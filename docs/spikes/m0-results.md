@@ -55,6 +55,13 @@
 
 修正後 gate 重跑：`go vet`、`go test -race ./...`（7 packages，含新 app 層測試）、`wails build`、`bundle-clis.sh` 全過。
 
+## 探索性 smoke 觀察（2026-08-06，封裝 app、Finder 啟動；非正式 gate 驗收）
+
+- **Claude 單回合成功**：init → streaming → message → result（exit 0、cost $0.2375 顯示正常）；訂閱 login 模式下大量 `system_other` 事件（使用者環境 hooks／skills 載入——A11 的實測材料）；出現 1 筆 `unknown` 事件（正式 A1 錄流時抄 raw 進 allow-unknown 判斷）。
+- **Workspace bug（已修）**：Finder 啟動時 cwd=`/`，`.workbench` 落根目錄不可寫 → approval socket bind 失敗。修為 env → 可寫 cwd → home 的 fallback 鏈，UI 顯示解析來源與 startup 錯誤。
+- **node 前置需求修正**：pinned **claude 2.1.223 為 native Mach-O binary（不需 node）**；**codex 0.146.1 的進入點是 node script（需 node）**。GUI app 不繼承 shell PATH → app 啟動時解析 node（LookPath → /usr/local/bin → /opt/homebrew/bin）並注入所有子程序 PATH。VERSIONS.md 的「node 為系統前置需求」修正為僅 Codex 線需要。
+- **UX**：M0 單回合設計（送完 prompt 即關 stdin）；session 結束後 UI 自動把 session/thread id 帶入 resume 欄，續問即 A8 的 resume 路徑。
+
 ## 訂閱與合規
 
 - 兩 provider 均僅喚起官方 login flow（Codex：app-server `account/login/start {"type":"chatgpt"}`；Claude：系統終端機執行 `claude auth login` + 狀態輪詢）；**app 程式碼不接收密碼、不讀寫 token**（credential 由官方 CLI 自有機制保管）。
