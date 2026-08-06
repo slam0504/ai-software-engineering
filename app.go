@@ -163,6 +163,7 @@ func resolveWorkspace() (workspace, state, source string, err error) {
 			lastErr = merr
 			continue
 		}
+		_ = os.MkdirAll(filepath.Join(st, "probe"), 0o755) // A2/A3 探針落點
 		return n, st, c.src, nil
 	}
 	tmp := os.TempDir()
@@ -451,7 +452,9 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 	sess, err := claude.Start(a.ctx, claude.Config{
 		Binary: a.claudeCLIPath(), CWD: cwd, Prompt: prompt, Resume: resume,
 		MCPConfigPath: mcpCfg, PermissionPromptTool: "mcp__workbench__approval_prompt",
-		SettingsJSON: `{"permissions":{"ask":["Bash(touch *)"]}}`, // probe 必問：ask 優先於 allow、所有 mode 有效
+		// probe 必問：ask 優先於 allow、所有 mode 有效；defaultMode 蓋掉使用者
+		// 環境的 plan 預設（實測 permissionMode:plan 會擋掉全部寫入、A2 無法執行）
+		SettingsJSON: `{"permissions":{"defaultMode":"default","ask":["Bash(touch *)"]}}`,
 		Env:          a.childEnv(),
 	})
 	if err != nil {

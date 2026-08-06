@@ -127,6 +127,7 @@ onMounted(async () => {
       <input v-model="recordCase" class="rec" :placeholder="provider + '-case（錄流，可空）'" />
       <input v-model="resume" class="rec"
         :placeholder="provider === 'claude' ? 'resume session id（可空）' : 'resume thread id（可空）'" />
+      <button title="清空 resume，開全新 session" @click="resume = ''; sessionId = ''">New</button>
       <button @click="start">Start</button>
       <button @click="terminate">Terminate</button>
       <button v-if="provider === 'codex'" @click="probeHandshake">B1 Probe</button>
