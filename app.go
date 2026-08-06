@@ -50,6 +50,7 @@ type App struct {
 
 	codexSingle   codex.Single[*codex.Server]
 	codexThreadID string
+	codexTurnID   string // turn/interrupt 必填（schema：threadId + turnId）
 	codexRec      *recorder.Recorder
 	codexActive   bool
 	codexLoginID  string
@@ -265,7 +266,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase string) error {
 	case "claude":
 		return a.startClaude(prompt, resume, recordCase)
 	case "codex":
-		return a.startCodex(prompt, recordCase)
+		return a.startCodex(prompt, resume, recordCase)
 	default:
 		return fmt.Errorf("unknown provider %q", provider)
 	}
@@ -273,7 +274,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase string) error {
 
 func (a *App) TerminateSession() error {
 	a.mu.Lock()
-	prov, sess, threadID := a.activeProv, a.claudeSess, a.codexThreadID
+	prov, sess := a.activeProv, a.claudeSess
 	a.mu.Unlock()
 	switch prov {
 	case "claude":
@@ -282,17 +283,59 @@ func (a *App) TerminateSession() error {
 		}
 		return sess.Terminate()
 	case "codex": // 長駐 server 不關，只中斷 turn（v1.5）
+		params, err := a.codexInterruptParams()
+		if err != nil {
+			return err
+		}
 		srv, err := a.currentAppServer()
 		if err != nil {
 			return err
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 		defer cancel()
-		_, err = srv.Conn().Call(ctx, codex.MethodTurnInterrupt, map[string]any{"threadId": threadID})
+		_, err = srv.Conn().Call(ctx, codex.MethodTurnInterrupt, params)
 		return err
 	default:
 		return errors.New("no active session")
 	}
+}
+
+// ---- codex turn 追蹤（turn/interrupt 的 schema 必填 threadId + turnId）----
+
+func parseTurnStarted(params []byte) (threadID, turnID string) {
+	var p struct {
+		ThreadID string `json:"threadId"`
+		Turn     struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	_ = json.Unmarshal(params, &p)
+	return p.ThreadID, p.Turn.ID
+}
+
+func (a *App) noteTurnStarted(params []byte) {
+	th, tu := parseTurnStarted(params)
+	a.mu.Lock()
+	if th != "" {
+		a.codexThreadID = th
+	}
+	a.codexTurnID = tu
+	a.mu.Unlock()
+}
+
+func (a *App) noteTurnEnded() {
+	a.mu.Lock()
+	a.codexTurnID = ""
+	a.mu.Unlock()
+}
+
+func (a *App) codexInterruptParams() (map[string]any, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.codexThreadID == "" || a.codexTurnID == "" {
+		return nil, fmt.Errorf("no active codex turn (threadId=%q, turnId=%q)", a.codexThreadID, a.codexTurnID)
+	}
+	return map[string]any{"threadId": a.codexThreadID, "turnId": a.codexTurnID}, nil
 }
 
 // ---- Claude 線 ----
@@ -423,7 +466,11 @@ func (a *App) wireCodexHandlers(srv *codex.Server) {
 			runtime.EventsEmit(a.ctx, "auth:status", map[string]any{"provider": "codex",
 				"event": method, "payload": string(params)})
 			a.audit("codex_auth", map[string]any{"method": method, "params": json.RawMessage(params)})
+		case codex.MethodTurnStarted:
+			a.noteTurnStarted(params) // Terminate 需要 turnId
+			runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(codex.MapEvent(method, params)))
 		case codex.MethodTurnCompleted:
+			a.noteTurnEnded()
 			runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(codex.MapEvent(method, params)))
 			a.finishCodexTurn(srv, params)
 		default:
@@ -475,7 +522,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	return map[string]string{"decision": decision}
 }
 
-func (a *App) startCodex(prompt, recordCase string) error {
+func (a *App) startCodex(prompt, resume, recordCase string) error {
 	srv, err := a.ensureAppServer()
 	if err != nil {
 		return err
@@ -501,11 +548,16 @@ func (a *App) startCodex(prompt, recordCase string) error {
 	a.mu.Unlock()
 
 	go func() {
+		// B6：resume 走 thread/resume（schema 必填 threadId），否則 thread/start
+		method, params := codex.MethodThreadStart, map[string]any{}
+		if resume != "" {
+			method, params = codex.MethodThreadResume, map[string]any{"threadId": resume}
+		}
 		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
-		res, err := conn.Call(ctx, codex.MethodThreadStart, map[string]any{})
+		res, err := conn.Call(ctx, method, params)
 		cancel()
 		if err != nil {
-			a.finishCodexTurnWithError(srv, "thread/start: "+err.Error())
+			a.finishCodexTurnWithError(srv, method+": "+err.Error())
 			return
 		}
 		var tr struct {
@@ -674,6 +726,33 @@ func (a *App) StartLogin(provider string) error {
 	default:
 		return fmt.Errorf("unknown provider %q", provider)
 	}
+}
+
+// CancelLogin 取消進行中的 codex 官方登入（account/login/cancel，schema 必填 loginId）。
+func (a *App) CancelLogin(provider string) error {
+	if provider != "codex" {
+		return fmt.Errorf("cancel login not supported for %q (claude login runs in the system terminal)", provider)
+	}
+	a.mu.Lock()
+	loginID := a.codexLoginID
+	a.mu.Unlock()
+	if loginID == "" {
+		return errors.New("no login in progress")
+	}
+	srv, err := a.currentAppServer()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+	defer cancel()
+	if _, err := srv.Conn().Call(ctx, codex.MethodAccountLoginCancel, map[string]any{"loginId": loginID}); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.codexLoginID = ""
+	a.mu.Unlock()
+	runtime.EventsEmit(a.ctx, "auth:status", map[string]any{"provider": "codex", "event": "login_cancelled"})
+	return nil
 }
 
 func (a *App) pollClaudeAuth() {

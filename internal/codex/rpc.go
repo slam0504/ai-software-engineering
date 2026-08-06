@@ -8,13 +8,49 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
 
+// RequestID 保留 wire 原始 ID 型別——pinned schema 的 RequestId 是
+// string | int64 union（RequestId.json），不得假設整數。
+type RequestID struct{ raw json.RawMessage }
+
+func NewIntID(n int64) *RequestID {
+	return &RequestID{raw: json.RawMessage(strconv.FormatInt(n, 10))}
+}
+
+func (r *RequestID) UnmarshalJSON(b []byte) error {
+	t := bytes.TrimSpace(b)
+	if len(t) == 0 {
+		return errors.New("codex: empty request id")
+	}
+	switch t[0] { // 只接受 string 或 number（schema union）
+	case '"':
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+	default:
+		return fmt.Errorf("codex: invalid request id %s", b)
+	}
+	r.raw = append(json.RawMessage(nil), t...)
+	return nil
+}
+
+func (r RequestID) MarshalJSON() ([]byte, error) {
+	if len(r.raw) == 0 {
+		return nil, errors.New("codex: empty request id")
+	}
+	return r.raw, nil
+}
+
+// Key 回傳 pending map 用的正規化鍵（原始 JSON 文字，string 與 number 不會相撞）。
+func (r *RequestID) Key() string { return string(r.raw) }
+
+func (r *RequestID) String() string { return string(r.raw) }
+
 // Frame 是 app-server wire 的單一 JSONL frame：JSON-RPC 2.0 語意但省略 jsonrpc 欄位。
 type Frame struct {
-	ID     *int64          `json:"id,omitempty"`
+	ID     *RequestID      `json:"id,omitempty"`
 	Method string          `json:"method,omitempty"`
 	Params json.RawMessage `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -33,7 +69,7 @@ type Conn struct {
 	nextID int64 // atomic
 
 	pendMu   sync.Mutex
-	pending  map[int64]chan Frame
+	pending  map[string]chan Frame
 	closed   bool
 	closeErr error
 
@@ -54,7 +90,7 @@ type Conn struct {
 }
 
 func NewConn(stdin io.Writer, stdout io.Reader) *Conn {
-	c := &Conn{stdin: stdin, pending: map[int64]chan Frame{}, doneCh: make(chan struct{})}
+	c := &Conn{stdin: stdin, pending: map[string]chan Frame{}, doneCh: make(chan struct{})}
 	go c.readLoop(stdout)
 	return c
 }
@@ -182,7 +218,7 @@ func (c *Conn) Call(ctx context.Context, method string, params any) (json.RawMes
 }
 
 func (c *Conn) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	id := atomic.AddInt64(&c.nextID, 1)
+	rid := NewIntID(atomic.AddInt64(&c.nextID, 1))
 	raw := json.RawMessage(`{}`)
 	if params != nil {
 		b, err := json.Marshal(params)
@@ -198,14 +234,14 @@ func (c *Conn) call(ctx context.Context, method string, params any) (json.RawMes
 		c.pendMu.Unlock()
 		return nil, fmt.Errorf("codex: connection closed: %w", err)
 	}
-	c.pending[id] = ch
+	c.pending[rid.Key()] = ch
 	c.pendMu.Unlock()
 	defer func() {
 		c.pendMu.Lock()
-		delete(c.pending, id)
+		delete(c.pending, rid.Key())
 		c.pendMu.Unlock()
 	}()
-	if err := c.send(Frame{ID: &id, Method: method, Params: raw}); err != nil {
+	if err := c.send(Frame{ID: rid, Method: method, Params: raw}); err != nil {
 		return nil, err
 	}
 	select {
@@ -248,7 +284,7 @@ func (c *Conn) readLoop(stdout io.Reader) {
 		switch {
 		case f.ID != nil && f.Method == "": // response
 			c.pendMu.Lock()
-			ch, ok := c.pending[*f.ID]
+			ch, ok := c.pending[f.ID.Key()]
 			c.pendMu.Unlock()
 			if ok {
 				ch <- f

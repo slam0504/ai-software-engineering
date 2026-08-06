@@ -313,6 +313,39 @@ func TestApprovalAllowDenyTimeout(t *testing.T) {
 	}
 }
 
+func TestApprovalStringRequestIDRoundTrip(t *testing.T) { // RequestId = string | int64（schema union）
+	p := newFakePair(t)
+	responses := make(chan Frame, 1)
+	p.fake.onResp = func(fr Frame) { responses <- fr }
+	p.conn.OnServerRequest(func(method string, params json.RawMessage) (any, error) {
+		return map[string]string{"decision": "accept"}, nil
+	})
+	doHandshake(t, p.conn)
+	// fake 以 string ID 發核可請求（schema 允許；不得掉進 OnUnknown）
+	p.fake.send(map[string]any{"id": "srv-abc", "method": MethodCmdExecRequestApproval,
+		"params": map[string]any{"threadId": "t1", "turnId": "turn1", "itemId": "i1"}})
+	select {
+	case fr := <-responses:
+		if fr.ID == nil || fr.ID.Key() != `"srv-abc"` {
+			t.Fatalf("response must echo original string id, got %v", fr.ID)
+		}
+		if !bytes.Contains(fr.Result, []byte("accept")) {
+			t.Fatalf("decision lost: %s", fr.Result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("string-ID server request never answered (fell into OnUnknown?)")
+	}
+	// wire 原文驗證：回覆 frame 的 id 是 string，不是數字
+	waitFor(t, func() bool {
+		for _, b := range p.fake.rawFrames() {
+			if bytes.Contains(b, []byte(`"id":"srv-abc"`)) {
+				return true
+			}
+		}
+		return false
+	}, "raw response frame must carry string id verbatim")
+}
+
 func TestServerErrorSurfaced(t *testing.T) {
 	p := newFakePair(t)
 	p.fake.onReq = func(fr Frame) {

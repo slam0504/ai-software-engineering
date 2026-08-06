@@ -45,6 +45,16 @@
 4. **probe start 失敗的 meta 錯誤欄位**：`recorder.Meta` 無一般 error 欄位，start 失敗訊息記入 `StderrTail`（`"probe start failed: …"`）；`RecorderError` 保留給 recorder 自身錯誤。
 5. **Codex 未知通知的分流**：M0 已認得通知集合定義於 `methods.go` `ServerNotifications`；集合外通知走 `OnUnknown`（raw 保留 → UI unknown 卡片），集合內未特判者映 KindSystemOther。
 
+## Review 修正記錄（2026-08-06 第一輪 code review，3 P1 + 2 P2）
+
+1. **P1 turn/interrupt 缺 turnId（已修）**：schema `TurnInterruptParams` 必填 `threadId`+`turnId`；app 現於 `turn/started` 通知追蹤 `turn.id`（`noteTurnStarted`）、`turn/completed` 清除；`TerminateSession(codex)` 由 `codexInterruptParams()` 組參數，無 active turn 即拒絕。迴歸測試：`TestCodexInterruptParamsLifecycle`／`TestParseTurnStarted`（app 層）。
+2. **P1 B6 thread/resume 無 app 路徑（已修）**：`startCodex` 接受 resume（`thread/resume {threadId}`，response 同樣讀 `result.thread.id`）；UI resume 欄位雙 provider 皆顯示。live 行為仍以 B6 實測為準。
+3. **P1 RequestID 只支援 int（已修）**：`Frame.ID` 改為保留原文的 `RequestID`（string | int64，`RequestId.json`）；pending map 改原文鍵；server request 回覆 echo 原始 ID。迴歸測試：`TestApprovalStringRequestIDRoundTrip`（含 wire 原文斷言）。實際 app-server 是否用 string ID 待 B4 live 驗證。
+4. **P2 Claude 完成訊息只剩 placeholder（已修）**：decoder 對 assistant/user 訊息串接 `content[].text` 進 `Event.Text`；測試 `TestDecodeMessageKeepsText`。
+5. **P2 codex login cancel 未實作（已修）**：新增 `CancelLogin` 綁定（`account/login/cancel {loginId}`）與 UI 按鈕；成功後清 loginId 並發 `auth:status`。
+
+修正後 gate 重跑：`go vet`、`go test -race ./...`（7 packages，含新 app 層測試）、`wails build`、`bundle-clis.sh` 全過。
+
 ## 訂閱與合規
 
 - 兩 provider 均僅喚起官方 login flow（Codex：app-server `account/login/start {"type":"chatgpt"}`；Claude：系統終端機執行 `claude auth login` + 狀態輪詢）；**app 程式碼不接收密碼、不讀寫 token**（credential 由官方 CLI 自有機制保管）。

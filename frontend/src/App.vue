@@ -3,7 +3,7 @@
 import { ref, onMounted } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import {
-  StartSession, TerminateSession, AuthStatus, StartLogin, Logout,
+  StartSession, TerminateSession, AuthStatus, StartLogin, CancelLogin, Logout,
   RestartCodexServerRecorded, CLIInfo,
 } from '../wailsjs/go/main/App'
 import Transcript from './components/Transcript.vue'
@@ -63,6 +63,15 @@ async function login() {
   }
 }
 
+async function cancelLogin() {
+  try {
+    await CancelLogin(provider.value)
+    statusMsg.value = 'login cancelled'
+  } catch (e: any) {
+    statusMsg.value = `cancel login failed: ${e}`
+  }
+}
+
 async function logout() {
   try {
     await Logout(provider.value)
@@ -95,7 +104,8 @@ onMounted(async () => {
       </select>
       <input v-model="prompt" class="prompt" placeholder="prompt" @keyup.enter="start" />
       <input v-model="recordCase" class="rec" :placeholder="provider + '-case（錄流，可空）'" />
-      <input v-if="provider === 'claude'" v-model="resume" class="rec" placeholder="resume session id（可空）" />
+      <input v-model="resume" class="rec"
+        :placeholder="provider === 'claude' ? 'resume session id（可空）' : 'resume thread id（可空）'" />
       <button @click="start">Start</button>
       <button @click="terminate">Terminate</button>
       <button v-if="provider === 'codex'" @click="probeHandshake">B1 Probe</button>
@@ -104,6 +114,7 @@ onMounted(async () => {
       <span class="sid">session: {{ sessionId || '—' }}</span>
       <button @click="refreshAuth">Auth Status</button>
       <button @click="login">Login</button>
+      <button v-if="provider === 'codex'" @click="cancelLogin">Cancel Login</button>
       <button @click="logout">Logout</button>
       <span class="cli" :title="JSON.stringify(cliInfo)">
         tools: {{ cliInfo.toolsSource }} @ {{ cliInfo.toolsDir }} | node {{ cliInfo.node }}

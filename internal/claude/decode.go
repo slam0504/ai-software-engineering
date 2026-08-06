@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
@@ -48,6 +49,23 @@ func Decode(line []byte) contract.Event {
 		}
 	case "assistant", "user":
 		ev.Kind = contract.KindMessage
+		var body struct {
+			Message struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &body) == nil { // 完成訊息保留本文，UI 才不會只剩 placeholder
+			var sb strings.Builder
+			for _, c := range body.Message.Content {
+				if c.Type == "text" {
+					sb.WriteString(c.Text)
+				}
+			}
+			ev.Text = sb.String()
+		}
 	case "stream_event":
 		ev.Kind = contract.KindDelta
 		var body struct {

@@ -53,3 +53,11 @@ func TestDecode(t *testing.T) {
 		t.Fatalf("init parse: %+v", init)
 	}
 }
+
+func TestDecodeMessageKeepsText(t *testing.T) { // review P2：完成訊息不得只剩 placeholder
+	line := `{"type":"assistant","session_id":"abc-123","message":{"role":"assistant","content":[{"type":"text","text":"first "},{"type":"tool_use","name":"Bash"},{"type":"text","text":"second"}]}}`
+	ev := Decode([]byte(line))
+	if ev.Kind != contract.KindMessage || ev.Text != "first second" {
+		t.Fatalf("kind=%s text=%q, want message text concatenated", ev.Kind, ev.Text)
+	}
+}
