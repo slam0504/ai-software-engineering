@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"sample-1","model":"placeholder-model","capabilities":["interrupt_receipt_v1"],"mcp_servers":[{"name":"workbench","status":"connected"}]}
+{"type":"stream_event","session_id":"sample-1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"sample "}}}
+{"type":"assistant","session_id":"sample-1","message":{"role":"assistant","content":[{"type":"text","text":"sample text"}]}}
+{"type":"result","subtype":"success","session_id":"sample-1","result":"sample text","total_cost_usd":0,"is_error":false}
