@@ -34,6 +34,8 @@ type App struct {
 	ctx          context.Context
 	workspaceDir string
 	stateDir     string
+	workspaceSrc string
+	startupErr   string
 	toolsDirPath string
 	toolsSource  string
 	diagramPath  string
@@ -66,25 +68,24 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	cwd, err := os.Getwd()
-	if err == nil {
-		if n, nerr := claude.NormalizeCWD(cwd); nerr == nil {
-			cwd = n
-		}
+	var wsErr error
+	a.workspaceDir, a.stateDir, a.workspaceSrc, wsErr = resolveWorkspace()
+	if wsErr != nil { // fail loud：UI 與 audit 都要看得到
+		a.startupErr = "workspace init failed: " + wsErr.Error()
 	}
-	a.workspaceDir = cwd
-	a.stateDir = filepath.Join(a.workspaceDir, ".workbench")
-	_ = os.MkdirAll(filepath.Join(a.stateDir, "recordings"), 0o755)
 	if r, rerr := claude.OpenRegistry(filepath.Join(a.stateDir, "sessions.json")); rerr == nil {
 		a.registry = r
+	} else if a.startupErr == "" {
+		a.startupErr = "registry init failed: " + rerr.Error()
 	}
 	if f, ferr := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 		a.auditF = f
 	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
-	a.audit("startup", map[string]any{"workspace": a.workspaceDir,
-		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": nodeVersion()})
+	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
+		"startup_error": a.startupErr,
+		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
 }
@@ -133,6 +134,42 @@ func (a *App) shutdown(ctx context.Context) {
 }
 
 // ---- helpers ----
+
+// resolveWorkspace：env WORKBENCH_WORKSPACE → 可寫的 cwd（Finder 啟動時 cwd 是 "/"，
+// 不可寫）→ home。第一個能建出 .workbench/recordings 的候選勝出。
+func resolveWorkspace() (workspace, state, source string, err error) {
+	type cand struct{ dir, src string }
+	var cands []cand
+	if d := os.Getenv("WORKBENCH_WORKSPACE"); d != "" {
+		cands = append(cands, cand{d, "env"})
+	}
+	if cwd, cerr := os.Getwd(); cerr == nil && cwd != "/" {
+		cands = append(cands, cand{cwd, "cwd"})
+	}
+	if home, herr := os.UserHomeDir(); herr == nil {
+		cands = append(cands, cand{home, "home"})
+	}
+	var lastErr error
+	for _, c := range cands {
+		n, nerr := claude.NormalizeCWD(c.dir)
+		if nerr != nil {
+			lastErr = nerr
+			continue
+		}
+		st := filepath.Join(n, ".workbench")
+		if merr := os.MkdirAll(filepath.Join(st, "recordings"), 0o755); merr != nil {
+			lastErr = merr
+			continue
+		}
+		return n, st, c.src, nil
+	}
+	tmp := os.TempDir()
+	st := filepath.Join(tmp, "sdlc-workbench", ".workbench")
+	if merr := os.MkdirAll(filepath.Join(st, "recordings"), 0o755); merr != nil {
+		return tmp, st, "tmp", errors.Join(lastErr, merr)
+	}
+	return tmp, st, "tmp", lastErr
+}
 
 // resolveToolsDir：env WORKBENCH_TOOLS_DIR → bundle Resources/tools → repo tools/（dev fallback）。
 func resolveToolsDir(workspace string) (string, string) {
@@ -220,6 +257,7 @@ func (a *App) CLIInfo() map[string]string {
 		"toolsDir": a.toolsDirPath, "toolsSource": a.toolsSource,
 		"claudeVersion": a.cliVersion("claude"), "codexVersion": a.cliVersion("codex"),
 		"node": nodeVersion(), "workspace": a.workspaceDir,
+		"workspaceSource": a.workspaceSrc, "startupError": a.startupErr,
 	}
 }
 
@@ -346,6 +384,9 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 	cwd, err := claude.NormalizeCWD(a.workspaceDir)
 	if err != nil {
 		return err
+	}
+	if a.registry == nil {
+		return fmt.Errorf("session registry unavailable (startup error: %s)", a.startupErr)
 	}
 	if resume != "" { // resume mismatch 拒絕
 		if bound, ok := a.registry.CWD(resume); !ok || bound != cwd {

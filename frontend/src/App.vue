@@ -117,8 +117,12 @@ onMounted(async () => {
       <button v-if="provider === 'codex'" @click="cancelLogin">Cancel Login</button>
       <button @click="logout">Logout</button>
       <span class="cli" :title="JSON.stringify(cliInfo)">
-        tools: {{ cliInfo.toolsSource }} @ {{ cliInfo.toolsDir }} | node {{ cliInfo.node }}
+        ws: {{ cliInfo.workspaceSource }} @ {{ cliInfo.workspace }} |
+        tools: {{ cliInfo.toolsSource }} | node {{ cliInfo.node }}
       </span>
+    </header>
+    <header v-if="cliInfo.startupError" class="second">
+      <span class="startup-err">startup: {{ cliInfo.startupError }}</span>
     </header>
     <div v-if="authInfo" class="auth"><pre>{{ authInfo }}</pre></div>
     <div v-if="statusMsg" class="status">{{ statusMsg }}</div>
@@ -147,6 +151,7 @@ header.second { padding-top: 0; font-size: 12px; }
 .rec { width: 200px; padding: 6px; }
 .sid { color: #7aa2c4; margin-right: 8px; }
 .cli { color: #66788a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.startup-err { color: #ff8a80; }
 .auth pre { text-align: left; font-size: 12px; background: #101820; margin: 0 8px; padding: 6px; max-height: 140px; overflow: auto; }
 .status { color: #ffd54f; font-size: 13px; padding: 2px 8px; text-align: left; }
 nav { display: flex; gap: 4px; padding: 4px 8px; }
