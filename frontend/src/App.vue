@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // spike quality: to be rebuilt in M1
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import {
   StartSession, TerminateSession, AuthStatus, StartLogin, CancelLogin, Logout,
@@ -20,19 +20,32 @@ const authInfo = ref('')
 const statusMsg = ref('')
 const cliInfo = ref<Record<string, string>>({})
 
+// resume id 是 provider-scoped（claude session id ≠ codex thread id），
+// 混填會被 registry / app-server 拒絕——per-provider 記錄、切換時跟著換。
+const lastSession: Record<string, string> = {}
+
 EventsOn('bridge:event', (ev: any) => {
-  if (ev.kind === 'init' && ev.sessionId) sessionId.value = ev.sessionId
+  if (ev.kind === 'init' && ev.sessionId) {
+    sessionId.value = ev.sessionId
+    if (ev.provider) lastSession[ev.provider] = ev.sessionId
+  }
 })
 EventsOn('auth:status', (s: any) => {
   statusMsg.value = `auth[${s.provider}]: ${s.event ?? ''} ${s.authUrl ?? ''}`
 })
 EventsOn('session:done', (d: any) => {
-  // M0 為單回合模式：續問走 resume（A8 路徑）——自動帶入上一個 session/thread id
-  if (sessionId.value) {
-    resume.value = sessionId.value
+  // M0 為單回合模式：續問走 resume（A8 路徑）——自動帶入同 provider 的上一個 id
+  const id = lastSession[d.provider]
+  if (id && d.provider === provider.value) {
+    resume.value = id
     statusMsg.value = '單回合結束；resume 已帶入，輸入下一句直接 Start 即可延續'
   }
   prompt.value = ''
+})
+
+watch(provider, (p) => { // 切 provider：resume 換成該 provider 自己的上一個 id
+  resume.value = lastSession[p] ?? ''
+  sessionId.value = lastSession[p] ?? ''
 })
 
 async function start() {
