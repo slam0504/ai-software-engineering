@@ -5,6 +5,8 @@ export function AuthStatus(arg1:string):Promise<string>;
 
 export function CLIInfo():Promise<Record<string, string>>;
 
+export function CancelLogin(arg1:string):Promise<void>;
+
 export function Logout(arg1:string):Promise<void>;
 
 export function ReadDiagram():Promise<string>;

@@ -10,6 +10,10 @@ export function CLIInfo() {
   return window['go']['main']['App']['CLIInfo']();
 }
 
+export function CancelLogin(arg1) {
+  return window['go']['main']['App']['CancelLogin'](arg1);
+}
+
 export function Logout(arg1) {
   return window['go']['main']['App']['Logout'](arg1);
 }
