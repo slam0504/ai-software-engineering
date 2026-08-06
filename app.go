@@ -38,6 +38,7 @@ type App struct {
 	startupErr   string
 	toolsDirPath string
 	toolsSource  string
+	nodePath     string
 	diagramPath  string
 
 	registry *claude.Registry
@@ -83,9 +84,10 @@ func (a *App) startup(ctx context.Context) {
 		a.auditF = f
 	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
+	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
-		"startup_error": a.startupErr,
-		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": nodeVersion()})
+		"startup_error": a.startupErr, "node_path": a.nodePath,
+		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
 }
@@ -193,10 +195,36 @@ func (a *App) codexCLIPath() string {
 	return filepath.Join(a.toolsDirPath, "codex-cli", "node_modules", ".bin", "codex")
 }
 
-func nodeVersion() string {
-	out, err := exec.Command("node", "--version").Output()
+// resolveNodePath：GUI app（Finder 啟動）不繼承 shell PATH，node 常在
+// /usr/local/bin 或 /opt/homebrew/bin。codex CLI 是 node script（claude 為
+// native binary），找不到 node 時 Codex 線必掛。
+func resolveNodePath() string {
+	if p, err := exec.LookPath("node"); err == nil {
+		return p
+	}
+	for _, c := range []string{"/usr/local/bin/node", "/opt/homebrew/bin/node"} {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// childEnv：把 node 所在目錄前置到子程序 PATH（duplicate PATH 以後者為準）。
+func (a *App) childEnv() []string {
+	if a.nodePath == "" {
+		return nil
+	}
+	return []string{"PATH=" + filepath.Dir(a.nodePath) + ":" + os.Getenv("PATH")}
+}
+
+func (a *App) nodeVersion() string {
+	if a.nodePath == "" {
+		return "missing (not on app PATH; codex CLI needs node)"
+	}
+	out, err := exec.Command(a.nodePath, "--version").Output()
 	if err != nil {
-		return "missing: " + err.Error()
+		return "error: " + err.Error()
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -206,7 +234,9 @@ func (a *App) cliVersion(provider string) string {
 	if provider == "codex" {
 		bin = a.codexCLIPath()
 	}
-	out, err := exec.Command(bin, "--version").Output()
+	cmd := exec.Command(bin, "--version")
+	cmd.Env = append(os.Environ(), a.childEnv()...) // codex CLI 是 node script
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -256,7 +286,7 @@ func (a *App) CLIInfo() map[string]string {
 	return map[string]string{
 		"toolsDir": a.toolsDirPath, "toolsSource": a.toolsSource,
 		"claudeVersion": a.cliVersion("claude"), "codexVersion": a.cliVersion("codex"),
-		"node": nodeVersion(), "workspace": a.workspaceDir,
+		"node": a.nodeVersion(), "workspace": a.workspaceDir,
 		"workspaceSource": a.workspaceSrc, "startupError": a.startupErr,
 	}
 }
@@ -422,6 +452,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 		Binary: a.claudeCLIPath(), CWD: cwd, Prompt: prompt, Resume: resume,
 		MCPConfigPath: mcpCfg, PermissionPromptTool: "mcp__workbench__approval_prompt",
 		SettingsJSON: `{"permissions":{"ask":["Bash(touch *)"]}}`, // probe 必問：ask 優先於 allow、所有 mode 有效
+		Env:          a.childEnv(),
 	})
 	if err != nil {
 		return err
@@ -476,7 +507,8 @@ func (a *App) pumpClaude(sess *claude.Session, cwd, recordCase string) {
 
 func (a *App) ensureAppServer() (*codex.Server, error) {
 	return a.codexSingle.Ensure(func() (*codex.Server, error) {
-		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(), CWD: a.workspaceDir})
+		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
+			CWD: a.workspaceDir, Env: a.childEnv()})
 		if err != nil {
 			return nil, err
 		}
@@ -683,7 +715,8 @@ func (a *App) RestartCodexServerRecorded(recordCase string) error {
 		return recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
 	}
 	start := func() (*codex.Server, error) {
-		return codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(), CWD: a.workspaceDir})
+		return codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
+			CWD: a.workspaceDir, Env: a.childEnv()})
 	}
 	err := codex.RunHandshakeProbe(a.ctx, &a.codexSingle, newRec, start, clientInfo())
 	if err != nil {

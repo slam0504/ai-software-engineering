@@ -26,6 +26,14 @@ EventsOn('bridge:event', (ev: any) => {
 EventsOn('auth:status', (s: any) => {
   statusMsg.value = `auth[${s.provider}]: ${s.event ?? ''} ${s.authUrl ?? ''}`
 })
+EventsOn('session:done', (d: any) => {
+  // M0 為單回合模式：續問走 resume（A8 路徑）——自動帶入上一個 session/thread id
+  if (sessionId.value) {
+    resume.value = sessionId.value
+    statusMsg.value = '單回合結束；resume 已帶入，輸入下一句直接 Start 即可延續'
+  }
+  prompt.value = ''
+})
 
 async function start() {
   statusMsg.value = ''
