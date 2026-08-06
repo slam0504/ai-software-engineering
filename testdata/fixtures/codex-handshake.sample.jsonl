@@ -1,0 +1,12 @@
+{"dir":"c2s","frame":{"id":1,"method":"initialize","params":{"clientInfo":{"name":"sdlc-workbench","version":"0.0.1"}}}}
+{"dir":"s2c","frame":{"id":1,"result":{}}}
+{"dir":"c2s","frame":{"method":"initialized"}}
+{"dir":"c2s","frame":{"id":2,"method":"thread/start","params":{}}}
+{"dir":"s2c","frame":{"id":2,"result":{"thread":{"id":"t1"}}}}
+{"dir":"c2s","frame":{"id":3,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"hello"}]}}}
+{"dir":"s2c","frame":{"method":"item/started","params":{"threadId":"t1","item":{"id":"i1","type":"commandExecution","command":"echo hi","status":"inProgress"}}}}
+{"dir":"s2c","frame":{"method":"item/completed","params":{"threadId":"t1","item":{"id":"i1","type":"commandExecution","command":"echo hi","status":"completed"}}}}
+{"dir":"s2c","frame":{"method":"item/agentMessage/delta","params":{"threadId":"t1","itemId":"i2","delta":"hi"}}}
+{"dir":"s2c","frame":{"method":"item/completed","params":{"threadId":"t1","item":{"id":"i2","type":"agentMessage","text":"hi"}}}}
+{"dir":"s2c","frame":{"id":3,"result":{}}}
+{"dir":"s2c","frame":{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn1","status":"completed"}}}}
