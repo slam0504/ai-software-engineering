@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "sdlc-workbench",
+  "outputfilename": "sdlc-workbench",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "eason_tseng",
+    "email": "eason_tseng@mail.chungyo.net"
+  }
+}
