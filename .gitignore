@@ -22,3 +22,4 @@ node_modules/
 .workbench/
 tools/claude-cli/node_modules/
 tools/codex-cli/node_modules/
+.playwright-mcp/
