@@ -89,6 +89,24 @@ func TestTimeoutDeniesFailClosed(t *testing.T) {
 	}
 }
 
+func TestTimeoutHookFires(t *testing.T) { // UI 靠這個收掉過期彈窗
+	br, sock, _ := newTestBroker(t, 50*time.Millisecond)
+	timedOut := make(chan string, 1)
+	br.SetTimeoutHook(func(id string) { timedOut <- id })
+	d := dialAndAsk(t, sock, Request{ID: "r-hook", ToolName: "Bash"}) // 無人 Resolve
+	if d.Behavior != "deny" {
+		t.Fatalf("timeout must deny, got %s", d.Behavior)
+	}
+	select {
+	case id := <-timedOut:
+		if id != "r-hook" {
+			t.Fatalf("hook id = %s", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout hook must fire")
+	}
+}
+
 func TestAuditKeepsRawParams(t *testing.T) {
 	br, sock, audit := newTestBroker(t, time.Second)
 	go func() {

@@ -438,6 +438,12 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 	a.mu.Lock()
 	a.broker = br
 	a.mu.Unlock()
+	br.SetTimeoutHook(func(id string) { // 逾時 deny 後收掉 UI 的過期彈窗
+		a.apprMu.Lock()
+		delete(a.apprPending, id)
+		a.apprMu.Unlock()
+		runtime.EventsEmit(a.ctx, "approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
+	})
 	go a.pumpApprovals(br, "claude")
 
 	self, _ := os.Executable()
@@ -593,6 +599,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		delete(a.apprPending, id)
 		a.apprMu.Unlock()
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
+		runtime.EventsEmit(a.ctx, "approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}

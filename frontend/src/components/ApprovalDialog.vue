@@ -9,6 +9,12 @@ const reason = ref('')
 const error = ref('')
 
 EventsOn('approval:request', (r: any) => { req.value = r; reason.value = ''; error.value = '' })
+EventsOn('approval:dismiss', (d: any) => { // 逾時已 fail-closed deny：收掉過期彈窗
+  if (req.value && req.value.id === d.id) {
+    req.value = null
+    reason.value = ''
+  }
+})
 
 async function decide(allow: boolean) {
   if (!req.value) return

@@ -25,12 +25,26 @@ type Decision struct {
 }
 
 type Broker struct {
-	ln      net.Listener
-	timeout time.Duration
-	audit   io.Writer
-	pending chan Request
-	mu      sync.Mutex
-	waiters map[string]chan Decision
+	ln        net.Listener
+	timeout   time.Duration
+	audit     io.Writer
+	pending   chan Request
+	mu        sync.Mutex
+	waiters   map[string]chan Decision
+	onTimeout func(id string)
+}
+
+// SetTimeoutHook 註冊逾時通知（UI 需要據此收掉過期的核可視窗）。
+func (b *Broker) SetTimeoutHook(f func(id string)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onTimeout = f
+}
+
+func (b *Broker) timeoutHook() func(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.onTimeout
 }
 
 func NewBroker(socketPath string, timeout time.Duration, audit io.Writer) (*Broker, error) {
@@ -98,6 +112,9 @@ func (b *Broker) serve(conn net.Conn) {
 		case <-time.After(b.timeout):
 			d = Decision{ID: req.ID, Behavior: "deny", Message: "approval timeout (fail closed)"}
 			b.log("timeout", req.ID)
+			if h := b.timeoutHook(); h != nil {
+				h(req.ID)
+			}
 		}
 		if d.Behavior == "allow" && len(d.UpdatedInput) == 0 {
 			d.UpdatedInput = req.Input // 官方 allow 回覆必須含 updatedInput
