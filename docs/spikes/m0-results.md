@@ -1,6 +1,9 @@
-# M0 Spike 結果（2026-08-06，進行中）
+# M0 Spike 結果（2026-08-07 定稿）
 
-> 狀態：**Task 1–10 完成、Task 12 自動化 gate 全過；Task 11 驗收矩陣（A0–A12／B0–B6／N1／R1）與封裝後隔離 smoke 待使用者本人操作**（真帳號登入與 UI 互動無法由 agent 代行）。本報告依實際執行證據撰寫，未執行項一律標 PENDING，不使用「應該可以」措辭。
+> 狀態：**驗收完成**——Claude 線 A1–A12、Codex 線 B1–B6、N1、R1、隔離封裝 smoke 全 PASS；
+> 選擇性未執行項：A0/B0 完整登出→登入循環（兩帳號現處登入態，auth 讀取與官方命令已驗）、
+> A11 bare/API-key 對照（選測，需成本授權）。本報告依實際執行證據撰寫，未執行項如實標註。
+> 建議：**方案 A 定案 GO；Codex 線 GO**（依據見「建議」節）。
 
 ## 版本基線
 
@@ -45,7 +48,7 @@
 | B6 session 持續性 | **PASS**（2026-08-07） | `thread/resume {threadId}` 成功、回答精準引用前回合（b4-deny 被拒）脈絡 | UI resume 傳遞 bug（codex resume 被吞）發現並修復 |
 | N1（同一 UI 雙 provider） | **PASS**（2026-08-06/07） | 同一 build 先後跑 claude 與 codex session（8/6 晚間同 app 實例）；Transcript／ApprovalDialog／session:done 全走 contract 事件、無 provider 特判；雙 fixtures glob 非空且全 Valid（replay 測試） | |
 | R1（Recorder 失敗可見性） | **PASS**（2026-08-07） | `chmod 500 recordings` → session:done 顯示 `recorder: permission denied`（UI 可見）；恢復權限重跑正常 | |
-| 封裝後隔離 smoke | PENDING | bundle 已產出 | 需 GUI 互動 |
+| 封裝後隔離 smoke | **PASS**（2026-08-07） | .app 複本於 `/tmp/m0smoke.*`、repo `tools/` 藏起、home cwd 啟動：CLIInfo 顯示 toolsDir=bundle 內路徑、雙 CLI 版本自 bundle 讀取、startupError 空；claude A2 級 probe（audit startup 記 tmp tools 路徑、Bash touch→allow→smoke.txt 存在）；codex binary 自 bundle 可執行（版本讀取）+ 操作者確認 turn 完成（未設 recordCase、無錄流留存） | 證據：截圖 + audit + probe 檔 |
 
 ## 協定觀察（至今）
 
@@ -106,11 +109,23 @@ scripts/bundle-clis.sh → bundled: 873M
 
 ## 失敗歸因與轉向評估
 
-至今無驗收 FAIL。方案 C 轉向條件（Claude CLI bridge 本身缺口）未觸發；Codex 線無阻礙。
+全矩陣無驗收 FAIL。過程中發現的問題全數歸因於自寫 code 或環境整合（workspace cwd、node PATH、
+UI resume 傳遞、彈窗殘留、plan-mode 覆寫、approvalPolicy 預設），依 Global Constraints 均屬
+「修復、不構成轉向理由」，且已全部修復並補測試。**方案 C 轉向條件（Claude CLI bridge 本身
+協定／能力缺口）未觸發**；Codex app-server 線無阻礙。
 
-## 待辦（需使用者）
+## 建議
 
-1. `wails dev`（或開啟 build 出的 app）→ 依 Task 11 逐項執行 A0–A12／B0–B6／N1／R1，錄流落 `.workbench/recordings/`。
-2. 去敏錄流節錄補進 `testdata/fixtures/`（`claude-stream-shape.ndjson`、`claude-permission-request.sample.json`、`codex-turn-shape.jsonl`）。
-3. Task 12 Step 3 隔離 smoke（.app 複製至暫存目錄、`tools/` 藏起、驗證解析路徑在 bundle 內）。
-4. 依模板補完本報告 → 方案 A 定案與 Codex go／no-go 勾選。
+- [x] **方案 A 定案（Go + Wails v2 + Vue 3 + CLI stream-json bridge）**——Claude 線 A1–A12
+  全 PASS：streaming、權限 MCP 往返（allow/deny/逾時/斷線/載入失敗全路徑 fail closed）、
+  resume/cwd 綁定、Terminate 整組收尾、replay 契約全部以真 CLI 驗證成立。
+- [x] **Codex 線 GO**——app-server handshake、turn 串流、核可往返（含 serverRequest/resolved）、
+  thread/resume、replay 全 PASS；訂閱（Sign in with ChatGPT）路徑實測可用。
+- 回饋 app-plan 下一版的修訂點：
+  1. M1 需把「多輪互動」做進問答面板（M0 單回合 + resume 的體感限制已實證）。
+  2. Codex approvalPolicy 需成為 UI 可見設定（M0 硬編 untrusted；預設 policy 會自動放行）。
+  3. CLI ownership 決策輸入：claude 2.1.223 為 native binary、codex 0.146.1 需系統 node
+     （app 已做 PATH 解析注入）；bundle 873M 主要是 CLI node_modules，M1 打包需瘦身策略。
+  4. 事件雜訊治理：訂閱模式載入使用者環境產生大量 system 事件，M1 時間軸需分層/摺疊。
+  5. `permissionMode` 覆寫（defaultMode=default）與 ask 規則的組合已驗證，可作 M1 權限
+     設定面的基礎。
