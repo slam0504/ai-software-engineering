@@ -1,8 +1,10 @@
 # M0 Spike 結果（2026-08-07 定稿）
 
-> 狀態：**驗收完成**——Claude 線 A1–A12、Codex 線 B1–B6、N1、R1、隔離封裝 smoke 全 PASS；
-> 選擇性未執行項：A0/B0 完整登出→登入循環（兩帳號現處登入態，auth 讀取與官方命令已驗）、
-> A11 bare/API-key 對照（選測，需成本授權）。本報告依實際執行證據撰寫，未執行項如實標註。
+> 狀態：**驗收完成（已執行項全 PASS，A0／B0 經 owner 核可豁免）**——Claude 線 A1–A12、
+> Codex 線 B1–B6、N1、R1、隔離封裝 smoke 全 PASS。**A0／B0（app 內完整登出→登入循環）為
+> 計畫內驗收項、本輪未執行**：owner（使用者）於 2026-08-07 審核時明確接受此殘餘風險並核可
+> 豁免，不影響本次 technical go/no-go；兩帳號現處登入態，auth 狀態讀取與官方 login 命令
+> 已實測。A11 bare/API-key 對照為計畫明定選測（需成本授權），未執行。
 > 建議：**方案 A 定案 GO；Codex 線 GO**（依據見「建議」節）。
 
 ## 版本基線
@@ -15,18 +17,18 @@
 | go | go1.26.5 darwin/amd64 |
 | node（系統前置需求） | v26.6.0 |
 | Codex schema | `schemas/codex/`（`generate-json-schema` 產物 275 檔 + SHA256SUMS，與 0.146.1 綁定） |
-| claude init capabilities | PENDING（A1 錄流後抄入） |
+| claude init capabilities | `interrupt_receipt_v1`、`interrupt_cancel_queued_v1`、`msg_lifecycle_v1`（A1 錄流 init 行；model claude-opus-5） |
 
 ## 驗收矩陣
 
 | 項 | 結果 | 證據 | 備註 |
 |---|---|---|---|
-| 單元測試（contract／claude／codex／proc／approval／recorder） | PASS | `go test -race ./...` 全綠（6 package、60+ 測試） | 含 supervisor 孫程序收割、大輸出反壓、真 ctx 取消、MCP E2E、RawParams 全鏈、session-scoped 錄流、Single／WithExclusive 併發、probe 四階段失敗注入 |
-| 協定 contract replay（claude fixtures） | PASS | `TestContractReplay`（fixtures 非空 gate 生效） | 目前僅 sample fixture；A1 真實錄流去敏後增補 |
-| 協定 contract replay（codex fixtures） | PASS | `TestReplay`（direction envelope、c2s 方法集、s2c 映射） | 同上，B3 錄流後增補 |
-| 建置 gate（vet／test -race／frontend build／wails build） | PASS | 四項實際執行全過（2026-08-06） | |
+| 單元測試（contract／claude／codex／proc／approval／recorder／app 層） | PASS | `go test -race ./... -count=1` 全過（**7 packages**、70+ 測試，最終重跑 2026-08-07） | 含 supervisor 孫程序收割、大輸出反壓、真 ctx 取消、MCP E2E、RawParams 全鏈、session-scoped 錄流、Single／WithExclusive 併發、probe 四階段失敗注入；穩定性觀察見「測試穩定性」節 |
+| 協定 contract replay（claude fixtures） | PASS | `TestContractReplay`（fixtures 非空 gate 生效） | fixtures 已含真實錄流去敏節錄（`claude-stream-shape.ndjson`、`claude-permission-request.sample.json`，committed）+ 8 份真實錄流本機 replay |
+| 協定 contract replay（codex fixtures） | PASS | `TestReplay`（direction envelope、c2s 方法集、s2c 映射） | fixtures 已含真實錄流去敏節錄（`codex-turn-shape.jsonl`，committed）+ 6 份真實錄流本機 replay |
+| 建置 gate（vet／test -race／frontend build／wails build） | PASS | 四項實際執行全過（最終重跑 2026-08-07，見「建置與封裝 gate 輸出」） | |
 | CLI 進 bundle | DONE | `scripts/bundle-clis.sh` → Resources/tools 873M | 體積大：CLI node_modules 全量；M1 打包決策議題 |
-| A0 app 內官方登入 | PENDING（選擇性） | — | 使用者已登入（Max）；完整登出→登入循環未演練。官方命令已確認：`claude auth login/logout/status`（fixture claude-auth-help.txt） |
+| A0 app 內官方登入 | **未執行（owner 核可豁免，2026-08-07）** | — | 計畫內驗收項；owner 接受殘餘風險，不影響 technical go/no-go。使用者已登入（Max）；官方命令已確認：`claude auth login/logout/status`（fixture claude-auth-help.txt） |
 | A1 串流 | **PASS**（2026-08-06） | `claude-basic.ndjson`（37KB）+ meta；text/thinking 逐 token 顯示 | 訂閱 login 模式；使用者環境（hooks/plugins）載入產生大量 system 事件 |
 | A2 allow + contract probe | **PASS**（2026-08-06） | `probe/a2.txt` 存在；audit REQ Bash + DEC allow（updatedInput echo）；RawParams schema：`{name, arguments:{tool_name, input, tool_use_id}}` | fixture `claude-permission-request.sample.json` |
 | A3 deny | **PASS**（2026-08-07） | `a3.txt` 不存在；audit DEC deny + 理由「A3 deny 測試」；turn 正常收尾 | |
@@ -39,7 +41,7 @@
 | A10 Terminate | **PASS**（2026-08-07） | sleep 60 執行中 Terminate → 5s 內收尾、**exit 143**（與文件值一致）、孫程序整組收掉 | |
 | A11 訂閱模式主測 | **PASS（主路徑）** | A1–A10 全在訂閱 login 模式實測；使用者環境載入行為（hooks、plan-mode 預設、allow 規則）錄流在案 | bare + API-key 對照為選測，未執行（需成本授權） |
 | A12 版本與 capabilities | **PASS** | capabilities：`interrupt_receipt_v1`、`interrupt_cancel_queued_v1`、`msg_lifecycle_v1`；model claude-opus-5；cli 2.1.223 | 自 claude-basic init 行 |
-| B0 app 內官方登入 | PENDING（選擇性） | 帳號已登入（chatgpt plus）；`account/read` 實測正常 | 完整登出→登入循環未演練（同 A0） |
+| B0 app 內官方登入 | **未執行（owner 核可豁免，2026-08-07）** | 帳號已登入（chatgpt plus）；`account/read` 實測正常 | 計畫內驗收項；owner 接受殘餘風險，不影響 technical go/no-go（同 A0） |
 | B1 handshake probe | **PASS**（2026-08-07） | `codex-handshake.jsonl`＝完整雙向 initialize→result→initialized、無後續流量；meta `process_still_running: true`、無 exit_code | `RestartCodexServerRecorded` 經 UI 按鈕執行 |
 | B2 登入狀態查詢 | **PASS**（2026-08-06/07） | `AuthStatus("codex")` 回報 chatgpt 帳號、planType | |
 | B3 turn 串流 | **PASS**（2026-08-07） | `codex-turn.jsonl`：61 delta、item started/completed、turn/completed；mapping 全走 Task 8 定案表；UI 同一 Transcript 呈現 | 4 個子集外通知升級為 KindSystemOther |
@@ -59,9 +61,38 @@
 - **使用者環境載入（A11 觀察）**：訂閱模式載入 hooks/plugins/skills（大量 system 事件、SessionEnd hook 失敗訊息入 stderr）、使用者 allow 規則生效（`sleep` 不彈窗）、plan-mode 預設需以 `--settings defaultMode` 覆寫（已實作）。
 - **Codex approval policy（B4 實測）**：預設 `thread/start`（未帶 approvalPolicy）下 `touch` 直接自動執行、不發 requestApproval——M0 改為一律送 `approvalPolicy:"untrusted"`；`AskForApproval` enum＝`untrusted | on-request | never`（+granular）。approval request 的 `availableDecisions` 列 `[accept, acceptWithExecpolicyAmendment, cancel]`（無 decline），但回 `decline` server 正常接受並發 `serverRequest/resolved`。request id 實測為整數（string-ID 支援已具備、未在 live 流量出現）。
 - **Codex 子集外通知（B3/B6 實測升級）**：`thread/status/changed`、`thread/tokenUsage/updated`、`account/rateLimits/updated`、`mcpServer/startupStatus/updated`、`thread/goal/cleared` 納入 KindSystemOther；皆在 pinned schema ServerNotification 列表內。
-- **Codex 線錄流 sha256（repo `.workbench/recordings/`，不 commit）**：handshake `94114f53…`、turn `bcfc1c89…`、b4 `11ceb77c…`、b4d `305570ef…`、b6 `9826b78a…`、r1 `147bd89f…`
-- **Claude 線錄流 sha256（原檔留 `~/.workbench/recordings/`，不 commit）**：
-  - claude-basic `f5b7f19e…51b04`、claude-a2 `117e0ea5…41840`、claude-a3 `0521ac7c…50d216`、claude-a4 `6458e208…9be8a`、claude-a5 `c3b77597…b9a2b1`、claude-a6 `f69ab450…8e75a0`、claude-a8 `82c3de4c…0edbd8`、claude-a10 `0101f5aa…0012ca`
+- **Codex 線錄流 SHA-256 完整清單（原檔：repo `.workbench/recordings/`，不 commit）**：
+
+  ```
+  94114f5368dc5bc4efd03e01d3cbebeaeac55b366372f0741d7972f9c0e8e7a9  codex-handshake.jsonl
+  bcfc1c89d3c420c6f9b34d3280fb08fdecf9a9febfdb988f534aeded08001cbb  codex-turn.jsonl
+  11ceb77cb48b8e135c416b1395bc417daef40fec50c87f5846554b7977bd31b4  codex-b4.jsonl
+  305570efe314859d44168af6a4ce74c0a4f43bdd6bfcd8199b87f55f559a0126  codex-b4d.jsonl
+  9826b78ab68915a511b2a5384bd20cdc60cff30b819212cf05a7c398c3cb3486  codex-b6.jsonl
+  147bd89f573160684707b8801ab08f9e1d97fd3b0baebf2c14134c88d7ffee41  codex-r1.jsonl
+  ```
+
+- **Claude 線錄流 SHA-256 完整清單（原檔：`~/.workbench/recordings/`，不 commit）**：
+
+  ```
+  f5b7f19e4c367e4d8facd761c24c038ad71d12e6a422dcab1577e13eb6f51b04  claude-basic.ndjson
+  117e0ea5a64d454d84035bcb8833f075c9aa818bc2325b1b3da63096f9a41840  claude-a2.ndjson
+  0521ac7c5aef0a0aa2234a1cc36f9784ebefe37f3845938ae64a9b4c5950d216  claude-a3.ndjson
+  6458e2083cb7af94258a33c24a7cdcb9a4abeebf5bb6c7e50719067858e9be8a  claude-a4.ndjson
+  c3b77597d12fde5241300f305be533eac87ce29387efb9c57f01a34115b9a2b1  claude-a5.ndjson
+  f69ab450a69fa07e3447f38644b2ffbd3adb7b4eb42911ccd635522c068e75a0  claude-a6.ndjson
+  82c3de4c4b8a388a2e2093a1fca72bd820c598258f66cf7b11b3b212440edbd8  claude-a8.ndjson
+  0101f5aa2020753272263bed337970844050e242755706ca4b844544700012ca  claude-a10.ndjson
+  ```
+
+- **稽核檔（定稿當日快照 digest；原檔不 commit、含 RawParams 原文）**：
+
+  ```
+  7b5d3cde04c0ad88c5ef50b0b7ac1873fce820cc1d16ffbce179e7906367dc4f  ~/.workbench/audit.jsonl（Claude 線 A2–A10 + 隔離 smoke）
+  ad45f87432d414c3a78be99656dd4bc300077d0b292f127a48a7654f959042a6  <repo>/.workbench/audit.jsonl（Codex 線 B4 核可）
+  ```
+
+- **隔離封裝 smoke 證據落點**：CLIInfo tooltip 截圖由 owner 於審核對話中提供、未歸檔為 repo 檔案；可追溯證據＝`~/.workbench/audit.jsonl` 的 startup 行（`tools_dir=/tmp/m0smoke.I0yE/...`）與 `~/.workbench/probe/smoke.txt`（timestamp 2026-08-07 12:22）。
 - **Codex schema 覆核**：pinned 0.146.1 的 item union 為 **18 型**（官方文件頁面載 14 型；新增 `hookPrompt`／`subAgentActivity`／`sleep`／`imageGeneration`，`collabToolCall` 實名 `collabAgentToolCall`）——證實計畫「子集原則」；未支援型別落 KindUnknown。方法集與計畫定名全部吻合（`thread/start`、`turn/start` input=item 陣列、`result.thread.id`、`item/commandExecution/requestApproval`、`account/login/start` 等）。
 - **Claude 官方 auth 命令（pinned 2.1.223 實測）**：`claude auth login`（互動式，`--claudeai` 為預設）／`auth logout`／`auth status`（JSON 輸出，含 loggedIn 欄位）——fixture `testdata/fixtures/claude-auth-help.txt`。app 的 fallback 輪詢即以 `auth status` JSON 實作。
 
@@ -97,15 +128,24 @@
 - 兩 provider 均僅喚起官方 login flow（Codex：app-server `account/login/start {"type":"chatgpt"}`；Claude：系統終端機執行 `claude auth login` + 狀態輪詢）；**app 程式碼不接收密碼、不讀寫 token**（credential 由官方 CLI 自有機制保管）。
 - Claude 訂閱路徑：**目標自用型態的技術驗證進行中**；Anthropic 規範對個人 wrapper 的適用性未獲官方確認，列為已知風險（不以「合規 ✔」表述）；發布 gating 為條件款（無發布計畫）。
 
-## 建置與封裝 gate 輸出（2026-08-06）
+## 建置與封裝 gate 輸出（最終重跑 2026-08-07）
 
 ```
-go vet ./...          → OK
-go test -race ./...   → 6 packages all ok
-npm run build         → ✓ built in 8.99s（chunk size warning：mermaid，M1 處理）
-wails build           → Built build/bin/sdlc-workbench.app
-scripts/bundle-clis.sh → bundled: 873M
+go vet ./...                    → OK
+go test -race ./... -count=1    → 7 packages all ok（含 app 層測試）
+npm run build（frontend）        → ✓ built（chunk size warning：mermaid，M1 處理）
+wails build                     → Built build/bin/sdlc-workbench.app
+scripts/bundle-clis.sh          → bundled: 873M
+codesign --verify --deep --strict → PASS（審核者重跑確認）
 ```
+
+## 測試穩定性觀察（審核要求記載）
+
+- `TestTerminateKillsProcessGroup`（internal/claude）曾在**與 frontend build 並行執行**的一次
+  `go test -race` 中以「kill escalation too slow」失敗（測試斷言 5 秒內收尾，系統高負載下
+  escalation 逾時）；單獨重跑立即通過，其後獨立完整重跑 `go test -race ./... -count=1` 亦
+  7 packages 全過。判定為**負載敏感的時間斷言**，非產品缺陷；不改描述為「每次全綠」。
+  處置：M1／CI 導入時持續監控此測試，必要時放寬時間門檻或隔離為 serial 測試。
 
 ## 失敗歸因與轉向評估
 
