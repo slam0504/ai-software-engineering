@@ -51,8 +51,7 @@ watch(provider, (p) => { // 切 provider：resume 換成該 provider 自己的�
 async function start() {
   statusMsg.value = ''
   try {
-    await StartSession(provider.value, prompt.value,
-      provider.value === 'claude' ? resume.value : '', recordCase.value)
+    await StartSession(provider.value, prompt.value, resume.value, recordCase.value)
     statusMsg.value = 'session started'
   } catch (e: any) {
     statusMsg.value = `start failed: ${e}`

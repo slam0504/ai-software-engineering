@@ -72,7 +72,10 @@ func MapEvent(method string, params json.RawMessage) contract.Event {
 			ev.IsError = p.Turn.Status == "failed"
 		}
 	case MethodTurnDiffUpdated, MethodTurnStarted, MethodThreadStarted,
-		MethodServerRequestResolved, MethodAccountLoginCompleted, MethodAccountUpdated:
+		MethodServerRequestResolved, MethodAccountLoginCompleted, MethodAccountUpdated,
+		MethodThreadStatusChanged, MethodThreadTokenUsageUpdated,
+		MethodAccountRateLimitsUpdated, MethodMCPServerStartupStatus,
+		MethodThreadGoalCleared:
 		ev.Kind = contract.KindSystemOther
 	default:
 		ev.Kind = contract.KindUnknown

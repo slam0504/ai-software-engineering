@@ -31,6 +31,8 @@ func TestMapEventBranchesOnItemType(t *testing.T) { // v1.5：item 事件依 par
 		{"delta", MethodAgentMessageDelta, `{"threadId":"t1","itemId":"i5","delta":"chunk"}`, contract.KindDelta, "chunk", ""},
 		{"turn_completed_ok", MethodTurnCompleted, `{"threadId":"t1","turn":{"id":"turn1","status":"completed"}}`, contract.KindResult, "", ""},
 		{"turn_diff", MethodTurnDiffUpdated, `{"threadId":"t1","diff":"..."}`, contract.KindSystemOther, "", ""},
+		{"token_usage", MethodThreadTokenUsageUpdated, `{"threadId":"t1","tokenUsage":{}}`, contract.KindSystemOther, "", ""},
+		{"rate_limits", MethodAccountRateLimitsUpdated, `{"threadId":"t1"}`, contract.KindSystemOther, "", ""},
 		{"unknown_method", "future/method", `{"threadId":"t1"}`, contract.KindUnknown, "", ""},
 	}
 	for _, c := range cases {

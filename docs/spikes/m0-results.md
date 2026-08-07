@@ -36,9 +36,15 @@
 | A10 Terminate | **PASS**（2026-08-07） | sleep 60 執行中 Terminate → 5s 內收尾、**exit 143**（與文件值一致）、孫程序整組收掉 | |
 | A11 訂閱模式主測 | **PASS（主路徑）** | A1–A10 全在訂閱 login 模式實測；使用者環境載入行為（hooks、plan-mode 預設、allow 規則）錄流在案 | bare + API-key 對照為選測，未執行（需成本授權） |
 | A12 版本與 capabilities | **PASS** | capabilities：`interrupt_receipt_v1`、`interrupt_cancel_queued_v1`、`msg_lifecycle_v1`；model claude-opus-5；cli 2.1.223 | 自 claude-basic init 行 |
-| B0–B6（Codex 線） | PENDING | — | 需使用者：Sign in with ChatGPT、真 app-server 回合 |
-| N1（同一 UI 雙 provider） | PENDING（程式面已就位） | UI 無 provider 特判、事件全走 contract.Event；fixtures 掃描在 replay 測試內 | live 驗證待 A1+B3 |
-| R1（Recorder 失敗可見性） | PENDING | 機制已有單元測試（錯誤 latch／CloseWith 傳播／session:done recorderError） | chmod 500 實測待 UI smoke |
+| B0 app 內官方登入 | PENDING（選擇性） | 帳號已登入（chatgpt plus）；`account/read` 實測正常 | 完整登出→登入循環未演練（同 A0） |
+| B1 handshake probe | **PASS**（2026-08-07） | `codex-handshake.jsonl`＝完整雙向 initialize→result→initialized、無後續流量；meta `process_still_running: true`、無 exit_code | `RestartCodexServerRecorded` 經 UI 按鈕執行 |
+| B2 登入狀態查詢 | **PASS**（2026-08-06/07） | `AuthStatus("codex")` 回報 chatgpt 帳號、planType | |
+| B3 turn 串流 | **PASS**（2026-08-07） | `codex-turn.jsonl`：61 delta、item started/completed、turn/completed；mapping 全走 Task 8 定案表；UI 同一 Transcript 呈現 | 4 個子集外通知升級為 KindSystemOther |
+| B4 核可往返 | **PASS**（2026-08-07） | Allow：requestApproval→`{"decision":"accept"}`→`serverRequest/resolved`→b4.txt 存在；Deny：`decline`→resolved→檔案不存在、turn 正常收尾 | 需 `thread/start` 帶 `approvalPolicy:"untrusted"`（預設 policy 自動放行、不觸發 requestApproval——實測發現）；request id 實測為 int；`availableDecisions` 未列 decline 但 server 接受 decline |
+| B5 replay | **PASS**（2026-08-07） | 6 份 codex 錄流 + fixtures 全過（c2s 方法集、s2c 映射、direction envelope） | |
+| B6 session 持續性 | **PASS**（2026-08-07） | `thread/resume {threadId}` 成功、回答精準引用前回合（b4-deny 被拒）脈絡 | UI resume 傳遞 bug（codex resume 被吞）發現並修復 |
+| N1（同一 UI 雙 provider） | **PASS**（2026-08-06/07） | 同一 build 先後跑 claude 與 codex session（8/6 晚間同 app 實例）；Transcript／ApprovalDialog／session:done 全走 contract 事件、無 provider 特判；雙 fixtures glob 非空且全 Valid（replay 測試） | |
+| R1（Recorder 失敗可見性） | **PASS**（2026-08-07） | `chmod 500 recordings` → session:done 顯示 `recorder: permission denied`（UI 可見）；恢復權限重跑正常 | |
 | 封裝後隔離 smoke | PENDING | bundle 已產出 | 需 GUI 互動 |
 
 ## 協定觀察（至今）
@@ -48,6 +54,9 @@
 - **MCP 失敗呈現（A6 實測）**：2.1.223 在 init 以 `mcp_servers[].status:"failed"` 呈現，`mcp_server_errors` 欄位未出現；permission tool 缺失時 CLI 直接 exit 1 + stderr 明確錯誤（fail loud 成立）。
 - **SIGTERM exit code（A10 實測）**：143，與文件值一致。
 - **使用者環境載入（A11 觀察）**：訂閱模式載入 hooks/plugins/skills（大量 system 事件、SessionEnd hook 失敗訊息入 stderr）、使用者 allow 規則生效（`sleep` 不彈窗）、plan-mode 預設需以 `--settings defaultMode` 覆寫（已實作）。
+- **Codex approval policy（B4 實測）**：預設 `thread/start`（未帶 approvalPolicy）下 `touch` 直接自動執行、不發 requestApproval——M0 改為一律送 `approvalPolicy:"untrusted"`；`AskForApproval` enum＝`untrusted | on-request | never`（+granular）。approval request 的 `availableDecisions` 列 `[accept, acceptWithExecpolicyAmendment, cancel]`（無 decline），但回 `decline` server 正常接受並發 `serverRequest/resolved`。request id 實測為整數（string-ID 支援已具備、未在 live 流量出現）。
+- **Codex 子集外通知（B3/B6 實測升級）**：`thread/status/changed`、`thread/tokenUsage/updated`、`account/rateLimits/updated`、`mcpServer/startupStatus/updated`、`thread/goal/cleared` 納入 KindSystemOther；皆在 pinned schema ServerNotification 列表內。
+- **Codex 線錄流 sha256（repo `.workbench/recordings/`，不 commit）**：handshake `94114f53…`、turn `bcfc1c89…`、b4 `11ceb77c…`、b4d `305570ef…`、b6 `9826b78a…`、r1 `147bd89f…`
 - **Claude 線錄流 sha256（原檔留 `~/.workbench/recordings/`，不 commit）**：
   - claude-basic `f5b7f19e…51b04`、claude-a2 `117e0ea5…41840`、claude-a3 `0521ac7c…50d216`、claude-a4 `6458e208…9be8a`、claude-a5 `c3b77597…b9a2b1`、claude-a6 `f69ab450…8e75a0`、claude-a8 `82c3de4c…0edbd8`、claude-a10 `0101f5aa…0012ca`
 - **Codex schema 覆核**：pinned 0.146.1 的 item union 為 **18 型**（官方文件頁面載 14 型；新增 `hookPrompt`／`subAgentActivity`／`sleep`／`imageGeneration`，`collabToolCall` 實名 `collabAgentToolCall`）——證實計畫「子集原則」；未支援型別落 KindUnknown。方法集與計畫定名全部吻合（`thread/start`、`turn/start` input=item 陣列、`result.thread.id`、`item/commandExecution/requestApproval`、`account/login/start` 等）。

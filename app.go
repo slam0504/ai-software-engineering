@@ -631,10 +631,14 @@ func (a *App) startCodex(prompt, resume, recordCase string) error {
 	a.mu.Unlock()
 
 	go func() {
-		// B6：resume 走 thread/resume（schema 必填 threadId），否則 thread/start
-		method, params := codex.MethodThreadStart, map[string]any{}
+		// B6：resume 走 thread/resume（schema 必填 threadId），否則 thread/start。
+		// approvalPolicy=untrusted（M0 驗證定位）：commandExecution 一律走
+		// requestApproval → app 的 ApprovalDialog（B4；預設 policy 會自動放行）。
+		method := codex.MethodThreadStart
+		params := map[string]any{"approvalPolicy": "untrusted"}
 		if resume != "" {
-			method, params = codex.MethodThreadResume, map[string]any{"threadId": resume}
+			method = codex.MethodThreadResume
+			params["threadId"] = resume
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 		res, err := conn.Call(ctx, method, params)

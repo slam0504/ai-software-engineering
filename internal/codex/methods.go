@@ -33,6 +33,12 @@ const (
 	MethodServerRequestResolved = "serverRequest/resolved"
 	MethodAccountLoginCompleted = "account/login/completed"
 	MethodAccountUpdated        = "account/updated"
+	// B3 實測錄流出現的狀態通知（皆在 pinned schema ServerNotification 列表內）
+	MethodThreadStatusChanged      = "thread/status/changed"
+	MethodThreadTokenUsageUpdated  = "thread/tokenUsage/updated"
+	MethodAccountRateLimitsUpdated = "account/rateLimits/updated"
+	MethodMCPServerStartupStatus   = "mcpServer/startupStatus/updated"
+	MethodThreadGoalCleared        = "thread/goal/cleared"
 )
 
 // ClientMethods 是 M0 會送出的 c2s 方法集（replay 的 c2s 驗證依據）。
@@ -53,14 +59,19 @@ var ClientMethods = map[string]bool{
 
 // ServerNotifications 是 M0 已認得的 s2c 通知子集；不在集合的通知走 OnUnknown。
 var ServerNotifications = map[string]bool{
-	MethodThreadStarted:         true,
-	MethodTurnStarted:           true,
-	MethodTurnCompleted:         true,
-	MethodTurnDiffUpdated:       true,
-	MethodItemStarted:           true,
-	MethodItemCompleted:         true,
-	MethodAgentMessageDelta:     true,
-	MethodServerRequestResolved: true,
-	MethodAccountLoginCompleted: true,
-	MethodAccountUpdated:        true,
+	MethodThreadStarted:            true,
+	MethodTurnStarted:              true,
+	MethodTurnCompleted:            true,
+	MethodTurnDiffUpdated:          true,
+	MethodItemStarted:              true,
+	MethodItemCompleted:            true,
+	MethodAgentMessageDelta:        true,
+	MethodServerRequestResolved:    true,
+	MethodAccountLoginCompleted:    true,
+	MethodAccountUpdated:           true,
+	MethodThreadStatusChanged:      true,
+	MethodThreadTokenUsageUpdated:  true,
+	MethodAccountRateLimitsUpdated: true,
+	MethodMCPServerStartupStatus:   true,
+	MethodThreadGoalCleared:        true,
 }
