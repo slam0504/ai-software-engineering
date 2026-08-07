@@ -23,7 +23,19 @@
 | 協定 contract replay（codex fixtures） | PASS | `TestReplay`（direction envelope、c2s 方法集、s2c 映射） | 同上，B3 錄流後增補 |
 | 建置 gate（vet／test -race／frontend build／wails build） | PASS | 四項實際執行全過（2026-08-06） | |
 | CLI 進 bundle | DONE | `scripts/bundle-clis.sh` → Resources/tools 873M | 體積大：CLI node_modules 全量；M1 打包決策議題 |
-| A0–A12（Claude 線） | PENDING | — | 需使用者：app 內登入、真 CLI turn、UI 核可操作 |
+| A0 app 內官方登入 | PENDING（選擇性） | — | 使用者已登入（Max）；完整登出→登入循環未演練。官方命令已確認：`claude auth login/logout/status`（fixture claude-auth-help.txt） |
+| A1 串流 | **PASS**（2026-08-06） | `claude-basic.ndjson`（37KB）+ meta；text/thinking 逐 token 顯示 | 訂閱 login 模式；使用者環境（hooks/plugins）載入產生大量 system 事件 |
+| A2 allow + contract probe | **PASS**（2026-08-06） | `probe/a2.txt` 存在；audit REQ Bash + DEC allow（updatedInput echo）；RawParams schema：`{name, arguments:{tool_name, input, tool_use_id}}` | fixture `claude-permission-request.sample.json` |
+| A3 deny | **PASS**（2026-08-07） | `a3.txt` 不存在；audit DEC deny + 理由「A3 deny 測試」；turn 正常收尾 | |
+| A4 逾時 fail closed | **PASS**（2026-08-07） | `WORKBENCH_APPROVAL_TIMEOUT=5s`：audit TIMEOUT + DEC deny（fail closed）；`a4.txt` 不存在 | 逾時後 UI 彈窗殘留 → 已修（approval:dismiss） |
+| A5 broker 斷線 | **PASS**（2026-08-07） | `rm approval.sock` 後核可自動 deny（錄流含 4 處 fail closed 訊息）；`a5.txt` 不存在；不 hang | |
+| A6 MCP 載入失敗 | **PASS**（2026-08-07） | init `mcp_servers:[{workbench, status:"failed"}]`；CLI exit 1、stderr 明確報 permission tool not found | 2.1.223 以 status:"failed" 呈現；`mcp_server_errors` 欄位未出現 |
+| A7 decoder 韌性 | **PASS** | TestDecode + synthetic malformed 分類正確 | |
+| A8 resume 與 cwd | **PASS**（2026-08-07） | 同 cwd resume：session_id 相同、正確引用 a5 前文；`/private/tmp` 啟動 resume → `resume refused` | |
+| A9 replay | **PASS**（2026-08-07） | 8 份真實錄流 + fixtures 全過、零 malformed；`rate_limit_event` 升級 decoder 為 KindSystemOther | 錄流 sha256 見下 |
+| A10 Terminate | **PASS**（2026-08-07） | sleep 60 執行中 Terminate → 5s 內收尾、**exit 143**（與文件值一致）、孫程序整組收掉 | |
+| A11 訂閱模式主測 | **PASS（主路徑）** | A1–A10 全在訂閱 login 模式實測；使用者環境載入行為（hooks、plan-mode 預設、allow 規則）錄流在案 | bare + API-key 對照為選測，未執行（需成本授權） |
+| A12 版本與 capabilities | **PASS** | capabilities：`interrupt_receipt_v1`、`interrupt_cancel_queued_v1`、`msg_lifecycle_v1`；model claude-opus-5；cli 2.1.223 | 自 claude-basic init 行 |
 | B0–B6（Codex 線） | PENDING | — | 需使用者：Sign in with ChatGPT、真 app-server 回合 |
 | N1（同一 UI 雙 provider） | PENDING（程式面已就位） | UI 無 provider 特判、事件全走 contract.Event；fixtures 掃描在 replay 測試內 | live 驗證待 A1+B3 |
 | R1（Recorder 失敗可見性） | PENDING | 機制已有單元測試（錯誤 latch／CloseWith 傳播／session:done recorderError） | chmod 500 實測待 UI smoke |
@@ -31,7 +43,13 @@
 
 ## 協定觀察（至今）
 
-- **Claude permission request 真實 schema**：PENDING（A2 錄流），typed 化建議留待 audit 的 RawParams。
+- **Claude permission request 真實 schema（A2 實測）**：`arguments: {tool_name: string, input: object, tool_use_id: string}`——typed 化可據此定義；樣本 `testdata/fixtures/claude-permission-request.sample.json`。
+- **`rate_limit_event`**：訂閱模式每 session 出現一筆（rate limit 與 overage 狀態），2.1.223 實測新事件型別，decoder 已納入 KindSystemOther。
+- **MCP 失敗呈現（A6 實測）**：2.1.223 在 init 以 `mcp_servers[].status:"failed"` 呈現，`mcp_server_errors` 欄位未出現；permission tool 缺失時 CLI 直接 exit 1 + stderr 明確錯誤（fail loud 成立）。
+- **SIGTERM exit code（A10 實測）**：143，與文件值一致。
+- **使用者環境載入（A11 觀察）**：訂閱模式載入 hooks/plugins/skills（大量 system 事件、SessionEnd hook 失敗訊息入 stderr）、使用者 allow 規則生效（`sleep` 不彈窗）、plan-mode 預設需以 `--settings defaultMode` 覆寫（已實作）。
+- **Claude 線錄流 sha256（原檔留 `~/.workbench/recordings/`，不 commit）**：
+  - claude-basic `f5b7f19e…51b04`、claude-a2 `117e0ea5…41840`、claude-a3 `0521ac7c…50d216`、claude-a4 `6458e208…9be8a`、claude-a5 `c3b77597…b9a2b1`、claude-a6 `f69ab450…8e75a0`、claude-a8 `82c3de4c…0edbd8`、claude-a10 `0101f5aa…0012ca`
 - **Codex schema 覆核**：pinned 0.146.1 的 item union 為 **18 型**（官方文件頁面載 14 型；新增 `hookPrompt`／`subAgentActivity`／`sleep`／`imageGeneration`，`collabToolCall` 實名 `collabAgentToolCall`）——證實計畫「子集原則」；未支援型別落 KindUnknown。方法集與計畫定名全部吻合（`thread/start`、`turn/start` input=item 陣列、`result.thread.id`、`item/commandExecution/requestApproval`、`account/login/start` 等）。
 - **Claude 官方 auth 命令（pinned 2.1.223 實測）**：`claude auth login`（互動式，`--claudeai` 為預設）／`auth logout`／`auth status`（JSON 輸出，含 loggedIn 欄位）——fixture `testdata/fixtures/claude-auth-help.txt`。app 的 fallback 輪詢即以 `auth status` JSON 實作。
 

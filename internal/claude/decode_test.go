@@ -22,6 +22,7 @@ func TestDecode(t *testing.T) {
 		{"result_err", `{"type":"result","subtype":"error_during_execution","session_id":"abc-123","is_error":true}`, contract.KindResult},
 		{"api_retry", `{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":2000,"error_status":529,"error":"overloaded","uuid":"u1","session_id":"abc-123"}`, contract.KindRetry},
 		{"system_other", `{"type":"system","subtype":"plugin_install","status":"started"}`, contract.KindSystemOther},
+		{"rate_limit", `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"abc-123"}`, contract.KindSystemOther},
 		{"unknown", `{"type":"banana","x":1}`, contract.KindUnknown},
 		{"malformed", `{"type":"resul`, contract.KindMalformed},
 	}

@@ -80,6 +80,8 @@ func Decode(line []byte) contract.Event {
 		if json.Unmarshal(line, &body) == nil {
 			ev.Text, ev.Thinking = body.Event.Delta.Text, body.Event.Delta.Thinking
 		}
+	case "rate_limit_event": // 訂閱 rate limit 狀態（A9 實測錄流出現，每 session 一筆）
+		ev.Kind = contract.KindSystemOther
 	case "result":
 		ev.Kind = contract.KindResult
 		var body struct {
