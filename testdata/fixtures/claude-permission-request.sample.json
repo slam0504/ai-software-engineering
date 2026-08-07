@@ -1,0 +1,11 @@
+{
+  "name": "approval_prompt",
+  "arguments": {
+    "tool_name": "Bash",
+    "input": {
+      "command": "touch .workbench/probe/a2.txt && ls -la .workbench/probe/a2.txt",
+      "description": "Create a2.txt in .workbench/probe"
+    },
+    "tool_use_id": "toolu_SAMPLE"
+  }
+}
