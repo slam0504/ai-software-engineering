@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
@@ -52,6 +53,61 @@ func TestDecode(t *testing.T) {
 	init := ParseInit(Decode([]byte(cases[1].line)))
 	if init == nil || len(init.MCPServerErrors) != 1 || init.MCPServerErrors[0].Type != "invalid_config" {
 		t.Fatalf("init parse: %+v", init)
+	}
+}
+
+func TestDecodeResultUsage(t *testing.T) {
+	line := `{"type":"result","subtype":"success","session_id":"s","is_error":false,"total_cost_usd":0.1,"usage":{"input_tokens":4,"output_tokens":714,"cache_read_input_tokens":84414}}`
+	ev := Decode([]byte(line))
+	if ev.Usage == nil || ev.Usage.InputTokens != 4 || ev.Usage.OutputTokens != 714 || ev.Usage.CachedInput != 84414 {
+		t.Fatalf("usage = %+v", ev.Usage)
+	}
+}
+
+func TestDecodeRoles(t *testing.T) {
+	a := Decode([]byte(`{"type":"assistant","session_id":"s","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`))
+	if a.Role != "assistant" {
+		t.Fatalf("assistant role = %q", a.Role)
+	}
+	u := Decode([]byte(`{"type":"user","session_id":"s","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}`))
+	if u.Role != "tool" {
+		t.Fatalf("user-echo role = %q", u.Role)
+	}
+}
+
+func TestDecodeAssistantToolUseSummary(t *testing.T) {
+	line := `{"type":"assistant","session_id":"s","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"touch x"}}]}}`
+	ev := Decode([]byte(line))
+	if ev.Kind != contract.KindToolUse {
+		t.Fatalf("tool-only assistant must map KindToolUse, got %s", ev.Kind)
+	}
+	if !strings.Contains(ev.Text, "Bash") || !strings.Contains(ev.Text, "touch x") {
+		t.Fatalf("text must carry name+input excerpt: %q", ev.Text)
+	}
+	mixed := Decode([]byte(`{"type":"assistant","session_id":"s","message":{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{}}]}}`))
+	if mixed.Kind != contract.KindMessage || mixed.Text != "hi" { // 含 text 維持 M0 行為
+		t.Fatalf("mixed content must stay message: %s %q", mixed.Kind, mixed.Text)
+	}
+}
+
+func TestDecodeToolSummaryTruncationAndMulti(t *testing.T) { // 80-rune 截斷、+N
+	long := strings.Repeat("字", 100)
+	line := `{"type":"assistant","session_id":"s","message":{"role":"assistant","content":[` +
+		`{"type":"tool_use","name":"Write","input":{"path":"` + long + `"}},` +
+		`{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`
+	ev := Decode([]byte(line))
+	if ev.Kind != contract.KindToolUse {
+		t.Fatalf("kind = %s", ev.Kind)
+	}
+	if !strings.Contains(ev.Text, "Write(") || !strings.Contains(ev.Text, "…") {
+		t.Fatalf("long input must be truncated with ellipsis: %q", ev.Text)
+	}
+	if !strings.HasSuffix(ev.Text, " +1") {
+		t.Fatalf("multi-tool must append +N: %q", ev.Text)
+	}
+	inner := ev.Text[strings.Index(ev.Text, "(")+1 : strings.LastIndex(ev.Text, ")")]
+	if n := len([]rune(inner)); n > 81 { // 節錄總長上限 81 rune（80 內容 + 刪節號）
+		t.Fatalf("excerpt too long: %d runes (cap 81)", n)
 	}
 }
 
