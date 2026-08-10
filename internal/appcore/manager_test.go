@@ -175,6 +175,35 @@ func TestSubmitCoordinatorOrdering(t *testing.T) { // provider 事件先到也�
 	}
 }
 
+// 第一輪 review P1 迴歸：coordinator flush 的 user → waiting → init 序列中，
+// init 必須中性——不得追發 state_change(idle) 把 waiting 打回 idle。
+func TestInitDoesNotRegressState(t *testing.T) {
+	m, got, mu := newTestManager(&memSink{})
+	id, err := m.BeginNewSessionSubmit("task-init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindInit,
+		SessionID: "t1", Raw: []byte(`{"threadId":"t1"}`)}) // 入 queue
+	if err := m.AcceptSubmit(id, contract.ProviderCodex, "t1", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if m.State() != contract.StateWaiting { // flush 後仍 waiting
+		t.Fatalf("state after user→waiting→init = %s, want waiting", m.State())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var seq []string
+	for _, e := range *got {
+		if e.Kind == "state_change" {
+			seq = append(seq, e.State)
+		}
+	}
+	if len(seq) != 1 || seq[0] != string(contract.StateWaiting) { // 恰一個 state_change：waiting
+		t.Fatalf("state_change sequence = %v, want [waiting] only", seq)
+	}
+}
+
 func TestStartSessionOwnershipBarrier(t *testing.T) { // production path 的原子交易
 	m, _, _ := newTestManager(&memSink{})
 	var providerStarts atomic.Int32

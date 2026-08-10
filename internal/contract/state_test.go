@@ -23,6 +23,25 @@ func TestReducerHappyPath(t *testing.T) {
 	applyKind(t, r, KindResult, false, "", StateDone)
 }
 
+// 第一輪 review P1 迴歸：init 對 reducer 狀態必須中性——claude 每輪皆發 init、
+// coordinator flush 時 init 排在 user→waiting 之後，若 init 改狀態會把
+// waiting／done 打回 idle（違反 SC2「卡在哪」）。
+func TestReducerInitIsNeutral(t *testing.T) {
+	r := NewReducer()
+	applyKind(t, r, KindMessage, false, "user", StateWaiting)
+	if _, changed := r.Apply(Event{Provider: ProviderClaude, Kind: KindInit, Raw: []byte("{}")}); changed {
+		t.Fatal("init during waiting must not change state")
+	}
+	applyKind(t, r, KindDelta, false, "", StateStreaming)
+	applyKind(t, r, KindResult, false, "", StateDone)
+	if _, changed := r.Apply(Event{Provider: ProviderClaude, Kind: KindInit, Raw: []byte("{}")}); changed {
+		t.Fatal("repeated init after done must not change state")
+	}
+	if r.Current() != StateDone {
+		t.Fatalf("state = %s, want done", r.Current())
+	}
+}
+
 func TestReducerFailedResult(t *testing.T) {
 	r := NewReducer()
 	applyKind(t, r, KindDelta, false, "", StateStreaming)

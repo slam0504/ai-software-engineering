@@ -21,6 +21,9 @@ const (
 // 不得停留 done）；assistant message/delta → streaming；tool echo（Role=tool）
 // 與 malformed（M0 定義不中斷）、system_other、unknown、usage、approval_decision
 // 為中性；result 依 IsError 分流 done/failed；stream_error 為 terminal failed。
+// init 為**中性**（第一輪 review P1）：新 session 的 idle 由 Reset() 建立；
+// claude 每輪皆發 init、coordinator flush 時 init 排在 user→waiting 之後，
+// 若 init 改狀態會把 waiting 打回 idle（違反 SC2「卡在哪」）。
 type Reducer struct{ cur SessionState }
 
 func NewReducer() *Reducer               { return &Reducer{cur: StateIdle} }
@@ -30,8 +33,6 @@ func (r *Reducer) Reset()                { r.cur = StateIdle }
 func (r *Reducer) Apply(ev Event) (SessionState, bool) {
 	next := r.cur
 	switch ev.Kind {
-	case KindInit:
-		next = StateIdle
 	case KindMessage:
 		switch ev.Role {
 		case "user":

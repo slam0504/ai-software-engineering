@@ -26,11 +26,11 @@ describe('session store', () => {
 
   it('accumulates deltas then finalizes on assistant message', () => {
     const s = useSession()
-    s.apply(env({ kind: 'delta', text: 'a' }))
-    s.apply(env({ kind: 'delta', text: 'b', thinking: 'th' }))
-    expect(s.chat.at(-1)).toMatchObject({ role: 'assistant', text: 'ab', streaming: true })
+    s.apply(env({ kind: 'delta', text: 'a', thinking: 'th1-' }))
+    s.apply(env({ kind: 'delta', text: 'b', thinking: 'th2' }))
+    expect(s.chat.at(-1)).toMatchObject({ role: 'assistant', text: 'ab', thinking: 'th1-th2', streaming: true })
     s.apply(env({ kind: 'message', role: 'assistant', text: 'ab!' }))
-    expect(s.chat.at(-1)).toMatchObject({ text: 'ab!', streaming: false })
+    expect(s.chat.at(-1)).toMatchObject({ text: 'ab!', thinking: 'th1-th2', streaming: false })
   })
 
   it('overwrites usage snapshot instead of adding', () => {

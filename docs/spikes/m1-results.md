@@ -26,7 +26,7 @@
 | `go vet ./...` | PASS | 無輸出 |
 | `go test -race ./... -count=1` | PASS | appcore/approval/claude/codex/contract/proc/recorder/main 全 ok |
 | V0.9 replay 迴歸 | PASS | `TestContractReplay`（claude）、`TestReplay`（codex）各 ok |
-| `npm --prefix frontend run test` | PASS | 20/20（store 13 + scroll 3 + sanitizer 4） |
+| `npm --prefix frontend run test` | PASS | 23/23（store 14 + scroll 3 + sanitizer 4 + ChatPanel thinking 2；歷次修正後最終數） |
 | `npm --prefix frontend run build` | PASS | vue-tsc + vite build 成功 |
 | `wails build` | PASS | `build/bin/sdlc-workbench.app` 產出 |
 | `scripts/bundle-clis.sh` | PASS | bundled: 873M |
@@ -55,7 +55,7 @@
 | V0.9 replay 迴歸 | PASS | `TestContractReplay` + `TestReplay` ok |
 | V1 多輪 | PASS | claude 3 輪（42→52→152，第 2、3 輪引用前文、session `8e2fbcfe…` 恆定、自然 End exit 0）；codex 3 輪（42→21→63、同 thread `019fea62…`、server 不重啟）；`codex-m1-chat.jsonl` 單檔 3× turn/start + 3× turn/completed、meta 恰一份（ProcessStillRunning、ExitCode nil） |
 | V2 SC2 四問 | PASS | 三輪當下 StatusBar 文字記錄：claude `任務：m1-v1-claude／完成／session 8e2fbcfe…／tokens 6/9（無 *）／$1.3014`；codex `任務：m1-v2-codex／等待核可（approval 時刻）／session 019fea62…／tokens 66470/101*（tooltip「provider 最新回報值」）／—`。存檔截圖 `docs/spikes/evidence/v2-{claude,codex}-statusbar.png`（驗收後補截的單輪 session，同欄位形狀；原三輪截圖誤刪，見偏差 6） |
-| V3 normative UI | PASS | streaming 逐 token＋游標；follow-tail：長回覆中 scrollTop 置 0 後內容持續增加不跳底；tool 卡片：claude approval 彈窗含 `Bash` + command input、codex `tool_use /bin/zsh -lc 'echo hi'（inProgress→completed）` per-type＋status；Timeline toggle 收合（181px→0）。thinking 摺疊：本輪 live 未出現 thinking 內容（claude -p 無 extended thinking），UI `<details>` 由元件實作、store 測試覆蓋——如實記錄未 live 觸發 |
+| V3 normative UI | PASS | streaming 逐 token＋游標；follow-tail：長回覆中 scrollTop 置 0 後內容持續增加不跳底；tool 卡片：claude approval 彈窗含 `Bash` + command input、codex `tool_use /bin/zsh -lc 'echo hi'（inProgress→completed）` per-type＋status；Timeline toggle 收合（181px→0）。thinking 摺疊：live 未出現 thinking 內容（claude -p 無 extended thinking），改以 ChatPanel component test 驗收（`ChatPanel.test.ts`：thinking 累積渲染於**預設收合**的 `<details>`、無 thinking 時不渲染；store 測試斷言 thinking 逐 delta 累積） |
 | V4 檔案樹＋預覽 | PASS | 懶載入樹瀏覽 repo；`v4-preview-test.md`：h1/strong 渲染、mermaid 區塊→SVG、`<script>` 被 DOMPurify 消毒；`sample.mmd` 編輯存檔 1 秒內重渲染（"Rerendered" 顯示）；symlink 指 /etc → `path escapes workspace` 錯誤 |
 | V5 approvalPolicy | PASS | untrusted：touch 彈核可（V0.7）；never：同 prompt 不彈、直接執行（`v5-never.txt` 建立、該 session approval envelope 0 筆）。**風險如實記錄：never 下寫入指令無人審即執行** |
 | V6 稽核 JSONL | PASS | `events.jsonl` 621 envelopes；event_id 嚴格單調；15 個 `role=user` message **全部**緊跟 `state_change(waiting)`（coordinator user-first live 證據）；抽 3 筆對照 UI（user text＝氣泡、approval raw＝彈窗內容、result cost 0.412835＝StatusBar $0.4128）；kinds 涵蓋 approval/approval_decision/usage/tool_use；無 stream_error（AuditErr nil） |
@@ -86,6 +86,22 @@
 
 三個 barrier 測試以 `-race -count=30` 重複通過；全套 gate（vet／race suite／vitest 20/20／frontend build／`wails build`）重跑 PASS。
 
+## 報告審查修正（merge 前審查，CHANGES_REQUIRED → 已修）
+
+2026-08-10 報告審查 2 P1 + 1 P2（多項），全數修正：
+
+1. **P1：init 把 waiting／done 重設成 idle（違反 SC2）**——reducer 對 `KindInit` 無條件切 idle；封裝 codex 錄流（user→waiting→init→idle）與 claude 多輪錄流均重現，等待回覆期間 StatusBar 錯顯 idle。修正：`KindInit` 改為**狀態中性**（新 session 的 idle 本由 `Reset()` 建立）。新測試：`TestReducerInitIsNeutral`（waiting→init 仍 waiting、done→重複 init 仍 done）、`TestInitDoesNotRegressState`（coordinator flush user→waiting→init 恰一個 state_change=waiting、不追發 idle）。修後 live 抽驗事件序列見下。
+2. **P1：V3 thinking 摺疊未驗收**——live 未觸發 thinking，原報告仍計入「全數完成」過強。補 `ChatPanel.test.ts` component 測試（thinking 累積渲染於預設收合 `<details>`、無 thinking 不渲染）＋ store thinking 累積斷言；V3 證據列同步改寫。
+3. **P2：報告 stale／契約差異**——vitest 計數更正（23/23）；殘餘風險「封裝 smoke 未執行」標記 stale；V0.6 失敗面向差異列為偏差 9。
+
+### 修後 live 事件序列抽驗
+
+2026-08-10 dev 模式抽驗（events.jsonl 逐 envelope 驗證）：
+
+- claude 兩輪（`m1-fix-verify-claude`，48 envelopes）：兩輪皆為 `message(user) → state:waiting → init → state:streaming → message → result → state:done`——init 之後**零** idle state_change。
+- codex 一輪（`m1-fix-verify-codex`，22 envelopes）：`message(user) → state:waiting → init → … → result → state:done`——同樣無 idle 追發。
+- bundled codex 一輪：owner 以重建後 `.app` 執行，序列驗證同上（見補記）。
+
 ## 偏差記錄
 
 1. **MermaidPane.vue 刪除時點**：plan 排在 Task 10 commit；實際移至 Task 11 commit（App.vue 重寫同時），避免中間 commit 引用已刪檔案。內容無偏差。
@@ -95,11 +111,12 @@
 5. **PreviewPane mermaid 錯誤顯示**：錯誤文字以 `textContent` 寫入（不進 HTML sink），較 plan 樣張更嚴格（XSS 防護）。
 6. **V2 原始截圖誤刪**：三輪驗收當下的 StatusBar 截圖在清理測試產物時誤刪（無備份）；當下欄位值已有文字記錄（見 V2 列），另以單輪 session 補截同形狀截圖存 `docs/spikes/evidence/`。後續證據截圖一律直接存 evidence 目錄。
 7. **V0.7 `echo hi` 未觸發核可**：codex 0.146.1 的 untrusted policy 將 `echo` 判定為 trusted 指令自動放行；改以寫入指令（`touch`）驗證核可流。如實記錄，非 app 缺陷。
-8. **claude 每輪皆發 init 事件**：claude 2.1.223 多輪模式每輪回一個 `system/init`（session_id 恆定）；UI 以 init 更新 sessionId 不受影響。
+8. **claude 每輪皆發 init 事件**：claude 2.1.223 多輪模式每輪回一個 `system/init`（session_id 恆定）。此行為曾使 reducer 把 waiting 打回 idle（報告審查第一輪 P1，已修——init 改為狀態中性，見「報告審查修正」節）。
+9. **V0.6 失敗面向與 plan 敘述不同**：plan 寫「session 帶 recorderError」；實際 M1 行為是 recorder 初始化失敗時 `StartSession` 直接回 error（fail-loud 更早、session 不啟動）。行為更嚴格，但非完全相同——如實列為偏差。
 
 ## 殘餘風險
 
-1. **封裝 smoke 未執行**：bundled `.app` 的雙 provider 各 1 輪需獨立視窗操作，留待 owner；dev 模式（同一 backend binary、bundle 的 tools 路徑）已全流程驗證。
+1. ~~封裝 smoke 未執行~~（stale，第一輪報告審查指正）：封裝 smoke 已由 owner 執行 PASS（見 V 表）。
 2. claude 自然結束（V1 End exit 0）與 Terminate（V0.5 exit 143）均 live 驗證；快速退出／abort 路徑由 production-path barrier 測試覆蓋（未 live 重現）。
 3. 測試穩定性：appcore barrier 測試依 channel 同步（deterministic）、三個 app-level barrier 測試 `-race -count=30` 通過；M0 race-test 穩定性註記沿用。
 4. bundle 873M 未瘦身（plan 明列 M1 不處理）。
