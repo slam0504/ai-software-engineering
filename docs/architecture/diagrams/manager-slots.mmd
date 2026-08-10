@@ -1,0 +1,35 @@
+classDiagram
+  class Manager {
+    -mu sync.Mutex
+    -cfg Config
+    -slots map~Provider~*slot
+    -closed bool
+    +Emit(ev Event)
+    +BeginNewSessionSubmit(provider, taskID) SubmissionID
+    +BeginSubmit(provider) SubmissionID
+    +AcceptSubmit(provider, id, sessionID, text)
+    +RejectSubmit(provider, id)
+    +BeginEndSession(provider) SessionToken
+    +CancelEndSession(provider, tok)
+    +FinishEndSession(provider, tok)
+    +BeginReset(provider) ResetToken
+    +FinishEndSessionIntoReset(provider, sessTok) ResetToken
+    +FinishReset(provider, resetTok)
+    +Totals(provider) (float64, Usage)
+    +State(provider) SessionState
+    +Close()
+  }
+  class slot {
+    -reducer *Reducer
+    -taskID string
+    -totalCost float64
+    -totalUsage Usage
+    -gen, seq uint64
+    -submitting *SubmissionID
+    -phase sessionPhase
+    -endTok *SessionToken
+    -pendingBuf []pendingEntry
+  }
+  Manager "1" *-- "2" slot : per provider
+  note for Manager "不變量：單一 mutex 序列化全部 emit；<br/>sink 寫入序＝event_id 序（檔案級單調）"
+  note for slot "不變量：per-slot user-first 順序；<br/>generation 失效；phase 狀態機"

@@ -1,0 +1,14 @@
+stateDiagram-v2
+  [*] --> idle
+  idle --> starting : BeginNewSessionSubmit
+  starting --> active : AcceptSubmit
+  starting --> idle : RejectSubmit
+  active --> ending : BeginEndSession
+  ending --> active : CancelEndSession（busy）
+  ending --> idle : FinishEndSession
+  idle --> resetting : BeginReset（New、無 active session）
+  ending --> resetting : FinishEndSessionIntoReset（New、原子轉移無 idle 縫隙）
+  resetting --> idle : FinishReset
+  note right of starting : 期間 End → ErrStartInProgress
+  note right of active : 期間再 Start → ErrSessionActive
+  note right of resetting : 期間 BeginSubmit／BeginNewSessionSubmit／<br/>BeginEndSession／第二個 BeginReset<br/>一律 ErrResetInProgress

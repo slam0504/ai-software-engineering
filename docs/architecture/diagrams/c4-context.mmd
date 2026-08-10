@@ -1,0 +1,10 @@
+C4Context
+  Person(owner, "Owner", "本機使用者（個人自用）")
+  System(wb, "sdlc-workbench", "雙 provider agent cockpit（macOS app）")
+  System_Ext(claude, "Claude Code CLI", "pinned 2.1.223；stream-json 子程序")
+  System_Ext(codex, "Codex CLI", "pinned 0.146.1；app-server JSON-RPC")
+  System_Ext(fs, "Workspace 檔案系統", "專案檔案、.workbench 稽核／錄流")
+  Rel(owner, wb, "對話、核可、檔案預覽")
+  Rel(wb, claude, "spawn + stdin/stdout stream-json")
+  Rel(wb, codex, "長駐子程序 JSON-RPC over stdio")
+  Rel(wb, fs, "讀（預覽）／寫（稽核、錄流）")
