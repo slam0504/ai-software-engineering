@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { StartSession, SendMessage, CLIInfo } from '../wailsjs/go/main/App'
+import { StartSession, SendMessage, CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
 import { useSession } from './stores/session'
 import { load, save } from './lib/persist'
 import SettingsBar from './components/SettingsBar.vue'
@@ -58,6 +58,7 @@ onMounted(async () => {
   })
   EventsOn('workbench:event', (e: any) => s.apply(e))
   EventsOn('session:done', (d: any) => s.applyDone(d))
+  try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
 })
 </script>

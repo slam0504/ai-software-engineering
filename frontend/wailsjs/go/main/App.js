@@ -26,6 +26,10 @@ export function Logout(arg1) {
   return window['go']['main']['App']['Logout'](arg1);
 }
 
+export function NewSession(arg1) {
+  return window['go']['main']['App']['NewSession'](arg1);
+}
+
 export function ReadDiagram() {
   return window['go']['main']['App']['ReadDiagram']();
 }
@@ -40,6 +44,10 @@ export function ResolveApproval(arg1, arg2, arg3) {
 
 export function RestartCodexServerRecorded(arg1) {
   return window['go']['main']['App']['RestartCodexServerRecorded'](arg1);
+}
+
+export function RestoreViews() {
+  return window['go']['main']['App']['RestoreViews']();
 }
 
 export function SendMessage(arg1, arg2) {

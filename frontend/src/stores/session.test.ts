@@ -252,3 +252,44 @@ describe('session store', () => {
     expect(s.views.codex.chat.length).toBe(1) // 另一 view 不動
   })
 })
+
+describe('restore replay (M1.5 D6)', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+
+  it('replays envelopes to rebuild views without unread', () => {
+    const s = useSession()
+    s.restoreViews({
+      claude: {
+        envelopes: [
+          env({ provider: 'claude', kind: 'message', role: 'user', text: 'old q' }),
+          env({ provider: 'claude', kind: 'result', cost_usd: 0.3, usage: { input_tokens: 5, output_tokens: 2 }, usage_semantics: 'session_total' }),
+        ],
+        resumeSessionId: 'sA', taskId: 'task-a',
+      },
+      codex: {
+        envelopes: [env({ provider: 'codex', kind: 'result' })],
+        resumeSessionId: 'tX', taskId: 'task-x',
+      },
+    })
+    expect(s.views.claude.chat.at(-1)!.text).toBe('old q')
+    expect(s.views.claude.totals.cost).toBeCloseTo(0.3)
+    expect(s.views.claude.taskLabel).toBe('task-a')
+    expect(s.views.claude.resume).toBe('sA') // resume 預填
+    expect(s.views.codex.resume).toBe('tX')
+    expect(s.unreadOf('claude')).toBe(0) // 重放不計 unread
+    expect(s.unreadOf('codex')).toBe(0)
+    expect(s.views.claude.active).toBe(false) // 恢復不 spawn：下一次 submit 走 StartSession
+  })
+
+  it('restored resume feeds the next StartSession', async () => {
+    const s = useSession()
+    const start = vi.fn(async () => {})
+    s.setBindings({ StartSession: start, SendMessage: vi.fn(async () => {}) })
+    s.restoreViews({
+      claude: { envelopes: [], resumeSessionId: 'sA', taskId: 'task-a' },
+      codex: { envelopes: [], resumeSessionId: '', taskId: '' },
+    })
+    await s.submit('continue please')
+    expect(start).toHaveBeenCalledWith('claude', 'continue please', 'sA', '', 'task-a', 'untrusted')
+  })
+})

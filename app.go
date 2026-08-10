@@ -46,6 +46,7 @@ type App struct {
 
 	registry *claude.Registry
 	manager  *appcore.Manager
+	restore  *restoreStore
 
 	auditMu sync.Mutex
 	auditF  *os.File
@@ -69,6 +70,7 @@ type App struct {
 
 	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
+	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
 }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
@@ -118,6 +120,11 @@ func (a *App) startup(ctx context.Context) {
 		// Task 4 live probe VERDICT=per-turn（turn2 output 9 << turn1 642）→ 累加制
 		ClaudeUsageCumulative: false,
 	})
+	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
+	a.restore = rs
+	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
+		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
+	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
@@ -534,6 +541,11 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		}
 		aerr := a.manager.AcceptSubmit(prov, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
+		if aerr == nil { // Accept 成功才 commit（staged candidate；D6）
+			if cerr := a.restore.CommitResume("claude", a.claudeSessionIDSnapshot(), taskLabel); cerr != nil {
+				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
+			}
+		}
 		return aerr
 	default: // codex
 		threadID, alreadyEnded, serr := a.startCodex(prompt, resume, recordCase, approvalPolicy)
@@ -543,6 +555,9 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		}
 		if err := a.manager.AcceptSubmit(prov, id, threadID, prompt); err != nil {
 			return err
+		}
+		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
+			a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
 		}
 		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
 		return nil
@@ -753,6 +768,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 			a.mu.Lock()
 			a.claudeSessionID = info.SessionID
 			a.mu.Unlock()
+			a.commitClaudeResume(sess, info.SessionID) // accepted generation 才寫（late init guard）
 		}
 		a.manager.Emit(ev)
 	})
@@ -1212,4 +1228,104 @@ func (a *App) Logout(provider string) error {
 	default:
 		return fmt.Errorf("unknown provider %q", provider)
 	}
+}
+
+// ---- M1.5：重啟恢復與 NewSession ----
+
+// failLoudRestore：restore commit 失敗的凍結語意（plan D6 第三輪 P1-2）——
+// session 保持 active、呼叫照樣成功，僅以 stream_error fail loud。
+func (a *App) failLoudRestore(p contract.Provider, err error) {
+	a.emit("workbench:event", contract.Envelope{
+		EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
+		Provider: string(p), Kind: string(contract.KindStreamError),
+		Error: "restore store: " + err.Error(),
+	})
+	a.audit("restore_store_error", map[string]any{"provider": string(p), "error": err.Error()})
+}
+
+// commitClaudeResume：claude init 抵達時 commit resumeSessionID。guard：
+// (1) sess 仍是目前 session（late init 於 NewSession 之後 → pointer 不符、不寫）
+// (2) session 已 accepted（init-before-Accept 只暫存於 claudeSessionID，
+//     由 StartSession Accept 成功後補 commit）。
+func (a *App) commitClaudeResume(sess *claude.Session, sessionID string) {
+	a.mu.Lock()
+	current := a.claudeSess == sess
+	a.mu.Unlock()
+	if !current || !a.manager.SessionActive(contract.ProviderClaude) {
+		return
+	}
+	e := a.restore.Get("claude")
+	if err := a.restore.CommitResume("claude", sessionID, e.TaskID); err != nil {
+		a.failLoudRestore(contract.ProviderClaude, err)
+	}
+}
+
+// RestoreViews：啟動時的 view 重放來源（唯讀——不 spawn provider、不回寫 audit）。
+func (a *App) RestoreViews() map[string]RestoredView {
+	out := map[string]RestoredView{}
+	for _, p := range []string{"claude", "codex"} {
+		e := a.restore.Get(p)
+		out[p] = RestoredView{
+			Envelopes:       replayViewWindow(a.eventsPath(), p, e.ViewStartEventID),
+			ResumeSessionID: e.ResumeSessionID,
+			TaskID:          e.TaskID,
+		}
+	}
+	return out
+}
+
+// NewSession：New 專用原子流程（plan D4）。收尾成功才重設恢復視窗；失敗回錯、
+// UI 不重設；另一 provider 完全不受影響。resetting phase 涵蓋
+// 「teardown → restore reset」整段（期間 Start 回 ErrResetInProgress）。
+func (a *App) NewSession(provider string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	pv := contract.Provider(provider)
+	a.mu.Lock()
+	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
+	runner, klease := a.runner, a.codexLease
+	a.mu.Unlock()
+
+	var rtok appcore.ResetToken
+	tok, err := a.manager.BeginEndSession(pv)
+	switch {
+	case err == nil: // active session：teardown 後原子轉入 resetting
+		if pv == contract.ProviderCodex && runner != nil && runner.ActiveTurnID() != "" {
+			cerr := a.manager.CancelEndSession(pv, tok)
+			return errors.Join(appcore.ErrProviderBusy, cerr)
+		}
+		var tearErr error
+		if pv == contract.ProviderClaude {
+			tearErr = a.claudeTeardown(sess, done, clease)()
+		} else {
+			tearErr = a.codexTeardown(klease)
+		}
+		rtok, err = a.manager.FinishEndSessionIntoReset(pv, tok) // teardown 錯誤仍轉入 reset
+		if err != nil {
+			return errors.Join(tearErr, err)
+		}
+		if tearErr != nil {
+			defer func() { _ = tearErr }() // 保留於回傳（下方 join）
+		}
+		err = tearErr
+	case errors.Is(err, appcore.ErrNoSession): // 無 active session：直接進 resetting
+		rtok, err = a.manager.BeginReset(pv)
+		if err != nil {
+			return err
+		}
+		err = nil
+	default:
+		return err
+	}
+
+	if h := a.hookDuringReset; h != nil { // 測試 barrier：teardown 完成與 restore reset 之間
+		h()
+	}
+	rerr := a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
+	finErr := a.manager.FinishReset(pv, rtok) // restore 失敗仍 FinishReset 回 idle
+	if rerr != nil {
+		return errors.Join(err, rerr, finErr) // 失敗回錯：UI 不重設
+	}
+	return errors.Join(err, finErr)
 }

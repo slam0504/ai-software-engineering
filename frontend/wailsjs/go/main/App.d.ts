@@ -14,6 +14,8 @@ export function ListWorkspace(arg1:string):Promise<Array<main.FileNode>>;
 
 export function Logout(arg1:string):Promise<void>;
 
+export function NewSession(arg1:string):Promise<void>;
+
 export function ReadDiagram():Promise<string>;
 
 export function ReadWorkspaceFile(arg1:string):Promise<string>;
@@ -21,6 +23,8 @@ export function ReadWorkspaceFile(arg1:string):Promise<string>;
 export function ResolveApproval(arg1:string,arg2:boolean,arg3:string):Promise<void>;
 
 export function RestartCodexServerRecorded(arg1:string):Promise<void>;
+
+export function RestoreViews():Promise<Record<string, main.RestoredView>>;
 
 export function SendMessage(arg1:string,arg2:string):Promise<void>;
 

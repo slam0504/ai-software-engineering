@@ -217,6 +217,27 @@ export const useSession = defineStore('session', {
       v.busy = false
     },
 
+    // 啟動重放（M1.5 D6）：RestoreViews 的 audited envelopes 逐筆 apply 重建
+    // 各 view；resume／taskLabel 預填；重放不計 unread、完畢歸零。
+    restoreViews(data: Record<string, { envelopes: Envelope[] | null; resumeSessionId: string; taskId: string }>) {
+      this.restoring = true
+      try {
+        for (const p of PROVIDERS) {
+          const d = data[p]
+          if (!d) continue
+          for (const e of d.envelopes ?? []) this.apply(e)
+          const v = this.views[p]
+          v.resume = d.resumeSessionId ?? ''
+          if (d.taskId) v.taskLabel = d.taskId
+          v.busy = false
+          v.active = false // 恢復不 spawn：下一次 submit 走 StartSession(resume)
+          v.unread = 0
+        }
+      } finally {
+        this.restoring = false
+      }
+    },
+
     // reset 只重置 active view（New 成功後呼叫）；bindings／approvalPolicy／
     // 另一個 view 不動。輸入欄位（taskLabel/recordCase）保留沿用。
     reset() {
