@@ -57,19 +57,19 @@ onMounted(async () => {
 
 <style>
 html, body, #app { height: 100%; margin: 0; }
-body { background: #1b2636; color: #e6edf3; font-family: ui-sans-serif, system-ui, sans-serif; }
+body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif, system-ui, sans-serif; }
 </style>
 
 <style scoped>
 .shell { display: flex; flex-direction: column; height: 100vh; }
-.meta { font-size: 11px; color: #66788a; padding: 0 10px 4px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.meta .err { color: #ff8a80; margin-left: 8px; }
+.meta { font-size: 11px; color: var(--text-faint); padding: 0 10px 4px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
-aside { width: 220px; border-right: 1px solid #3a4a5a; overflow-y: auto; }
+aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 nav { display: flex; gap: 4px; padding: 4px 8px; }
-nav .active { background: #2d5a88; color: #fff; }
+nav .active { background: var(--bg-bubble-user); color: #fff; }
 main > :not(nav) { flex: 1; min-height: 0; }
-.tl { height: 180px; border-top: 1px solid #3a4a5a; }
-.tl-toggle { align-self: flex-start; font-size: 11px; background: none; border: none; color: #66788a; cursor: pointer; padding: 2px 10px; }
+.tl { height: 180px; border-top: 1px solid var(--border); }
+.tl-toggle { align-self: flex-start; font-size: 11px; background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 2px 10px; }
 </style>

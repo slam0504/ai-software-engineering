@@ -42,8 +42,8 @@ function toggle(p: string) {
 
 <style scoped>
 .tree { list-style: none; margin: 0; padding-left: 12px; font-size: 13px; text-align: left; }
-button { background: none; border: none; color: #cdd9e5; cursor: pointer; padding: 2px 4px; font-size: 13px; }
-button.dir { color: #9db2c5; }
+button { background: none; border: none; color: var(--text); cursor: pointer; padding: 2px 4px; font-size: 13px; }
+button.dir { color: var(--text-muted); }
 button:hover { color: #fff; }
-.err { color: #ff8a80; font-size: 12px; padding: 4px; list-style: none; }
+.err { color: var(--err); font-size: 12px; padding: 4px; list-style: none; }
 </style>

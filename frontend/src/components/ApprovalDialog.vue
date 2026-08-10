@@ -48,16 +48,16 @@ async function decide(allow: boolean) {
   display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .dialog {
-  background: #1e2a38; border: 1px solid #3a4a5a; border-radius: 8px;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 16px; max-width: 640px; width: 90%; text-align: left;
 }
 .dialog pre {
-  background: #101820; padding: 8px; border-radius: 4px;
+  background: var(--bg-inset); padding: 8px; border-radius: 4px;
   max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-all;
 }
 .dialog input { width: 100%; margin: 8px 0; padding: 6px; }
 .actions { display: flex; gap: 8px; }
 .allow { background: #2e7d32; color: #fff; }
 .deny { background: #c62828; color: #fff; }
-.error { color: #ff8a80; }
+.error { color: var(--err); }
 </style>

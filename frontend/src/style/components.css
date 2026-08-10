@@ -1,0 +1,41 @@
+/* components.css — 基礎元件 class（token 組合；不引入新色值） */
+.btn {
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-m);
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn-primary { background: var(--bg-bubble-user); border-color: var(--bg-bubble-user); }
+.btn-danger { color: var(--err); border-color: var(--err); }
+
+.input, .select {
+  background: var(--bg-inset);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-m);
+}
+.input:focus, .select:focus { outline: none; border-color: var(--accent); }
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+}
+
+.badge {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-l);
+  background: var(--accent);
+  color: var(--bg-inset);
+  font-size: var(--fs-s);
+  text-align: center;
+}

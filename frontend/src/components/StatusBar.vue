@@ -20,8 +20,8 @@ const stateLabel: Record<string, string> = {
 </template>
 
 <style scoped>
-.status { display: flex; gap: 16px; padding: 4px 12px; font-size: 12px; border-top: 1px solid #3a4a5a; color: #9db2c5; }
-.state.awaiting_approval { color: #ffd54f; }
-.state.failed { color: #ff8a80; }
-.state.waiting, .state.streaming, .state.tool_running { color: #80cbc4; }
+.status { display: flex; gap: 16px; padding: 4px 12px; font-size: 12px; border-top: 1px solid var(--border); color: var(--text-muted); }
+.state.awaiting_approval { color: var(--warn); }
+.state.failed { color: var(--err); }
+.state.waiting, .state.streaming, .state.tool_running { color: var(--ok); }
 </style>
