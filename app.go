@@ -1,7 +1,5 @@
 package main
 
-// spike quality: to be rebuilt in M1
-
 import (
 	"context"
 	"encoding/json"
@@ -17,10 +15,12 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 )
 
@@ -29,7 +29,8 @@ type pendingApproval struct {
 	resolve  func(allow bool, reason string) error
 }
 
-// App struct
+// App 是薄綁定層：workspace／CLI 解析、Wails 事件出口與 provider 接線。
+// 序列化、coordinator、lifecycle 與錄流收尾全部在 internal/appcore。
 type App struct {
 	ctx          context.Context
 	workspaceDir string
@@ -42,21 +43,25 @@ type App struct {
 	diagramPath  string
 
 	registry *claude.Registry
+	manager  *appcore.Manager
 
 	auditMu sync.Mutex
 	auditF  *os.File
 
-	mu         sync.Mutex
-	claudeSess *claude.Session
-	broker     *approval.Broker
-	activeProv string
+	mu              sync.Mutex
+	activeProv      string
+	broker          *approval.Broker
+	claudeSess      *claude.Session
+	claudeSessionID string
+	claudePumpDone  <-chan struct{}
+	claudeLease     *appcore.RecordingLease
+	claudeCWD       string
 
-	codexSingle   codex.Single[*codex.Server]
-	codexThreadID string
-	codexTurnID   string // turn/interrupt 必填（schema：threadId + turnId）
-	codexRec      *recorder.Recorder
-	codexActive   bool
-	codexLoginID  string
+	codexSingle  codex.Single[*codex.Server]
+	runner       *codex.ThreadRunner
+	track        appcore.TurnTrack
+	codexLease   *appcore.RecordingLease
+	codexLoginID string
 
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
@@ -83,6 +88,23 @@ func (a *App) startup(ctx context.Context) {
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 		a.auditF = f
 	}
+	sink, serr := appcore.NewJSONLSink(filepath.Join(a.stateDir, "events.jsonl"))
+	if serr != nil {
+		if a.startupErr == "" {
+			a.startupErr = "event sink init failed: " + serr.Error()
+		}
+		sink = nil
+	}
+	var auditSink appcore.AuditSink = sink
+	if sink == nil { // manager 必須存在；sink 失敗已 fail loud 於 startupErr
+		auditSink = failedSink{reason: serr}
+	}
+	a.manager = appcore.New(appcore.Config{
+		Sink: auditSink,
+		Emit: func(env contract.Envelope) { runtime.EventsEmit(a.ctx, "workbench:event", env) },
+		// Task 4 live probe VERDICT=per-turn（turn2 output 9 << turn1 642）→ 累加制
+		ClaudeUsageCumulative: false,
+	})
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
@@ -91,6 +113,13 @@ func (a *App) startup(ctx context.Context) {
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
 }
+
+// failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
+// Manager 會 latch 並以 stream_error fail loud（不無聲丟稽核）。
+type failedSink struct{ reason error }
+
+func (s failedSink) Write(contract.Envelope) error { return s.reason }
+func (s failedSink) Close() error                  { return nil }
 
 // ReadDiagram 回傳目前圖檔內容（Mermaid pane 初始載入）。
 func (a *App) ReadDiagram() (string, error) {
@@ -119,17 +148,19 @@ func (a *App) watchDiagram(path string) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	if err := a.EndSession(); err != nil { // active session 走同一收尾編排
+		a.audit("shutdown_end_session_error", map[string]any{"error": err.Error()})
+	}
+	if a.manager != nil {
+		_ = a.manager.Close() // pending queue 由 abort+flush 兜底
+	}
 	if srv, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
 		_ = srv.Terminate()
 		srv.Wait()
 	}
 	a.mu.Lock()
-	sess, br := a.claudeSess, a.broker
+	br := a.broker
 	a.mu.Unlock()
-	if sess != nil {
-		_ = sess.Terminate()
-		sess.Wait()
-	}
 	if br != nil {
 		_ = br.Close()
 	}
@@ -272,17 +303,7 @@ func clientInfo() codex.ClientInfo {
 	return codex.ClientInfo{Name: "sdlc-workbench", Version: "0.0.1"}
 }
 
-func toUIEvent(ev contract.Event) map[string]any {
-	m := map[string]any{"provider": string(ev.Provider), "kind": string(ev.Kind),
-		"sessionId": ev.SessionID, "text": ev.Text, "thinking": ev.Thinking,
-		"isError": ev.IsError, "costUsd": ev.CostUSD, "raw": string(ev.Raw)}
-	if ev.Err != nil {
-		m["error"] = ev.Err.Error()
-	}
-	return m
-}
-
-// CLIInfo 回報 CLI 解析路徑與版本（Task 12 隔離 smoke 的證據面）。
+// CLIInfo 回報 CLI 解析路徑與版本（隔離 smoke 的證據面）。
 func (a *App) CLIInfo() map[string]string {
 	return map[string]string{
 		"toolsDir": a.toolsDirPath, "toolsSource": a.toolsSource,
@@ -292,7 +313,7 @@ func (a *App) CLIInfo() map[string]string {
 	}
 }
 
-// ---- approvals（雙 provider 共用 UI 流）----
+// ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
 
 func (a *App) registerApproval(id, provider string, resolve func(bool, string) error) {
 	a.apprMu.Lock()
@@ -316,11 +337,15 @@ func (a *App) pumpApprovals(br *approval.Broker, provider string) {
 		id := req.ID
 		a.registerApproval(id, provider, func(allow bool, reason string) error {
 			behavior := "deny"
+			decision := "deny"
 			if allow {
-				behavior = "allow"
+				behavior, decision = "allow", "allow"
 			}
-			return br.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
+			err := br.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
+			a.manager.EmitApprovalDecision(contract.ProviderClaude, a.claudeSessionIDSnapshot(), decision, reason)
+			return err
 		})
+		a.manager.EmitApprovalRequest(contract.ProviderClaude, a.claudeSessionIDSnapshot(), req.ToolName, req.Input)
 		runtime.EventsEmit(a.ctx, "approval:request", map[string]any{
 			"id": id, "provider": provider, "toolName": req.ToolName,
 			"inputJson": string(req.Input),
@@ -328,16 +353,103 @@ func (a *App) pumpApprovals(br *approval.Broker, provider string) {
 	}
 }
 
+func (a *App) claudeSessionIDSnapshot() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.claudeSessionID
+}
+
 // ---- session 綁定 ----
 
-func (a *App) StartSession(provider, prompt, resume, recordCase string) error {
+// StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
+// process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
+func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
+	id, err := a.manager.BeginNewSessionSubmit(taskLabel)
+	if err != nil {
+		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
+	}
 	switch provider {
 	case "claude":
-		return a.startClaude(prompt, resume, recordCase)
+		err = a.startClaude(prompt, resume, recordCase)
+		if err == nil {
+			err = a.manager.AcceptSubmit(id, contract.ProviderClaude, "", prompt)
+		} else {
+			_ = a.manager.RejectSubmit(id)
+		}
+		return err
 	case "codex":
-		return a.startCodex(prompt, resume, recordCase)
+		threadID, alreadyEnded, serr := a.startCodex(prompt, resume, recordCase, approvalPolicy)
+		if serr != nil {
+			_ = a.manager.RejectSubmit(id)
+			return serr
+		}
+		if err := a.manager.AcceptSubmit(id, contract.ProviderCodex, threadID, prompt); err != nil {
+			return err
+		}
+		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
+		return nil
 	default:
+		_ = a.manager.RejectSubmit(id)
 		return fmt.Errorf("unknown provider %q", provider)
+	}
+}
+
+// SendMessage：既有 session 的後續輪（僅 phaseActive 允許；錯誤原樣回 UI）。
+func (a *App) SendMessage(prompt string) error {
+	a.mu.Lock()
+	prov, sess, runner := a.activeProv, a.claudeSess, a.runner
+	a.mu.Unlock()
+	id, err := a.manager.BeginSubmit()
+	if err != nil {
+		return err
+	}
+	switch prov {
+	case "claude":
+		if sess == nil {
+			_ = a.manager.RejectSubmit(id)
+			return errors.New("no active claude session")
+		}
+		if err := sess.Send(prompt); err != nil {
+			_ = a.manager.RejectSubmit(id)
+			return err
+		}
+		return a.manager.AcceptSubmit(id, contract.ProviderClaude, a.claudeSessionIDSnapshot(), prompt)
+	case "codex":
+		if runner == nil {
+			_ = a.manager.RejectSubmit(id)
+			return errors.New("no active codex thread")
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+		defer cancel()
+		if _, _, err := runner.StartTurn(ctx, prompt); err != nil {
+			_ = a.manager.RejectSubmit(id)
+			return err
+		}
+		return a.manager.AcceptSubmit(id, contract.ProviderCodex, runner.ThreadID(), prompt)
+	default:
+		_ = a.manager.RejectSubmit(id)
+		return errors.New("no active session")
+	}
+}
+
+// EndSession：唯一收尾編排（appcore.EndSessionFlow）。冪等；ErrProviderBusy
+// 等真實錯誤原樣回 UI（前端「New」須成功後才 reset）。
+func (a *App) EndSession() error {
+	a.mu.Lock()
+	prov := a.activeProv
+	sess, done, clease, cwd := a.claudeSess, a.claudePumpDone, a.claudeLease, a.claudeCWD
+	runner, klease := a.runner, a.codexLease
+	a.mu.Unlock()
+	switch prov {
+	case "claude":
+		return appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, clease, cwd))
+	case "codex":
+		busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
+		return appcore.EndSessionFlow(a.manager, busy, func() error {
+			return a.codexTeardown(klease)
+		})
+	default: // 無 active provider：交由 EndSessionFlow 冪等處理
+		return appcore.EndSessionFlow(a.manager, nil, func() error { return nil })
 	}
 }
 
@@ -351,8 +463,8 @@ func (a *App) TerminateSession() error {
 			return errors.New("no active claude session")
 		}
 		return sess.Terminate()
-	case "codex": // 長駐 server 不關，只中斷 turn（v1.5）
-		params, err := a.codexInterruptParams()
+	case "codex": // 長駐 server 不關，只中斷 turn
+		params, err := a.track.InterruptParams()
 		if err != nil {
 			return err
 		}
@@ -367,44 +479,6 @@ func (a *App) TerminateSession() error {
 	default:
 		return errors.New("no active session")
 	}
-}
-
-// ---- codex turn 追蹤（turn/interrupt 的 schema 必填 threadId + turnId）----
-
-func parseTurnStarted(params []byte) (threadID, turnID string) {
-	var p struct {
-		ThreadID string `json:"threadId"`
-		Turn     struct {
-			ID string `json:"id"`
-		} `json:"turn"`
-	}
-	_ = json.Unmarshal(params, &p)
-	return p.ThreadID, p.Turn.ID
-}
-
-func (a *App) noteTurnStarted(params []byte) {
-	th, tu := parseTurnStarted(params)
-	a.mu.Lock()
-	if th != "" {
-		a.codexThreadID = th
-	}
-	a.codexTurnID = tu
-	a.mu.Unlock()
-}
-
-func (a *App) noteTurnEnded() {
-	a.mu.Lock()
-	a.codexTurnID = ""
-	a.mu.Unlock()
-}
-
-func (a *App) codexInterruptParams() (map[string]any, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.codexThreadID == "" || a.codexTurnID == "" {
-		return nil, fmt.Errorf("no active codex turn (threadId=%q, turnId=%q)", a.codexThreadID, a.codexTurnID)
-	}
-	return map[string]any{"threadId": a.codexThreadID, "turnId": a.codexTurnID}, nil
 }
 
 // ---- Claude 線 ----
@@ -442,6 +516,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 		a.apprMu.Lock()
 		delete(a.apprPending, id)
 		a.apprMu.Unlock()
+		a.manager.EmitApprovalDecision(contract.ProviderClaude, a.claudeSessionIDSnapshot(), "timeout", "")
 		runtime.EventsEmit(a.ctx, "approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	})
 	go a.pumpApprovals(br, "claude")
@@ -455,61 +530,120 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 	if err := os.WriteFile(mcpCfg, []byte(cfg), 0o644); err != nil {
 		return err
 	}
+
+	var rec *recorder.Recorder
+	var lease *appcore.RecordingLease
+	if recordCase != "" {
+		rec, err = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".ndjson")
+		if err != nil { // Recorder 初始化失敗 = 可見的 session 失敗，不無聲降級
+			return err
+		}
+	}
+
 	sess, err := claude.Start(a.ctx, claude.Config{
 		Binary: a.claudeCLIPath(), CWD: cwd, Prompt: prompt, Resume: resume,
 		MCPConfigPath: mcpCfg, PermissionPromptTool: "mcp__workbench__approval_prompt",
-		// probe 必問：ask 優先於 allow、所有 mode 有效；defaultMode 蓋掉使用者
-		// 環境的 plan 預設（實測 permissionMode:plan 會擋掉全部寫入、A2 無法執行）
+		// ask 優先於 allow、defaultMode 蓋掉使用者環境的 plan 預設
 		SettingsJSON: `{"permissions":{"defaultMode":"default","ask":["Bash(touch *)"]}}`,
 		Env:          a.childEnv(),
+		MultiTurn:    true, // M1：stdin 保持開啟，SendMessage 逐輪送 user message
 	})
 	if err != nil {
+		if rec != nil {
+			_ = rec.CloseWith(recorder.Meta{Provider: "claude", RecordedAt: time.Now().UTC().Format(time.RFC3339)})
+		}
 		return err
 	}
-	a.mu.Lock()
-	a.claudeSess, a.activeProv = sess, "claude"
-	a.mu.Unlock()
-	go a.pumpClaude(sess, cwd, recordCase)
-	return nil
-}
-
-func (a *App) pumpClaude(sess *claude.Session, cwd, recordCase string) {
-	var rec *recorder.Recorder
-	if recordCase != "" {
-		var recErr error
-		rec, recErr = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".ndjson")
-		if recErr != nil { // v1.4：Recorder 初始化失敗 = 可見的 session 失敗，不無聲降級
-			_ = sess.Terminate()
-			sess.Wait()
-			runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "claude", "recorderError": recErr.Error()})
-			return
-		}
+	if rec != nil {
+		lease = appcore.NewRecordingLease(rec, func() error { return nil },
+			func(ex ports.Exit) recorder.Meta {
+				m := recorder.Meta{Provider: "claude", CLIVersion: a.cliVersion("claude"),
+					Argv: sess.Argv(), CWD: cwd,
+					RecordedAt: time.Now().UTC().Format(time.RFC3339), StderrTail: ex.StderrTail}
+				if ex.Exited { // 未知結局不偽裝 exit code（meta ExitCode 維持 nil）
+					code := ex.Code
+					m.ExitCode = &code
+				}
+				return m
+			})
 	}
-	for ev := range sess.Events() {
+
+	// pump：錄流 tap ＋ init 綁定 registry → 一律經 Manager.Emit
+	done := appcore.Pump(sess.Events(), func(ev contract.Event) {
 		if rec != nil {
-			if err := rec.Line(ev.Raw); err != nil {
-				runtime.EventsEmit(a.ctx, "bridge:event", map[string]any{"kind": "recorder_error", "error": err.Error()})
+			if lerr := rec.Line(ev.Raw); lerr != nil {
+				a.manager.Emit(contract.Event{Provider: contract.ProviderClaude,
+					Kind: contract.KindStreamError, Raw: []byte(lerr.Error()), Err: lerr})
 			}
 		}
 		if info := claude.ParseInit(ev); info != nil {
 			_ = a.registry.Bind(info.SessionID, cwd)
+			a.mu.Lock()
+			a.claudeSessionID = info.SessionID
+			a.mu.Unlock()
 		}
-		runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(ev))
-	}
-	ex := sess.Wait()
-	var recErrText string
-	if rec != nil { // v1.4：CloseWith（含底層 close 與 meta 寫入）錯誤進 session:done
-		if err := rec.CloseWith(recorder.Meta{Provider: "claude", CLIVersion: a.cliVersion("claude"),
-			Argv: sess.Argv(), CWD: cwd, RecordedAt: time.Now().UTC().Format(time.RFC3339),
-			ExitCode: &ex.Code, StderrTail: ex.StderrTail}); err != nil { // v1.7：*int，claude 回合必已退出
+		a.manager.Emit(ev)
+	})
+
+	a.mu.Lock()
+	a.claudeSess, a.claudePumpDone, a.claudeLease = sess, done, lease
+	a.claudeCWD, a.claudeSessionID, a.activeProv = cwd, "", "claude"
+	a.mu.Unlock()
+
+	go func() { // 自然結束／崩潰：pump 收乾後走同一收尾編排
+		<-done
+		a.mu.Lock()
+		current := a.claudeSess == sess
+		a.mu.Unlock()
+		if !current { // EndSession 已接手
+			return
+		}
+		if err := appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, lease, cwd)); err != nil {
+			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
+		}
+	}()
+	return nil
+}
+
+// claudeTeardown：CloseSequence（close → quiesce → 必要時 terminate → Wait →
+// lease.Finalize(ex)），並發 session:done（Exit 為證據）。
+func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
+	lease *appcore.RecordingLease, cwd string) func() error {
+	return func() error {
+		if sess == nil {
+			return errors.New("no active claude session")
+		}
+		fin := func(ex ports.Exit) error {
+			if lease != nil {
+				return lease.Finalize(ex)
+			}
+			return nil
+		}
+		ex, err := appcore.CloseSequence(sess.Close, done, 5*time.Second, 10*time.Second,
+			sess.Terminate, sess.Wait, fin)
+		a.mu.Lock()
+		if a.claudeSess == sess {
+			a.claudeSess, a.claudePumpDone, a.claudeLease = nil, nil, nil
+			a.activeProv = ""
+		}
+		br := a.broker
+		a.broker = nil
+		a.mu.Unlock()
+		if br != nil {
+			_ = br.Close()
+		}
+		var recErrText string
+		if err != nil {
 			recErrText = err.Error()
 		}
+		payload := map[string]any{"provider": "claude", "stderrTail": ex.StderrTail,
+			"recorderError": recErrText}
+		if ex.Exited {
+			payload["exitCode"] = ex.Code
+		}
+		runtime.EventsEmit(a.ctx, "session:done", payload)
+		return err
 	}
-	a.mu.Lock()
-	a.claudeSess = nil
-	a.mu.Unlock()
-	runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "claude",
-		"exitCode": ex.Code, "stderrTail": ex.StderrTail, "recorderError": recErrText})
 }
 
 // ---- Codex 線 ----
@@ -540,6 +674,12 @@ func (a *App) currentAppServer() (*codex.Server, error) {
 	})
 }
 
+func (a *App) currentRunner() *codex.ThreadRunner {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.runner
+}
+
 func (a *App) wireCodexHandlers(srv *codex.Server) {
 	conn := srv.Conn()
 	conn.OnNotification(func(method string, params json.RawMessage) {
@@ -549,26 +689,29 @@ func (a *App) wireCodexHandlers(srv *codex.Server) {
 				"event": method, "payload": string(params)})
 			a.audit("codex_auth", map[string]any{"method": method, "params": json.RawMessage(params)})
 		case codex.MethodTurnStarted:
-			a.noteTurnStarted(params) // Terminate 需要 turnId
-			runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(codex.MapEvent(method, params)))
+			a.track.NoteStarted(params) // TerminateSession 需要 turnId
+			a.manager.Emit(codex.MapEvent(method, params))
 		case codex.MethodTurnCompleted:
-			a.noteTurnEnded()
-			runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(codex.MapEvent(method, params)))
-			a.finishCodexTurn(srv, params)
+			a.track.NoteEnded()
+			_, turnID := appcore.ParseTurnStarted(params) // 同 schema：turn.id
+			if r := a.currentRunner(); r != nil {
+				r.NoteTurnEnded(turnID) // 解 busy；不動 recorder（session-scoped 錄流）
+			}
+			a.manager.Emit(codex.MapEvent(method, params))
 		default:
-			runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(codex.MapEvent(method, params)))
+			a.manager.Emit(codex.MapEvent(method, params))
 		}
 	})
 	conn.OnUnknown(func(raw []byte) {
-		ev := contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindUnknown, Raw: append([]byte(nil), raw...)}
-		runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(ev))
+		a.manager.Emit(contract.Event{Provider: contract.ProviderCodex,
+			Kind: contract.KindUnknown, Raw: append([]byte(nil), raw...)})
 	})
 	conn.OnServerRequest(func(method string, params json.RawMessage) (any, error) {
 		switch method {
 		case codex.MethodCmdExecRequestApproval, codex.MethodFileChangeRequestApproval:
 			return a.codexApproval(method, params), nil
 		default:
-			return nil, fmt.Errorf("unsupported server request %s (M0 subset)", method)
+			return nil, fmt.Errorf("unsupported server request %s", method)
 		}
 	})
 }
@@ -576,154 +719,126 @@ func (a *App) wireCodexHandlers(srv *codex.Server) {
 // codexApproval：核可請求 → 同一 ApprovalDialog → allow=accept / deny=decline；逾時 decline（fail closed）。
 func (a *App) codexApproval(method string, params json.RawMessage) map[string]string {
 	id := fmt.Sprintf("codex-%d", time.Now().UnixNano())
+	threadID := ""
+	if r := a.currentRunner(); r != nil {
+		threadID = r.ThreadID()
+	}
 	ch := make(chan bool, 1)
 	a.registerApproval(id, "codex", func(allow bool, reason string) error {
 		ch <- allow
 		return nil
 	})
-	var p struct {
-		ItemID string `json:"itemId"`
-	}
-	_ = json.Unmarshal(params, &p)
 	a.audit("codex_approval_request", map[string]any{"id": id, "method": method, "raw_params": json.RawMessage(params)})
+	a.manager.EmitApprovalRequest(contract.ProviderCodex, threadID, method, params)
 	runtime.EventsEmit(a.ctx, "approval:request", map[string]any{
 		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
+	uiDecision := "deny"
 	select {
 	case allow := <-ch:
 		if allow {
-			decision = "accept"
+			decision, uiDecision = "accept", "allow"
 		}
 	case <-time.After(approvalTimeout()):
 		a.apprMu.Lock()
 		delete(a.apprPending, id)
 		a.apprMu.Unlock()
+		uiDecision = "timeout"
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
 		runtime.EventsEmit(a.ctx, "approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
+	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, "")
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}
 }
 
-func (a *App) startCodex(prompt, resume, recordCase string) error {
+// startCodex：EnsureThread＋StartTurn bounded synchronous（ctx 30s；turn/start
+// response 立即回）。回傳 threadID 供 AcceptSubmit。
+func (a *App) startCodex(prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
 	srv, err := a.ensureAppServer()
 	if err != nil {
-		return err
+		return "", false, err
 	}
-	conn := srv.Conn()
+	if approvalPolicy == "" { // M0 驗證定位沿用：commandExecution 一律 requestApproval
+		approvalPolicy = "untrusted"
+	}
+	runner := codex.NewThreadRunner(srv.Conn())
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
+	if err != nil {
+		return "", false, err
+	}
 
-	var rec *recorder.Recorder
+	var lease *appcore.RecordingLease
 	if recordCase != "" {
-		rec, err = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
-		if err != nil { // 可見的 session 失敗，不無聲降級
-			runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "codex", "recorderError": err.Error()})
-			return err
+		rec, rerr := recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
+		if rerr != nil { // 可見的 session 失敗，不無聲降級
+			return "", false, rerr
 		}
-		if err := conn.BeginRecording(rec.Line); err != nil {
+		if berr := srv.Conn().BeginRecording(rec.Line); berr != nil {
 			cerr := rec.CloseWith(recorder.Meta{Provider: "codex", RecordedAt: time.Now().UTC().Format(time.RFC3339)})
-			msg := errors.Join(err, cerr).Error()
-			runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "codex", "recorderError": msg})
-			return err
+			return "", false, errors.Join(berr, cerr)
 		}
+		lease = appcore.NewRecordingLease(rec, srv.Conn().StopRecording,
+			func(ports.Exit) recorder.Meta { // 長駐 server 不隨 session 退出：live snapshot、ExitCode nil
+				return recorder.Meta{Provider: "codex", CLIVersion: a.cliVersion("codex"),
+					Argv: srv.Argv(), CWD: a.workspaceDir,
+					RecordedAt:          time.Now().UTC().Format(time.RFC3339),
+					ProcessStillRunning: true, StderrTail: srv.StderrSnapshot()}
+			})
 	}
+
+	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
+	if err != nil {
+		if lease != nil {
+			_ = lease.Finalize(ports.Exit{Exited: false})
+		}
+		return "", false, err
+	}
+
 	a.mu.Lock()
-	a.codexRec, a.codexActive, a.activeProv = rec, true, "codex"
+	a.runner, a.codexLease, a.activeProv = runner, lease, "codex"
 	a.mu.Unlock()
 
-	go func() {
-		// B6：resume 走 thread/resume（schema 必填 threadId），否則 thread/start。
-		// approvalPolicy=untrusted（M0 驗證定位）：commandExecution 一律走
-		// requestApproval → app 的 ApprovalDialog（B4；預設 policy 會自動放行）。
-		method := codex.MethodThreadStart
-		params := map[string]any{"approvalPolicy": "untrusted"}
-		if resume != "" {
-			method = codex.MethodThreadResume
-			params["threadId"] = resume
-		}
-		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
-		res, err := conn.Call(ctx, method, params)
-		cancel()
-		if err != nil {
-			a.finishCodexTurnWithError(srv, method+": "+err.Error())
-			return
-		}
-		var tr struct {
-			Thread struct {
-				ID string `json:"id"`
-			} `json:"thread"`
-		}
-		_ = json.Unmarshal(res, &tr)
-		a.mu.Lock()
-		a.codexThreadID = tr.Thread.ID
-		a.mu.Unlock()
-		runtime.EventsEmit(a.ctx, "bridge:event", toUIEvent(contract.Event{
-			Provider: contract.ProviderCodex, Kind: contract.KindInit,
-			SessionID: tr.Thread.ID, Raw: res}))
-		// turn/start 的 response 在 turn 結束才回來；收尾由 turn/completed 通知驅動
-		tctx, tcancel := context.WithTimeout(a.ctx, 30*time.Minute)
-		defer tcancel()
-		if _, err := conn.Call(tctx, codex.MethodTurnStart, map[string]any{
-			"threadId": tr.Thread.ID,
-			"input":    []map[string]any{{"type": "text", "text": prompt}},
-		}); err != nil {
-			a.finishCodexTurnWithError(srv, "turn/start: "+err.Error())
-		}
-	}()
-	return nil
+	if lease != nil { // fatal：app-server 死亡時仍收尾錄流（冪等由 lease 保證）
+		go func() {
+			<-srv.Done()
+			_ = lease.Finalize(ports.Exit{Exited: false})
+		}()
+	}
+	return threadID, alreadyEnded, nil
 }
 
-// finishCodexTurn：v1.6 順序固定——先 StopRecording（原子 detach）再 CloseWith；
-// 長駐 server 不隨回合退出，meta 記 process_still_running + live stderr snapshot。
-func (a *App) finishCodexTurn(srv *codex.Server, params json.RawMessage) {
+// codexTeardown：長駐 server 不關；lease.Finalize(Exited=false) 收錄流，
+// 清 runner／track 並發 session:done。
+func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
+	var err error
+	if lease != nil {
+		err = lease.Finalize(ports.Exit{Exited: false})
+	}
 	a.mu.Lock()
-	rec, active := a.codexRec, a.codexActive
-	a.codexRec, a.codexActive = nil, false
+	a.runner, a.codexLease = nil, nil
+	if a.activeProv == "codex" {
+		a.activeProv = ""
+	}
 	a.mu.Unlock()
-	if !active {
-		return
+	a.track.NoteEnded()
+	stderr := ""
+	if srv, serr := a.currentAppServer(); serr == nil {
+		stderr = srv.StderrSnapshot()
 	}
 	var recErrText string
-	if rec != nil {
-		stopErr := srv.Conn().StopRecording()
-		cerr := rec.CloseWith(recorder.Meta{Provider: "codex", CLIVersion: a.cliVersion("codex"),
-			Argv: srv.Argv(), CWD: a.workspaceDir, RecordedAt: time.Now().UTC().Format(time.RFC3339),
-			ProcessStillRunning: true, StderrTail: srv.StderrSnapshot()})
-		if err := errors.Join(stopErr, cerr); err != nil {
-			recErrText = err.Error()
-		}
-	}
-	var p struct {
-		Turn struct {
-			Status string `json:"status"`
-		} `json:"turn"`
-	}
-	_ = json.Unmarshal(params, &p)
-	runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "codex",
-		"turnStatus": p.Turn.Status, "processStillRunning": true,
-		"stderrTail": srv.StderrSnapshot(), "recorderError": recErrText})
-}
-
-func (a *App) finishCodexTurnWithError(srv *codex.Server, msg string) {
-	a.mu.Lock()
-	rec, active := a.codexRec, a.codexActive
-	a.codexRec, a.codexActive = nil, false
-	a.mu.Unlock()
-	var recErrText string
-	if active && rec != nil {
-		stopErr := srv.Conn().StopRecording()
-		cerr := rec.CloseWith(recorder.Meta{Provider: "codex", Argv: srv.Argv(),
-			RecordedAt: time.Now().UTC().Format(time.RFC3339),
-			ProcessStillRunning: true, StderrTail: srv.StderrSnapshot()})
-		if err := errors.Join(stopErr, cerr); err != nil {
-			recErrText = err.Error()
-		}
+	if err != nil {
+		recErrText = err.Error()
 	}
 	runtime.EventsEmit(a.ctx, "session:done", map[string]any{"provider": "codex",
-		"error": msg, "processStillRunning": true, "recorderError": recErrText})
+		"processStillRunning": true, "stderrTail": stderr, "recorderError": recErrText})
+	return err
 }
 
 // RestartCodexServerRecorded：B1 受控重啟 probe（薄封裝 codex.RunHandshakeProbe，
-// 生命週期 Begin → Handshake → Stop → CloseWith 與四階段失敗處置在 Task 8 以測試固定）。
+// 生命週期 Begin → Handshake → Stop → CloseWith 與四階段失敗處置在 M0 Task 8 以測試固定）。
 func (a *App) RestartCodexServerRecorded(recordCase string) error {
 	newRec := func() (*recorder.Recorder, error) {
 		return recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
@@ -799,7 +914,7 @@ func (a *App) StartLogin(provider string) error {
 		return nil
 	case "claude":
 		// 官方命令 claude auth login 為互動式（fixture claude-auth-help.txt）：
-		// 系統終端機 fallback + 每 5s 輪詢 auth status、5 分鐘逾時（v1.5）。
+		// 系統終端機 fallback + 每 5s 輪詢 auth status、5 分鐘逾時。
 		script := fmt.Sprintf("tell application \"Terminal\" to do script %q",
 			a.claudeCLIPath()+" auth login")
 		if err := exec.Command("osascript", "-e", "tell application \"Terminal\" to activate").Run(); err != nil {
