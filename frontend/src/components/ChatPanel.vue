@@ -49,9 +49,9 @@ watch(() => s.chat.length + (s.chat.at(-1)?.text.length ?? 0), () =>
 <style scoped>
 .chat { display: flex; flex-direction: column; height: 100%; }
 .msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-.bubble { max-width: 76%; padding: 8px 12px; border-radius: 10px; text-align: left; white-space: pre-wrap; }
-.bubble.user { align-self: flex-end; background: var(--bg-bubble-user); }
-.bubble.assistant { align-self: flex-start; background: var(--bg-bubble-assistant); }
+.bubble { max-width: 76%; padding: 8px 12px; border-radius: var(--radius-l); text-align: left; white-space: pre-wrap; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); line-height: 1.45; }
+.bubble.user { align-self: flex-end; background: var(--bg-bubble-user); border-bottom-right-radius: var(--radius-s); }
+.bubble.assistant { align-self: flex-start; background: var(--bg-bubble-assistant); border-bottom-left-radius: var(--radius-s); }
 .thinking pre { font-size: 12px; color: var(--text-muted); white-space: pre-wrap; }
 .cursor { animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }

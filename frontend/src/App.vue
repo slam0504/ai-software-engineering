@@ -103,7 +103,8 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-nav { display: flex; gap: 4px; padding: 4px 8px; }
+nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); }
+nav button { border: none; background: transparent; color: var(--text-muted); }
 nav .active { background: var(--bg-bubble-user); color: #fff; }
 main > :not(nav) { flex: 1; min-height: 0; }
 .tl { border-top: 1px solid var(--border); overflow: hidden; }

@@ -64,8 +64,9 @@ function toggle(set: Set<number> | Set<string>, key: never) {
 </template>
 
 <style scoped>
-.timeline { height: 100%; overflow-y: auto; padding: 6px 10px; font-size: 12px; text-align: left; }
-.row { margin: 2px 0; }
+.timeline { height: 100%; overflow-y: auto; padding: 6px 10px; font-size: var(--fs-s); text-align: left; }
+.row { margin: 0; padding: 2px 4px; border-radius: var(--radius-s); }
+.row:hover { background: var(--bg-panel); }
 .kind { color: var(--accent); margin-right: 8px; }
 .row.tool_use .sum { color: var(--ok); }
 .row.approval .sum, .row.approval_decision .sum { color: var(--warn); }
