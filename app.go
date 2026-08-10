@@ -51,7 +51,6 @@ type App struct {
 	auditF  *os.File
 
 	mu              sync.Mutex
-	activeProv      string
 	broker          *approval.Broker
 	claudeSess      *claude.Session
 	claudeSessionID string
@@ -59,6 +58,7 @@ type App struct {
 	claudeLease     *appcore.RecordingLease
 
 	codexSingle  codex.Single[*codex.Server]
+	codexConn    *codex.Conn // wireCodexConn 記錄；interrupt 用（fake wire 測試同路徑）
 	runner       *codex.ThreadRunner
 	track        appcore.TurnTrack
 	codexLease   *appcore.RecordingLease
@@ -161,11 +161,11 @@ func (a *App) watchDiagram(path string) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	if err := a.EndSession(); err != nil { // active session 走同一收尾編排
-		a.audit("shutdown_end_session_error", map[string]any{"error": err.Error()})
+	if err := a.forcedShutdown(); err != nil { // 並行 forced path（M1.5 plan D4）
+		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
 	if a.manager != nil {
-		_ = a.manager.Close() // pending queue 由 abort+flush 兜底
+		_ = a.manager.Close() // 全部 finalize 之後才關 sink（pending queue abort+flush 兜底）
 	}
 	if srv, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
 		_ = srv.Terminate()
@@ -177,6 +177,56 @@ func (a *App) shutdown(ctx context.Context) {
 	if br != nil {
 		_ = br.Close()
 	}
+}
+
+// forcedShutdown：shutdown 專用並行收尾（正常 EndSessionFlow 會被 busy／pending
+// submit 擋住，無法保證 E8）。每個 active provider：先 interrupt／terminate active
+// turn → 走收尾；EndSessionFlow 被 lifecycle 狀態拒絕時直接 teardown 兜底（lease
+// 冪等）。兩邊都被等待、錯誤 errors.Join 保留、一邊失敗不跳過另一邊。
+func (a *App) forcedShutdown() error {
+	a.mu.Lock()
+	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
+	runner, klease := a.runner, a.codexLease
+	a.mu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	if sess != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = sess.Terminate() // interrupt 先行：加速 CloseSequence quiesce
+			if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil,
+				a.claudeTeardown(sess, done, clease)); err != nil {
+				terr := a.claudeTeardown(sess, done, clease)() // lifecycle 擋住：直接收（冪等）
+				errs[0] = errors.Join(err, terr)
+			}
+		}()
+	}
+	if runner != nil || klease != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if runner != nil && runner.ActiveTurnID() != "" { // interrupt active turn（best effort）
+				a.mu.Lock()
+				conn := a.codexConn
+				a.mu.Unlock()
+				if params, perr := a.track.InterruptParams(); perr == nil && conn != nil {
+					ictx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_, _ = conn.Call(ictx, codex.MethodTurnInterrupt, params)
+					cancel()
+				}
+			}
+			if err := appcore.EndSessionFlow(a.manager, contract.ProviderCodex, nil, func() error {
+				return a.codexTeardown(klease)
+			}); err != nil {
+				terr := a.codexTeardown(klease) // lifecycle 擋住：直接收（冪等）
+				errs[1] = errors.Join(err, terr)
+			}
+		}()
+	}
+	wg.Wait() // 兩邊都必須被等待
+	return errors.Join(errs[0], errs[1])
 }
 
 // ---- helpers ----
@@ -499,15 +549,16 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 	}
 }
 
-// SendMessage：既有 session 的後續輪（僅 phaseActive 允許；錯誤原樣回 UI）。
-func (a *App) SendMessage(prompt string) error {
-	a.mu.Lock()
-	prov, sess, runner := a.activeProv, a.claudeSess, a.runner
-	a.mu.Unlock()
-	if prov != "claude" && prov != "codex" {
-		return errors.New("no active session")
+// SendMessage：指定 provider 既有 session 的後續輪（僅該 slot phaseActive 允許；
+// 錯誤原樣回 UI）。雙 session 並存：一個 provider busy 不影響另一個。
+func (a *App) SendMessage(provider, prompt string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
 	}
-	pv := contract.Provider(prov)
+	pv := contract.Provider(provider)
+	a.mu.Lock()
+	sess, runner := a.claudeSess, a.runner
+	a.mu.Unlock()
 	id, err := a.manager.BeginSubmit(pv)
 	if err != nil {
 		return err
@@ -538,35 +589,31 @@ func (a *App) SendMessage(prompt string) error {
 	}
 }
 
-// EndSession：唯一收尾編排（appcore.EndSessionFlow）。冪等；ErrProviderBusy
-// 等真實錯誤原樣回 UI（前端「New」須成功後才 reset）。
-func (a *App) EndSession() error {
+// EndSession：指定 provider 的收尾編排（appcore.EndSessionFlow）。冪等；
+// ErrProviderBusy 等真實錯誤原樣回 UI。
+func (a *App) EndSession(provider string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
 	a.mu.Lock()
-	prov := a.activeProv
 	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
 	runner, klease := a.runner, a.codexLease
 	a.mu.Unlock()
-	switch prov {
-	case "claude":
+	if provider == "claude" {
 		return appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, clease))
-	case "codex":
-		busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
-		return appcore.EndSessionFlow(a.manager, contract.ProviderCodex, busy, func() error {
-			return a.codexTeardown(klease)
-		})
-	default: // 無 active provider：兩個 slot 各自冪等收尾
-		err1 := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, func() error { return nil })
-		err2 := appcore.EndSessionFlow(a.manager, contract.ProviderCodex, nil, func() error { return nil })
-		return errors.Join(err1, err2)
 	}
+	busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
+	return appcore.EndSessionFlow(a.manager, contract.ProviderCodex, busy, func() error {
+		return a.codexTeardown(klease)
+	})
 }
 
-func (a *App) TerminateSession() error {
-	a.mu.Lock()
-	prov, sess := a.activeProv, a.claudeSess
-	a.mu.Unlock()
-	switch prov {
+func (a *App) TerminateSession(provider string) error {
+	switch provider {
 	case "claude":
+		a.mu.Lock()
+		sess := a.claudeSess
+		a.mu.Unlock()
 		if sess == nil {
 			return errors.New("no active claude session")
 		}
@@ -576,16 +623,18 @@ func (a *App) TerminateSession() error {
 		if err != nil {
 			return err
 		}
-		srv, err := a.currentAppServer()
-		if err != nil {
-			return err
+		a.mu.Lock()
+		conn := a.codexConn
+		a.mu.Unlock()
+		if conn == nil {
+			return errors.New("codex app-server not running")
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 		defer cancel()
-		_, err = srv.Conn().Call(ctx, codex.MethodTurnInterrupt, params)
+		_, err = conn.Call(ctx, codex.MethodTurnInterrupt, params)
 		return err
 	default:
-		return errors.New("no active session")
+		return fmt.Errorf("unknown provider %q", provider)
 	}
 }
 
@@ -710,7 +759,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 
 	a.mu.Lock()
 	a.claudeSess, a.claudePumpDone, a.claudeLease = sess, done, lease
-	a.claudeSessionID, a.activeProv = "", "claude"
+	a.claudeSessionID = ""
 	a.mu.Unlock()
 
 	commitCh := make(chan bool, 1)
@@ -758,7 +807,6 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 		a.mu.Lock()
 		if a.claudeSess == sess {
 			a.claudeSess, a.claudePumpDone, a.claudeLease = nil, nil, nil
-			a.activeProv = ""
 		}
 		br := a.broker
 		a.broker = nil
@@ -815,6 +863,9 @@ func (a *App) currentRunner() *codex.ThreadRunner {
 }
 
 func (a *App) wireCodexConn(conn *codex.Conn) {
+	a.mu.Lock()
+	a.codexConn = conn
+	a.mu.Unlock()
 	conn.OnNotification(func(method string, params json.RawMessage) {
 		switch method {
 		case codex.MethodAccountLoginCompleted, codex.MethodAccountUpdated:
@@ -962,7 +1013,7 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 	}
 
 	a.mu.Lock()
-	a.codexLease, a.activeProv = lease, "codex"
+	a.codexLease = lease
 	a.mu.Unlock()
 
 	// init envelope（M0 行為保留）：UI 的 sessionId／taskId 來源。此刻 submit
@@ -988,9 +1039,6 @@ func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
 	}
 	a.mu.Lock()
 	a.runner, a.codexLease = nil, nil
-	if a.activeProv == "codex" {
-		a.activeProv = ""
-	}
 	a.mu.Unlock()
 	a.track.NoteEnded()
 	stderr := ""

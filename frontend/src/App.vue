@@ -20,7 +20,7 @@ const cliInfo = ref<Record<string, string>>({})
 onMounted(async () => {
   s.setBindings({
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
-    SendMessage: (t) => SendMessage(t),
+    SendMessage: (t) => SendMessage(s.provider, t),
   })
   EventsOn('workbench:event', (e: any) => s.apply(e))
   EventsOn('session:done', (d: any) => s.applyDone(d))

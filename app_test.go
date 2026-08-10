@@ -126,6 +126,18 @@ type fakeCodexWire struct {
 	out   io.Writer
 	mu    sync.Mutex
 	onReq func(f codex.Frame)
+	seen  []codex.Frame
+}
+
+func (w *fakeCodexWire) sawMethod(method string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, f := range w.seen {
+		if f.Method == method {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *fakeCodexWire) send(v any) {
@@ -160,6 +172,7 @@ func newFakeCodexConn(t *testing.T) (*codex.Conn, *fakeCodexWire) {
 			}
 			if f.Method != "" && f.ID != nil { // client request；response 給 server request 的忽略
 				w.mu.Lock()
+				w.seen = append(w.seen, f)
 				h := w.onReq
 				w.mu.Unlock()
 				if h != nil {
@@ -251,7 +264,7 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 // P1 迴歸（第二輪 review）：start 交易 abort（如 shutdown 與 StartSession 交錯，
 // Accept 得 ErrClosed）時，reaper 不得等 process EOF——MultiTurn CLI 仍在等
 // 輸入，必須立即 teardown：process 界限內退出、lease finalized、
-// claudeSess／activeProv／broker 全清除。
+// claudeSess／broker 全清除。
 func TestClaudeAbortedStartIsReclaimed(t *testing.T) {
 	a, ui := newTestApp(t)
 	bin := a.claudeCLIPath()
@@ -273,7 +286,7 @@ func TestClaudeAbortedStartIsReclaimed(t *testing.T) {
 	waitFor(t, "state reclaimed", func() bool {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		return a.claudeSess == nil && a.activeProv == "" && a.broker == nil
+		return a.claudeSess == nil && a.broker == nil
 	})
 	meta, err := os.ReadFile(filepath.Join(a.stateDir, "recordings", "claude-abort.meta.json"))
 	if err != nil {
@@ -349,5 +362,245 @@ func TestWorkspaceReadSecurity(t *testing.T) {
 	}
 	if _, err := a.ListWorkspace(".."); err == nil {
 		t.Fatal("list escape must be rejected")
+	}
+}
+
+// ---- M1.5-T2：雙 session 並存與 forced shutdown ----
+
+// writeMultiTurnClaude：每讀一行輸出一輪 assistant+result；stdin 關閉即退出。
+func writeMultiTurnClaude(t *testing.T, a *App) {
+	t.Helper()
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nwhile read -r _line; do\n" +
+		"printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startCodexForTest：以 production 交易（BeginNewSessionSubmit→startCodexHost→Accept）
+// 建立 codex session（StartSession 的 codex 分支等價，host 換 fake wire）。
+func startCodexForTest(t *testing.T, a *App, wire *fakeCodexWire, conn *codex.Conn, recordCase, task string) {
+	t.Helper()
+	var turnSeq atomic.Int32
+	wire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodInitialize:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		case codex.MethodThreadStart, codex.MethodThreadResume:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{"thread": map[string]any{"id": "t1"}}})
+		case codex.MethodTurnStart:
+			turnID := fmt.Sprintf("turn-%d", turnSeq.Add(1))
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			// 隨即完成 turn（解 busy）；busy 情境由個別測試覆蓋 onReq
+			wire.send(map[string]any{"method": codex.MethodTurnCompleted,
+				"params": map[string]any{"threadId": "t1", "turn": map[string]any{"id": turnID, "status": "completed"}}})
+		}
+	})
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	if err := conn.Handshake(hctx, clientInfo()); err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	threadID, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi codex", "", recordCase, "untrusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.manager.AcceptSubmit(contract.ProviderCodex, id, threadID, "hi codex"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDualSessionsConcurrently(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+
+	if err := a.StartSession("claude", "hi claude", "", "claude-dual", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "codex-dual", "task-x")
+	if !a.manager.SessionActive(contract.ProviderClaude) || !a.manager.SessionActive(contract.ProviderCodex) {
+		t.Fatal("both sessions must be active concurrently")
+	}
+
+	// 各自 SendMessage 一輪（claude 等 result 解鎖後送；codex turn/start 立即回）
+	waitFor(t, "claude first result", func() bool {
+		return len(ui.findEnvKind("result")) >= 1
+	})
+	if err := a.SendMessage("claude", "round 2"); err != nil {
+		t.Fatalf("claude send: %v", err)
+	}
+	if err := a.SendMessage("codex", "round 2"); err != nil {
+		t.Fatalf("codex send while claude busy: %v", err) // 跨 provider 不阻塞
+	}
+	waitFor(t, "claude second result", func() bool { return len(ui.findEnvKind("result")) >= 2 })
+
+	// 事件 provider／task 隔離
+	ui.mu.Lock()
+	for _, e := range ui.envs {
+		if e.Provider == "claude" && e.TaskID != "" && e.TaskID != "task-c" {
+			ui.mu.Unlock()
+			t.Fatalf("claude envelope carries wrong task: %+v", e)
+		}
+		if e.Provider == "codex" && e.TaskID != "" && e.TaskID != "task-x" {
+			ui.mu.Unlock()
+			t.Fatalf("codex envelope carries wrong task: %+v", e)
+		}
+	}
+	ui.mu.Unlock()
+
+	if err := a.EndSession("claude"); err != nil {
+		t.Fatalf("end claude: %v", err)
+	}
+	if err := a.EndSession("codex"); err != nil {
+		t.Fatalf("end codex: %v", err)
+	}
+	for _, name := range []string{"claude-dual.meta.json", "codex-dual.meta.json"} { // 錄流各自收尾
+		if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", name)); err != nil {
+			t.Fatalf("recording meta %s: %v", name, err)
+		}
+	}
+}
+
+func TestEndOneProviderLeavesOtherActive(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	if err := a.StartSession("claude", "hi", "", "", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "", "task-x")
+	if err := a.EndSession("claude"); err != nil {
+		t.Fatal(err)
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) {
+		t.Fatal("claude must be ended")
+	}
+	if !a.manager.SessionActive(contract.ProviderCodex) { // 另一 provider 不受影響
+		t.Fatal("codex must stay active")
+	}
+	if err := a.EndSession("codex"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShutdownForcedWaitsForBoth(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	if err := a.StartSession("claude", "hi", "", "claude-fsd", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "codex-fsd", "task-x")
+	// 起一個不完成的 turn（busy）；interrupt 回應正常
+	wire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodTurnStart:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": "turn-busy", "status": "inProgress"}}})
+		case codex.MethodTurnInterrupt:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		}
+	})
+	if err := a.SendMessage("codex", "long task"); err != nil {
+		t.Fatal(err)
+	}
+	a.track.NoteStarted([]byte(`{"threadId":"t1","turn":{"id":"turn-busy"}}`))
+	if a.currentRunner().ActiveTurnID() == "" {
+		t.Fatal("precondition: codex turn must be active")
+	}
+
+	if err := a.forcedShutdown(); err != nil {
+		t.Fatalf("forced shutdown: %v", err)
+	}
+	if !wire.sawMethod(codex.MethodTurnInterrupt) { // busy turn 先被 interrupt
+		t.Fatal("forced shutdown must interrupt the active codex turn")
+	}
+	for _, name := range []string{"claude-fsd.meta.json", "codex-fsd.meta.json"} { // 兩邊 lease 都 finalize
+		if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", name)); err != nil {
+			t.Fatalf("lease not finalized (%s): %v", name, err)
+		}
+	}
+	if len(ui.find("session:done")) < 2 { // 兩邊 session:done 都發出
+		t.Fatalf("session:done count = %d, want >= 2", len(ui.find("session:done")))
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+		t.Fatal("both sessions must be ended")
+	}
+}
+
+func TestShutdownJoinsErrors(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	if err := a.StartSession("claude", "hi", "", "", "task-c", ""); err != nil { // claude 無錄流
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "codex-joinerr", "task-x")
+	// 弄壞 codex meta 寫入（claude 無錄流不受影響）
+	if err := os.Chmod(filepath.Join(a.stateDir, "recordings"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(a.stateDir, "recordings"), 0o755) })
+
+	err := a.forcedShutdown()
+	if err == nil { // codex meta 寫失敗必須以 errors.Join 浮出
+		t.Fatal("codex lease error must surface")
+	}
+	waitFor(t, "claude session:done despite codex error", func() bool {
+		for _, e := range ui.find("session:done") {
+			if d, ok := e.data.(map[string]any); ok && d["provider"] == "claude" {
+				return true
+			}
+		}
+		return false
+	})
+	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+		t.Fatal("one side's error must not skip the other side's teardown")
+	}
+}
+
+func TestShutdownHungProviderIsBounded(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	if err := a.StartSession("claude", "hi", "", "", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "", "task-x")
+	wire.setOnReq(func(f codex.Frame) {
+		if f.Method == codex.MethodTurnStart {
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": "turn-hang", "status": "inProgress"}}})
+		}
+		// interrupt 完全無回應（hang）：靠 5s ctx timeout 兜底
+	})
+	if err := a.SendMessage("codex", "long task"); err != nil {
+		t.Fatal(err)
+	}
+	a.track.NoteStarted([]byte(`{"threadId":"t1","turn":{"id":"turn-hang"}}`))
+
+	start := time.Now()
+	_ = a.forcedShutdown() // interrupt timeout 屬 best-effort，不影響收尾
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("forced shutdown must be bounded, took %v", elapsed)
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+		t.Fatal("hung interrupt must not block either teardown")
 	}
 }

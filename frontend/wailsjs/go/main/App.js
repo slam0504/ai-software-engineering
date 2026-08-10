@@ -14,8 +14,8 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
-export function EndSession() {
-  return window['go']['main']['App']['EndSession']();
+export function EndSession(arg1) {
+  return window['go']['main']['App']['EndSession'](arg1);
 }
 
 export function ListWorkspace(arg1) {
@@ -42,8 +42,8 @@ export function RestartCodexServerRecorded(arg1) {
   return window['go']['main']['App']['RestartCodexServerRecorded'](arg1);
 }
 
-export function SendMessage(arg1) {
-  return window['go']['main']['App']['SendMessage'](arg1);
+export function SendMessage(arg1, arg2) {
+  return window['go']['main']['App']['SendMessage'](arg1, arg2);
 }
 
 export function StartLogin(arg1) {
@@ -54,6 +54,6 @@ export function StartSession(arg1, arg2, arg3, arg4, arg5, arg6) {
   return window['go']['main']['App']['StartSession'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
-export function TerminateSession() {
-  return window['go']['main']['App']['TerminateSession']();
+export function TerminateSession(arg1) {
+  return window['go']['main']['App']['TerminateSession'](arg1);
 }

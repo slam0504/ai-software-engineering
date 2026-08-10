@@ -134,7 +134,7 @@ export const useSession = defineStore('session', {
             this.recordCase, this.taskLabel, this.approvalPolicy)
           this.active = true
         } else {
-          await this.bindings.SendMessage(text)
+          await this.bindings.SendMessage(this.provider, text)
         }
         // 不本地新增 user 氣泡：等 host 的 canonical user envelope
       } catch (e) {

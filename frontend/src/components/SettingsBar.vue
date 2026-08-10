@@ -39,11 +39,11 @@ async function call(fn: () => Promise<unknown>, label: string) {
     <input v-model="s.recordCase" class="w-160" :placeholder="s.provider + '-case（錄流，可空）'" />
     <input v-model="resumeInput" class="w-200" placeholder="resume id（可空）" />
     <button title="結束目前 session（quiesce 舊 provider）後開新對話"
-      @click="call(async () => { await EndSession(); s.reset() }, 'new')">New</button>
+      @click="call(async () => { await EndSession(s.provider); s.reset() }, 'new')">New</button>
     <!-- EndSession 冪等（無 active session 回 nil）；真實錯誤由 call() 顯示且不 reset -->
 
-    <button @click="call(TerminateSession, 'terminate')">Terminate</button>
-    <button @click="call(EndSession, 'end')">End</button>
+    <button @click="call(() => TerminateSession(s.provider), 'terminate')">Terminate</button>
+    <button @click="call(() => EndSession(s.provider), 'end')">End</button>
     <span class="spacer" />
     <button @click="call(() => AuthStatus(s.provider), 'auth')">Auth</button>
     <button @click="call(() => StartLogin(s.provider), 'login')">Login</button>

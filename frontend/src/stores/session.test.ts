@@ -81,7 +81,7 @@ describe('session store', () => {
     expect(start).toHaveBeenCalledOnce()
     s.apply(env({ kind: 'result' })) // busy 解鎖
     await s.submit('two')
-    expect(send).toHaveBeenCalledWith('two')
+    expect(send).toHaveBeenCalledWith('claude', 'two')
   })
 
   it('submit failure pushes error and unlocks without user bubble', async () => {
