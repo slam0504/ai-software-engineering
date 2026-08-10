@@ -46,6 +46,8 @@ export const useSession = defineStore('session', {
 
   getters: {
     costDisplay: (s): string => (s.totals.cost > 0 ? '$' + s.totals.cost.toFixed(4) : '—'),
+    // per-provider resume 記憶：切 provider 顯示各自的值（寫入走 setResumeInput）
+    resumeInput: (s): string => s.resume[s.provider] ?? '',
   },
 
   actions: {
@@ -130,6 +132,31 @@ export const useSession = defineStore('session', {
       } catch (e) {
         this.pushError(String((e as Error)?.message ?? e))
       }
+    },
+
+    setResumeInput(v: string) {
+      this.resume[this.provider] = v
+    },
+
+    note(msg: string) {
+      this.timeline.push({
+        env: { event_id: 'ui-note-' + this.timeline.length, ts: new Date().toISOString(),
+          provider: this.provider, kind: 'note', text: msg },
+      })
+      this.noiseGroup = -1
+    },
+
+    // session:done（exit/stderr/recorderError）入 timeline；session 已結束 →
+    // busy 解鎖、active 清除（下一次 submit 走 StartSession）。
+    applyDone(d: Record<string, unknown>) {
+      this.timeline.push({
+        env: { event_id: 'ui-done-' + this.timeline.length, ts: new Date().toISOString(),
+          provider: String(d?.provider ?? this.provider), kind: 'session_done',
+          text: JSON.stringify(d) },
+      })
+      this.noiseGroup = -1
+      this.busy = false
+      this.active = false
     },
 
     pushError(msg: string) {

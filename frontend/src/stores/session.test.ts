@@ -93,6 +93,34 @@ describe('session store', () => {
     expect(s.timeline.at(-1)!.env.error).toContain('busy')
   })
 
+  it('note enters timeline as info item', () => {
+    const s = useSession()
+    s.note('auth ok')
+    expect(s.timeline.at(-1)!.env).toMatchObject({ kind: 'note', text: 'auth ok' })
+  })
+
+  it('applyDone records session end and clears active/busy', () => {
+    const s = useSession()
+    s.active = true
+    s.busy = true
+    s.applyDone({ provider: 'claude', exitCode: 0, recorderError: '' })
+    expect(s.timeline.at(-1)!.env.kind).toBe('session_done')
+    expect(s.timeline.at(-1)!.env.text).toContain('exitCode')
+    expect(s.busy).toBe(false)
+    expect(s.active).toBe(false)
+  })
+
+  it('remembers resume per provider', () => {
+    const s = useSession()
+    s.setResumeInput('claude-id')
+    s.provider = 'codex'
+    expect(s.resumeInput).toBe('')
+    s.setResumeInput('codex-id')
+    expect(s.resumeInput).toBe('codex-id')
+    s.provider = 'claude'
+    expect(s.resumeInput).toBe('claude-id')
+  })
+
   it('groups consecutive system noise in timeline', () => {
     const s = useSession()
     s.apply(env({ kind: 'system_other' }))
