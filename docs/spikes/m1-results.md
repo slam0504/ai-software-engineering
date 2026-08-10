@@ -59,7 +59,7 @@
 | V4 檔案樹＋預覽 | PASS | 懶載入樹瀏覽 repo；`v4-preview-test.md`：h1/strong 渲染、mermaid 區塊→SVG、`<script>` 被 DOMPurify 消毒；`sample.mmd` 編輯存檔 1 秒內重渲染（"Rerendered" 顯示）；symlink 指 /etc → `path escapes workspace` 錯誤 |
 | V5 approvalPolicy | PASS | untrusted：touch 彈核可（V0.7）；never：同 prompt 不彈、直接執行（`v5-never.txt` 建立、該 session approval envelope 0 筆）。**風險如實記錄：never 下寫入指令無人審即執行** |
 | V6 稽核 JSONL | PASS | `events.jsonl` 621 envelopes；event_id 嚴格單調；15 個 `role=user` message **全部**緊跟 `state_change(waiting)`（coordinator user-first live 證據）；抽 3 筆對照 UI（user text＝氣泡、approval raw＝彈窗內容、result cost 0.412835＝StatusBar $0.4128）；kinds 涵蓋 approval/approval_decision/usage/tool_use；無 stream_error（AuditErr nil） |
-| 封裝 smoke | 待 owner | bundled `.app` 需獨立視窗操作，無法以 devserver 驅動——留待 owner 雙 provider 各 1 輪 |
+| 封裝 smoke | PASS（owner 2026-08-10 執行） | bundled `.app`（Finder 啟動，workspace fallback `home`、tools `bundle`、startup_error 空）：claude 2 輪 session（result ok、cost 累計、其中一輪 approval E2E Allow）＋codex 1 輪（init thread id、usage `provider_latest` 21858/72、result ok）；`~/.workbench/events.jsonl` event_id 單調。過程附帶確認：active session 期間切 provider 下拉不影響進行中 session（訊息仍送原 provider），New 之後才以新 provider 開 session——符合設計 |
 
 ### Live 驗收中發現並修正（dev 過程 fix，均有測試或迴歸證據）
 
