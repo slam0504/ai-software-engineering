@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/ports"
 )
 
 func fakeCfg(t *testing.T, env ...string) Config {
@@ -22,6 +23,84 @@ func drain(s *Session) []contract.Kind {
 		ks = append(ks, ev.Kind)
 	}
 	return ks
+}
+
+var _ ports.Turns = (*Session)(nil)       // 編譯期介面契約
+var _ ports.Diagnostics = (*Session)(nil) // Argv 診斷能力
+
+func TestMultiTurnSendAndTurnBoundaries(t *testing.T) {
+	cfg := fakeCfg(t, "FAKE_MULTI=1")
+	cfg.MultiTurn = true
+	cfg.Prompt = "first"
+	s, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results int
+	events := s.Events()
+	waitResult := func() {
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					t.Fatal("stream closed before result")
+				}
+				if ev.Kind == contract.KindResult {
+					results++
+					return
+				}
+			case <-deadline:
+				t.Fatal("no result within 5s")
+			}
+		}
+	}
+	waitResult() // 第 1 輪（Start 的 prompt）
+	if err := s.Send("second"); err != nil {
+		t.Fatal(err)
+	}
+	waitResult()
+	if err := s.Send("third"); err != nil {
+		t.Fatal(err)
+	}
+	waitResult()
+	if results != 3 {
+		t.Fatalf("results = %d", results)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range events { // drain 至 EOF
+	}
+	if ex := s.Wait(); ex.Code != 0 || !ex.Exited {
+		t.Fatalf("exit = %+v", ex)
+	}
+}
+
+func TestSendAfterCloseErrors(t *testing.T) {
+	cfg := fakeCfg(t, "FAKE_MULTI=1")
+	cfg.MultiTurn = true
+	s, _ := Start(context.Background(), cfg)
+	_ = s.Close()
+	if err := s.Send("x"); err == nil {
+		t.Fatal("Send after Close must error")
+	}
+	drain(s)
+	s.Wait()
+}
+
+func TestSingleTurnBehaviorUnchanged(t *testing.T) { // M0 回歸
+	s, err := Start(context.Background(), fakeCfg(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks := drain(s)
+	if len(ks) != 3 {
+		t.Fatalf("single-turn kinds = %v", ks)
+	}
+	if err := s.Send("x"); err == nil {
+		t.Fatal("single-turn Send must error (stdin closed)")
+	}
 }
 
 func TestHappyPathAndArgv(t *testing.T) {

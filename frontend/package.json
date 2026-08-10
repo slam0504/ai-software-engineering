@@ -6,17 +6,24 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
+    "dompurify": "^3.4.13",
+    "marked": "^18.0.9",
     "mermaid": "^11.16.1",
+    "pinia": "^4.0.2",
     "vue": "^3.5.0"
   },
   "devDependencies": {
     "@babel/types": "^7.26.0",
     "@vitejs/plugin-vue": "^6.0.0",
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^30.0.1",
     "typescript": "^5.6.3",
     "vite": "^7.0.0",
+    "vitest": "^4.1.10",
     "vue-tsc": "^2.1.0"
   }
 }

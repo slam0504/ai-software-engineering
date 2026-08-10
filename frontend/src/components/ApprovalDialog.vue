@@ -1,5 +1,4 @@
 <script setup lang="ts">
-// spike quality: to be rebuilt in M1
 import { ref } from 'vue'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ResolveApproval } from '../../wailsjs/go/main/App'

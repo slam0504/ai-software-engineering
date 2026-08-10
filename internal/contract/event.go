@@ -21,17 +21,24 @@ const (
 	KindUnknown     Kind = "unknown"      // 不認得：Raw 保留、不中斷
 	KindMalformed   Kind = "malformed"    // 解析失敗：Raw 保留、Err 必填
 	KindStreamError Kind = "stream_error" // 傳輸層錯誤（scanner / rpc）
+
+	// M1 新增（additive；app-plan §5.2 範圍內）
+	KindUsage            Kind = "usage"             // token 用量事件
+	KindStateChange      Kind = "state_change"      // state reducer 輸出
+	KindApprovalDecision Kind = "approval_decision" // 核可決定入事件流
 )
 
 type Event struct {
 	Provider  Provider
 	Kind      Kind
 	SessionID string
+	Role      string // ""|user|assistant|tool|system——adapter 明確標注（M1）
 	Raw       []byte // provider wire 原文，一律保留
 	Text      string // delta / message 的文字
 	Thinking  string
 	IsError   bool    // result 用
 	CostUSD   float64 // result 用（provider 有提供才填）
+	Usage     *Usage  // provider 有提供才填（wire 原語意；session 級收斂在 appcore）
 	Err       error
 }
 

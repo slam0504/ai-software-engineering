@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
@@ -24,6 +28,7 @@ type Config struct {
 	Env                  []string
 	TermGrace            time.Duration // 預設 5s
 	MaxLineBytes         int           // scanner 行上限，預設 16MB；超過 → KindStreamError
+	MultiTurn            bool          // true：stdin 保持開啟（Send 逐輪送 user message）
 }
 
 func (c Config) args() []string {
@@ -54,6 +59,9 @@ type Session struct {
 	p      *proc.Proc
 	argv   []string
 	events chan contract.Event
+
+	stdinMu sync.Mutex
+	stdin   io.WriteCloser // MultiTurn 時保留；nil = 已關
 }
 
 func Start(ctx context.Context, cfg Config) (*Session, error) {
@@ -73,7 +81,6 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 		p.Wait()
 		return nil, err
 	}
-	_ = p.Stdin.Close() // M0 單回合：送完 prompt 即關
 
 	maxLine := cfg.MaxLineBytes
 	if maxLine == 0 {
@@ -81,6 +88,11 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	s := &Session{p: p, argv: append([]string{cfg.Binary}, cfg.args()...),
 		events: make(chan contract.Event, 64)}
+	if cfg.MultiTurn { // M1 多輪：stdin 保持開啟，Send 逐輪送 user message
+		s.stdin = p.Stdin
+	} else {
+		_ = p.Stdin.Close() // M0 單回合：送完 prompt 即關
+	}
 	go func() {
 		defer close(s.events)
 		sc := bufio.NewScanner(p.Stdout)
@@ -106,5 +118,40 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 func (s *Session) Events() <-chan contract.Event { return s.events }
 func (s *Session) Argv() []string                { return append([]string(nil), s.argv...) }
 func (s *Session) Terminate() error              { return s.p.Terminate() }
-func (s *Session) Wait() proc.Exit               { return s.p.Wait() } // supervisor 快取，任意時點可呼叫
 func (s *Session) PGID() int                     { return s.p.PGID() }
+
+// Wait 回傳 supervisor 快取的收尾值（任意時點可呼叫）；Session 由 supervisor
+// 回收後才返回，故恆為 Exited=true。
+func (s *Session) Wait() ports.Exit {
+	ex := s.p.Wait()
+	return ports.Exit{Exited: true, Code: ex.Code, StderrTail: ex.StderrTail}
+}
+
+// Send 寫入一則 user message（stream-json 格式同首輪）；stdin 已關或寫入失敗
+// （→ Terminate 整組）回 error。
+func (s *Session) Send(prompt string) error {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdin == nil {
+		return errors.New("claude: session stdin closed")
+	}
+	msg, _ := json.Marshal(map[string]any{"type": "user",
+		"message": map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": prompt}}}})
+	if _, err := fmt.Fprintf(s.stdin, "%s\n", msg); err != nil {
+		_ = s.p.Terminate() // 寫入失敗＝process 不可信，整組收掉
+		return err
+	}
+	return nil
+}
+
+// Close 冪等關閉 stdin（「不再有輸入」）；CLI 隨後自然收尾。
+func (s *Session) Close() error {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdin == nil {
+		return nil
+	}
+	err := s.stdin.Close()
+	s.stdin = nil
+	return err
+}
