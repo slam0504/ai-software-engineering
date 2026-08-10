@@ -309,14 +309,14 @@ func TestClaudeFastExitDoesNotLeaveDeadActiveSession(t *testing.T) {
 	}
 	waitFor(t, "session:done", func() bool { return len(ui.find("session:done")) > 0 })
 	waitFor(t, "manager idle", func() bool {
-		_, err := a.manager.BeginSubmit()
+		_, err := a.manager.BeginSubmit(contract.ProviderClaude)
 		return errors.Is(err, appcore.ErrNoSession)
 	})
-	id, err := a.manager.BeginNewSessionSubmit("task-y") // 下一個 session 可建立
+	id, err := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-y") // 下一個 session 可建立
 	if err != nil {
 		t.Fatalf("next session must be startable: %v", err)
 	}
-	_ = a.manager.RejectSubmit(id)
+	_ = a.manager.RejectSubmit(contract.ProviderClaude, id)
 }
 
 func TestWorkspaceReadSecurity(t *testing.T) {

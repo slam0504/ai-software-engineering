@@ -16,19 +16,24 @@ var (
 	ErrNoSession       = errors.New("appcore: no active session")
 	ErrStartInProgress = errors.New("appcore: session start in progress")
 	ErrEndInProgress   = errors.New("appcore: session end in progress")
+	ErrResetInProgress = errors.New("appcore: view reset in progress")
 	ErrStaleSession    = errors.New("appcore: stale session token")
+	ErrStaleReset      = errors.New("appcore: stale reset token")
 	ErrClosed          = errors.New("appcore: manager closed")
 )
 
-// SubmissionID：coordinator 的唯一 ownership token。
+// SubmissionID：coordinator 的唯一 ownership token（per slot）。
 type SubmissionID struct{ gen, seq uint64 }
 
 // SessionToken：session lifecycle token（generation + end 序號）；
 // Cancel／Finish 只認目前 outstanding 的一枚。
 type SessionToken struct{ gen, seq uint64 }
 
+// ResetToken：NewSession 的 reset ownership token（M1.5；plan §5.4）。
+type ResetToken struct{ gen, seq uint64 }
+
 type Config struct {
-	Sink                  AuditSink                    // 必填
+	Sink                  AuditSink                   // 必填
 	Emit                  func(env contract.Envelope) // 必填：UI 出口
 	ClaudeUsageCumulative bool                        // Task 4 VERDICT=per-turn → false（累加制）
 }
@@ -45,142 +50,228 @@ const (
 	phaseStarting
 	phaseActive
 	phaseEnding
+	phaseResetting // M1.5：NewSession 的「teardown → restore reset」ownership 區段
 )
 
-// Manager 是唯一序列化事件入口（單一 mutex：wrap→totals→sink→emit→state_change
-// 同鎖完成，event_id 輸出序嚴格遞增——含 fail-loud 路徑）。
-//
-// # Session lifecycle（單一 mutex 下的狀態機）
-//
-//	idle --BeginNewSessionSubmit--> starting --AcceptSubmit--> active
-//	starting --RejectSubmit--> idle
-//	active --BeginEndSession--> ending --FinishEndSession(token)--> idle
-//	ending --CancelEndSession(token)--> active
-//
-// 非法轉移一律 sentinel error；stale token 一律 no-op error。
-type Manager struct {
-	mu         sync.Mutex
-	cfg        Config
+// slot：單一 provider 的 session 狀態容器（M1.5 plan §5.3）。不對外暴露——
+// Manager 是唯一 aggregate root，所有操作帶 provider 進同一 mutex。
+type slot struct {
 	reducer    *contract.Reducer
 	taskID     string
 	totalCost  float64
 	totalUsage contract.Usage
-	auditErr   error
-	closed     bool
 
-	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken 全部失效
+	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken／ResetToken 全部失效
 	seq            uint64
-	submitting     *SubmissionID // nil = 無 owner
-	fromNewSession bool          // reservation 來自 BeginNewSessionSubmit
+	submitting     *SubmissionID
+	fromNewSession bool
 	phase          sessionPhase
 	sessionGen     uint64
 	endSeq         uint64
-	endTok         *SessionToken // 目前 outstanding 的 end token（nil = 無）
+	endTok         *SessionToken
+	resetSeq       uint64
+	resetTok       *ResetToken
 	pendingBuf     []pendingEntry
 }
 
+func newSlot() *slot { return &slot{reducer: contract.NewReducer()} }
+
+// Manager 是唯一序列化事件入口：單一 mutex 下完成 wrap→slot totals→sink→emit→
+// state_change，輸出 event_id **檔案級**嚴格遞增（跨 provider；含 fail-loud 路徑）。
+//
+// # Per-slot session lifecycle（M1.5 plan §5.4）
+//
+//	idle --BeginNewSessionSubmit--> starting --AcceptSubmit--> active
+//	starting --RejectSubmit--> idle
+//	active --BeginEndSession--> ending --FinishEndSession--> idle
+//	ending --CancelEndSession--> active
+//	idle --BeginReset--> resetting --FinishReset--> idle
+//	ending --FinishEndSessionIntoReset--> resetting（原子、無 idle 縫隙）
+//
+// resetting 期間 BeginSubmit／BeginNewSessionSubmit／BeginEndSession／第二個
+// BeginReset 一律 ErrResetInProgress。非法轉移一律 sentinel error；stale token
+// 一律 no-op error。跨 provider：一個 slot 的 pending submit 不阻塞另一個 slot。
+type Manager struct {
+	mu       sync.Mutex
+	cfg      Config
+	slots    map[contract.Provider]*slot
+	auditErr error
+	closed   bool
+}
+
 func New(cfg Config) *Manager {
-	return &Manager{cfg: cfg, reducer: contract.NewReducer()}
+	return &Manager{cfg: cfg, slots: map[contract.Provider]*slot{}}
 }
 
-// newSessionLocked：flush 殘留 queue（掛舊 task）→ 換代 → 重設。
-func (m *Manager) newSessionLocked(taskID string) {
-	m.flushLocked()
-	m.gen++ // 舊 SubmissionID／SessionToken 失效
-	m.submitting, m.fromNewSession = nil, false
-	m.phase, m.endTok = phaseIdle, nil
-	m.reducer.Reset()
-	m.taskID = taskID
-	m.totalCost, m.totalUsage = 0, contract.Usage{}
+func (m *Manager) slotLocked(p contract.Provider) *slot {
+	sl, ok := m.slots[p]
+	if !ok {
+		sl = newSlot()
+		m.slots[p] = sl
+	}
+	return sl
 }
 
-func (m *Manager) NewSession(taskID string) {
+// newSessionLocked：flush 該 slot 殘留 queue（掛舊 task）→ 換代 → 重設。
+func (m *Manager) newSessionLocked(p contract.Provider, sl *slot, taskID string) {
+	m.flushLocked(sl)
+	sl.gen++
+	sl.submitting, sl.fromNewSession = nil, false
+	sl.phase, sl.endTok, sl.resetTok = phaseIdle, nil, nil
+	sl.reducer.Reset()
+	sl.taskID = taskID
+	sl.totalCost, sl.totalUsage = 0, contract.Usage{}
+}
+
+func (m *Manager) NewSession(p contract.Provider, taskID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.newSessionLocked(taskID)
+	m.newSessionLocked(p, m.slotLocked(p), taskID)
 }
 
-// BeginNewSessionSubmit：StartSession 的單一 ownership 交易——active 檢查、換代
-// 與 reservation 在同一 mutex 內完成；併發 StartSession 恰一個取得 ownership，
-// 輸家在建立任何 process／recorder／pump 之前就收到 error。
-func (m *Manager) BeginNewSessionSubmit(taskID string) (SubmissionID, error) {
+// BeginNewSessionSubmit：StartSession 的單一 ownership 交易（per slot）。
+func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (SubmissionID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	switch m.phase {
+	sl := m.slotLocked(p)
+	switch sl.phase {
 	case phaseActive, phaseEnding:
 		return SubmissionID{}, ErrSessionActive
 	case phaseStarting:
 		return SubmissionID{}, ErrSubmitActive
+	case phaseResetting:
+		return SubmissionID{}, ErrResetInProgress
 	}
-	if m.submitting != nil {
+	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
 	}
-	m.newSessionLocked(taskID)
-	m.seq++
-	id := SubmissionID{gen: m.gen, seq: m.seq}
-	m.submitting, m.fromNewSession = &id, true
-	m.phase = phaseStarting
+	m.newSessionLocked(p, sl, taskID)
+	sl.seq++
+	id := SubmissionID{gen: sl.gen, seq: sl.seq}
+	sl.submitting, sl.fromNewSession = &id, true
+	sl.phase = phaseStarting
 	return id, nil
 }
 
-// BeginEndSession：進入 ending 並取得 token。starting → ErrStartInProgress
-// （Start 未 Accept 前 End 不得無聲成功）；pending submit → ErrSubmitActive
-// （teardown 不得與 pending submit 重疊）。
-func (m *Manager) BeginEndSession() (SessionToken, error) {
+// BeginEndSession：進入 ending 並取得 token（per slot）。
+func (m *Manager) BeginEndSession(p contract.Provider) (SessionToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SessionToken{}, ErrClosed
 	}
-	switch m.phase {
+	sl := m.slotLocked(p)
+	switch sl.phase {
 	case phaseIdle:
 		return SessionToken{}, ErrNoSession
 	case phaseStarting:
 		return SessionToken{}, ErrStartInProgress
 	case phaseEnding:
 		return SessionToken{}, ErrEndInProgress
+	case phaseResetting:
+		return SessionToken{}, ErrResetInProgress
 	}
-	if m.submitting != nil {
+	if sl.submitting != nil {
 		return SessionToken{}, ErrSubmitActive
 	}
-	m.phase = phaseEnding
-	m.endSeq++
-	tok := SessionToken{gen: m.sessionGen, seq: m.endSeq}
-	m.endTok = &tok
+	sl.phase = phaseEnding
+	sl.endSeq++
+	tok := SessionToken{gen: sl.sessionGen, seq: sl.endSeq}
+	sl.endTok = &tok
 	return tok, nil
 }
 
 // CancelEndSession：ending → active 復原（teardown 前）；stale token no-op error。
-func (m *Manager) CancelEndSession(t SessionToken) error {
+func (m *Manager) CancelEndSession(p contract.Provider, t SessionToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.phase != phaseEnding || m.endTok == nil || *m.endTok != t {
+	sl := m.slotLocked(p)
+	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
 		return ErrStaleSession
 	}
-	m.phase = phaseActive
-	m.endTok = nil
+	sl.phase = phaseActive
+	sl.endTok = nil
 	return nil
 }
 
 // FinishEndSession：收尾完成；stale token 一律 no-op error。
-func (m *Manager) FinishEndSession(t SessionToken) error {
+func (m *Manager) FinishEndSession(p contract.Provider, t SessionToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.phase != phaseEnding || m.endTok == nil || *m.endTok != t {
+	sl := m.slotLocked(p)
+	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
 		return ErrStaleSession
 	}
-	m.phase = phaseIdle
-	m.endTok = nil
+	sl.phase = phaseIdle
+	sl.endTok = nil
 	return nil
 }
 
-func (m *Manager) SessionActive() bool {
+// BeginReset：idle → resetting（NewSession 於無 active session 時的入口）。
+func (m *Manager) BeginReset(p contract.Provider) (ResetToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.phase == phaseActive
+	if m.closed {
+		return ResetToken{}, ErrClosed
+	}
+	sl := m.slotLocked(p)
+	switch sl.phase {
+	case phaseStarting:
+		return ResetToken{}, ErrStartInProgress
+	case phaseActive:
+		return ResetToken{}, ErrSessionActive
+	case phaseEnding:
+		return ResetToken{}, ErrEndInProgress
+	case phaseResetting:
+		return ResetToken{}, ErrResetInProgress
+	}
+	if sl.submitting != nil {
+		return ResetToken{}, ErrSubmitActive
+	}
+	return m.enterResetLocked(sl), nil
+}
+
+// FinishEndSessionIntoReset：ending → resetting 原子轉移（無 idle 縫隙）——
+// NewSession 於有 active session 時，收尾完成即直接持有 reset ownership。
+func (m *Manager) FinishEndSessionIntoReset(p contract.Provider, t SessionToken) (ResetToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl := m.slotLocked(p)
+	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
+		return ResetToken{}, ErrStaleSession
+	}
+	sl.endTok = nil
+	return m.enterResetLocked(sl), nil
+}
+
+func (m *Manager) enterResetLocked(sl *slot) ResetToken {
+	sl.phase = phaseResetting
+	sl.resetSeq++
+	tok := ResetToken{gen: sl.gen, seq: sl.resetSeq}
+	sl.resetTok = &tok
+	return tok
+}
+
+// FinishReset：resetting → idle；stale token 回 ErrStaleReset no-op。
+func (m *Manager) FinishReset(p contract.Provider, t ResetToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl := m.slotLocked(p)
+	if sl.phase != phaseResetting || sl.resetTok == nil || *sl.resetTok != t {
+		return ErrStaleReset
+	}
+	sl.phase = phaseIdle
+	sl.resetTok = nil
+	return nil
+}
+
+func (m *Manager) SessionActive(p contract.Provider) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.slotLocked(p).phase == phaseActive
 }
 
 func (m *Manager) Emit(ev contract.Event) {
@@ -190,91 +281,94 @@ func (m *Manager) Emit(ev contract.Event) {
 		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
 		return
 	}
-	if m.submitting != nil { // coordinator queue
-		m.pendingBuf = append(m.pendingBuf, pendingEntry{ev: ev})
+	sl := m.slotLocked(ev.Provider)
+	if sl.submitting != nil { // 只 queue 該 slot（跨 provider 不互相阻塞）
+		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
 		return
 	}
-	m.emitLocked(ev)
+	m.emitLocked(sl, ev)
 }
 
-// BeginSubmit：既有 session 的後續輪。僅 phaseActive 允許——idle → ErrNoSession、
-// starting → ErrStartInProgress、ending → ErrEndInProgress（teardown 期間不得
-// 啟動新 provider request）。
-func (m *Manager) BeginSubmit() (SubmissionID, error) {
+// BeginSubmit：既有 session 的後續輪（僅該 slot phaseActive 允許）。
+func (m *Manager) BeginSubmit(p contract.Provider) (SubmissionID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	switch m.phase {
+	sl := m.slotLocked(p)
+	switch sl.phase {
 	case phaseIdle:
 		return SubmissionID{}, ErrNoSession
 	case phaseStarting:
 		return SubmissionID{}, ErrStartInProgress
 	case phaseEnding:
 		return SubmissionID{}, ErrEndInProgress
+	case phaseResetting:
+		return SubmissionID{}, ErrResetInProgress
 	}
-	if m.submitting != nil {
+	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
 	}
-	m.seq++
-	id := SubmissionID{gen: m.gen, seq: m.seq}
-	m.submitting = &id
+	sl.seq++
+	id := SubmissionID{gen: sl.gen, seq: sl.seq}
+	sl.submitting = &id
 	return id, nil
 }
 
-func (m *Manager) checkOwnerLocked(id SubmissionID) error {
+func (m *Manager) checkOwnerLocked(sl *slot, id SubmissionID) error {
 	if m.closed {
 		return ErrClosed
 	}
-	if m.submitting == nil || *m.submitting != id || id.gen != m.gen {
+	if sl.submitting == nil || *sl.submitting != id || id.gen != sl.gen {
 		return ErrStaleSubmission
 	}
 	return nil
 }
 
-// AcceptSubmit：provider 接受後呼叫——canonical user envelope 先行 → queue 依序
-// flush（順序保證 user → state_change(waiting) → provider events）。
-func (m *Manager) AcceptSubmit(id SubmissionID, provider contract.Provider, sessionID, text string) error {
+// AcceptSubmit：canonical user envelope 先行 → 該 slot queue 依序 flush。
+func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.checkOwnerLocked(id); err != nil {
+	sl := m.slotLocked(p)
+	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
-	if m.fromNewSession { // StartSession 路徑：provider 接受即 session 存活
-		m.phase = phaseActive
-		m.sessionGen = id.gen
+	if sl.fromNewSession { // StartSession 路徑：provider 接受即 session 存活
+		sl.phase = phaseActive
+		sl.sessionGen = id.gen
 	}
-	m.submitting, m.fromNewSession = nil, false
-	m.emitLocked(contract.Event{Provider: provider, Kind: contract.KindMessage,
+	sl.submitting, sl.fromNewSession = nil, false
+	m.emitLocked(sl, contract.Event{Provider: p, Kind: contract.KindMessage,
 		Role: "user", SessionID: sessionID, Text: text,
 		Raw: []byte(`{"source":"workbench_user_input"}`)})
-	m.flushLocked()
+	m.flushLocked(sl)
 	return nil
 }
 
-func (m *Manager) RejectSubmit(id SubmissionID) error {
+func (m *Manager) RejectSubmit(p contract.Provider, id SubmissionID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.checkOwnerLocked(id); err != nil {
+	sl := m.slotLocked(p)
+	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
-	if m.fromNewSession { // StartSession 失敗：回 idle
-		m.phase = phaseIdle
+	if sl.fromNewSession { // StartSession 失敗：回 idle
+		sl.phase = phaseIdle
 	}
-	m.submitting, m.fromNewSession = nil, false
-	m.flushLocked()
+	sl.submitting, sl.fromNewSession = nil, false
+	m.flushLocked(sl)
 	return nil
 }
 
-func (m *Manager) flushLocked() {
-	buf := m.pendingBuf
-	m.pendingBuf = nil
+func (m *Manager) flushLocked(sl *slot) {
+	buf := sl.pendingBuf
+	sl.pendingBuf = nil
 	for _, e := range buf {
-		m.emitLocked(e.ev)
+		m.emitLocked(sl, e.ev)
 		if e.resolveApprove {
-			if st, changed := m.reducer.ResolveApproval(); changed {
-				m.emitStateLocked(e.ev.Provider, e.ev.SessionID, st)
+			if st, changed := sl.reducer.ResolveApproval(); changed {
+				m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
 			}
 		}
 	}
@@ -287,13 +381,14 @@ func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, too
 		m.emitClosedDroppedLocked(string(contract.KindApproval), string(provider))
 		return
 	}
+	sl := m.slotLocked(provider)
 	ev := contract.Event{Provider: provider, Kind: contract.KindApproval,
 		SessionID: sessionID, Text: toolName, Raw: raw}
-	if m.submitting != nil { // approval 同樣入 queue
-		m.pendingBuf = append(m.pendingBuf, pendingEntry{ev: ev})
+	if sl.submitting != nil { // approval 同樣入該 slot queue
+		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
 		return
 	}
-	m.emitLocked(ev)
+	m.emitLocked(sl, ev)
 }
 
 func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, decision, reason string) {
@@ -303,54 +398,55 @@ func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, de
 		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(provider))
 		return
 	}
+	sl := m.slotLocked(provider)
 	ev := contract.Event{Provider: provider, Kind: contract.KindApprovalDecision,
 		SessionID: sessionID, Text: decision, Thinking: reason,
 		Raw: []byte(`{"decision":"` + decision + `"}`)}
-	if m.submitting != nil {
-		m.pendingBuf = append(m.pendingBuf, pendingEntry{ev: ev, resolveApprove: true})
+	if sl.submitting != nil {
+		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev, resolveApprove: true})
 		return
 	}
-	m.emitLocked(ev)
-	if st, changed := m.reducer.ResolveApproval(); changed {
-		m.emitStateLocked(provider, sessionID, st)
+	m.emitLocked(sl, ev)
+	if st, changed := sl.reducer.ResolveApproval(); changed {
+		m.emitStateLocked(sl, provider, sessionID, st)
 	}
 }
 
-func (m *Manager) emitLocked(ev contract.Event) {
+func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
 	semantics := ""
 	switch {
 	case ev.Kind == contract.KindUsage && ev.Usage != nil: // codex snapshot：覆寫
-		m.totalUsage = *ev.Usage
+		sl.totalUsage = *ev.Usage
 		semantics = "provider_latest"
 	case ev.Kind == contract.KindResult:
-		m.totalCost += ev.CostUSD
+		sl.totalCost += ev.CostUSD
 		if ev.Usage != nil {
 			if m.cfg.ClaudeUsageCumulative {
-				m.totalUsage = *ev.Usage
+				sl.totalUsage = *ev.Usage
 				semantics = "provider_latest"
 			} else {
-				m.totalUsage.InputTokens += ev.Usage.InputTokens
-				m.totalUsage.OutputTokens += ev.Usage.OutputTokens
-				m.totalUsage.CachedInput += ev.Usage.CachedInput
+				sl.totalUsage.InputTokens += ev.Usage.InputTokens
+				sl.totalUsage.OutputTokens += ev.Usage.OutputTokens
+				sl.totalUsage.CachedInput += ev.Usage.CachedInput
 				semantics = "session_total"
 			}
 		}
 	}
-	env := contract.Wrap(ev, m.taskID)
+	env := contract.Wrap(ev, sl.taskID)
 	if ev.Kind == contract.KindUsage || ev.Kind == contract.KindResult {
-		snap := m.totalUsage
-		env.Usage = &snap // 輸出一律累計 snapshot
+		snap := sl.totalUsage
+		env.Usage = &snap // 輸出一律該 slot 的累計 snapshot
 		env.UsageSemantics = semantics
 	}
 	m.writeAndEmitLocked(env)
-	if st, changed := m.reducer.Apply(ev); changed {
-		m.emitStateLocked(ev.Provider, ev.SessionID, st)
+	if st, changed := sl.reducer.Apply(ev); changed {
+		m.emitStateLocked(sl, ev.Provider, ev.SessionID, st)
 	}
 }
 
-func (m *Manager) emitStateLocked(provider contract.Provider, sessionID string, st contract.SessionState) {
+func (m *Manager) emitStateLocked(sl *slot, provider contract.Provider, sessionID string, st contract.SessionState) {
 	env := contract.Wrap(contract.Event{Provider: provider, Kind: contract.KindStateChange,
-		SessionID: sessionID, Raw: []byte(`{"state":"` + string(st) + `"}`)}, m.taskID)
+		SessionID: sessionID, Raw: []byte(`{"state":"` + string(st) + `"}`)}, sl.taskID)
 	env.State = string(st)
 	m.writeAndEmitLocked(env)
 }
@@ -380,16 +476,17 @@ func (m *Manager) emitClosedDroppedLocked(kind, provider string) {
 	})
 }
 
-func (m *Manager) Totals() (float64, contract.Usage) {
+func (m *Manager) Totals(p contract.Provider) (float64, contract.Usage) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.totalCost, m.totalUsage
+	sl := m.slotLocked(p)
+	return sl.totalCost, sl.totalUsage
 }
 
-func (m *Manager) State() contract.SessionState {
+func (m *Manager) State(p contract.Provider) contract.SessionState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.reducer.Current()
+	return m.slotLocked(p).reducer.Current()
 }
 
 func (m *Manager) AuditErr() error {
@@ -398,26 +495,28 @@ func (m *Manager) AuditErr() error {
 	return m.auditErr
 }
 
-// Close：同一 mutex、closed 旗標。pending submission 存在時採顯式 abort+flush：
-// sink 關閉前把 queue 事件全部落 audit（無 user envelope）＋ fail-loud 通知。
+// Close：同一 mutex、closed 旗標。對**所有** slot 執行 abort+flush（sink 關閉前
+// queue 事件全部落 audit、無 user envelope、fail-loud 通知），之後才關 sink。
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return nil
 	}
-	if m.submitting != nil || len(m.pendingBuf) > 0 {
-		n := len(m.pendingBuf)
-		m.submitting, m.fromNewSession = nil, false
-		if m.phase == phaseStarting {
-			m.phase = phaseIdle
+	for p, sl := range m.slots {
+		if sl.submitting != nil || len(sl.pendingBuf) > 0 {
+			n := len(sl.pendingBuf)
+			sl.submitting, sl.fromNewSession = nil, false
+			if sl.phase == phaseStarting {
+				sl.phase = phaseIdle
+			}
+			m.flushLocked(sl) // sink 尚未關：queue 事件全數落 audit + UI
+			m.cfg.Emit(contract.Envelope{
+				EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
+				Provider: string(p), Kind: string(contract.KindStreamError),
+				Error: fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
+			})
 		}
-		m.flushLocked() // sink 尚未關：queue 事件全數落 audit + UI
-		m.cfg.Emit(contract.Envelope{
-			EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
-			Kind:    string(contract.KindStreamError),
-			Error:   fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
-		})
 	}
 	m.closed = true
 	return m.cfg.Sink.Close()

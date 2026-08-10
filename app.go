@@ -464,37 +464,38 @@ func (a *App) claudeSessionIDSnapshot() string {
 // StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
 // process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
 func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
-	id, err := a.manager.BeginNewSessionSubmit(taskLabel)
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	prov := contract.Provider(provider)
+	id, err := a.manager.BeginNewSessionSubmit(prov, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
 	}
-	switch provider {
-	case "claude":
+	switch prov {
+	case contract.ProviderClaude:
 		commit, serr := a.startClaude(prompt, resume, recordCase)
 		if serr != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(prov, id)
 			return serr
 		}
 		if h := a.hookAfterProviderStart; h != nil {
 			h()
 		}
-		aerr := a.manager.AcceptSubmit(id, contract.ProviderClaude, "", prompt)
+		aerr := a.manager.AcceptSubmit(prov, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
 		return aerr
-	case "codex":
+	default: // codex
 		threadID, alreadyEnded, serr := a.startCodex(prompt, resume, recordCase, approvalPolicy)
 		if serr != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(prov, id)
 			return serr
 		}
-		if err := a.manager.AcceptSubmit(id, contract.ProviderCodex, threadID, prompt); err != nil {
+		if err := a.manager.AcceptSubmit(prov, id, threadID, prompt); err != nil {
 			return err
 		}
 		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
 		return nil
-	default:
-		_ = a.manager.RejectSubmit(id)
-		return fmt.Errorf("unknown provider %q", provider)
 	}
 }
 
@@ -503,36 +504,37 @@ func (a *App) SendMessage(prompt string) error {
 	a.mu.Lock()
 	prov, sess, runner := a.activeProv, a.claudeSess, a.runner
 	a.mu.Unlock()
-	id, err := a.manager.BeginSubmit()
+	if prov != "claude" && prov != "codex" {
+		return errors.New("no active session")
+	}
+	pv := contract.Provider(prov)
+	id, err := a.manager.BeginSubmit(pv)
 	if err != nil {
 		return err
 	}
-	switch prov {
-	case "claude":
+	switch pv {
+	case contract.ProviderClaude:
 		if sess == nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return errors.New("no active claude session")
 		}
 		if err := sess.Send(prompt); err != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return err
 		}
-		return a.manager.AcceptSubmit(id, contract.ProviderClaude, a.claudeSessionIDSnapshot(), prompt)
-	case "codex":
+		return a.manager.AcceptSubmit(pv, id, a.claudeSessionIDSnapshot(), prompt)
+	default: // codex
 		if runner == nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return errors.New("no active codex thread")
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 		defer cancel()
 		if _, _, err := runner.StartTurn(ctx, prompt); err != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return err
 		}
-		return a.manager.AcceptSubmit(id, contract.ProviderCodex, runner.ThreadID(), prompt)
-	default:
-		_ = a.manager.RejectSubmit(id)
-		return errors.New("no active session")
+		return a.manager.AcceptSubmit(pv, id, runner.ThreadID(), prompt)
 	}
 }
 
@@ -546,14 +548,16 @@ func (a *App) EndSession() error {
 	a.mu.Unlock()
 	switch prov {
 	case "claude":
-		return appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, clease))
+		return appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, clease))
 	case "codex":
 		busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
-		return appcore.EndSessionFlow(a.manager, busy, func() error {
+		return appcore.EndSessionFlow(a.manager, contract.ProviderCodex, busy, func() error {
 			return a.codexTeardown(klease)
 		})
-	default: // 無 active provider：交由 EndSessionFlow 冪等處理
-		return appcore.EndSessionFlow(a.manager, nil, func() error { return nil })
+	default: // 無 active provider：兩個 slot 各自冪等收尾
+		err1 := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, func() error { return nil })
+		err2 := appcore.EndSessionFlow(a.manager, contract.ProviderCodex, nil, func() error { return nil })
+		return errors.Join(err1, err2)
 	}
 }
 
@@ -727,7 +731,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 		if !current { // EndSession 已接手
 			return
 		}
-		if err := appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, lease)); err != nil {
+		if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, lease)); err != nil {
 			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
 		}
 	}()

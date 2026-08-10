@@ -62,12 +62,12 @@ func CloseSequence(closeFn func() error, done <-chan struct{},
 
 var ErrProviderBusy = errors.New("appcore: provider busy; cannot end session now")
 
-// EndSessionFlow：EndSession 的單一編排。busyCheck 為 teardown 前置檢查
-// （nil = 無）；true → CancelEndSession + ErrProviderBusy（phase 復原、Cancel
-// 錯誤保留）。teardown 一旦開始，無論成敗都 FinishEndSession；回傳
+// EndSessionFlow：EndSession 的單一編排（per provider）。busyCheck 為 teardown
+// 前置檢查（nil = 無）；true → CancelEndSession + ErrProviderBusy（phase 復原、
+// Cancel 錯誤保留）。teardown 一旦開始，無論成敗都 FinishEndSession；回傳
 // errors.Join(teardownErr, finishErr)。無 active session 冪等回 nil。
-func EndSessionFlow(m *Manager, busyCheck func() bool, teardown func() error) error {
-	tok, err := m.BeginEndSession()
+func EndSessionFlow(m *Manager, p contract.Provider, busyCheck func() bool, teardown func() error) error {
+	tok, err := m.BeginEndSession(p)
 	if errors.Is(err, ErrNoSession) {
 		return nil // 冪等
 	}
@@ -75,10 +75,10 @@ func EndSessionFlow(m *Manager, busyCheck func() bool, teardown func() error) er
 		return err
 	}
 	if busyCheck != nil && busyCheck() {
-		cerr := m.CancelEndSession(tok) // Cancel 錯誤保留、不吞
+		cerr := m.CancelEndSession(p, tok) // Cancel 錯誤保留、不吞
 		return errors.Join(ErrProviderBusy, cerr)
 	}
 	tearErr := teardown()
-	finErr := m.FinishEndSession(tok)
+	finErr := m.FinishEndSession(p, tok)
 	return errors.Join(tearErr, finErr)
 }
