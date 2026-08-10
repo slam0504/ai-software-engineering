@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import { StartSession, SendMessage, CLIInfo } from '../wailsjs/go/main/App'
 import { useSession } from './stores/session'
+import { load, save } from './lib/persist'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import Timeline from './components/Timeline.vue'
@@ -13,11 +14,44 @@ import ApprovalDialog from './components/ApprovalDialog.vue'
 
 const s = useSession()
 const tab = ref<'chat' | 'preview'>('chat')
-const timelineOpen = ref(true) // VS Code panel 慣例（normative：可摺疊；拖高/高度記憶 → M2）
+const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
+const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
 const selectedFile = ref('')
 const cliInfo = ref<Record<string, string>>({})
+watch(timelineOpen, v => save('wb.tl.open', v))
+watch(timelineHeight, v => save('wb.tl.height', v))
+
+// Timeline 拖高：resize handle 垂直拖曳
+let dragStartY = 0
+let dragStartH = 0
+function onResizeMove(e: MouseEvent) {
+  timelineHeight.value = Math.min(600, Math.max(80, dragStartH + (dragStartY - e.clientY)))
+}
+function onResizeEnd() {
+  window.removeEventListener('mousemove', onResizeMove)
+  window.removeEventListener('mouseup', onResizeEnd)
+}
+function onResizeStart(e: MouseEvent) {
+  dragStartY = e.clientY
+  dragStartH = timelineHeight.value
+  window.addEventListener('mousemove', onResizeMove)
+  window.addEventListener('mouseup', onResizeEnd)
+}
+
+// 快捷鍵：Cmd+1/2 切 provider tab、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (!e.metaKey) return
+  if (e.key === '1') { e.preventDefault(); s.setActiveProvider('claude') }
+  else if (e.key === '2') { e.preventDefault(); s.setActiveProvider('codex') }
+  else if (e.key === 'k') {
+    e.preventDefault()
+    document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus()
+  }
+}
+onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKeydown)
   s.setBindings({
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
     SendMessage: (t) => SendMessage(s.provider, t),
@@ -46,7 +80,8 @@ onMounted(async () => {
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
       </main>
     </div>
-    <div v-show="timelineOpen" class="tl"><Timeline /></div>
+    <div v-show="timelineOpen" class="tl-resize" title="拖曳調整高度" @mousedown.prevent="onResizeStart" />
+    <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
     <button class="tl-toggle" @click="timelineOpen = !timelineOpen">
       {{ timelineOpen ? '▾ Timeline' : '▸ Timeline' }}
     </button>
@@ -70,6 +105,8 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 nav { display: flex; gap: 4px; padding: 4px 8px; }
 nav .active { background: var(--bg-bubble-user); color: #fff; }
 main > :not(nav) { flex: 1; min-height: 0; }
-.tl { height: 180px; border-top: 1px solid var(--border); }
+.tl { border-top: 1px solid var(--border); overflow: hidden; }
+.tl-resize { height: 4px; cursor: row-resize; background: transparent; }
+.tl-resize:hover { background: var(--accent); }
 .tl-toggle { align-self: flex-start; font-size: 11px; background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 2px 10px; }
 </style>
