@@ -7,6 +7,8 @@ const env = (over: Partial<Envelope>): Envelope => ({
   event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta', ...over,
 })
 
+const okBindings = () => ({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}) })
+
 describe('session store', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
@@ -33,6 +35,19 @@ describe('session store', () => {
     expect(s.chat.at(-1)).toMatchObject({ text: 'ab!', thinking: 'th1-th2', streaming: false })
   })
 
+  it('result finalizes trailing streaming bubble', () => {
+    const s = useSession()
+    s.apply(env({ kind: 'delta', text: 'hi' }))
+    s.apply(env({ kind: 'message', role: 'assistant', text: 'hi' }))
+    s.apply(env({ kind: 'delta', text: '' }))
+    s.apply(env({ kind: 'result' }))
+    expect(s.chat.length).toBe(1)
+    expect(s.chat.at(-1)).toMatchObject({ text: 'hi', streaming: false })
+    s.apply(env({ kind: 'delta', text: 'partial tail' }))
+    s.apply(env({ kind: 'result' }))
+    expect(s.chat.at(-1)).toMatchObject({ text: 'partial tail', streaming: false })
+  })
+
   it('overwrites usage snapshot instead of adding', () => {
     const s = useSession()
     s.apply(env({ kind: 'usage', usage: { input_tokens: 10, output_tokens: 1 } }))
@@ -50,7 +65,7 @@ describe('session store', () => {
     expect(s.costDisplay).toBe('$0.5000')
   })
 
-  it('tracks usage semantics for provider_latest marker', () => { // 第四輪 P2-1
+  it('tracks usage semantics for provider_latest marker', () => {
     const s = useSession()
     s.apply(env({ kind: 'usage', usage: { input_tokens: 10, output_tokens: 1 }, usage_semantics: 'provider_latest' }))
     expect(s.usageSemantics).toBe('provider_latest')
@@ -60,7 +75,7 @@ describe('session store', () => {
 
   it('tracks identity and state; result unlocks busy', () => {
     const s = useSession()
-    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}) })
+    s.setBindings(okBindings())
     void s.submit('hello')
     expect(s.busy).toBe(true)
     s.apply(env({ kind: 'init', session_id: 's1', task_id: 'task-1' }))
@@ -69,7 +84,7 @@ describe('session store', () => {
     expect(s.busy).toBe(false)
     expect(s.sessionId).toBe('s1')
     expect(s.taskId).toBe('task-1')
-    expect(s.state).toBe('waiting') // state 只由 state_change 驅動（result 的 done 事件另行到達）
+    expect(s.state).toBe('waiting')
   })
 
   it('submit routes first to StartSession then to SendMessage', async () => {
@@ -79,7 +94,7 @@ describe('session store', () => {
     s.setBindings({ StartSession: start, SendMessage: send })
     await s.submit('one')
     expect(start).toHaveBeenCalledOnce()
-    s.apply(env({ kind: 'result' })) // busy 解鎖
+    s.apply(env({ kind: 'result' }))
     await s.submit('two')
     expect(send).toHaveBeenCalledWith('claude', 'two')
   })
@@ -93,45 +108,23 @@ describe('session store', () => {
     expect(s.timeline.at(-1)!.env.error).toContain('busy')
   })
 
-  it('result finalizes trailing streaming bubble', () => {
-    const s = useSession()
-    s.apply(env({ kind: 'delta', text: 'hi' }))
-    s.apply(env({ kind: 'message', role: 'assistant', text: 'hi' }))
-    s.apply(env({ kind: 'delta', text: '' })) // message 落定後的殘餘 delta（空氣泡）
-    s.apply(env({ kind: 'result' }))
-    expect(s.chat.length).toBe(1) // 空殘餘氣泡被移除
-    expect(s.chat.at(-1)).toMatchObject({ text: 'hi', streaming: false })
-    s.apply(env({ kind: 'delta', text: 'partial tail' })) // 有內容的殘餘則落定保留
-    s.apply(env({ kind: 'result' }))
-    expect(s.chat.at(-1)).toMatchObject({ text: 'partial tail', streaming: false })
-  })
-
   it('note enters timeline as info item', () => {
     const s = useSession()
     s.note('auth ok')
     expect(s.timeline.at(-1)!.env).toMatchObject({ kind: 'note', text: 'auth ok' })
   })
 
-  it('applyDone records session end and clears active/busy', () => {
-    const s = useSession()
-    s.active = true
-    s.busy = true
-    s.applyDone({ provider: 'claude', exitCode: 0, recorderError: '' })
-    expect(s.timeline.at(-1)!.env.kind).toBe('session_done')
-    expect(s.timeline.at(-1)!.env.text).toContain('exitCode')
-    expect(s.busy).toBe(false)
-    expect(s.active).toBe(false)
-  })
-
-  it('remembers resume per provider', () => {
+  it('remembers inputs per view across switches', () => {
     const s = useSession()
     s.setResumeInput('claude-id')
-    s.provider = 'codex'
+    s.setTaskLabel('label-c')
+    s.setActiveProvider('codex')
     expect(s.resumeInput).toBe('')
     s.setResumeInput('codex-id')
     expect(s.resumeInput).toBe('codex-id')
-    s.provider = 'claude'
+    s.setActiveProvider('claude')
     expect(s.resumeInput).toBe('claude-id')
+    expect(s.taskLabel).toBe('label-c')
   })
 
   it('groups consecutive system noise in timeline', () => {
@@ -143,5 +136,119 @@ describe('session store', () => {
     const groups = new Set(s.timeline.map(i => i.group).filter(g => g !== undefined))
     expect(groups.size).toBe(1)
     expect(s.timeline.at(-1)!.group).toBeUndefined()
+  })
+
+  // ---- M1.5：per-provider views ----
+
+  it('routes events to per-provider views', () => {
+    const s = useSession()
+    s.apply(env({ provider: 'claude', kind: 'delta', text: 'c1' }))
+    s.apply(env({ provider: 'codex', kind: 'delta', text: 'x1' }))
+    expect(s.views.claude.chat.at(-1)!.text).toBe('c1')
+    expect(s.views.codex.chat.at(-1)!.text).toBe('x1')
+    s.apply(env({ provider: 'codex', kind: 'usage', usage: { input_tokens: 9, output_tokens: 1 } }))
+    expect(s.views.codex.totals.input).toBe(9)
+    expect(s.views.claude.totals.input).toBe(0) // 隔離
+  })
+
+  it('switching provider preserves both views', () => {
+    const s = useSession()
+    s.apply(env({ provider: 'claude', kind: 'message', role: 'user', text: 'hi-c' }))
+    s.setActiveProvider('codex')
+    s.apply(env({ provider: 'codex', kind: 'message', role: 'user', text: 'hi-x' }))
+    expect(s.chat.at(-1)!.text).toBe('hi-x')
+    s.setActiveProvider('claude')
+    expect(s.chat.at(-1)!.text).toBe('hi-c') // 切回零丟失
+    expect(s.views.codex.chat.at(-1)!.text).toBe('hi-x')
+  })
+
+  it('background view counts unread per completed turn', () => {
+    const s = useSession() // active = claude
+    s.apply(env({ provider: 'codex', kind: 'delta', text: 'streaming…' })) // 非 turn 完成：不計
+    expect(s.unreadOf('codex')).toBe(0)
+    s.apply(env({ provider: 'codex', kind: 'message', role: 'assistant', text: 'done' })) // 訊息也不計
+    expect(s.unreadOf('codex')).toBe(0)
+    s.apply(env({ provider: 'codex', kind: 'result' })) // 每完成 turn +1
+    expect(s.unreadOf('codex')).toBe(1)
+    s.apply(env({ provider: 'codex', kind: 'result' }))
+    expect(s.unreadOf('codex')).toBe(2)
+    s.apply(env({ provider: 'claude', kind: 'result' })) // active view 不計 unread
+    expect(s.unreadOf('claude')).toBe(0)
+  })
+
+  it('unread clears on switch', () => {
+    const s = useSession()
+    s.apply(env({ provider: 'codex', kind: 'result' }))
+    expect(s.unreadOf('codex')).toBe(1)
+    s.setActiveProvider('codex')
+    expect(s.unreadOf('codex')).toBe(0)
+  })
+
+  it('per-view busy: A busy does not block B submit', async () => {
+    const s = useSession()
+    const b = okBindings()
+    s.setBindings(b)
+    await s.submit('claude go') // claude busy=true（等 result）
+    expect(s.views.claude.busy).toBe(true)
+    s.setActiveProvider('codex')
+    expect(s.busy).toBe(false) // codex view 不受影響
+    await s.submit('codex go')
+    expect(b.StartSession).toHaveBeenCalledTimes(2)
+    expect(s.views.codex.busy).toBe(true)
+  })
+
+  it('applyDone routes by payload provider', () => {
+    const s = useSession() // active = claude
+    s.views.codex.active = true
+    s.views.codex.busy = true
+    s.applyDone({ provider: 'codex', processStillRunning: true })
+    expect(s.views.codex.busy).toBe(false)
+    expect(s.views.codex.active).toBe(false)
+    expect(s.views.codex.timeline.at(-1)!.env.kind).toBe('session_done')
+    expect(s.views.claude.timeline.length).toBe(0) // 不進 active view
+  })
+
+  it('awaiting_approval flags the owning view', () => {
+    const s = useSession() // active = claude
+    s.apply(env({ provider: 'codex', kind: 'state_change', state: 'awaiting_approval' }))
+    expect(s.awaitingOf('codex')).toBe(true)
+    expect(s.awaitingOf('claude')).toBe(false)
+  })
+
+  it('taskLabel is isolated per view', async () => {
+    const s = useSession()
+    const b = okBindings()
+    s.setBindings(b)
+    s.setTaskLabel('task-c')
+    s.setActiveProvider('codex')
+    s.setTaskLabel('task-x')
+    await s.submit('go x') // codex submit 帶自己的標籤
+    expect(b.StartSession).toHaveBeenCalledWith('codex', 'go x', '', '', 'task-x', 'untrusted')
+    s.setActiveProvider('claude')
+    expect(s.taskLabel).toBe('task-c') // A 設標籤不影響 B、各帶各的
+    await s.submit('go c')
+    expect(b.StartSession).toHaveBeenCalledWith('claude', 'go c', '', '', 'task-c', 'untrusted')
+  })
+
+  it('recordCase is isolated per view', () => {
+    const s = useSession()
+    s.setRecordCase('claude-rec')
+    s.setActiveProvider('codex')
+    expect(s.recordCase).toBe('')
+    s.setRecordCase('codex-rec')
+    s.setActiveProvider('claude')
+    expect(s.recordCase).toBe('claude-rec')
+    expect(s.views.codex.recordCase).toBe('codex-rec')
+  })
+
+  it('reset only resets the active view', () => {
+    const s = useSession()
+    s.apply(env({ provider: 'claude', kind: 'message', role: 'user', text: 'c' }))
+    s.apply(env({ provider: 'codex', kind: 'message', role: 'user', text: 'x' }))
+    s.setTaskLabel('keep-me')
+    s.reset()
+    expect(s.chat.length).toBe(0)
+    expect(s.taskLabel).toBe('keep-me') // 輸入欄位保留
+    expect(s.views.codex.chat.length).toBe(1) // 另一 view 不動
   })
 })

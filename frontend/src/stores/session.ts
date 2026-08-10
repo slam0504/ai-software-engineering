@@ -2,13 +2,11 @@ import { defineStore } from 'pinia'
 import type { Bindings, ChatItem, Envelope, TimelineItem } from '../types'
 
 const NOISE_KINDS = new Set(['system_other', 'unknown'])
+export const PROVIDERS = ['claude', 'codex'] as const
+export type ProviderKey = (typeof PROVIDERS)[number]
 
-interface State {
-  provider: string
-  taskLabel: string
-  approvalPolicy: string
-  recordCase: string
-  resume: Record<string, string> // per-provider 記憶
+// SessionView：單一 provider 的對話視圖（M1.5 plan D3）。
+export interface SessionView {
   sessionId: string
   taskId: string
   state: string
@@ -17,37 +15,69 @@ interface State {
   totals: { cost: number; input: number; output: number }
   usageSemantics: string
   busy: boolean
-  active: boolean // session 已啟動（submit 路由 StartSession/SendMessage）
-  bindings: Bindings | null
-  noiseGroup: number // 目前 noise run 的 group id；-1 = 無進行中 run
+  active: boolean
+  unread: number // 每完成 turn +1（result 抵達且非 active view）；切入歸零
+  noiseGroup: number
   nextGroup: number
+  // 輸入欄位（per view；M1.5 第一輪 review P1-7）
+  taskLabel: string
+  recordCase: string
+  resume: string
+}
+
+function newView(): SessionView {
+  return {
+    sessionId: '', taskId: '', state: 'idle',
+    chat: [], timeline: [],
+    totals: { cost: 0, input: 0, output: 0 },
+    usageSemantics: '', busy: false, active: false, unread: 0,
+    noiseGroup: -1, nextGroup: 0,
+    taskLabel: '', recordCase: '', resume: '',
+  }
+}
+
+interface State {
+  activeProvider: ProviderKey
+  approvalPolicy: string
+  views: Record<ProviderKey, SessionView>
+  bindings: Bindings | null
+  restoring: boolean // 重放恢復中：不計 unread（M1.5 D6）
+}
+
+function providerOf(env: { provider?: string }): ProviderKey {
+  return env.provider === 'codex' ? 'codex' : 'claude'
 }
 
 export const useSession = defineStore('session', {
   state: (): State => ({
-    provider: 'claude',
-    taskLabel: '',
+    activeProvider: 'claude',
     approvalPolicy: 'untrusted',
-    recordCase: '',
-    resume: {},
-    sessionId: '',
-    taskId: '',
-    state: 'idle',
-    chat: [],
-    timeline: [],
-    totals: { cost: 0, input: 0, output: 0 },
-    usageSemantics: '',
-    busy: false,
-    active: false,
+    views: { claude: newView(), codex: newView() },
     bindings: null,
-    noiseGroup: -1,
-    nextGroup: 0,
+    restoring: false,
   }),
 
   getters: {
-    costDisplay: (s): string => (s.totals.cost > 0 ? '$' + s.totals.cost.toFixed(4) : '—'),
-    // per-provider resume 記憶：切 provider 顯示各自的值（寫入走 setResumeInput）
-    resumeInput: (s): string => s.resume[s.provider] ?? '',
+    view: (s): SessionView => s.views[s.activeProvider],
+    // 轉發 getter：元件沿 M1 讀法（一律 active view）
+    provider: (s): string => s.activeProvider,
+    chat(): ChatItem[] { return this.view.chat },
+    timeline(): TimelineItem[] { return this.view.timeline },
+    totals(): { cost: number; input: number; output: number } { return this.view.totals },
+    state(): string { return this.view.state },
+    sessionId(): string { return this.view.sessionId },
+    taskId(): string { return this.view.taskId },
+    busy(): boolean { return this.view.busy },
+    active(): boolean { return this.view.active },
+    usageSemantics(): string { return this.view.usageSemantics },
+    taskLabel(): string { return this.view.taskLabel },
+    recordCase(): string { return this.view.recordCase },
+    resumeInput(): string { return this.view.resume },
+    costDisplay(): string {
+      return this.view.totals.cost > 0 ? '$' + this.view.totals.cost.toFixed(4) : '—'
+    },
+    unreadOf: (s) => (p: ProviderKey): number => s.views[p].unread,
+    awaitingOf: (s) => (p: ProviderKey): boolean => s.views[p].state === 'awaiting_approval',
   },
 
   actions: {
@@ -55,141 +85,144 @@ export const useSession = defineStore('session', {
       this.bindings = b
     },
 
-    // apply 是 host envelope 的唯一入口（EventsOn('workbench:event', s.apply)）。
+    setActiveProvider(p: ProviderKey) {
+      this.activeProvider = p
+      this.views[p].unread = 0 // 切入歸零
+    },
+
+    setTaskLabel(v: string) { this.view.taskLabel = v },
+    setRecordCase(v: string) { this.view.recordCase = v },
+    setResumeInput(v: string) { this.view.resume = v },
+    setApprovalPolicy(v: string) { this.approvalPolicy = v },
+
+    // apply 是 host envelope 的唯一入口；依 env.provider 路由（與 activeProvider
+    // 無關——背景 view 照常累積）。
     apply(env: Envelope) {
-      // usage snapshot 覆寫（host 端 totals 已是累計值，不在前端相加）
+      const p = providerOf(env)
+      const v = this.views[p]
+
       if (env.usage) {
-        this.totals.input = env.usage.input_tokens
-        this.totals.output = env.usage.output_tokens
+        v.totals.input = env.usage.input_tokens
+        v.totals.output = env.usage.output_tokens
       }
-      if (env.usage_semantics) this.usageSemantics = env.usage_semantics
+      if (env.usage_semantics) v.usageSemantics = env.usage_semantics
 
       switch (env.kind) {
         case 'init':
-          if (env.session_id) this.sessionId = env.session_id
-          if (env.task_id) this.taskId = env.task_id
+          if (env.session_id) v.sessionId = env.session_id
+          if (env.task_id) v.taskId = env.task_id
           break
         case 'state_change':
-          if (env.state) this.state = env.state
+          if (env.state) v.state = env.state
           break
         case 'result': {
-          this.totals.cost += env.cost_usd ?? 0
-          this.busy = false
-          // 落定尾端 streaming 氣泡：message 之後的殘餘 delta（如 message_stop
-          // 前的 partial）會留下閃爍游標的空氣泡，result 表示該輪已結束
-          const tail = this.chat.at(-1)
+          v.totals.cost += env.cost_usd ?? 0
+          v.busy = false
+          if (p !== this.activeProvider && !this.restoring) v.unread++ // 每完成 turn +1
+          const tail = v.chat.at(-1)
           if (tail && tail.role === 'assistant' && tail.streaming) {
-            if (tail.text === '' && tail.thinking === '') this.chat.pop()
+            if (tail.text === '' && tail.thinking === '') v.chat.pop()
             else tail.streaming = false
           }
           break
         }
       }
 
-      // chat 路由
       if (env.kind === 'delta') {
-        const last = this.chat.at(-1)
+        const last = v.chat.at(-1)
         if (last && last.role === 'assistant' && last.streaming) {
           last.text += env.text ?? ''
           last.thinking += env.thinking ?? ''
         } else {
-          this.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: true })
+          v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: true })
         }
         return // delta 不進 timeline
       }
       if (env.kind === 'message' && env.role === 'user') {
-        this.chat.push({ role: 'user', text: env.text ?? '', thinking: '', streaming: false })
+        v.chat.push({ role: 'user', text: env.text ?? '', thinking: '', streaming: false })
       } else if (env.kind === 'message' && env.role === 'assistant') {
-        const last = this.chat.at(-1)
+        const last = v.chat.at(-1)
         if (last && last.role === 'assistant' && last.streaming) {
           last.text = env.text ?? last.text
           if (env.thinking) last.thinking = env.thinking
           last.streaming = false
         } else {
-          this.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: false })
+          v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: false })
         }
       }
-      // role==='tool' 的 message 只進 timeline（不進 chat）
+      // role==='tool' 的 message 只進 timeline
 
-      // timeline：連續 system_other/unknown 併 group
       if (NOISE_KINDS.has(env.kind)) {
-        if (this.noiseGroup === -1) this.noiseGroup = this.nextGroup++
-        this.timeline.push({ env, group: this.noiseGroup })
+        if (v.noiseGroup === -1) v.noiseGroup = v.nextGroup++
+        v.timeline.push({ env, group: v.noiseGroup })
       } else {
-        this.noiseGroup = -1
-        this.timeline.push({ env })
+        v.noiseGroup = -1
+        v.timeline.push({ env })
       }
     },
 
+    // submit 作用於 active view；per-view busy（A busy 不擋 B）。
     async submit(text: string) {
-      if (this.busy) return
+      const p = this.activeProvider
+      const v = this.views[p]
+      if (v.busy) return
       if (!this.bindings) {
         this.pushError('bindings not ready')
         return
       }
-      this.busy = true
+      v.busy = true
       try {
-        if (!this.active) {
-          await this.bindings.StartSession(this.provider, text, this.resume[this.provider] ?? '',
-            this.recordCase, this.taskLabel, this.approvalPolicy)
-          this.active = true
+        if (!v.active) {
+          await this.bindings.StartSession(p, text, v.resume, v.recordCase, v.taskLabel, this.approvalPolicy)
+          v.active = true
         } else {
-          await this.bindings.SendMessage(this.provider, text)
+          await this.bindings.SendMessage(p, text)
         }
         // 不本地新增 user 氣泡：等 host 的 canonical user envelope
       } catch (e) {
-        this.pushError(String((e as Error)?.message ?? e))
+        this.pushError(String((e as Error)?.message ?? e), p)
       }
     },
 
-    setResumeInput(v: string) {
-      this.resume[this.provider] = v
-    },
-
     note(msg: string) {
-      this.timeline.push({
-        env: { event_id: 'ui-note-' + this.timeline.length, ts: new Date().toISOString(),
-          provider: this.provider, kind: 'note', text: msg },
+      const v = this.view
+      v.timeline.push({
+        env: { event_id: 'ui-note-' + v.timeline.length, ts: new Date().toISOString(),
+          provider: this.activeProvider, kind: 'note', text: msg },
       })
-      this.noiseGroup = -1
+      v.noiseGroup = -1
     },
 
-    // session:done（exit/stderr/recorderError）入 timeline；session 已結束 →
-    // busy 解鎖、active 清除（下一次 submit 走 StartSession）。
+    // session:done 依 payload 的 provider 路由到對應 view。
     applyDone(d: Record<string, unknown>) {
-      this.timeline.push({
-        env: { event_id: 'ui-done-' + this.timeline.length, ts: new Date().toISOString(),
-          provider: String(d?.provider ?? this.provider), kind: 'session_done',
-          text: JSON.stringify(d) },
+      const p = providerOf({ provider: String(d?.provider ?? this.activeProvider) })
+      const v = this.views[p]
+      v.timeline.push({
+        env: { event_id: 'ui-done-' + v.timeline.length, ts: new Date().toISOString(),
+          provider: p, kind: 'session_done', text: JSON.stringify(d) },
       })
-      this.noiseGroup = -1
-      this.busy = false
-      this.active = false
+      v.noiseGroup = -1
+      v.busy = false
+      v.active = false
     },
 
-    pushError(msg: string) {
-      this.timeline.push({
-        env: { event_id: 'ui-err-' + this.timeline.length, ts: new Date().toISOString(),
-          provider: this.provider, kind: 'stream_error', error: msg },
+    pushError(msg: string, provider?: ProviderKey) {
+      const p = provider ?? this.activeProvider
+      const v = this.views[p]
+      v.timeline.push({
+        env: { event_id: 'ui-err-' + v.timeline.length, ts: new Date().toISOString(),
+          provider: p, kind: 'stream_error', error: msg },
       })
-      this.noiseGroup = -1
-      this.busy = false
+      v.noiseGroup = -1
+      v.busy = false
     },
 
+    // reset 只重置 active view（New 成功後呼叫）；bindings／approvalPolicy／
+    // 另一個 view 不動。輸入欄位（taskLabel/recordCase）保留沿用。
     reset() {
-      const b = this.bindings
-      const provider = this.provider
-      const taskLabel = this.taskLabel
-      const approvalPolicy = this.approvalPolicy
-      const recordCase = this.recordCase
-      const resume = this.resume
-      this.$reset()
-      this.bindings = b
-      this.provider = provider
-      this.taskLabel = taskLabel
-      this.approvalPolicy = approvalPolicy
-      this.recordCase = recordCase
-      this.resume = resume
+      const v = this.view
+      const keep = { taskLabel: v.taskLabel, recordCase: v.recordCase }
+      this.views[this.activeProvider] = { ...newView(), ...keep }
     },
   },
 })

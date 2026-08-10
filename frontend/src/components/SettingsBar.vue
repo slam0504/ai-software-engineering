@@ -8,10 +8,13 @@ import {
 
 const s = useSession()
 
-// per-provider resume 記憶的 v-model 包裝（store getter 唯讀，寫入走 action）
-const resumeInput = computed({
-  get: () => s.resumeInput,
-  set: (v: string) => s.setResumeInput(v),
+// per-view 輸入欄位的 v-model 包裝（store getter 唯讀，寫入走 action）
+const resumeInput = computed({ get: () => s.resumeInput, set: (v: string) => s.setResumeInput(v) })
+const taskLabel = computed({ get: () => s.taskLabel, set: (v: string) => s.setTaskLabel(v) })
+const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.setRecordCase(v) })
+const provider = computed({
+  get: () => s.activeProvider,
+  set: (v: string) => s.setActiveProvider(v === 'codex' ? 'codex' : 'claude'),
 })
 
 async function call(fn: () => Promise<unknown>, label: string) {
@@ -26,17 +29,17 @@ async function call(fn: () => Promise<unknown>, label: string) {
 
 <template>
   <div class="settings">
-    <select v-model="s.provider">
+    <select v-model="provider">
       <option value="claude">claude</option>
       <option value="codex">codex</option>
     </select>
-    <input v-model="s.taskLabel" class="w-160" placeholder="任務標籤（task id）" />
+    <input v-model="taskLabel" class="w-160" placeholder="任務標籤（task id）" />
     <select v-if="s.provider === 'codex'" v-model="s.approvalPolicy" title="codex approvalPolicy">
       <option value="untrusted">untrusted（每次核可）</option>
       <option value="on-request">on-request</option>
       <option value="never" class="danger">never（不核可，風險自負）</option>
     </select>
-    <input v-model="s.recordCase" class="w-160" :placeholder="s.provider + '-case（錄流，可空）'" />
+    <input v-model="recordCase" class="w-160" :placeholder="s.provider + '-case（錄流，可空）'" />
     <input v-model="resumeInput" class="w-200" placeholder="resume id（可空）" />
     <button title="結束目前 session（quiesce 舊 provider）後開新對話"
       @click="call(async () => { await EndSession(s.provider); s.reset() }, 'new')">New</button>
