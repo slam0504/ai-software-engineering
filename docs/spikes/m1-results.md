@@ -71,6 +71,13 @@
 
 配套重構：`wireCodexHandlers(srv)` → `wireCodexConn(conn)`；`startCodex` 拆出 `startCodexHost(codexHost, …)`（最小 host 介面：`Conn`/`Argv`/`StderrSnapshot`，fatal watch 改 `conn.Done()`）；UI 事件出口統一 `a.emit`（`emitUI` 測試注入 seam）。修正後全套 gate 重跑：`go vet`、`go test -race ./... -count=1`、vitest 20/20、frontend build、`wails build`、ClaudeTurns grep 0——全 PASS。
 
+### 第二輪 review（CHANGES_REQUIRED，1 P1 + 1 P2 → 已修）
+
+1. **P1：commit(false) 可能永久等不到 teardown**——reaper 原本先等 process EOF 再讀 commit 結果；abort 時 MultiTurn CLI 仍在等下一輪輸入（done 不會關），teardown 永不執行（shutdown 與 StartSession 交錯即可觸發：`Manager.Close()` → Accept `ErrClosed` → commit(false) 滯留）。修正：reaper **先讀 commit 結果**——false 立即 `claudeTeardown`（CloseSequence 關 stdin → 界限內收乾）；true 才等 done 走自然結束流程。新測試 `TestClaudeAbortedStartIsReclaimed`：long-running fake CLI（讀首則訊息後等 EOF），hook 於 Accept 前 `Manager.Close()`，斷言 `StartSession` 回 `ErrClosed`、session:done 界限內發出、`claudeSess`／`activeProv`／`broker` 全清除、lease finalized（meta `exit_code: 0` 落檔）。
+2. **P2：codex 測試背景 goroutine 呼叫 `t.Fatalf`**——approval 解決移回主 goroutine（envelope 於 codexApproval 阻塞前已 Emit，斷言不依賴 resolve 時序），失敗一律由主 goroutine Fatal。
+
+三個 barrier 測試以 `-race -count=30` 重複通過；全套 gate（vet／race suite／vitest 20/20／frontend build／`wails build`）重跑 PASS。
+
 ## 偏差記錄
 
 1. **MermaidPane.vue 刪除時點**：plan 排在 Task 10 commit；實際移至 Task 11 commit（App.vue 重寫同時），避免中間 commit 引用已刪檔案。內容無偏差。

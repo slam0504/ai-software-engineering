@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -166,6 +167,7 @@ func newFakeCodexConn(t *testing.T) (*codex.Conn, *fakeCodexWire) {
 				}
 			}
 		}
+		_ = sc.Err() // cleanup 關 pipe 屬預期收尾，非測試失敗
 	}()
 	t.Cleanup(func() { _ = c2sW.Close(); _ = s2cW.Close() })
 	return conn, w
@@ -212,13 +214,6 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// approval:request 一出現就 allow（codexApproval 阻塞於 handleServerRequest goroutine）
-	go func() {
-		waitFor(t, "approval:request", func() bool { return len(ui.find("approval:request")) > 0 })
-		d := ui.find("approval:request")[0].data.(map[string]any)
-		_ = a.ResolveApproval(d["id"].(string), true, "")
-	}()
-
 	threadID, alreadyEnded, err := a.startCodexHost(fakeCodexHost{conn}, "hi", "", "", "untrusted")
 	if err != nil || threadID != "t1" {
 		t.Fatalf("start: %q %v", threadID, err)
@@ -233,6 +228,8 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 	if _, _, err := r.StartTurn(context.Background(), "round two"); err != nil { // 第二輪可送
 		t.Fatalf("second turn must start: %v", err)
 	}
+	// approval envelope 於 codexApproval 阻塞前已 Emit；驗證帶 thread ID 後
+	// 在主 goroutine 解決 pending approval（避免留下等 timeout 的 goroutine）。
 	waitFor(t, "approval envelope with thread id", func() bool {
 		for _, e := range ui.findEnvKind(string(contract.KindApproval)) {
 			if e.SessionID == "t1" {
@@ -241,6 +238,47 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 		}
 		return false
 	})
+	waitFor(t, "approval:request dialog event", func() bool { return len(ui.find("approval:request")) > 0 })
+	d := ui.find("approval:request")[0].data.(map[string]any)
+	if err := a.ResolveApproval(d["id"].(string), true, ""); err != nil {
+		t.Fatalf("resolve approval: %v", err)
+	}
+}
+
+// P1 迴歸（第二輪 review）：start 交易 abort（如 shutdown 與 StartSession 交錯，
+// Accept 得 ErrClosed）時，reaper 不得等 process EOF——MultiTurn CLI 仍在等
+// 輸入，必須立即 teardown：process 界限內退出、lease finalized、
+// claudeSess／activeProv／broker 全清除。
+func TestClaudeAbortedStartIsReclaimed(t *testing.T) {
+	a, ui := newTestApp(t)
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// long-running fake：讀首則訊息後等 stdin EOF 才退出（不主動結束）
+	script := "#!/bin/sh\nread -r _line\ncat >/dev/null\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.hookAfterProviderStart = func() { _ = a.manager.Close() } // Accept 前 Close → ErrClosed → commit(false)
+
+	err := a.StartSession("claude", "hi", "", "claude-abort", "task-x", "")
+	if !errors.Is(err, appcore.ErrClosed) {
+		t.Fatalf("aborted start must surface ErrClosed, got %v", err)
+	}
+	waitFor(t, "session:done after abort", func() bool { return len(ui.find("session:done")) > 0 })
+	waitFor(t, "state reclaimed", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.claudeSess == nil && a.activeProv == "" && a.broker == nil
+	})
+	meta, err := os.ReadFile(filepath.Join(a.stateDir, "recordings", "claude-abort.meta.json"))
+	if err != nil {
+		t.Fatalf("lease must be finalized (meta written): %v", err)
+	}
+	if !strings.Contains(string(meta), `"exit_code": 0`) { // CloseSequence 關 stdin → 自然退出
+		t.Fatalf("meta must record exit 0, got: %s", meta)
+	}
 }
 
 // P1 迴歸：claude 快速退出（auth／參數錯誤等）不得被接受成「active 的死亡

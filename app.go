@@ -706,15 +706,17 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 	a.mu.Unlock()
 
 	commitCh := make(chan bool, 1)
-	go func() { // 自然結束／崩潰：pump 收乾後，先等 start 交易 commit/abort 再收尾
-		<-done
+	go func() { // reaper：先等 start 交易結果，再決定收尾路徑
 		accepted := <-commitCh
-		if !accepted { // 交易 abort：無 session（phase 已回 idle），直接清理＋session:done
+		if !accepted {
+			// 交易 abort：MultiTurn CLI 可能仍在等下一輪輸入（done 不會自己關），
+			// 不能等 EOF——立即 teardown（CloseSequence 關 stdin → 界限內收乾）。
 			if err := a.claudeTeardown(sess, done, lease)(); err != nil {
 				a.audit("claude_aborted_start_cleanup_error", map[string]any{"error": err.Error()})
 			}
 			return
 		}
+		<-done // committed：等自然結束／崩潰（pump 收乾）再走同一收尾編排
 		a.mu.Lock()
 		current := a.claudeSess == sess
 		a.mu.Unlock()
