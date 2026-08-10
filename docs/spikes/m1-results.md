@@ -60,6 +60,17 @@
 - [ ] V6 稽核 `events.jsonl`（event_id 單調、抽 3 筆對照 UI、user message 先於該輪首個 provider event、無 stream_error）
 - [ ] 封裝 smoke（bundle 後雙 provider 各 1 輪）
 
+## 實作審查修正（第一輪 code review，CHANGES_REQUIRED → 已修）
+
+2026-08-10 外部審查 2 P1 + 2 P2，全數修正並補 production-path barrier 測試：
+
+1. **P1：codex 首輪 turn/completed 遺失（永久 busy）**——notification handler 只查 `a.runner`，但 runner 於 `StartTurn` 成功後才發布；completed-before-response 或發布前抵達時 earlyEnded latch 收不到。修正：runner 於 `EnsureThread` 成功後、`StartTurn` 前發布（`startCodexHost`），後續 recorder／StartTurn 失敗一律原子 rollback（`a.runner` 清回 nil）；同一修正使首輪空窗中的 approval envelope 帶 thread ID。新測試 `TestCodexFirstTurnCompletedBeforeResponse`：fake wire（in-memory pipes 上的真 `codex.Conn`）固定 approval→completed→response 惡意順序，斷言 alreadyEnded 對消、不殘留 busy、第二輪可送、approval envelope `SessionID=="t1"`。
+2. **P1：claude 快速退出被接受成 active 的死亡 session**——自然結束 goroutine 在 phase=starting 時打 `EndSessionFlow` 得 `ErrStartInProgress` 後放棄，隨後 `AcceptSubmit` 標成 active。修正：`startClaude` 回傳 commit callback，goroutine 於 pump 收乾後**先等 start 交易 commit/abort**：accepted → `EndSessionFlow`；aborted → 直接 `claudeTeardown` 清理＋session:done。新測試 `TestClaudeFastExitDoesNotLeaveDeadActiveSession`：fast-exit fake CLI＋`hookAfterProviderStart` barrier 保證 pump 先於 Accept 收乾，斷言 session:done 發出、manager 終態 idle、下一個 session 可建立。
+3. **P2：claude 啟動失敗未回收 broker**——broker 發布後的 MCP config／recorder／`claude.Start` 失敗路徑以 `defer` rollback（未 commit ownership 即 `Close` 並清 `a.broker`）。
+4. **P2：`// spike quality` 註解殘留**——`ApprovalDialog.vue` 註解移除；未使用的 M0 `Transcript.vue` 整檔刪除。全 repo `spike quality` grep 為 0。
+
+配套重構：`wireCodexHandlers(srv)` → `wireCodexConn(conn)`；`startCodex` 拆出 `startCodexHost(codexHost, …)`（最小 host 介面：`Conn`/`Argv`/`StderrSnapshot`，fatal watch 改 `conn.Done()`）；UI 事件出口統一 `a.emit`（`emitUI` 測試注入 seam）。修正後全套 gate 重跑：`go vet`、`go test -race ./... -count=1`、vitest 20/20、frontend build、`wails build`、ClaudeTurns grep 0——全 PASS。
+
 ## 偏差記錄
 
 1. **MermaidPane.vue 刪除時點**：plan 排在 Task 10 commit；實際移至 Task 11 commit（App.vue 重寫同時），避免中間 commit 引用已刪檔案。內容無偏差。
