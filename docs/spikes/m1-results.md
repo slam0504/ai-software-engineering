@@ -100,7 +100,7 @@
 
 - claude 兩輪（`m1-fix-verify-claude`，48 envelopes）：兩輪皆為 `message(user) → state:waiting → init → state:streaming → message → result → state:done`——init 之後**零** idle state_change。
 - codex 一輪（`m1-fix-verify-codex`，22 envelopes）：`message(user) → state:waiting → init → … → result → state:done`——同樣無 idle 追發。
-- bundled codex 一輪：owner 以重建後 `.app` 執行，序列驗證同上（見補記）。
+- bundled codex 一輪（owner 2026-08-10 以重建後 `.app` 執行）：`~/.workbench/events.jsonl` 第 205–238 筆共 34 envelopes、task `m1-final-bundled-codex`、session `019feab4-6199-7032-b941-11816da7f116`；序列 `message(user) → waiting → init → streaming → message(assistant) → usage → result → done`，**init 後 idle state_change 0 筆**；回覆精確為 `M1-CODEX-INIT-NEUTRAL-PASS`、usage `provider_latest` 21870/17、34 個 event_id 嚴格遞增；證據片段 SHA-256 `87556dbe9a8d8b63e8b2866644a0d205948e9d1228d0cf461e6975f9ac5f797f`。End 後 Workbench 與長駐 codex app-server 均於 2 秒內退出（AppleScript 關閉回報 -128，程序檢查確認非殘留）。
 
 ## 偏差記錄
 
