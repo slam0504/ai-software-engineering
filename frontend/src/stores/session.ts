@@ -72,10 +72,18 @@ export const useSession = defineStore('session', {
         case 'state_change':
           if (env.state) this.state = env.state
           break
-        case 'result':
+        case 'result': {
           this.totals.cost += env.cost_usd ?? 0
           this.busy = false
+          // 落定尾端 streaming 氣泡：message 之後的殘餘 delta（如 message_stop
+          // 前的 partial）會留下閃爍游標的空氣泡，result 表示該輪已結束
+          const tail = this.chat.at(-1)
+          if (tail && tail.role === 'assistant' && tail.streaming) {
+            if (tail.text === '' && tail.thinking === '') this.chat.pop()
+            else tail.streaming = false
+          }
           break
+        }
       }
 
       // chat 路由

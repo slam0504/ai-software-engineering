@@ -93,6 +93,19 @@ describe('session store', () => {
     expect(s.timeline.at(-1)!.env.error).toContain('busy')
   })
 
+  it('result finalizes trailing streaming bubble', () => {
+    const s = useSession()
+    s.apply(env({ kind: 'delta', text: 'hi' }))
+    s.apply(env({ kind: 'message', role: 'assistant', text: 'hi' }))
+    s.apply(env({ kind: 'delta', text: '' })) // message 落定後的殘餘 delta（空氣泡）
+    s.apply(env({ kind: 'result' }))
+    expect(s.chat.length).toBe(1) // 空殘餘氣泡被移除
+    expect(s.chat.at(-1)).toMatchObject({ text: 'hi', streaming: false })
+    s.apply(env({ kind: 'delta', text: 'partial tail' })) // 有內容的殘餘則落定保留
+    s.apply(env({ kind: 'result' }))
+    expect(s.chat.at(-1)).toMatchObject({ text: 'partial tail', streaming: false })
+  })
+
   it('note enters timeline as info item', () => {
     const s = useSession()
     s.note('auth ok')

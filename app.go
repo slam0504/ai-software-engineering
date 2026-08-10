@@ -425,7 +425,11 @@ func (a *App) ResolveApproval(id string, allow bool, reason string) error {
 	if !ok {
 		return fmt.Errorf("no pending approval %s (timed out?)", id)
 	}
-	return p.resolve(allow, reason)
+	err := p.resolve(allow, reason)
+	// 廣播 dismiss：dev 模式（原生視窗＋browser devserver）或多視窗下，
+	// 未按下按鈕的前端也要收掉彈窗
+	a.emit("approval:dismiss", map[string]any{"id": id, "cause": "resolved"})
+	return err
 }
 
 func (a *App) pumpApprovals(br *approval.Broker, provider string) {
@@ -956,6 +960,11 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 	a.mu.Lock()
 	a.codexLease, a.activeProv = lease, "codex"
 	a.mu.Unlock()
+
+	// init envelope（M0 行為保留）：UI 的 sessionId／taskId 來源。此刻 submit
+	// 仍 pending → 進 queue，Accept 後依序 flush（user → waiting → init）。
+	a.manager.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindInit,
+		SessionID: threadID, Raw: fmt.Appendf(nil, `{"threadId":%q}`, threadID)})
 
 	if lease != nil { // fatal：wire EOF（server 死亡）時仍收尾錄流（冪等由 lease 保證）
 		go func() {

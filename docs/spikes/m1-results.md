@@ -1,8 +1,8 @@
-# M1 驗收結果（進行中）
+# M1 驗收結果
 
 - 執行依據：`docs/architecture/sdlc-workbench-m1-plan.md`（v13 APPROVED，SHA256 `c2c1f237464e7b415e86ce3df4513ef1a0e53bda41955d1f62f31c30b6f142ac`）
-- 基線：main @ `05415b9`；branch `m1-mvp`（`9564727`…`91fba7e`，Task 1–11 全數 commit）
-- 狀態：**自動 gate 全 PASS；V0–V6 live 驗收待 owner 操作**（見「待驗收」節）
+- 基線：main @ `05415b9`；branch `m1-mvp`（Task 1–12 全數 commit）
+- 狀態：自動 gate 全 PASS；**V0–V6 live 驗收 2026-08-10 執行**（`wails dev` + Playwright 驅動 browser 前端，與原生視窗共用同一 backend；證據見下）
 
 ## 版本基線（CLI pin 不變聲明）
 
@@ -40,25 +40,33 @@
 - contract：ULID 單調、Wrap role precedence、raw fallback、reducer 全轉移。
 - 前端：user-envelope 氣泡、tool-echo 路由、delta 累積、usage 覆寫、costDisplay、busy、submit 分流／失敗、雜訊分組、note／applyDone／resumeInput、sanitizer 4 例、isAtBottom 3 例。
 
-## 待驗收（需 owner 操作 live app）
+## V0–V6 live 驗收（2026-08-10 執行）
 
-以下項目需啟動 `build/bin/sdlc-workbench.app`（或 `wails dev`）與已登入的雙 CLI：
+| 項目 | 結果 | 證據 |
+|---|---|---|
+| V0.1 claude allow | PASS | touch probe → 彈窗「[claude] 工具權限請求：Bash」→ Allow → `.workbench/probe/m1-v0-allow.txt` 存在；audit request（含 command input）+ decision |
+| V0.2 claude deny | PASS | Deny+理由 → `m1-v0-deny.txt` 不存在、turn 正常收尾（done） |
+| V0.3 claude 逾時 | PASS | `WORKBENCH_APPROVAL_TIMEOUT=5s` 重啟後 touch prompt 不操作：彈窗 5s 自動消失、`v03-timeout.txt` 不存在、`approval_decision: timeout` envelope 落檔、turn 正常收尾 |
+| V0.4 claude resume | PASS | backend 重啟後 resume `9308172d…`：正確回答前 session 被 deny 的檔名 `m1-v0-deny.txt`；未綁定 id resume → `resume refused: … bound to ""` |
+| V0.5 claude Terminate | PASS | streaming 中 Terminate → session:done `exitCode:143`、秒級收尾 |
+| V0.6 Recorder 失敗可見 | PASS | chmod 500 recordings → StartSession 回 `permission denied`（可見失敗、不無聲降級）；chmod 755 後 V5 錄流正常 |
+| V0.7 codex approval + resume | PASS | untrusted：`touch` 彈核可（`echo hi` 被 codex 判 trusted 自動放行，如實記錄）→ Allow 檔案存在／Deny 不存在＋audit accept/decline；End 後 thread/resume `019fea62…` 正確回答前 session 第一題答案 2 |
+| V0.8 codex auth | PASS（AuthStatus only） | claude `loggedIn:true`、codex `chatgpt/plus`；**logout/login 循環未授權，記 waiver（沿 M0）** |
+| V0.9 replay 迴歸 | PASS | `TestContractReplay` + `TestReplay` ok |
+| V1 多輪 | PASS | claude 3 輪（42→52→152，第 2、3 輪引用前文、session `8e2fbcfe…` 恆定、自然 End exit 0）；codex 3 輪（42→21→63、同 thread `019fea62…`、server 不重啟）；`codex-m1-chat.jsonl` 單檔 3× turn/start + 3× turn/completed、meta 恰一份（ProcessStillRunning、ExitCode nil） |
+| V2 SC2 四問 | PASS | 三輪當下 StatusBar 文字記錄：claude `任務：m1-v1-claude／完成／session 8e2fbcfe…／tokens 6/9（無 *）／$1.3014`；codex `任務：m1-v2-codex／等待核可（approval 時刻）／session 019fea62…／tokens 66470/101*（tooltip「provider 最新回報值」）／—`。存檔截圖 `docs/spikes/evidence/v2-{claude,codex}-statusbar.png`（驗收後補截的單輪 session，同欄位形狀；原三輪截圖誤刪，見偏差 6） |
+| V3 normative UI | PASS | streaming 逐 token＋游標；follow-tail：長回覆中 scrollTop 置 0 後內容持續增加不跳底；tool 卡片：claude approval 彈窗含 `Bash` + command input、codex `tool_use /bin/zsh -lc 'echo hi'（inProgress→completed）` per-type＋status；Timeline toggle 收合（181px→0）。thinking 摺疊：本輪 live 未出現 thinking 內容（claude -p 無 extended thinking），UI `<details>` 由元件實作、store 測試覆蓋——如實記錄未 live 觸發 |
+| V4 檔案樹＋預覽 | PASS | 懶載入樹瀏覽 repo；`v4-preview-test.md`：h1/strong 渲染、mermaid 區塊→SVG、`<script>` 被 DOMPurify 消毒；`sample.mmd` 編輯存檔 1 秒內重渲染（"Rerendered" 顯示）；symlink 指 /etc → `path escapes workspace` 錯誤 |
+| V5 approvalPolicy | PASS | untrusted：touch 彈核可（V0.7）；never：同 prompt 不彈、直接執行（`v5-never.txt` 建立、該 session approval envelope 0 筆）。**風險如實記錄：never 下寫入指令無人審即執行** |
+| V6 稽核 JSONL | PASS | `events.jsonl` 621 envelopes；event_id 嚴格單調；15 個 `role=user` message **全部**緊跟 `state_change(waiting)`（coordinator user-first live 證據）；抽 3 筆對照 UI（user text＝氣泡、approval raw＝彈窗內容、result cost 0.412835＝StatusBar $0.4128）；kinds 涵蓋 approval/approval_decision/usage/tool_use；無 stream_error（AuditErr nil） |
+| 封裝 smoke | 待 owner | bundled `.app` 需獨立視窗操作，無法以 devserver 驅動——留待 owner 雙 provider 各 1 輪 |
 
-- [ ] V0.1 claude approval allow（touch probe → 彈窗 → Allow → 檔案存在 + audit）
-- [ ] V0.2 claude approval deny（檔案不存在、turn 正常收尾）
-- [ ] V0.3 claude approval 逾時自動 deny（`WORKBENCH_APPROVAL_TIMEOUT=5s`）
-- [ ] V0.4 claude resume（跨 app 重啟引用前文；異 cwd refused）
-- [ ] V0.5 claude Terminate（5s 內收尾、exit 143）
-- [ ] V0.6 Recorder 失敗可見（chmod 500 recordings → recorderError）
-- [ ] V0.7 codex approval allow/deny（untrusted）＋ thread/resume
-- [ ] V0.8 codex AuthStatus（logout/login 循環僅在 owner 事前明示同意時執行；未同意記「未執行（沿 M0 waiver）」）
-- [ ] V1 多輪：claude 3 輪 + codex 3 輪（同 thread、server 不重啟；codex 三輪單一 `codex-m1-chat.jsonl`、meta 恰一份）
-- [ ] V2 SC2 四問（StatusBar 截圖；claude tokens 無 `*`、codex 恆 `*`＋tooltip）
-- [ ] V3 streaming／thinking 摺疊／follow-tail 上捲停跟隨／tool 卡片（claude `Bash(touch …)`、codex per-type＋status）／Timeline 摺疊 toggle
-- [ ] V4 檔案樹＋預覽（`.md` 含 mermaid 區塊、`.mmd` 存檔 1 秒內重渲染、symlink 拒絕一例實測）
-- [ ] V5 approvalPolicy（untrusted 彈核可；never 不彈——行為與風險如實記錄）
-- [ ] V6 稽核 `events.jsonl`（event_id 單調、抽 3 筆對照 UI、user message 先於該輪首個 provider event、無 stream_error）
-- [ ] 封裝 smoke（bundle 後雙 provider 各 1 輪）
+### Live 驗收中發現並修正（dev 過程 fix，均有測試或迴歸證據）
+
+1. **main.ts 未註冊 Pinia**（App mount 即炸；vitest 自建 pinia 故未攔到）→ `createApp(App).use(createPinia())`。
+2. **codex 線缺 init envelope**（M0 行為在 T6 重寫時遺漏；StatusBar 任務/session 顯示 `—`）→ `startCodexHost` 成功後 Emit `KindInit`（queue 至 Accept 後 flush，順序 user→waiting→init）；`TestCodexFirstTurnCompletedBeforeResponse` 增 init envelope 斷言。
+3. **result 後殘留 streaming 游標氣泡**（message 落定後的殘餘 delta 產生空氣泡）→ store `result` 分支落定／移除尾端 streaming 氣泡；vitest 新增 1 測試（21/21）。
+4. **多視窗殘留 approval 彈窗**（dev 模式原生視窗＋browser 前端共用 backend；Resolve 只關掉按鈕所在前端）→ `ResolveApproval` 成功後廣播 `approval:dismiss(cause:resolved)`。
 
 ## 實作審查修正（第一輪 code review，CHANGES_REQUIRED → 已修）
 
@@ -85,18 +93,28 @@
 3. **FileTree 實作形狀**：plan 描述「懶載入樹（約 60 行）」未附完整碼；實作採 Vue 3 檔名自遞迴 SFC，每層展開時 mount 子層才呼叫 `ListWorkspace`（懶載入語意一致）。
 4. **`ListWorkspace("..")` 拒絕**：`filepath.Clean("/"+rel)` 會把 `..` 中和成 root（不逸出但也不報錯），與 plan 測試「必須拒絕」不符；實作補 `..` 成分顯式檢查（拒絕、不無聲重導）。
 5. **PreviewPane mermaid 錯誤顯示**：錯誤文字以 `textContent` 寫入（不進 HTML sink），較 plan 樣張更嚴格（XSS 防護）。
+6. **V2 原始截圖誤刪**：三輪驗收當下的 StatusBar 截圖在清理測試產物時誤刪（無備份）；當下欄位值已有文字記錄（見 V2 列），另以單輪 session 補截同形狀截圖存 `docs/spikes/evidence/`。後續證據截圖一律直接存 evidence 目錄。
+7. **V0.7 `echo hi` 未觸發核可**：codex 0.146.1 的 untrusted policy 將 `echo` 判定為 trusted 指令自動放行；改以寫入指令（`touch`）驗證核可流。如實記錄，非 app 缺陷。
+8. **claude 每輪皆發 init 事件**：claude 2.1.223 多輪模式每輪回一個 `system/init`（session_id 恆定）；UI 以 init 更新 sessionId 不受影響。
 
 ## 殘餘風險
 
-1. V0–V6 live 驗收未執行（上表）；coordinator 的「app.go 忘記呼叫」殘餘情境依 plan 由 V1／V6 live 把關。
-2. claude 自然結束路徑（pump 收乾 → EndSessionFlow）在單元層以 CloseSequence 測試覆蓋，但與 live CLI 的整合行為待 V1／V0.5 驗證。
-3. 測試穩定性：appcore barrier 測試依 channel 同步（deterministic），無 sleep 競態；M0 已知 race-test 穩定性註記沿用。
+1. **封裝 smoke 未執行**：bundled `.app` 的雙 provider 各 1 輪需獨立視窗操作，留待 owner；dev 模式（同一 backend binary、bundle 的 tools 路徑）已全流程驗證。
+2. claude 自然結束（V1 End exit 0）與 Terminate（V0.5 exit 143）均 live 驗證；快速退出／abort 路徑由 production-path barrier 測試覆蓋（未 live 重現）。
+3. 測試穩定性：appcore barrier 測試依 channel 同步（deterministic）、三個 app-level barrier 測試 `-race -count=30` 通過；M0 race-test 穩定性註記沿用。
 4. bundle 873M 未瘦身（plan 明列 M1 不處理）。
+5. thinking 摺疊 UI 未經 live thinking 內容觸發（claude -p 本輪無 extended thinking）；元件與 store 邏輯有測試覆蓋。
+6. dev 模式雙前端（原生視窗＋browser devserver）共用 backend 時，approval 彈窗殘留已以 dismiss 廣播修正；bundled 單視窗不受影響。
 
 ## SC2 達成聲明
 
-待 V2 截圖存證後補記。
+V2 live 驗收確認：單一 StatusBar 同時回答 SC2 四問——目前任務（taskLabel）、agent 狀態（含「等待核可」時刻的黃色高亮）、session／thread id、資源消耗（tokens 累計或 provider 最新值＋cost；語意以 `*`＋tooltip 明示，不把最新回報值謊稱累計）。**SC2 達成**。
 
-## 錄流 digest
+## 錄流 digest（SHA-256）
 
-待 V1／V0 錄流產出後補 SHA-256 清單。
+```
+d4d62ace79c0805dec2491f2c4e2880bc18850e61027c046510fc8993d3f5aa3  claude-m1-chat.ndjson
+eca302e729b0d42a2f7a38bc4790f21a37064405792ec8fc463c7dc23f957d60  claude-m1-chat.meta.json
+5fd7a03189834c115189fb37f562362171003aae967e599dc7c08e3a909d590c  codex-m1-chat.jsonl
+6d01e5489a1b2668c074f51a43a28529e2c14afe31863dbeef71eda2dc0c82e0  codex-m1-chat.meta.json
+```

@@ -238,6 +238,9 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 		}
 		return false
 	})
+	if envs := ui.findEnvKind(string(contract.KindInit)); len(envs) != 1 || envs[0].SessionID != "t1" {
+		t.Fatalf("start must emit exactly one init envelope with thread id, got %+v", envs)
+	}
 	waitFor(t, "approval:request dialog event", func() bool { return len(ui.find("approval:request")) > 0 })
 	d := ui.find("approval:request")[0].data.(map[string]any)
 	if err := a.ResolveApproval(d["id"].(string), true, ""); err != nil {
