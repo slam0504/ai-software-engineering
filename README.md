@@ -191,7 +191,10 @@ internal/
 |---|---|---|
 | **M0** spike | ✅ merged | 雙 CLI wire 打通、核可 E2E、錄流／replay、驗收矩陣 A/B/N/R（[結果](docs/spikes/m0-results.md)） |
 | **M1** MVP | ✅ merged | Envelope v1 契約、序列化 Manager＋coordinator、多輪雙 provider、三欄 UI、驗收矩陣 V0–V6（[結果](docs/spikes/m1-results.md)） |
-| **M2** | 規劃中 | Provider 切換時對話視窗跟著切、雙 session 並存；`turn/steer`；bundle 瘦身 |
+| **M1.5** | 規劃中 | Provider 切換時對話視窗跟著切、雙 session 並存、design token＋視覺 polish（owner 提前的插入項） |
+| **M2** Stage A 閉環 | 未開始 | 規格工作區、ApprovalRecord／manifest／STALE、Gate 1 主控台（SC1、SC3） |
+| **M3** 計畫與測試契約 | 未開始 | 任務 DAG、Gate 2、Test Contract Approval、升級收件匣（SC3 擴及 Gate 2／TCA） |
+| **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、forge adapter（SC4：單任務全程不切出 app） |
 
 每個里程碑的執行計畫經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`SHA256SUMS` 可驗證），
 實作偏差與殘餘風險記錄於對應的 results 文件。
