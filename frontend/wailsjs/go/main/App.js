@@ -14,12 +14,24 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
+export function EndSession() {
+  return window['go']['main']['App']['EndSession']();
+}
+
+export function ListWorkspace(arg1) {
+  return window['go']['main']['App']['ListWorkspace'](arg1);
+}
+
 export function Logout(arg1) {
   return window['go']['main']['App']['Logout'](arg1);
 }
 
 export function ReadDiagram() {
   return window['go']['main']['App']['ReadDiagram']();
+}
+
+export function ReadWorkspaceFile(arg1) {
+  return window['go']['main']['App']['ReadWorkspaceFile'](arg1);
 }
 
 export function ResolveApproval(arg1, arg2, arg3) {
@@ -30,12 +42,16 @@ export function RestartCodexServerRecorded(arg1) {
   return window['go']['main']['App']['RestartCodexServerRecorded'](arg1);
 }
 
+export function SendMessage(arg1) {
+  return window['go']['main']['App']['SendMessage'](arg1);
+}
+
 export function StartLogin(arg1) {
   return window['go']['main']['App']['StartLogin'](arg1);
 }
 
-export function StartSession(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['StartSession'](arg1, arg2, arg3, arg4);
+export function StartSession(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['StartSession'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
 export function TerminateSession() {

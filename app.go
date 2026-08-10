@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +57,6 @@ type App struct {
 	claudeSessionID string
 	claudePumpDone  <-chan struct{}
 	claudeLease     *appcore.RecordingLease
-	claudeCWD       string
 
 	codexSingle  codex.Single[*codex.Server]
 	runner       *codex.ThreadRunner
@@ -313,6 +314,89 @@ func (a *App) CLIInfo() map[string]string {
 	}
 }
 
+// ---- workspace 檔案（canonical 邊界）----
+
+type FileNode struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"` // workspace 相對路徑
+	IsDir bool   `json:"isDir"`
+}
+
+var listExcluded = map[string]bool{".git": true, ".workbench": true, "node_modules": true, "build": true}
+
+// resolveInWorkspace：rel → canonical 絕對路徑；EvalSymlinks 後必須仍在
+// workspace root 內（symlink 指外一律擋）。
+func (a *App) resolveInWorkspace(rel string) (string, error) {
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		// Clean 會把 /.. 中和成 root——顯式拒絕，不無聲重導
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	abs := filepath.Join(root, filepath.Clean("/"+rel))
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	return resolved, nil
+}
+
+func (a *App) ListWorkspace(rel string) ([]FileNode, error) {
+	dir, err := a.resolveInWorkspace(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []FileNode
+	for _, e := range entries {
+		name := e.Name()
+		if listExcluded[name] || strings.HasPrefix(name, ".") {
+			continue
+		}
+		out = append(out, FileNode{Name: name,
+			Path: filepath.Join(filepath.Clean("/"+rel), name)[1:], IsDir: e.IsDir()})
+	}
+	return out, nil
+}
+
+func (a *App) ReadWorkspaceFile(rel string) (string, error) {
+	p, err := a.resolveInWorkspace(rel)
+	if err != nil {
+		return "", err
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%q is not a regular file", rel)
+	}
+	if st.Size() > 1<<20 {
+		return "", fmt.Errorf("%q too large (%d bytes > 1MB)", rel, st.Size())
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 1<<20+1)) // Stat 之外的雙保險
+	if err != nil {
+		return "", err
+	}
+	if len(b) > 1<<20 {
+		return "", fmt.Errorf("%q too large", rel)
+	}
+	return string(b), nil
+}
+
 // ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
 
 func (a *App) registerApproval(id, provider string, resolve func(bool, string) error) {
@@ -437,12 +521,12 @@ func (a *App) SendMessage(prompt string) error {
 func (a *App) EndSession() error {
 	a.mu.Lock()
 	prov := a.activeProv
-	sess, done, clease, cwd := a.claudeSess, a.claudePumpDone, a.claudeLease, a.claudeCWD
+	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
 	runner, klease := a.runner, a.codexLease
 	a.mu.Unlock()
 	switch prov {
 	case "claude":
-		return appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, clease, cwd))
+		return appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, clease))
 	case "codex":
 		busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
 		return appcore.EndSessionFlow(a.manager, busy, func() error {
@@ -587,7 +671,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 
 	a.mu.Lock()
 	a.claudeSess, a.claudePumpDone, a.claudeLease = sess, done, lease
-	a.claudeCWD, a.claudeSessionID, a.activeProv = cwd, "", "claude"
+	a.claudeSessionID, a.activeProv = "", "claude"
 	a.mu.Unlock()
 
 	go func() { // 自然結束／崩潰：pump 收乾後走同一收尾編排
@@ -598,7 +682,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 		if !current { // EndSession 已接手
 			return
 		}
-		if err := appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, lease, cwd)); err != nil {
+		if err := appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, lease)); err != nil {
 			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
 		}
 	}()
@@ -608,7 +692,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) error {
 // claudeTeardown：CloseSequence（close → quiesce → 必要時 terminate → Wait →
 // lease.Finalize(ex)），並發 session:done（Exit 為證據）。
 func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
-	lease *appcore.RecordingLease, cwd string) func() error {
+	lease *appcore.RecordingLease) func() error {
 	return func() error {
 		if sess == nil {
 			return errors.New("no active claude session")
