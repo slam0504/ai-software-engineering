@@ -55,6 +55,10 @@ onMounted(() => {
   try {
     // 開啟中的 context-map 檔變更 → 重渲染（同 PreviewPane 的 diagram:changed 慣例）
     EventsOn('diagram:changed', () => { void load() })
+    // fix round 1（spec §5.2）：diagram:changed 目前只由 docs/sample.mmd 的獨立
+    // watcher 發出，spec/ 樹（含 context-map/*.mmd）的變更走 Task 12 spec watcher
+    // 的 spec:changed 訊號——payload 不可靠，一律重讀目前的 props.path。
+    EventsOn('spec:changed', () => { void load() })
   } catch { /* dev/test 無 runtime 綁定時忽略 */ }
 })
 </script>

@@ -322,6 +322,7 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<
 	defer close(done)
 	defer w.Close()
 	var debounceC <-chan time.Time
+	var lastChanged string
 	for {
 		select {
 		case <-stop:
@@ -337,6 +338,7 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<
 					}
 				}
 			}
+			lastChanged = ev.Name
 			debounceC = time.After(specWatchDebounce)
 		case werr, ok := <-w.Errors:
 			if !ok {
@@ -346,6 +348,12 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<
 		case <-debounceC:
 			debounceC = nil
 			a.reconcileGate1NotifyOnly()
+			// Task 16 fix round 1（spec §5.2）：spec/ 樹（含 context-map/*.mmd）變更時
+			// 額外送一個輕量 UI 訊號，讓 DiagramPane 等監看層自行重讀重渲染——與上面
+			// 的 reconcile 共用同一個 debounce 視窗，不影響 reconcile 邏輯或 fail-loud
+			// 錯誤處理。payload 只是「目前所知的最後變更路徑」，非權威；接收端一律
+			// 重讀自己目前開啟的檔案，不依賴 payload 內容。
+			a.emit("spec:changed", lastChanged)
 		}
 	}
 }
