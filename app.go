@@ -24,6 +24,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
+	"github.com/slam0504/sdlc-workbench/internal/spec"
 )
 
 type pendingApproval struct {
@@ -495,6 +496,136 @@ func (a *App) ReadWorkspaceFile(rel string) (string, error) {
 		return "", fmt.Errorf("%q too large", rel)
 	}
 	return string(b), nil
+}
+
+// ---- 納管 spec 檔（spec/features/**、spec/nfr/**、spec/glossary.md、spec/context-map/**）----
+
+// specDigestPrefix：SpecRead／SpecWrite 共用的 digest 格式，對齊
+// internal/spec.ManifestDigest 與 internal/gate 既有的 "sha256:<64hex>" 慣例
+// （見 internal/gate/project.go reSHA256）——不是自創格式。
+const specDigestPrefix = "sha256:"
+
+func specDigestOf(raw []byte) string { return specDigestPrefix + spec.HashBytes(raw) }
+
+// ErrSpecWriteConflict：既有納管檔的 expected_digest 與目前內容不符（optimistic
+// concurrency 撞鎖）。新檔（磁碟上尚不存在）帶非空 expected_digest 視同過期假設，
+// 同樣回這個錯誤。
+var ErrSpecWriteConflict = errors.New("spec write conflict: expected_digest does not match current file")
+
+// SpecList 列出納管 spec 樹（spec.InScope 過濾），供前端 spec 瀏覽器初始載入。
+// 沿用 internal/spec.GitRepo.ReadScopedWorktree 的 walk 慣例：spec/ 尚不存在時
+// 回空清單、不是錯誤。
+func (a *App) SpecList() ([]FileNode, error) {
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	specRoot := filepath.Join(root, "spec")
+	var out []FileNode
+	err = filepath.WalkDir(specRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			if os.IsNotExist(werr) && path == specRoot {
+				return nil // spec/ 尚未建立：無納管檔
+			}
+			return werr
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() || !spec.InScope(rel) {
+			return nil
+		}
+		out = append(out, FileNode{Name: d.Name(), Path: rel, IsDir: false})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SpecRead 讀既有納管檔；digest 為 specDigestOf(raw bytes)，與 SpecWrite 的
+// expected_digest／回傳值同格式。
+func (a *App) SpecRead(rel string) (content string, digest string, err error) {
+	if !spec.InScope(rel) {
+		return "", "", fmt.Errorf("path %q is not a managed spec file", rel)
+	}
+	p, err := a.resolveInWorkspace(rel)
+	if err != nil {
+		return "", "", err
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return "", "", err
+	}
+	return string(raw), specDigestOf(raw), nil
+}
+
+// SpecWrite 寫納管檔（新檔或既有檔覆寫），atomic rename＋optimistic concurrency。
+//
+// 不能重用 resolveInWorkspace：它對「完整目標路徑」做 EvalSymlinks，新檔尚不
+// 存在時必然出錯。改為驗證 PARENT 目錄：先在 workspace root 內（拒絕 ".."，
+// 與 resolveInWorkspace 同一 containment 檢查）算出目標路徑、視需要建立 parent
+// 目錄，再對 PARENT 做 EvalSymlinks 確認 canonical 後仍在 root 之內（symlinked
+// parent 逃逸一律擋）——目標檔本身此刻可能不存在，不對它做 EvalSymlinks。
+func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+	if !spec.InScope(rel) {
+		return "", fmt.Errorf("path %q is not a managed spec file", rel)
+	}
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		// resolveInWorkspace 同款顯式拒絕（Clean 會把 /.. 中和成 root，不能無聲重導）
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	target := filepath.Join(root, filepath.Clean("/"+rel))
+	parent := filepath.Dir(target)
+
+	if raw, rerr := os.ReadFile(target); rerr == nil {
+		if expectedDigest != specDigestOf(raw) {
+			return "", ErrSpecWriteConflict
+		}
+	} else if os.IsNotExist(rerr) {
+		if expectedDigest != "" { // 新檔：非空 expected_digest＝呼叫端假設過期
+			return "", ErrSpecWriteConflict
+		}
+	} else {
+		return "", rerr
+	}
+
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	canonicalParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
+	if canonicalParent != root && !strings.HasPrefix(canonicalParent, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	finalTarget := filepath.Join(canonicalParent, filepath.Base(target))
+
+	tmp, err := os.CreateTemp(canonicalParent, ".spec-write-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // rename 成功後 no-op（原路徑已不存在）
+	if _, werr := tmp.WriteString(content); werr != nil {
+		_ = tmp.Close()
+		return "", werr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return "", cerr
+	}
+	if rerr := os.Rename(tmpPath, finalTarget); rerr != nil {
+		return "", rerr
+	}
+	return specDigestOf([]byte(content)), nil
 }
 
 // ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
