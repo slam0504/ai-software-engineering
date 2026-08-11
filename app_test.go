@@ -412,18 +412,8 @@ func startCodexForTest(t *testing.T, a *App, wire *fakeCodexWire, conn *codex.Co
 	if err := conn.Handshake(hctx, clientInfo()); err != nil {
 		t.Fatal(err)
 	}
-	id, err := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	threadID, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi codex", "", recordCase, "untrusted")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := a.manager.AcceptSubmit(contract.ProviderCodex, id, threadID, "hi codex"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.restore.CommitResume("codex", threadID, task); err != nil { // StartSession 分支同序
+	a.codexHostOverride = fakeCodexHost{conn} // production StartSession codex 分支
+	if err := a.StartSession("codex", "hi codex", "", recordCase, task, "untrusted"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -987,5 +977,195 @@ func TestLateClaudeInitCannotOverwriteNewGeneration(t *testing.T) {
 	a.commitClaudeResume(oldSess, "stale-session-id") // 舊 pump 的 late init（同一 guard 函式）
 	if got := a.restore.Get("claude"); got.ResumeSessionID == "stale-session-id" {
 		t.Fatalf("late init from old generation must not overwrite: %+v", got)
+	}
+}
+
+// ---- M1.5 第三輪 review P1 迴歸 ----
+
+func TestNewSessionTeardownFailureKeepsRestore(t *testing.T) { // P1-2
+	a, _ := newTestApp(t)
+	// manager-only session（無 process）：claudeTeardown 必回錯——teardown 失敗形狀
+	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-a")
+	_ = a.manager.AcceptSubmit(contract.ProviderClaude, id, "sA", "hi")
+	if err := a.restore.CommitResume("claude", "sA", "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	err := a.NewSession("claude")
+	if err == nil {
+		t.Fatal("teardown failure must surface")
+	}
+	if got := a.restore.Get("claude"); got.ResumeSessionID != "sA" { // restore entry 保留
+		t.Fatalf("restore must be kept on teardown failure: %+v", got)
+	}
+	// lifecycle 已收束回 idle：可再開 session（不卡 ending/resetting）
+	if _, err := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-b"); err != nil {
+		t.Fatalf("slot must be idle after failed New: %v", err)
+	}
+}
+
+func TestAutoResumeAfterPlainEnd(t *testing.T) { // P1-3：一般 End 後未重啟自動 resume
+	a, _ := newTestApp(t)
+	// claude：fresh start（init 落 sA）→ End → 再 submit（resume 空）→ argv --resume sA
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argvFile := filepath.Join(a.stateDir, "argv-auto.txt")
+	script := "#!/bin/sh\necho \"$@\" >> " + argvFile + "\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"auto-sA\"}'\n" +
+		"while read -r _line; do\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
+	_ = a.registry.Bind("auto-sA", cwd)
+	if err := a.StartSession("claude", "hi", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "resume committed after init", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "auto-sA"
+	})
+	if err := a.EndSession("claude"); err != nil { // 一般 End：不清 restore
+		t.Fatal(err)
+	}
+	if err := a.StartSession("claude", "again", "", "", "task-a", ""); err != nil { // resume 參數空
+		t.Fatal(err)
+	}
+	waitFor(t, "second start resumes automatically", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Contains(string(b), "--resume auto-sA")
+	})
+	_ = a.EndSession("claude")
+
+	// codex：t1 committed → End → 再 StartSession（resume 空）→ thread/resume t1
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	var sawResume atomic.Bool
+	var turnSeq atomic.Int32
+	wire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodInitialize:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		case codex.MethodThreadStart:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{"thread": map[string]any{"id": "t1"}}})
+		case codex.MethodThreadResume:
+			if strings.Contains(string(f.Params), `"t1"`) {
+				sawResume.Store(true)
+			}
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{"thread": map[string]any{"id": "t1"}}})
+		case codex.MethodTurnStart:
+			turnID := fmt.Sprintf("turn-%d", turnSeq.Add(1))
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			wire.send(map[string]any{"method": codex.MethodTurnCompleted,
+				"params": map[string]any{"threadId": "t1", "turn": map[string]any{"id": turnID, "status": "completed"}}})
+		}
+	})
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	if err := conn.Handshake(hctx, clientInfo()); err != nil {
+		t.Fatal(err)
+	}
+	a.codexHostOverride = fakeCodexHost{conn}
+	if err := a.StartSession("codex", "hi", "", "", "task-x", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EndSession("codex"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.StartSession("codex", "again", "", "", "task-x", ""); err != nil { // resume 參數空
+		t.Fatal(err)
+	}
+	if !sawResume.Load() { // 自動帶 restore 的 t1 → thread/resume
+		t.Fatal("plain End must auto-resume the codex thread on next start")
+	}
+	_ = a.EndSession("codex")
+}
+
+func TestRestoreCommitFailureKeepsSessionActive(t *testing.T) { // P1-4（plan D6 凍結語意）
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	a.restore.path = filepath.Join(a.stateDir, "no-such-dir", "restore.json") // persist 必失敗
+	if err := a.StartSession("claude", "hi", "", "", "task-a", ""); err != nil {
+		t.Fatalf("StartSession must succeed despite restore failure: %v", err)
+	}
+	if !a.manager.SessionActive(contract.ProviderClaude) { // session 保持 active
+		t.Fatal("session must stay active")
+	}
+	waitFor(t, "restore failure stream_error", func() bool {
+		for _, ev := range ui.find("workbench:event") { // failLoudRestore 直發 UI（不回寫 sink）
+			if env, ok := ev.data.(contract.Envelope); ok &&
+				env.Kind == string(contract.KindStreamError) && strings.Contains(env.Error, "restore store") {
+				return true
+			}
+		}
+		return false
+	})
+	_ = a.EndSession("claude")
+}
+
+func TestRestoreCommitFailureRollsBack(t *testing.T) { // P1-4：失敗變更不得被後續成功寫入夾帶
+	a, _ := newTestApp(t)
+	goodPath := a.restore.path
+	a.restore.path = filepath.Join(a.stateDir, "no-such-dir", "restore.json")
+	if err := a.restore.CommitResume("claude", "should-not-survive", "task-bad"); err == nil {
+		t.Fatal("commit must fail")
+	}
+	a.restore.path = goodPath
+	if err := a.restore.CommitResume("codex", "tX", "task-x"); err != nil { // 另一 provider 成功寫入
+		t.Fatal(err)
+	}
+	rs, err := openRestoreStore(goodPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Get("claude").ResumeSessionID == "should-not-survive" { // 失敗變更未被持久化
+		t.Fatalf("failed commit leaked to disk: %+v", rs.Get("claude"))
+	}
+	if rs.Get("codex").ResumeSessionID != "tX" {
+		t.Fatalf("good commit must persist: %+v", rs.Get("codex"))
+	}
+}
+
+func TestCodexAcceptFailureReclaimsResources(t *testing.T) { // P1-5
+	a, ui := newTestApp(t)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	var turnSeq atomic.Int32
+	wire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodInitialize:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		case codex.MethodThreadStart:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{"thread": map[string]any{"id": "t1"}}})
+		case codex.MethodTurnStart:
+			turnID := fmt.Sprintf("turn-%d", turnSeq.Add(1))
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+		}
+	})
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	if err := conn.Handshake(hctx, clientInfo()); err != nil {
+		t.Fatal(err)
+	}
+	a.codexHostOverride = fakeCodexHost{conn}
+	a.hookAfterProviderStart = func() { _ = a.manager.Close() } // runner/lease 已發布 → Accept 失敗
+	err := a.StartSession("codex", "hi", "", "codex-acceptfail", "task-x", "untrusted")
+	if !errors.Is(err, appcore.ErrClosed) {
+		t.Fatalf("accept must fail with ErrClosed, got %v", err)
+	}
+	a.mu.Lock()
+	runnerNil, leaseNil := a.runner == nil, a.codexLease == nil
+	a.mu.Unlock()
+	if !runnerNil || !leaseNil { // 已發布資源全部回收
+		t.Fatalf("runner/lease must be reclaimed: runner-nil=%v lease-nil=%v", runnerNil, leaseNil)
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-acceptfail.meta.json")); err != nil {
+		t.Fatalf("lease must be finalized (meta written): %v", err)
+	}
+	if len(ui.find("session:done")) == 0 {
+		t.Fatal("teardown must emit session:done")
 	}
 }

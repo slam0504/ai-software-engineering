@@ -84,16 +84,40 @@ func (rs *restoreStore) Get(provider string) restoreEntry {
 }
 
 // CommitResume：Accept 成功後 commit（staged candidate → durable）。
+// persist 失敗回滾記憶體 entry（第三輪 P1-4：否則另一 provider 的後續成功寫入
+// 會把這筆失敗變更一起持久化）。
 func (rs *restoreStore) CommitResume(provider, sessionID, taskID string) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	e := rs.entries[provider]
+	old := rs.entries[provider]
+	e := old
 	if sessionID != "" {
 		e.ResumeSessionID = sessionID
 	}
 	e.TaskID = taskID
 	rs.entries[provider] = e
-	return rs.persistLocked()
+	if err := rs.persistLocked(); err != nil {
+		rs.entries[provider] = old // 回滾
+		return err
+	}
+	return nil
+}
+
+// CommitSessionID：init 抵達時的單一交易——保留現有 TaskID、只更新
+// ResumeSessionID；失敗回滾（第三輪 P1-4：取代呼叫端 Get＋Commit 兩段鎖，
+// 消除 late init 以舊 task ID 覆寫新 commit 的競態）。
+func (rs *restoreStore) CommitSessionID(provider, sessionID string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	old := rs.entries[provider]
+	e := old
+	e.ResumeSessionID = sessionID
+	rs.entries[provider] = e
+	if err := rs.persistLocked(); err != nil {
+		rs.entries[provider] = old // 回滾
+		return err
+	}
+	return nil
 }
 
 // ResetView：僅 NewSession 呼叫——view 視窗前進、resume 清空。失敗時 entry 不變。

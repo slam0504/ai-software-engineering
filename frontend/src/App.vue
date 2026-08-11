@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { StartSession, SendMessage, CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
+import { CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
+import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { load, save } from './lib/persist'
 import SettingsBar from './components/SettingsBar.vue'
@@ -52,10 +53,7 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
-  s.setBindings({
-    StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
-    SendMessage: (t) => SendMessage(s.provider, t),
-  })
+  s.setBindings(makeBindings())
   EventsOn('workbench:event', (e: any) => s.apply(e))
   EventsOn('session:done', (d: any) => s.applyDone(d))
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }

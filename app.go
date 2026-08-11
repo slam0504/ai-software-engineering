@@ -71,6 +71,7 @@ type App struct {
 	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
 	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
+	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
 }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
@@ -525,6 +526,9 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		return fmt.Errorf("unknown provider %q", provider)
 	}
 	prov := contract.Provider(provider)
+	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
+		resume = a.restore.Get(provider).ResumeSessionID
+	}
 	id, err := a.manager.BeginNewSessionSubmit(prov, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
@@ -553,8 +557,18 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 			_ = a.manager.RejectSubmit(prov, id)
 			return serr
 		}
+		if h := a.hookAfterProviderStart; h != nil {
+			h()
+		}
 		if err := a.manager.AcceptSubmit(prov, id, threadID, prompt); err != nil {
-			return err
+			// 第三輪 P1-5：runner／lease 已發布——Accept 失敗必須回收，
+			// 否則 shutdown snapshot 之後才發布的資源會漏收（破壞
+			// 「全部 finalize 後才 Manager.Close」保證）
+			a.mu.Lock()
+			klease := a.codexLease
+			a.mu.Unlock()
+			terr := a.codexTeardown(klease) // 冪等：清 runner/lease/track＋session:done
+			return errors.Join(err, terr)
 		}
 		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
 			a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
@@ -960,6 +974,9 @@ type codexHost interface {
 }
 
 func (a *App) startCodex(prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
+	if a.codexHostOverride != nil { // 測試 seam：fake wire 走同一 production 分支
+		return a.startCodexHost(a.codexHostOverride, prompt, resume, recordCase, approvalPolicy)
+	}
 	srv, err := a.ensureAppServer()
 	if err != nil {
 		return "", false, err
@@ -1254,8 +1271,7 @@ func (a *App) commitClaudeResume(sess *claude.Session, sessionID string) {
 	if !current || !a.manager.SessionActive(contract.ProviderClaude) {
 		return
 	}
-	e := a.restore.Get("claude")
-	if err := a.restore.CommitResume("claude", sessionID, e.TaskID); err != nil {
+	if err := a.restore.CommitSessionID("claude", sessionID); err != nil {
 		a.failLoudRestore(contract.ProviderClaude, err)
 	}
 }
@@ -1301,20 +1317,20 @@ func (a *App) NewSession(provider string) error {
 		} else {
 			tearErr = a.codexTeardown(klease)
 		}
-		rtok, err = a.manager.FinishEndSessionIntoReset(pv, tok) // teardown 錯誤仍轉入 reset
+		if tearErr != nil { // 第三輪 P1-2：收尾失敗立即返回——lifecycle 以
+			// FinishEndSession 收束回 idle、restore entry 保留、UI 不重設
+			finErr := a.manager.FinishEndSession(pv, tok)
+			return errors.Join(tearErr, finErr)
+		}
+		rtok, err = a.manager.FinishEndSessionIntoReset(pv, tok)
 		if err != nil {
-			return errors.Join(tearErr, err)
+			return err
 		}
-		if tearErr != nil {
-			defer func() { _ = tearErr }() // 保留於回傳（下方 join）
-		}
-		err = tearErr
 	case errors.Is(err, appcore.ErrNoSession): // 無 active session：直接進 resetting
 		rtok, err = a.manager.BeginReset(pv)
 		if err != nil {
 			return err
 		}
-		err = nil
 	default:
 		return err
 	}
@@ -1325,7 +1341,7 @@ func (a *App) NewSession(provider string) error {
 	rerr := a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
 	finErr := a.manager.FinishReset(pv, rtok) // restore 失敗仍 FinishReset 回 idle
 	if rerr != nil {
-		return errors.Join(err, rerr, finErr) // 失敗回錯：UI 不重設
+		return errors.Join(rerr, finErr) // 失敗回錯：UI 不重設
 	}
-	return errors.Join(err, finErr)
+	return finErr
 }

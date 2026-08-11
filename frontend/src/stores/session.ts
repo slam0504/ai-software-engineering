@@ -109,7 +109,10 @@ export const useSession = defineStore('session', {
 
       switch (env.kind) {
         case 'init':
-          if (env.session_id) v.sessionId = env.session_id
+          if (env.session_id) {
+            v.sessionId = env.session_id
+            v.resume = env.session_id // 一般 End 後續聊自動接續（與 backend fallback 一致）
+          }
           if (env.task_id) v.taskId = env.task_id
           break
         case 'state_change':
