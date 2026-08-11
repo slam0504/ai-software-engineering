@@ -46,12 +46,12 @@ type App struct {
 
 	registry *claude.Registry
 	manager  *appcore.Manager
+	restore  *restoreStore
 
 	auditMu sync.Mutex
 	auditF  *os.File
 
 	mu              sync.Mutex
-	activeProv      string
 	broker          *approval.Broker
 	claudeSess      *claude.Session
 	claudeSessionID string
@@ -59,6 +59,7 @@ type App struct {
 	claudeLease     *appcore.RecordingLease
 
 	codexSingle  codex.Single[*codex.Server]
+	codexConn    *codex.Conn // wireCodexConn 記錄；interrupt 用（fake wire 測試同路徑）
 	runner       *codex.ThreadRunner
 	track        appcore.TurnTrack
 	codexLease   *appcore.RecordingLease
@@ -67,9 +68,37 @@ type App struct {
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
 
+	// shutdown gate（第四輪 review P1）：shutdown 先拒新 StartSession、等已取得
+	// start ownership 的交易 accept／abort 完成，才 snapshot／teardown／Close／Take——
+	// 堵住「Take() 之後 Ensure() 重新回填 server」的窗口。
+	shutMu       sync.Mutex
+	shuttingDown bool
+	inflight     sync.WaitGroup
+
 	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
+	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
+	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
+	hookInServerTxn         func()                     // 測試注入：server 交易已登記、Ensure 未開始
+	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
 }
+
+// beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
+// 建立／替換 codex server 或啟動 provider 的操作（StartSession、ensureAppServer、
+// B1 probe）。check＋in-flight 登記在同一 shutMu 內原子：TOCTOU 關閉——
+// 若 check 通過，shutdown 的 Wait 必等本交易離場，Take 一定在 Ensure 之後執行，
+// 任何回填的 server 都會被 Take 收走；shuttingDown 之後的新交易一律被拒。
+func (a *App) beginAppTxn() error {
+	a.shutMu.Lock()
+	defer a.shutMu.Unlock()
+	if a.shuttingDown {
+		return errors.New("app shutting down")
+	}
+	a.inflight.Add(1)
+	return nil
+}
+
+func (a *App) endAppTxn() { a.inflight.Done() }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
 func (a *App) emit(name string, data any) {
@@ -118,6 +147,11 @@ func (a *App) startup(ctx context.Context) {
 		// Task 4 live probe VERDICT=per-turn（turn2 output 9 << turn1 642）→ 累加制
 		ClaudeUsageCumulative: false,
 	})
+	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
+	a.restore = rs
+	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
+		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
+	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
@@ -161,11 +195,15 @@ func (a *App) watchDiagram(path string) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	if err := a.EndSession(); err != nil { // active session 走同一收尾編排
-		a.audit("shutdown_end_session_error", map[string]any{"error": err.Error()})
+	a.shutMu.Lock()
+	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer
+	a.shutMu.Unlock()
+	a.inflight.Wait() // 2) 等已取得 start ownership 的交易 accept／abort 完成
+	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
+		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
 	if a.manager != nil {
-		_ = a.manager.Close() // pending queue 由 abort+flush 兜底
+		_ = a.manager.Close() // 全部 finalize 之後才關 sink（pending queue abort+flush 兜底）
 	}
 	if srv, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
 		_ = srv.Terminate()
@@ -177,6 +215,56 @@ func (a *App) shutdown(ctx context.Context) {
 	if br != nil {
 		_ = br.Close()
 	}
+}
+
+// forcedShutdown：shutdown 專用並行收尾（正常 EndSessionFlow 會被 busy／pending
+// submit 擋住，無法保證 E8）。每個 active provider：先 interrupt／terminate active
+// turn → 走收尾；EndSessionFlow 被 lifecycle 狀態拒絕時直接 teardown 兜底（lease
+// 冪等）。兩邊都被等待、錯誤 errors.Join 保留、一邊失敗不跳過另一邊。
+func (a *App) forcedShutdown() error {
+	a.mu.Lock()
+	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
+	runner, klease := a.runner, a.codexLease
+	a.mu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	if sess != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = sess.Terminate() // interrupt 先行：加速 CloseSequence quiesce
+			if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil,
+				a.claudeTeardown(sess, done, clease)); err != nil {
+				terr := a.claudeTeardown(sess, done, clease)() // lifecycle 擋住：直接收（冪等）
+				errs[0] = errors.Join(err, terr)
+			}
+		}()
+	}
+	if runner != nil || klease != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if runner != nil && runner.ActiveTurnID() != "" { // interrupt active turn（best effort）
+				a.mu.Lock()
+				conn := a.codexConn
+				a.mu.Unlock()
+				if params, perr := a.track.InterruptParams(); perr == nil && conn != nil {
+					ictx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_, _ = conn.Call(ictx, codex.MethodTurnInterrupt, params)
+					cancel()
+				}
+			}
+			if err := appcore.EndSessionFlow(a.manager, contract.ProviderCodex, nil, func() error {
+				return a.codexTeardown(klease)
+			}); err != nil {
+				terr := a.codexTeardown(klease) // lifecycle 擋住：直接收（冪等）
+				errs[1] = errors.Join(err, terr)
+			}
+		}()
+	}
+	wg.Wait() // 兩邊都必須被等待
+	return errors.Join(errs[0], errs[1])
 }
 
 // ---- helpers ----
@@ -464,105 +552,134 @@ func (a *App) claudeSessionIDSnapshot() string {
 // StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
 // process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
 func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
-	id, err := a.manager.BeginNewSessionSubmit(taskLabel)
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	prov := contract.Provider(provider)
+	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
+		resume = a.restore.Get(provider).ResumeSessionID
+	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 Start
+		return err
+	}
+	defer a.endAppTxn()
+	id, err := a.manager.BeginNewSessionSubmit(prov, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
 	}
-	switch provider {
-	case "claude":
+	if h := a.hookBeforeProviderStart; h != nil { // 測試 barrier：ownership 已取得、provider 未啟動
+		h()
+	}
+	switch prov {
+	case contract.ProviderClaude:
 		commit, serr := a.startClaude(prompt, resume, recordCase)
 		if serr != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(prov, id)
 			return serr
 		}
 		if h := a.hookAfterProviderStart; h != nil {
 			h()
 		}
-		aerr := a.manager.AcceptSubmit(id, contract.ProviderClaude, "", prompt)
+		aerr := a.manager.AcceptSubmit(prov, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
+		if aerr == nil { // Accept 成功才 commit（staged candidate；D6）
+			if cerr := a.restore.CommitResume("claude", a.claudeSessionIDSnapshot(), taskLabel); cerr != nil {
+				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
+			}
+		}
 		return aerr
-	case "codex":
+	default: // codex
 		threadID, alreadyEnded, serr := a.startCodex(prompt, resume, recordCase, approvalPolicy)
 		if serr != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(prov, id)
 			return serr
 		}
-		if err := a.manager.AcceptSubmit(id, contract.ProviderCodex, threadID, prompt); err != nil {
-			return err
+		if h := a.hookAfterProviderStart; h != nil {
+			h()
+		}
+		if err := a.manager.AcceptSubmit(prov, id, threadID, prompt); err != nil {
+			// 第三輪 P1-5：runner／lease 已發布——Accept 失敗必須回收，
+			// 否則 shutdown snapshot 之後才發布的資源會漏收（破壞
+			// 「全部 finalize 後才 Manager.Close」保證）
+			a.mu.Lock()
+			klease := a.codexLease
+			a.mu.Unlock()
+			terr := a.codexTeardown(klease) // 冪等：清 runner/lease/track＋session:done
+			return errors.Join(err, terr)
+		}
+		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
+			a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
 		}
 		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
 		return nil
-	default:
-		_ = a.manager.RejectSubmit(id)
-		return fmt.Errorf("unknown provider %q", provider)
 	}
 }
 
-// SendMessage：既有 session 的後續輪（僅 phaseActive 允許；錯誤原樣回 UI）。
-func (a *App) SendMessage(prompt string) error {
+// SendMessage：指定 provider 既有 session 的後續輪（僅該 slot phaseActive 允許；
+// 錯誤原樣回 UI）。雙 session 並存：一個 provider busy 不影響另一個。
+func (a *App) SendMessage(provider, prompt string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	pv := contract.Provider(provider)
 	a.mu.Lock()
-	prov, sess, runner := a.activeProv, a.claudeSess, a.runner
+	sess, runner := a.claudeSess, a.runner
 	a.mu.Unlock()
-	id, err := a.manager.BeginSubmit()
+	id, err := a.manager.BeginSubmit(pv)
 	if err != nil {
 		return err
 	}
-	switch prov {
-	case "claude":
+	switch pv {
+	case contract.ProviderClaude:
 		if sess == nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return errors.New("no active claude session")
 		}
 		if err := sess.Send(prompt); err != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return err
 		}
-		return a.manager.AcceptSubmit(id, contract.ProviderClaude, a.claudeSessionIDSnapshot(), prompt)
-	case "codex":
+		return a.manager.AcceptSubmit(pv, id, a.claudeSessionIDSnapshot(), prompt)
+	default: // codex
 		if runner == nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return errors.New("no active codex thread")
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 		defer cancel()
 		if _, _, err := runner.StartTurn(ctx, prompt); err != nil {
-			_ = a.manager.RejectSubmit(id)
+			_ = a.manager.RejectSubmit(pv, id)
 			return err
 		}
-		return a.manager.AcceptSubmit(id, contract.ProviderCodex, runner.ThreadID(), prompt)
-	default:
-		_ = a.manager.RejectSubmit(id)
-		return errors.New("no active session")
+		return a.manager.AcceptSubmit(pv, id, runner.ThreadID(), prompt)
 	}
 }
 
-// EndSession：唯一收尾編排（appcore.EndSessionFlow）。冪等；ErrProviderBusy
-// 等真實錯誤原樣回 UI（前端「New」須成功後才 reset）。
-func (a *App) EndSession() error {
+// EndSession：指定 provider 的收尾編排（appcore.EndSessionFlow）。冪等；
+// ErrProviderBusy 等真實錯誤原樣回 UI。
+func (a *App) EndSession(provider string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
 	a.mu.Lock()
-	prov := a.activeProv
 	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
 	runner, klease := a.runner, a.codexLease
 	a.mu.Unlock()
-	switch prov {
-	case "claude":
-		return appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, clease))
-	case "codex":
-		busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
-		return appcore.EndSessionFlow(a.manager, busy, func() error {
-			return a.codexTeardown(klease)
-		})
-	default: // 無 active provider：交由 EndSessionFlow 冪等處理
-		return appcore.EndSessionFlow(a.manager, nil, func() error { return nil })
+	if provider == "claude" {
+		return appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, clease))
 	}
+	busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
+	return appcore.EndSessionFlow(a.manager, contract.ProviderCodex, busy, func() error {
+		return a.codexTeardown(klease)
+	})
 }
 
-func (a *App) TerminateSession() error {
-	a.mu.Lock()
-	prov, sess := a.activeProv, a.claudeSess
-	a.mu.Unlock()
-	switch prov {
+func (a *App) TerminateSession(provider string) error {
+	switch provider {
 	case "claude":
+		a.mu.Lock()
+		sess := a.claudeSess
+		a.mu.Unlock()
 		if sess == nil {
 			return errors.New("no active claude session")
 		}
@@ -572,16 +689,18 @@ func (a *App) TerminateSession() error {
 		if err != nil {
 			return err
 		}
-		srv, err := a.currentAppServer()
-		if err != nil {
-			return err
+		a.mu.Lock()
+		conn := a.codexConn
+		a.mu.Unlock()
+		if conn == nil {
+			return errors.New("codex app-server not running")
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 		defer cancel()
-		_, err = srv.Conn().Call(ctx, codex.MethodTurnInterrupt, params)
+		_, err = conn.Call(ctx, codex.MethodTurnInterrupt, params)
 		return err
 	default:
-		return errors.New("no active session")
+		return fmt.Errorf("unknown provider %q", provider)
 	}
 }
 
@@ -700,13 +819,14 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 			a.mu.Lock()
 			a.claudeSessionID = info.SessionID
 			a.mu.Unlock()
+			a.commitClaudeResume(sess, info.SessionID) // accepted generation 才寫（late init guard）
 		}
 		a.manager.Emit(ev)
 	})
 
 	a.mu.Lock()
 	a.claudeSess, a.claudePumpDone, a.claudeLease = sess, done, lease
-	a.claudeSessionID, a.activeProv = "", "claude"
+	a.claudeSessionID = ""
 	a.mu.Unlock()
 
 	commitCh := make(chan bool, 1)
@@ -727,7 +847,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 		if !current { // EndSession 已接手
 			return
 		}
-		if err := appcore.EndSessionFlow(a.manager, nil, a.claudeTeardown(sess, done, lease)); err != nil {
+		if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, lease)); err != nil {
 			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
 		}
 	}()
@@ -754,7 +874,6 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 		a.mu.Lock()
 		if a.claudeSess == sess {
 			a.claudeSess, a.claudePumpDone, a.claudeLease = nil, nil, nil
-			a.activeProv = ""
 		}
 		br := a.broker
 		a.broker = nil
@@ -779,6 +898,15 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 // ---- Codex 線 ----
 
 func (a *App) ensureAppServer() (*codex.Server, error) {
+	// server-create 交易：check 與 Ensure 對 shutdown 原子（TOCTOU 關閉）——
+	// AuthStatus／StartLogin／Logout 等所有經此入口的路徑一體適用
+	if err := a.beginAppTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endAppTxn()
+	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、Ensure 未開始
+		h()
+	}
 	return a.codexSingle.Ensure(func() (*codex.Server, error) {
 		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
 			CWD: a.workspaceDir, Env: a.childEnv()})
@@ -811,6 +939,9 @@ func (a *App) currentRunner() *codex.ThreadRunner {
 }
 
 func (a *App) wireCodexConn(conn *codex.Conn) {
+	a.mu.Lock()
+	a.codexConn = conn
+	a.mu.Unlock()
 	conn.OnNotification(func(method string, params json.RawMessage) {
 		switch method {
 		case codex.MethodAccountLoginCompleted, codex.MethodAccountUpdated:
@@ -852,9 +983,13 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	if r := a.currentRunner(); r != nil {
 		threadID = r.ThreadID()
 	}
-	ch := make(chan bool, 1)
+	type codexDecision struct {
+		allow  bool
+		reason string
+	}
+	ch := make(chan codexDecision, 1)
 	a.registerApproval(id, "codex", func(allow bool, reason string) error {
-		ch <- allow
+		ch <- codexDecision{allow, reason} // reason（如 Esc 的 "esc"）保留進 envelope
 		return nil
 	})
 	a.audit("codex_approval_request", map[string]any{"id": id, "method": method, "raw_params": json.RawMessage(params)})
@@ -863,9 +998,11 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
 	uiDecision := "deny"
+	reason := ""
 	select {
-	case allow := <-ch:
-		if allow {
+	case d := <-ch:
+		reason = d.reason
+		if d.allow {
 			decision, uiDecision = "accept", "allow"
 		}
 	case <-time.After(approvalTimeout()):
@@ -876,7 +1013,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
-	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, "")
+	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, reason)
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}
 }
@@ -889,6 +1026,9 @@ type codexHost interface {
 }
 
 func (a *App) startCodex(prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
+	if a.codexHostOverride != nil { // 測試 seam：fake wire 走同一 production 分支
+		return a.startCodexHost(a.codexHostOverride, prompt, resume, recordCase, approvalPolicy)
+	}
 	srv, err := a.ensureAppServer()
 	if err != nil {
 		return "", false, err
@@ -911,32 +1051,19 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 	runner := codex.NewThreadRunner(conn)
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	defer cancel()
-	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
-	if err != nil {
-		return "", false, err
-	}
 
-	a.mu.Lock()
-	a.runner = runner // 發布：首輪事件的 handler ownership
-	a.mu.Unlock()
-	rollback := func() {
-		a.mu.Lock()
-		if a.runner == runner {
-			a.runner = nil
-		}
-		a.mu.Unlock()
-	}
-
+	// 錄流先於 EnsureThread 開啟——thread/start｜resume 屬 session wire 的一部分，
+	// 必須進錄流（W6：codex resume 以 JSON-RPC 錄流佐證）。
 	var lease *appcore.RecordingLease
+	var rec *recorder.Recorder
 	if recordCase != "" {
-		rec, rerr := recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
+		var rerr error
+		rec, rerr = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
 		if rerr != nil { // 可見的 session 失敗，不無聲降級
-			rollback()
 			return "", false, rerr
 		}
 		if berr := conn.BeginRecording(rec.Line); berr != nil {
 			cerr := rec.CloseWith(recorder.Meta{Provider: "codex", RecordedAt: time.Now().UTC().Format(time.RFC3339)})
-			rollback()
 			return "", false, errors.Join(berr, cerr)
 		}
 		lease = appcore.NewRecordingLease(rec, conn.StopRecording,
@@ -947,18 +1074,38 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 					ProcessStillRunning: true, StderrTail: host.StderrSnapshot()}
 			})
 	}
-
-	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
-	if err != nil {
+	finalizeLease := func() {
 		if lease != nil {
 			_ = lease.Finalize(ports.Exit{Exited: false})
 		}
-		rollback()
+	}
+
+	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
+	if err != nil {
+		finalizeLease() // 錄流已開：EnsureThread 失敗須收尾
 		return "", false, err
 	}
 
 	a.mu.Lock()
-	a.codexLease, a.activeProv = lease, "codex"
+	a.runner = runner // 發布：首輪事件的 handler ownership
+	a.mu.Unlock()
+	rollback := func() {
+		finalizeLease()
+		a.mu.Lock()
+		if a.runner == runner {
+			a.runner = nil
+		}
+		a.mu.Unlock()
+	}
+
+	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
+	if err != nil {
+		rollback() // 含 finalizeLease
+		return "", false, err
+	}
+
+	a.mu.Lock()
+	a.codexLease = lease
 	a.mu.Unlock()
 
 	// init envelope（M0 行為保留）：UI 的 sessionId／taskId 來源。此刻 submit
@@ -984,9 +1131,6 @@ func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
 	}
 	a.mu.Lock()
 	a.runner, a.codexLease = nil, nil
-	if a.activeProv == "codex" {
-		a.activeProv = ""
-	}
 	a.mu.Unlock()
 	a.track.NoteEnded()
 	stderr := ""
@@ -1005,6 +1149,10 @@ func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
 // RestartCodexServerRecorded：B1 受控重啟 probe（薄封裝 codex.RunHandshakeProbe，
 // 生命週期 Begin → Handshake → Stop → CloseWith 與四階段失敗處置在 M0 Task 8 以測試固定）。
 func (a *App) RestartCodexServerRecorded(recordCase string) error {
+	if err := a.beginAppTxn(); err != nil { // probe 直接操作 codexSingle：同樣入 gate
+		return err
+	}
+	defer a.endAppTxn()
 	newRec := func() (*recorder.Recorder, error) {
 		return recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
 	}
@@ -1160,4 +1308,103 @@ func (a *App) Logout(provider string) error {
 	default:
 		return fmt.Errorf("unknown provider %q", provider)
 	}
+}
+
+// ---- M1.5：重啟恢復與 NewSession ----
+
+// failLoudRestore：restore commit 失敗的凍結語意（plan D6 第三輪 P1-2）——
+// session 保持 active、呼叫照樣成功，僅以 stream_error fail loud。
+func (a *App) failLoudRestore(p contract.Provider, err error) {
+	a.emit("workbench:event", contract.Envelope{
+		EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
+		Provider: string(p), Kind: string(contract.KindStreamError),
+		Error: "restore store: " + err.Error(),
+	})
+	a.audit("restore_store_error", map[string]any{"provider": string(p), "error": err.Error()})
+}
+
+// commitClaudeResume：claude init 抵達時 commit resumeSessionID。guard：
+// (1) sess 仍是目前 session（late init 於 NewSession 之後 → pointer 不符、不寫）
+// (2) session 已 accepted（init-before-Accept 只暫存於 claudeSessionID，
+//     由 StartSession Accept 成功後補 commit）。
+func (a *App) commitClaudeResume(sess *claude.Session, sessionID string) {
+	a.mu.Lock()
+	current := a.claudeSess == sess
+	a.mu.Unlock()
+	if !current || !a.manager.SessionActive(contract.ProviderClaude) {
+		return
+	}
+	if err := a.restore.CommitSessionID("claude", sessionID); err != nil {
+		a.failLoudRestore(contract.ProviderClaude, err)
+	}
+}
+
+// RestoreViews：啟動時的 view 重放來源（唯讀——不 spawn provider、不回寫 audit）。
+func (a *App) RestoreViews() map[string]RestoredView {
+	out := map[string]RestoredView{}
+	for _, p := range []string{"claude", "codex"} {
+		e := a.restore.Get(p)
+		out[p] = RestoredView{
+			Envelopes:       replayViewWindow(a.eventsPath(), p, e.ViewStartEventID),
+			ResumeSessionID: e.ResumeSessionID,
+			TaskID:          e.TaskID,
+		}
+	}
+	return out
+}
+
+// NewSession：New 專用原子流程（plan D4）。收尾成功才重設恢復視窗；失敗回錯、
+// UI 不重設；另一 provider 完全不受影響。resetting phase 涵蓋
+// 「teardown → restore reset」整段（期間 Start 回 ErrResetInProgress）。
+func (a *App) NewSession(provider string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	pv := contract.Provider(provider)
+	a.mu.Lock()
+	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
+	runner, klease := a.runner, a.codexLease
+	a.mu.Unlock()
+
+	var rtok appcore.ResetToken
+	tok, err := a.manager.BeginEndSession(pv)
+	switch {
+	case err == nil: // active session：teardown 後原子轉入 resetting
+		if pv == contract.ProviderCodex && runner != nil && runner.ActiveTurnID() != "" {
+			cerr := a.manager.CancelEndSession(pv, tok)
+			return errors.Join(appcore.ErrProviderBusy, cerr)
+		}
+		var tearErr error
+		if pv == contract.ProviderClaude {
+			tearErr = a.claudeTeardown(sess, done, clease)()
+		} else {
+			tearErr = a.codexTeardown(klease)
+		}
+		if tearErr != nil { // 第三輪 P1-2：收尾失敗立即返回——lifecycle 以
+			// FinishEndSession 收束回 idle、restore entry 保留、UI 不重設
+			finErr := a.manager.FinishEndSession(pv, tok)
+			return errors.Join(tearErr, finErr)
+		}
+		rtok, err = a.manager.FinishEndSessionIntoReset(pv, tok)
+		if err != nil {
+			return err
+		}
+	case errors.Is(err, appcore.ErrNoSession): // 無 active session：直接進 resetting
+		rtok, err = a.manager.BeginReset(pv)
+		if err != nil {
+			return err
+		}
+	default:
+		return err
+	}
+
+	if h := a.hookDuringReset; h != nil { // 測試 barrier：teardown 完成與 restore reset 之間
+		h()
+	}
+	rerr := a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
+	finErr := a.manager.FinishReset(pv, rtok) // restore 失敗仍 FinishReset 回 idle
+	if rerr != nil {
+		return errors.Join(rerr, finErr) // 失敗回錯：UI 不重設
+	}
+	return finErr
 }

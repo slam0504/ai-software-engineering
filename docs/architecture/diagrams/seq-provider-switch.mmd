@@ -1,0 +1,9 @@
+sequenceDiagram
+  participant U as Owner
+  participant Tab as SettingsBar tabs
+  participant S as Pinia store
+  participant BE as Backend
+  U->>Tab: 點 codex tab
+  Tab->>S: activeProvider = codex
+  S-->>Tab: codex view（chat/timeline/totals/state）
+  Note over S,BE: 零 backend 呼叫；claude 事件照常<br/>經 apply(env) 進背景 view，unread++

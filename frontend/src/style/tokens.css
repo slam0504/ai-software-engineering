@@ -1,0 +1,27 @@
+/* tokens.css — 深色主題 v1（M1.5 plan 附錄 A：現值取自 M1 既有樣式的正規化） */
+:root {
+  --bg-app: #1b2636;
+  --bg-panel: #1e2a38;
+  --bg-inset: #101820;
+  --bg-bubble-user: #2d5a88;
+  --bg-bubble-assistant: #263444;
+  --border: #3a4a5a;
+  --text: #e6edf3;
+  --text-muted: #9db2c5;
+  --text-faint: #66788a;
+  --accent: #7aa2c4;
+  --ok: #80cbc4;
+  --warn: #ffd54f;
+  --err: #ff8a80;
+  --radius-s: 4px;
+  --radius-m: 8px;
+  --radius-l: 10px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --font-ui: ui-sans-serif, system-ui, sans-serif;
+  --fs-s: 11px;
+  --fs-m: 13px;
+  --fs-body: 14px;
+}

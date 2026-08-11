@@ -11,5 +11,5 @@ export interface TimelineItem { env: Envelope; group?: number }
 export interface Bindings {
   StartSession(provider: string, prompt: string, resume: string, recordCase: string,
     taskLabel: string, approvalPolicy: string): Promise<void>
-  SendMessage(prompt: string): Promise<void>
+  SendMessage(provider: string, prompt: string): Promise<void>
 }

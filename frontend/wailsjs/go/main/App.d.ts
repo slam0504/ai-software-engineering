@@ -8,11 +8,13 @@ export function CLIInfo():Promise<Record<string, string>>;
 
 export function CancelLogin(arg1:string):Promise<void>;
 
-export function EndSession():Promise<void>;
+export function EndSession(arg1:string):Promise<void>;
 
 export function ListWorkspace(arg1:string):Promise<Array<main.FileNode>>;
 
 export function Logout(arg1:string):Promise<void>;
+
+export function NewSession(arg1:string):Promise<void>;
 
 export function ReadDiagram():Promise<string>;
 
@@ -22,10 +24,12 @@ export function ResolveApproval(arg1:string,arg2:boolean,arg3:string):Promise<vo
 
 export function RestartCodexServerRecorded(arg1:string):Promise<void>;
 
-export function SendMessage(arg1:string):Promise<void>;
+export function RestoreViews():Promise<Record<string, main.RestoredView>>;
+
+export function SendMessage(arg1:string,arg2:string):Promise<void>;
 
 export function StartLogin(arg1:string):Promise<void>;
 
 export function StartSession(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<void>;
 
-export function TerminateSession():Promise<void>;
+export function TerminateSession(arg1:string):Promise<void>;

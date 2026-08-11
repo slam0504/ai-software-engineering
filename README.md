@@ -151,6 +151,55 @@ internal/
   Claude 收尾走 `CloseSequence`（關 stdin→quiesce→必要時 terminate→exit 證據），
   未知結局不偽裝 exit 0
 
+### Architecture Diagrams
+
+依 SDLC v2 流程（BDD→DDD→TDD），每個里程碑的領域模型以 mermaid diagram-as-code 維護於
+[`docs/architecture/diagrams/`](docs/architecture/diagrams/)、行為規格（Gherkin）於
+[`docs/architecture/features/`](docs/architecture/features/)；圖與實作偏差同 PR 修正。
+
+**Bounded Context Map**
+
+```mermaid
+flowchart TB
+  subgraph app["sdlc-workbench.app"]
+    ui["Webview（Vue 3 + Pinia）<br/>Presentation context"]
+    host["Go host（app.go）<br/>接線層（thin binding）"]
+    core["appcore<br/>【Session Orchestration context】<br/>Manager（多 slot）/ coordinator / lease"]
+    contract["contract<br/>【Shared Kernel】Envelope v1 / reducer"]
+    ca["claude adapter<br/>【ACL】stream-json → Event"]
+    xa["codex adapter<br/>【ACL】JSON-RPC → Event"]
+  end
+  cli1[("claude 子程序")]
+  cli2[("codex app-server")]
+  sink[("events.jsonl / recordings")]
+  ui <-->|"Wails events / bindings"| host
+  host --> core
+  core --> contract
+  ca --> contract
+  xa --> contract
+  host --> ca --> cli1
+  host --> xa --> cli2
+  core --> sink
+```
+
+**Session lifecycle（per provider slot）**
+
+```mermaid
+stateDiagram-v2
+  [*] --> idle
+  idle --> starting : BeginNewSessionSubmit
+  starting --> active : AcceptSubmit
+  starting --> idle : RejectSubmit
+  active --> ending : BeginEndSession
+  ending --> active : CancelEndSession（busy）
+  ending --> idle : FinishEndSession
+  idle --> resetting : BeginReset（New）
+  ending --> resetting : FinishEndSessionIntoReset
+  resetting --> idle : FinishReset
+```
+
+其餘圖（C4 Context、Manager aggregate、SendMessage／provider 切換 sequence）見 diagrams 目錄。
+
 ### Tech Stack
 
 | 層 | 技術 |

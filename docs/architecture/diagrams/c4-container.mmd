@@ -1,0 +1,20 @@
+flowchart TB
+  subgraph app["sdlc-workbench.app"]
+    ui["Webview（Vue 3 + Pinia）<br/>Presentation context"]
+    host["Go host（app.go）<br/>接線層（thin binding）"]
+    core["appcore<br/>【Session Orchestration context】<br/>Manager（多 slot）/ coordinator / lease"]
+    contract["contract<br/>【Shared Kernel】Envelope v1 / reducer"]
+    ca["claude adapter<br/>【ACL】stream-json → Event"]
+    xa["codex adapter<br/>【ACL】JSON-RPC → Event"]
+  end
+  cli1[("claude 子程序")]
+  cli2[("codex app-server")]
+  sink[("events.jsonl / recordings")]
+  ui <-->|"Wails events / bindings"| host
+  host --> core
+  core --> contract
+  ca --> contract
+  xa --> contract
+  host --> ca --> cli1
+  host --> xa --> cli2
+  core --> sink

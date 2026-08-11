@@ -64,15 +64,16 @@ function toggle(set: Set<number> | Set<string>, key: never) {
 </template>
 
 <style scoped>
-.timeline { height: 100%; overflow-y: auto; padding: 6px 10px; font-size: 12px; text-align: left; }
-.row { margin: 2px 0; }
-.kind { color: #7aa2c4; margin-right: 8px; }
-.row.tool_use .sum { color: #80cbc4; }
-.row.approval .sum, .row.approval_decision .sum { color: #ffd54f; }
+.timeline { height: 100%; overflow-y: auto; padding: 6px 10px; font-size: var(--fs-s); text-align: left; }
+.row { margin: 0; padding: 2px 4px; border-radius: var(--radius-s); }
+.row:hover { background: var(--bg-panel); }
+.kind { color: var(--accent); margin-right: 8px; }
+.row.tool_use .sum { color: var(--ok); }
+.row.approval .sum, .row.approval_decision .sum { color: var(--warn); }
 .row.result .sum { font-weight: 600; }
-.row.retry .sum, .row.stream_error .sum { color: #ff8a80; }
-.noise button { color: #66788a; background: none; border: none; cursor: pointer; }
+.row.retry .sum, .row.stream_error .sum { color: var(--err); }
+.noise button { color: var(--text-faint); background: none; border: none; cursor: pointer; }
 .rawbtn { font-size: 10px; margin-left: 6px; }
-pre { background: #101820; padding: 6px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+pre { background: var(--bg-inset); padding: 6px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
 .sub { margin-left: 18px; }
 </style>

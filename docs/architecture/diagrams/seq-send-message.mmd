@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant UI
+  participant App as app.go
+  participant M as Manager
+  participant A as slot[claude]
+  participant B as slot[codex]
+  participant CX as codex adapter
+  Note over A: claude streaming 中（事件持續 emit）
+  UI->>App: SendMessage("codex", text)
+  App->>M: BeginSubmit(codex)
+  M->>B: 佔位（A 不受影響）
+  App->>CX: StartTurn(text)
+  CX-->>App: turnID（response 立即回）
+  App->>M: AcceptSubmit(codex, id, threadID, text)
+  M->>B: emit user → state(waiting) → flush queue
+  Note over M: 全程單一 mutex：A 的事件與 B 的<br/>交易交錯序列化，event_id 檔案級單調

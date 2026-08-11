@@ -104,10 +104,10 @@ onMounted(() => {
 
 <style scoped>
 .preview { height: 100%; overflow-y: auto; padding: 12px 16px; text-align: left; }
-.err { color: #ff8a80; }
-.hint { color: #66788a; }
+.err { color: var(--err); }
+.hint { color: var(--text-faint); }
 .plain { white-space: pre-wrap; word-break: break-all; font-size: 13px; }
-.rendered :deep(pre) { background: #101820; padding: 8px; border-radius: 6px; overflow-x: auto; }
-.rendered :deep(a) { color: #7aa2c4; }
-.rendered :deep(.mmd-err) { color: #ff8a80; }
+.rendered :deep(pre) { background: var(--bg-inset); padding: 8px; border-radius: 6px; overflow-x: auto; }
+.rendered :deep(a) { color: var(--accent); }
+.rendered :deep(.mmd-err) { color: var(--err); }
 </style>
