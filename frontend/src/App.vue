@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateList, RestoreViews } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
@@ -18,6 +18,7 @@ import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
+import DiagramPane from './components/DiagramPane.vue'
 
 const s = useSession()
 const gate = useGate()
@@ -48,7 +49,19 @@ async function decideGate(id: string, decision: string, reason: string) {
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview' | 'spec'>('chat')
+const tab = ref<'chat' | 'preview' | 'spec' | 'diagram'>('chat')
+// Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
+const diagramFiles = ref<string[]>([])
+const diagramPath = ref('')
+async function refreshDiagramFiles() {
+  try {
+    const files = (await SpecList()) ?? []
+    diagramFiles.value = files
+      .map(f => f.path)
+      .filter(p => p.startsWith('spec/context-map/') && p.endsWith('.mmd'))
+    if (!diagramPath.value && diagramFiles.value.length) diagramPath.value = diagramFiles.value[0]
+  } catch { /* dev 無綁定時忽略 */ }
+}
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
 const selectedFile = ref('')
@@ -98,6 +111,7 @@ onMounted(async () => {
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
+  await refreshDiagramFiles()
 })
 </script>
 
@@ -115,10 +129,18 @@ onMounted(async () => {
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">Chat</button>
           <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">Preview</button>
           <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">Spec</button>
+          <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">表示圖</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
+        <div v-show="tab === 'diagram'" class="diagram-tab">
+          <div class="diagram-files">
+            <button v-for="f in diagramFiles" :key="f" :class="{ active: f === diagramPath }"
+              @click="diagramPath = f">{{ f }}</button>
+          </div>
+          <DiagramPane :path="diagramPath" />
+        </div>
       </main>
       <aside class="gate-panel">
         <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
@@ -153,6 +175,10 @@ nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bo
 nav button { border: none; background: transparent; color: var(--text-muted); }
 nav .active { background: var(--bg-bubble-user); color: #fff; }
 main > :not(nav) { flex: 1; min-height: 0; }
+.diagram-tab { display: flex; flex-direction: column; min-height: 0; }
+.diagram-files { display: flex; gap: 4px; flex-wrap: wrap; padding: var(--space-1) var(--space-2); }
+.diagram-files button.active { background: var(--bg-bubble-user); color: #fff; }
+.diagram-tab > :not(.diagram-files) { flex: 1; min-height: 0; }
 .tl { border-top: 1px solid var(--border); overflow: hidden; }
 .tl-resize { height: 4px; cursor: row-resize; background: transparent; }
 .tl-resize:hover { background: var(--accent); }
