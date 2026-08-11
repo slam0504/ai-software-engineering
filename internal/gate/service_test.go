@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,71 @@ func TestReconcileAppendsSingleStaleThenNoRevive(t *testing.T) {
 	_ = s.ReconcileGate1()
 	if entryByID(mustProjectOps(t, s), id).State != Stale {
 		t.Fatal("stale must not revive")
+	}
+}
+
+// TestReconcileSingleStaleUnderConcurrency is the spec §7 barrier: a watcher
+// (ReconcileGate1) and GateList (List, which also reconciles) racing against
+// each other must produce exactly ONE stale transition for the affected
+// approval id — never a duplicate. Unlike
+// TestReconcileAppendsSingleStaleThenNoRevive (which calls ReconcileGate1
+// sequentially and only checks the projected terminal state), this test
+// fires 8 goroutines concurrently and counts raw "stale" transition records
+// in the journal, which would catch a bug that appends a redundant stale
+// transition under a genuine race.
+func TestReconcileSingleStaleUnderConcurrency(t *testing.T) {
+	digest := "sha256:" + hex64()
+	changed := "sha256:" + hex64b()
+	var curMu sync.Mutex
+	cur := digest
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) {
+		curMu.Lock()
+		defer curMu.Unlock()
+		return cur, nil
+	})
+	id, _ := s.Submit(digest, "git:sha1:"+hex40(), gate1BWith(digest))
+	if err := s.Decide(id, "approved", "", Approver{ID: "u", Method: "app-local"}, gate1BWith(digest)); err != nil {
+		t.Fatal(err)
+	}
+
+	curMu.Lock()
+	cur = changed // spec changed, before any concurrent reconcile starts
+	curMu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i%3 == 0 {
+				if _, err := s.List(); err != nil {
+					t.Error(err)
+				}
+			} else if err := s.ReconcileGate1(); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	staleCount := 0
+	for _, op := range s.opsForTest() {
+		for _, raw := range op.Records {
+			var probe struct {
+				Type       string `json:"_type"`
+				ApprovalID string `json:"approval_id"`
+				To         string `json:"to"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil {
+				t.Fatalf("unmarshal record: %v", err)
+			}
+			if probe.Type == "transition" && probe.ApprovalID == id && probe.To == "stale" {
+				staleCount++
+			}
+		}
+	}
+	if staleCount != 1 {
+		t.Fatalf("want exactly 1 stale transition under concurrency, got %d", staleCount)
 	}
 }
 
