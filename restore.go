@@ -181,6 +181,17 @@ func replayViewWindow(eventsPath, provider, viewStart string) []contract.Envelop
 		if e.Provider != provider || e.EventID == "" {
 			continue
 		}
+		// Only genuine provider-session events belong in a provider view window.
+		// Provider session events go through contract.Wrap, which leaves Scope
+		// empty; only EmitWorkspace sets scope="workspace" and EmitAssist sets
+		// scope="session"+purpose="spec_assist". So exclude workspace/gate
+		// envelopes (defensive — they also carry no provider) and, critically,
+		// isolated SpecAssist events: those share the provider but must never be
+		// replayed through session.apply, or their delta/message would leak into
+		// the provider Chat and inflate totals (frozen §5.1).
+		if e.Scope == "workspace" || e.Purpose == "spec_assist" {
+			continue
+		}
 		if viewStart != "" && e.EventID <= viewStart {
 			continue
 		}

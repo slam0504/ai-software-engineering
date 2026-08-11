@@ -844,6 +844,40 @@ func TestRestoreToleratesMalformedTail(t *testing.T) {
 	}
 }
 
+// TestRestoreExcludesAssistEventsFromProviderView guards §5.1: on restart, an
+// isolated SpecAssist event (scope=session, provider=claude, purpose=spec_assist)
+// shares the provider but must NOT be bucketed into that provider's view window,
+// or its delta/message would leak into the provider Chat and inflate totals.
+func TestRestoreExcludesAssistEventsFromProviderView(t *testing.T) {
+	a, _ := newTestApp(t)
+	m := a.manager
+	// 正常 provider session 訊息（走 Wrap → scope 空、purpose 空）——應被重放。
+	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindMessage,
+		Raw: []byte("{}"), Text: "hello-from-provider"})
+	// 隔離 SpecAssist 事件（帶文字＋usage）——絕不可進 provider view window。
+	m.EmitAssist(contract.ProviderClaude, "corr-assist-1", "spec_assist",
+		contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta,
+			Raw: []byte("{}"), Text: "assist-draft-leak",
+			Usage: &contract.Usage{InputTokens: 111, OutputTokens: 222}})
+
+	got := replayViewWindow(a.eventsPath(), "claude", "")
+	var sawProvider, sawAssist bool
+	for _, e := range got {
+		if e.Purpose == "spec_assist" || e.Text == "assist-draft-leak" {
+			sawAssist = true
+		}
+		if e.Text == "hello-from-provider" {
+			sawProvider = true
+		}
+	}
+	if !sawProvider {
+		t.Fatal("normal provider message must be replayed into the provider view window")
+	}
+	if sawAssist {
+		t.Fatal("assist event leaked into provider view window (would inflate Chat/totals)")
+	}
+}
+
 func TestRestoredResumeReachesProvider(t *testing.T) {
 	a, _ := newTestApp(t)
 	// claude：fake CLI 把 argv 落檔——斷言 --resume 真正進 argv
