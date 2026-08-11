@@ -745,21 +745,30 @@ func (a *App) SpecList() ([]FileNode, error) {
 	return out, nil
 }
 
-// SpecRead 讀既有納管檔；digest 為 specDigestOf(raw bytes)，與 SpecWrite 的
+// SpecFile：SpecRead 的 JSON-friendly 回傳。Wails v2 對 Go 端多回傳值只保留
+// 第一個（App.d.ts 會生成 Promise<string>、實際 runtime 回陣列），前端無法穩定
+// 拿到 digest——SpecWrite 的 expectedDigest 卻仰賴它。單一 struct 回傳沒有這個
+// multi-return 陷阱（見 Task 14 review parked issue）。
+type SpecFile struct {
+	Content string `json:"content"`
+	Digest  string `json:"digest"`
+}
+
+// SpecRead 讀既有納管檔；Digest 為 specDigestOf(raw bytes)，與 SpecWrite 的
 // expected_digest／回傳值同格式。
-func (a *App) SpecRead(rel string) (content string, digest string, err error) {
+func (a *App) SpecRead(rel string) (SpecFile, error) {
 	if !spec.InScope(rel) {
-		return "", "", fmt.Errorf("path %q is not a managed spec file", rel)
+		return SpecFile{}, fmt.Errorf("path %q is not a managed spec file", rel)
 	}
 	p, err := a.resolveInWorkspace(rel)
 	if err != nil {
-		return "", "", err
+		return SpecFile{}, err
 	}
 	raw, err := os.ReadFile(p)
 	if err != nil {
-		return "", "", err
+		return SpecFile{}, err
 	}
-	return string(raw), specDigestOf(raw), nil
+	return SpecFile{Content: string(raw), Digest: specDigestOf(raw)}, nil
 }
 
 // deepestExistingAncestor walks up from dir until it finds a path segment
@@ -932,6 +941,38 @@ func (a *App) SubmitForApproval() (string, error) {
 		return "", err
 	}
 	return svc.Submit(manifestDigest, baseCommit, gate1Bindings(manifestDigest, baseCommit))
+}
+
+// ---- SpecCommit（Task 15：spec §5.1 兩階段 commit UI，wraps internal/spec.GitRepo）----
+
+// SpecCommitPreview：PreviewSpecCommit 的 JSON-friendly 回傳。同 SpecRead 的
+// multi-return 教訓——spec.GitRepo.PreviewSpecCommit 回傳 (CommitToken, string,
+// error) 三個值，Wails 只保留第一個，struct 回傳才能把 diff 穩定帶給前端。
+type SpecCommitPreview struct {
+	Token spec.CommitToken `json:"token"`
+	Diff  string            `json:"diff"`
+}
+
+// PreviewSpecCommit 回傳目前納管樹相對 HEAD 的 diff，並附上綁定當下狀態的
+// CommitToken——前端保留此 token，未改動地傳給 ConfirmSpecCommit。
+func (a *App) PreviewSpecCommit() (SpecCommitPreview, error) {
+	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.specRepo（同 SubmitForApproval 路徑）
+		return SpecCommitPreview{}, err
+	}
+	tok, diff, err := a.specRepo.PreviewSpecCommit()
+	if err != nil {
+		return SpecCommitPreview{}, err
+	}
+	return SpecCommitPreview{Token: tok, Diff: diff}, nil
+}
+
+// ConfirmSpecCommit 以 PreviewSpecCommit 回傳的 token 提交納管樹異動；token
+// 與目前 repo 狀態不符（HEAD 移動或內容變更）回 spec.ErrCommitStale。
+func (a *App) ConfirmSpecCommit(tok spec.CommitToken, message string) error {
+	if _, err := a.ensureGate(); err != nil {
+		return err
+	}
+	return a.specRepo.ConfirmSpecCommit(tok, message)
 }
 
 // GateEntryDTO：GateList 的 JSON-friendly projection（前端消費）。

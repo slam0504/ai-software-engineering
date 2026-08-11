@@ -13,8 +13,11 @@ func TestSpecWriteNewFileAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, got, _ := a.SpecRead("spec/features/x.feature")
-	if got != d {
+	sf, err := a.SpecRead("spec/features/x.feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.Digest != d {
 		t.Fatal("read digest must match write digest")
 	}
 }

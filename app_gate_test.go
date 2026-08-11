@@ -56,11 +56,11 @@ func stateOf(list []GateEntryDTO, id string) string {
 
 func digestOf(t *testing.T, a *App, path string) string {
 	t.Helper()
-	_, digest, err := a.SpecRead(path)
+	sf, err := a.SpecRead(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return digest
+	return sf.Digest
 }
 
 func TestGateLiveLoopSubmitApproveThenStale(t *testing.T) {

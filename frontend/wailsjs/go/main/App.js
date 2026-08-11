@@ -14,6 +14,10 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
+export function ConfirmSpecCommit(arg1, arg2) {
+  return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
+}
+
 export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
@@ -36,6 +40,10 @@ export function Logout(arg1) {
 
 export function NewSession(arg1) {
   return window['go']['main']['App']['NewSession'](arg1);
+}
+
+export function PreviewSpecCommit() {
+  return window['go']['main']['App']['PreviewSpecCommit']();
 }
 
 export function ReadDiagram() {
