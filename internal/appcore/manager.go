@@ -1,6 +1,7 @@
 package appcore
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -372,6 +373,28 @@ func (m *Manager) flushLocked(sl *slot) {
 			}
 		}
 	}
+}
+
+// EmitWorkspace：workspace scope 事件出口（gate/binding 等）——不帶 provider/session
+// id、不碰任何 slot／reducer，只走 writeAndEmitLocked 取得檔案級單調 event_id。
+func (m *Manager) EmitWorkspace(kind string, bindings []contract.Binding, payload any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先
+		m.emitClosedDroppedLocked(kind, "")
+		return
+	}
+	raw, _ := json.Marshal(payload)
+	now := time.Now()
+	env := contract.Envelope{
+		EventID:  contract.NewULID(now),
+		TS:       now.UTC().Format(time.RFC3339Nano),
+		Scope:    "workspace",
+		Kind:     kind,
+		Bindings: bindings,
+		Payload:  raw,
+	}
+	m.writeAndEmitLocked(env)
 }
 
 func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, toolName string, raw []byte) {

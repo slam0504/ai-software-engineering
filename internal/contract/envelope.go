@@ -60,6 +60,13 @@ type Usage struct {
 	CachedInput  int64 `json:"cached_input_tokens,omitempty"`
 }
 
+// Binding：workspace 事件攜帶的檔案/資源綁定（spec_manifest 等）＋內容 digest。
+type Binding struct {
+	Kind   string `json:"kind"`
+	Ref    string `json:"ref"`
+	Digest string `json:"digest"`
+}
+
 // Envelope 是事件 schema v1（app-plan §5.2）：UI 與稽核 JSONL 的統一載體。additive-only。
 type Envelope struct {
 	EventID        string          `json:"event_id"` // ULID，同毫秒單調
@@ -78,6 +85,14 @@ type Envelope struct {
 	State          string          `json:"state,omitempty"`
 	Error          string          `json:"error,omitempty"`
 	Raw            json.RawMessage `json:"raw,omitempty"` // 非合法 JSON 原文以 JSON string fallback
+
+	// M2 新增（additive；Stage A §3.4c）：workspace scope 事件用（gate/binding），
+	// 與 provider 事件共用同一 Envelope schema，但不進任何 provider slot。
+	Scope         string          `json:"scope,omitempty"`          // "workspace" 表非 provider 事件
+	Bindings      []Binding       `json:"bindings,omitempty"`       // gate/binding 事件攜帶的資源綁定
+	Payload       json.RawMessage `json:"payload,omitempty"`        // 結構化 payload（不塞進 Text）
+	CorrelationID string          `json:"correlation_id,omitempty"` // 跨事件關聯 id（例如 approval_id）
+	Purpose       string          `json:"purpose,omitempty"`        // 事件用途說明
 }
 
 // Wrap：Event → Envelope。role 規則：ev.Role 明確標注優先；否則 Kind==delta →
