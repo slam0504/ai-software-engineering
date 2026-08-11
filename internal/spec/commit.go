@@ -30,9 +30,11 @@ var managedScopeRoots = []string{"spec/features", "spec/nfr", "spec/glossary.md"
 
 // CommitToken binds a previewed SpecCommit to the exact repo state it was
 // previewed against: the HEAD commit OID and a canonical digest over the
-// in-scope worktree content (see ReadScopedWorktree + ManifestDigest). Any
-// scoped add/delete/rename/content/mode change, or any HEAD move, changes at
-// least one field, which ConfirmSpecCommit uses to detect staleness.
+// in-scope worktree content (see ReadScopedWorktree + ManifestDigest). The
+// digest is content-only — each entry is path + sha256 of raw bytes, with no
+// file mode — so it binds content (path + content hash) over the managed scope,
+// NOT file mode. Any scoped add/delete/rename/content change, or any HEAD move,
+// changes at least one field, which ConfirmSpecCommit uses to detect staleness.
 type CommitToken struct {
 	HeadOID    string
 	TreeDigest string

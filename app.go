@@ -1119,9 +1119,13 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 	if provider != "claude" && provider != "codex" {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
-	if purpose == "" {
-		purpose = "spec_assist"
-	}
+	// Pin the assist purpose at the emit boundary (defense in depth): this is the
+	// isolated assist lane, so every emitted envelope MUST carry
+	// purpose="spec_assist" regardless of the caller-supplied argument. Trusting
+	// the caller would let a future caller passing "" or another value leak
+	// assist (scope=session) events into the provider slot — restore.go's
+	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
+	purpose = "spec_assist"
 	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
