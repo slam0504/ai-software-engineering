@@ -1,0 +1,183 @@
+package spec
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+var (
+	// ErrCommitStale is returned by ConfirmSpecCommit when the current HEAD
+	// OID or the current scoped tree digest no longer matches the
+	// CommitToken returned by PreviewSpecCommit — content or HEAD changed
+	// after preview, so the previewed diff no longer describes what would be
+	// committed.
+	ErrCommitStale = errors.New("spec: commit token stale — content or HEAD changed since preview")
+
+	// ErrStagedChangesPresent is returned by ConfirmSpecCommit when the
+	// index contains staged changes outside the managed spec scope. We fail
+	// closed rather than risk disturbing or silently committing unrelated
+	// staged work.
+	ErrStagedChangesPresent = errors.New("spec: staged changes outside managed scope present")
+)
+
+// managedScopeRoots are the top-level managed paths passed to `git add`.
+// Only entries that actually exist on disk are added — see
+// existingManagedPaths.
+var managedScopeRoots = []string{"spec/features", "spec/nfr", "spec/glossary.md", "spec/context-map"}
+
+// CommitToken binds a previewed SpecCommit to the exact repo state it was
+// previewed against: the HEAD commit OID and a canonical digest over the
+// in-scope worktree content (see ReadScopedWorktree + ManifestDigest). Any
+// scoped add/delete/rename/content/mode change, or any HEAD move, changes at
+// least one field, which ConfirmSpecCommit uses to detect staleness.
+type CommitToken struct {
+	HeadOID    string
+	TreeDigest string
+}
+
+// headOIDOrUnborn returns the current HEAD commit OID, or "" if HEAD does
+// not resolve (unborn HEAD on a repo with no commits yet) — that is a valid
+// state, not an error, so PreviewSpecCommit/ConfirmSpecCommit can still run
+// before the first commit. `git rev-parse HEAD`'s failure message is
+// locale-dependent, so any failure here is treated as unborn rather than
+// pattern-matched on stderr text; a genuinely broken repo will still fail
+// loudly on the git calls that follow (ReadScopedWorktree, git add/commit).
+func (r *GitRepo) headOIDOrUnborn() string {
+	oid, err := r.HeadCommit()
+	if err != nil {
+		return ""
+	}
+	return oid
+}
+
+// scopedTreeDigest computes the canonical digest over the current in-scope
+// worktree content — this is what CommitToken.TreeDigest binds to.
+func (r *GitRepo) scopedTreeDigest() (string, error) {
+	entries, err := r.ReadScopedWorktree()
+	if err != nil {
+		return "", err
+	}
+	return ManifestDigest(entries)
+}
+
+// existingManagedPaths returns the managedScopeRoots entries that actually
+// exist on disk, so `git add` never errors on a not-yet-created scope path
+// and never falls back to `git add -A`.
+func (r *GitRepo) existingManagedPaths() []string {
+	var out []string
+	for _, p := range managedScopeRoots {
+		if _, err := os.Stat(filepath.Join(r.root, p)); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// scopedDiffForDisplay renders a human-readable diff of in-scope changes:
+// `git diff` over the existing managed paths plus a listing of untracked
+// in-scope files. This is for UI display only — it is never used to decide
+// what gets committed.
+func (r *GitRepo) scopedDiffForDisplay() (string, error) {
+	var b strings.Builder
+	if paths := r.existingManagedPaths(); len(paths) > 0 {
+		out, err := r.git(append([]string{"diff", "--"}, paths...)...)
+		if err != nil {
+			return "", err
+		}
+		b.Write(out)
+	}
+	statusOut, err := r.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
+	if err != nil {
+		// No spec/ path tracked/existing yet — nothing more to show.
+		return b.String(), nil
+	}
+	for _, line := range strings.Split(string(statusOut), "\n") {
+		if !strings.HasPrefix(line, "??") {
+			continue
+		}
+		path := statusPath(line)
+		if !InScope(path) {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(r.root, path))
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "+++ new file: %s\n%s\n", path, content)
+	}
+	return b.String(), nil
+}
+
+// checkNoOutOfScopeStaged fails closed with ErrStagedChangesPresent if the
+// index has any staged change outside the managed spec scope. Guaranteeing
+// perfect index isolation is hard, so this is the required fallback: refuse
+// to touch the index/commit at all rather than risk disturbing or including
+// unrelated staged work.
+func (r *GitRepo) checkNoOutOfScopeStaged() error {
+	out, err := r.git("diff", "--cached", "--name-only")
+	if err != nil {
+		return err
+	}
+	for _, path := range strings.Split(string(out), "\n") {
+		if path == "" {
+			continue
+		}
+		if !InScope(path) {
+			return ErrStagedChangesPresent
+		}
+	}
+	return nil
+}
+
+// PreviewSpecCommit returns a CommitToken binding {current HEAD OID, current
+// scoped TreeDigest} together with a human-readable diff for display. The
+// token must be passed unchanged to ConfirmSpecCommit, which re-verifies
+// both fields before committing.
+func (r *GitRepo) PreviewSpecCommit() (CommitToken, string, error) {
+	headOID := r.headOIDOrUnborn()
+	digest, err := r.scopedTreeDigest()
+	if err != nil {
+		return CommitToken{}, "", err
+	}
+	diff, err := r.scopedDiffForDisplay()
+	if err != nil {
+		return CommitToken{}, "", err
+	}
+	return CommitToken{HeadOID: headOID, TreeDigest: digest}, diff, nil
+}
+
+// ConfirmSpecCommit re-reads the current HEAD OID and scoped TreeDigest; if
+// either differs from tok, the repo moved since preview and it returns
+// ErrCommitStale rather than commit stale content. It then fails closed with
+// ErrStagedChangesPresent if any staged change lies outside the managed
+// scope, and otherwise stages only the existing managed scope paths (never
+// `git add -A`) and commits them.
+func (r *GitRepo) ConfirmSpecCommit(tok CommitToken, message string) error {
+	if r.headOIDOrUnborn() != tok.HeadOID {
+		return ErrCommitStale
+	}
+	digest, err := r.scopedTreeDigest()
+	if err != nil {
+		return err
+	}
+	if digest != tok.TreeDigest {
+		return ErrCommitStale
+	}
+	if err := r.checkNoOutOfScopeStaged(); err != nil {
+		return err
+	}
+	paths := r.existingManagedPaths()
+	if len(paths) == 0 {
+		return errors.New("spec: nothing in managed scope to commit")
+	}
+	if _, err := r.git(append([]string{"add", "--"}, paths...)...); err != nil {
+		return err
+	}
+	if _, err := r.git("commit", "-m", message); err != nil {
+		return err
+	}
+	return nil
+}
