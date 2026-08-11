@@ -52,6 +52,35 @@ func TestGitRepoCommittedSnapshotIgnoresWorktreeEdit(t *testing.T) {
 	}
 }
 
+// TestBuildCurrentManifestIgnoresGitIgnoredFile guards the false permanent-STALE
+// bug: a git-ignored in-scope file (e.g. macOS .DS_Store) must not appear in the
+// worktree manifest, so the committed-snapshot digest and the current-manifest
+// digest agree with zero real spec change.
+func TestBuildCurrentManifestIgnoresGitIgnoredFile(t *testing.T) {
+	dir := initRepo(t)
+	os.MkdirAll(filepath.Join(dir, "spec", "features"), 0o755)
+	os.WriteFile(filepath.Join(dir, "spec", "glossary.md"), []byte("v1"), 0o644)
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.DS_Store\n"), 0o644)
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-m", "c1")
+
+	// In-scope but git-ignored: must be invisible to both manifest paths.
+	os.WriteFile(filepath.Join(dir, "spec", "features", ".DS_Store"), []byte("junk"), 0o644)
+
+	r := NewGitRepo(dir)
+	committed, _, err := BuildCommittedSnapshot(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := BuildCurrentManifest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed != current {
+		t.Fatalf("git-ignored file caused false drift: committed=%s current=%s", committed, current)
+	}
+}
+
 func TestGitRepoRejectsSymlinkInScope(t *testing.T) {
 	dir := initRepo(t)
 	os.MkdirAll(filepath.Join(dir, "spec", "features"), 0o755)

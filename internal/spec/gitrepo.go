@@ -2,9 +2,9 @@ package spec
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -100,64 +100,75 @@ func (g *GitRepo) ReadScopedHeadTree(head string) ([]FileEntry, error) {
 	return entries, nil
 }
 
-// ReadScopedWorktree walks the managed spec/ patterns on disk and hashes raw
-// bytes. It rejects symlinks and any non-regular file (fail loud, never
-// silently skip) and refuses to descend into nested .git directories so a
-// submodule checkout under scope cannot be read as plain files.
+// ReadScopedWorktree enumerates exactly the files git considers in scope —
+// tracked (--cached) plus untracked-but-not-ignored (--others
+// --exclude-standard) — via `git ls-files`, so its view of the managed scope
+// matches ScopedClean and ReadScopedHeadTree. This is the fix for the false
+// permanent-STALE bug: a raw filesystem walk also enumerated git-ignored
+// files (e.g. macOS `.DS_Store`), which the HEAD-tree manifest never contains,
+// so the digests diverged with zero real spec change. Deferring enumeration to
+// git makes .gitignore / global ignore / .git/info/exclude apply uniformly.
+//
+// It still rejects symlinks and any non-regular file (fail loud, never
+// silently skip) and refuses to read files under a nested-repo boundary so a
+// submodule/embedded repo under scope cannot be read as plain files.
 func (g *GitRepo) ReadScopedWorktree() ([]FileEntry, error) {
-	root := filepath.Join(g.root, "spec")
-	var entries []FileEntry
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) && path == root {
-				return nil // no spec/ dir yet — nothing in scope
-			}
-			return err
-		}
-		rel, err := filepath.Rel(g.root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			if d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			if InScope(rel) {
-				// A submodule working tree has a `.git` FILE (gitdir pointer);
-				// an embedded repo has a `.git` DIR. Either way, its presence
-				// marks a nested-repo boundary we must not walk into.
-				if _, statErr := os.Lstat(filepath.Join(path, ".git")); statErr == nil {
-					return fmt.Errorf("spec: submodule/nested repo not allowed in scope: %s", rel)
-				} else if !os.IsNotExist(statErr) {
-					return statErr
-				}
-			}
-			return nil
-		}
-		if !InScope(rel) {
-			return nil
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("spec: symlink not allowed in scoped tree: %s", rel)
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("spec: non-regular file not allowed in scoped tree: %s", rel)
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, FileEntry{Path: rel, SHA256: HashBytes(raw)})
-		return nil
-	})
+	out, err := g.git("ls-files", "--cached", "--others", "--exclude-standard", "-z",
+		"--", "spec/features", "spec/nfr", "spec/glossary.md", "spec/context-map")
 	if err != nil {
 		return nil, err
 	}
+	var entries []FileEntry
+	checkedDirs := map[string]bool{} // memo: dir already verified free of nested .git
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" || !InScope(rel) {
+			continue
+		}
+		if err := g.rejectNestedRepo(rel, checkedDirs); err != nil {
+			return nil, err
+		}
+		abs := filepath.Join(g.root, filepath.FromSlash(rel))
+		info, err := os.Lstat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // tracked (--cached) but deleted from the worktree — not present content
+			}
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("spec: symlink not allowed in scoped tree: %s", rel)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("spec: non-regular file not allowed in scoped tree: %s", rel)
+		}
+		raw, err := os.ReadFile(abs)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, FileEntry{Path: rel, SHA256: HashBytes(raw)})
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	return entries, nil
+}
+
+// rejectNestedRepo fails loud if any in-scope ancestor directory of rel holds a
+// `.git` marker. A submodule working tree has a `.git` FILE (gitdir pointer);
+// an embedded repo has a `.git` DIR. When that pointer is not itself a live
+// repo, `git ls-files` still lists the files beneath it, so this explicit guard
+// preserves Task 6's boundary — a nested repo under scope must never be read as
+// plain spec files. Checked dirs are memoised so shared ancestors stat once.
+func (g *GitRepo) rejectNestedRepo(rel string, checked map[string]bool) error {
+	for dir := path.Dir(rel); dir != "." && dir != "/" && InScope(dir); dir = path.Dir(dir) {
+		if checked[dir] {
+			continue
+		}
+		checked[dir] = true
+		marker := filepath.Join(g.root, filepath.FromSlash(dir), ".git")
+		if _, err := os.Lstat(marker); err == nil {
+			return fmt.Errorf("spec: submodule/nested repo not allowed in scope: %s", dir)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
