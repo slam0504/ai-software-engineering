@@ -983,9 +983,13 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	if r := a.currentRunner(); r != nil {
 		threadID = r.ThreadID()
 	}
-	ch := make(chan bool, 1)
+	type codexDecision struct {
+		allow  bool
+		reason string
+	}
+	ch := make(chan codexDecision, 1)
 	a.registerApproval(id, "codex", func(allow bool, reason string) error {
-		ch <- allow
+		ch <- codexDecision{allow, reason} // reason（如 Esc 的 "esc"）保留進 envelope
 		return nil
 	})
 	a.audit("codex_approval_request", map[string]any{"id": id, "method": method, "raw_params": json.RawMessage(params)})
@@ -994,9 +998,11 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
 	uiDecision := "deny"
+	reason := ""
 	select {
-	case allow := <-ch:
-		if allow {
+	case d := <-ch:
+		reason = d.reason
+		if d.allow {
 			decision, uiDecision = "accept", "allow"
 		}
 	case <-time.After(approvalTimeout()):
@@ -1007,7 +1013,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
-	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, "")
+	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, reason)
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}
 }
@@ -1045,32 +1051,19 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 	runner := codex.NewThreadRunner(conn)
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	defer cancel()
-	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
-	if err != nil {
-		return "", false, err
-	}
 
-	a.mu.Lock()
-	a.runner = runner // 發布：首輪事件的 handler ownership
-	a.mu.Unlock()
-	rollback := func() {
-		a.mu.Lock()
-		if a.runner == runner {
-			a.runner = nil
-		}
-		a.mu.Unlock()
-	}
-
+	// 錄流先於 EnsureThread 開啟——thread/start｜resume 屬 session wire 的一部分，
+	// 必須進錄流（W6：codex resume 以 JSON-RPC 錄流佐證）。
 	var lease *appcore.RecordingLease
+	var rec *recorder.Recorder
 	if recordCase != "" {
-		rec, rerr := recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
+		var rerr error
+		rec, rerr = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
 		if rerr != nil { // 可見的 session 失敗，不無聲降級
-			rollback()
 			return "", false, rerr
 		}
 		if berr := conn.BeginRecording(rec.Line); berr != nil {
 			cerr := rec.CloseWith(recorder.Meta{Provider: "codex", RecordedAt: time.Now().UTC().Format(time.RFC3339)})
-			rollback()
 			return "", false, errors.Join(berr, cerr)
 		}
 		lease = appcore.NewRecordingLease(rec, conn.StopRecording,
@@ -1081,13 +1074,33 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 					ProcessStillRunning: true, StderrTail: host.StderrSnapshot()}
 			})
 	}
-
-	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
-	if err != nil {
+	finalizeLease := func() {
 		if lease != nil {
 			_ = lease.Finalize(ports.Exit{Exited: false})
 		}
-		rollback()
+	}
+
+	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
+	if err != nil {
+		finalizeLease() // 錄流已開：EnsureThread 失敗須收尾
+		return "", false, err
+	}
+
+	a.mu.Lock()
+	a.runner = runner // 發布：首輪事件的 handler ownership
+	a.mu.Unlock()
+	rollback := func() {
+		finalizeLease()
+		a.mu.Lock()
+		if a.runner == runner {
+			a.runner = nil
+		}
+		a.mu.Unlock()
+	}
+
+	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
+	if err != nil {
+		rollback() // 含 finalizeLease
 		return "", false, err
 	}
 

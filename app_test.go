@@ -1273,3 +1273,85 @@ func TestShutdownGateBlocksLateEnsure(t *testing.T) {
 		t.Fatalf("post-shutdown B1 probe must be rejected: %v", err)
 	}
 }
+
+// W3 live 抓到的 gap 迴歸：codex approval 的 reason（如 Esc 的 "esc"）必須進
+// approval_decision envelope（原 codex resolve callback 丟棄 reason）。
+func TestCodexApprovalReasonReachesEnvelope(t *testing.T) {
+	a, ui := newTestApp(t)
+	done := make(chan map[string]string, 1)
+	go func() {
+		done <- a.codexApproval("item/commandExecution/requestApproval", []byte(`{"command":"touch x"}`))
+	}()
+	var id string
+	waitFor(t, "approval:request", func() bool {
+		for _, e := range ui.find("approval:request") {
+			if d, ok := e.data.(map[string]any); ok {
+				id = d["id"].(string)
+				return true
+			}
+		}
+		return false
+	})
+	if err := a.ResolveApproval(id, false, "esc"); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	var got string
+	for _, e := range ui.findEnvKind(string(contract.KindApprovalDecision)) {
+		if e.Provider == "codex" {
+			got = e.Thinking // reason
+		}
+	}
+	if got != "esc" {
+		t.Fatalf("codex approval reason must reach envelope, got %q", got)
+	}
+}
+
+// W6 佐證迴歸：codex 錄流須涵蓋 thread/resume（BeginRecording 先於 EnsureThread）——
+// 否則 resume request 在錄流開始前發出、無法以 JSON-RPC 錄流佐證。
+func TestCodexRecordingCapturesThreadResume(t *testing.T) {
+	a, _ := newTestApp(t)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	var sawResume atomic.Bool
+	var turnSeq atomic.Int32
+	wire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodInitialize:
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		case codex.MethodThreadResume:
+			sawResume.Store(true)
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{"thread": map[string]any{"id": "t-resumed"}}})
+		case codex.MethodTurnStart:
+			turnID := fmt.Sprintf("turn-%d", turnSeq.Add(1))
+			wire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			wire.send(map[string]any{"method": codex.MethodTurnCompleted,
+				"params": map[string]any{"threadId": "t-resumed", "turn": map[string]any{"id": turnID, "status": "completed"}}})
+		}
+	})
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	if err := conn.Handshake(hctx, clientInfo()); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, "task-x")
+	threadID, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi", "t-resumed", "codex-resume-rec", "untrusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = a.manager.AcceptSubmit(contract.ProviderCodex, id, threadID, "hi")
+	if !sawResume.Load() {
+		t.Fatal("precondition: thread/resume must reach the wire")
+	}
+	if err := a.EndSession("codex"); err != nil { // 收尾 flush 錄流
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(a.stateDir, "recordings", "codex-resume-rec.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"thread/resume"`) { // 錄流涵蓋 thread/resume
+		t.Fatalf("recording must capture thread/resume, got:\n%s", b)
+	}
+}
