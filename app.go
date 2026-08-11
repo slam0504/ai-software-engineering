@@ -79,12 +79,16 @@ type App struct {
 	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
 	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
 	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
+	hookInServerTxn         func()                     // 測試注入：server 交易已登記、Ensure 未開始
 	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
 }
 
-// beginStartTxn：StartSession 的 shutdown gate 入場——shutdown 已開始則拒絕，
-// 否則登記 in-flight（shutdown 會等待全部離場）。
-func (a *App) beginStartTxn() error {
+// beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
+// 建立／替換 codex server 或啟動 provider 的操作（StartSession、ensureAppServer、
+// B1 probe）。check＋in-flight 登記在同一 shutMu 內原子：TOCTOU 關閉——
+// 若 check 通過，shutdown 的 Wait 必等本交易離場，Take 一定在 Ensure 之後執行，
+// 任何回填的 server 都會被 Take 收走；shuttingDown 之後的新交易一律被拒。
+func (a *App) beginAppTxn() error {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
 	if a.shuttingDown {
@@ -94,7 +98,7 @@ func (a *App) beginStartTxn() error {
 	return nil
 }
 
-func (a *App) endStartTxn() { a.inflight.Done() }
+func (a *App) endAppTxn() { a.inflight.Done() }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
 func (a *App) emit(name string, data any) {
@@ -555,10 +559,10 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
 		resume = a.restore.Get(provider).ResumeSessionID
 	}
-	if err := a.beginStartTxn(); err != nil { // shutdown gate：拒新 Start
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 Start
 		return err
 	}
-	defer a.endStartTxn()
+	defer a.endAppTxn()
 	id, err := a.manager.BeginNewSessionSubmit(prov, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
@@ -894,11 +898,14 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 // ---- Codex 線 ----
 
 func (a *App) ensureAppServer() (*codex.Server, error) {
-	a.shutMu.Lock()
-	down := a.shuttingDown
-	a.shutMu.Unlock()
-	if down { // shutdown 後不得建立／回填長駐 server（Take 之後的 Ensure 一律拒）
-		return nil, errors.New("app shutting down")
+	// server-create 交易：check 與 Ensure 對 shutdown 原子（TOCTOU 關閉）——
+	// AuthStatus／StartLogin／Logout 等所有經此入口的路徑一體適用
+	if err := a.beginAppTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endAppTxn()
+	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、Ensure 未開始
+		h()
 	}
 	return a.codexSingle.Ensure(func() (*codex.Server, error) {
 		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
@@ -1129,6 +1136,10 @@ func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
 // RestartCodexServerRecorded：B1 受控重啟 probe（薄封裝 codex.RunHandshakeProbe，
 // 生命週期 Begin → Handshake → Stop → CloseWith 與四階段失敗處置在 M0 Task 8 以測試固定）。
 func (a *App) RestartCodexServerRecorded(recordCase string) error {
+	if err := a.beginAppTxn(); err != nil { // probe 直接操作 codexSingle：同樣入 gate
+		return err
+	}
+	defer a.endAppTxn()
 	newRec := func() (*recorder.Recorder, error) {
 		return recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
 	}

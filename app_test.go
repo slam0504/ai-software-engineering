@@ -72,7 +72,9 @@ func (c *uiCapture) findEnvKind(kind string) []contract.Envelope {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// 15s：-race full suite 的 package 並行會擠壓 fake CLI spawn（實測 5s 偶發逾時
+	// ——單獨 ×10 與 -p 1 全綠）；放寬等待上限、斷言不變
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -1224,5 +1226,50 @@ func TestShutdownGateBlocksLateCodexStart(t *testing.T) {
 	if err := a.StartSession("codex", "after", "", "", "t", ""); err == nil ||
 		!strings.Contains(err.Error(), "shutting down") { // gate 持續拒新 Start
 		t.Fatalf("post-shutdown start must be rejected: %v", err)
+	}
+}
+
+// 第五輪 review P1 迴歸：非 StartSession 的 server 建立入口（AuthStatus 等經
+// ensureAppServer）同樣受 gate 保護——check＋Ensure 對 shutdown 原子，
+// 「讀到 false → shutdown Take → 才 Ensure 回填」的 TOCTOU 關閉。
+func TestShutdownGateBlocksLateEnsure(t *testing.T) {
+	a, _ := newTestApp(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookInServerTxn = func() { // 交易已登記、Ensure 未開始
+		close(entered)
+		<-release
+	}
+	authErr := make(chan error, 1)
+	go func() {
+		_, err := a.AuthStatus("codex") // 非 StartSession 入口
+		authErr <- err
+	}()
+	<-entered
+	a.hookInServerTxn = nil
+
+	shutDone := make(chan struct{})
+	go func() {
+		a.shutdown(context.Background())
+		close(shutDone)
+	}()
+	select { // shutdown 必須等待 in-flight server 交易
+	case <-shutDone:
+		t.Fatal("shutdown must wait for the in-flight server transaction")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release) // 交易離場（Ensure 會因無 codex binary 失敗——無 server 回填）
+	<-authErr
+	<-shutDone
+
+	if _, ok := a.codexSingle.Take(); ok { // Take 之後不可能再回填
+		t.Fatal("no codex server may be (re)filled after shutdown")
+	}
+	// shutdown 後所有 server 入口一律被拒
+	if _, err := a.AuthStatus("codex"); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("post-shutdown AuthStatus must be rejected: %v", err)
+	}
+	if err := a.RestartCodexServerRecorded("codex-probe"); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("post-shutdown B1 probe must be rejected: %v", err)
 	}
 }
