@@ -23,9 +23,9 @@ var (
 	ErrStagedChangesPresent = errors.New("spec: staged changes outside managed scope present")
 )
 
-// managedScopeRoots are the top-level managed paths passed to `git add`.
-// Only entries that actually exist on disk are added — see
-// existingManagedPaths.
+// managedScopeRoots are the top-level managed paths passed to `git add -A`
+// as a pathspec. See activeScopePathspecs for why the full list can't
+// always be passed as-is.
 var managedScopeRoots = []string{"spec/features", "spec/nfr", "spec/glossary.md", "spec/context-map"}
 
 // CommitToken binds a previewed SpecCommit to the exact repo state it was
@@ -63,31 +63,56 @@ func (r *GitRepo) scopedTreeDigest() (string, error) {
 	return ManifestDigest(entries)
 }
 
-// existingManagedPaths returns the managedScopeRoots entries that actually
-// exist on disk, so `git add` never errors on a not-yet-created scope path
-// and never falls back to `git add -A`.
-func (r *GitRepo) existingManagedPaths() []string {
+// activeScopePathspecs returns the managedScopeRoots entries that are safe
+// to pass to `git add -A`/`git diff` as a pathspec: those that currently
+// exist on disk, OR (when headOID is non-empty) were tracked under HEAD. A
+// root that was deleted from disk but is still tracked in HEAD MUST stay in
+// the list — otherwise `git add -A -- <roots>` never even sees the deletion
+// (the path is gone, so a stat-existence filter silently drops it) and the
+// deletion is never staged/committed. Passing a pathspec that matches
+// nothing at all (never existed, never tracked) makes `git add`/`git diff`
+// fail with "pathspec did not match any files", so roots that are neither
+// on disk nor in HEAD are omitted instead.
+func (r *GitRepo) activeScopePathspecs(headOID string) ([]string, error) {
 	var out []string
 	for _, p := range managedScopeRoots {
 		if _, err := os.Stat(filepath.Join(r.root, p)); err == nil {
 			out = append(out, p)
+			continue
+		}
+		if headOID == "" {
+			continue // unborn HEAD: nothing can be tracked yet
+		}
+		tracked, err := r.git("ls-tree", "-r", "--name-only", "HEAD", "--", p)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(string(tracked)) != "" {
+			out = append(out, p)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // scopedDiffForDisplay renders a human-readable diff of in-scope changes:
-// `git diff` over the existing managed paths plus a listing of untracked
-// in-scope files. This is for UI display only — it is never used to decide
-// what gets committed.
-func (r *GitRepo) scopedDiffForDisplay() (string, error) {
+// `git diff HEAD` over the active managed paths (this shows deletions, not
+// just modifications, since it compares the worktree directly against the
+// HEAD tree) plus a listing of untracked in-scope files. This is for UI
+// display only — it is never used to decide what gets committed.
+func (r *GitRepo) scopedDiffForDisplay(headOID string) (string, error) {
 	var b strings.Builder
-	if paths := r.existingManagedPaths(); len(paths) > 0 {
-		out, err := r.git(append([]string{"diff", "--"}, paths...)...)
+	if headOID != "" {
+		paths, err := r.activeScopePathspecs(headOID)
 		if err != nil {
 			return "", err
 		}
-		b.Write(out)
+		if len(paths) > 0 {
+			out, err := r.git(append([]string{"diff", "HEAD", "--"}, paths...)...)
+			if err != nil {
+				return "", err
+			}
+			b.Write(out)
+		}
 	}
 	statusOut, err := r.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
 	if err != nil {
@@ -142,7 +167,7 @@ func (r *GitRepo) PreviewSpecCommit() (CommitToken, string, error) {
 	if err != nil {
 		return CommitToken{}, "", err
 	}
-	diff, err := r.scopedDiffForDisplay()
+	diff, err := r.scopedDiffForDisplay(headOID)
 	if err != nil {
 		return CommitToken{}, "", err
 	}
@@ -153,10 +178,13 @@ func (r *GitRepo) PreviewSpecCommit() (CommitToken, string, error) {
 // either differs from tok, the repo moved since preview and it returns
 // ErrCommitStale rather than commit stale content. It then fails closed with
 // ErrStagedChangesPresent if any staged change lies outside the managed
-// scope, and otherwise stages only the existing managed scope paths (never
-// `git add -A`) and commits them.
+// scope, and otherwise stages the managed scope (pathspec-restricted
+// `git add -A`, never a global `git add -A`) and commits it. `-A` is
+// required, not `git add --`, so a managed path that was deleted on disk
+// still has its deletion staged — see activeScopePathspecs.
 func (r *GitRepo) ConfirmSpecCommit(tok CommitToken, message string) error {
-	if r.headOIDOrUnborn() != tok.HeadOID {
+	headOID := r.headOIDOrUnborn()
+	if headOID != tok.HeadOID {
 		return ErrCommitStale
 	}
 	digest, err := r.scopedTreeDigest()
@@ -169,11 +197,14 @@ func (r *GitRepo) ConfirmSpecCommit(tok CommitToken, message string) error {
 	if err := r.checkNoOutOfScopeStaged(); err != nil {
 		return err
 	}
-	paths := r.existingManagedPaths()
+	paths, err := r.activeScopePathspecs(headOID)
+	if err != nil {
+		return err
+	}
 	if len(paths) == 0 {
 		return errors.New("spec: nothing in managed scope to commit")
 	}
-	if _, err := r.git(append([]string{"add", "--"}, paths...)...); err != nil {
+	if _, err := r.git(append([]string{"add", "-A", "--"}, paths...)...); err != nil {
 		return err
 	}
 	if _, err := r.git("commit", "-m", message); err != nil {
