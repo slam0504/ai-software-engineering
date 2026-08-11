@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,6 +104,14 @@ type App struct {
 	assistActive        map[string]*assistGen
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
+
+	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
+	// 觸發 ReconcileGate1()。specWatchStop／specWatchDone 在 a.mu 下管理，供
+	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
+	// 呼叫 watcher.Close() 後才 close(specWatchDone)，shutdown 等 done 保證
+	// watcher 真的關閉、goroutine 真的結束（不留 orphan）。
+	specWatchStop chan struct{}
+	specWatchDone chan struct{}
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -196,6 +205,7 @@ func (a *App) startup(ctx context.Context) {
 		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
+	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 ReconcileGate1()
 }
 
 // failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
@@ -231,10 +241,162 @@ func (a *App) watchDiagram(path string) {
 	}()
 }
 
+// specWatchDebounce：連續 fsnotify 事件合併視窗——macOS 對 atomic save 常見
+// 短時間內成對送出 Create／Rename，避免每個事件各自觸發一次 reconcile。
+const specWatchDebounce = 200 * time.Millisecond
+
+// watchSpecTree 對納管的 spec/ 樹（spec.ScopePatterns 範圍）遞迴監看，變更
+// debounce 後觸發 ReconcileGate1()（spec §4：通知層）。只重用 watchDiagram 的
+// 概念，修正其三個缺陷：(1) 這裡遞迴 Add 整棵子樹、新目錄 Create 時再 Add，
+// 不只監看單一 parent；(2) watcher／Add／讀取錯誤一律 fail-loud（audit＋
+// EmitWorkspace stream_error），不吞聲；(3) 透過 specWatchStop／specWatchDone
+// 掛進 shutdown，goroutine 保證退出、watcher.Close() 保證被呼叫。
+//
+// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 ReconcileGate1()（best-effort），
+// 目的是讓已核可的 Gate 1 儘快在 UI 顯示 STALE；權威重算永遠在讀取路徑
+// （gate.Service.List／GateList，Task 10），watcher 失敗不影響正確性。
+func (a *App) watchSpecTree() {
+	a.stopSpecWatch() // 冪等：若先前已在監看（重複呼叫），先收掉舊的、不留 orphan goroutine
+
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		a.failLoudSpecWatch("normalize workspace: " + err.Error())
+		return
+	}
+	specRoot := filepath.Join(root, "spec")
+	if _, statErr := os.Stat(specRoot); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			a.failLoudSpecWatch("stat spec/: " + statErr.Error())
+		}
+		return // 尚無納管樹可看；GateList 的權威重算不受影響
+	}
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		a.failLoudSpecWatch("fsnotify.NewWatcher: " + err.Error())
+		return
+	}
+	if aerr := addRecursiveWatch(w, specRoot); aerr != nil {
+		a.failLoudSpecWatch("watch spec/: " + aerr.Error())
+		// 已成功 Add 的目錄仍持續監看；不因單一子目錄失敗放棄整棵樹。
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	a.mu.Lock()
+	a.specWatchStop = stop
+	a.specWatchDone = done
+	a.mu.Unlock()
+
+	go a.runSpecWatch(w, stop, done)
+}
+
+// addRecursiveWatch 對 dir 底下每個目錄（含自身）呼叫 watcher.Add；WalkDir
+// 中途錯誤（例如 race 中被刪）記錄第一個但不中止整趟 walk，盡量多加。
+func addRecursiveWatch(w *fsnotify.Watcher, dir string) error {
+	var firstErr error
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil // 略過這個節點，繼續 walk 其餘部分
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if aerr := w.Add(path); aerr != nil && firstErr == nil {
+			firstErr = aerr
+		}
+		return nil
+	})
+	return firstErr
+}
+
+// runSpecWatch：watcher 事件迴圈——debounce 合併連續事件後觸發
+// ReconcileGate1()；新目錄 Create 時 re-add（遞迴涵蓋新子樹）；Rename／Remove
+// 的路徑可能已消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由
+// 重算反映）；error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，
+// defer 保證 watcher.Close() 恰好呼叫一次、done 保證 shutdown 等得到。
+func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	defer w.Close()
+	var debounceC <-chan time.Time
+	for {
+		select {
+		case <-stop:
+			return
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if ev.Op&fsnotify.Create != 0 {
+				if fi, statErr := os.Stat(ev.Name); statErr == nil && fi.IsDir() {
+					if aerr := addRecursiveWatch(w, ev.Name); aerr != nil {
+						a.failLoudSpecWatch("watch new dir: " + aerr.Error())
+					}
+				}
+			}
+			debounceC = time.After(specWatchDebounce)
+		case werr, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			a.failLoudSpecWatch("fsnotify: " + werr.Error())
+		case <-debounceC:
+			debounceC = nil
+			a.reconcileGate1NotifyOnly()
+		}
+	}
+}
+
+// reconcileGate1NotifyOnly：watcher 觸發的 best-effort reconcile——失敗只
+// fail-loud UI，不影響權威（GateList 讀取路徑永遠自己重算一次）。
+func (a *App) reconcileGate1NotifyOnly() {
+	svc, err := a.ensureGate()
+	if err != nil {
+		a.failLoudSpecWatch("ensureGate: " + err.Error())
+		return
+	}
+	if err := svc.ReconcileGate1(); err != nil {
+		a.failLoudSpecWatch("ReconcileGate1: " + err.Error())
+	}
+}
+
+// failLoudSpecWatch：spec watcher 錯誤的唯一出口——audit 落一筆稽核 ＋
+// workspace-scope stream_error（EmitWorkspace，同 gateEmitter 的出口）。只影響
+// NOTIFICATION，權威重算（GateList）不受任何 watcher 錯誤影響。
+func (a *App) failLoudSpecWatch(msg string) {
+	a.audit("spec_watch_error", map[string]any{"error": msg})
+	if a.manager != nil {
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
+	}
+}
+
+// stopSpecWatch：shutdown／重新啟動 watch 前的收尾——關閉 stop 訊號、等
+// goroutine 真正退出（其 defer 已呼叫 watcher.Close()），保證不留背景
+// goroutine、watcher 一定被關閉。未啟動過時是 no-op。
+func (a *App) stopSpecWatch() {
+	a.mu.Lock()
+	stop := a.specWatchStop
+	done := a.specWatchDone
+	a.specWatchStop = nil
+	a.specWatchDone = nil
+	a.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	if done != nil {
+		<-done
+	}
+}
+
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
 	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
 	a.shutMu.Unlock()
+	a.stopSpecWatch()  // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
 	a.reclaimAssists() // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
 	a.inflight.Wait()  // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
