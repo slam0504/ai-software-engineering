@@ -950,7 +950,7 @@ func (a *App) SubmitForApproval() (string, error) {
 // error) 三個值，Wails 只保留第一個，struct 回傳才能把 diff 穩定帶給前端。
 type SpecCommitPreview struct {
 	Token spec.CommitToken `json:"token"`
-	Diff  string            `json:"diff"`
+	Diff  string           `json:"diff"`
 }
 
 // PreviewSpecCommit 回傳目前納管樹相對 HEAD 的 diff，並附上綁定當下狀態的

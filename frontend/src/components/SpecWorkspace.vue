@@ -103,10 +103,21 @@ onMounted(async () => {
   await initEditor()
 })
 onBeforeUnmount(() => cmView?.destroy())
-watch(() => props.path, loadFile)
+watch(() => props.path, () => {
+  resetDraft() // 換檔：清掉舊檔殘留的草稿，避免 accept 把 A 的草稿寫進 B（見 fix round 1）
+  void loadFile()
+})
+
+// resetDraft：換選檔時呼叫——草稿是逐檔的，不能帶著另一個檔案的 correlation_id
+// 跨檔殘留，否則 acceptDraft() 會用「目前選中檔案」的合法 digest 把「另一個檔案」
+// 的草稿寫進來，SpecWrite 的樂觀鎖擋不住（digest 本身確實對得上目前檔案）。
+function resetDraft() {
+  currentCorrelationId.value = null
+}
 
 function selectFile(p: string) {
   selectedPath.value = p
+  resetDraft()
   if (!props.path) void loadFile()
 }
 
