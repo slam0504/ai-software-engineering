@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateList, RestoreViews } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
+import type { GateEntry } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import Timeline from './components/Timeline.vue'
@@ -15,10 +16,37 @@ import StatusBar from './components/StatusBar.vue'
 import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
+import GateConsole from './components/GateConsole.vue'
 
 const s = useSession()
 const gate = useGate()
 const assist = useAssist()
+const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
+const gateError = ref('')
+
+// GateList 為權威重算（每次都 ReconcileGate1 後 project），refresh 後直接覆蓋 store
+// projection——比等下一筆 workspace 事件更即時，也修正 decide 失敗後的畫面落後。
+async function refreshGate() {
+  try {
+    const list = await GateList()
+    gateDegraded.value = list.some(e => e.journal_degraded === true)
+    const next: Record<string, GateEntry> = {}
+    for (const e of list) {
+      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, bindings: e.bindings, base_commit: e.base_commit }
+    }
+    gate.entries = next
+  } catch { /* dev 無綁定時忽略 */ }
+}
+
+async function decideGate(id: string, decision: string, reason: string) {
+  gateError.value = ''
+  try {
+    await GateDecide(id, decision, reason)
+  } catch (e) {
+    gateError.value = String(e)
+  }
+  await refreshGate()
+}
 const tab = ref<'chat' | 'preview'>('chat')
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
@@ -68,6 +96,7 @@ onMounted(async () => {
   EventsOn('session:done', (d: any) => s.applyDone(d))
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
+  await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
 })
 </script>
 
@@ -88,6 +117,10 @@ onMounted(async () => {
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
       </main>
+      <aside class="gate-panel">
+        <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
+        <p v-if="gateError" class="gate-err">{{ gateError }}</p>
+      </aside>
     </div>
     <div v-show="timelineOpen" class="tl-resize" title="拖曳調整高度" @mousedown.prevent="onResizeStart" />
     <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
@@ -110,6 +143,8 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
+.gate-panel { width: 280px; border-left: 1px solid var(--border); overflow-y: auto; }
+.gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); }
 nav button { border: none; background: transparent; color: var(--text-muted); }
