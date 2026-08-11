@@ -1,7 +1,7 @@
 # M2 — Stage A 閉環設計
 
 - 日期：2026-08-11
-- 狀態：設計定稿 rev3（第三輪 closure review：閉合 workspace event kind／SpecCommit 兩階段／journal tail 修復／SpecAssist no-tools）
+- 狀態：設計定稿 rev4（第四輪 closure review：BuildCurrentManifest 雙建、SpecAssist 定為隔離 one-shot、commit_token 綁 canonical tree digest）
 - 上游依據：`docs/architecture/sdlc-workbench-app-plan.md` §4、§5.2–5.4、§7（M2 列）；`docs/architecture/sdlc-ai-agent-automation-plan.md` §3–4
 - 前置里程碑：M0 ✅、M1 ✅、M1.5 ✅（雙 provider session 並存、重啟恢復、單 Manager 多 slot、檔案級 `event_id` 單調不變量）
 
@@ -19,7 +19,7 @@ M2 交付 **Stage A 閉環**：規格編輯 → AI 輔助 → **scoped commit** 
 ### 1.1 本輪三個 scope 決策（owner 2026-08-11 拍板）
 
 1. **UI 改版不進 M2**：memory 兩張截圖的視覺改版排成 Stage A 落地後的獨立 polish pass。
-2. **三個 AI 輔助動作全進 M2**（照 plan）：草擬 Gherkin、歧義偵測、oracle 覆蓋檢查（受 §5.1 no-tools 前置條件約束）。
+2. **三個 AI 輔助動作全進 M2**（照 plan）：草擬 Gherkin、歧義偵測、oracle 覆蓋檢查。實作形態已定為**隔離 one-shot**（§5.1），不進目前 session context；enforcement probe 失敗只讓該 provider 的 SpecAssist fail closed，不改 session 架構。
 3. **context-map/ 納進 manifest**：`spec_manifest` 涵蓋納管全樹；不新增 `context_map` binding kind，仍由單一 `spec_manifest` 綁定。表示圖採獨立圖層但只做瀏覽／監看／重渲染。
 
 ### 1.2 納管範圍（path pattern，凍結）
@@ -143,7 +143,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 **凍結補充**：
 - Gate 1 **只比較 `spec_manifest`**；`base_commit` 是歷史重建錨點，**不與目前 HEAD 持續比較**。
 - **fail-closed 分流**：digest-mismatch → append stale；**read-error（暫時性 I/O）→ 回錯誤、UI 顯示「無法判定」，不得回 active、不得永久 append stale**。
-- **`BuildCurrentManifest()` 掃描期間偵測到檔案集合或內容變動 → 回 `ErrConcurrentModification`，走 read-error 分支**，不以混合快照永久標 STALE（掃描前後各取一次納管檔清單＋mtime/size 指紋比對，不一致即重試或回錯）。
+- **`BuildCurrentManifest()` 併發安全（P1-1(rev4)）**：**完整建立兩次 canonical manifest**（含檔案集合與各檔 raw bytes digest）；**兩次 digest 相同才回傳**；不同則 **bounded retry**，仍不同才回 **`ErrConcurrentModification`** 走 read-error 分支，**不以混合快照永久標 STALE**。**mtime/size 不作權威判斷**（內容替換可能 mtime/size 不變），最多作快速失敗提示。
 - **transition durable 後 `EmitWorkspace()` 失敗**：gate journal 仍權威、projection 仍 stale、`ReconcileGate1()` 回 fail-loud error；workspace envelope 是通知鏡像，**不回滾 transition**。
 - watcher 錯誤**只影響即時通知**，不影響權威判定。
 
@@ -160,7 +160,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 
 **兩階段 SpecCommit（P1-2(rev3)，凍結）**——保證「確認的 diff 就是實際 commit」，且 scope 外 index/worktree 完全不變：
 
-- **`PreviewSpecCommit()`** → 回 `commit_token`，至少綁定 **HEAD object ID ＋ scoped diff digest**（僅 §1.2 納管路徑），並回傳 diff 供 app 內確認。
+- **`PreviewSpecCommit()`** → 回 `commit_token`，綁定 **HEAD object ID ＋ canonical candidate snapshot/tree digest**（P2(rev4)：綁**候選提交的 canonical tree digest**，非 UI 顯示用的 diff 字串 digest；須涵蓋**新增、刪除、rename、untracked、file mode**，避免 diff renderer 差異影響確認語意），並回傳 diff 供 app 內顯示確認。
 - **`ConfirmSpecCommit(token, message)`** → 重新驗證 token；**內容或 HEAD 改變即拒絕**（不得 commit 新內容）。
 - 成功與失敗都必須保持 **scope 外的 index/worktree 完全不變**；既有 staged changes 不得被帶入、unstage 或改變。
 - **若實作無法保證 index 隔離，則在任何 staged change 存在時 fail closed**（要求使用者先自行處理 staged 變更）。
@@ -232,12 +232,18 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 - **SpecWrite**：**不沿用 `resolveInWorkspace()`**（`EvalSymlinks` 對不存在新檔失敗）。改為**驗證 canonical parent → atomic rename**，帶 **`expected_digest`** optimistic concurrency。
 - **SpecCommit**：見 §3.4a 兩階段。
 
-**SpecAssist（P1-4(rev3)，凍結；含前置可行性 gate）**：
-- **no-tools 不變量**：`purpose=spec_assist` 一律以 **no-tools 能力**執行——**不能只靠 prompt 約束**。正常 turn 可能執行工具，僅「輸出進草稿」無法阻止 provider 改檔。
-- **fail closed**：provider 無法對目前 session 套用 per-turn no-tools 時，SpecAssist **必須 fail closed，不得退回一般可寫工具權限**。
-- **前置可行性（已知現況，需 live probe）**：現行 claude session（`internal/claude/session.go` `Config.args()`）**無** `--disallowed-tools`/`--allowed-tools` plumbing，且 session 是啟動時定 flag 的持久 multi-turn process；codex turn 僅帶 `approvalPolicy`（≠ no-tools）。**因此 M2 早期須先 live probe：同一 session 能否強制 per-turn no-tools**。**probe 失敗 → 回 plan gate 決定是否採隔離 one-shot session；writing-plans 不得自行擴張 M1.5 session 模型**。
-- **correlation 生命週期**：`SpecAssist` 呼叫時配 `correlation_id` ＋ `purpose="spec_assist"`；**涵蓋該 turn 全部事件**（`init`/`delta`/`message`/`result`/**`state_change`/`stream_error`/abort**）；`result` 或 abort 時清除。
-- **可見性**：此 turn 是可稽核 turn，照常進 Chat／Timeline；草稿區**額外**依 `correlation_id` 鏡像。佔用當前 session context，spec 明寫。
+**SpecAssist（P1-2(rev4)：架構已拍板為隔離 one-shot，凍結）**：
+
+理由（code 證據）：Claude 工具限制是 **process 啟動參數**，現有 `Send()`（`session.go:132`）只送 user message、無 per-turn control；Codex pinned `TurnStartParams` 有 per-turn `sandboxPolicy`（含 `readOnly`）但**無 tool allowlist/disable 欄位**（`schemas/codex/v2/TurnStartParams.json`）。因此**同 session 的 behavioral probe 只能證明某輪「剛好沒用工具」，無法證明工具被強制關閉**。故不把此架構分岔留到 writing-plans。
+
+- **隔離 one-shot**：SpecAssist **不進目前 Claude session／Codex thread context**，改以獨立 one-shot 執行。
+- **安全不變量：provider-enforced zero workspace mutation**（比「no-tools」更貼近原需求，且有 argv／wire enforcement 證據）：
+  - **Claude**：one-shot process 使用 **`--tools ""`**（argv 上停用工具）。
+  - **Codex**：獨立 ephemeral thread，強制 **`sandboxPolicy=readOnly`**（wire enforcement）。
+- **規格內容由 app 明確放進 prompt**，不讓 agent 自行讀取 workspace。
+- **可見性**：輸出進**草稿區與 Timeline，不進一般 Chat**；仍保留 `correlation_id` ＋ `purpose="spec_assist"` 與完整稽核。correlation **涵蓋該 one-shot 全部事件**（`init`/`delta`/`message`/`result`/`state_change`/`stream_error`/abort），`result` 或 abort 時清除。
+- **enforcement probe（argv／wire 證據，非 behavioral）**：實作初期做 enforcement probe，驗 argv／wire 確實停用 mutation；**probe 失敗只讓該 provider 的 SpecAssist fail closed，不再改變 session 架構**。
+- **NO-GO 邊界**：安全不變量採 zero workspace mutation，Codex `readOnly` 即滿足（GO）。**若改採「雙 provider 都必須完全 no-tools」，Codex pinned schema 無 tool-disable 證據 → Codex SpecAssist 標 NO-GO，不得以 read-only 冒充 no-tools**。
 - **AI 輔助邊界**：輸出一律進草稿區、**不直接寫檔**，人 accept 後才走 SpecWrite。
 
 ### 5.2 表示圖層
@@ -265,7 +271,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 **確定性核心 oracle 單元測試**：
 - manifest 演算法（排序、raw bytes SHA-256、canonical JSON 無時間欄、`scope_version`＋pattern 進 canonical、symlink/submodule/非 regular 拒絕）。
 - `BuildCommittedSnapshot` 只讀 object DB；dirty-tree 拒送、HEAD₁/HEAD₂ 一致重試。
-- `BuildCurrentManifest` 掃描期間變動 → `ErrConcurrentModification` → read-error 分支（非永久 STALE）。
+- `BuildCurrentManifest` **雙次建 manifest 一致才回**；掃描期間內容替換（含 mtime/size 不變）→ bounded retry → `ErrConcurrentModification` → read-error 分支（非永久 STALE）。
 - `gate.Project()`（active/stale/superseded 重算、stale 不復活）、binding 必填 ＋ 重複 kind 拒絕、digest 格式。
 
 **併發／重啟／crash barrier 測試**：
@@ -276,7 +282,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 
 **SpecCommit barrier 測試**：preview 後外部改檔／移動 HEAD **均不得 commit**；已有 scope 外 staged change **不得進新 commit**（或 fail closed）。
 
-**SpecAssist 安全測試**：惡意 **fake provider 嘗試 tool/write** → 斷言 **workspace 零變更**。
+**SpecAssist 安全測試**：(a) **enforcement 證據**——斷言 Claude one-shot argv 含 `--tools ""`、Codex turn wire 帶 `sandboxPolicy=readOnly`（非 behavioral）；(b) 惡意 **fake provider 嘗試 tool/write** → 斷言 **workspace 零變更**；(c) enforcement probe 失敗 → 該 provider SpecAssist **fail closed**、session 架構不變。
 
 **routing 隔離**：`TestWorkspaceGateEventDoesNotEnterProviderViews`。
 
@@ -290,7 +296,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 
 ## 8. 風險與待驗證假設
 
-1. **SpecAssist no-tools 可行性（最高優先，前置 gate）**：現行 plumbing 無 per-turn no-tools（§5.1）；M2 早期 live probe 決定同 session 可否強制 no-tools，否則 fail closed 回 plan gate。此項可能改變 SpecAssist 交付形態，須在建 SpecAssist 前先驗。
+1. **SpecAssist enforcement（架構已定為隔離 one-shot）**：不變量為 provider-enforced zero workspace mutation（Claude `--tools ""`、Codex `sandboxPolicy=readOnly`，§5.1）。M2 早期做 argv／wire enforcement probe；**失敗只讓該 provider fail closed，不改 session 架構**。此項不再是 session 模型分岔，僅剩各 provider 的 enforcement 驗證。
 2. **fsnotify 跨編輯器行為**：atomic save／rename 可能 remove+create；debounce ＋ 遞迴 re-add ＋ 讀取重算為權威，需 macOS 實測。
 3. **CodeMirror 6 整合成本**：新前端相依與打包體積未實測。
 4. **committed-snapshot 讀取實作**：go-git vs `git cat-file` 讀 HEAD tree 於 writing-plans 定案；**不含 worktree 讀檔選項**（§3.4a 凍結）。SpecCommit 的 index 隔離實作若無法保證則 fail closed。
