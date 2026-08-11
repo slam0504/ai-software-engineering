@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/assist"
@@ -140,6 +142,42 @@ func TestShutdownWaitsForAndReclaimsSpecAssist(t *testing.T) {
 	a.assistMu.Unlock()
 	if n != 0 {
 		t.Fatalf("active flag must be cleared at teardown, got %d", n)
+	}
+}
+
+// shutdown-during-startup 窗口：assist 已把 gen 入 assistActive、尚未 beginAppTxn
+// 時 shutdown 介入——shutdown 不得被它 stall（此刻無 inflight），事後 beginAppTxn
+// 被 gate 拒、gen rollback。反轉 insert／beginAppTxn 順序後此窗口關閉。
+func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
+	a := newTestAppAssist(t, blockingRunner())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookAssistBeforeTxn = func() {
+		close(entered)
+		<-release
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- a.SpecAssist("claude", "spec_assist", "draft") }()
+	<-entered // gen 已可見、beginAppTxn 未開始
+	a.hookAssistBeforeTxn = nil
+
+	shutDone := make(chan struct{})
+	go func() { a.shutdown(context.Background()); close(shutDone) }()
+	select { // 不得被 startup 窗口內的 assist 卡住（無 inflight 可等）
+	case <-shutDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("shutdown stalled on an assist still in its startup window")
+	}
+	close(release) // 放行 beginAppTxn → shuttingDown → 拒絕 → rollback、無 inflight
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("in-window assist must be rejected by the shutdown gate, got %v", err)
+	}
+	a.assistMu.Lock()
+	n := len(a.assistActive)
+	a.assistMu.Unlock()
+	if n != 0 {
+		t.Fatalf("rolled-back assist must leave no active gen, got %d", n)
 	}
 }
 

@@ -122,6 +122,11 @@ func (c *claudeAssist) Run(ctx context.Context, prompt string, sink func(contrac
 		for sc.Scan() {
 			events <- claude.Decode(sc.Bytes())
 		}
+		if serr := sc.Err(); serr != nil { // 傳輸層錯誤（>16MB 行／pipe read）是驗收證據，不可吞
+			events <- contract.Event{Provider: contract.ProviderClaude,
+				Kind: contract.KindStreamError, Raw: []byte(serr.Error()), Err: serr}
+			_ = p.Terminate() // stream 已不可信，收掉整組（對齊 session.go 慣例）
+		}
 	}()
 
 	for {

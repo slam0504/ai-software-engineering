@@ -102,6 +102,7 @@ type App struct {
 	assistMu            sync.Mutex
 	assistActive        map[string]*assistGen
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
+	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -910,21 +911,34 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 	if purpose == "" {
 		purpose = "spec_assist"
 	}
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新請求
-		return err
-	}
 	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
+	// gen（含 cancel）必須早於 beginAppTxn 進 assistActive——shutdown 的 reclaim
+	// 掃描此結構。若 txn 先登記進 inflight、gen 卻尚不可見，reclaim 會掃到空集合、
+	// cancel 不到，inflight.Wait 卻等到 assistTimeout（~3min stall）。反轉順序後：
+	// 任何會被 inflight.Wait 等到的 assist，其 gen 必已可被 reclaim cancel。
 	a.assistMu.Lock()
 	if _, exists := a.assistActive[provider]; exists { // 獨佔性：第二個併發請求被拒
 		a.assistMu.Unlock()
 		cancel()
-		a.endAppTxn() // 未進 active：立即平衡交易閘
 		return ErrAssistActive
 	}
 	a.assistActive[provider] = gen
 	a.assistMu.Unlock()
+
+	if h := a.hookAssistBeforeTxn; h != nil { // 測試 barrier：gen 已可見、txn 未登記
+		h()
+	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新請求
+		a.assistMu.Lock() // rollback：未取得交易閘，撤下 gen（reclaim 若已 cancel 亦冪等）
+		if a.assistActive[provider] == gen {
+			delete(a.assistActive, provider)
+		}
+		a.assistMu.Unlock()
+		cancel()
+		return err
+	}
 
 	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
 	teardown := func() {

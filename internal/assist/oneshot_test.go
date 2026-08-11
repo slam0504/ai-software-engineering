@@ -1,8 +1,14 @@
 package assist
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
 
 // enforcement 證據（argv／wire 建構斷言，非 behavioral）：Claude one-shot argv 含
@@ -45,6 +51,30 @@ func TestCodexAssistTurnParamsEnforceReadOnlyNoApproval(t *testing.T) {
 	}
 	if NewCodexAssist("codex", "/tmp", nil) == nil {
 		t.Fatal("NewCodexAssist must return a Runner")
+	}
+}
+
+// fail loud：Claude stdout 出現 >16MB 行（scanner ErrTooLong）時，必須 surface
+// 一個 stream_error（不可無聲以 clean-EOF 收場）——對齊 session.go 的驗收慣例。
+func TestClaudeAssistFailsLoudOnOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fakeclaude.sh")
+	// 讀掉 prompt 行後吐一條 >16MB 的行（超過 scanner 上限）。
+	script := "#!/bin/sh\nread -r _line\nhead -c 17000000 /dev/zero | tr '\\0' 'a'\necho\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var sawStreamErr bool
+	// sink 由 Run 序列呼叫（單一 goroutine），無需額外同步。
+	err := NewClaudeAssist(bin, dir, nil).Run(ctx, "draft", func(env contract.Envelope) {
+		if env.Kind == string(contract.KindStreamError) {
+			sawStreamErr = true
+		}
+	})
+	if !sawStreamErr {
+		t.Fatalf("oversized line must surface a stream_error (fail loud); run err=%v", err)
 	}
 }
 
