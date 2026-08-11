@@ -24,6 +24,7 @@ func TestWatcherTriggersReconcileOnSpecChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.watchSpecTree()
+	t.Cleanup(a.stopSpecWatch) // 停 watcher goroutine，避免 t.TempDir() 清掉後它還在跑
 	a.SpecWrite("spec/glossary.md", "v2", digestOf(t, a, "spec/glossary.md"))
 	commitAll(t, a)
 	waitFor(t, "gate goes stale after watcher-triggered reconcile", func() bool {
@@ -78,6 +79,7 @@ func TestWatcherReAddsNewSubdirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.watchSpecTree()
+	t.Cleanup(a.stopSpecWatch) // 停 watcher goroutine，避免 t.TempDir() 清掉後它還在跑
 
 	if err := os.MkdirAll(filepath.Join(a.workspaceDir, "spec", "features"), 0o755); err != nil {
 		t.Fatal(err)

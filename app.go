@@ -79,12 +79,12 @@ type App struct {
 	shuttingDown bool
 	inflight     sync.WaitGroup
 
-	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
-	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
-	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
-	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
-	hookInServerTxn         func()                     // 測試注入：server 交易已登記、Ensure 未開始
-	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
+	emitUI                  func(name string, data any) // 測試注入；nil = wails runtime
+	hookAfterProviderStart  func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
+	hookDuringReset         func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
+	hookBeforeProviderStart func()                      // 測試注入：start ownership 取得後、provider 啟動前
+	hookInServerTxn         func()                      // 測試注入：server 交易已登記、Ensure 未開始
+	codexHostOverride       codexHost                   // 測試注入：fake wire 走 production StartSession 分支
 
 	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
 	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
@@ -202,7 +202,7 @@ func (a *App) startup(ctx context.Context) {
 	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
 		"startup_error": a.startupErr, "node_path": a.nodePath,
-		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
+		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
 	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 ReconcileGate1()
@@ -396,9 +396,9 @@ func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
 	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
 	a.shutMu.Unlock()
-	a.stopSpecWatch()  // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
-	a.reclaimAssists() // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
-	a.inflight.Wait()  // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
+	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
+	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
@@ -1280,7 +1280,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		}
 		aerr := a.manager.AcceptSubmit(prov, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
-		if aerr == nil { // Accept 成功才 commit（staged candidate；D6）
+		if aerr == nil {    // Accept 成功才 commit（staged candidate；D6）
 			if cerr := a.restore.CommitResume("claude", a.claudeSessionIDSnapshot(), taskLabel); cerr != nil {
 				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
 			}
@@ -2024,7 +2024,8 @@ func (a *App) failLoudRestore(p contract.Provider, err error) {
 // commitClaudeResume：claude init 抵達時 commit resumeSessionID。guard：
 // (1) sess 仍是目前 session（late init 於 NewSession 之後 → pointer 不符、不寫）
 // (2) session 已 accepted（init-before-Accept 只暫存於 claudeSessionID，
-//     由 StartSession Accept 成功後補 commit）。
+//
+//	由 StartSession Accept 成功後補 commit）。
 func (a *App) commitClaudeResume(sess *claude.Session, sessionID string) {
 	a.mu.Lock()
 	current := a.claudeSess == sess
