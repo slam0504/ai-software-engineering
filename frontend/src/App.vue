@@ -17,6 +17,7 @@ import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
+import SpecWorkspace from './components/SpecWorkspace.vue'
 
 const s = useSession()
 const gate = useGate()
@@ -47,7 +48,7 @@ async function decideGate(id: string, decision: string, reason: string) {
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview'>('chat')
+const tab = ref<'chat' | 'preview' | 'spec'>('chat')
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
 const selectedFile = ref('')
@@ -113,9 +114,11 @@ onMounted(async () => {
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">Chat</button>
           <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">Preview</button>
+          <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">Spec</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
+        <SpecWorkspace v-if="tab === 'spec'" />
       </main>
       <aside class="gate-panel">
         <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
