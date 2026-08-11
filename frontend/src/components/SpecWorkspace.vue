@@ -126,10 +126,19 @@ function selectFile(p: string) {
 // 這裡只需認出「這次呼叫新增的 correlation_id」（provider 獨佔性保證同一時間
 // 至多一個 active，SpecAssist 的 promise 要等 runner 收尾才 resolve，故 await
 // 完成時對應的草稿 key 必已存在）。
+//
+// 換檔競態（fix round 2）：await 期間操作者可能已切到另一個檔案——resetDraft()
+// 會在切檔當下清掉 currentCorrelationId，但若這裡無條件於 await 後把新 key
+// 塞回去，等於用「目前選中檔案」的合法 digest 把「發起 assist 當下那個檔案」
+// 的草稿寫回來，與 fix round 1 是同一種跨檔污染，只是換一個時間點觸發。因此
+// 起手先記下 startedForPath，await 後只在 effectivePath 沒變時才採用結果；
+// 變了就視為操作者已經放棄這次結果，草稿留空（不落回 store 的 drafts 本身
+// 沒有副作用，只是不讓它綁定成目前檔案的 currentCorrelationId）。
 async function runAssist(prompt: string) {
   assistError.value = ''
   assistBusy.value = true
   const before = new Set(Object.keys(assist.drafts))
+  const startedForPath = effectivePath.value
   try {
     await SpecAssist(s.provider, 'spec_assist', prompt)
   } catch (e) {
@@ -139,7 +148,9 @@ async function runAssist(prompt: string) {
     assistBusy.value = false
   }
   const added = Object.keys(assist.drafts).filter(k => !before.has(k))
-  if (added.length) currentCorrelationId.value = added[added.length - 1]
+  if (added.length && effectivePath.value === startedForPath) {
+    currentCorrelationId.value = added[added.length - 1]
+  }
 }
 
 function draftGherkin() {
