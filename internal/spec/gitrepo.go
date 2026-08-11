@@ -123,6 +123,16 @@ func (g *GitRepo) ReadScopedWorktree() ([]FileEntry, error) {
 			if d.Name() == ".git" {
 				return filepath.SkipDir
 			}
+			if InScope(rel) {
+				// A submodule working tree has a `.git` FILE (gitdir pointer);
+				// an embedded repo has a `.git` DIR. Either way, its presence
+				// marks a nested-repo boundary we must not walk into.
+				if _, statErr := os.Lstat(filepath.Join(path, ".git")); statErr == nil {
+					return fmt.Errorf("spec: submodule/nested repo not allowed in scope: %s", rel)
+				} else if !os.IsNotExist(statErr) {
+					return statErr
+				}
+			}
 			return nil
 		}
 		if !InScope(rel) {

@@ -61,3 +61,15 @@ func TestGitRepoRejectsSymlinkInScope(t *testing.T) {
 		t.Fatal("symlink in scope must be rejected")
 	}
 }
+
+func TestGitRepoRejectsSubmoduleInScope(t *testing.T) {
+	dir := initRepo(t)
+	vendor := filepath.Join(dir, "spec", "features", "vendor")
+	os.MkdirAll(vendor, 0o755)
+	os.WriteFile(filepath.Join(vendor, ".git"), []byte("gitdir: ../../../.git/modules/vendor\n"), 0o644)
+	os.WriteFile(filepath.Join(vendor, "x.feature"), []byte("Feature: vendored"), 0o644)
+	r := NewGitRepo(dir)
+	if _, err := r.ReadScopedWorktree(); err == nil {
+		t.Fatal("submodule/nested repo in scope must be rejected")
+	}
+}
