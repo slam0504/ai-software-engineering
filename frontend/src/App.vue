@@ -4,6 +4,9 @@ import { EventsOn } from '../wailsjs/runtime/runtime'
 import { CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
+import { useGate } from './stores/gate'
+import { useAssist } from './stores/assist'
+import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
@@ -14,6 +17,8 @@ import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 
 const s = useSession()
+const gate = useGate()
+const assist = useAssist()
 const tab = ref<'chat' | 'preview'>('chat')
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
@@ -54,7 +59,12 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
   s.setBindings(makeBindings())
-  EventsOn('workbench:event', (e: any) => s.apply(e))
+  EventsOn('workbench:event', (e: any) => {
+    const dst = routeEnvelope(e)
+    if (dst === 'gate') gate.applyGateEvent(e)
+    else if (dst === 'assist') assist.applyAssistEvent(e)
+    else s.apply(e)
+  })
   EventsOn('session:done', (d: any) => s.applyDone(d))
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
