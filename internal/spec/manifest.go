@@ -8,9 +8,9 @@ import (
 	"strings"
 )
 
-var scopeVersion = 1
-
 const ScopeVersion = 1 // 對外常數；內部以 scopeVersion 供測試覆寫
+
+var scopeVersion = ScopeVersion
 
 var ScopePatterns = []string{"spec/features/**", "spec/nfr/**", "spec/glossary.md", "spec/context-map/**"}
 
