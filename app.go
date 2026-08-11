@@ -563,13 +563,37 @@ func (a *App) SpecRead(rel string) (content string, digest string, err error) {
 	return string(raw), specDigestOf(raw), nil
 }
 
+// deepestExistingAncestor walks up from dir until it finds a path segment
+// that already exists on disk (os.Lstat succeeds; does NOT follow the final
+// symlink component — presence is all that matters here). Every component
+// below the returned ancestor is guaranteed not to exist yet, so it cannot be
+// a pre-planted symlink. Terminates at root at the latest (root always exists).
+func deepestExistingAncestor(dir, root string) (string, error) {
+	for {
+		if _, err := os.Lstat(dir); err == nil {
+			return dir, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(dir)
+		if dir == root || parent == dir {
+			return dir, nil
+		}
+		dir = parent
+	}
+}
+
 // SpecWrite 寫納管檔（新檔或既有檔覆寫），atomic rename＋optimistic concurrency。
 //
 // 不能重用 resolveInWorkspace：它對「完整目標路徑」做 EvalSymlinks，新檔尚不
-// 存在時必然出錯。改為驗證 PARENT 目錄：先在 workspace root 內（拒絕 ".."，
-// 與 resolveInWorkspace 同一 containment 檢查）算出目標路徑、視需要建立 parent
-// 目錄，再對 PARENT 做 EvalSymlinks 確認 canonical 後仍在 root 之內（symlinked
-// parent 逃逸一律擋）——目標檔本身此刻可能不存在，不對它做 EvalSymlinks。
+// 存在時必然出錯。改為驗證 PARENT 目錄——但驗證必須在任何檔案系統異動之前完成：
+// 若 target 的某個中繼目錄（例如納管的 "spec/features"）是預先植入、指向
+// workspace 外部的 symlink，MkdirAll 會直接跟著 symlink 在外部建立真實目錄，
+// 內容寫入雖然被 InScope／containment 擋住，目錄本身早就逃逸了（deterministic
+// escape，不需要 race——一個固定的 symlink 每次都會觸發）。修法：先找 PARENT
+// 最深的「已存在」祖先目錄（其下所有路徑段必然尚不存在，不可能是 symlink），
+// 對這個祖先做 EvalSymlinks 確認仍在 root 之內，通過才 MkdirAll——之後新建的
+// 每一段路徑都在已驗證 contained 的祖先之下、且是全新建立（不是 symlink）。
 func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, err error) {
 	if !spec.InScope(rel) {
 		return "", fmt.Errorf("path %q is not a managed spec file", rel)
@@ -595,6 +619,21 @@ func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, 
 		}
 	} else {
 		return "", rerr
+	}
+
+	// containment 驗證在任何 mutation 之前：找 parent 最深已存在祖先、EvalSymlinks
+	// 驗證仍在 root 內，通過才允許 MkdirAll（見上方函式註解——擋 pre-existing
+	// symlink 逃逸，不是事後補救）。
+	ancestor, aerr := deepestExistingAncestor(parent, root)
+	if aerr != nil {
+		return "", aerr
+	}
+	resolvedAncestor, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if resolvedAncestor != root && !strings.HasPrefix(resolvedAncestor, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
 	}
 
 	if err := os.MkdirAll(parent, 0o755); err != nil {
