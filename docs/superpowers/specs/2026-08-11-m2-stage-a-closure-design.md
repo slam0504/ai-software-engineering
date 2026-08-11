@@ -1,7 +1,7 @@
 # M2 — Stage A 閉環設計
 
 - 日期：2026-08-11
-- 狀態：設計定稿 rev4（第四輪 closure review：BuildCurrentManifest 雙建、SpecAssist 定為隔離 one-shot、commit_token 綁 canonical tree digest）
+- 狀態：設計定稿 rev5（第五輪 closure review：SpecAssist one-shot lifecycle — ownership／shutdown 收束／escalation fail closed／前端 purpose 路由）
 - 上游依據：`docs/architecture/sdlc-workbench-app-plan.md` §4、§5.2–5.4、§7（M2 列）；`docs/architecture/sdlc-ai-agent-automation-plan.md` §3–4
 - 前置里程碑：M0 ✅、M1 ✅、M1.5 ✅（雙 provider session 並存、重啟恢復、單 Manager 多 slot、檔案級 `event_id` 單調不變量）
 
@@ -178,7 +178,7 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 - Envelope **additive 新增**：`scope: "session" | "workspace"`；**`bindings`（頂層，對齊 app-plan §5.2 頂層 `bindings?`）**；`payload`（`json.RawMessage`）；`correlation_id`／`purpose`（`omitempty`，§5.1 用）。舊事件 `scope` 缺值視為 `session`。
 - **`scope=session`**：`provider` 必為 `claude|codex`。
 - **`scope=workspace`**：`provider` 與 `session_id` **省略**。
-- **`App.vue` 先依 `scope` 分流**：`scope=workspace` → gate store，**不得**進 `s.apply()`／`providerOf()`。
+- **`App.vue` 先依 `scope` 分流**：`scope=workspace` → gate store，**不得**進 `s.apply()`／`providerOf()`。`scope=session` 者**再依 `purpose` 二次分流**：`purpose="spec_assist"` → assist store／Timeline（§5.1），**不進** provider session reducer／Chat／totals／unread；其餘照常進 `s.apply()`。
 - **三種 workspace event 各為明確 kind**：`gate_request`、`approval_decision`（沿用既有 kind 承載 workspace 決定，靠 `scope=workspace` 與現有 provider 工具核可區分）、`binding_stale`。**不再用 `payload.sub` 當 discriminator**。
 - **`bindings` 放 Envelope 頂層**，`payload` 不重複保存 bindings。
 - **digest 格式凍結**：`spec_manifest.digest = sha256:<64 hex>`；`base_commit.digest = git:<algorithm>:<完整 object id>`（如 `git:sha1:<40hex>`），**不得用短 SHA**；`ref` 為人類可讀參照（如 `spec/`、`HEAD`）。
@@ -239,12 +239,23 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 - **隔離 one-shot**：SpecAssist **不進目前 Claude session／Codex thread context**，改以獨立 one-shot 執行。
 - **安全不變量：provider-enforced zero workspace mutation**（比「no-tools」更貼近原需求，且有 argv／wire enforcement 證據）：
   - **Claude**：one-shot process 使用 **`--tools ""`**（argv 上停用工具）。
-  - **Codex**：獨立 ephemeral thread，強制 **`sandboxPolicy=readOnly`**（wire enforcement）。
-- **規格內容由 app 明確放進 prompt**，不讓 agent 自行讀取 workspace。
+  - **Codex**：獨立 ephemeral thread，wire 同時強制 **`sandboxPolicy={type:"readOnly", networkAccess:false}`** ＋ **`approvalPolicy="never"`**；**任何 sandbox escalation／approval request 一律 fail closed**，不得讓使用者核可升級而破壞 zero-mutation。
+- **規格內容由 app 明確放進 prompt**，**不依賴 agent 自行讀取 workspace**（read-only sandbox 禁止寫入，但不禁止讀取，故不能靠 sandbox 保證 agent 不自行讀檔）。
 - **可見性**：輸出進**草稿區與 Timeline，不進一般 Chat**；仍保留 `correlation_id` ＋ `purpose="spec_assist"` 與完整稽核。correlation **涵蓋該 one-shot 全部事件**（`init`/`delta`/`message`/`result`/`state_change`/`stream_error`/abort），`result` 或 abort 時清除。
 - **enforcement probe（argv／wire 證據，非 behavioral）**：實作初期做 enforcement probe，驗 argv／wire 確實停用 mutation；**probe 失敗只讓該 provider 的 SpecAssist fail closed，不再改變 session 架構**。
 - **NO-GO 邊界**：安全不變量採 zero workspace mutation，Codex `readOnly` 即滿足（GO）。**若改採「雙 provider 都必須完全 no-tools」，Codex pinned schema 無 tool-disable 證據 → Codex SpecAssist 標 NO-GO，不得以 read-only 冒充 no-tools**。
 - **AI 輔助邊界**：輸出一律進草稿區、**不直接寫檔**，人 accept 後才走 SpecWrite。
+
+**SpecAssist one-shot lifecycle（P1(rev5)，凍結）**——隔離執行不等於無主；須定義 ownership／shutdown／escalation 與現有單一 runner、app transaction gate 的互動（`beginAppTxn`/`endAppTxn`、`shuttingDown`、`inflight`）：
+
+- **獨佔性**：每個 provider **至多一個 active SpecAssist**；第二個請求回 **`ErrAssistActive`**。
+- **交易閘**：SpecAssist 啟動必須進 **`beginAppTxn`/`endAppTxn`**；**shutdown 後拒絕新請求**。
+- **shutdown 收束**：shutdown 必須 **cancel/terminate one-shot、等待 bounded completion、完成稽核收尾後**才 `Manager.Close()`。
+- **ownership 隔離**：
+  - Claude one-shot **不得寫入目前的 `claudeSess` ownership**（獨立 process handle）。
+  - Codex ephemeral thread **不得發布成目前的 `a.runner`／`a.codexConn`**；用**獨立 runner/connection 或以 thread ID dispatcher 明確隔離**；**晚到 notification 不得污染現有 thread**。
+- **前端路由**：assist envelope 走共用序列化 audit 出口，但前端必須**先依 `purpose=spec_assist` 路由到 assist store／Timeline**，**不進 provider session reducer、Chat、totals 或 unread**。
+- **恰一次收尾**：`result`／`abort`／`timeout`／`shutdown` 四種來源以 **once/token ownership 恰一次收尾**；**舊 generation 的晚到事件丟棄並 fail loud**。
 
 ### 5.2 表示圖層
 獨立圖層，重用 PreviewPane 的 Mermaid ＋ `securityLevel:'strict'`，監看 `context-map/` 自動重渲染。只瀏覽／監看／重渲染。
@@ -282,7 +293,12 @@ Watcher 與 GateList 共用唯一入口 **`ReconcileGate1()`**：
 
 **SpecCommit barrier 測試**：preview 後外部改檔／移動 HEAD **均不得 commit**；已有 scope 外 staged change **不得進新 commit**（或 fail closed）。
 
-**SpecAssist 安全測試**：(a) **enforcement 證據**——斷言 Claude one-shot argv 含 `--tools ""`、Codex turn wire 帶 `sandboxPolicy=readOnly`（非 behavioral）；(b) 惡意 **fake provider 嘗試 tool/write** → 斷言 **workspace 零變更**；(c) enforcement probe 失敗 → 該 provider SpecAssist **fail closed**、session 架構不變。
+**SpecAssist 安全測試**：(a) **enforcement 證據**——斷言 Claude one-shot argv 含 `--tools ""`、Codex turn wire 帶 `sandboxPolicy={readOnly,networkAccess:false}` ＋ `approvalPolicy="never"`（非 behavioral）；(b) 惡意 **fake provider 嘗試 tool/write** → 斷言 **workspace 零變更**；(c) enforcement probe 失敗 → 該 provider SpecAssist **fail closed**、session 架構不變。
+
+**SpecAssist lifecycle barrier 測試（production path）**：
+- `TestSpecAssistExclusivePerProvider`：第二個請求回 `ErrAssistActive`。
+- `TestShutdownWaitsForAndReclaimsSpecAssist`：shutdown cancel/等待 bounded completion＋稽核收尾後才 `Manager.Close()`。
+- `TestCodexAssistCannotEscalateOrMutateSessionView`：escalation/approval request fail closed；assist 事件不進 provider session reducer／Chat／totals／unread；晚到舊 generation 事件丟棄 fail loud。
 
 **routing 隔離**：`TestWorkspaceGateEventDoesNotEnterProviderViews`。
 
