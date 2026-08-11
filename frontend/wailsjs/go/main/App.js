@@ -18,6 +18,14 @@ export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
 
+export function GateDecide(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GateDecide'](arg1, arg2, arg3);
+}
+
+export function GateList() {
+  return window['go']['main']['App']['GateList']();
+}
+
 export function ListWorkspace(arg1) {
   return window['go']['main']['App']['ListWorkspace'](arg1);
 }
@@ -54,12 +62,32 @@ export function SendMessage(arg1, arg2) {
   return window['go']['main']['App']['SendMessage'](arg1, arg2);
 }
 
+export function SpecAssist(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SpecAssist'](arg1, arg2, arg3);
+}
+
+export function SpecList() {
+  return window['go']['main']['App']['SpecList']();
+}
+
+export function SpecRead(arg1) {
+  return window['go']['main']['App']['SpecRead'](arg1);
+}
+
+export function SpecWrite(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SpecWrite'](arg1, arg2, arg3);
+}
+
 export function StartLogin(arg1) {
   return window['go']['main']['App']['StartLogin'](arg1);
 }
 
 export function StartSession(arg1, arg2, arg3, arg4, arg5, arg6) {
   return window['go']['main']['App']['StartSession'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
+export function SubmitForApproval() {
+  return window['go']['main']['App']['SubmitForApproval']();
 }
 
 export function TerminateSession(arg1) {

@@ -10,6 +10,10 @@ export function CancelLogin(arg1:string):Promise<void>;
 
 export function EndSession(arg1:string):Promise<void>;
 
+export function GateDecide(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function GateList():Promise<Array<main.GateEntryDTO>>;
+
 export function ListWorkspace(arg1:string):Promise<Array<main.FileNode>>;
 
 export function Logout(arg1:string):Promise<void>;
@@ -28,8 +32,18 @@ export function RestoreViews():Promise<Record<string, main.RestoredView>>;
 
 export function SendMessage(arg1:string,arg2:string):Promise<void>;
 
+export function SpecAssist(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function SpecList():Promise<Array<main.FileNode>>;
+
+export function SpecRead(arg1:string):Promise<string>;
+
+export function SpecWrite(arg1:string,arg2:string,arg3:string):Promise<string>;
+
 export function StartLogin(arg1:string):Promise<void>;
 
 export function StartSession(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<void>;
+
+export function SubmitForApproval():Promise<string>;
 
 export function TerminateSession(arg1:string):Promise<void>;
