@@ -101,6 +101,29 @@ func TestProjectSupersede(t *testing.T) {
 	}
 }
 
+func TestProjectStaleAfterSupersededDoesNotDowngrade(t *testing.T) {
+	ops := []GateOp{
+		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+			Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+		opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approval"}),
+		opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "changed"}),
+	}
+	if got := entryByID(mustProject(t, ops), "A").State; got != Superseded {
+		t.Fatalf("want superseded (stale must not downgrade), got %s", got)
+	}
+}
+
+func TestProjectUnknownTypeErrors(t *testing.T) {
+	ops := []GateOp{
+		{OpID: "op-x", At: "t", Records: []json.RawMessage{
+			json.RawMessage(`{"_type":"bogus","approval_id":"A"}`),
+		}},
+	}
+	if _, err := Project(ops); err == nil {
+		t.Fatal("want error for unknown record _type, got nil")
+	}
+}
+
 func TestValidateGate1Bindings(t *testing.T) {
 	if err := ValidateGate1Bindings(gate1B("sha256:"+hex64(), "git:sha1:"+hex40())); err != nil {
 		t.Fatalf("valid should pass: %v", err)
