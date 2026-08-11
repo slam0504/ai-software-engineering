@@ -27,6 +27,9 @@ func TestEmitWorkspaceScopedAndNoSlot(t *testing.T) {
 	if e.Scope != "workspace" || e.Provider != "" || e.SessionID != "" {
 		t.Fatalf("workspace event must omit provider/session_id, got %+v", e)
 	}
+	if len(m.slots) != 0 {
+		t.Fatalf("EmitWorkspace must not allocate or touch any provider slot; got %d slot(s)", len(m.slots))
+	}
 	if e.Kind != "gate_request" || len(e.Bindings) != 1 {
 		t.Fatal("kind/bindings must be top-level")
 	}
