@@ -11,6 +11,9 @@ type Repo interface {
 	ReadScopedHeadTree(head string) ([]FileEntry, error)
 }
 
+// buildRetries is the max total ReadScopedWorktree calls BuildCurrentManifest
+// will make (sliding-window compare against the previous read), not a count
+// of double-read "attempts" — see BuildCurrentManifest's doc comment.
 const buildRetries = 3
 
 // BuildCurrentManifest builds the canonical manifest from the worktree and
