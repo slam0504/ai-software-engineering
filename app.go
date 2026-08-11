@@ -19,6 +19,7 @@ import (
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
+	"github.com/slam0504/sdlc-workbench/internal/assist"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
@@ -93,7 +94,29 @@ type App struct {
 	gateOnce            sync.Once
 	gateInitErr         error
 	gitIdentityOverride func() (name, email string, err error) // 測試注入：略過真實 git config 查詢
+
+	// SpecAssist（Task 11：Stage A §5.1）——per-provider 至多一個 active 隔離
+	// one-shot。assistActive 在 assistMu 下管理獨佔性；每個 generation 的 cancel
+	// 供 shutdown reclaim，once 保證 result／abort／timeout／shutdown 任一先觸發
+	// 即收一次（清 active flag＋endAppTxn＋close done）。
+	assistMu            sync.Mutex
+	assistActive        map[string]*assistGen
+	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 }
+
+// assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
+type assistGen struct {
+	correlationID string
+	cancel        context.CancelFunc
+	done          chan struct{} // teardown 完成後關閉（shutdown reclaim 等待點）
+	once          sync.Once
+}
+
+// ErrAssistActive：同一 provider 已有 active SpecAssist（獨佔性；第二個請求回此）。
+var ErrAssistActive = errors.New("assist already active for provider")
+
+// assistTimeout：單一 one-shot 草擬的上限（timeout 為 once/token 收尾觸發之一）。
+const assistTimeout = 3 * time.Minute
 
 // beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
 // 建立／替換 codex server 或啟動 provider 的操作（StartSession、ensureAppServer、
@@ -123,7 +146,8 @@ func (a *App) emit(name string, data any) {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{apprPending: map[string]*pendingApproval{}}
+	return &App{apprPending: map[string]*pendingApproval{},
+		assistActive: map[string]*assistGen{}}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -208,9 +232,10 @@ func (a *App) watchDiagram(path string) {
 
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
-	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer
+	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
 	a.shutMu.Unlock()
-	a.inflight.Wait() // 2) 等已取得 start ownership 的交易 accept／abort 完成
+	a.reclaimAssists() // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.inflight.Wait()  // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
@@ -859,6 +884,139 @@ func (a *App) GateDecide(approvalID, decision, reason string) error {
 		bindings = gate1Bindings(req.SpecManifestDigest, req.BaseCommit)
 	}
 	return svc.Decide(approvalID, decision, reason, approver, bindings)
+}
+
+// ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----
+
+// SpecAssist 以隔離的一次性 AI 呼叫草擬 spec 內容，帶 provider 端強制的零 workspace
+// 變更保證（Claude `--tools ""`／Codex readOnly+never，見 internal/assist）。
+//
+// lifecycle 不變量：
+//   - 獨佔性：每個 provider 至多一個 active；第二個併發請求回 ErrAssistActive。
+//   - 交易閘：beginAppTxn 於啟動（shutdown 後拒新），endAppTxn 於收尾一次。
+//   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endAppTxn）
+//     後才 Manager.Close（reclaimAssists＋inflight.Wait）。
+//   - ownership 隔離：不寫 a.claudeSess／a.runner／a.codexConn（runner 為獨立 process）；
+//     晚到舊 generation 事件（correlation 不符）丟棄並發 stream_error（fail loud）。
+//   - once/token 收尾：result／abort／timeout／shutdown 任一先觸發即收一次。
+//
+// 事件經 Manager.EmitAssist 出口（scope=session、provider、correlation_id、
+// purpose="spec_assist"）——保留稽核＋檔案級 event_id，但**不進 provider slot**
+// （前端依 purpose 二次分流，不污染 reducer／Chat／totals）。
+func (a *App) SpecAssist(provider, purpose, prompt string) error {
+	if provider != "claude" && provider != "codex" {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	if purpose == "" {
+		purpose = "spec_assist"
+	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新請求
+		return err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
+
+	a.assistMu.Lock()
+	if _, exists := a.assistActive[provider]; exists { // 獨佔性：第二個併發請求被拒
+		a.assistMu.Unlock()
+		cancel()
+		a.endAppTxn() // 未進 active：立即平衡交易閘
+		return ErrAssistActive
+	}
+	a.assistActive[provider] = gen
+	a.assistMu.Unlock()
+
+	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
+	teardown := func() {
+		gen.once.Do(func() {
+			cancel()
+			a.assistMu.Lock()
+			if a.assistActive[provider] == gen {
+				delete(a.assistActive, provider)
+			}
+			a.assistMu.Unlock()
+			a.endAppTxn()
+			close(gen.done)
+		})
+	}
+	defer teardown()
+
+	runner, err := a.newAssistRunner(provider)
+	if err != nil {
+		return err
+	}
+
+	prov := contract.Provider(provider)
+	sink := func(env contract.Envelope) {
+		a.assistMu.Lock()
+		cur, ok := a.assistActive[provider]
+		a.assistMu.Unlock()
+		if !ok || cur != gen { // 晚到舊 generation：丟棄並 fail loud（不進 provider slot）
+			a.manager.EmitAssist(prov, gen.correlationID, purpose,
+				contract.Event{Provider: prov, Kind: contract.KindStreamError,
+					Raw: []byte(`{"assist":"stale_generation_event_dropped"}`),
+					Err: errors.New("assist: late event from stale generation dropped")})
+			return
+		}
+		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
+	}
+	return runner.Run(ctx, prompt, sink)
+}
+
+// newAssistRunner：production 造 provider 專屬隔離 one-shot Runner；測試以
+// assistRunnerFactory 注入 fake。
+func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
+	if a.assistRunnerFactory != nil {
+		return a.assistRunnerFactory(provider)
+	}
+	cwd, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	if provider == "claude" {
+		return assist.NewClaudeAssist(a.claudeCLIPath(), cwd, a.childEnv()), nil
+	}
+	return assist.NewCodexAssist(a.codexCLIPath(), cwd, a.childEnv()), nil
+}
+
+// reclaimAssists：shutdown 對 in-flight SpecAssist 的收束——cancel 每個 active
+// generation（runner 界限內退出 → teardown 清 active＋endAppTxn＋close done）。
+// 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
+// （稽核收尾在 sink 關閉前完成）。bounded 由 runner 尊重 ctx（proc TermGrace）保證。
+func (a *App) reclaimAssists() {
+	a.assistMu.Lock()
+	gens := make([]*assistGen, 0, len(a.assistActive))
+	for _, g := range a.assistActive {
+		gens = append(gens, g)
+	}
+	a.assistMu.Unlock()
+	for _, g := range gens {
+		g.cancel()
+	}
+}
+
+// assistEnvelopeToEvent：Runner 送出的 envelope → Event（EmitAssist 於出口重蓋
+// 檔案級 event_id／ts／scope／correlation／purpose）。rich 內容原樣保留。
+func assistEnvelopeToEvent(prov contract.Provider, env contract.Envelope) contract.Event {
+	ev := contract.Event{
+		Provider:  prov,
+		Kind:      contract.Kind(env.Kind),
+		SessionID: env.SessionID,
+		Role:      env.Role,
+		Text:      env.Text,
+		Thinking:  env.Thinking,
+		IsError:   env.IsError,
+		CostUSD:   env.CostUSD,
+		Usage:     env.Usage,
+		Raw:       []byte(env.Raw),
+	}
+	if env.Error != "" {
+		ev.Err = errors.New(env.Error)
+	}
+	if len(ev.Raw) == 0 { // Wrap 對空 Raw 無妨，但保守給合法 JSON
+		ev.Raw = []byte(`{}`)
+	}
+	return ev
 }
 
 // ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
