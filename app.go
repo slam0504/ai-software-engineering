@@ -22,6 +22,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/gate"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
@@ -82,6 +83,16 @@ type App struct {
 	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
 	hookInServerTxn         func()                     // 測試注入：server 交易已登記、Ensure 未開始
 	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
+
+	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
+	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
+	// （gitignored app state；不隨測試覆寫的 stateDir 漂移，永遠綁 workspace 本身）。
+	specRepo            *spec.GitRepo
+	gateSvc             *gate.Service
+	gateJournal         *gate.Journal
+	gateOnce            sync.Once
+	gateInitErr         error
+	gitIdentityOverride func() (name, email string, err error) // 測試注入：略過真實 git config 查詢
 }
 
 // beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
@@ -665,6 +676,189 @@ func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, 
 		return "", rerr
 	}
 	return specDigestOf([]byte(content)), nil
+}
+
+// ---- Gate 1（M2 Stage A：spec §3.5／§5.4）----
+
+// gateEmitter：gate.Emitter → Manager.EmitWorkspace，轉 []gate.Binding →
+// []contract.Binding（同欄位，無新語意）。
+type gateEmitter struct{ a *App }
+
+func (g gateEmitter) EmitGateEvent(kind string, bindings []gate.Binding, payload any) {
+	cb := make([]contract.Binding, len(bindings))
+	for i, b := range bindings {
+		cb[i] = contract.Binding{Kind: b.Kind, Ref: b.Ref, Digest: b.Digest}
+	}
+	g.a.manager.EmitWorkspace(kind, cb, payload)
+}
+
+// ensureGate 惰性初始化 gate.Service／spec.GitRepo：journal 落在 workspace 的
+// .workbench/gate.jsonl（spec §5.4：第 2 層 app state、gitignored）——刻意綁
+// a.workspaceDir 而非 a.stateDir，兩者production 下同值，但測試會為
+// unix socket 路徑長度另配 stateDir，Gate journal 仍必須跟著 workspace 走。
+func (a *App) ensureGate() (*gate.Service, error) {
+	a.gateOnce.Do(func() {
+		root, err := claude.NormalizeCWD(a.workspaceDir)
+		if err != nil {
+			a.gateInitErr = err
+			return
+		}
+		wbDir := filepath.Join(root, ".workbench")
+		if merr := os.MkdirAll(wbDir, 0o755); merr != nil {
+			a.gateInitErr = merr
+			return
+		}
+		j, jerr := gate.OpenJournal(filepath.Join(wbDir, "gate.jsonl"))
+		if jerr != nil {
+			a.gateInitErr = jerr
+			return
+		}
+		a.specRepo = spec.NewGitRepo(root)
+		a.gateJournal = j
+		current := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
+		ulidFn := func() string { return contract.NewULID(time.Now()) }
+		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+		a.gateSvc = gate.NewService(j, current, ulidFn, nowFn, gateEmitter{a})
+	})
+	return a.gateSvc, a.gateInitErr
+}
+
+// gate1Bindings：Gate 1 標準綁定組合（spec §3.5）——committed spec 快照的
+// spec_manifest digest ＋ base_commit（spec.BuildCommittedSnapshot 的回傳值）。
+func gate1Bindings(manifestDigest, baseCommit string) []gate.Binding {
+	return []gate.Binding{
+		{Kind: "spec_manifest", Ref: "spec/", Digest: manifestDigest},
+		{Kind: "base_commit", Ref: "HEAD", Digest: baseCommit},
+	}
+}
+
+// SubmitForApproval 以目前 committed spec 快照送出 Gate 1 核可申請。
+// dirty tree／HEAD 位移等錯誤原樣自 spec.BuildCommittedSnapshot 傳回。
+func (a *App) SubmitForApproval() (string, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return "", err
+	}
+	manifestDigest, baseCommit, err := spec.BuildCommittedSnapshot(a.specRepo)
+	if err != nil {
+		return "", err
+	}
+	return svc.Submit(manifestDigest, baseCommit, gate1Bindings(manifestDigest, baseCommit))
+}
+
+// GateEntryDTO：GateList 的 JSON-friendly projection（前端消費）。
+type GateEntryDTO struct {
+	ApprovalID         string         `json:"approval_id"`
+	State              string         `json:"state"`
+	Gate               string         `json:"gate,omitempty"`
+	SpecManifestDigest string         `json:"spec_manifest_digest,omitempty"`
+	BaseCommit         string         `json:"base_commit,omitempty"`
+	CreatedAt          string         `json:"created_at,omitempty"`
+	Bindings           []gate.Binding `json:"bindings,omitempty"`
+	Decision           string         `json:"decision,omitempty"`
+	Reason             string         `json:"reason,omitempty"`
+	Approver           *gate.Approver `json:"approver,omitempty"`
+	JournalDegraded    bool           `json:"journal_degraded,omitempty"`
+}
+
+// GateList 回傳 Gate 1 projection。Service.List 內部先 ReconcileGate1 才
+// Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
+// degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
+func (a *App) GateList() ([]GateEntryDTO, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.List()
+	if err != nil {
+		return nil, err
+	}
+	degraded := a.gateJournal != nil && a.gateJournal.Degraded()
+	out := make([]GateEntryDTO, 0, len(entries))
+	for _, e := range entries {
+		dto := GateEntryDTO{ApprovalID: e.ApprovalID, State: string(e.State), JournalDegraded: degraded}
+		if e.Request != nil {
+			dto.Gate = e.Request.Gate
+			dto.SpecManifestDigest = e.Request.SpecManifestDigest
+			dto.BaseCommit = e.Request.BaseCommit
+			dto.CreatedAt = e.Request.CreatedAt
+		}
+		if e.Record != nil {
+			if dto.Gate == "" {
+				dto.Gate = e.Record.Gate
+			}
+			dto.Bindings = e.Record.Bindings
+			dto.Decision = e.Record.Decision
+			dto.Reason = e.Record.Reason
+			approver := e.Record.Approver
+			dto.Approver = &approver
+		}
+		out = append(out, dto)
+	}
+	return out, nil
+}
+
+// gitConfigValue：`git -C workspace config <key>`；missing key → ""（不是錯誤，
+// 由呼叫端判斷是否視為身分缺失）。
+func (a *App) gitConfigValue(key string) string {
+	out, err := exec.Command("git", "-C", a.workspaceDir, "config", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitIdentity：approver 身分來源，預設查 git config；可測試覆寫
+// （gitIdentityOverride）以避免依賴執行機器的全域 git 設定。
+func (a *App) gitIdentity() (name, email string, err error) {
+	if a.gitIdentityOverride != nil {
+		return a.gitIdentityOverride()
+	}
+	return a.gitConfigValue("user.name"), a.gitConfigValue("user.email"), nil
+}
+
+// GateDecide 對 pending approval 記錄核可／駁回決議。approver 一律取 git
+// identity——name／email 皆缺一律拒絕，不生成假 approver ID（spec §5.4）。
+// 核可時的 Gate 1 bindings 重用 pending request 當初記錄的 spec_manifest
+// digest／base_commit（不在 decide 當下重掃 worktree——避免決議內容漂移到
+// 「核可時」而非「申請時」的快照，也不要求 decide 當下 worktree 仍乾淨）。
+func (a *App) GateDecide(approvalID, decision, reason string) error {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return err
+	}
+	name, email, err := a.gitIdentity()
+	if err != nil {
+		return err
+	}
+	id := name
+	if id == "" {
+		id = email
+	}
+	if id == "" {
+		return errors.New("gate: git identity not configured — set git config user.name (or user.email) before approving")
+	}
+	approver := gate.Approver{ID: id, Method: "app-local"}
+
+	var bindings []gate.Binding
+	if decision == "approved" {
+		entries, lerr := svc.List()
+		if lerr != nil {
+			return lerr
+		}
+		var req *gate.GateRequest
+		for _, e := range entries {
+			if e.ApprovalID == approvalID {
+				req = e.Request
+				break
+			}
+		}
+		if req == nil {
+			return gate.ErrNotPending
+		}
+		bindings = gate1Bindings(req.SpecManifestDigest, req.BaseCommit)
+	}
+	return svc.Decide(approvalID, decision, reason, approver, bindings)
 }
 
 // ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
