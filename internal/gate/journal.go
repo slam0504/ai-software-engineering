@@ -66,6 +66,20 @@ func parseOps(data []byte) (ops []GateOp, validLen int, bad *parseErr) {
 		ops = append(ops, op)
 		offset += len(ln) + 1
 	}
+	// Every line parsed as valid JSON. Append always writes `line + '\n'` in a
+	// single Sync'd call, so a file that does NOT end in '\n' means the last
+	// line was never durably committed — a crash can tear off exactly the
+	// trailing newline while leaving otherwise-valid JSON bytes behind. Treat
+	// that last line as a torn final tail even though it parses, so it goes
+	// through the same quarantine+truncate repair path.
+	if len(data) > 0 && len(lines) > 0 && !bytes.HasSuffix(data, []byte("\n")) {
+		lastLen := len(lines[len(lines)-1])
+		validLen := offset - lastLen - 1
+		return ops[:len(ops)-1], validLen, &parseErr{
+			err:     errors.New("torn final line without trailing newline"),
+			isFinal: true,
+		}
+	}
 	return ops, offset, nil
 }
 

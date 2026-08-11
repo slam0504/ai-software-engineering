@@ -68,3 +68,39 @@ func TestJournalFinalMalformedRepairThenAppend(t *testing.T) {
 		t.Fatal("bad tail must be quarantined as evidence")
 	}
 }
+
+func TestJournalTornFinalNewlineRepaired(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "gate.jsonl")
+	// A complete, validly-parseable op line, but WITHOUT its trailing '\n'.
+	// Append always writes line+'\n' in one Sync'd call, so a file missing
+	// that trailing newline means the write was never durably committed —
+	// it must be treated as a torn tail even though the JSON itself parses.
+	torn := `{"op_id":"o1","at":"t","records":[]}`
+	os.WriteFile(p, []byte(torn), 0o644)
+
+	j, err := OpenJournal(p)
+	if err != nil {
+		t.Fatalf("torn final newline should repair, got %v", err)
+	}
+	if j.Degraded() {
+		t.Fatal("successful repair must not be degraded")
+	}
+	if got := len(j.Ops()); got != 0 {
+		t.Fatalf("torn (never-committed) line must be discarded, got %d ops", got)
+	}
+	if _, err := os.Stat(p + ".quarantine"); err != nil {
+		t.Fatal("torn tail must be quarantined as evidence")
+	}
+
+	if err := j.Append(mustOp(t, GateRequest{Type: "gate_request", ApprovalID: "C"})); err != nil {
+		t.Fatal(err)
+	}
+
+	j2, err := OpenJournal(p)
+	if err != nil {
+		t.Fatalf("reload after repair failed (mid-file corruption?): %v", err)
+	}
+	if len(j2.Ops()) != 1 {
+		t.Fatalf("want 1 op (only the appended one; torn line discarded), got %d", len(j2.Ops()))
+	}
+}
