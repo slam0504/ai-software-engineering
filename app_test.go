@@ -1169,3 +1169,60 @@ func TestCodexAcceptFailureReclaimsResources(t *testing.T) { // P1-5
 		t.Fatal("teardown must emit session:done")
 	}
 }
+
+// 第四輪 review P1 迴歸：shutdown gate——「BeginNewSessionSubmit 完成、
+// ensureAppServer 尚未開始」窗口內啟動 shutdown：shutdown 等待交易離場、
+// 晚到的 Start 被 gate 拒、不建立／回填新 server、lease 於 Manager.Close 前 finalize。
+func TestShutdownGateBlocksLateCodexStart(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	// claude active session＋錄流：驗 shutdown 序列中 lease 在 Close 前 finalize
+	if err := a.StartSession("claude", "hi", "", "claude-gate", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 晚到的 codex Start：ownership 取得後、ensureAppServer 前停住
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookBeforeProviderStart = func() {
+		close(entered)
+		<-release
+	}
+	lateErr := make(chan error, 1)
+	go func() {
+		lateErr <- a.StartSession("codex", "late", "", "", "task-late", "untrusted")
+	}()
+	<-entered // 窗口固定：Begin 完成、provider 啟動未開始
+	a.hookBeforeProviderStart = nil
+
+	shutDone := make(chan struct{})
+	go func() {
+		a.shutdown(context.Background())
+		close(shutDone)
+	}()
+	select { // shutdown 必須等待 in-flight 交易（尚未 Close manager）
+	case <-shutDone:
+		t.Fatal("shutdown must wait for the in-flight start transaction")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if _, err := a.manager.BeginSubmit(contract.ProviderCodex); errors.Is(err, appcore.ErrClosed) {
+		t.Fatal("manager must not be closed while a start transaction is in flight")
+	}
+	close(release) // 交易離場：ensureAppServer 被 gate 拒
+	err := <-lateErr
+	if err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("late start must be rejected by the shutdown gate, got %v", err)
+	}
+	<-shutDone
+
+	if _, ok := a.codexSingle.Take(); ok { // 無新 server 建立／回填
+		t.Fatal("no codex server may be (re)filled after shutdown")
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-gate.meta.json")); err != nil {
+		t.Fatalf("lease must be finalized before Manager.Close: %v", err)
+	}
+	if err := a.StartSession("codex", "after", "", "", "t", ""); err == nil ||
+		!strings.Contains(err.Error(), "shutting down") { // gate 持續拒新 Start
+		t.Fatalf("post-shutdown start must be rejected: %v", err)
+	}
+}

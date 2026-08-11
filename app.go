@@ -68,11 +68,33 @@ type App struct {
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
 
+	// shutdown gate（第四輪 review P1）：shutdown 先拒新 StartSession、等已取得
+	// start ownership 的交易 accept／abort 完成，才 snapshot／teardown／Close／Take——
+	// 堵住「Take() 之後 Ensure() 重新回填 server」的窗口。
+	shutMu       sync.Mutex
+	shuttingDown bool
+	inflight     sync.WaitGroup
+
 	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
 	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
+	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
 	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
 }
+
+// beginStartTxn：StartSession 的 shutdown gate 入場——shutdown 已開始則拒絕，
+// 否則登記 in-flight（shutdown 會等待全部離場）。
+func (a *App) beginStartTxn() error {
+	a.shutMu.Lock()
+	defer a.shutMu.Unlock()
+	if a.shuttingDown {
+		return errors.New("app shutting down")
+	}
+	a.inflight.Add(1)
+	return nil
+}
+
+func (a *App) endStartTxn() { a.inflight.Done() }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
 func (a *App) emit(name string, data any) {
@@ -169,7 +191,11 @@ func (a *App) watchDiagram(path string) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	if err := a.forcedShutdown(); err != nil { // 並行 forced path（M1.5 plan D4）
+	a.shutMu.Lock()
+	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer
+	a.shutMu.Unlock()
+	a.inflight.Wait() // 2) 等已取得 start ownership 的交易 accept／abort 完成
+	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
 	if a.manager != nil {
@@ -529,9 +555,16 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
 		resume = a.restore.Get(provider).ResumeSessionID
 	}
+	if err := a.beginStartTxn(); err != nil { // shutdown gate：拒新 Start
+		return err
+	}
+	defer a.endStartTxn()
 	id, err := a.manager.BeginNewSessionSubmit(prov, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
+	}
+	if h := a.hookBeforeProviderStart; h != nil { // 測試 barrier：ownership 已取得、provider 未啟動
+		h()
 	}
 	switch prov {
 	case contract.ProviderClaude:
@@ -861,6 +894,12 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 // ---- Codex 線 ----
 
 func (a *App) ensureAppServer() (*codex.Server, error) {
+	a.shutMu.Lock()
+	down := a.shuttingDown
+	a.shutMu.Unlock()
+	if down { // shutdown 後不得建立／回填長駐 server（Take 之後的 Ensure 一律拒）
+		return nil, errors.New("app shutting down")
+	}
 	return a.codexSingle.Ensure(func() (*codex.Server, error) {
 		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
 			CWD: a.workspaceDir, Env: a.childEnv()})
