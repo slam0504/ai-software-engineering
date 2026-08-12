@@ -40,11 +40,12 @@
 
 **新增 Go（Phase 2）：**
 - `internal/spec/scope.go` — `Scope` 參數化（spec／plan 雙 scope）。
-- `internal/plan/types.go`、`internal/plan/parse.go`、`internal/plan/validate.go`、`internal/plan/riskpolicy.go`、`internal/plan/lineage.go`、`internal/plan/gate2policy.go`。
+- `internal/plan/types.go`、`internal/plan/parse.go`、`internal/plan/validate.go`、`internal/plan/riskpolicy.go`、`internal/plan/lineage.go`——**plan 不 import gate**（技術中立）。
+- `internal/gatepolicy/gate2.go` — Gate 2 policy（application package：import gate＋plan＋spec，**避免 gate→plan→gate cycle**）。
 
 **新增 Go（Phase 3）：**
 - `internal/evidence/oracle.go`、`cas.go`、`worktree.go`、`runner.go`、`matcher.go`、`journal.go`、`types.go`。
-- `internal/gate/tcapolicy.go` — TCA GatePolicy（一致性 validator 呼叫 evidence 查詢 port）。
+- `internal/gatepolicy/tca.go` — TCA policy（import gate＋plan＋evidence；gate package 維持技術中立、不 import 任何 domain package）。
 
 **新增 Go（Phase 4）：**
 - `internal/escalation/types.go`、`journal.go`、`project.go`、`service.go`。
@@ -318,10 +319,13 @@ func TestGate1PolicyReconcile(t *testing.T) {
 func NewService(j *Journal, reg Registry, ulid func() string, now func() string, em Emitter) *Service
 func (s *Service) Submit(gateName, subject string, bindings []Binding) (string, error)
 // Decide 拆為兩段，供 §3.10 的權威順序（reconcile→validator→blocker→append）在 app 層編排：
-// PrepareDecision 在 mutex 內 Project→pending 檢查→normalizeRequest→policy.BuildDecision（硬性
-// validator）→回傳組好的 record（尚未 append）。CommitDecision 驗 prepared 仍為 pending 後
-// append record＋scoped supersession transitions。兩段之間由呼叫端（app.workflowMu）保證無其他
-// blocking 狀態生產者插入。
+// PrepareDecision 在 mutex 內 Project→pending 檢查→normalizeRequest→
+// **current-binding validation**（以 pending request 的 bindings 建 pseudo-record 跑該 gate 的
+// policy.ReconcileBindings——Reconcile() 只掃 active projection，涵蓋不到 pending；待核期間
+// plan／oracle／上游 Gate 2 改變時，此步以任何 stale cause 拒絕核可，fail closed）→
+// policy.BuildDecision（硬性 decision validator）→回傳組好的 record（尚未 append）。
+// CommitDecision 驗 prepared 仍為 pending 後 append record＋scoped supersession transitions。
+// 兩段之間由呼叫端（app.workflowMu）保證無其他 blocking 狀態生產者插入。
 type PreparedDecision struct{ Record ApprovalRecord }
 func (s *Service) PrepareDecision(id, decision, reason string, approver Approver, input DecisionInput) (PreparedDecision, error)
 func (s *Service) CommitDecision(p PreparedDecision) error
@@ -593,8 +597,8 @@ func TestVerifyLineageRenameSafety(t *testing.T) {
 ### Task 10: Gate 2 policy
 
 **Files:**
-- Create: `internal/plan/gate2policy.go`
-- Test: `internal/plan/gate2policy_test.go`
+- Create: `internal/gatepolicy/gate2.go`（application package——import `gate`＋`plan`＋`spec`；`internal/gate` 不得 import 任何 domain package，避免 import cycle）
+- Test: `internal/gatepolicy/gate2_test.go`
 
 **Interfaces:**
 - Consumes: Task 4 `gate.GatePolicy`／`DecisionInput`、Task 8 `plan.Plan`／`RiskPolicy`、Task 9 `VerifyLineage`。
@@ -605,7 +609,7 @@ func TestVerifyLineageRenameSafety(t *testing.T) {
 type PlanLoader interface {
 	LoadAt(commitOID, planID string) (plan.Plan, plan.RiskPolicy, error)
 }
-func NewGate2Policy(loader PlanLoader, g GitRunner,
+func NewGate2Policy(loader PlanLoader, g plan.GitRunner, // package gatepolicy
 	currentPlanManifest func() (string, error),
 	currentSpecManifest func() (string, error),
 	currentRiskPolicyDigest func() (string, error),
@@ -656,7 +660,7 @@ func ClaudePlannerArgs() []string {
   - `SubmitPlanForApproval`：**前置——存在 active Gate 1**，且 Gate 2 的 `spec_manifest` binding 值**直接取自該 active Gate 1 record 的 binding**（非重算 worktree；兩者不一致的情況由 Gate 1 STALE 機制而非 Gate 2 處理）→ dirty-tree 拒核（`BuildCommittedSnapshot` with PlanScope）→ 讀 committed plan → scenario 集合取自 **active Gate 1 綁定的 committed spec tree**（`ReadScopedHeadTree` at Gate 1 `base_commit`，解析 `spec/features/**` 的 Scenario 上一行 `@` tag 為 ID；無 tag 的 scenario 不可被 plan 引用）→ `plan.Validate`（fail 即拒）→ lineage 驗證 → 組五筆 bindings → `Submit("gate2", "plan:"+planID, bindings)`。
   - `GateDecisionContext(approvalID)`：後端從該 pending request 的 `base_commit`（plan_commit）用 `PlanLoader.LoadAt` 讀 **committed plan**，回傳 `{Tasks: [{task_id, title, minimum_risk_tier, planner_risk_tier}]}` 供 Gate 2 卡片渲染 risk 列。**UI 禁止以目前 worktree plan 推導 minimum／planner**（committed 才是核可對象）。
 
-- [ ] **Step 1: 失敗測試**：無 active Gate 1 時送核被拒；dirty plan tree 送核被拒；成功送核後 `GateList` 出現 `gate:"gate2", subject:"plan:P1"` pending 項且 spec_manifest binding 等於 Gate 1 所綁值；`GateDecisionContext` 在送核後**修改 worktree plan** 仍回傳 committed 值（不受 worktree 影響）。
+- [ ] **Step 1: 失敗測試**：無 active Gate 1 時送核被拒；dirty plan tree 送核被拒；成功送核後 `GateList` 出現 `gate:"gate2", subject:"plan:P1"` pending 項且 spec_manifest binding 等於 Gate 1 所綁值；`GateDecisionContext` 在送核後**修改 worktree plan** 仍回傳 committed 值（不受 worktree 影響）；**mutation-before-decide（Gate 2）**——送核後、核可前修改並 commit 新版 plan（plan manifest 變）→ `GateDecide` 被 current-binding validation 拒絕（Task 5）。
 - [ ] **Step 2–4: TDD 循環＋全套 `-race`。**
 - [ ] **Step 5: Commit**：`feat(app): plan workspace 綁定＋watcher＋Gate 2 送核（§7 Stage B）`
 
@@ -753,7 +757,7 @@ type Mutation struct {
 }
 ```
 
-- [ ] **Step 1: 失敗測試**：`PutCAS` 後檔案在 `sha256/<hex>` 且無 temp 殘留；`OpenCAS` 對被竄改的檔案（直接改 bytes）回錯；`CleanOrphanTemps` 只清 temp 不動 CAS 檔；**crash boundary 模擬**——先手動放一個 `*.tmp-x` 再 `CleanOrphanTemps`，CAS 檔案完好。
+- [ ] **Step 1: 失敗測試**：`PutCAS` 後檔案在 `sha256/<hex>` 且無 temp 殘留；`OpenCAS` 對被竄改的檔案（直接改 bytes）回錯；`CleanOrphanTemps` 只清 temp 不動 CAS 檔；**spec §3.7 全部 crash boundary 逐一注入＋重啟驗證**（測試以「手工佈置該時點的磁碟狀態→跑恢復→驗不變量」模擬，不變量＝journal 永不指向不存在的檔案、恢復冪等）：(a) file sync 後／rename 前——只有 temp 檔、無 CAS 檔、無 journal 行 → 恢復清 temp、無副作用；(b) rename 後／directory sync 前——CAS 檔在、無 journal 行 → 恢復保留 CAS 檔（無 journal 引用之 CAS 為無害 orphan，不清）、`PutCAS` 同內容重放冪等（同 digest 路徑）；(c) directory sync 後／journal append 前——同 (b) 狀態＋驗重放後 journal append 成功且引用存在的檔案。
 - [ ] **Step 2–4: TDD＋`-race`。** → **Step 5: Commit**：`feat(evidence): CAS store（temp→sync→rename→dirsync）＋mutation 登記（§3.7）`
 
 ### Task 18: detached worktree 生命週期
@@ -765,22 +769,28 @@ type Mutation struct {
 - Produces:
 
 ```go
-// Registry：append-only JSONL（internal/journal），worktree 生命週期以 durable transition 表達：
-//   {"_type":"wt_intent","evidence_id":..,"dir":..,"at":..}   // 建立前先寫（durable）
-//   {"_type":"wt_active","evidence_id":..,"at":..}            // git worktree add 成功後
-//   {"_type":"wt_removed","evidence_id":..,"at":..}           // remove+prune 成功後
-// crash 恢復依 projection：intent 無 active → 目錄可能半建，強制 remove+prune＋標 removed；
+// Registry：append-only JSONL（internal/journal），worktree 生命週期以 durable transition 表達。
+// **順序凍結：先推導路徑並持久化 intent，才允許任何檔案系統建立**——路徑為
+// filepath.Join(os.TempDir(), "wb-evidence-"+evidenceID)（evidenceID=ULID 保證唯一，
+// 不用 MkdirTemp：MkdirTemp 會先建目錄，intent 前 crash 即產生 registry 無法辨識的目錄）：
+//   {"_type":"wt_intent","evidence_id":..,"dir":..,"at":..}   // ① 目錄尚不存在時先寫（durable）
+//   （② git worktree add --detach <dir> <commit> 建立目錄）
+//   {"_type":"wt_active","evidence_id":..,"at":..}            // ③ add 成功後
+//   {"_type":"wt_removed","evidence_id":..,"at":..}           // ④ remove+prune 成功後
+// crash 恢復依 projection：intent 無 active → 目錄可能不存在或半建，冪等 remove+prune＋標 removed；
 // active 無 removed 且非 live → orphan，remove+prune＋標 removed。§4-4／§4-6。
 type Worktree struct{ Dir string; EvidenceID string }
 func NewWorktree(repoRoot, commitOID, registryPath, evidenceID string) (*Worktree, error) // intent→add→active
-// ApplyPatch：先 `git -C dir apply --check`（驗可套用＋以 --numstat 列路徑供 oracle 檢查），
-// 再 `git -C dir apply`；patch bytes 一律經受控 stdin 傳入，不落 shell 字串（P2 修正）。
-func (w *Worktree) ApplyPatch(patch []byte) error
+// ApplyPatch：先 `git -C dir apply --check`（驗可套用），路徑列舉用
+// `git apply --numstat -z`（-z 凍結解析；rename/copy 條目帶 old＋new 兩路徑，**兩側皆回傳**
+// 供呼叫端過 oracle 檢查——單驗一側可被 oracle→非 oracle rename 規避），
+// 再 `git -C dir apply`；patch bytes 一律經受控 stdin 傳入，不落 shell 字串。
+func (w *Worktree) ApplyPatch(patch []byte) (touched []string, err error)
 func (w *Worktree) Remove(repoRoot, registryPath string) error // remove --force + prune + 標 removed
 func CleanupOrphans(repoRoot, registryPath string, liveIDs map[string]bool) error
 ```
 
-- [ ] **Step 1: 失敗測試**：worktree checkout 出指定 commit 的內容（非 HEAD）；`ApplyPatch` 對套不上的 patch 回錯且 worktree 未半套用（--check 先行）；**crash window 逐一測**：(a) 只有 intent（模擬 add 前 crash：手寫 intent 行＋建半個目錄）→ `CleanupOrphans` 後目錄清除＋registry 標 removed；(b) intent+active 無 removed 且非 live → 同上；(c) 已 removed 的不重複處理；全部情境後 `git worktree list` 無殭屍。
+- [ ] **Step 1: 失敗測試**：worktree checkout 出指定 commit 的內容（非 HEAD）；`ApplyPatch` 對套不上的 patch 回錯且 worktree 未半套用（--check 先行）；**crash window 逐一測**：(a0) intent 已寫、目錄從未建立（add 前 crash）→ `CleanupOrphans` 冪等標 removed 不報錯；(a) intent 已寫＋目錄半建（add 中 crash：手動 mkdir）→ 目錄清除＋標 removed；(b) intent+active 無 removed 且非 live → 同上；(c) 已 removed 的不重複處理；全部情境後 `git worktree list` 無殭屍、系統暫存目錄無 `wb-evidence-*` 殘留。
 - [ ] **Step 2–4: TDD＋`-race`。** → **Step 5: Commit**：`feat(evidence): detached worktree 生命週期＋orphan 清理（§4）`
 
 ### Task 19: runner 執行＋matcher＋結果分類
@@ -838,10 +848,10 @@ func ClassifyExpectedRed(exitCode int, output []byte, ef plan.ExpectedFailure) (
 func ClassifyNegativeControl(exitCode int, output []byte, ef plan.ExpectedFailure) (result, observed string)
 ```
 
-- Run 流程（§3.4／§4）：`ld.LoadAt(PlanCommit, PlanID)` 取 task 的 approved `TestContract`＋`ld.LoadOracleAt(PlanCommit)` 取 oracle 宣告 → 驗 test_commit 以 plan_commit 為祖先＋range 限 oracle 路徑（`plan.VerifyLineage` with `OracleDecl.Match`，rename 兩側皆驗）→ runner 於 test_commit tree 重算 `OracleSurfaceDigest` → 建 worktree（checkout test_commit）→ negative_control 時 ApplyPatch（`--check`＋`--numstat` 路徑不得命中 oracle）→ `exec.CommandContext` 以 approved `Command` 結構化執行（`Dir=worktree`、`Env` 白名單：PATH/HOME/GOCACHE 等，去除 provider token 類）＋`proc` 式 process group、timeout kill → stdout/stderr tee 到 CAS（超限＝`result:error`）→ Classify → 填 `EvidenceRun` → worktree Remove。
+- Run 流程（§3.4／§4）：`ld.LoadAt(PlanCommit, PlanID)` 取 task 的 approved `TestContract`＋`ld.LoadOracleAt(PlanCommit)` 取 oracle 宣告 → 驗 test_commit 以 plan_commit 為祖先＋range 限 oracle 路徑（`plan.VerifyLineage` with `OracleDecl.Match`，rename 兩側皆驗）→ runner 於 test_commit tree 重算 `OracleSurfaceDigest` → 建 worktree（checkout test_commit）→ negative_control 時 ApplyPatch（`--check`＋`--numstat -z` 回傳的 touched 路徑——含 rename old／new 兩側——**任一命中 oracle 即拒**）→ `exec.CommandContext` 以 approved `Command` 結構化執行（`Dir=worktree`、`Env` 白名單：PATH/HOME/GOCACHE 等，去除 provider token 類）＋`proc` 式 process group、timeout kill → stdout/stderr tee 到 CAS（超限＝`result:error`）→ Classify → 填 `EvidenceRun` → worktree Remove。
 
 - [ ] **Step 1: matcher 失敗測試**（表格式：紅燈特徵符合→passed；exit 0→failed；編譯錯誤輸出（無 matcher 特徵）→error；輸出超限→error）。
-- [ ] **Step 2: runner 整合失敗測試**（fixture repo：C0 有 `run_test.sh`（approved plan 的 `Command{Executable:"sh",Argv:["run_test.sh"]}`）輸出 `FAIL: TestX` exit 1 → expected_red passed；timeout fixture（`sleep 60`、Timeout=1s）→ error 且 **worktree 目錄與 process group 皆零殘留**（`git worktree list` 乾淨、pgid kill 驗證同 proc 測試慣例）；**oracle→非 oracle rename 的 test_commit 拒絕**（Task 9 對偶）；**EvidenceRunDigest 竄改測試**——改 record 任一欄位 digest 必變）。
+- [ ] **Step 2: runner 整合失敗測試**（fixture repo：C0 有 `run_test.sh`（approved plan 的 `Command{Executable:"sh",Argv:["run_test.sh"]}`）輸出 `FAIL: TestX` exit 1 → expected_red passed；timeout fixture（`sleep 60`、Timeout=1s）→ error 且 **worktree 目錄與 process group 皆零殘留**（`git worktree list` 乾淨、pgid kill 驗證同 proc 測試慣例）；**oracle→非 oracle rename 的 test_commit 拒絕**（Task 9 對偶）；**mutation patch rename 雙向拒絕**——patch 含 oracle→非 oracle rename 與非 oracle→oracle rename 各一測，皆因 touched 兩側檢查被拒；**EvidenceRunDigest 竄改測試**——改 record 任一欄位 digest 必變）。
 - [ ] **Step 3–4: TDD＋`-race`。** → **Step 5: Commit**：`feat(evidence): runner＋matcher＋結果分類（timeout／輸出超限 fail closed）（§3.7／§4）`
 
 ### Task 20: evidence journal＋恰一次 finalize＋app.go 綁定
@@ -853,15 +863,15 @@ func ClassifyNegativeControl(exitCode int, output []byte, ef plan.ExpectedFailur
 
 **Interfaces:**
 - Produces: journal append 順序固定＝**CAS artifact 全部落盤後才 append**（Task 17 保證）＋「同一 evidence run 恰一次 finalize」——evidence_id 唯一鍵重複 append 拒絕（§4-5）。
-- **App lifecycle ownership（本 task 凍結）**：`RunEvidence` 進入即 `beginAppTxn()`（沿 `app.go:136` 慣例，shutdown 拒新工作）；執行 context 掛在 app shutdown context 之下（shutdown → cancel → runner timeout 路徑收拾 worktree／process group）；app 持 **active run registry**（`map[evidenceID]cancel`，workflowMu 保護），finalize（journal append）與 registry 移除為同一臨界區——恰一次語意由此保證；shutdown 走 bounded wait（沿 `a.inflight` WaitGroup），逾時 forcedShutdown 路徑由 Task 18 的 `CleanupOrphans` 於下次啟動收拾。
+- **App lifecycle ownership（本 task 凍結；不依賴 Task 24 的 workflowMu——本 task 自帶 registry mutex，Task 24 再整合 lock ordering）**：`RunEvidence` 進入即 `beginAppTxn()`（沿 `app.go:136` 慣例，shutdown 拒新工作）；執行 context 掛在 app shutdown context 之下；app 持 **active run registry**（`a.evidenceMu sync.Mutex`＋`map[evidenceID]context.CancelFunc`），finalize（journal append）與 registry 移除為同一臨界區——恰一次語意由此保證。**Shutdown 取消順序凍結**（鏡射 `reclaimAssists`，`app.go:1242`）：`shutdown()` 先呼叫 `reclaimEvidenceRuns()`（逐一 cancel active runs——runner 的 ctx cancel 路徑收拾 process group 與 worktree）**再** `a.inflight.Wait()` bounded wait——否則長時 runner 會讓 `inflight.Wait()` 卡死；逾時 forcedShutdown 路徑由 Task 18 的 `CleanupOrphans` 於下次啟動收拾。
 
-- [ ] **Step 1: 失敗測試**：同 evidence_id append 兩次第二次回錯；journal replay 後 `EvidenceGet` 重建完整 record；`RunEvidence` 在 `plan_commit..test_commit` 混入非 oracle 路徑時拒絕；**shutdown barrier 測試**——run 進行中觸發 app shutdown：RunEvidence 以 error 收場、無 finalize 半寫入、process group 零殘留、下次啟動 `CleanupOrphans` 清 worktree。
+- [ ] **Step 1: 失敗測試**：同 evidence_id append 兩次第二次回錯；journal replay 後 `EvidenceGet` 重建完整 record；`RunEvidence` 在 `plan_commit..test_commit` 混入非 oracle 路徑時拒絕；**shutdown channel-barrier production 測試**——fixture 命令為「寫入 started 檔後長眠」，測試等 started 檔出現（channel／輪詢檔案，非 time.Sleep 猜時間）後呼叫 `shutdown()`：斷言 `reclaimEvidenceRuns` 先於 `inflight.Wait` 完成（shutdown 在 bounded 時間內返回）、RunEvidence 以 error 收場、無 finalize 半寫入、process group 零殘留、下次啟動 `CleanupOrphans` 清 worktree。
 - [ ] **Step 2–4: TDD＋`-race`。** → **Step 5: Commit**：`feat(evidence): journal＋恰一次 finalize＋app 綁定（§4-5）`
 
 ### Task 21: TCA policy＋SubmitTestContract
 
 **Files:**
-- Create: `internal/gate/tcapolicy.go`＋`tcapolicy_test.go`
+- Create: `internal/gatepolicy/tca.go`＋`tca_test.go`（同 Task 10：gatepolicy import gate＋plan＋evidence，gate 維持技術中立）
 - Modify: `app.go`：`SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID string) (string, error)`——組七筆 bindings 後 `Submit("test_contract_approval", "task:"+planID+"/"+taskID, bindings)`
 
 **Interfaces:**
@@ -877,25 +887,27 @@ type EvidenceStore interface {
 type GateReader interface { // 供 gate2_approval resolver 查 projection＋原始 record
 	Lookup(approvalID string) (rec *ApprovalRecord, state State, err error)
 }
-func NewTCAPolicy(ev EvidenceStore, gates GateReader, loader plan.PlanLoader, g plan.GitRunner) GatePolicy
+func NewTCAPolicy(ev EvidenceStore, gates GateReader, loader PlanLoader, g plan.GitRunner) gate.GatePolicy // package gatepolicy
 ```
 
 - `ValidateRequest` bindings 必填：`gate2_approval`（ref=`approval:<ULID>`、digest=sha256）＋`base_commit`＋`oracle_surface`（ref=git OID）＋`evidence_run`×2（role 區分）＋`mutation`。
 - `BuildDecision`（approved）跑 §3.4 七條一致性 validator（role↔kind、雙 passed、三欄 snapshot 一致、`oracle_surface.ref==test_commit`、mutation digest 對齊、expected-red 無 mutation、descriptor 從 `gate2_approval` 所綁 record 的 `base_commit`（plan_commit）用 `loader.LoadAt` 讀——**禁讀 worktree**）。
 - `ReconcileBindings`：`gate2_approval`＝digest 重算（`RecordDigest`）＋projection active 雙驗（§3.4）；`evidence_run`＝`EvidenceRunDigest` 重算（journal record）＋record 引用的 CAS artifact 重讀驗證；`mutation`＝CAS 重讀；`oracle_surface`＝**以核可時的 OracleDecl（自 plan_commit 載入）對目前 workspace 內容重算**（§3.9 持續重算——目前 oracle-surface 檔案被改即 STALE；重算沿 `BuildCurrentManifest` 的 sliding-window 慣例，讀取錯誤／併發修改回 error fail closed、不寫永久 STALE）；`base_commit`＝存在性。**注意：test_commit tree 上的重算只用於 runner 執行時（Task 19），resolver 的權威是目前內容**——否則 oracle 變更永不 STALE，與驗收 A5 矛盾。
 
-- [ ] **Step 1: 失敗測試**（表格式覆蓋：兩筆 evidence 的 test_commit 不同→拒；expected-red 帶 mutation→拒；gate2 STALE 後 reconcile→TCA stale cause；record 竄改（`EvidenceRunDigest` 不符）→stale cause；**目前 oracle-surface 檔案修改→stale cause（A5 對應）**；oracle 重算讀取錯誤→error 不寫 stale；descriptor 與 committed plan 不符→拒）。
+- [ ] **Step 1: 失敗測試**（表格式覆蓋：兩筆 evidence 的 test_commit 不同→拒；expected-red 帶 mutation→拒；gate2 STALE 後 reconcile→TCA stale cause；record 竄改（`EvidenceRunDigest` 不符）→stale cause；**目前 oracle-surface 檔案修改→stale cause（A5 對應）**；oracle 重算讀取錯誤→error 不寫 stale；descriptor 與 committed plan 不符→拒；**mutation-before-decide（TCA）**——TCA 送核後、核可前 supersede 其 gate2_approval → `GateDecide` 被 current-binding validation 拒絕（Task 5））。
 - [ ] **Step 2–4: TDD＋`-race`。** → **Step 5: Commit**：`feat(gate): TCA policy——七條一致性＋gate2_approval 雙驗 resolver（§3.4／§3.9）`
 
-### Task 22: TCA console UI＋evidence 詳情
+### Task 22: TCA workspace（Stage C 操作入口）＋console UI＋evidence 詳情
 
 **Files:**
-- Modify: `frontend/src/components/GateConsole.vue`（tca 卡片：subject、gate2_approval 連結、兩筆 evidence 摘要（kind／result／test_commit 短 SHA→點開詳情）、mutation digest）、`frontend/src/stores/gate.ts`、`types.ts`、locales
+- Create: `frontend/src/components/TcaWorkspace.vue`＋`TcaWorkspace.test.ts`——**Stage C 全程可從 app 完成的操作面**（A4／SC4 方向）：從 active Gate 2 的 committed plan 列出 tasks（`GateDecisionContext`）→ 每 task 一列：test_commit 輸入（下拉近期 commits＋手動輸入，送出前呼叫後端 lineage 預檢）、mutation patch 貼上→`RegisterMutation`、「跑 expected-red」「跑 negative-control」按鈕（`RunEvidence`，進度顯示 workspace lane 的 `evidence_run` 事件、完成顯示 result 徽章）、兩筆 evidence 皆 passed 後啟用「送核 TCA」→`SubmitTestContract`
+- Create: `frontend/src/stores/evidence.ts`（mutation／evidence run 狀態，by plan/task）
 - Create: `frontend/src/components/EvidenceDetail.vue`（EvidenceGet 顯示完整 record＋recording ref）
-- Test: `GateConsole.test.ts` 擴充
+- Modify: `frontend/src/components/GateConsole.vue`（tca 卡片：subject、gate2_approval 連結、兩筆 evidence 摘要（kind／result／test_commit 短 SHA→點開詳情）、mutation digest）、`frontend/src/stores/gate.ts`、`types.ts`、`App.vue`（TcaWorkspace tab）、locales
+- Test: `GateConsole.test.ts` 擴充＋`app_evidence_test.go` 補 production adapter 測試（Wails 綁定簽名與前端呼叫一致：`RegisterMutation`／`RunEvidence`／`EvidenceGet`／`SubmitTestContract` 走一輪）
 
-- [ ] **Step 1: 失敗測試**：tca 卡片渲染兩筆 evidence role；result=error 的 evidence 顯示錯誤標示且核可按鈕 disabled 提示。
-- [ ] **Step 2–4: TDD＋vitest／build。** → **Step 5: Commit**：`feat(frontend): TCA 卡片＋evidence 詳情（§6）`
+- [ ] **Step 1: 失敗測試**：TcaWorkspace 對兩筆 evidence 未齊時「送核」disabled；result=error 顯示錯誤標示＋重跑按鈕；tca 卡片渲染兩筆 evidence role；production adapter 測試走 mutation→兩 run→送核全流程。
+- [ ] **Step 2–4: TDD＋vitest／build＋`go test -race`。** → **Step 5: Commit**：`feat(frontend): TCA workspace（Stage C 入口）＋卡片＋evidence 詳情（§6／A4）`
 
 **Phase 3 收尾 gate**：全套四項驗證＋實機走 Stage C 前段（宣告已在 Stage B 核可 → test commit → mutation → 兩筆 evidence → TCA 送核核可）。
 
@@ -945,7 +957,7 @@ func OpenKeyed(entries []Entry, conditionKey string) *Entry // 未 resolved 的�
 ### Task 24: workflow mutex barrier＋自動來源接線
 
 **Files:**
-- Create: `internal/escalation/service.go`（`Service`：`CreateSystem(conditionKey, blockScope, hard bool, summary, sourceRef)`（OpenKeyed 去重、occurrence 遞增）、`CreateManual(sourceRef, blockScope, summary)`（sourceRef 必填）、`Ack`、`Resolve(id, resolution, reason, actor)`——**hard 項的 Resolve 只接受 `actor=="system"`**、`ResolveByKey(conditionKey, evidenceRef)`（系統重驗通過後解除，A8 用））
+- Create: `internal/escalation/service.go`（`Service`：`CreateSystem(conditionKey, blockScope, hard bool, summary, sourceRef)`（OpenKeyed 去重、occurrence 遞增）、`CreateManual(sourceRef, blockScope, summary)`（sourceRef 必填）、`Ack`、`Resolve(id, resolution, reason, actor)`——**hard 項的 Resolve 只接受 `actor=="system"`**、`ResolveByKey(conditionKey, evidenceRef)`（系統重驗通過後解除））。**重入規約**：escalation Service 本身不取 workflowMu；app 層提供成對入口——public `EscalationCreate`／`EscalationResolve` 等先取 `workflowMu` 再呼叫內部 `createSystemLocked`／`resolveByKeyLocked`，而**已持有 workflowMu 的路徑（GateDecide 編排、Reconcile 的 stale 接線、evidence finalize）只准呼叫 `*Locked` 變體**——否則 GateDecide→Reconcile→emitter→public API 會對同一 mutex 重入死鎖。
 - Modify: `app.go`：新增 `workflowMu sync.Mutex`；`GateDecide` 依 spec §3.10 凍結順序編排（用 Task 5 的 Prepare／Commit 拆分）：
 
 ```go
@@ -963,8 +975,9 @@ return svc.CommitDecision(prepared)                                     // 4. ap
 ```
 
   `RunEvidence` 的 finalize、escalation Create／Ack／Resolve、watcher 觸發的 `Reconcile` 全部先取 `workflowMu`（lock ordering：workflowMu → gate journal → escalation journal）。
-- **自動來源接線（spec §3.8 九條逐一對應，缺一即 spec 缺口）**：(1) plan.Validate 的 risk 分類失敗（minimum 無法重算）→ `CreateSystem("risk-unclassifiable:<plan_id>", "gate2:<plan_id>", hard=true)`；(2) 送核缺必要 binding（ValidateRequest 失敗且來源為系統組裝）→ `"missing-binding:<gate>:<subject>"`；(3)(4) `Reconcile` 產生的 stale → `"stale:<gate>:<subject>"`（hard=true，scope 對應 gate2:<plan_id>／tca:<plan_id>/<task_id>）；(5) runner 逾時／環境錯誤／輸出超限 → `"evidence-error:<plan_id>/<task_id>/<kind>"`（**key 綁 plan/task/kind 而非 evidence_id**——新 run 成功即可 `ResolveByKey` 舊項，A8 才可實現；hard=false）；(6) expected-red 錯誤原因（result=error 且非環境類）→ 同 (5) key；(7) negative-control 未抓到（result=failed）→ `"negative-control-missed:<plan_id>/<task_id>"`；(8) journal degraded／read error → `"journal-degraded:<which>"`（workspace、hard=true）；(9) PlannerAssist enforcement 失敗 → `"planner-enforcement:<provider>"`。
-- **啟動／讀取補建（§3.8）**：`Reconcile` 與 app startup 依權威狀態掃描——已 stale 的 active 核可、degraded journal 等若無對應未 resolved 項（`OpenKeyed`）即補建；**系統重驗通過（stale 解除不可能——stale 為終態，此處指 evidence 重跑成功、journal 恢復等）→ `ResolveByKey` append resolved transition（actor=system）**。
+- **自動來源接線（spec §3.8 九條逐一對應，缺一即 spec 缺口；持 workflowMu 的路徑一律走 `createSystemLocked`）**：(1) plan.Validate 的 risk 分類失敗（minimum 無法重算）→ `createSystemLocked("risk-unclassifiable:<plan_id>", "gate2:<plan_id>", hard=true)`；(2) 送核缺必要 binding（ValidateRequest 失敗且來源為系統組裝）→ `"missing-binding:<gate>:<subject>"`；(3)(4) `Reconcile` 產生的 stale → `"stale:<gate>:<subject>"`（hard=true，scope 對應 gate2:<plan_id>／tca:<plan_id>/<task_id>）；(5) runner 逾時／環境錯誤／輸出超限 → `"evidence-error:<plan_id>/<task_id>/<kind>"`（**key 綁 plan/task/kind 而非 evidence_id**——新 run 成功即可 `ResolveByKey` 舊項，A8 才可實現；hard=false）；(6) expected-red 錯誤原因（result=error 且非環境類）→ 同 (5) key；(7) negative-control 未抓到（result=failed）→ `"negative-control-missed:<plan_id>/<task_id>"`；(8) journal degraded／read error → `"journal-degraded:<which>"`（workspace、hard=true）；(9) PlannerAssist enforcement 失敗 → `"planner-enforcement:<provider>"`。
+- **啟動／讀取補建（§3.8）**：`Reconcile` 與 app startup 依權威狀態掃描——已 stale 的 active 核可、degraded journal 等若無對應未 resolved 項（`OpenKeyed`）即補建。
+- **九條來源的權威修復條件（缺一即該 blocker 永久卡死替代核可，逐條凍結）**：(1) risk-unclassifiable → 新版 plan commit 後 `plan.Validate` 通過即 `resolveByKeyLocked`；(2) missing-binding → 同 subject 新 request `ValidateRequest` 通過；(3)(4) **stale:<gate>:<subject> → 同 `(gate, subject)` 出現新 pending request 且其 current-binding validation（Task 5）通過即系統解除舊 blocker**——stale record 本身是終態，修復載體是修正版送核，否則新版永遠被舊 blocker 擋住；(5)(6) evidence-error → 同 key 新 run result=passed（A8）；(7) negative-control-missed → 同上；(8) journal-degraded → 重啟後 journal 開啟成功且 tail 修復完成；(9) planner-enforcement → 該 provider probe 重新通過。每一條由對應的權威路徑（submit／validate／run finalize／startup）在持有 workflowMu 時呼叫 `resolveByKeyLocked`。
 - Test: `app_escalation_test.go`
 
 **Interfaces:**
@@ -986,25 +999,54 @@ func TestGateDecideBlockedByEscalation(t *testing.T) {
 }
 
 func TestGateDecideBarrierWindowInjected(t *testing.T) {
-	// 可重現的 injected barrier：hook 在「blocker 檢查後、append 前」的窗口內嘗試建 blocker。
-	// 正確實作下 EscalationCreate 需要 workflowMu，會被擋到 CommitDecision 之後——
-	// 因此斷言 decide 成功且 blocker 建立時 gate 已 active（journal 總序：approval 先於 item）。
+	// 可重現的 injected barrier（無 time.Sleep）：兩個 production seam——
+	// a.decideBarrierHook：GateDecide 在 blocker 檢查後、CommitDecision 前呼叫（Task 24 編排碼）；
+	// a.onWorkflowMuAcquired：public EscalationCreate 取得 workflowMu 後、寫入前呼叫（test-only seam）。
+	// 兩份 JSONL 無共同總序可斷言——改驗「blocker 取得 mutex 後觀察到的 gate 狀態」。
 	a := newTestApp(t)
+	inWindow := make(chan struct{})  // hook 已進窗口
+	release := make(chan struct{})   // 放行 CommitDecision
 	created := make(chan error, 1)
-	a.decideBarrierHook = func() {
-		go func() { _, err := a.EscalationCreate("plan:P1", "gate2:P1", "窗口內阻擋"); created <- err }()
-		time.Sleep(10 * time.Millisecond) // 給 goroutine 進入 mutex 等待的機會
+	var stateSeenByBlocker gate.State
+	a.onWorkflowMuAcquired = func() { // blocker 真正進入臨界區的時點
+		entries, _ := a.gateSvc.List()
+		stateSeenByBlocker = stateOf(entries, pendingID)
 	}
-	if err := a.GateDecide(pendingID, "approved", "",
-		[]gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}}); err != nil {
+	a.decideBarrierHook = func() { close(inWindow); <-release }
+	go func() { _, err := a.EscalationCreate("plan:P1", "gate2:P1", "窗口內阻擋"); created <- err }()
+	decideDone := make(chan error, 1)
+	go func() {
+		decideDone <- a.GateDecide(pendingID, "approved", "",
+			[]gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}})
+	}()
+	<-inWindow      // decide 已過 blocker 檢查、持有 mutex；EscalationCreate 此刻必然阻塞於 mutex
+	close(release)  // 放行 append
+	if err := <-decideDone; err != nil {
 		t.Fatalf("decide must succeed: %v", err)
 	}
 	if err := <-created; err != nil {
 		t.Fatalf("blocker create after window: %v", err)
 	}
-	assertJournalOrder(t, a, "approval_record before escalation_item") // 以兩 journal 的 op 時序驗證
+	if stateSeenByBlocker != gate.Active { // blocker 進臨界區時核可已 durable——無 TOCTOU 窗口
+		t.Fatalf("blocker must observe post-append state, saw %v", stateSeenByBlocker)
+	}
 }
 // 執行：go test -race -count=30 ./... -run TestGateDecideBarrier（收尾 gate 必跑）
+
+func TestStaleBlockerReleasedByResubmission(t *testing.T) { // P1：stale blocker 不得永久擋住修正版
+	a := newTestApp(t)
+	a.approveGate2(t, "P1")            // v1 核可
+	a.mutateSpec(t)                    // spec 變更 → Gate 2 stale → hard blocker（stale:gate2:plan:P1）
+	a.reapproveGate1AndRevisePlan(t)   // 修復：Gate 1 重核、plan 修訂 commit
+	id2 := a.submitPlan(t, "P1")       // 修正版送核：current-binding validation 通過 → 系統解除舊 blocker
+	if item := a.openItemByKey("stale:gate2:plan:P1"); item != nil {
+		t.Fatal("corrected resubmission must system-resolve the stale blocker")
+	}
+	if err := a.GateDecide(id2, "approved", "",
+		[]gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}}); err != nil {
+		t.Fatalf("replacement approval must succeed: %v", err)
+	}
+}
 
 func TestHardEscalationNotManuallyResolvable(t *testing.T) {
 	a := newTestApp(t)
@@ -1073,6 +1115,10 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 - [ ] **Step 3: Commit**：`docs: M3a 驗收結果`；併版（merge to main）依 repo 慣例由 owner 決定。
 
 ---
+
+## Self-Review 記錄（v3）
+
+**v3 修訂（第二輪 plan 審閱 9 P1）**：Task 5 PrepareDecision 加 pending request current-binding validation（Task 12／21 各補 mutation-before-decide 測試）；Gate 2／TCA policy 移至 `internal/gatepolicy`（消除 gate→plan→gate import cycle，gate 維持技術中立）；Task 22 擴為 TCA workspace（Stage C 前端操作入口＋production adapter 測試）；Task 18 intent 先於任何目錄建立（棄 MkdirTemp）＋(a0) crash window；Task 17 補 §3.7 三個 crash boundary 注入測試；Task 20 自帶 evidenceMu＋`reclaimEvidenceRuns()` 先於 `inflight.Wait()`＋channel-barrier 測試；Task 24 九條來源逐一凍結權威修復條件（stale→修正版送核系統解除，含測試）＋`createSystemLocked`／`resolveByKeyLocked` 重入規約＋barrier 測試改 channel seam（棄 time.Sleep、改驗 blocker 臨界區內觀察到的 gate 狀態）；Task 18/19 mutation patch `--numstat -z` rename 雙側驗證＋雙向 rename 測試。
 
 ## Self-Review 記錄（v2）
 
