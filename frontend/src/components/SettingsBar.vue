@@ -17,7 +17,7 @@ const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.set
 
 // opKey ∈ settings.operationAction 的 key（new/terminate/end/authStatus/login/cancelLogin/logout/b1Probe）
 async function call(fn: () => Promise<unknown>, opKey: string) {
-  const action = t('settings.operationAction.' + opKey)
+  const action = t(`settings.operationAction.${opKey}`)
   try {
     const r = await fn()
     if (typeof r === 'string' && r) {
