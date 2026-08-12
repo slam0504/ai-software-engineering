@@ -367,6 +367,18 @@ func TestTCABuildDecisionConsistencyValidator(t *testing.T) {
 			wantErr: "base_commit/test_commit/oracle_surface_digest mismatch",
 		},
 		{
+			// review HIGH finding: both runs agreeing with EACH OTHER is not
+			// enough — they must also match gate2_approval's own plan_commit.
+			// Otherwise evidence gathered under an older gate2 (stale code
+			// snapshot) would still satisfy this check.
+			name: "both evidence runs consistent but base_commit != gate2_approval's plan_commit",
+			mutate: func(s *tcaScenario) {
+				s.redRun.BaseCommit = strings.Repeat("f", 40)
+				s.negRun.BaseCommit = strings.Repeat("f", 40)
+			},
+			wantErr: "does not match gate2_approval",
+		},
+		{
 			name:    "expected_red carries a mutation_digest",
 			mutate:  func(s *tcaScenario) { s.redRun.MutationDigest = s.mutation.Digest },
 			wantErr: "must not carry a mutation_digest",

@@ -228,6 +228,16 @@ func (p *TCAPolicy) BuildDecision(req gate.GateRequest, decision string, input g
 	if redRun.BaseCommit != negRun.BaseCommit || redRun.TestCommit != negRun.TestCommit || redRun.OracleSurfaceDigest != negRun.OracleSurfaceDigest {
 		return nil, fmt.Errorf("gatepolicy: tca expected_red/negative_control base_commit/test_commit/oracle_surface_digest mismatch")
 	}
+	// §3.0 ancestor-chain re-check (review HIGH finding): the two runs being
+	// mutually consistent is not enough — they must also have actually run
+	// against THIS gate2_approval's plan_commit. Without this, evidence
+	// produced under an older gate2 (a stale code snapshot) would still
+	// satisfy every other check (descriptor/oracle unchanged) and pass a TCA
+	// anchored to a gate2 that was re-approved at a different plan_commit
+	// after the evidence was gathered.
+	if redRun.BaseCommit != planCommit {
+		return nil, fmt.Errorf("gatepolicy: tca evidence base_commit %q does not match gate2_approval %s's plan_commit %q", redRun.BaseCommit, approvalID, planCommit)
+	}
 	// (d) oracle_surface.ref == test_commit.
 	oracleB, _ := findBinding(req.Bindings, "oracle_surface", "")
 	if oracleB.Ref != redRun.TestCommit {
