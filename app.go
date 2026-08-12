@@ -255,6 +255,13 @@ const specWatchDebounce = 200 * time.Millisecond
 // 這是 NOTIFICATION 層，不是權威：觸發只呼叫 ReconcileGate1()（best-effort），
 // 目的是讓已核可的 Gate 1 儘快在 UI 顯示 STALE；權威重算永遠在讀取路徑
 // （gate.Service.List／GateList，Task 10），watcher 失敗不影響正確性。
+//
+// fix round 2（acceptance smoke 發現的落差）：spec/ 在 watchSpecTree() 啟動
+// 當下可能還不存在（例如全新 workspace，尚未有人寫過第一個納管檔）——一律
+// Add workspace root，才能觀察到 <root>/spec 這個 CREATE；spec/ 若已存在則
+// 額外遞迴 Add 進去（同今行為）。root 底下同時有 .workbench/（gate journal／
+// events 持續寫入）與 .git/，事件必須在 runSpecWatch 過濾到 spec/ 子樹以內，
+// 否則 reconcile 寫 journal → 觸發自己的 watch 事件 → 無窮迴圈。
 func (a *App) watchSpecTree() {
 	a.stopSpecWatch() // 冪等：若先前已在監看（重複呼叫），先收掉舊的、不留 orphan goroutine
 
@@ -264,22 +271,26 @@ func (a *App) watchSpecTree() {
 		return
 	}
 	specRoot := filepath.Join(root, "spec")
-	if _, statErr := os.Stat(specRoot); statErr != nil {
-		if !os.IsNotExist(statErr) {
-			a.failLoudSpecWatch("stat spec/: " + statErr.Error())
-		}
-		return // 尚無納管樹可看；GateList 的權威重算不受影響
-	}
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		a.failLoudSpecWatch("fsnotify.NewWatcher: " + err.Error())
 		return
 	}
-	if aerr := addRecursiveWatch(w, specRoot); aerr != nil {
-		a.failLoudSpecWatch("watch spec/: " + aerr.Error())
-		// 已成功 Add 的目錄仍持續監看；不因單一子目錄失敗放棄整棵樹。
+	if aerr := w.Add(root); aerr != nil {
+		a.failLoudSpecWatch("watch workspace root: " + aerr.Error())
+		// 繼續：root 沒加成功仍嘗試把已存在的 spec/ 加進去，能看多少算多少。
 	}
+	if _, statErr := os.Stat(specRoot); statErr == nil {
+		if aerr := addRecursiveWatch(w, specRoot); aerr != nil {
+			a.failLoudSpecWatch("watch spec/: " + aerr.Error())
+			// 已成功 Add 的目錄仍持續監看；不因單一子目錄失敗放棄整棵樹。
+		}
+	} else if !os.IsNotExist(statErr) {
+		a.failLoudSpecWatch("stat spec/: " + statErr.Error())
+	}
+	// spec/ 尚不存在也不 return：root 已在監看範圍內，之後 spec/ 被建立會是
+	// root 上的一個 CREATE 事件，runSpecWatch 收到後會遞迴 Add 進去。
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -288,7 +299,7 @@ func (a *App) watchSpecTree() {
 	a.specWatchDone = done
 	a.mu.Unlock()
 
-	go a.runSpecWatch(w, stop, done)
+	go a.runSpecWatch(w, specRoot, stop, done)
 }
 
 // addRecursiveWatch 對 dir 底下每個目錄（含自身）呼叫 watcher.Add；WalkDir
@@ -313,12 +324,24 @@ func addRecursiveWatch(w *fsnotify.Watcher, dir string) error {
 	return firstErr
 }
 
-// runSpecWatch：watcher 事件迴圈——debounce 合併連續事件後觸發
-// ReconcileGate1()；新目錄 Create 時 re-add（遞迴涵蓋新子樹）；Rename／Remove
-// 的路徑可能已消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由
-// 重算反映）；error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，
-// defer 保證 watcher.Close() 恰好呼叫一次、done 保證 shutdown 等得到。
-func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<- struct{}) {
+// specEventInScope：事件路徑是否落在 spec/ 子樹內（含 spec/ 自身）——watcher
+// 必須 Add workspace root 才能觀察到 spec/ 被晚建立，但 root 底下同時有
+// .workbench/（gate journal／events 持續寫入）與 .git/：reconcile 觸發的
+// journal append 若被自己的 watch 事件再次撿到，會形成無窮迴圈。所有
+// reconcile／emit 都必須先經這個過濾。
+func specEventInScope(specRoot, name string) bool {
+	return name == specRoot || strings.HasPrefix(name, specRoot+string(filepath.Separator))
+}
+
+// runSpecWatch：watcher 事件迴圈——只處理落在 spec/ 子樹內的事件
+// （specEventInScope；root 上其餘事件如 .workbench/、.git/ 一律忽略，避免
+// reconcile 寫 journal 又觸發自己的 watch 造成無窮迴圈）。debounce 合併連續
+// 事件後觸發 ReconcileGate1()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
+// 新子樹，也涵蓋 spec/ 自身被晚建立的情況）；Rename／Remove 的路徑可能已
+// 消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由重算反映）；
+// error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，defer 保證
+// watcher.Close() 恰好呼叫一次、done 保證 shutdown 等得到。
+func (a *App) runSpecWatch(w *fsnotify.Watcher, specRoot string, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	defer w.Close()
 	var debounceC <-chan time.Time
@@ -330,6 +353,9 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, stop <-chan struct{}, done chan<
 		case ev, ok := <-w.Events:
 			if !ok {
 				return
+			}
+			if !specEventInScope(specRoot, ev.Name) {
+				continue // root 上的非 spec/ 事件（.workbench/、.git/ 等）：忽略，避免自我觸發迴圈
 			}
 			if ev.Op&fsnotify.Create != 0 {
 				if fi, statErr := os.Stat(ev.Name); statErr == nil && fi.IsDir() {

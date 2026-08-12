@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // ---- Task 12：spec/ 遞迴 watcher（通知層，spec §4）----
@@ -93,4 +94,90 @@ func TestWatcherReAddsNewSubdirectory(t *testing.T) {
 		l, _ := a.GateList()
 		return stateOf(l, id) == "stale"
 	})
+}
+
+// TestWatcherPicksUpLateCreatedSpecDir：fix round 2（acceptance smoke 發現的
+// 落差）——watchSpecTree() 啟動當下 spec/ 尚不存在（全新 workspace，尚未有人
+// 寫過第一個納管檔）。watcher 必須觀察到 workspace root 上 spec/ 這個 CREATE
+// 並遞迴 Add 進去，而不是啟動當下看一次「不存在」就永遠不看了。
+func TestWatcherPicksUpLateCreatedSpecDir(t *testing.T) {
+	a := newTestAppGit(t) // 全新 git repo，尚無 spec/
+
+	a.watchSpecTree() // spec/ 還不存在時就先啟動——只看得到 workspace root
+	t.Cleanup(a.stopSpecWatch)
+
+	// spec/ 在 watchSpecTree() 之後才第一次被建立（SpecWrite 內部 MkdirAll）。
+	if _, err := a.SpecWrite("spec/glossary.md", "v1", ""); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+		t.Fatal(err)
+	}
+
+	a.SpecWrite("spec/glossary.md", "v2", digestOf(t, a, "spec/glossary.md"))
+	commitAll(t, a)
+	waitFor(t, "gate goes stale after change under a spec/ tree created after watchSpecTree() started", func() bool {
+		l, _ := a.GateList()
+		return stateOf(l, id) == "stale"
+	})
+}
+
+// TestWatcherIgnoresNonSpecWrites：fix round 2——watcher 必須 Add workspace
+// root 才能觀察到 spec/ 被晚建立（見上一測試），但 root 底下同時有
+// .workbench/（gate journal／events 持續寫入）與其他檔案。若事件沒有過濾到
+// spec/ 子樹，reconcile 觸發的 journal append 會被自己的 watch 事件再次撿到，
+// 形成無窮迴圈。這裡直接檢查 UI envelope（不經 GateList，GateList 自己的
+// 權威 reconcile 會混淆判斷來源），確保非 spec/ 寫入不會產生任何
+// binding_stale 事件。
+func TestWatcherIgnoresNonSpecWrites(t *testing.T) {
+	a, ui := newTestApp(t)
+	runGit(t, a, "init")
+	runGit(t, a, "config", "user.name", "Test User")
+	runGit(t, a, "config", "user.email", "test@example.com")
+
+	a.SpecWrite("spec/glossary.md", "v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+		t.Fatal(err)
+	}
+
+	a.watchSpecTree()
+	t.Cleanup(a.stopSpecWatch)
+
+	wb := filepath.Join(a.workspaceDir, ".workbench")
+	if err := os.MkdirAll(wb, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := os.WriteFile(filepath.Join(wb, "junk"), []byte{byte('a' + i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(a.workspaceDir, "root-level.txt"), []byte{byte('a' + i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// 給 watcher 一段遠大於 debounce（200ms）的時間處理——若過濾漏了任何一個
+	// 非 spec/ 事件，這裡會來得及反映成一筆 binding_stale。
+	time.Sleep(500 * time.Millisecond)
+
+	if evs := ui.findEnvKind("binding_stale"); len(evs) != 0 {
+		t.Fatalf("non-spec/ writes must not trigger binding_stale, got %d event(s)", len(evs))
+	}
+	l, err := a.GateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateOf(l, id) != "active" {
+		t.Fatalf("approval must remain active when only non-spec/ paths changed, got %s", stateOf(l, id))
+	}
 }
