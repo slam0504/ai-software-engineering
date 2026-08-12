@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useSession } from '../stores/session'
 import type { TimelineItem } from '../types'
+import { resolveState, sessionStateKeys, codexToolStatusKeys } from '../i18n/stateKeys'
 
 const s = useSession()
+const { t } = useI18n()
 const openGroups = ref(new Set<number>())
 const openRaw = ref(new Set<string>())
 
@@ -21,15 +24,15 @@ function summary(i: TimelineItem) {
   const e = i.env
   if (e.kind === 'tool_use') { // BAT AgentToolRow（normative）：工具名＋參數節錄＋狀態
     const status = (e.raw as any)?.params?.item?.status // codex item 狀態，best-effort
-    const label = e.text || '工具呼叫' // adapter 已填「名稱(參數節錄)」（Task 2）
-    return status ? `${label}（${status}）` : label
+    const label = e.text || t('timeline.summary.toolCall') // adapter 已填「名稱(參數節錄)」（Task 2）
+    return status ? `${label}（${resolveState(codexToolStatusKeys, status, t)}）` : label
   }
-  if (e.kind === 'result') return `${e.is_error ? 'ERROR' : 'ok'}`
-  if (e.kind === 'approval') return `核可請求：${e.text}`
-  if (e.kind === 'approval_decision') return `核可決定：${e.text}`
-  if (e.kind === 'state_change') return `狀態 → ${e.state}`
-  if (e.kind === 'retry') return 'provider 重試'
-  if (e.kind === 'message' && e.role === 'tool') return '工具結果'
+  if (e.kind === 'result') return e.is_error ? t('timeline.result.failed') : t('timeline.result.completed')
+  if (e.kind === 'approval') return t('timeline.summary.approvalRequest', { text: e.text })
+  if (e.kind === 'approval_decision') return t('timeline.summary.approvalDecision', { text: e.text })
+  if (e.kind === 'state_change') return t('timeline.summary.stateChange', { state: resolveState(sessionStateKeys, e.state ?? '', t) })
+  if (e.kind === 'retry') return t('timeline.summary.retry')
+  if (e.kind === 'message' && e.role === 'tool') return t('timeline.summary.toolResult')
   if (e.error) return e.error
   return e.kind
 }
@@ -48,7 +51,7 @@ function toggle(set: Set<number> | Set<string>, key: never) {
         <div v-if="openGroups.has(r.group!)" class="noise-items">
           <div v-for="g in groupItems(r.group!)" :key="g.env.event_id" class="row sub">
             <span class="kind">{{ g.env.kind }}</span>
-            <button class="rawbtn" @click="toggle(openRaw, g.env.event_id as never)">raw</button>
+            <button class="rawbtn" @click="toggle(openRaw, g.env.event_id as never)">{{ t('timeline.raw') }}</button>
             <pre v-if="openRaw.has(g.env.event_id)">{{ JSON.stringify(g.env.raw, null, 1) }}</pre>
           </div>
         </div>
@@ -56,7 +59,7 @@ function toggle(set: Set<number> | Set<string>, key: never) {
       <div v-else :class="['row', r.head.env.kind]">
         <span class="kind">{{ r.head.env.kind }}</span>
         <span class="sum">{{ summary(r.head) }}</span>
-        <button class="rawbtn" @click="toggle(openRaw, r.head.env.event_id as never)">raw</button>
+        <button class="rawbtn" @click="toggle(openRaw, r.head.env.event_id as never)">{{ t('timeline.raw') }}</button>
         <pre v-if="openRaw.has(r.head.env.event_id)">{{ JSON.stringify(r.head.env.raw, null, 1) }}</pre>
       </div>
     </template>

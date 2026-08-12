@@ -1,18 +1,17 @@
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
 import { useSession } from '../stores/session'
+import { resolveState, sessionStateKeys } from '../i18n/stateKeys'
 const s = useSession()
-const stateLabel: Record<string, string> = {
-  idle: '待命', waiting: '等待回覆', streaming: '回覆中', tool_running: '工具執行中',
-  awaiting_approval: '等待核可', retrying: '重試中', done: '完成', failed: '失敗',
-}
+const { t } = useI18n()
 </script>
 
 <template>
   <div class="status">
-    <span class="task">任務：{{ s.taskId || '—' }}</span>
-    <span :class="['state', s.state]">{{ stateLabel[s.state] ?? s.state }}</span>
-    <span class="sid">session：{{ s.sessionId || '—' }}</span>
-    <span class="usage" :title="s.usageSemantics === 'provider_latest' ? 'provider 最新回報值' : '本 session 累計'">
+    <span class="task">{{ t('statusbar.task', { id: s.taskId || '—' }) }}</span>
+    <span :class="['state', s.state]">{{ resolveState(sessionStateKeys, s.state, t) }}</span>
+    <span class="sid">{{ t('statusbar.session', { id: s.sessionId || '—' }) }}</span>
+    <span class="usage" :title="s.usageSemantics === 'provider_latest' ? t('statusbar.usage.providerLatest') : t('statusbar.usage.sessionTotal')">
       tokens {{ s.totals.input }}/{{ s.totals.output }}{{ s.usageSemantics === 'provider_latest' ? '*' : '' }}
     </span>
     <span class="cost">{{ s.costDisplay }}</span>
