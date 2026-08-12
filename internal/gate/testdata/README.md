@@ -63,7 +63,7 @@ JSON 重排或重新序列化。
 - `len(ops) == 6`
 - `Project(ops)` 無錯，`len(entries) == 3`（`01KZSQN1N7000AJNEECCGH8M3C` →
   stale；`01KZSQXAMW0006RERF0874JVD3` → pending；
-  `01KZTQ6NTY000E5GEPJH4875A3` → 現行 v1 `Project` 對 rejected 決定不設終
-  態，維持 pending——這正是 M3a 之後任務要修的相容性缺口之一）
+  `01KZTQ6NTY000E5GEPJH4875A3` → rejected 終態——M3a Task 3 已補上此相容性
+  缺口，見 `TestProjectNormalizesV1AndRejectedTerminal`）
 
 驗證指令：`go test -race ./internal/gate/ -count=1`

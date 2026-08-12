@@ -3,6 +3,7 @@ package gate
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -165,6 +166,34 @@ func TestBindingKindRoleUniqueness(t *testing.T) {
 	bs[1].Role = "expected_red" // 同 (kind,role) 重複
 	if err := validateBindingSet(bs, req); err == nil {
 		t.Fatal("duplicate (kind,role) must fail")
+	}
+}
+
+func TestProjectNormalizesV1AndRejectedTerminal(t *testing.T) {
+	data, err := os.ReadFile("testdata/m2-gate-v1.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	ops, _, bad := parseOps(data)
+	if bad != nil {
+		t.Fatalf("fixture must parse: %v", bad.err)
+	}
+	entries, err := Project(ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := entries[0].Request
+	if req.Subject != "workspace" || len(req.Bindings) != 2 {
+		t.Fatalf("v1 request must normalize to subject=workspace + 2 bindings, got %+v", req)
+	}
+	var rejected *GateEntry
+	for i := range entries {
+		if entries[i].Record != nil && entries[i].Record.Decision == "rejected" {
+			rejected = &entries[i]
+		}
+	}
+	if rejected == nil || rejected.State != Rejected {
+		t.Fatalf("rejected must be terminal state, got %+v", rejected)
 	}
 }
 

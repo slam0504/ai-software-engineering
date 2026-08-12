@@ -12,9 +12,25 @@ var (
 )
 
 type BindingReq struct {
-	Kind    string
-	Role    string
+	Kind     string
+	Role     string
 	DigestRe *regexp.Regexp
+}
+
+// normalizeRequest 將 v1 形狀（無 schema_version、有 spec_manifest_digest／
+// base_commit legacy 欄位）正規化為 v2 形狀（schema_version=2、
+// subject="workspace"、bindings=[spec_manifest, base_commit]）。純函式，僅
+// 影響 in-memory projection，不回寫 journal。已是 v2 的請求原樣回傳。
+func normalizeRequest(r GateRequest) GateRequest {
+	if r.SchemaVersion == 0 && r.SpecManifestDigest != "" {
+		r.SchemaVersion = 2
+		r.Subject = "workspace"
+		r.Bindings = []Binding{
+			{Kind: "spec_manifest", Digest: r.SpecManifestDigest},
+			{Kind: "base_commit", Digest: r.BaseCommit},
+		}
+	}
+	return r
 }
 
 func Project(ops []GateOp) ([]GateEntry, error) {
@@ -41,6 +57,7 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 			case "gate_request":
 				var r GateRequest
 				_ = json.Unmarshal(raw, &r)
+				r = normalizeRequest(r)
 				e := get(r.ApprovalID)
 				e.Request = &r // 仍 pending
 			case "approval_record":
@@ -51,17 +68,22 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 				if e.State == Pending && r.Decision == "approved" {
 					e.State = Active
 				}
+				if e.State == Pending && r.Decision == "rejected" {
+					e.State = Rejected
+				}
 			case "transition":
 				var tr Transition
 				_ = json.Unmarshal(raw, &tr)
 				e := get(tr.ApprovalID)
-				switch tr.To { // stale/superseded 皆終態，不復活
+				switch tr.To { // stale/superseded/rejected 皆終態，不復活
 				case "stale":
-					if e.State != Superseded {
+					if e.State != Superseded && e.State != Rejected {
 						e.State = Stale
 					}
 				case "superseded":
-					e.State = Superseded
+					if e.State != Rejected {
+						e.State = Superseded
+					}
 				}
 			default:
 				return nil, fmt.Errorf("unknown record _type %q", probe.Type)
