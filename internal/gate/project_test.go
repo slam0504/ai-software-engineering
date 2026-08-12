@@ -117,6 +117,26 @@ func TestProjectStaleAfterSupersededDoesNotDowngrade(t *testing.T) {
 	}
 }
 
+func TestProjectRejectedNotDowngradedByStale(t *testing.T) {
+	ops := []GateOp{
+		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "rejected"}),
+		opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "changed"}),
+	}
+	if got := entryByID(mustProject(t, ops), "A").State; got != Rejected {
+		t.Fatalf("want rejected (stale must not overwrite terminal rejected), got %s", got)
+	}
+}
+
+func TestProjectRejectedNotDowngradedBySuperseded(t *testing.T) {
+	ops := []GateOp{
+		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "rejected"}),
+		opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approval"}),
+	}
+	if got := entryByID(mustProject(t, ops), "A").State; got != Rejected {
+		t.Fatalf("want rejected (superseded must not overwrite terminal rejected), got %s", got)
+	}
+}
+
 func TestProjectUnknownTypeErrors(t *testing.T) {
 	ops := []GateOp{
 		{OpID: "op-x", At: "t", Records: []json.RawMessage{
