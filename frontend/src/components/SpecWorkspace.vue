@@ -122,34 +122,28 @@ function selectFile(p: string) {
 }
 
 // 三個 AI 輔助按鈕：呼叫 SpecAssist(provider,'spec_assist',prompt)，輸出經
-// EventsOn('workbench:event') → App.vue routeEnvelope → assist store 累積，
-// 這裡只需認出「這次呼叫新增的 correlation_id」（provider 獨佔性保證同一時間
-// 至多一個 active，SpecAssist 的 promise 要等 runner 收尾才 resolve，故 await
-// 完成時對應的草稿 key 必已存在）。
+// EventsOn('workbench:event') → App.vue routeEnvelope → assist store 累積。
+// SpecAssist 現在直接回傳這次呼叫的 correlation_id（app.go 的 gen.correlationID）
+// ——不再靠「await 前後 diff assist.drafts 的 key」推測，那個做法不可靠：Wails
+// 不保證事件已送達／processed 才 resolve method 的 Promise，草稿可能永遠綁不上。
 //
-// 換檔競態（fix round 2）：await 期間操作者可能已切到另一個檔案——resetDraft()
-// 會在切檔當下清掉 currentCorrelationId，但若這裡無條件於 await 後把新 key
-// 塞回去，等於用「目前選中檔案」的合法 digest 把「發起 assist 當下那個檔案」
-// 的草稿寫回來，與 fix round 1 是同一種跨檔污染，只是換一個時間點觸發。因此
-// 起手先記下 startedForPath，await 後只在 effectivePath 沒變時才採用結果；
-// 變了就視為操作者已經放棄這次結果，草稿留空（不落回 store 的 drafts 本身
-// 沒有副作用，只是不讓它綁定成目前檔案的 currentCorrelationId）。
+// 換檔競態（fix round 2，沿用）：await 期間操作者可能已切到另一個檔案——
+// resetDraft() 會在切檔當下清掉 currentCorrelationId，這裡仍先記下
+// startedForPath，await 後只在 effectivePath 沒變時才採用回傳的 id；變了就視
+// 為操作者已經放棄這次結果，草稿留空。
 async function runAssist(prompt: string) {
   assistError.value = ''
   assistBusy.value = true
-  const before = new Set(Object.keys(assist.drafts))
   const startedForPath = effectivePath.value
   try {
-    await SpecAssist(s.provider, 'spec_assist', prompt)
+    const id = await SpecAssist(s.provider, 'spec_assist', prompt)
+    if (id && effectivePath.value === startedForPath) {
+      currentCorrelationId.value = id
+    }
   } catch (e) {
     assistError.value = String(e)
-    return
   } finally {
     assistBusy.value = false
-  }
-  const added = Object.keys(assist.drafts).filter(k => !before.has(k))
-  if (added.length && effectivePath.value === startedForPath) {
-    currentCorrelationId.value = added[added.length - 1]
   }
 }
 
@@ -239,6 +233,7 @@ async function confirmCommit() {
     <p v-if="assistError" class="err">{{ assistError }}</p>
 
     <div class="draft-area">
+      <p v-if="assistBusy" class="assist-busy" data-test="assist-busy">AI 產生中…</p>
       <pre class="draft-text" data-test="draft-text">{{ draftText }}</pre>
       <button data-test="accept-draft" :disabled="!draftText" @click="acceptDraft">Accept</button>
     </div>
@@ -271,6 +266,7 @@ async function confirmCommit() {
 .draft-area { display: flex; flex-direction: column; gap: 4px; }
 .draft-text { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); min-height: 60px; }
 .diff { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); max-height: 240px; overflow-y: auto; }
+.assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }
 </style>

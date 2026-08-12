@@ -39,9 +39,12 @@ describe('SpecWorkspace draft accept', () => {
   // fix round 2：SpecAssist 在 in-flight 時操作者切到另一個檔案，assist 完成後
   // 不得把舊檔的 correlation_id 綁到現在選中的新檔——否則 accept 會用新檔的合法
   // digest 把舊檔的草稿寫進新檔（同 fix round 1 的跨檔污染，經由競態觸發）。
+  //
+  // SpecAssist 現在直接回傳 correlation_id（見 app.go），mock 需回傳同一個 id
+  // 才能還原「id 到達時 effectivePath 已經變了」這個競態視窗。
   it('discards spec-assist result if the file switches during the call', async () => {
-    let resolveAssist: () => void = () => {}
-    mocks.SpecAssist.mockImplementation(() => new Promise<void>(r => { resolveAssist = r }))
+    let resolveAssist: (id: string) => void = () => {}
+    mocks.SpecAssist.mockImplementation(() => new Promise<string>(r => { resolveAssist = r }))
 
     const w = mount(SpecWorkspace, { props: { path: 'spec/a.feature' } })
     await flushPromises()
@@ -59,10 +62,29 @@ describe('SpecWorkspace draft accept', () => {
     await w.setProps({ path: 'spec/b.feature' }) // 操作者切到 B（resetDraft 已清空 currentCorrelationId）
     await flushPromises()
 
-    resolveAssist() // A 的 SpecAssist 呼叫現在才 resolve
+    resolveAssist('corr-a') // A 的 SpecAssist 呼叫現在才 resolve，回傳 A 的 correlation_id
     await flushPromises()
 
     expect(w.find('[data-test=draft-text]').text()).toBe('') // 不得綁定成 B 的目前草稿
     expect(w.find('[data-test=accept-draft]').attributes('disabled')).toBeDefined()
+  })
+
+  it('binds the draft via the correlation_id returned by SpecAssist', async () => {
+    mocks.SpecAssist.mockResolvedValue('corr-a')
+
+    const w = mount(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushPromises()
+
+    const assist = useAssist()
+    assist.applyAssistEvent({
+      event_id: 'e1', ts: 't', provider: 'claude', kind: 'delta',
+      correlation_id: 'corr-a', text: 'draft for A',
+    })
+
+    await w.find('[data-test=assist-draft]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=draft-text]').text()).toBe('draft for A')
+    expect(w.find('[data-test=assist-busy]').exists()).toBe(false)
   })
 })

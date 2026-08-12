@@ -62,6 +62,7 @@ async function refreshDiagramFiles() {
     if (!diagramPath.value && diagramFiles.value.length) diagramPath.value = diagramFiles.value[0]
   } catch { /* dev 無綁定時忽略 */ }
 }
+watch(tab, t => { if (t === 'diagram') void refreshDiagramFiles() }) // 切到表示圖 tab 時重新掃 spec/context-map/*.mmd，避免新增檔案要重啟才看得到
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
 const selectedFile = ref('')
