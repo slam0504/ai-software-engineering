@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func taskWithImpact(contexts, modules []string) Task {
 	t := Task{ID: "T1", Title: "T"}
@@ -65,5 +68,40 @@ func TestParseRiskPolicyRejectsUnknownField(t *testing.T) {
 	_, err := ParseRiskPolicy([]byte("version: 1\ndefault_tier: low\nbogus_field: true\n"))
 	if err == nil {
 		t.Fatal("unknown field in risk policy must be rejected")
+	}
+}
+
+// TestParseRiskPolicyRejectsUnknownRuleTier guards against a broken policy
+// file silently poisoning ComputeMinimum: without this check, an illegal
+// rule tier makes ComputeMinimum return "", and Validate then reports the
+// task's minimum_risk_tier as "not matching recomputed value" — pointing
+// diagnosis at the plan/task when the real defect is the policy file.
+func TestParseRiskPolicyRejectsUnknownRuleTier(t *testing.T) {
+	b := []byte("version: 1\ndefault_tier: low\nrules:\n  - match:\n      contexts: [gate]\n    tier: critical\n")
+	_, err := ParseRiskPolicy(b)
+	if err == nil {
+		t.Fatal("unknown rule tier must be rejected")
+	}
+	if !strings.Contains(err.Error(), "risk policy") || !strings.Contains(err.Error(), "rule") {
+		t.Fatalf("error must point at the risk policy rule, not the task: %v", err)
+	}
+	if strings.Contains(err.Error(), "task") {
+		t.Fatalf("error must not blame the task: %v", err)
+	}
+}
+
+// TestParseRiskPolicyRejectsUnknownDefaultTier mirrors the rule-tier case
+// for an illegal default_tier — same fail-loud-at-load-time reasoning.
+func TestParseRiskPolicyRejectsUnknownDefaultTier(t *testing.T) {
+	b := []byte("version: 1\ndefault_tier: critical\n")
+	_, err := ParseRiskPolicy(b)
+	if err == nil {
+		t.Fatal("unknown default_tier must be rejected")
+	}
+	if !strings.Contains(err.Error(), "risk policy") || !strings.Contains(err.Error(), "default_tier") {
+		t.Fatalf("error must point at the risk policy default_tier, not the task: %v", err)
+	}
+	if strings.Contains(err.Error(), "task") {
+		t.Fatalf("error must not blame the task: %v", err)
 	}
 }
