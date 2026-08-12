@@ -36,7 +36,7 @@ function onReject(id: string) {
       <div class="head">
         <span class="id">{{ e.approval_id }}</span>
         <span v-if="e.gate" class="gate">{{ e.gate }}</span>
-        <span class="badge" :data-test="'badge-' + e.approval_id">{{ e.state.toUpperCase() }}</span>
+        <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ e.state.toUpperCase() }}</span>
       </div>
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + b.ref">{{ b.kind }}: {{ b.digest }}</li>
@@ -65,7 +65,11 @@ function onReject(id: string) {
 .head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .id { font-weight: 600; overflow-wrap: anywhere; word-break: break-all; }
 .gate { color: var(--text-muted); font-size: var(--fs-s); }
-.badge { margin-left: auto; font-size: var(--fs-s); padding: 1px 6px; border-radius: var(--radius-s); background: var(--bg-inset); }
+.badge { margin-left: auto; font-size: var(--fs-s); padding: 1px 6px; border-radius: var(--radius-s); font-weight: 600; }
+.badge-active { background: var(--ok); color: #10201e; }
+.badge-stale { background: var(--err); color: #2a0d0b; }
+.badge-pending { background: var(--warn); color: #2a2410; }
+.badge-superseded { background: var(--text-faint, #6b7280); color: #f0f0f0; }
 .bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); overflow-wrap: anywhere; word-break: break-all; }
 .bindings li { overflow-wrap: anywhere; word-break: break-all; }
 .actions { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }

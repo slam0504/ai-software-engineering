@@ -6,6 +6,7 @@ import {
 import type { main, spec } from '../../wailsjs/go/models'
 import { useSession } from '../stores/session'
 import { useAssist } from '../stores/assist'
+import { extractGherkin } from '../lib/gherkin'
 
 // SpecWorkspace（Task 15，spec §5.1）：CodeMirror 6 編輯器＋三個 AI 輔助按鈕＋
 // 草稿區（accept 後才 SpecWrite）＋送核＋SpecCommit 兩階段 UI。
@@ -157,14 +158,17 @@ function checkOracleCoverage() {
   void runAssist(`檢查以下 spec 內容的 oracle 覆蓋：\n${fileContent.value}`)
 }
 
-// Accept：草稿寫入檔案的唯一入口（spec §5.1 不變量——AI 輸出不直接寫檔）。
+// Accept：草稿寫入檔案的唯一入口（spec §5.1 不變量——AI 輸出不直接寫檔）。只取
+// draft 裡 ```gherkin/```feature（或退而求其次的通用 ``` code fence）的內容，
+// 不把 assistant 的整段 prose（例如「我沒辦法直接讀寫檔案…」）一起寫進 .feature。
 async function acceptDraft() {
   acceptError.value = ''
   const writer = props.write ?? SpecWrite
+  const content = extractGherkin(draftText.value)
   try {
-    const newDigest = await writer(effectivePath.value, draftText.value, fileDigest.value)
+    const newDigest = await writer(effectivePath.value, content, fileDigest.value)
     fileDigest.value = newDigest
-    fileContent.value = draftText.value
+    fileContent.value = content
     syncEditorDoc()
     currentCorrelationId.value = null
   } catch (e) {
