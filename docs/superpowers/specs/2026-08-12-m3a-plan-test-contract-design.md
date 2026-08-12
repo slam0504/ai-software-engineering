@@ -1,7 +1,7 @@
 # M3a — 計畫與測試契約閉環設計
 
 - 日期：2026-08-12
-- 狀態：設計定稿 rev3（第一輪審閱 7 P1：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／runner 安全邊界；第二輪審閱 7 P1：commit 身分三分／oracle-surface 宣告時機前移／TCA subject 含 plan_id＋gate2_approval 綁定／ApprovalRecord v2＋rejected 終態／risk_decisions[] 基數／evidence 一致性 validator＋落盤順序／workflow mutex 全覆蓋；第三輪審閱 4 P1＋1 P2：plan_commit lineage 封閉／risk decision 單一權威／gate2_approval 確定性重建／CAS durable 順序／輸出超限＝error）
+- 狀態：設計定稿 rev3（第一輪審閱 7 P1：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／runner 安全邊界；第二輪審閱 7 P1：commit 身分三分／oracle-surface 宣告時機前移／TCA subject 含 plan_id＋gate2_approval 綁定／ApprovalRecord v2＋rejected 終態／risk_decisions[] 基數／evidence 一致性 validator＋落盤順序／workflow mutex 全覆蓋；第三輪審閱 4 P1＋1 P2：plan_commit lineage 封閉／risk decision 單一權威／gate2_approval 確定性重建／CAS durable 順序／輸出超限＝error；第四輪：plan validator 與 Gate 2 decision validator 的 risk 職責徹底分離、rejected 免 risk 輸入）
 - 上游依據：`docs/architecture/sdlc-workbench-app-plan.md` §5.2–5.4、§7（M3 列）；`docs/architecture/sdlc-ai-agent-automation-plan.md` §3–§6（Stage B／C、Gate 2、Test Contract Approval、升級路徑）
 - 前置里程碑：M0 ✅、M1 ✅、M1.5 ✅、M2 Stage A ✅（Gate 1 引擎、canonical manifest、兩階段 scoped commit、SpecAssist 隔離 one-shot）、i18n ✅
 
@@ -162,7 +162,7 @@ ApprovalRecordV2 {
 risk_decisions: [{task_id, minimum_risk_tier, planner_risk_tier, selected_risk_tier, override_reason?}]
 ```
 
-**硬性 validator**：決議輸入的 task 集合必須與 committed plan 的 task 集合**完全一致**（不缺、不多、task_id 唯一）；minimum／planner 必須與 committed plan 及綁定的 risk policy 重算結果相符；`selected < planner` 時該 task 的 `override_reason` 必填；`selected < minimum` 一律拒絕。整組 risk_decisions 與 `risk_policy` digest 一同凍結於核可記錄。
+**Gate 2 decision validator（硬性）**：受限 risk 輸入**僅 `decision=approved` 時必填**（rejected 只要求 reason，同既有慣例）；approved 時驗——決議輸入的 task 集合與 committed plan 的 task 集合**完全一致**（不缺、不多、task_id 唯一）；minimum／planner 與 committed plan 及綁定的 risk policy 重算結果相符；`selected < planner` 時該 task 的 `override_reason` 必填；`selected < minimum` 一律拒絕。整組 risk_decisions 與 `risk_policy` digest 一同凍結於核可記錄。
 
 ### 3.4 TCA 必填 bindings、測試快照重建與 evidence 一致性
 
@@ -220,7 +220,7 @@ tasks:
       expected_failure: {test_ids: [TestEvidenceRunner], matcher: "FAIL: TestEvidenceRunner"}
 ```
 
-**確定性驗證器**（純函式，違反即拒絕套用草稿／送核）：YAML schema、DAG 無環、依賴皆存在、task ID 唯一且穩定、risk 三層不變量（§3.3）、scenario ref 存在於 active spec manifest。一般 schema 錯誤顯示在編輯器旁，**不**建立升級項目（§3.8 邊界）。
+**確定性驗證器**（純函式，違反即拒絕套用草稿／送核）：YAML schema、DAG 無環、依賴皆存在、task ID 唯一且穩定、**risk 欄位只驗 plan 內兩層**——依綁定 risk policy 重算 `minimum_risk_tier`、驗 `planner_risk_tier ≥ minimum`（`selected_risk_tier`／`override_reason` 不屬 plan schema，由 Gate 2 decision validator 負責，§3.3）、scenario ref 存在於 active spec manifest。一般 schema 錯誤顯示在編輯器旁，**不**建立升級項目（§3.8 邊界）。
 
 ### 3.6 Oracle-surface 宣告（時機：Stage B、Gate 2 前）
 
@@ -357,7 +357,7 @@ M3a 凍結以下邊界；「不做 shell 展開」只防一類注入，測試本
 
 依 SDLC v2（BDD→DDD→TDD）；Gherkin features 進 `docs/architecture/features/`（`plan-gate.feature`、`test-contract.feature`、`escalation.feature`），mermaid UML（context map 更新、plan aggregate、TCA sequence）進 `docs/architecture/diagrams/`，收尾嵌 README。
 
-- **Go `-race`**：plan 驗證器（cycle／依賴／ID／risk floor／override_reason 必填）、plan manifest、GatePolicy registry、**多 gate supersession 隔離**（核可 TCA 不動 Gate 1／不同 subject 互不影響；**不同 plan 都含 T1 時 TCA 不互相 supersede**）、**commit 身分 lineage**（analysis_base_commit／plan_commit／test_commit 三分，祖先與路徑範圍驗證；`analysis_base_commit..plan_commit` 混入非 plan/** 變更拒核；**Preview／Confirm 間 HEAD 前移拒絕的 barrier 競態**）、**risk 決議 task 集合一致性**（缺、多、重複 task_id 拒核；minimum／planner 與 committed plan＋policy 重算不符拒核）、**gate2_approval canonical digest 重建**（record 竄改偵測；descriptor 從 plan_commit 讀取而非 worktree）、**真實 M2 gate.jsonl fixture 的 v1→v2 replay 相容（含 rejected）**＋**rejected 終態 projection**、**GateDecide × blocker 建立的 barrier 競態**、**Gate 2 STALE → 所屬 TCA 連動 STALE**、**Gate 2 核可後進入 Stage C（test commit 前移）不觸發 STALE**、evidence runner（fixture 命令：紅燈特徵匹配、錯誤原因分類、**兩種 evidence role 完整性**、**兩筆 evidence snapshot 不一致拒核**、**timeout 後 worktree／process group 零殘留**、crash 遺留清理、落盤順序）、**CAS 落盤順序的各 crash boundary 重啟測試＋orphan temp 清理**、escalation projection（condition key 只對未 resolved 去重、occurrence 重建、**硬性項目無法由 UI 手動 resolve**）、journal tail 修復。
+- **Go `-race`**：plan 驗證器（cycle／依賴／ID／minimum 重算＋planner≥minimum；**不含** selected／override，該欄位入 plan schema 即拒絕）、Gate 2 decision validator（task 集合一致、selected floor、selected<planner 時 override_reason 必填、rejected 免 risk 輸入）、plan manifest、GatePolicy registry、**多 gate supersession 隔離**（核可 TCA 不動 Gate 1／不同 subject 互不影響；**不同 plan 都含 T1 時 TCA 不互相 supersede**）、**commit 身分 lineage**（analysis_base_commit／plan_commit／test_commit 三分，祖先與路徑範圍驗證；`analysis_base_commit..plan_commit` 混入非 plan/** 變更拒核；**Preview／Confirm 間 HEAD 前移拒絕的 barrier 競態**）、**gate2_approval canonical digest 重建**（record 竄改偵測；descriptor 從 plan_commit 讀取而非 worktree）、**真實 M2 gate.jsonl fixture 的 v1→v2 replay 相容（含 rejected）**＋**rejected 終態 projection**、**GateDecide × blocker 建立的 barrier 競態**、**Gate 2 STALE → 所屬 TCA 連動 STALE**、**Gate 2 核可後進入 Stage C（test commit 前移）不觸發 STALE**、evidence runner（fixture 命令：紅燈特徵匹配、錯誤原因分類、**兩種 evidence role 完整性**、**兩筆 evidence snapshot 不一致拒核**、**timeout 後 worktree／process group 零殘留**、crash 遺留清理、落盤順序）、**CAS 落盤順序的各 crash boundary 重啟測試＋orphan temp 清理**、escalation projection（condition key 只對未 resolved 去重、occurrence 重建、**硬性項目無法由 UI 手動 resolve**）、journal tail 修復。
 - **vitest**：PlanWorkspace／DagPane／GateConsole 擴充／EscalationInbox、i18n key parity。
 - **E2E 驗收矩陣（實機）**：完整 Stage B→C 閉環一輪；STALE 情境（spec 變更→Gate 2 STALE；oracle-surface 變更→TCA STALE；HEAD 前移**不**STALE；Gate 2 STALE→TCA 連動）；fail-closed 情境（編譯失敗誤紅燈→收件匣→修復→重驗→解除阻擋）。
 - **最終 gate（合併前完整套件）**：`go vet ./...`、`go test -race ./... -count=1`、`npm --prefix frontend run test`、`npm --prefix frontend run build`、`wails build`。
