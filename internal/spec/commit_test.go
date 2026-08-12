@@ -61,6 +61,36 @@ func TestConfirmRejectsWhenContentChangedAfterPreview(t *testing.T) {
 	}
 }
 
+// TestConfirmRejectsWhenHeadMovedAfterPreview is the barrier test for the
+// plan two-phase commit (§3.0): if HEAD advances (a real commit lands)
+// between PreviewSpecCommit and ConfirmSpecCommit, Confirm must reject with
+// ErrCommitStale even though the token's TreeDigest still matches — the
+// HeadOID comparison in ConfirmSpecCommit alone must catch this, without
+// needing to reason about AnalysisBase at all (commit.go:187-198).
+func TestConfirmRejectsWhenHeadMovedAfterPreview(t *testing.T) {
+	dir := initRepo(t)
+	os.MkdirAll(filepath.Join(dir, "spec"), 0o755)
+	os.WriteFile(filepath.Join(dir, "spec", "glossary.md"), []byte("v1"), 0o644)
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-m", "c1")
+
+	r := NewGitRepo(dir, SpecScope)
+	tok, _, err := r.PreviewSpecCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Another commit lands out-of-band, moving HEAD, while the previewed
+	// scoped tree content stays byte-identical.
+	os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("x"), 0o644)
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-m", "unrelated commit")
+
+	if err := r.ConfirmSpecCommit(tok, "m"); !errors.Is(err, ErrCommitStale) {
+		t.Fatalf("HEAD moving after preview must reject with ErrCommitStale: %v", err)
+	}
+}
+
 func TestConfirmFailsClosedWithOutOfScopeStaged(t *testing.T) {
 	dir := initRepo(t)
 	os.WriteFile(filepath.Join(dir, "app.go"), []byte("package x"), 0o644)

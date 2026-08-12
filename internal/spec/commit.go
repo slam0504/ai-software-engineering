@@ -35,9 +35,19 @@ var managedScopeRoots = []string{"spec/features", "spec/nfr", "spec/glossary.md"
 // file mode — so it binds content (path + content hash) over the managed scope,
 // NOT file mode. Any scoped add/delete/rename/content change, or any HEAD move,
 // changes at least one field, which ConfirmSpecCommit uses to detect staleness.
+//
+// AnalysisBase is not populated or verified by this package — spec must not
+// import plan (that would be a reverse dependency; plan is downstream of
+// spec's scope machinery). For a PlanScope-backed GitRepo, the caller (app
+// layer, Task 12) fills AnalysisBase from the previewed plan YAML's
+// analysis_base_commit and is responsible for re-checking it against the
+// worktree's current plan YAML before calling ConfirmSpecCommit. HEAD
+// having moved between preview and confirm is already caught by the
+// HeadOID comparison below (see TestConfirmRejectsWhenHeadMovedAfterPreview).
 type CommitToken struct {
-	HeadOID    string
-	TreeDigest string
+	HeadOID      string
+	TreeDigest   string
+	AnalysisBase string
 }
 
 // headOIDOrUnborn returns the current HEAD commit OID, or "" if HEAD does
