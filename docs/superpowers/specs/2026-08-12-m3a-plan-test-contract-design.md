@@ -1,7 +1,7 @@
 # M3a — 計畫與測試契約閉環設計
 
 - 日期：2026-08-12
-- 狀態：設計定稿 rev1（整合外部審閱 7 項 P1 契約修訂：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／evidence runner 安全邊界）
+- 狀態：設計定稿 rev2（第一輪審閱 7 P1：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／runner 安全邊界；第二輪審閱 7 P1：commit 身分三分／oracle-surface 宣告時機前移／TCA subject 含 plan_id＋gate2_approval 綁定／ApprovalRecord v2＋rejected 終態／risk_decisions[] 基數／evidence 一致性 validator＋落盤順序／workflow mutex 全覆蓋）
 - 上游依據：`docs/architecture/sdlc-workbench-app-plan.md` §5.2–5.4、§7（M3 列）；`docs/architecture/sdlc-ai-agent-automation-plan.md` §3–§6（Stage B／C、Gate 2、Test Contract Approval、升級路徑）
 - 前置里程碑：M0 ✅、M1 ✅、M1.5 ✅、M2 Stage A ✅（Gate 1 引擎、canonical manifest、兩階段 scoped commit、SpecAssist 隔離 one-shot）、i18n ✅
 
@@ -76,10 +76,10 @@ flowchart TB
 
 ```go
 type GatePolicy interface {
-    ValidateRequest(req GateRequestV2) error      // gate-specific bindings schema（cardinality／role／ref／digest 格式）
-    ValidateDecision(rec ApprovalRecord) error
-    SupersessionKey(rec ApprovalRecord) string    // "gate1|workspace"、"gate2|plan:<plan_id>"、"tca|task:<task_id>"
-    ReconcileBindings(rec ApprovalRecord) ([]StaleCause, error) // §3.9 分類重算；讀取錯誤回 error（fail closed，不寫永久 STALE）
+    ValidateRequest(req GateRequestV2) error        // gate-specific bindings schema（cardinality／role／ref／digest 格式）
+    ValidateDecision(rec ApprovalRecordV2) error    // 硬性 validator（含 §3.4 TCA evidence 一致性）
+    SupersessionKey(rec ApprovalRecordV2) string    // "gate1|workspace"、"gate2|plan:<plan_id>"、"tca|task:<plan_id>/<task_id>"
+    ReconcileBindings(rec ApprovalRecordV2) ([]StaleCause, error) // §3.9 分類重算；讀取錯誤回 error（fail closed，不寫永久 STALE）
 }
 ```
 
@@ -89,23 +89,46 @@ Gate 1、Gate 2、TCA 各自註冊 policy；單一 `gate.jsonl` 保留全流程�
 
 ## 3. 資料契約（實作前凍結）
 
-### 3.1 GateRequest v2 與 supersession scope（P1-1）
+### 3.0 Commit 身分（凍結詞彙，全文遵用）
 
-新 `gate_request` 寫 `schema_version: 2`，泛化為 bindings 陣列＋穩定 subject：
+三種 commit 身分明確分離，不得混用單一 `base_commit` 詞彙：
+
+| 身分 | 定義 | 出現位置 |
+|---|---|---|
+| `analysis_base_commit` | PlannerAssist 實際分析的 code commit | 寫在 plan YAML 內（§3.5） |
+| `plan_commit` | ConfirmPlanCommit 產生的 commit（plan 檔已入 HEAD） | Gate 2 的 `base_commit` binding 值（§3.3） |
+| `test_commit` | 測試綁定 commit，**必須以 `plan_commit` 為祖先**；`plan_commit..test_commit` 只能修改 oracle-surface 路徑 | TCA 的 `oracle_surface.ref`（§3.4） |
+
+TCA 的 `base_commit` binding 必須**精確等於**其 `gate2_approval` 所綁 Gate 2 記錄的 `base_commit`（即 plan_commit）。plan YAML 內寫 `analysis_base_commit` 而非自身 commit OID，避免「檔案內容包含自身 commit」的循環。
+
+### 3.1 GateRequest v2／ApprovalRecord v2 與 supersession scope
+
+新 `gate_request`／`approval_record` 皆寫 `schema_version: 2`，泛化為 bindings 陣列＋穩定 subject：
 
 ```
 GateRequestV2 {
   _type: "gate_request", schema_version: 2,
   approval_id: ULID, gate: gate1|gate2|test_contract_approval,
-  subject: string,            # gate1→"workspace"；gate2→"plan:<plan_id>"；tca→"task:<task_id>"
+  subject: string,            # gate1→"workspace"；gate2→"plan:<plan_id>"；tca→"task:<plan_id>/<task_id>"
   bindings: [Binding],
+  created_at: RFC3339
+}
+
+ApprovalRecordV2 {
+  _type: "approval_record", schema_version: 2,
+  approval_id, gate, subject,
+  decision: approved|rejected, approver: {id, method}, reason,
+  bindings: [Binding],
+  metadata: {}                # gate-specific：gate2 放 risk_decisions[]（§3.3）
   created_at: RFC3339
 }
 ```
 
-- **subject 是穩定 identity，不得以 digest 代替**：`plan_id`／`task_id` 跨版本不變（plan 檔內宣告，驗證器保證唯一且不可與既有衝突）。
+- **subject 是穩定 identity，不得以 digest 代替**：`plan_id` 跨版本不變（plan 檔內宣告，驗證器保證唯一且不可與既有衝突）；task subject 一律帶 plan 前綴 `task:<plan_id>/<task_id>`，避免不同 plan 的同名 task 互相衝突或 supersede。
+- **Decide() 不接受呼叫端提供的 bindings**：核可時從 journal 中的 `GateRequestV2` 複製 `gate`／`subject`／`bindings` 進 ApprovalRecordV2，保證核可內容與送核內容一致；呼叫端只提供 decision、approver、reason 與 gate-specific metadata。
 - **Supersession scope**：新核可只 supersede 相同 `(gate, subject)` 的 active 核可。現行 `Decide()` 掃全部 active 的行為（`service.go` 泛化前為 gate1-only 故等價）改為以 `SupersessionKey` 過濾。
-- **舊資料相容**：projector 讀到 v1 `gate_request`（含 `spec_manifest_digest`／`base_commit` 欄位、無 subject）時正規化為 v2 形狀（gate1、subject=workspace、兩筆 bindings），**不回寫舊 journal**；以真實 M2 `gate.jsonl` fixture 做重啟相容測試。
+- **Rejected 終態**：projector 新增 `rejected` 終態（現行實作 rejected record 停留在 pending，泛化時修正）；v1 rejected 記錄 replay 後同樣落 rejected 終態。
+- **舊資料相容**：projector 讀到 v1 記錄（含 `spec_manifest_digest`／`base_commit` 欄位、無 subject／schema_version）時正規化為 v2 形狀（gate1、subject=workspace、bindings 展開），**不回寫舊 journal**；以真實 M2 `gate.jsonl` fixture（含 approved 與 rejected）做重啟相容測試。
 
 ### 3.2 Binding role（P1-2）
 
@@ -119,9 +142,9 @@ GateRequestV2 {
 
 舊 Gate 1 binding 的 `role=""` 維持相容。gate-specific schema（GatePolicy.ValidateRequest）驗 cardinality、role、ref 與 digest 格式。
 
-### 3.3 Gate 2 必填 bindings 與 risk tier 三層（P1-6）
+### 3.3 Gate 2 必填 bindings 與 risk tier 三層
 
-**必填 bindings**：`spec_manifest`（active Gate 1 所綁）＋ `plan`（plan manifest digest）＋ `base_commit` ＋ `risk_policy`（版本化政策檔 digest）＋ `permission_manifest`（權限清單檔 digest＋ref）。
+**必填 bindings**：`spec_manifest`（active Gate 1 所綁）＋ `plan`（plan manifest digest）＋ `base_commit`（值＝`plan_commit`，§3.0）＋ `risk_policy`（版本化政策檔 digest）＋ `permission_manifest`（**所有 task permission refs 的 canonical manifest digest**，非單一檔案）。
 
 **Risk tier 三層**（plan 內每 task 保存）：
 
@@ -131,34 +154,52 @@ GateRequestV2 {
 | `planner_risk_tier` | AI 建議 | ≥ minimum |
 | `selected_risk_tier` | 人在 Gate 2 決定 | ≥ minimum；可低於 planner 建議（防 AI 一律標最高造成阻斷），降回需記錄理由 |
 
-「Agent 只能提高、不能降低」解讀為**不得低於 policy floor**。Gate 2 ApprovalRecord 保存最後核可的 `selected_risk_tier` 並綁定 `risk_policy` digest。
+「Agent 只能提高、不能降低」解讀為**不得低於 policy floor**。Plan 是多 task，risk 決定的基數是 per-task：Gate 2 `ApprovalRecordV2.metadata` 保存
 
-### 3.4 TCA 必填 bindings 與測試快照重建（P1-3）
+```
+risk_decisions: [{task_id, minimum_risk_tier, planner_risk_tier, selected_risk_tier, override_reason?}]
+```
 
-**必填 bindings**：`base_commit` ＋ `oracle_surface` ＋ `evidence_run×2`（role=expected_red／negative_control）＋ `mutation`。
+`selected < planner` 時該 task 的 `override_reason` 必填；`selected < minimum` 一律拒絕。整組 risk_decisions 與 `risk_policy` digest 一同凍結於核可記錄。
+
+### 3.4 TCA 必填 bindings、測試快照重建與 evidence 一致性
+
+**必填 bindings**：`gate2_approval`（所依 Gate 2 ApprovalRecordV2 的 ref＋digest）＋ `base_commit`（＝該 Gate 2 的 plan_commit，§3.0）＋ `oracle_surface` ＋ `evidence_run×2`（role=expected_red／negative_control）＋ `mutation`。
+
+`gate2_approval` 的 resolver 必須確認該筆 Gate 2 **仍為 active**；Gate 2 STALE／superseded 時對應 TCA 一併 STALE（否則 plan 已失效、舊 TCA 仍顯示 active）。
 
 **測試快照重建規則（凍結）**：
 
 1. `oracle_surface.ref` 必須是**完整的 test commit OID**（`git:<algo>:<oid>`）；digest 為 oracle-surface 路徑集的 canonical manifest digest（演算法同 app plan §5.3）。
-2. Runner 驗證 test commit 以 `base_commit` 為祖先。
-3. `base_commit..test_commit` 只能修改宣告的 oracle-surface 路徑（超出即拒絕）。
+2. Runner 驗證 test commit 以 `plan_commit` 為祖先。
+3. `plan_commit..test_commit` 只能修改已核可宣告的 oracle-surface 路徑（超出即拒絕）。
 4. expected-red 直接 checkout **test commit**（＝base code＋紅燈測試）；negative-control 在同一 snapshot 上套用 mutation。
 5. Mutation patch 不得修改 oracle-surface 路徑，且 runner 必須驗證 patch 確實成功套用。
 6. `EvidenceRun` 記錄 `test_commit`，由記錄可完整重建當時執行內容。
+
+**Evidence 一致性硬性 validator**（TCA `ValidateDecision`，任一不符拒核；防止拿兩筆不相干的 evidence 送核）：
+
+1. binding role 與 `EvidenceRun.kind` 相符。
+2. 兩筆 `result` 皆為 `passed`。
+3. 兩筆使用相同 `base_commit`、`test_commit`、`oracle_surface_digest`。
+4. `oracle_surface.ref` == `test_commit`。
+5. negative-control 的 `mutation_digest` == TCA 的 `mutation` binding digest。
+6. expected-red **不得**攜帶 mutation。
+7. `command`／`matcher` 精確等於已核可 Gate 2 plan 中該 task 的 test contract descriptor（§3.5）。
 
 ### 3.5 Plan artifact（YAML 單一權威來源）
 
 `plan/` 目錄納管於 workspace git（納管 pattern：`plan/**`，涵蓋 plan 檔、oracle-surface 宣告、risk policy、權限清單檔，全數進 plan manifest；`scope_version` 同 M2 慣例）。單一結構化 YAML 為權威，DAG 圖是解析後的 projection，**不另外維護 mermaid 權威副本**：
 
 ```yaml
-plan_id: M3A-001            # 穩定 identity，跨版本不變
-base_commit: git:sha1:...
+plan_id: M3A-001               # 穩定 identity，跨版本不變
+analysis_base_commit: git:sha1:...   # Planner 分析的 code commit（§3.0；非自身 commit）
 spec_manifest: sha256:...
 risk_policy: sha256:...
 tasks:
-  - id: T1                  # 穩定 identity（TCA subject 用）
+  - id: T1                     # 穩定 identity（TCA subject＝task:M3A-001/T1）
     title: 建立 evidence runner
-    scenarios: [E1, E2]     # 對應 Gate 1 規格 scenario
+    scenarios: [E1, E2]        # 對應 Gate 1 規格 scenario
     depends_on: []
     impact: {contexts: [test-contract], modules: [internal/evidence]}
     completion:
@@ -168,13 +209,18 @@ tasks:
     planner_risk_tier: medium
     selected_risk_tier: medium
     permissions_ref: permissions/T1.yaml
+    test_contract:             # descriptor 於 Gate 2 一併核可（§3.4 validator 7、§3.6）
+      command: {executable: go, argv: [test, -run, "TestEvidenceRunner", ./internal/evidence/...]}
+      expected_failure: {test_ids: [TestEvidenceRunner], matcher: "FAIL: TestEvidenceRunner"}
 ```
 
 **確定性驗證器**（純函式，違反即拒絕套用草稿／送核）：YAML schema、DAG 無環、依賴皆存在、task ID 唯一且穩定、risk 三層不變量（§3.3）、scenario ref 存在於 active spec manifest。一般 schema 錯誤顯示在編輯器旁，**不**建立升級項目（§3.8 邊界）。
 
-### 3.6 Oracle-surface 宣告
+### 3.6 Oracle-surface 宣告（時機：Stage B、Gate 2 前）
 
 以版本化設定檔宣告 path patterns（例 `plan/oracle-surface.yaml`，納入 plan manifest 範圍），涵蓋 step definitions、fixtures、helpers、snapshots、runner config 等完整 oracle surface；digest＝匹配檔案的 canonical manifest digest。
+
+**宣告時機凍結**：oracle-surface path patterns、每 task 的測試命令與 matcher（test contract descriptor，§3.5）、執行權限**全部在 Stage B、Gate 2 送核前完成並 commit**，隨 plan 一併被 Gate 2 核可。Stage C 只依已核可宣告撰寫測試、登記 mutation 與執行 evidence runner——若宣告留到 Stage C 才寫，寫檔即改動 `plan/**` manifest、Gate 2 立即 STALE，時序矛盾。
 
 ### 3.7 EvidenceRun 與 mutation 登記
 
@@ -199,12 +245,14 @@ EvidenceRun {
 - **不可只以 exit code 非零判定成功**：expected-red 必須匹配預期失敗的 test ID／錯誤特徵；編譯失敗、缺相依、環境錯誤判為 `error` 並進收件匣。negative-control 必須確認同一組目標測試抓到 mutation。
 - 原始 stdout／stderr 寫入不可變錄流檔（`.workbench/recordings/` 慣例）；evidence journal 只追加。
 - Mutation 登記：patch 內容存檔＋digest；TCA 綁定 mutation digest。
+- `command`／`expected_failure` 必須取自已核可 Gate 2 plan 的 test contract descriptor（§3.5），不接受臨場輸入。
+- **Content-addressed 儲存與落盤順序（凍結）**：mutation patch 與 EvidenceRun artifact 存於 `.workbench/` 下的 content-addressed 路徑；順序固定為 **artifact 寫入 → `Sync()` → 計算 digest → 最後 append evidence journal**——journal 內的 digest 永遠指向已 durable 的內容。
 
 ### 3.8 升級收件匣（escalation）
 
 **定位**：需要人做決定或修復阻擋條件的**例外佇列**，不是通知中心，也不是多角色 agent 信箱。
 
-**系統自動來源（限定清單，以 condition key 去重、啟動／讀取時可補建遺漏項）**：
+**系統自動來源（限定清單；condition key 去重**只對尚未 resolved 的項目**生效——同一條件再次發生時建立新 occurrence／generation，不因舊項目已 resolved 而漏報；啟動／讀取時依權威條件補建遺漏項）**：
 
 1. Planner 風險無法依政策分類（fail closed）
 2. plan／權限清單／risk policy 缺必要 binding
@@ -220,7 +268,7 @@ EvidenceRun {
 
 **處置語意（三態）**：`open → acknowledged → resolved`，append-only transition＋projection。resolved 必填 `resolution`、`reason`、`actor`、`resolved_at`，可附 evidence ref。不做派工／留言串／SLA／提醒／snooze／routing。
 
-**阻擋規則**：每項有 `block_scope ∈ {workspace, gate2:<plan_id>, tca:<task_id>, evidence:<evidence_id>}`；未 resolve 的 blocking 項目禁止對應核可；`acknowledged` 不解除阻擋。STALE、缺 binding、journal degraded 等**硬性不變量不能靠 waiver 解鎖**，必須修復後由系統重新驗證；需要人取捨的項目可用 `accepted_risk` resolution（必填理由），但不能取代必要證據、不能解鎖硬性條件。
+**阻擋規則**：每項有 `block_scope ∈ {workspace, gate2:<plan_id>, tca:<plan_id>/<task_id>, evidence:<evidence_id>}`；未 resolve 的 blocking 項目禁止對應核可；`acknowledged` 不解除阻擋。STALE、缺 binding、journal degraded 等**硬性不變量項目使用者不能手動 resolve**——只能修復後由系統重新驗證通過時 resolve，不能靠 waiver 解鎖；需要人取捨的項目可用 `accepted_risk` resolution（必填理由），但不能取代必要證據、不能解鎖硬性條件。
 
 ### 3.9 STALE 分類（P1-4）
 
@@ -231,12 +279,13 @@ EvidenceRun {
 | 持續重算 | spec_manifest、plan、risk_policy、permission_manifest、oracle_surface | 目前內容 digest ≠ 核可綁定 digest |
 | 內容定址驗證 | evidence_run、mutation | ref 遺失或內容 digest 不符（**建立新 evidence run 不使舊 TCA 失效**；新版 TCA 送核時才 supersede 同 task 舊核可） |
 | 歷史錨點 | base_commit | 不隨 HEAD 前移失效（否則建立 test commit 後 Gate 2 立刻 STALE）；只驗 commit 仍存在於 repo |
+| 核可鏈 | gate2_approval | 所綁 Gate 2 記錄不再 active（STALE／superseded）→ 對應 TCA STALE（§3.4） |
 
 讀取錯誤維持 M2 語意：**fail closed（拒絕核可），但不寫入永久 STALE**。Watcher 仍為通知層，讀取時重算為權威。
 
-### 3.10 核可權威順序（P1-5）
+### 3.10 核可權威順序與 workflow mutex
 
-收件匣不是核可正確性的唯一來源（避免「查 inbox 沒 blocker → 核可」的 TOCTOU）。`GateDecide` 固定順序，由 application-level workflow mutex 線性化：
+收件匣不是核可正確性的唯一來源（避免「查 inbox 沒 blocker → 核可」的 TOCTOU）。`GateDecide` 固定順序：
 
 ```
 GateDecide
@@ -245,6 +294,8 @@ GateDecide
   → 檢查同 scope 的人工 blocking escalation
   → append approval
 ```
+
+**Workflow mutex 覆蓋所有 blocking 狀態生產路徑**：`GateDecide`、reconcile（含 watcher 觸發）、escalation create／resolve、evidence run finalize 都必須先取得**同一個 workspace-level workflow mutex**；lock ordering 固定（workflow mutex → gate journal → escalation journal），避免兩個 journal 互鎖。
 
 系統硬性條件以 validator 為權威；收件匣只是 durable 通知與處置介面。**escalation journal 寫入失敗時 Gate 仍必須拒絕核可**。
 
@@ -267,7 +318,7 @@ M3a 凍結以下邊界；「不做 shell 展開」只防一類注入，測試本
 
 比照 SpecAssist 隔離 one-shot，但輸入面更寬（需讀 code）、寫入面同樣為零：
 
-- **輸入**：active Gate 1 的 spec_manifest（committed snapshot）、精確 base_commit 的 code tree、人維護的版本化 risk policy。
+- **輸入**：active Gate 1 的 spec_manifest（committed snapshot）、精確 `analysis_base_commit` 的 code tree（記入 plan，§3.0）、人維護的版本化 risk policy。
 - **Provider enforcement**：Claude 以唯讀工具白名單（pin `2.1.223` 旗標行為列 §9 待驗證，live probe 後定案）、Codex `sandboxPolicy=readOnly`；enforcement probe 失敗 → 該 provider 的 PlannerAssist fail closed＋收件匣項目（§3.8 條件 9）。
 - **輸出**：結構化 plan 草稿（影響面分析、任務與依賴、完成定義、建議 risk tier、建議權限清單）進 Plan Workspace 草稿區，**不直接寫入正式 plan**；人套用草稿才寫檔。AI 建議的 risk tier 只能 ≥ minimum（§3.3）。
 - 輸出不進一般對話、不污染 provider 用量（同 SpecAssist 慣例）。
@@ -288,9 +339,9 @@ M3a 凍結以下邊界；「不做 shell 展開」只防一類注入，測試本
 
 ## 7. 關鍵流程
 
-**Stage B（計畫）**：Gate 1 active → PlannerAssist 草稿 → 人編修（增刪拆任務、調依賴／完成定義／權限）→ 確定性驗證 → 套用草稿寫 `plan/` → Preview／Confirm scoped commit（dirty-tree 拒核）→ 送核 Gate 2（subject=plan:<plan_id>）→ §3.10 順序核可。
+**Stage B（計畫）**：Gate 1 active → PlannerAssist 分析 `analysis_base_commit` 產草稿 → 人編修（增刪拆任務、調依賴／完成定義／權限）→ **完成 oracle-surface 宣告＋每 task test contract descriptor＋執行權限（§3.6）** → 確定性驗證 → 套用草稿寫 `plan/` → Preview／Confirm scoped commit（產生 `plan_commit`，dirty-tree 拒核）→ 送核 Gate 2（subject=plan:<plan_id>，base_commit=plan_commit）→ §3.10 順序核可（含 per-task risk_decisions）。
 
-**Stage C 前段（測試契約）**：宣告 oracle-surface → 測試寫作與 commit（test commit，僅動 oracle-surface 路徑）→ 登記 mutation → evidence runner 跑 expected_red＋negative_control（§3.4／§4）→ matcher 判定 → TCA 送核（subject=task:<task_id>）→ 核可。
+**Stage C 前段（測試契約）**：依已核可宣告撰寫測試並 commit（`test_commit` 以 plan_commit 為祖先、僅動 oracle-surface 路徑）→ 登記 mutation → evidence runner 跑 expected_red＋negative_control（§3.4／§4）→ matcher 判定 → TCA 送核（subject=task:<plan_id>/<task_id>，綁 gate2_approval）→ 核可（§3.4 一致性 validator）。
 
 **STALE／升級閉環**：綁定變更（§3.9）→ `binding_stale`＋transition＋（如 blocking）收件匣項目 → 人修復（如重跑 evidence、重送核）→ 系統重新驗證 → resolve → 解除阻擋。
 
@@ -300,9 +351,10 @@ M3a 凍結以下邊界；「不做 shell 展開」只防一類注入，測試本
 
 依 SDLC v2（BDD→DDD→TDD）；Gherkin features 進 `docs/architecture/features/`（`plan-gate.feature`、`test-contract.feature`、`escalation.feature`），mermaid UML（context map 更新、plan aggregate、TCA sequence）進 `docs/architecture/diagrams/`，收尾嵌 README。
 
-- **Go `-race`**：plan 驗證器（cycle／依賴／ID／risk floor）、plan manifest、GatePolicy registry、**多 gate supersession 隔離**（核可 TCA 不動 Gate 1／不同 subject 互不影響）、**真實 M2 gate.jsonl fixture 的 v1→v2 replay 相容**、**GateDecide × blocker 建立的 barrier 競態**、evidence runner（fixture 命令：紅燈特徵匹配、錯誤原因分類、**兩種 evidence role 完整性**、**timeout 後 worktree／process group 零殘留**、crash 遺留清理）、escalation projection＋condition key 去重、journal tail 修復。
+- **Go `-race`**：plan 驗證器（cycle／依賴／ID／risk floor／override_reason 必填）、plan manifest、GatePolicy registry、**多 gate supersession 隔離**（核可 TCA 不動 Gate 1／不同 subject 互不影響；**不同 plan 都含 T1 時 TCA 不互相 supersede**）、**commit 身分 lineage**（analysis_base_commit／plan_commit／test_commit 三分，祖先與路徑範圍驗證）、**真實 M2 gate.jsonl fixture 的 v1→v2 replay 相容（含 rejected）**＋**rejected 終態 projection**、**GateDecide × blocker 建立的 barrier 競態**、**Gate 2 STALE → 所屬 TCA 連動 STALE**、**Gate 2 核可後進入 Stage C（test commit 前移）不觸發 STALE**、evidence runner（fixture 命令：紅燈特徵匹配、錯誤原因分類、**兩種 evidence role 完整性**、**兩筆 evidence snapshot 不一致拒核**、**timeout 後 worktree／process group 零殘留**、crash 遺留清理、落盤順序）、escalation projection（condition key 只對未 resolved 去重、occurrence 重建、**硬性項目無法由 UI 手動 resolve**）、journal tail 修復。
 - **vitest**：PlanWorkspace／DagPane／GateConsole 擴充／EscalationInbox、i18n key parity。
-- **E2E 驗收矩陣（實機）**：完整 Stage B→C 閉環一輪；STALE 情境（spec 變更→Gate 2 STALE；oracle-surface 變更→TCA STALE；HEAD 前移**不**STALE）；fail-closed 情境（編譯失敗誤紅燈→收件匣→修復→重驗→解除阻擋）。
+- **E2E 驗收矩陣（實機）**：完整 Stage B→C 閉環一輪；STALE 情境（spec 變更→Gate 2 STALE；oracle-surface 變更→TCA STALE；HEAD 前移**不**STALE；Gate 2 STALE→TCA 連動）；fail-closed 情境（編譯失敗誤紅燈→收件匣→修復→重驗→解除阻擋）。
+- **最終 gate（合併前完整套件）**：`go vet ./...`、`go test -race ./... -count=1`、`npm --prefix frontend run test`、`npm --prefix frontend run build`、`wails build`。
 
 ---
 
@@ -316,7 +368,7 @@ M3a 凍結以下邊界；「不做 shell 展開」只防一類注入，測試本
 
 ## 10. 實作分段（估 3–4 週工程量）
 
-1. **契約凍結＋gate 引擎泛化**：GateRequest v2＋subject＋(kind,role)＋GatePolicy registry＋v1 正規化＋replay 相容測試。
+1. **契約凍結＋gate 引擎泛化**：GateRequest v2／ApprovalRecordV2＋subject＋(kind,role)＋rejected 終態＋GatePolicy registry＋Decide 從 request 複製 bindings＋v1 正規化＋replay 相容測試（含 rejected）。
 2. **Plan 資料層＋Plan Workspace＋PlannerAssist＋DAG＋Gate 2 主控台**。
 3. **Oracle-surface＋mutation＋evidence runner＋TCA 主控台**。
 4. **升級收件匣＋阻擋 barrier＋E2E 驗收＋diagrams／README 收尾**。
