@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import { CLIInfo, GateDecide, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
@@ -20,6 +21,7 @@ import GateConsole from './components/GateConsole.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
 import DiagramPane from './components/DiagramPane.vue'
 
+const { t } = useI18n()
 const s = useSession()
 const gate = useGate()
 const assist = useAssist()
@@ -140,16 +142,16 @@ onMounted(async () => {
     <SettingsBar />
     <div class="meta" :title="JSON.stringify(cliInfo)">
       ws: {{ cliInfo.workspaceSource }} @ {{ cliInfo.workspace }} | tools: {{ cliInfo.toolsSource }} | node {{ cliInfo.node }}
-      <span v-if="cliInfo.startupError" class="err">startup: {{ cliInfo.startupError }}</span>
+      <span v-if="cliInfo.startupError" class="err">{{ t('app.startupError', { error: cliInfo.startupError }) }}</span>
     </div>
     <div class="body">
       <aside><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></aside>
       <main>
         <nav>
-          <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">Chat</button>
-          <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">Preview</button>
-          <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">Spec</button>
-          <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">表示圖</button>
+          <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
+          <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">{{ t('app.tab.preview') }}</button>
+          <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">{{ t('app.tab.spec') }}</button>
+          <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
@@ -162,16 +164,16 @@ onMounted(async () => {
           <DiagramPane :path="diagramPath" />
         </div>
       </main>
-      <div class="gate-resize" title="拖曳調整寬度" @mousedown.prevent="onGateResizeStart" />
+      <div class="gate-resize" :title="t('app.resize.width')" @mousedown.prevent="onGateResizeStart" />
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
         <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
         <p v-if="gateError" class="gate-err">{{ gateError }}</p>
       </aside>
     </div>
-    <div v-show="timelineOpen" class="tl-resize" title="拖曳調整高度" @mousedown.prevent="onResizeStart" />
+    <div v-show="timelineOpen" class="tl-resize" :title="t('app.resize.height')" @mousedown.prevent="onResizeStart" />
     <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
     <button class="tl-toggle" @click="timelineOpen = !timelineOpen">
-      {{ timelineOpen ? '▾ Timeline' : '▸ Timeline' }}
+      {{ (timelineOpen ? '▾ ' : '▸ ') + t('app.timeline.label') }}
     </button>
     <StatusBar />
     <ApprovalDialog />

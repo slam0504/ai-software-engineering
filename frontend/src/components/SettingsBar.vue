@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { PROVIDERS, useSession } from '../stores/session'
 import {
   TerminateSession, EndSession, NewSession, AuthStatus, StartLogin, CancelLogin, Logout,
   RestartCodexServerRecorded,
 } from '../../wailsjs/go/main/App'
 
+const { t } = useI18n()
 const s = useSession()
 
 // per-view 輸入欄位的 v-model 包裝（store getter 唯讀，寫入走 action）
@@ -13,13 +15,14 @@ const resumeInput = computed({ get: () => s.resumeInput, set: (v: string) => s.s
 const taskLabel = computed({ get: () => s.taskLabel, set: (v: string) => s.setTaskLabel(v) })
 const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.setRecordCase(v) })
 
-
-async function call(fn: () => Promise<unknown>, label: string) {
+// opKey ∈ settings.operationAction 的 key（new/terminate/end/authStatus/login/cancelLogin/logout/b1Probe）
+async function call(fn: () => Promise<unknown>, opKey: string) {
+  const action = t('settings.operationAction.' + opKey)
   try {
-    const r = await fn()
-    s.note(`${label} ok${typeof r === 'string' && r ? '：' + r.slice(0, 400) : ''}`)
+    await fn()
+    s.note(t('settings.operation.success', { action }))
   } catch (e: any) {
-    s.pushError(`${label}: ${e}`)
+    s.note(t('settings.operation.failure', { action, error: String(e) }))
   }
 }
 </script>
@@ -33,29 +36,29 @@ async function call(fn: () => Promise<unknown>, label: string) {
         @click="s.setActiveProvider(p)">
         {{ p }}
         <span v-if="s.unreadOf(p) > 0" class="badge">{{ s.unreadOf(p) }}</span>
-        <span v-if="s.awaitingOf(p)" class="await" title="等待核可">⚠</span>
+        <span v-if="s.awaitingOf(p)" class="await" :title="t('settings.awaitingApproval.tooltip')">⚠</span>
       </button>
     </nav>
-    <input v-model="taskLabel" class="w-160" placeholder="任務標籤（task id）" />
-    <select v-if="s.provider === 'codex'" v-model="s.approvalPolicy" title="codex approvalPolicy">
-      <option value="untrusted">untrusted（每次核可）</option>
-      <option value="on-request">on-request</option>
-      <option value="never" class="danger">never（不核可，風險自負）</option>
+    <input v-model="taskLabel" class="w-160" :placeholder="t('settings.taskId.placeholder')" />
+    <select v-if="s.provider === 'codex'" v-model="s.approvalPolicy" :title="t('settings.approvalPolicy.tooltip')">
+      <option value="untrusted">{{ t('settings.approvalPolicy.untrusted') }}</option>
+      <option value="on-request">{{ t('settings.approvalPolicy.onRequest') }}</option>
+      <option value="never" class="danger">{{ t('settings.approvalPolicy.never') }}</option>
     </select>
-    <input v-model="recordCase" class="w-160" :placeholder="s.provider + '-case（錄流，可空）'" />
-    <input v-model="resumeInput" class="w-200" placeholder="resume id（可空）" />
-    <button title="結束目前 session（quiesce 舊 provider）後開新對話"
-      @click="call(async () => { await NewSession(s.provider); s.reset() }, 'new')">New</button>
+    <input v-model="recordCase" class="w-160" :placeholder="t('settings.recordCase.placeholder', { provider: s.provider })" />
+    <input v-model="resumeInput" class="w-200" :placeholder="t('settings.resumeId.placeholder')" />
+    <button :title="t('settings.newSession.tooltip')"
+      @click="call(async () => { await NewSession(s.provider); s.reset() }, 'new')">{{ t('settings.action.new') }}</button>
     <!-- NewSession 原子流程（收尾＋恢復視窗重設）；失敗由 call() 顯示且不 reset -->
 
-    <button @click="call(() => TerminateSession(s.provider), 'terminate')">Terminate</button>
-    <button @click="call(() => EndSession(s.provider), 'end')">End</button>
+    <button @click="call(() => TerminateSession(s.provider), 'terminate')">{{ t('settings.action.terminate') }}</button>
+    <button @click="call(() => EndSession(s.provider), 'end')">{{ t('settings.action.end') }}</button>
     <span class="spacer" />
-    <button @click="call(() => AuthStatus(s.provider), 'auth')">Auth</button>
-    <button @click="call(() => StartLogin(s.provider), 'login')">Login</button>
-    <button v-if="s.provider === 'codex'" @click="call(() => CancelLogin(s.provider), 'cancel-login')">Cancel</button>
-    <button @click="call(() => Logout(s.provider), 'logout')">Logout</button>
-    <button v-if="s.provider === 'codex'" @click="call(() => RestartCodexServerRecorded(s.recordCase || 'codex-handshake'), 'b1-probe')">B1</button>
+    <button @click="call(() => AuthStatus(s.provider), 'authStatus')">{{ t('settings.action.authStatus') }}</button>
+    <button @click="call(() => StartLogin(s.provider), 'login')">{{ t('settings.action.login') }}</button>
+    <button v-if="s.provider === 'codex'" @click="call(() => CancelLogin(s.provider), 'cancelLogin')">{{ t('settings.action.cancelLogin') }}</button>
+    <button @click="call(() => Logout(s.provider), 'logout')">{{ t('settings.action.logout') }}</button>
+    <button v-if="s.provider === 'codex'" @click="call(() => RestartCodexServerRecorded(s.recordCase || 'codex-handshake'), 'b1Probe')">{{ t('settings.action.b1Probe') }}</button>
   </div>
 </template>
 
