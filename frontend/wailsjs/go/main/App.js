@@ -26,6 +26,14 @@ export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
 
+export function EvidenceCommitCandidates(arg1) {
+  return window['go']['main']['App']['EvidenceCommitCandidates'](arg1);
+}
+
+export function EvidenceGet(arg1) {
+  return window['go']['main']['App']['EvidenceGet'](arg1);
+}
+
 export function GateDecide(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GateDecide'](arg1, arg2, arg3, arg4);
 }
@@ -82,6 +90,10 @@ export function ReadWorkspaceFile(arg1) {
   return window['go']['main']['App']['ReadWorkspaceFile'](arg1);
 }
 
+export function RegisterMutation(arg1, arg2) {
+  return window['go']['main']['App']['RegisterMutation'](arg1, arg2);
+}
+
 export function ResolveApproval(arg1, arg2, arg3) {
   return window['go']['main']['App']['ResolveApproval'](arg1, arg2, arg3);
 }
@@ -92,6 +104,10 @@ export function RestartCodexServerRecorded(arg1) {
 
 export function RestoreViews() {
   return window['go']['main']['App']['RestoreViews']();
+}
+
+export function RunEvidence(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['RunEvidence'](arg1, arg2, arg3, arg4, arg5);
 }
 
 export function SendMessage(arg1, arg2) {
@@ -130,6 +146,14 @@ export function SubmitPlanForApproval(arg1) {
   return window['go']['main']['App']['SubmitPlanForApproval'](arg1);
 }
 
+export function SubmitTestContract(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['SubmitTestContract'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
 export function TerminateSession(arg1) {
   return window['go']['main']['App']['TerminateSession'](arg1);
+}
+
+export function ValidateTestCommit(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ValidateTestCommit'](arg1, arg2, arg3);
 }

@@ -7,6 +7,7 @@ export default {
       plan: 'Plan',
       diagram: 'Diagram',
       dag: 'Task DAG',
+      tca: 'TCA',
     },
     timeline: {
       label: 'Timeline',
@@ -101,6 +102,11 @@ export default {
       planner: 'Planner risk tier',
       overrideReasonPlaceholder: 'Override reason (required when selected is below planner)',
     },
+    tca: {
+      gate2Link: 'Gate 2: {id}',
+      viewEvidence: 'View evidence',
+      mutationDigest: 'mutation digest',
+    },
   },
   spec: {
     action: {
@@ -145,6 +151,62 @@ export default {
       placeholder: 'commit message',
     },
     submittedApprovalId: 'approval_id: {id}',
+  },
+  tcaWorkspace: {
+    empty: 'No active Gate 2 plan to work on',
+    testCommit: {
+      pick: 'Pick a recent commit…',
+      placeholder: 'test commit (manual entry)',
+      precheckOk: 'Lineage precheck passed',
+    },
+    action: {
+      precheck: 'Precheck',
+      registerMutation: 'Register mutation',
+      runExpectedRed: 'Run expected-red',
+      runNegativeControl: 'Run negative-control',
+      retry: 'Retry',
+      submit: 'Submit TCA',
+    },
+    mutationPatch: {
+      placeholder: 'unified diff patch for negative-control',
+    },
+    mutationId: 'mutation_id: {id}',
+    submittedApprovalId: 'approval_id: {id}',
+  },
+  evidence: {
+    title: 'evidence: {id}',
+    loading: 'Loading…',
+    result: {
+      passed: 'passed',
+      failed: 'failed',
+      error: 'error',
+    },
+    run: {
+      running: 'Running…',
+    },
+    action: {
+      close: 'Close',
+    },
+    label: {
+      evidenceId: 'evidence_id',
+      kind: 'kind',
+      result: 'result',
+      baseCommit: 'base_commit',
+      testCommit: 'test_commit',
+      oracleSurfaceDigest: 'oracle_surface_digest',
+      mutationDigest: 'mutation_digest',
+      command: 'command',
+      cwd: 'cwd',
+      startedAt: 'started at',
+      finishedAt: 'finished at',
+      exitCode: 'exit_code',
+      expectedFailure: 'expected_failure',
+      observedFailure: 'observed_failure',
+      stdoutDigest: 'stdout_digest',
+      stderrDigest: 'stderr_digest',
+      recordingRef: 'recording ref',
+      runnerVersion: 'runner_version',
+    },
   },
   approval: {
     action: {

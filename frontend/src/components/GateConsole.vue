@@ -2,20 +2,24 @@
 import { reactive, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { GateEntry, GateDecisionTask, RiskSelection } from '../types'
-import { resolveState, gateStateKeys } from '../i18n/stateKeys'
+import type { evidence } from '../../wailsjs/go/models'
+import { resolveState, gateStateKeys, evidenceResultKeys } from '../i18n/stateKeys'
 
 const { t } = useI18n()
 
 // Gate 主控台（spec §5.3／§3.3）：entries／decide／loadDecisionContext 走 props 注入
 // （測試以 props 驅動，不依賴 live Wails binding）；真實 wiring 在 App.vue
-// （GateDecide＋GateDecisionContext＋GateList refresh）。
+// （GateDecide＋GateDecisionContext＋GateList refresh）。getEvidence（Task 22）
+// 同一慣例：tca 卡片的兩筆 evidence 摘要走 props 注入，不依賴真實 Wails binding。
 const props = defineProps<{
   entries: GateEntry[]
   decide: (id: string, decision: string, reason: string, riskSelections: RiskSelection[]) => void
   loadDecisionContext?: (approvalId: string) => Promise<{ tasks: GateDecisionTask[] }>
+  getEvidence?: (evidenceId: string) => Promise<evidence.EvidenceRun>
   degraded?: boolean
   highlightId?: string
 }>()
+const emit = defineEmits<{ (e: 'open-evidence', evidenceId: string): void }>()
 
 const reasons = reactive<Record<string, string>>({}) // 理由欄：per approval_id 獨立輸入
 const hints = reactive<Record<string, boolean>>({}) // reject 無理由時的提示旗標
@@ -62,8 +66,56 @@ async function ensureRiskContext(id: string) {
   }
 }
 
+// tca 卡片（Task 22，§3.4／§6）：test_contract_approval gate 的兩筆 evidence_run
+// binding 只帶 ref（evidence_id）／digest——role／result／test_commit 要顯示
+// 短格式必須另外呼叫 EvidenceGet(ref) 取得完整 record，鏡射 ensureRiskContext
+// 的載入＋快取慣例（載入中／已知失敗都不重複打）。
+function isTca(e: GateEntry): boolean {
+  return e.gate === 'test_contract_approval'
+}
+function evidenceBindingsOf(e: GateEntry) {
+  return (e.bindings ?? []).filter(b => b.kind === 'evidence_run')
+}
+function mutationBindingOf(e: GateEntry) {
+  return (e.bindings ?? []).find(b => b.kind === 'mutation')
+}
+function gate2ApprovalIdOf(e: GateEntry): string {
+  const b = (e.bindings ?? []).find(b => b.kind === 'gate2_approval')
+  if (!b) return ''
+  return b.ref.startsWith('approval:') ? b.ref.slice('approval:'.length) : b.ref
+}
+const evidenceCache = reactive<Record<string, evidence.EvidenceRun>>({})
+const evidenceErrors = reactive<Record<string, string>>({})
+async function ensureEvidence(evidenceId: string) {
+  if (!props.getEvidence) return
+  if (evidenceCache[evidenceId] || evidenceErrors[evidenceId]) return
+  try {
+    evidenceCache[evidenceId] = await props.getEvidence(evidenceId)
+  } catch (e) {
+    evidenceErrors[evidenceId] = String(e) // 錯誤原文顯示，不吞
+  }
+}
+
+// scrollToApproval：gate2_approval 連結點擊後捲到對應卡片（同 DagPane
+// select-task → highlightId 的「導航」語意，這裡改用 scrollIntoView 直接定位，
+// 不像 highlightId 需要跨元件狀態）。jsdom 測試環境不一定實作
+// scrollIntoView，optional chaining 讓測試安全跳過。
+function scrollToApproval(id: string) {
+  const el = document.querySelector(`[data-test="entry-${id}"]`) as (HTMLElement & { scrollIntoView?: (opts?: unknown) => void }) | null
+  el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+}
+
+// shortOID：test_commit 短格式（git OID，非 digest——沒有 "sha256:" 前綴，
+// shortDigest 的 12 字元切法一樣適用，各自獨立避免耦合兩種不同語意的字串）。
+function shortOID(oid: string): string {
+  return oid.length > 10 ? oid.slice(0, 10) : oid
+}
+
 watch(() => props.entries, (entries) => {
-  for (const e of entries) if (isGate2Pending(e)) void ensureRiskContext(e.approval_id)
+  for (const e of entries) {
+    if (isGate2Pending(e)) void ensureRiskContext(e.approval_id)
+    if (isTca(e)) for (const b of evidenceBindingsOf(e)) void ensureEvidence(b.ref)
+  }
 }, { immediate: true })
 
 function needsOverride(id: string, task: GateDecisionTask): boolean {
@@ -177,6 +229,34 @@ function shortDigest(d: string): string {
         </div>
       </div>
 
+      <div v-if="isTca(e)" class="tca-section" data-test="tca-section">
+        <p v-if="gate2ApprovalIdOf(e)" class="tca-link">
+          <button type="button" data-test="tca-gate2-link" @click="scrollToApproval(gate2ApprovalIdOf(e))">
+            {{ t('gate.tca.gate2Link', { id: gate2ApprovalIdOf(e) }) }}
+          </button>
+        </p>
+        <div v-for="b in evidenceBindingsOf(e)" :key="b.role + b.ref" class="tca-evidence" :data-test="'tca-evidence-' + b.role">
+          <span class="role">{{ b.role }}</span>
+          <span v-if="evidenceErrors[b.ref]" class="err" :data-test="'tca-evidence-error-' + b.role">{{ evidenceErrors[b.ref] }}</span>
+          <template v-else-if="evidenceCache[b.ref]">
+            <span
+              :class="['result', 'result-' + evidenceCache[b.ref].result]"
+              :data-test="'tca-evidence-result-' + b.role"
+            >{{ resolveState(evidenceResultKeys, evidenceCache[b.ref].result, t) }}</span>
+            <span class="test-commit" :title="evidenceCache[b.ref].test_commit">{{ shortOID(evidenceCache[b.ref].test_commit) }}</span>
+            <span v-if="evidenceCache[b.ref].result === 'error'" class="err" :data-test="'tca-evidence-observed-' + b.role">
+              {{ evidenceCache[b.ref].observed_failure }}
+            </span>
+            <button type="button" :data-test="'tca-evidence-open-' + b.role" @click="emit('open-evidence', b.ref)">
+              {{ t('gate.tca.viewEvidence') }}
+            </button>
+          </template>
+        </div>
+        <p v-if="mutationBindingOf(e)" class="tca-mutation" data-test="tca-mutation">
+          {{ t('gate.tca.mutationDigest') }}: {{ shortDigest(mutationBindingOf(e)!.digest) }}
+        </p>
+      </div>
+
       <div v-if="e.state === 'pending'" class="actions">
         <input
           v-model="reasons[e.approval_id]"
@@ -219,4 +299,13 @@ function shortDigest(d: string): string {
 .actions { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .actions input { flex: 1; min-width: 120px; padding: 4px 6px; }
 .hint { color: var(--err); font-size: var(--fs-s); }
+.tca-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; font-size: var(--fs-s); }
+.tca-link button { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; text-decoration: underline; }
+.tca-evidence { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.tca-evidence .role { font-weight: 600; }
+.tca-evidence .result { padding: 1px 6px; border-radius: var(--radius-s); font-weight: 600; }
+.tca-evidence .result-passed { background: var(--ok); color: #10201e; }
+.tca-evidence .result-failed, .tca-evidence .result-error { background: var(--err); color: #2a0d0b; }
+.tca-evidence .test-commit { color: var(--text-faint); }
+.tca-mutation { color: var(--text-muted); margin-top: 4px; }
 </style>

@@ -7,6 +7,7 @@ export default {
       plan: '計畫',
       diagram: '表示圖',
       dag: '任務 DAG',
+      tca: 'TCA',
     },
     timeline: {
       label: '執行時間軸',
@@ -101,6 +102,11 @@ export default {
       planner: '規劃風險層級',
       overrideReasonPlaceholder: '覆寫理由（selected 低於 planner 時必填）',
     },
+    tca: {
+      gate2Link: '對應 Gate 2：{id}',
+      viewEvidence: '查看證據',
+      mutationDigest: 'mutation digest',
+    },
   },
   spec: {
     action: {
@@ -145,6 +151,62 @@ export default {
       placeholder: 'commit 訊息',
     },
     submittedApprovalId: '核可編號（approval_id）：{id}',
+  },
+  tcaWorkspace: {
+    empty: '目前沒有已生效的 Gate 2 計畫可操作',
+    testCommit: {
+      pick: '選擇近期 commit…',
+      placeholder: 'test commit（手動輸入）',
+      precheckOk: 'lineage 預檢通過',
+    },
+    action: {
+      precheck: '預檢',
+      registerMutation: '登記 mutation',
+      runExpectedRed: '跑 expected-red',
+      runNegativeControl: '跑 negative-control',
+      retry: '重跑',
+      submit: '送核 TCA',
+    },
+    mutationPatch: {
+      placeholder: 'negative-control 用的 unified diff patch',
+    },
+    mutationId: 'mutation_id：{id}',
+    submittedApprovalId: '核可編號（approval_id）：{id}',
+  },
+  evidence: {
+    title: 'evidence：{id}',
+    loading: '載入中…',
+    result: {
+      passed: '通過',
+      failed: '失敗',
+      error: '錯誤',
+    },
+    run: {
+      running: '執行中…',
+    },
+    action: {
+      close: '關閉',
+    },
+    label: {
+      evidenceId: 'evidence_id',
+      kind: 'kind',
+      result: '結果',
+      baseCommit: 'base_commit',
+      testCommit: 'test_commit',
+      oracleSurfaceDigest: 'oracle_surface_digest',
+      mutationDigest: 'mutation_digest',
+      command: 'command',
+      cwd: 'cwd',
+      startedAt: '開始時間',
+      finishedAt: '結束時間',
+      exitCode: 'exit_code',
+      expectedFailure: 'expected_failure',
+      observedFailure: 'observed_failure',
+      stdoutDigest: 'stdout_digest',
+      stderrDigest: 'stderr_digest',
+      recordingRef: 'recording ref',
+      runnerVersion: 'runner_version',
+    },
   },
   approval: {
     action: {

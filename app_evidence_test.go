@@ -420,3 +420,105 @@ func TestShutdownDuringPreUlidWindowStillBoundsRunEvidence(t *testing.T) {
 		t.Fatalf("active-run registry must be empty after reclaim, got %d", nActiveAfter)
 	}
 }
+
+// ---- ValidateTestCommit (Task 22): validate-only lineage precheck ----
+
+func TestValidateTestCommitAcceptsPlanCommitItself(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+
+	// planCommit 對自己而言必為 ancestor（git merge-base --is-ancestor 自反），
+	// 範圍內 diff 為空——同 RunEvidence 的 happy path 用的 testCommit 值
+	// （TestRunEvidenceExpectedRed_AppendsJournalAndEmitsProgress）。
+	if err := a.ValidateTestCommit("P1", "T1", planCommit); err != nil {
+		t.Fatalf("ValidateTestCommit: %v", err)
+	}
+}
+
+func TestValidateTestCommitRejectsNonOracleLineage(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
+	setupApprovedEvidencePlan(t, a, "P1")
+
+	runGit(t, a, "mv", "run_test.sh", "not_oracle.sh")
+	runGit(t, a, "commit", "-m", "rename run_test.sh out of oracle scope")
+	testCommit := revParseHead(t, a)
+
+	if err := a.ValidateTestCommit("P1", "T1", testCommit); err == nil {
+		t.Fatal("ValidateTestCommit must reject a lineage range that renames the oracle file out of scope")
+	}
+}
+
+func TestValidateTestCommitRejectsUnknownTask(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+
+	if err := a.ValidateTestCommit("P1", "T-does-not-exist", planCommit); err == nil {
+		t.Fatal("ValidateTestCommit must reject an unknown task_id")
+	}
+}
+
+func TestValidateTestCommitRejectsWithoutActiveGate2(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	if err := a.ValidateTestCommit("P1", "T1", strings.Repeat("0", 40)); err == nil {
+		t.Fatal("ValidateTestCommit without an active Gate 2 approval for the plan must reject")
+	}
+}
+
+// ---- EvidenceCommitCandidates (Task 22): recent-commit dropdown data source ----
+
+func TestEvidenceCommitCandidatesListsCommitsAfterPlanCommitNewestFirst(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
+	setupApprovedEvidencePlan(t, a, "P1")
+
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho one\nexit 0\n")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "first candidate")
+	first := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho two\nexit 0\n")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "second candidate")
+	second := revParseHead(t, a)
+
+	candidates, err := a.EvidenceCommitCandidates("P1")
+	if err != nil {
+		t.Fatalf("EvidenceCommitCandidates: %v", err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("want 2 candidates after plan_commit, got %d: %+v", len(candidates), candidates)
+	}
+	if candidates[0].OID != second || candidates[0].Subject != "second candidate" {
+		t.Errorf("candidates[0] = %+v, want newest-first: oid=%s subject=%q", candidates[0], second, "second candidate")
+	}
+	if candidates[1].OID != first || candidates[1].Subject != "first candidate" {
+		t.Errorf("candidates[1] = %+v, want oid=%s subject=%q", candidates[1], first, "first candidate")
+	}
+}
+
+func TestEvidenceCommitCandidatesEmptyNotNilWhenNoNewCommits(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
+	setupApprovedEvidencePlan(t, a, "P1")
+
+	candidates, err := a.EvidenceCommitCandidates("P1")
+	if err != nil {
+		t.Fatalf("EvidenceCommitCandidates: %v", err)
+	}
+	if candidates == nil {
+		t.Fatal("EvidenceCommitCandidates must return a non-nil empty slice, not nil, when there are no new commits")
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("want 0 candidates, got %d: %+v", len(candidates), candidates)
+	}
+}
+
+func TestEvidenceCommitCandidatesRejectsWithoutActiveGate2(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	if _, err := a.EvidenceCommitCandidates("P1"); err == nil {
+		t.Fatal("EvidenceCommitCandidates without an active Gate 2 approval for the plan must reject")
+	}
+}

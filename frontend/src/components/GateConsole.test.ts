@@ -112,4 +112,100 @@ describe('GateConsole', () => {
     expect(w.find('[data-test=risk-error]').text()).toContain('gate: approval id "A" not found')
     expect(w.find('[data-test=approve]').attributes('disabled')).toBeDefined()
   })
+
+  // Task 22：tca 卡片——subject（既有 .subject 泛用渲染）、gate2_approval 連結、
+  // 兩筆 evidence 摘要（role/result/test_commit 短 SHA）、mutation digest。
+  const tcaBindings = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const evidenceRunFixture = (over: Partial<{ evidence_id: string; result: string; test_commit: string; observed_failure: string }> = {}) => ({
+    evidence_id: 'ev-red', kind: 'expected_red', result: 'passed', test_commit: 'a'.repeat(40),
+    observed_failure: '', ...over,
+  })
+
+  it('tca 卡片渲染 gate2_approval 連結、兩筆 evidence role／result／test_commit 短 SHA、mutation digest', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn()
+      .mockImplementation((id: string) => Promise.resolve(
+        id === 'ev-red' ? evidenceRunFixture({ result: 'passed' }) : evidenceRunFixture({ evidence_id: 'ev-neg', result: 'passed' }),
+      ))
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'pending', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(getEvidence).toHaveBeenCalledWith('ev-red')
+    expect(getEvidence).toHaveBeenCalledWith('ev-neg')
+    expect(w.find('[data-test=tca-section]').exists()).toBe(true)
+    expect(w.find('[data-test=tca-gate2-link]').text()).toContain('G2-1')
+    expect(w.find('[data-test=tca-evidence-expected_red]').exists()).toBe(true)
+    expect(w.find('[data-test=tca-evidence-result-expected_red]').text()).toContain('通過')
+    expect(w.find('[data-test=tca-evidence-expected_red]').text()).toContain('aaaaaaaaaa') // test_commit 短 SHA
+    expect(w.find('[data-test=tca-evidence-negative_control]').exists()).toBe(true)
+    expect(w.find('[data-test=tca-mutation]').text()).toContain('sha256:fffff…')
+  })
+
+  it('tca 卡片：result=error 顯示錯誤標示', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockImplementation((id: string) => Promise.resolve(
+      id === 'ev-red'
+        ? evidenceRunFixture({ result: 'error', observed_failure: 'timeout exceeded after 10m0s' })
+        : evidenceRunFixture({ evidence_id: 'ev-neg', result: 'passed' }),
+    ))
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'active', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(w.find('[data-test=tca-evidence-result-expected_red]').text()).toContain('錯誤')
+    expect(w.find('[data-test=tca-evidence-observed-expected_red]').text()).toContain('timeout exceeded after 10m0s')
+  })
+
+  it('tca 卡片：點擊「查看證據」emit open-evidence 帶 evidence_id', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'active', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    await w.find('[data-test=tca-evidence-open-expected_red]').trigger('click')
+    expect(w.emitted('open-evidence')).toEqual([['ev-red']])
+  })
+
+  it('tca 卡片：EvidenceGet 失敗顯示錯誤原文', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockRejectedValue(new Error('evidence: not found: evidence_id ev-red'))
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'active', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(w.find('[data-test=tca-evidence-error-expected_red]').text()).toContain('evidence: not found: evidence_id ev-red')
+  })
+
+  it('gate2／gate1 卡片不渲染 tca-section（回歸）', async () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'active', gate: 'gate2', subject: 'plan:P1' }], decide: vi.fn() },
+    })
+    await flushPromises()
+    expect(w.find('[data-test=tca-section]').exists()).toBe(false)
+  })
 })

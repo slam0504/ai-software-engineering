@@ -1,3 +1,5 @@
+import type { evidence } from '../wailsjs/go/models'
+
 // Envelope v1（M1 凍結契約）：欄位名對齊 Go contract.Envelope 的 json tag。
 export interface Usage { input_tokens: number; output_tokens: number; cached_input_tokens?: number }
 export interface ApprovalBinding { kind: string; role?: string; ref: string; digest: string }
@@ -26,8 +28,30 @@ export interface RiskSelection {
 }
 export interface ChatItem { role: 'user' | 'assistant'; text: string; thinking: string; streaming: boolean }
 export interface TimelineItem { env: Envelope; group?: number }
+// EvidenceCommitCandidates 回傳的單一候選（Task 22，main.CommitInfo 的
+// snake_case-free 手動鏡射——CommitInfo 本身只有 oid/subject 兩個欄位，
+// 不像 EvidenceRun 有 19 個欄位，值得直接手鏡射而非 import wailsjs 型別）。
+export interface CommitCandidate { oid: string; subject: string }
+// Bindings：session store（stores/session.ts）唯一消費的形狀——只有
+// StartSession／SendMessage，維持原樣不擴大（session.test.ts 的 mock 只給這兩
+// 個欄位，見 EvidenceBindings 的分離理由）。
 export interface Bindings {
   StartSession(provider: string, prompt: string, resume: string, recordCase: string,
     taskLabel: string, approvalPolicy: string): Promise<void>
   SendMessage(provider: string, prompt: string): Promise<void>
+}
+// EvidenceBindings：Task 22 TCA workspace 六個多參數 Go 綁定——同 SendMessage
+// 的既定教訓（M1.5 review P1-1），每個 adapter 都逐參數轉發，順序鎖在
+// bindings.test.ts。獨立於 Bindings（session store 用）之外，makeBindings()
+// 回傳的物件同時滿足兩者，但 App.vue 把這六個方法個別當 prop 傳給
+// TcaWorkspace／GateConsole／EvidenceDetail，不整包依賴 session 的
+// Bindings 形狀。
+export interface EvidenceBindings {
+  RegisterMutation(taskRef: string, patch: string): Promise<string>
+  RunEvidence(planID: string, taskID: string, testCommit: string, kind: string, mutationID: string): Promise<string>
+  EvidenceGet(evidenceID: string): Promise<evidence.EvidenceRun>
+  SubmitTestContract(planID: string, taskID: string, testCommit: string,
+    expectedRedID: string, negativeControlID: string, mutationID: string): Promise<string>
+  ValidateTestCommit(planID: string, taskID: string, testCommit: string): Promise<void>
+  EvidenceCommitCandidates(planID: string): Promise<CommitCandidate[]>
 }

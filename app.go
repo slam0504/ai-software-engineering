@@ -2017,6 +2017,98 @@ func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
 	return a.evidenceJournal.Get(evidenceID)
 }
 
+// CommitInfo is a single candidate for TcaWorkspace's test_commit dropdown
+// (Task 22): OID/Subject only — the UI shows a short OID + subject, the full
+// value goes into ValidateTestCommit/RunEvidence untouched.
+type CommitInfo struct {
+	OID     string `json:"oid"`
+	Subject string `json:"subject"`
+}
+
+// ValidateTestCommit is the UI's pre-flight lineage check (Task 22, §6/A4):
+// before spending a worktree checkout + command run on RunEvidence, let
+// TcaWorkspace surface a plan_commit..testCommit lineage error immediately.
+// It reuses exactly the checks evidence.Run performs before ever touching a
+// worktree — LoadAt (task must exist in the committed plan) and
+// LoadOracleAt+plan.VerifyLineage (every path touched in that range must
+// stay within the declared oracle surface) — against the same active Gate 2
+// plan_commit RunEvidence trusts (activeGate2PlanCommit), never the
+// caller-supplied testCommit's own ancestry. Validate only: no worktree, no
+// command execution.
+func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
+	entries, err := a.GateList()
+	if err != nil {
+		return err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	pl, _, err := a.planLoader.LoadAt(planCommit, planID)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, t := range pl.Tasks {
+		if t.ID == taskID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("evidence: task %q not found in plan %q at %s", taskID, planID, planCommit)
+	}
+	oracleDecl, err := a.planLoader.LoadOracleAt(planCommit)
+	if err != nil {
+		return err
+	}
+	return plan.VerifyLineage(a.planGit, planCommit, testCommit, oracleDecl.Match)
+}
+
+// EvidenceCommitCandidates lists the most recent commits after the active
+// Gate 2 plan_commit (Task 22): the data source for TcaWorkspace's
+// test_commit dropdown — `git log --format=%H%x00%s -n 20 <plan_commit>..HEAD`,
+// newest first (git log's default order). Returns an empty (non-nil) slice
+// when the range has no commits, never nil, so the frontend can render it
+// without a null-check.
+func (a *App) EvidenceCommitCandidates(planID string) ([]CommitInfo, error) {
+	entries, err := a.GateList()
+	if err != nil {
+		return nil, err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return nil, fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	out, err := a.planGit.Git("log", "--format=%H%x00%s", "-n", "20", planCommit+"..HEAD")
+	if err != nil {
+		return nil, err
+	}
+	return parseCommitCandidates(out), nil
+}
+
+// parseCommitCandidates parses `git log --format=%H%x00%s` output (one
+// "<oid>\x00<subject>" record per line, newline-delimited — git log's
+// default record separator, unlike the -z NUL-delimited format
+// plan.VerifyLineage's diff parsing needs).
+func parseCommitCandidates(out []byte) []CommitInfo {
+	trimmed := strings.TrimRight(string(out), "\n")
+	if trimmed == "" {
+		return []CommitInfo{}
+	}
+	lines := strings.Split(trimmed, "\n")
+	result := make([]CommitInfo, 0, len(lines))
+	for _, ln := range lines {
+		parts := strings.SplitN(ln, "\x00", 2)
+		ci := CommitInfo{OID: parts[0]}
+		if len(parts) > 1 {
+			ci.Subject = parts[1]
+		}
+		result = append(result, ci)
+	}
+	return result
+}
+
 // tcaBindings assembles the six §3.4 required test_contract_approval
 // bindings (Task 21). gate2ApprovalID/gate2RecordDigest/gate2BaseCommitDigest
 // anchor this contract to the specific gate2 ApprovalRecord it was decided

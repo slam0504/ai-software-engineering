@@ -8,6 +8,7 @@ import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
 import { usePlan } from './stores/plan'
+import { useEvidence } from './stores/evidence'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import type { GateEntry, RiskSelection } from './types'
@@ -21,6 +22,8 @@ import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
 import PlanWorkspace from './components/PlanWorkspace.vue'
+import TcaWorkspace from './components/TcaWorkspace.vue'
+import EvidenceDetail from './components/EvidenceDetail.vue'
 import DiagramPane from './components/DiagramPane.vue'
 import DagPane from './components/DagPane.vue'
 
@@ -29,6 +32,9 @@ const s = useSession()
 const gate = useGate()
 const assist = useAssist()
 const plan = usePlan()
+const evidence = useEvidence()
+const wailsBindings = makeBindings() // Task 22：TCA workspace 六個綁定的唯一 production 來源（見 bindings.test.ts）
+const selectedEvidenceId = ref('')
 const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
 const gateError = ref('')
 
@@ -55,7 +61,7 @@ async function decideGate(id: string, decision: string, reason: string, riskSele
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag'>('chat')
+const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'>('chat')
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
 // 本身是常駐側欄，不是分頁，故「導航」在此語意上就是高亮＋不動 tab）。查不到對應
@@ -143,12 +149,13 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
-  s.setBindings(makeBindings())
+  s.setBindings(wailsBindings)
   EventsOn('workbench:event', (e: any) => {
     const dst = routeEnvelope(e)
     if (dst === 'gate') gate.applyGateEvent(e)
     else if (dst === 'assist') assist.applyAssistEvent(e)
     else if (dst === 'plan') plan.applyAssistEvent(e)
+    else if (dst === 'evidence') evidence.applyEvidenceEvent(e)
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
@@ -176,11 +183,18 @@ onMounted(async () => {
           <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">{{ t('app.tab.plan') }}</button>
           <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
           <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
+          <button :class="{ active: tab === 'tca' }" @click="tab = 'tca'">{{ t('app.tab.tca') }}</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
         <PlanWorkspace v-if="tab === 'plan'" />
+        <TcaWorkspace
+          v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
+          :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"
+          :register-mutation="wailsBindings.RegisterMutation" :run-evidence="wailsBindings.RunEvidence"
+          :get-evidence="wailsBindings.EvidenceGet" :submit-test-contract="wailsBindings.SubmitTestContract"
+        />
         <div v-show="tab === 'diagram'" class="diagram-tab">
           <div class="diagram-files">
             <button v-for="f in diagramFiles" :key="f" :class="{ active: f === diagramPath }"
@@ -194,7 +208,8 @@ onMounted(async () => {
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
         <GateConsole
           :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
-          :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
+          :get-evidence="wailsBindings.EvidenceGet" :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
+          @open-evidence="selectedEvidenceId = $event"
         />
         <p v-if="gateError" class="gate-err">{{ gateError }}</p>
       </aside>
@@ -206,6 +221,7 @@ onMounted(async () => {
     </button>
     <StatusBar />
     <ApprovalDialog />
+    <EvidenceDetail :evidence-id="selectedEvidenceId" :get="wailsBindings.EvidenceGet" @close="selectedEvidenceId = ''" />
   </div>
 </template>
 

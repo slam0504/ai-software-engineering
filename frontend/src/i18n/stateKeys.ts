@@ -12,6 +12,9 @@ export const codexToolStatusKeys: Record<string, string> = {
   completed: 'timeline.toolStatus.completed', inProgress: 'timeline.toolStatus.inProgress',
   failed: 'timeline.toolStatus.failed',
 }
+export const evidenceResultKeys: Record<string, string> = {
+  passed: 'evidence.result.passed', failed: 'evidence.result.failed', error: 'evidence.result.error',
+}
 export function resolveState(map: Record<string, string>, raw: string, translate: (k: string) => string): string {
   const key = map[raw]
   return key ? translate(key) : raw // unknown → 原樣，不洩漏缺漏 key
