@@ -248,7 +248,7 @@ async function confirmCommit() {
 
     <div class="approval">
       <button data-test="submit-for-approval" :disabled="submitBusy" @click="submitForApproval">{{ t('spec.action.submit') }}</button>
-      <span v-if="submitResult" class="ok">approval_id: {{ submitResult }}</span>
+      <span v-if="submitResult" class="ok">{{ t('spec.submittedApprovalId', { id: submitResult }) }}</span>
     </div>
     <p v-if="submitError" class="err">{{ submitError }}</p>
 

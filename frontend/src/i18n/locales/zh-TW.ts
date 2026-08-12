@@ -111,6 +111,7 @@ export default {
     commitMessage: {
       placeholder: 'commit 訊息',
     },
+    submittedApprovalId: '核可編號（approval_id）：{id}',
   },
   approval: {
     action: {
@@ -120,6 +121,8 @@ export default {
     reason: {
       placeholder: '理由（拒絕時建議填寫）',
     },
+    toolRequest: '工具權限請求',
+    pendingCount: '{n} 筆等待中',
   },
   diagram: {
     empty: '尚無可顯示的圖表',

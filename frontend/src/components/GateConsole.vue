@@ -45,7 +45,7 @@ function onReject(id: string) {
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + b.ref">{{ b.kind }}: {{ b.digest }}</li>
       </ul>
-      <p v-else-if="e.base_commit" class="bindings">base_commit: {{ e.base_commit }}</p>
+      <p v-else-if="e.base_commit" class="bindings">{{ t('gate.label.baseCommit') }}: {{ e.base_commit }}</p>
       <div v-if="e.state === 'pending'" class="actions">
         <input
           v-model="reasons[e.approval_id]"

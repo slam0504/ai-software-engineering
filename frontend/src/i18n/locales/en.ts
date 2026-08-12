@@ -111,6 +111,7 @@ export default {
     commitMessage: {
       placeholder: 'commit message',
     },
+    submittedApprovalId: 'approval_id: {id}',
   },
   approval: {
     action: {
@@ -120,6 +121,8 @@ export default {
     reason: {
       placeholder: 'Reason (suggested when denying)',
     },
+    toolRequest: 'Tool permission request',
+    pendingCount: '{n} pending',
   },
   diagram: {
     empty: 'No diagram to display',
