@@ -9,10 +9,13 @@
 //       minimum_risk_tier: medium
 //       planner_risk_tier: medium
 // 也就是 2-space 縮排的 task 列表項、4-space 縮排的欄位（對齊 "- " 後的
-// 第一個字元）、depends_on 的 block list 項目再多縮 2 space。不支援其他縮排
+// 第一個字元）。depends_on 的 block list 支援兩種縮排（go-yaml v3 兩種寫法都
+// 合法、後端實際會寫出）：項目比 key 多縮 2 space（"      - T2"），或項目與
+// key 同縮排（"    - T2"，go-yaml v3 預設 marshal 風格）。不支援其他縮排
 // 深度、多行 scalar（| / >）、或欄位順序以外的 YAML 特性；解析失敗（缺
-// plan_id、缺 tasks、task 缺 id）一律回傳 null，呼叫端（DagPane）決定如何
-// 呈現錯誤，不在這裡拋例外或猜測。
+// plan_id、缺 tasks、task 缺 id、或 depends_on 後面接了看似 list 項目但縮排
+// 既非上述兩種的可疑行——寧可 fail-null 也不要靜默吞成空陣列產出自信的錯圖）
+// 一律回傳 null，呼叫端（DagPane）決定如何呈現錯誤，不在這裡拋例外或猜測。
 
 export interface PlanTask {
   id: string
@@ -66,8 +69,12 @@ export function parsePlanDoc(yamlText: string): PlanDoc | null {
     const tasks: PlanTask[] = []
     let current: PlanTask | null = null
     // pendingDepsBlock：目前 task 的 depends_on 是 block list 形式（值留白），
-    // 等後續 "      - X" 行才收集依賴——見下方迴圈。
+    // 等後續 dash 行才收集依賴——見下方迴圈。malformed：曾出現「看起來像 depends_on
+    // 的 list 項目，但縮排既非同縮排也非多縮 2 space」的可疑行——與其把它當成
+    // 別的欄位跳過（等於把 depends_on 靜默解析成空陣列），整份文件直接判定解析
+    // 失敗（fail-null），不要產出自信但錯誤的圖。
     let pendingDepsBlock = false
+    let malformed = false
 
     function flush() {
       if (current) tasks.push(current)
@@ -92,9 +99,15 @@ export function parsePlanDoc(yamlText: string): PlanDoc | null {
       if (!current) continue
 
       if (pendingDepsBlock) {
-        const dep = /^ {6}- (.*)$/.exec(line)
-        if (dep) { current.dependsOn.push(stripScalar(dep[1])); continue }
-        pendingDepsBlock = false // 縮排不符 → depends_on block 結束，往下當一般欄位處理
+        const dep = /^( +)- ?(.*)$/.exec(line)
+        if (dep) {
+          // 同縮排（4-space，go-yaml v3 預設 marshal 風格）或多縮 2 space（6-space，
+          // 人工編排常見寫法）都算合法 depends_on 項目；其他縮排視為 malformed。
+          if (dep[1].length === 4 || dep[1].length === 6) { current.dependsOn.push(stripScalar(dep[2])); continue }
+          malformed = true
+          continue
+        }
+        pendingDepsBlock = false // 非 dash 行 → depends_on block 正常結束，往下當一般欄位處理
       }
 
       const field = /^ {4}(title|minimum_risk_tier|planner_risk_tier|depends_on):\s*(.*)$/.exec(line)
@@ -111,6 +124,7 @@ export function parsePlanDoc(yamlText: string): PlanDoc | null {
     }
     flush()
 
+    if (malformed) return null
     if (tasks.length === 0) return null
     if (tasks.some(t => !t.id)) return null
 
@@ -123,8 +137,33 @@ export function parsePlanDoc(yamlText: string): PlanDoc | null {
 // sanitizeNodeId：mermaid 節點 id 只允許 [A-Za-z0-9_-]，其餘字元換成 "_"。
 // 匯出供 DagPane 在渲染後的 SVG 節點 id（flowchart-<nodeId>-<idx>，mermaid 慣例）
 // 換回原始 task id 時複用同一套規則，避免兩處各自維護一份正規化邏輯。
+// 注意：這一步不保證唯一（見下方 buildNodeIdMap）——後端對 task id 只驗非空＋
+// 唯一，沒有字元限制，"a b" 與 "a_b" 這種不同 id sanitize 後會撞在一起。
 export function sanitizeNodeId(id: string): string {
   return id.replace(/[^A-Za-z0-9_-]/g, '_')
+}
+
+// buildNodeIdMap：task.id → 保證唯一的 mermaid 節點 id。sanitizeNodeId 本身
+// 不是單射（不同原始 id 可能 sanitize 成同一個字串），若直接拿它當節點 id，
+// 碰撞的兩個 task 會被 mermaid 疊成同一個節點（邊接錯、DagPane 點選對回錯的
+// taskId）。這裡照 doc.tasks 順序遇碰撞就加遞增後綴（_2, _3, ...）分開，
+// planToMermaid 與 DagPane 的點選反查都呼叫這個函式，兩邊永遠算出同一份
+// id 對應，不會各自維護、走鐘。
+export function buildNodeIdMap(doc: PlanDoc): Map<string, string> {
+  const used = new Set<string>()
+  const nodeIds = new Map<string, string>()
+  for (const task of doc.tasks) {
+    const base = sanitizeNodeId(task.id)
+    let candidate = base
+    let suffix = 2
+    while (used.has(candidate)) {
+      candidate = `${base}_${suffix}`
+      suffix++
+    }
+    used.add(candidate)
+    nodeIds.set(task.id, candidate)
+  }
+  return nodeIds
 }
 
 // escapeLabel：mermaid 字串節點內 `"` 需寫成 #quot; 才不會提早結束標籤字串、
@@ -142,17 +181,22 @@ function escapeLabel(s: string): string {
 // 風險」；缺值時退回 minimum_risk_tier；兩者皆空則該段省略），邊
 // `dep --> task`（依 depends_on 展開，缺依賴的任務不產生入邊）。
 export function planToMermaid(doc: PlanDoc): string {
+  const nodeIds = buildNodeIdMap(doc)
   const lines = ['flowchart TD']
   for (const task of doc.tasks) {
-    const nodeId = sanitizeNodeId(task.id)
+    const nodeId = nodeIds.get(task.id)!
     const tier = task.plannerRiskTier || task.minimumRiskTier
     const parts = [task.id, task.title, tier].filter(Boolean)
     lines.push(`  ${nodeId}["${escapeLabel(parts.join(' · '))}"]`)
   }
   for (const task of doc.tasks) {
-    const nodeId = sanitizeNodeId(task.id)
+    const nodeId = nodeIds.get(task.id)!
     for (const dep of task.dependsOn) {
-      lines.push(`  ${sanitizeNodeId(dep)} --> ${nodeId}`)
+      // 依賴指向的 task id 若不在 doc.tasks 內（dangling ref），退回單純 sanitize
+      // ——這種 plan 本身不合法，由 internal/plan.Validate 擋，不是本函式的職責，
+      // 這裡只求不崩、不誤把 dangling id 對到別的節點。
+      const depNodeId = nodeIds.get(dep) ?? sanitizeNodeId(dep)
+      lines.push(`  ${depNodeId} --> ${nodeId}`)
     }
   }
   return lines.join('\n')

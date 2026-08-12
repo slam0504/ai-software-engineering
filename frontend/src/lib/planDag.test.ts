@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parsePlanDoc, planToMermaid } from './planDag'
+import { parsePlanDoc, planToMermaid, type PlanDoc } from './planDag'
 
 function planYaml(opts: { title2?: string; dependsOn2?: string } = {}): string {
   const title2 = opts.title2 ?? 'Task 2'
@@ -57,10 +57,30 @@ describe('parsePlanDoc', () => {
     expect(doc?.tasks[1].dependsOn).toEqual(['T1'])
   })
 
-  it('depends_on 為 block list 形式也能解析', () => {
+  it('depends_on 為 block list 形式（比 key 多縮 2 space）也能解析', () => {
     const yaml = planYaml({ dependsOn2: '' }).replace('    depends_on: \n', '    depends_on:\n      - T1\n')
     const doc = parsePlanDoc(yaml)
     expect(doc?.tasks[1].dependsOn).toEqual(['T1'])
+  })
+
+  // review finding 1：depends_on 的 block list 項目若跟 depends_on: 同縮排
+  // （go-yaml v3 預設 marshal 風格、後端實際會寫出），舊版解析器會把它靜默
+  // 當成無法辨識的欄位跳過，dependsOn 停留在初始值 []——產出「看起來成功、
+  // 實際少了依賴邊」的錯圖，比直接回 null 更糟。這裡驗證同縮排也要正確解析
+  // 出依賴，不能是空陣列。
+  it('depends_on 為 block list 形式（與 key 同縮排）也能正確解析，不是空陣列', () => {
+    const yaml = planYaml({ dependsOn2: '' }).replace('    depends_on: \n', '    depends_on:\n    - T1\n')
+    const doc = parsePlanDoc(yaml)
+    expect(doc).not.toBeNull()
+    expect(doc?.tasks[1].dependsOn).toEqual(['T1'])
+  })
+
+  // 同一個 finding 的反面：depends_on 後面接了看起來像 list 項目、但縮排既非
+  // 同縮排（4-space）也非多縮 2 space（6-space）的可疑行——寧可 fail-null，
+  // 也不能把它當成別的欄位跳過而讓 dependsOn 悄悄停在空陣列。
+  it('depends_on block list 縮排既非同縮排也非多縮 2 space → 回傳 null（不是空依賴的成功解析）', () => {
+    const yaml = planYaml({ dependsOn2: '' }).replace('    depends_on: \n', '    depends_on:\n  - T1\n')
+    expect(parsePlanDoc(yaml)).toBeNull()
   })
 
   it('非法輸入（缺 plan_id）回傳 null', () => {
@@ -102,5 +122,25 @@ describe('planToMermaid', () => {
     const doc = parsePlanDoc(planYaml({ dependsOn2: '[]' }))!
     const out = planToMermaid(doc)
     expect(out).not.toContain('-->')
+  })
+
+  // review finding 2：後端對 task id 只驗非空＋唯一，沒有字元限制。"a b" 與
+  // "a_b" 是兩個不同、合法的 task id，但 sanitizeNodeId 都會變成 "a_b"——若
+  // 直接拿來當節點 id，會被 mermaid 疊成同一個節點，邊接錯、DagPane 點選也
+  // 會對回錯的 taskId。驗證兩者仍各自產生獨立節點、依賴邊接到正確的節點。
+  it('sanitize 後碰撞的 task id 仍各自產生獨立節點與正確的邊', () => {
+    const doc: PlanDoc = {
+      planId: 'P1',
+      tasks: [
+        { id: 'a b', title: 'First', dependsOn: [], minimumRiskTier: 'low', plannerRiskTier: 'low' },
+        { id: 'a_b', title: 'Second', dependsOn: ['a b'], minimumRiskTier: 'low', plannerRiskTier: 'low' },
+      ],
+    }
+    const out = planToMermaid(doc)
+    const nodeLines = out.split('\n').filter(l => l.includes('["'))
+    expect(nodeLines).toHaveLength(2) // 沒有被疊成同一個節點
+    expect(out).toContain('a_b["a b · First · low"]')
+    expect(out).toContain('a_b_2["a_b · Second · low"]')
+    expect(out).toContain('a_b --> a_b_2') // 依賴邊接到正確（各自獨立）的節點 id
   })
 })

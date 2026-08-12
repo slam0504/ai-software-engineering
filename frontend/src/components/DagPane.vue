@@ -3,7 +3,7 @@ import { nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import mermaid from 'mermaid'
 import { usePlan } from '../stores/plan'
-import { parsePlanDoc, planToMermaid, sanitizeNodeId, type PlanDoc } from '../lib/planDag'
+import { parsePlanDoc, planToMermaid, buildNodeIdMap, type PlanDoc } from '../lib/planDag'
 
 // DagPane（Task 14，spec §6）：plan store 目前檔內容（PlanWorkspace 已載入的
 // buffer）→ parsePlanDoc → planToMermaid → mermaid render，重用 DiagramPane.vue
@@ -15,9 +15,12 @@ import { parsePlanDoc, planToMermaid, sanitizeNodeId, type PlanDoc } from '../li
 // 自動重渲染」，不需要另外訂閱 workspace 事件。
 //
 // 節點點選：mermaid 11 對 flowchart 節點的 DOM id 慣例是
-// `flowchart-<sanitizedNodeId>-<index>`；渲染後用這個規則換回原始 task id
-// （sanitizeNodeId 非一定可逆，換不回來就不綁 click，不臆測）再 emit
-// select-task，交給 App.vue 導向 GateConsole（Task 15）。
+// `flowchart-<nodeId>-<index>`；渲染後用這個規則換回原始 task id 再 emit
+// select-task，交給 App.vue 導向 GateConsole（Task 15）。nodeId → task id 的
+// 反查表用 planDag 的 buildNodeIdMap（與 planToMermaid 內部同一份邏輯）反轉
+// 而來——task id sanitize 後可能碰撞（如 "a b" 與 "a_b" 都變 "a_b"），
+// buildNodeIdMap 已經用遞增後綴保證節點 id 彼此不同，這裡才能放心反轉成
+// 一對一的 Map，不會把兩個 task 的點選都導到同一個 taskId。
 const { t } = useI18n()
 const plan = usePlan()
 const emit = defineEmits<{ (e: 'select-task', taskId: string): void }>()
@@ -29,7 +32,7 @@ let renderSeq = 0
 
 function bindClicks(doc: PlanDoc) {
   if (!container.value) return
-  const idByNode = new Map(doc.tasks.map(task => [sanitizeNodeId(task.id), task.id]))
+  const idByNode = new Map(Array.from(buildNodeIdMap(doc), ([taskId, nodeId]) => [nodeId, taskId]))
   container.value.querySelectorAll<SVGGElement>('.node').forEach(node => {
     const m = /^flowchart-(.+)-\d+$/.exec(node.id)
     const taskId = m ? idByNode.get(m[1]) : undefined
