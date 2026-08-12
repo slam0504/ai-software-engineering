@@ -117,7 +117,7 @@ func TestSpecAssistExclusivePerProvider(t *testing.T) {
 	a := newTestAppAssist(t, blockingRunner())
 	go a.SpecAssist("claude", "spec_assist", "draft") //nolint:errcheck // 卡住至 reclaim
 	waitAssistActive(t, a, "claude")
-	if err := a.SpecAssist("claude", "spec_assist", "draft2"); !errors.Is(err, ErrAssistActive) {
+	if _, err := a.SpecAssist("claude", "spec_assist", "draft2"); !errors.Is(err, ErrAssistActive) {
 		t.Fatalf("second concurrent assist must be rejected: %v", err)
 	}
 	a.reclaimAssists() // 收束：cancel 卡住的 one-shot（釋放 goroutine＋交易閘）
@@ -157,7 +157,7 @@ func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 		<-release
 	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- a.SpecAssist("claude", "spec_assist", "draft") }()
+	go func() { _, err := a.SpecAssist("claude", "spec_assist", "draft"); errCh <- err }()
 	<-entered // gen 已可見、beginAppTxn 未開始
 	a.hookAssistBeforeTxn = nil
 
@@ -190,7 +190,7 @@ func TestCodexAssistCannotEscalateOrMutateSessionView(t *testing.T) {
 			providerEvents++
 		}
 	}
-	err := a.SpecAssist("codex", "spec_assist", "draft")
+	_, err := a.SpecAssist("codex", "spec_assist", "draft")
 	if err == nil {
 		t.Fatal("escalation/approval must fail closed")
 	}
@@ -218,7 +218,7 @@ func TestSpecAssistStaleGenerationEventDropped(t *testing.T) {
 		return nil // 立即結束 → teardown 清 active flag
 	})
 	a := newTestAppAssist(t, leak)
-	if err := a.SpecAssist("codex", "spec_assist", "draft"); err != nil {
+	if _, err := a.SpecAssist("codex", "spec_assist", "draft"); err != nil {
 		t.Fatal(err)
 	}
 	// 此刻無 active generation：晚到事件必被丟棄並發 stream_error（fail loud）。

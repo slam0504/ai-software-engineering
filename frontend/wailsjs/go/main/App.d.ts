@@ -37,7 +37,7 @@ export function RestoreViews():Promise<Record<string, main.RestoredView>>;
 
 export function SendMessage(arg1:string,arg2:string):Promise<void>;
 
-export function SpecAssist(arg1:string,arg2:string,arg3:string):Promise<void>;
+export function SpecAssist(arg1:string,arg2:string,arg3:string):Promise<string>;
 
 export function SpecList():Promise<Array<main.FileNode>>;
 

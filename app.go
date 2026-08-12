@@ -1141,9 +1141,9 @@ func (a *App) GateDecide(approvalID, decision, reason string) error {
 // 事件經 Manager.EmitAssist 出口（scope=session、provider、correlation_id、
 // purpose="spec_assist"）——保留稽核＋檔案級 event_id，但**不進 provider slot**
 // （前端依 purpose 二次分流，不污染 reducer／Chat／totals）。
-func (a *App) SpecAssist(provider, purpose, prompt string) error {
+func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
 	if provider != "claude" && provider != "codex" {
-		return fmt.Errorf("unknown provider %q", provider)
+		return "", fmt.Errorf("unknown provider %q", provider)
 	}
 	// Pin the assist purpose at the emit boundary (defense in depth): this is the
 	// isolated assist lane, so every emitted envelope MUST carry
@@ -1163,7 +1163,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 	if _, exists := a.assistActive[provider]; exists { // 獨佔性：第二個併發請求被拒
 		a.assistMu.Unlock()
 		cancel()
-		return ErrAssistActive
+		return "", ErrAssistActive
 	}
 	a.assistActive[provider] = gen
 	a.assistMu.Unlock()
@@ -1178,7 +1178,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 		}
 		a.assistMu.Unlock()
 		cancel()
-		return err
+		return "", err
 	}
 
 	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
@@ -1198,7 +1198,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 
 	runner, err := a.newAssistRunner(provider)
 	if err != nil {
-		return err
+		return gen.correlationID, err
 	}
 
 	prov := contract.Provider(provider)
@@ -1215,7 +1215,8 @@ func (a *App) SpecAssist(provider, purpose, prompt string) error {
 		}
 		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
 	}
-	return runner.Run(ctx, prompt, sink)
+	err = runner.Run(ctx, prompt, sink)
+	return gen.correlationID, err
 }
 
 // newAssistRunner：production 造 provider 專屬隔離 one-shot Runner；測試以
