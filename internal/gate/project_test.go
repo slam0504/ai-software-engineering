@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -194,11 +195,18 @@ func TestProjectNormalizesV1AndRejectedTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	ops, _, bad := parseOps(data)
-	if bad != nil {
-		t.Fatalf("fixture must parse: %v", bad.err)
+	// parseOps moved into internal/journal as part of the M3a Task 6
+	// generalization; reload via OpenJournal from a scratch copy instead of
+	// calling the (now generic, raw-line) parser directly.
+	p := filepath.Join(t.TempDir(), "gate.jsonl")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("write scratch copy: %v", err)
 	}
-	entries, err := Project(ops)
+	j, err := OpenJournal(p)
+	if err != nil {
+		t.Fatalf("fixture must parse: %v", err)
+	}
+	entries, err := Project(j.Ops())
 	if err != nil {
 		t.Fatal(err)
 	}

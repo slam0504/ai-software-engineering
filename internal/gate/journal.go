@@ -1,117 +1,58 @@
 package gate
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
-	"os"
 	"sync"
+
+	"github.com/slam0504/sdlc-workbench/internal/journal"
 )
 
 var ErrJournalDegraded = errors.New("gate journal degraded")
 
+// Journal is a thin GateOp-typed wrapper around the generic append-only
+// internal/journal.Journal. It owns marshaling GateOp <-> raw JSON lines;
+// crash-safe tail repair and write/sync semantics live in internal/journal.
 type Journal struct {
-	mu       sync.Mutex
-	path     string
-	f        *os.File
-	ops      []GateOp
-	degraded bool
+	mu  sync.Mutex
+	j   *journal.Journal
+	ops []GateOp
 }
 
+// OpenJournal opens the underlying raw journal at path and unmarshals every
+// loaded line into a GateOp. A line that fails to unmarshal as a GateOp is
+// mid-file corruption at the gate level (the generic layer already accepted
+// it as syntactically valid JSON) and causes OpenJournal to fail loud,
+// matching the pre-refactor behavior.
 func OpenJournal(path string) (*Journal, error) {
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	ops, validLen, badTail := parseOps(data)
-	if badTail != nil && !badTail.isFinal {
-		return nil, badTail.err // 中段 malformed：fail loud，不修
-	}
-	if badTail != nil { // final malformed：quarantine + truncate
-		if werr := os.WriteFile(path+".quarantine", data[validLen:], 0o644); werr != nil {
-			return nil, werr
-		}
-		if terr := truncateAndSync(path, data[:validLen]); terr != nil {
-			return nil, terr
-		}
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	j, err := journal.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &Journal{path: path, f: f, ops: ops}, nil
-}
-
-type parseErr struct {
-	err     error
-	isFinal bool
-}
-
-func parseOps(data []byte) (ops []GateOp, validLen int, bad *parseErr) {
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	offset := 0
-	lines := [][]byte{}
-	for sc.Scan() {
-		lines = append(lines, append([]byte(nil), sc.Bytes()...))
-	}
-	// 逐行 unmarshal；最後一行壞 = final（截斷），中段壞 = fail loud
-	for i, ln := range lines {
+	lines := j.Lines()
+	ops := make([]GateOp, 0, len(lines))
+	for _, ln := range lines {
 		var op GateOp
 		if err := json.Unmarshal(ln, &op); err != nil {
-			isFinal := i == len(lines)-1 && !bytes.HasSuffix(data, []byte("\n"))
-			return ops, offset, &parseErr{err: err, isFinal: isFinal}
+			return nil, err
 		}
 		ops = append(ops, op)
-		offset += len(ln) + 1
 	}
-	// Every line parsed as valid JSON. Append always writes `line + '\n'` in a
-	// single Sync'd call, so a file that does NOT end in '\n' means the last
-	// line was never durably committed — a crash can tear off exactly the
-	// trailing newline while leaving otherwise-valid JSON bytes behind. Treat
-	// that last line as a torn final tail even though it parses, so it goes
-	// through the same quarantine+truncate repair path.
-	if len(data) > 0 && len(lines) > 0 && !bytes.HasSuffix(data, []byte("\n")) {
-		lastLen := len(lines[len(lines)-1])
-		validLen := offset - lastLen - 1
-		return ops[:len(ops)-1], validLen, &parseErr{
-			err:     errors.New("torn final line without trailing newline"),
-			isFinal: true,
-		}
-	}
-	return ops, offset, nil
-}
-
-func truncateAndSync(path string, keep []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := f.Write(keep); err != nil {
-		return err
-	}
-	return f.Sync()
+	return &Journal{j: j, ops: ops}, nil
 }
 
 func (j *Journal) Append(op GateOp) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.degraded {
+	if j.j.Degraded() {
 		return ErrJournalDegraded
 	}
 	line, err := json.Marshal(op)
 	if err != nil {
 		return err
 	}
-	if _, err := j.f.Write(append(line, '\n')); err != nil {
-		j.degraded = true
-		return err
-	}
-	if err := j.f.Sync(); err != nil {
-		j.degraded = true
-		return err
+	if err := j.j.Append(line); err != nil {
+		return err // raw write/sync error; underlying journal is now degraded
 	}
 	j.ops = append(j.ops, op)
 	return nil
@@ -123,6 +64,6 @@ func (j *Journal) Ops() []GateOp {
 	return append([]GateOp(nil), j.ops...)
 }
 
-func (j *Journal) Degraded() bool { j.mu.Lock(); defer j.mu.Unlock(); return j.degraded }
+func (j *Journal) Degraded() bool { return j.j.Degraded() }
 
-func (j *Journal) Close() error { return j.f.Close() }
+func (j *Journal) Close() error { return j.j.Close() }
