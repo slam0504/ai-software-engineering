@@ -13,6 +13,7 @@ const (
 
 type Binding struct {
 	Kind   string `json:"kind"`
+	Role   string `json:"role,omitempty"`
 	Ref    string `json:"ref"`
 	Digest string `json:"digest"`
 }
