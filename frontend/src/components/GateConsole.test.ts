@@ -14,6 +14,6 @@ describe('GateConsole', () => {
   })
   it('shows stale badge', () => {
     const w = mountWithI18n(GateConsole, { props: { entries: [{ approval_id: 'A', state: 'stale' }], decide: vi.fn() } })
-    expect(w.find('[data-test=badge-A]').text()).toContain('STALE')
+    expect(w.find('[data-test=badge-A]').text()).toContain('已失效') // zh-TW 預設 locale：gate.state.stale
   })
 })

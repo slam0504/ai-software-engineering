@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import mermaid from 'mermaid'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { SpecRead } from '../../wailsjs/go/main/App'
@@ -16,6 +17,7 @@ const props = defineProps<{
   read?: (rel: string) => Promise<{ content: string; digest: string }>
 }>()
 
+const { t } = useI18n()
 const svg = ref('')
 const error = ref('')
 
@@ -66,7 +68,7 @@ onMounted(() => {
 <template>
   <div class="diagram-pane">
     <div v-if="error" class="err">{{ error }}</div>
-    <div v-if="!error && !svg" class="hint">尚無可顯示的圖表</div>
+    <div v-if="!error && !svg" class="hint">{{ t('diagram.empty') }}</div>
     <div v-if="svg" class="rendered" v-html="svg" />
   </div>
 </template>

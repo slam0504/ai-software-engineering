@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import {
   ConfirmSpecCommit, PreviewSpecCommit, SpecAssist, SpecList, SpecRead, SpecWrite, SubmitForApproval,
 } from '../../wailsjs/go/main/App'
@@ -7,6 +8,8 @@ import type { main, spec } from '../../wailsjs/go/models'
 import { useSession } from '../stores/session'
 import { useAssist } from '../stores/assist'
 import { extractGherkin } from '../lib/gherkin'
+
+const { t } = useI18n()
 
 // SpecWorkspace（Task 15，spec §5.1）：CodeMirror 6 編輯器＋三個 AI 輔助按鈕＋
 // 草稿區（accept 後才 SpecWrite）＋送核＋SpecCommit 兩階段 UI。
@@ -230,31 +233,31 @@ async function confirmCommit() {
     <p v-if="loadError" class="err">{{ loadError }}</p>
 
     <div class="assist-buttons">
-      <button data-test="assist-draft" :disabled="assistBusy" @click="draftGherkin">草擬 Gherkin</button>
-      <button data-test="assist-ambiguity" :disabled="assistBusy" @click="detectAmbiguity">歧義偵測</button>
-      <button data-test="assist-oracle" :disabled="assistBusy" @click="checkOracleCoverage">oracle 覆蓋檢查</button>
+      <button data-test="assist-draft" :disabled="assistBusy" @click="draftGherkin">{{ t('spec.action.draftGherkin') }}</button>
+      <button data-test="assist-ambiguity" :disabled="assistBusy" @click="detectAmbiguity">{{ t('spec.action.detectAmbiguity') }}</button>
+      <button data-test="assist-oracle" :disabled="assistBusy" @click="checkOracleCoverage">{{ t('spec.action.checkOracle') }}</button>
     </div>
     <p v-if="assistError" class="err">{{ assistError }}</p>
 
     <div class="draft-area">
-      <p v-if="assistBusy" class="assist-busy" data-test="assist-busy">AI 產生中…</p>
+      <p v-if="assistBusy" class="assist-busy" data-test="assist-busy">{{ t('spec.assist.drafting') }}</p>
       <pre class="draft-text" data-test="draft-text">{{ draftText }}</pre>
-      <button data-test="accept-draft" :disabled="!draftText" @click="acceptDraft">Accept</button>
+      <button data-test="accept-draft" :disabled="!draftText" @click="acceptDraft">{{ t('spec.action.acceptDraft') }}</button>
     </div>
     <p v-if="acceptError" class="err">{{ acceptError }}</p>
 
     <div class="approval">
-      <button data-test="submit-for-approval" :disabled="submitBusy" @click="submitForApproval">Submit for Approval</button>
+      <button data-test="submit-for-approval" :disabled="submitBusy" @click="submitForApproval">{{ t('spec.action.submit') }}</button>
       <span v-if="submitResult" class="ok">approval_id: {{ submitResult }}</span>
     </div>
     <p v-if="submitError" class="err">{{ submitError }}</p>
 
     <div class="commit">
-      <button data-test="preview-commit" :disabled="commitBusy" @click="previewCommit">Preview Commit</button>
+      <button data-test="preview-commit" :disabled="commitBusy" @click="previewCommit">{{ t('spec.action.previewCommit') }}</button>
       <pre v-if="commitDiff" class="diff" data-test="commit-diff">{{ commitDiff }}</pre>
       <template v-if="commitToken">
-        <input v-model="commitMessage" data-test="commit-message" placeholder="commit message" />
-        <button data-test="confirm-commit" :disabled="commitBusy" @click="confirmCommit">Confirm Commit</button>
+        <input v-model="commitMessage" data-test="commit-message" :placeholder="t('spec.commitMessage.placeholder')" />
+        <button data-test="confirm-commit" :disabled="commitBusy" @click="confirmCommit">{{ t('spec.action.confirmCommit') }}</button>
       </template>
     </div>
     <p v-if="commitError" class="err">{{ commitError }}</p>

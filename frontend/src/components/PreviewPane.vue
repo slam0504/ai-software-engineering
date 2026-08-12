@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import mermaid from 'mermaid'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ReadWorkspaceFile } from '../../wailsjs/go/main/App'
 import { renderMarkdown } from '../lib/markdown'
 
 const props = defineProps<{ path: string }>()
+const { t } = useI18n()
 
 const html = ref('')
 const plain = ref('')
@@ -96,7 +98,7 @@ onMounted(() => {
 <template>
   <div ref="paneEl" class="preview">
     <div v-if="error" class="err">{{ error }}</div>
-    <div v-if="mode === 'empty' && !error" class="hint">在左側選擇檔案以預覽</div>
+    <div v-if="mode === 'empty' && !error" class="hint">{{ t('preview.empty') }}</div>
     <pre v-if="mode === 'text'" class="plain">{{ plain }}</pre>
     <div v-if="mode === 'md' || mode === 'mmd'" class="rendered" v-html="html" />
   </div>
