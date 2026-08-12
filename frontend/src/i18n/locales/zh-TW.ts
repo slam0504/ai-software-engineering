@@ -38,6 +38,7 @@ export default {
     },
     operation: {
       success: '{action}成功',
+      successDetail: '{action}成功：{detail}',
       failure: '{action}失敗：{error}',
     },
     taskId: {

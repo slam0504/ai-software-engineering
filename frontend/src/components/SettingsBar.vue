@@ -19,10 +19,14 @@ const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.set
 async function call(fn: () => Promise<unknown>, opKey: string) {
   const action = t('settings.operationAction.' + opKey)
   try {
-    await fn()
-    s.note(t('settings.operation.success', { action }))
+    const r = await fn()
+    if (typeof r === 'string' && r) {
+      s.note(t('settings.operation.successDetail', { action, detail: r.slice(0, 400) }))
+    } else {
+      s.note(t('settings.operation.success', { action }))
+    }
   } catch (e: any) {
-    s.note(t('settings.operation.failure', { action, error: String(e) }))
+    s.pushError(t('settings.operation.failure', { action, error: String(e) }))
   }
 }
 </script>

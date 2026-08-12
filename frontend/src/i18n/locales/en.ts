@@ -38,6 +38,7 @@ export default {
     },
     operation: {
       success: '{action} ok',
+      successDetail: '{action} ok: {detail}',
       failure: '{action} failed: {error}',
     },
     taskId: {
