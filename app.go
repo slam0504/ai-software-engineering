@@ -1150,12 +1150,23 @@ func (a *App) ensureGate() (*gate.Service, error) {
 		}
 		currentRiskPolicyDigest := func() (string, error) { return worktreeRiskPolicyDigest(root) }
 		currentPermissionManifest := func() (string, error) { return worktreePermissionManifestDigest(root) }
+		// currentOracleDigest（Task 21：§3.9 持續重算）：decl 一律來自 TCA 綁定的
+		// gate2 approval plan_commit（TCALoader.LoadOracleAt），這裡只負責對「目前
+		// 工作區」重算其 manifest digest——鏡射 currentPlanManifest／
+		// currentSpecManifest 建 spec.GitRepo(root, scope) 再走
+		// BuildCurrentManifestScoped 的既定用法，scope 換成 decl.Scope()（每次呼叫
+		// 依 decl 動態決定，不像 Spec／PlanScope 是套件層級常數）。
+		currentOracleDigest := func(decl evidence.OracleDecl) (string, error) {
+			return spec.BuildCurrentManifestScoped(spec.NewGitRepo(root, decl.Scope()), decl.Scope())
+		}
 		ulidFn := func() string { return contract.NewULID(time.Now()) }
 		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 		reg := gate.Registry{
 			"gate1": gate.NewGate1Policy(currentSpecManifest),
 			"gate2": gatepolicy.NewGate2Policy(a.planLoader, a.planGit,
 				currentPlanManifest, currentSpecManifest, currentRiskPolicyDigest, currentPermissionManifest),
+			"test_contract_approval": gatepolicy.NewTCAPolicy(appEvidenceStore{a: a}, appGateReader{a: a},
+				a.planLoader, a.planGit, currentOracleDigest),
 		}
 		a.gateSvc = gate.NewService(j, reg, ulidFn, nowFn, gateEmitter{a})
 	})
@@ -1278,6 +1289,60 @@ func (l appPlanLoader) LoadOracleAt(commitOID string) (evidence.OracleDecl, erro
 	return evidence.ParseOracleDecl(raw)
 }
 
+// appEvidenceStore implements gatepolicy.EvidenceStore over a's evidence
+// journal/CAS. Holds a reference to *App (not a value snapshot of
+// a.evidenceJournal/a.evidenceCASDir) because those fields are populated by
+// startupEvidence(), a function independent of ensureGate()'s lazy init —
+// reading through a keeps every call bound to whatever the fields hold at
+// call time. Get/Mutation each re-verify the CAS artifacts their journal
+// record references (stdout/stderr for a run, the patch for a mutation)
+// before returning, folding §3.9's "CAS artifact reread" into the two reads
+// TCAPolicy already needs (see gatepolicy.EvidenceStore's doc comment).
+type appEvidenceStore struct{ a *App }
+
+func (s appEvidenceStore) Get(evidenceID string) (evidence.EvidenceRun, error) {
+	if s.a.evidenceJournal == nil {
+		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
+	}
+	run, err := s.a.evidenceJournal.Get(evidenceID)
+	if err != nil {
+		return evidence.EvidenceRun{}, err
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, run.StdoutDigest); verr != nil {
+		return evidence.EvidenceRun{}, fmt.Errorf("evidence: verify stdout artifact for %s: %w", evidenceID, verr)
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, run.StderrDigest); verr != nil {
+		return evidence.EvidenceRun{}, fmt.Errorf("evidence: verify stderr artifact for %s: %w", evidenceID, verr)
+	}
+	return run, nil
+}
+
+func (s appEvidenceStore) Mutation(mutationID string) (evidence.Mutation, error) {
+	if s.a.evidenceJournal == nil {
+		return evidence.Mutation{}, errors.New("evidence: not initialized")
+	}
+	m, err := s.a.evidenceJournal.GetMutation(mutationID)
+	if err != nil {
+		return evidence.Mutation{}, err
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, m.Digest); verr != nil {
+		return evidence.Mutation{}, fmt.Errorf("evidence: verify mutation artifact %s: %w", mutationID, verr)
+	}
+	return m, nil
+}
+
+// appGateReader implements gatepolicy.GateReader by delegating to
+// a.gateSvc.Lookup. A thin indirection (rather than passing a.gateSvc
+// directly) because the registry that wires TCAPolicy is itself being built
+// inside the same ensureGate() call that will assign a.gateSvc — by the time
+// any TCAPolicy method runs (always after ensureGate() has returned),
+// a.gateSvc is set.
+type appGateReader struct{ a *App }
+
+func (r appGateReader) Lookup(approvalID string) (*gate.ApprovalRecord, gate.State, error) {
+	return r.a.gateSvc.Lookup(approvalID)
+}
+
 // planIDFromSubject／bindingDigest／gitOIDFromDigest mirror
 // internal/gatepolicy 的同名未匯出 helper——app 層無法引用其他 package 的未
 // 匯出識別字，複製這三個各 4-10 行的小函式比為單一呼叫端擴大 gatepolicy 的
@@ -1336,6 +1401,20 @@ func activeGate2PlanCommit(entries []GateEntryDTO, planID string) (planCommit st
 			continue
 		}
 		return gitOIDFromDigest(bindingDigest(e.Bindings, "base_commit")), true
+	}
+	return "", false
+}
+
+// activeGate2ApprovalID：SubmitTestContract 唯一信任的 gate2_approval 來源
+// ——active gate2（subject="plan:"+planID）的 approval_id，用來反查完整
+// ApprovalRecord（RecordDigest 需要全部欄位，GateEntryDTO 不夠）。
+func activeGate2ApprovalID(entries []GateEntryDTO, planID string) (approvalID string, ok bool) {
+	subject := "plan:" + planID
+	for _, e := range entries {
+		if e.Gate != "gate2" || e.State != string(gate.Active) || e.Subject != subject {
+			continue
+		}
+		return e.ApprovalID, true
 	}
 	return "", false
 }
@@ -1936,6 +2015,90 @@ func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
 		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
 	}
 	return a.evidenceJournal.Get(evidenceID)
+}
+
+// tcaBindings assembles the six §3.4 required test_contract_approval
+// bindings (Task 21). gate2ApprovalID/gate2RecordDigest/gate2BaseCommitDigest
+// anchor this contract to the specific gate2 ApprovalRecord it was decided
+// under (§3.0); the evidence_run/mutation digests are read straight from
+// already-computed journal/CAS values — SubmitTestContract never re-derives
+// or pre-validates them itself, that is entirely TCAPolicy's job.
+func tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest string,
+	testCommit, oracleSurfaceDigest string,
+	redEvidenceID, redDigest, negEvidenceID, negDigest, mutationID, mutationDigest string) []gate.Binding {
+	return []gate.Binding{
+		{Kind: "gate2_approval", Ref: "approval:" + gate2ApprovalID, Digest: gate2RecordDigest},
+		{Kind: "base_commit", Ref: "plan_commit", Digest: gate2BaseCommitDigest},
+		{Kind: "oracle_surface", Ref: testCommit, Digest: oracleSurfaceDigest},
+		{Kind: "evidence_run", Role: "expected_red", Ref: redEvidenceID, Digest: redDigest},
+		{Kind: "evidence_run", Role: "negative_control", Ref: negEvidenceID, Digest: negDigest},
+		{Kind: "mutation", Ref: mutationID, Digest: mutationDigest},
+	}
+}
+
+// SubmitTestContract 送出 TCA（test_contract_approval）核可申請（Task 21，
+// §3.4）：讀 active gate2（subject="plan:"+planID）取得其完整 ApprovalRecord
+// ——gate2_approval binding 的 ref/digest 來源，base_commit binding 原樣複製
+// 其 base_commit（§3.0 錨定，TCAPolicy.BuildDecision 另外覆核兩者相符）；再讀
+// expectedRedID／negativeControlID 兩筆 EvidenceRun（EvidenceRunDigest 現算）
+// 與 mutationID 的 Mutation（digest 直接取 CAS digest），組六筆 bindings 後
+// Submit——bindings 本身是否彼此一致（role/kind、兩筆 passed、descriptor 等）
+// 全交給 TCAPolicy.ValidateRequest／BuildDecision，這裡只負責組裝已有的值。
+func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID string) (string, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return "", err
+	}
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	gate2ApprovalID, ok := activeGate2ApprovalID(entries, planID)
+	if !ok {
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	gate2Rec, _, err := svc.Lookup(gate2ApprovalID)
+	if err != nil {
+		return "", err
+	}
+	if gate2Rec == nil {
+		return "", fmt.Errorf("gate: gate2 approval %q has no record", gate2ApprovalID)
+	}
+	gate2RecordDigest, err := gate.RecordDigest(*gate2Rec)
+	if err != nil {
+		return "", err
+	}
+	gate2BaseCommitDigest := bindingDigest(gate2Rec.Bindings, "base_commit")
+
+	redRun, err := a.evidenceJournal.Get(expectedRedID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load expected_red evidence %q: %w", expectedRedID, err)
+	}
+	redDigest, err := evidence.EvidenceRunDigest(redRun)
+	if err != nil {
+		return "", err
+	}
+	negRun, err := a.evidenceJournal.Get(negativeControlID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load negative_control evidence %q: %w", negativeControlID, err)
+	}
+	negDigest, err := evidence.EvidenceRunDigest(negRun)
+	if err != nil {
+		return "", err
+	}
+	m, err := a.evidenceJournal.GetMutation(mutationID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, err)
+	}
+
+	bindings := tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest,
+		testCommit, redRun.OracleSurfaceDigest,
+		expectedRedID, redDigest, negativeControlID, negDigest, mutationID, m.Digest)
+	return svc.Submit("test_contract_approval", "task:"+planID+"/"+taskID, bindings)
 }
 
 // reclaimEvidenceRuns：shutdown 對 in-flight RunEvidence 的收束——cancel 每個
