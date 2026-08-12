@@ -261,10 +261,12 @@ async function confirmCommit() {
 .spec-workspace { display: flex; flex-direction: column; gap: 8px; padding: 8px; text-align: left; height: 100%; overflow-y: auto; }
 .files { display: flex; gap: 4px; flex-wrap: wrap; }
 .files button.active { background: var(--bg-bubble-user); color: #fff; }
-.editor { min-height: 200px; border: 1px solid var(--border); border-radius: var(--radius-s); }
+.editor { height: 280px; min-height: 120px; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
+.editor :deep(.cm-editor) { height: 100%; }
+.editor :deep(.cm-scroller) { overflow: auto; }
 .assist-buttons { display: flex; gap: 6px; }
 .draft-area { display: flex; flex-direction: column; gap: 4px; }
-.draft-text { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); min-height: 60px; }
+.draft-text { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); min-height: 60px; max-height: 240px; overflow-y: auto; }
 .diff { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); max-height: 240px; overflow-y: auto; }
 .assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }

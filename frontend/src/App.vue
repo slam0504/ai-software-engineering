@@ -65,10 +65,12 @@ async function refreshDiagramFiles() {
 watch(tab, t => { if (t === 'diagram') void refreshDiagramFiles() }) // 切到表示圖 tab 時重新掃 spec/context-map/*.mmd，避免新增檔案要重啟才看得到
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
+const gateWidth = ref(load('wb.gate.width', 280)) // gate 面板拖寬＋記憶（同 timeline 拖高 pattern）
 const selectedFile = ref('')
 const cliInfo = ref<Record<string, string>>({})
 watch(timelineOpen, v => save('wb.tl.open', v))
 watch(timelineHeight, v => save('wb.tl.height', v))
+watch(gateWidth, v => save('wb.gate.width', v))
 
 // Timeline 拖高：resize handle 垂直拖曳
 let dragStartY = 0
@@ -85,6 +87,23 @@ function onResizeStart(e: MouseEvent) {
   dragStartH = timelineHeight.value
   window.addEventListener('mousemove', onResizeMove)
   window.addEventListener('mouseup', onResizeEnd)
+}
+
+// Gate 面板拖寬：resize handle 水平拖曳（往左拖＝變寬，鏡射 timeline 拖高 pattern）
+let dragStartX = 0
+let dragStartW = 0
+function onGateResizeMove(e: MouseEvent) {
+  gateWidth.value = Math.min(600, Math.max(200, dragStartW + (dragStartX - e.clientX)))
+}
+function onGateResizeEnd() {
+  window.removeEventListener('mousemove', onGateResizeMove)
+  window.removeEventListener('mouseup', onGateResizeEnd)
+}
+function onGateResizeStart(e: MouseEvent) {
+  dragStartX = e.clientX
+  dragStartW = gateWidth.value
+  window.addEventListener('mousemove', onGateResizeMove)
+  window.addEventListener('mouseup', onGateResizeEnd)
 }
 
 // 快捷鍵：Cmd+1/2 切 provider tab、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
@@ -143,7 +162,8 @@ onMounted(async () => {
           <DiagramPane :path="diagramPath" />
         </div>
       </main>
-      <aside class="gate-panel">
+      <div class="gate-resize" title="拖曳調整寬度" @mousedown.prevent="onGateResizeStart" />
+      <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
         <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
         <p v-if="gateError" class="gate-err">{{ gateError }}</p>
       </aside>
@@ -169,8 +189,10 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
-.gate-panel { width: 280px; border-left: 1px solid var(--border); overflow-y: auto; }
+.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
 .gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
+.gate-resize { width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0; }
+.gate-resize:hover { background: var(--accent); }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); }
 nav button { border: none; background: transparent; color: var(--text-muted); }

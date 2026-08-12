@@ -62,11 +62,12 @@ function onReject(id: string) {
 .degraded-notice { color: var(--err); font-size: var(--fs-s); }
 .empty { color: var(--text-faint); font-size: var(--fs-s); }
 .entry { border: 1px solid var(--border); border-radius: var(--radius-s); padding: 8px; margin-bottom: 8px; }
-.head { display: flex; align-items: center; gap: 6px; }
-.id { font-weight: 600; }
+.head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.id { font-weight: 600; overflow-wrap: anywhere; word-break: break-all; }
 .gate { color: var(--text-muted); font-size: var(--fs-s); }
 .badge { margin-left: auto; font-size: var(--fs-s); padding: 1px 6px; border-radius: var(--radius-s); background: var(--bg-inset); }
-.bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); }
+.bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); overflow-wrap: anywhere; word-break: break-all; }
+.bindings li { overflow-wrap: anywhere; word-break: break-all; }
 .actions { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .actions input { flex: 1; min-width: 120px; padding: 4px 6px; }
 .hint { color: var(--err); font-size: var(--fs-s); }
