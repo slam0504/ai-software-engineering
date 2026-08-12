@@ -24,6 +24,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/evidence"
 	"github.com/slam0504/sdlc-workbench/internal/gate"
 	"github.com/slam0504/sdlc-workbench/internal/gatepolicy"
 	"github.com/slam0504/sdlc-workbench/internal/plan"
@@ -128,6 +129,19 @@ type App struct {
 	// 兩個 watcher 各自獨立 goroutine，可同時運行、各自被 shutdown 收斂。
 	planWatchStop chan struct{}
 	planWatchDone chan struct{}
+
+	// Evidence run（Task 20：M3a §4-5）——evidenceMu 保護 active run registry
+	// （evidence_id → cancel func，供 shutdown reclaim，鏡射 assistActive）；
+	// finalize（journal append）與 registry 移除在 RunEvidence 內同一臨界區
+	// 完成，這是「恰一次 finalize」保證的落點。evidenceJournal／
+	// evidenceCASDir／evidenceRegistryPath 於 startup 惰性建立於
+	// .workbench/evidence/ 下（journal＝evidence.jsonl，worktree registry＝
+	// worktrees.jsonl，同時做一次 CleanupOrphans／CleanOrphanTemps）。
+	evidenceMu           sync.Mutex
+	evidenceActive       map[string]context.CancelFunc
+	evidenceJournal      *evidence.Journal
+	evidenceCASDir       string
+	evidenceRegistryPath string
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -173,7 +187,8 @@ func (a *App) emit(name string, data any) {
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{apprPending: map[string]*pendingApproval{},
-		assistActive: map[string]*assistGen{}}
+		assistActive:   map[string]*assistGen{},
+		evidenceActive: map[string]context.CancelFunc{}}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -223,6 +238,39 @@ func (a *App) startup(ctx context.Context) {
 	a.watchDiagram(a.diagramPath)
 	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 Reconcile()
 	a.watchPlanTree() // Task 12：plan/ 遞迴監看，鏡射 watchSpecTree（同一 Reconcile()，涵蓋 gate1／gate2）
+	a.startupEvidence()
+}
+
+// startupEvidence（Task 20）：惰性 gate/plan 之外少數在 startup 就建立的狀態——
+// evidence journal／CAS／worktree registry 路徑都落在 .workbench/evidence/
+// 下，且 CleanupOrphans／CleanOrphanTemps 必須在任何 RunEvidence 呼叫之前跑
+// 過一次，才能收乾淨上次程序異常結束留下的 worktree／temp 殘留（brief 凍結：
+// 下次啟動兜底逾時 forcedShutdown 未清乾淨的窗口）。liveIDs 傳空 map：啟動當下
+// 不可能有任何 in-flight run，registry 裡的每個 active 項目都是孤兒。這幾步
+// 全是檔案操作＋（僅在真有孤兒殘留時）git worktree 指令；一個尚未 git init 的
+// 全新 workspace（registry 檔不存在或是空檔）不會觸發任何 git 呼叫，因此可以
+// 安全地在 ensureGate() 惰性初始化之前無條件執行。
+func (a *App) startupEvidence() {
+	dir := filepath.Join(a.workspaceDir, ".workbench", "evidence")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		if a.startupErr == "" {
+			a.startupErr = "evidence dir init failed: " + err.Error()
+		}
+		return
+	}
+	a.evidenceCASDir = filepath.Join(dir, "cas")
+	a.evidenceRegistryPath = filepath.Join(dir, "worktrees.jsonl")
+	if j, jerr := evidence.OpenJournal(filepath.Join(dir, "evidence.jsonl")); jerr == nil {
+		a.evidenceJournal = j
+	} else if a.startupErr == "" {
+		a.startupErr = "evidence journal init failed: " + jerr.Error()
+	}
+	if oerr := evidence.CleanupOrphans(a.workspaceDir, a.evidenceRegistryPath, map[string]bool{}); oerr != nil && a.startupErr == "" {
+		a.startupErr = "evidence orphan worktree cleanup failed: " + oerr.Error()
+	}
+	if _, terr := evidence.CleanOrphanTemps(a.evidenceCASDir); terr != nil && a.startupErr == "" {
+		a.startupErr = "evidence orphan temp cleanup failed: " + terr.Error()
+	}
 }
 
 // failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
@@ -571,6 +619,7 @@ func (a *App) shutdown(ctx context.Context) {
 	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
 	a.stopPlanWatch()                          // 1a′) 停 plan/ watcher，同上理由
 	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.reclaimEvidenceRuns()                    // 1b′) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
 	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
@@ -1211,6 +1260,17 @@ func (l appPlanLoader) LoadAt(commitOID, planID string) (plan.Plan, plan.RiskPol
 	return pl, pol, nil
 }
 
+// LoadOracleAt 實作 evidence.ContextLoader：讀 committed oracle-surface 宣告，
+// 同 LoadAt 一律 `git show <oid>:plan/oracle-surface.yaml`——絕不讀 worktree，
+// 理由與 LoadAt 相同（committed context 閉環，見上方 doc）。
+func (l appPlanLoader) LoadOracleAt(commitOID string) (evidence.OracleDecl, error) {
+	raw, err := l.git.Git("show", commitOID+":plan/oracle-surface.yaml")
+	if err != nil {
+		return evidence.OracleDecl{}, fmt.Errorf("plan: load oracle surface at %s: %w", commitOID, err)
+	}
+	return evidence.ParseOracleDecl(raw)
+}
+
 // planIDFromSubject／bindingDigest／gitOIDFromDigest mirror
 // internal/gatepolicy 的同名未匯出 helper——app 層無法引用其他 package 的未
 // 匯出識別字，複製這三個各 4-10 行的小函式比為單一呼叫端擴大 gatepolicy 的
@@ -1255,6 +1315,22 @@ func activeGate1Binding(entries []GateEntryDTO) (specManifest, baseCommit string
 		return bindingDigest(e.Bindings, "spec_manifest"), bindingDigest(e.Bindings, "base_commit"), true
 	}
 	return "", "", false
+}
+
+// activeGate2PlanCommit：RunEvidence 唯一信任的 plan_commit 來源——active
+// gate2（subject="plan:"+planID）綁定的 base_commit，即 SubmitPlanForApproval
+// 當下的 planHeadOID。evidence.Run 的 ContextLoader 一律以此為 rs.PlanCommit
+// 讀取 committed TestContract／oracle-surface，絕不信任 caller 傳入或目前
+// worktree 的 plan 內容（鏡射 GateDecisionContext 的 committed context 閉環）。
+func activeGate2PlanCommit(entries []GateEntryDTO, planID string) (planCommit string, ok bool) {
+	subject := "plan:" + planID
+	for _, e := range entries {
+		if e.Gate != "gate2" || e.State != string(gate.Active) || e.Subject != subject {
+			continue
+		}
+		return gitOIDFromDigest(bindingDigest(e.Bindings, "base_commit")), true
+	}
+	return "", false
 }
 
 // worktreePlanDoc 在 worktree 的 plan/ 底下找「唯一」一份可解析為 plan.Plan
@@ -1673,6 +1749,182 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 
 	bindings := gate2Bindings(gate1SpecManifest, planManifestDigest, planBaseCommit, riskPolicyDigest, permissionManifestDigest)
 	return svc.Submit("gate2", "plan:"+planID, bindings)
+}
+
+// ---- Evidence run（Task 20：M3a §4-5，wraps internal/evidence）----
+
+// RegisterMutation 把一份 negative_control 用的 patch 存進 evidence CAS
+// store，再把描述它的 Mutation 記錄 append 進 evidence journal，回傳新產生的
+// mutation_id。RunEvidence 的 negative_control 路徑只接受 mutation_id（不接受
+// 原始 patch bytes）——patch 內容一律經由此登記，落盤與可稽核的紀錄同時成立
+// （鏡射 Task 17 CAS＋Task 20 journal 的既定順序：CAS 先落盤才 append）。
+func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+	digest, _, err := evidence.PutCAS(a.evidenceCASDir, []byte(patch))
+	if err != nil {
+		return "", fmt.Errorf("evidence: put mutation patch in CAS: %w", err)
+	}
+	m := evidence.Mutation{
+		MutationID: contract.NewULID(time.Now()),
+		TaskRef:    taskRef,
+		Digest:     digest,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := a.evidenceJournal.AppendMutation(m); err != nil {
+		return "", fmt.Errorf("evidence: append mutation: %w", err)
+	}
+	return m.MutationID, nil
+}
+
+// RunEvidence 同步執行 planID/taskID 已核可（Gate 2 active）的 TestContract，
+// 對 testCommit 的 committed tree 產生一筆 EvidenceRun，回傳 evidence_id。
+// kind="negative_control" 時 mutationID 必填，其登記的 patch（RegisterMutation）
+// 會被套用；kind="expected_red" 時 mutationID 必須為空（evidence.Run 本身拒絕
+// 帶 mutation 的 expected_red，見 runner.go）。
+//
+// Lifecycle ownership（task-20-brief.md 凍結，不依賴 Task 24 的
+// workflowMu）：beginAppTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
+// shutdown 後拒新 run）；執行 context 衍生自 a.ctx（app 的 shutdown-scoped
+// context，同 SpecAssist／StartSession 的既定用法），供 reclaimEvidenceRuns
+// 手動 cancel。evidence.Run 內部才會 mint evidence_id（ulid callback），所以
+// active-run registry 的登記時機挪進 ulid callback 本身——一旦 ulid 被呼叫，
+// evidence_id 立即可見於 a.evidenceActive，比 NewWorktree／實際執行都早。
+// registry 移除與 journal finalize（AppendEvidenceRun）在同一個 evidenceMu
+// 臨界區內完成：這是「恰一次 finalize」的落點。若 ctx 在 Run 返回時已被取消
+// （shutdown reclaim 造成），即使 evidence.Run 本身回傳了一筆語意完整的
+// EvidenceRun（ctx 取消走的是 abortReason="context canceled"，不是 Go
+// error），也視為未完成、不 finalize——一個被 shutdown 中止的 run 不能被當成
+// 有效證據收進 journal。
+func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (string, error) {
+	if kind != "expected_red" && kind != "negative_control" {
+		return "", fmt.Errorf("evidence: unknown kind %q", kind)
+	}
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+
+	var mutationPatch []byte
+	if kind == "negative_control" {
+		if mutationID == "" {
+			return "", errors.New("evidence: negative_control requires a mutation_id")
+		}
+		m, merr := a.evidenceJournal.GetMutation(mutationID)
+		if merr != nil {
+			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
+		}
+		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
+		if oerr != nil {
+			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
+		}
+		mutationPatch = patch
+	} else if mutationID != "" {
+		return "", errors.New("evidence: expected_red must not carry a mutation_id")
+	}
+
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 run
+		return "", err
+	}
+	defer a.endAppTxn()
+
+	ctx, cancel := context.WithCancel(a.ctx)
+	defer cancel()
+
+	a.manager.EmitWorkspace(evidenceRunEventKind, nil, map[string]any{
+		"phase": "started", "plan_id": planID, "task_id": taskID,
+		"kind": kind, "test_commit": testCommit,
+	})
+
+	var evidenceID string
+	ulidFn := func() string {
+		id := contract.NewULID(time.Now())
+		a.evidenceMu.Lock()
+		a.evidenceActive[id] = cancel
+		a.evidenceMu.Unlock()
+		evidenceID = id
+		return id
+	}
+	nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+	rs := evidence.RunSpec{
+		Kind: kind, PlanID: planID, TaskID: taskID,
+		PlanCommit: planCommit, TestCommit: testCommit, MutationPatch: mutationPatch,
+	}
+	run, runErr := evidence.Run(ctx, a.workspaceDir, a.evidenceCASDir, a.evidenceRegistryPath,
+		a.planLoader, rs, ulidFn, nowFn)
+	if runErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			runErr = fmt.Errorf("evidence: run canceled: %w", ctxErr)
+		}
+	}
+
+	a.evidenceMu.Lock()
+	if evidenceID != "" {
+		delete(a.evidenceActive, evidenceID)
+	}
+	var appendErr error
+	if runErr == nil {
+		appendErr = a.evidenceJournal.AppendEvidenceRun(run)
+	}
+	a.evidenceMu.Unlock()
+
+	finalErr := runErr
+	if finalErr == nil {
+		finalErr = appendErr
+	}
+	payload := map[string]any{"phase": "finished", "evidence_id": evidenceID}
+	if finalErr != nil {
+		payload["error"] = finalErr.Error()
+	} else {
+		payload["result"] = run.Result
+	}
+	a.manager.EmitWorkspace(evidenceRunEventKind, nil, payload)
+
+	if finalErr != nil {
+		return "", finalErr
+	}
+	return evidenceID, nil
+}
+
+// evidenceRunEventKind：RunEvidence 進度事件的 EmitWorkspace kind——additive
+// only（每次呼叫各發一筆 started／finished，從不覆寫既有事件）。
+const evidenceRunEventKind = "evidence_run"
+
+// EvidenceGet 回傳 journal 內 evidenceID 對應的完整 EvidenceRun（含 journal
+// 重播後重建的紀錄）。
+func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
+	if a.evidenceJournal == nil {
+		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
+	}
+	return a.evidenceJournal.Get(evidenceID)
+}
+
+// reclaimEvidenceRuns：shutdown 對 in-flight RunEvidence 的收束——cancel 每個
+// active run 的 context（鏡射 reclaimAssists，task-20-brief.md 凍結順序：必須
+// 早於 inflight.Wait，RunEvidence 持 txn，否則長時 runner 會讓 Wait 死等）。
+// runner 的 ctx cancel 路徑（evidence.Run→runCommand）負責收拾 process group
+// 與 worktree；下次啟動的 CleanupOrphans／CleanOrphanTemps 兜底任何未收乾淨
+// 的殘留（見 startupEvidence）。
+func (a *App) reclaimEvidenceRuns() {
+	a.evidenceMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(a.evidenceActive))
+	for _, c := range a.evidenceActive {
+		cancels = append(cancels, c)
+	}
+	a.evidenceMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
 }
 
 // GateDecisionTaskDTO：GateDecisionContext 的單一 task risk 列，供 Gate 2
