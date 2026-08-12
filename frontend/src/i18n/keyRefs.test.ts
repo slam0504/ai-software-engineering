@@ -39,4 +39,10 @@ describe('t() key references exist', () => {
     ]
     expect(mapVals.filter(v => !keys.has(v))).toEqual([])
   })
+  it('every SettingsBar operationAction key resolves to a locale leaf', () => {
+    const keys = leafSet(zhTW)
+    const opKeys = ['new', 'terminate', 'end', 'authStatus', 'login', 'cancelLogin', 'logout', 'b1Probe']
+    const missing = opKeys.map(k => `settings.operationAction.${k}`).filter(k => !keys.has(k))
+    expect(missing).toEqual([])
+  })
 })
