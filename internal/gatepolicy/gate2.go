@@ -199,9 +199,9 @@ func (p *Gate2Policy) SupersessionKey(gateName, subject string) string {
 }
 
 // exitCoder matches *exec.ExitError's ExitCode() method structurally — same
-// trick as plan.VerifyLineage — so a "cat-file -e" non-zero exit (object
-// missing) can be told apart from a genuine command failure without
-// importing os/exec.
+// trick as plan.VerifyLineage — so a "rev-parse --verify" exit 1 (commit
+// missing) can be told apart from a fatal/genuine command failure (exit 128
+// or non-ExitError) without importing os/exec.
 type exitCoder interface{ ExitCode() int }
 
 // ReconcileBindings compares each continuously-recomputed binding
@@ -233,12 +233,17 @@ func (p *Gate2Policy) ReconcileBindings(rec gate.ApprovalRecord) ([]gate.StaleCa
 
 	if baseDigest := bindingDigest(rec.Bindings, "base_commit"); baseDigest != "" {
 		oid := gitOID(baseDigest)
-		if _, err := p.git.Git("cat-file", "-e", oid+"^{commit}"); err != nil {
+		// `git cat-file -e` exits 128 for BOTH "commit missing" and fatal
+		// repo errors, so it cannot tell staleness from a read failure.
+		// `rev-parse --verify --quiet` exits 1 for "not a valid commit" and
+		// 128 for fatal errors — the same ancestor/fatal split
+		// VerifyLineage relies on (lineage.go) — so only exit 1 is staleness.
+		if _, err := p.git.Git("rev-parse", "--verify", "--quiet", oid+"^{commit}"); err != nil {
 			var ec exitCoder
-			if !errors.As(err, &ec) {
-				return nil, err // not a plain non-zero exit: treat as a read failure, fail closed
+			if !errors.As(err, &ec) || ec.ExitCode() != 1 {
+				return nil, err // fatal/unrecognized failure: fail closed, not a stale cause
 			}
-			causes = append(causes, gate.StaleCause{Cause: "base_commit changed"})
+			causes = append(causes, gate.StaleCause{Cause: "base_commit missing", EvidenceRef: oid})
 		}
 	}
 

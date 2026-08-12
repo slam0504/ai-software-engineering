@@ -49,6 +49,21 @@ func (nopGit) Git(args ...string) ([]byte, error) {
 
 func failFn() (string, error) { return "", fmt.Errorf("unexpected current* call") }
 
+// stubGit is a plan.GitRunner that always returns err, for exercising
+// ReconcileBindings' base_commit failure-classification branches without
+// needing a real git process to exit non-zero for a specific reason.
+type stubGit struct{ err error }
+
+func (s *stubGit) Git(args ...string) ([]byte, error) { return nil, s.err }
+
+// fakeExitError implements the exitCoder shape (ExitCode() int) that
+// *exec.ExitError satisfies, so tests can simulate a specific process exit
+// code without shelling out.
+type fakeExitError struct{ code int }
+
+func (e fakeExitError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+func (e fakeExitError) ExitCode() int { return e.code }
+
 // --- real git repo helper (mirrors internal/plan/lineage_test.go) --------
 
 type testGitRepo struct {
@@ -232,9 +247,13 @@ func TestGate2BuildDecisionRejectedRequiresEmptyInput(t *testing.T) {
 }
 
 func TestGate2BuildDecisionApproved(t *testing.T) {
+	// Deliberately out of task_id order (T2 before T1): BuildDecision must
+	// sort its output by task_id rather than relying on the committed
+	// plan's task order, so the happy-path assertion below fails if the
+	// sort.Slice call in BuildDecision is ever dropped.
 	pl := planWithTasks(
-		riskTask("T1", "medium", "medium"),
 		riskTask("T2", "medium", "high"),
+		riskTask("T1", "medium", "medium"),
 	)
 	req := gate2Req()
 
@@ -355,14 +374,41 @@ func TestGate2ReconcileBindings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		found := false
-		for _, c := range causes {
-			if c.Cause == "base_commit changed" {
-				found = true
+		var got *gate.StaleCause
+		for i, c := range causes {
+			if c.Cause == "base_commit missing" {
+				got = &causes[i]
 			}
 		}
-		if !found {
-			t.Fatalf("missing commit must report base_commit changed, got %v", causes)
+		if got == nil {
+			t.Fatalf("missing commit must report base_commit missing, got %v", causes)
+		}
+		if got.EvidenceRef != missing {
+			t.Fatalf("stale cause EvidenceRef must be the missing oid, got %q", got.EvidenceRef)
+		}
+	})
+
+	t.Run("base_commit reconcile fails closed on a fatal git error (exit 128), not stale", func(t *testing.T) {
+		// exit 128 is what `git rev-parse --verify --quiet` returns for
+		// fatal/unreachable-repo errors (verified against a real git repo:
+		// `git -C <non-repo-dir> rev-parse --verify --quiet <sha>^{commit}`
+		// exits 128), as opposed to exit 1 for "commit not found" — the
+		// same split VerifyLineage relies on for merge-base --is-ancestor.
+		fatal := &stubGit{err: fakeExitError{code: 128}}
+		p := NewGate2Policy(&fakeLoader{}, fatal,
+			currentFn("plan"), currentFn("spec_manifest"), currentFn("risk_policy"), currentFn("permission_manifest"))
+		causes, err := p.ReconcileBindings(rec)
+		if err == nil {
+			t.Fatalf("fatal git error must fail closed, not report stale, got causes=%v", causes)
+		}
+	})
+
+	t.Run("base_commit reconcile fails closed on a non-ExitError failure", func(t *testing.T) {
+		notExitErr := &stubGit{err: errors.New("network unreachable")}
+		p := NewGate2Policy(&fakeLoader{}, notExitErr,
+			currentFn("plan"), currentFn("spec_manifest"), currentFn("risk_policy"), currentFn("permission_manifest"))
+		if _, err := p.ReconcileBindings(rec); err == nil {
+			t.Fatal("non-ExitError git failure must fail closed, not report stale")
 		}
 	})
 
