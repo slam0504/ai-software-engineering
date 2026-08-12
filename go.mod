@@ -6,6 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/wailsapp/wails/v2 v2.13.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
