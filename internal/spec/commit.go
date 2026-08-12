@@ -62,7 +62,7 @@ func (r *GitRepo) scopedTreeDigest() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ManifestDigest(entries)
+	return r.sc.ManifestDigest(entries)
 }
 
 // activeScopePathspecs returns the managedScopeRoots entries that are safe

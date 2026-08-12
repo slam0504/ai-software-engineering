@@ -7,6 +7,45 @@ import (
 	"testing"
 )
 
+// TestPreviewSpecCommitTreeDigestFollowsRepoScope guards a regression where
+// scopedTreeDigest called the package-level (SpecScope-fixed) ManifestDigest
+// instead of r.sc.ManifestDigest — so a PlanScope-backed GitRepo's
+// CommitToken.TreeDigest silently used SpecScope's Version/Patterns. That
+// would make PreviewSpecCommit/ConfirmSpecCommit staleness checks blind to
+// scope-identity: a PlanScope commit token would validate identically to
+// what SpecScope would have computed for the very same entries.
+func TestPreviewSpecCommitTreeDigestFollowsRepoScope(t *testing.T) {
+	dir := initRepo(t)
+	os.MkdirAll(filepath.Join(dir, "plan"), 0o755)
+	os.WriteFile(filepath.Join(dir, "plan", "x.yaml"), []byte("v1"), 0o644)
+
+	r := NewGitRepo(dir, PlanScope)
+	tok, _, err := r.PreviewSpecCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := r.ReadScopedWorktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPlanDigest, err := PlanScope.ManifestDigest(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.TreeDigest != wantPlanDigest {
+		t.Fatalf("PlanScope-backed repo's TreeDigest must equal PlanScope.ManifestDigest(entries): got %s, want %s", tok.TreeDigest, wantPlanDigest)
+	}
+
+	specDigestOfSameEntries, err := SpecScope.ManifestDigest(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.TreeDigest == specDigestOfSameEntries {
+		t.Fatal("PlanScope-backed repo's TreeDigest must NOT equal what SpecScope would compute for the same entries — token digest must follow the repo's own scope")
+	}
+}
+
 func TestConfirmRejectsWhenContentChangedAfterPreview(t *testing.T) {
 	dir := initRepo(t)
 	os.MkdirAll(filepath.Join(dir, "spec"), 0o755)
