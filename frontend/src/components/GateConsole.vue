@@ -28,9 +28,18 @@ const selectedTier = reactive<Record<string, Record<string, string>>>({})
 const overrideReason = reactive<Record<string, Record<string, string>>>({})
 
 const tierOrder: Record<string, number> = { low: 1, medium: 2, high: 3 }
+const allTiers = ['low', 'medium', 'high']
 
 function isGate2Pending(e: GateEntry): boolean {
   return e.state === 'pending' && e.gate === 'gate2'
+}
+
+// 下拉只列 >= minimum 的 tier（binding constraint，spec 明文）：未知 minimum 時不過濾，
+// 讓後端錯誤訊息浮現而不是前端默默清空選項。
+function tierOptions(task: GateDecisionTask): string[] {
+  const minRank = tierOrder[task.minimum_risk_tier]
+  if (!minRank) return allTiers
+  return allTiers.filter(tier => tierOrder[tier] >= minRank)
 }
 
 async function ensureRiskContext(id: string) {
@@ -63,10 +72,20 @@ function needsOverride(id: string, task: GateDecisionTask): boolean {
   return tierOrder[sel] < tierOrder[task.planner_risk_tier]
 }
 
+// selected < minimum 防禦縱深：下拉已依 minimum 過濾，這裡再擋一次送出，避免下拉
+// 過濾邏輯未來被改動或繞過時，前端仍判 valid 而讓送出後才被後端拒（gatepolicy/gate2.go
+// 的 selected_risk_tier below minimum_risk_tier 檢查）。
+function belowMinimum(id: string, task: GateDecisionTask): boolean {
+  const sel = selectedTier[id]?.[task.task_id]
+  if (!sel) return false
+  return tierOrder[sel] < tierOrder[task.minimum_risk_tier]
+}
+
 function riskValid(id: string): boolean {
   const tasks = riskTasks[id]
   if (!tasks) return false // context 尚未載入完成（或失敗）前不可核可
-  return tasks.every(t => !needsOverride(id, t) || !!(overrideReason[id]?.[t.task_id] ?? '').trim())
+  return tasks.every(t =>
+    !belowMinimum(id, t) && (!needsOverride(id, t) || !!(overrideReason[id]?.[t.task_id] ?? '').trim()))
 }
 
 function approveDisabled(e: GateEntry): boolean {
@@ -145,9 +164,7 @@ function shortDigest(d: string): string {
               :data-test="'selected-' + task.task_id"
               :disabled="degraded"
             >
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
+              <option v-for="tier in tierOptions(task)" :key="tier" :value="tier">{{ tier }}</option>
             </select>
             <textarea
               v-if="needsOverride(e.approval_id, task)"
