@@ -1,7 +1,7 @@
 # M3a — 計畫與測試契約閉環設計
 
 - 日期：2026-08-12
-- 狀態：設計定稿 rev3（第一輪審閱 7 P1：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／runner 安全邊界；第二輪審閱 7 P1：commit 身分三分／oracle-surface 宣告時機前移／TCA subject 含 plan_id＋gate2_approval 綁定／ApprovalRecord v2＋rejected 終態／risk_decisions[] 基數／evidence 一致性 validator＋落盤順序／workflow mutex 全覆蓋；第三輪審閱 4 P1＋1 P2：plan_commit lineage 封閉／risk decision 單一權威／gate2_approval 確定性重建／CAS durable 順序／輸出超限＝error；第四輪：plan validator 與 Gate 2 decision validator 的 risk 職責徹底分離、rejected 免 risk 輸入）
+- 狀態：設計定稿 rev4，closure review APPROVED 2026-08-12（第一輪審閱 7 P1：supersession scope／binding role／test commit 快照／STALE 分類／核可權威順序／risk tier 三層／runner 安全邊界；第二輪審閱 7 P1：commit 身分三分／oracle-surface 宣告時機前移／TCA subject 含 plan_id＋gate2_approval 綁定／ApprovalRecord v2＋rejected 終態／risk_decisions[] 基數／evidence 一致性 validator＋落盤順序／workflow mutex 全覆蓋；第三輪審閱 4 P1＋1 P2：plan_commit lineage 封閉／risk decision 單一權威／gate2_approval 確定性重建／CAS durable 順序／輸出超限＝error；第四輪：plan validator 與 Gate 2 decision validator 的 risk 職責徹底分離、rejected 免 risk 輸入）
 - 上游依據：`docs/architecture/sdlc-workbench-app-plan.md` §5.2–5.4、§7（M3 列）；`docs/architecture/sdlc-ai-agent-automation-plan.md` §3–§6（Stage B／C、Gate 2、Test Contract Approval、升級路徑）
 - 前置里程碑：M0 ✅、M1 ✅、M1.5 ✅、M2 Stage A ✅（Gate 1 引擎、canonical manifest、兩階段 scoped commit、SpecAssist 隔離 one-shot）、i18n ✅
 
