@@ -944,7 +944,7 @@ func (a *App) ensureGate() (*gate.Service, error) {
 			a.gateInitErr = jerr
 			return
 		}
-		a.specRepo = spec.NewGitRepo(root)
+		a.specRepo = spec.NewGitRepo(root, spec.SpecScope)
 		a.gateJournal = j
 		current := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
 		ulidFn := func() string { return contract.NewULID(time.Now()) }

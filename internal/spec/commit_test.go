@@ -11,7 +11,7 @@ func TestConfirmRejectsWhenContentChangedAfterPreview(t *testing.T) {
 	dir := initRepo(t)
 	os.MkdirAll(filepath.Join(dir, "spec"), 0o755)
 	os.WriteFile(filepath.Join(dir, "spec", "glossary.md"), []byte("draft"), 0o644)
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	tok, _, err := r.PreviewSpecCommit()
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +28,7 @@ func TestConfirmFailsClosedWithOutOfScopeStaged(t *testing.T) {
 	run(t, dir, "add", "app.go") // scope 外 staged
 	os.MkdirAll(filepath.Join(dir, "spec"), 0o755)
 	os.WriteFile(filepath.Join(dir, "spec", "glossary.md"), []byte("draft"), 0o644)
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	tok, _, _ := r.PreviewSpecCommit()
 	if err := r.ConfirmSpecCommit(tok, "m"); !errors.Is(err, ErrStagedChangesPresent) {
 		t.Fatalf("out-of-scope staged change must fail closed: %v", err)
@@ -58,7 +58,7 @@ func TestConfirmCommitsScopedContentChange(t *testing.T) {
 	run(t, dir, "commit", "-m", "c1")
 
 	os.WriteFile(filepath.Join(dir, "spec", "features", "foo.feature"), []byte("v2"), 0o644)
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	tok, _, err := r.PreviewSpecCommit()
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestConfirmCommitsScopedDeletion(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(dir, "spec", "features", "foo.feature"), []byte("b"), 0o644)
 
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	tok, _, err := r.PreviewSpecCommit()
 	if err != nil {
 		t.Fatal(err)

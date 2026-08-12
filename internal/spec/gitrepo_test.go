@@ -35,7 +35,7 @@ func TestGitRepoCommittedSnapshotIgnoresWorktreeEdit(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "spec", "glossary.md"), []byte("v1"), 0o644)
 	run(t, dir, "add", "-A")
 	run(t, dir, "commit", "-m", "c1")
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	d1, _, err := BuildCommittedSnapshot(r)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestBuildCurrentManifestIgnoresGitIgnoredFile(t *testing.T) {
 	// In-scope but git-ignored: must be invisible to both manifest paths.
 	os.WriteFile(filepath.Join(dir, "spec", "features", ".DS_Store"), []byte("junk"), 0o644)
 
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	committed, _, err := BuildCommittedSnapshot(r)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestGitRepoRejectsSymlinkInScope(t *testing.T) {
 	dir := initRepo(t)
 	os.MkdirAll(filepath.Join(dir, "spec", "features"), 0o755)
 	os.Symlink("/etc/passwd", filepath.Join(dir, "spec", "features", "evil.feature"))
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	if _, err := r.ReadScopedWorktree(); err == nil {
 		t.Fatal("symlink in scope must be rejected")
 	}
@@ -97,7 +97,7 @@ func TestGitRepoRejectsSubmoduleInScope(t *testing.T) {
 	os.MkdirAll(vendor, 0o755)
 	os.WriteFile(filepath.Join(vendor, ".git"), []byte("gitdir: ../../../.git/modules/vendor\n"), 0o644)
 	os.WriteFile(filepath.Join(vendor, "x.feature"), []byte("Feature: vendored"), 0o644)
-	r := NewGitRepo(dir)
+	r := NewGitRepo(dir, SpecScope)
 	if _, err := r.ReadScopedWorktree(); err == nil {
 		t.Fatal("submodule/nested repo in scope must be rejected")
 	}

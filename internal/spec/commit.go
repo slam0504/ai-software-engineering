@@ -77,7 +77,7 @@ func (r *GitRepo) scopedTreeDigest() (string, error) {
 // on disk nor in HEAD are omitted instead.
 func (r *GitRepo) activeScopePathspecs(headOID string) ([]string, error) {
 	var out []string
-	for _, p := range managedScopeRoots {
+	for _, p := range r.sc.Roots {
 		if _, err := os.Stat(filepath.Join(r.root, p)); err == nil {
 			out = append(out, p)
 			continue
@@ -116,9 +116,9 @@ func (r *GitRepo) scopedDiffForDisplay(headOID string) (string, error) {
 			b.Write(out)
 		}
 	}
-	statusOut, err := r.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
+	statusOut, err := r.git(append([]string{"status", "--porcelain", "--untracked-files=all", "--"}, r.sc.Roots...)...)
 	if err != nil {
-		// No spec/ path tracked/existing yet — nothing more to show.
+		// No scoped path tracked/existing yet — nothing more to show.
 		return b.String(), nil
 	}
 	for _, line := range strings.Split(string(statusOut), "\n") {
@@ -126,7 +126,7 @@ func (r *GitRepo) scopedDiffForDisplay(headOID string) (string, error) {
 			continue
 		}
 		path := statusPath(line)
-		if !InScope(path) {
+		if !r.sc.Match(path) {
 			continue
 		}
 		content, err := os.ReadFile(filepath.Join(r.root, path))
@@ -152,7 +152,7 @@ func (r *GitRepo) checkNoOutOfScopeStaged() error {
 		if path == "" {
 			continue
 		}
-		if !InScope(path) {
+		if !r.sc.Match(path) {
 			return ErrStagedChangesPresent
 		}
 	}
