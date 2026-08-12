@@ -96,6 +96,40 @@ describe('TcaWorkspace', () => {
     expect(w.find('[data-test=run-expected_red-T1]').attributes('disabled')).toBeUndefined()
   })
 
+  // review fix（Medium correctness finding）：RunEvidence 是同步長呼叫，同一
+  // task 的兩顆 run 按鈕原本互不 disable——先按 expected-red 再按
+  // negative-control，會讓兩筆 started 依序抵達、後端 finished payload 若沒帶
+  // plan_id/task_id/kind 就只能靠「最近一筆 started」配對，錯位。修法：
+  // per-task 互斥（任一 kind 執行中兩顆按鈕都 disabled）＋finished payload 帶
+  // 三個識別欄位直接定位。這裡驗證 UI 防護那一半：expected-red 執行中時，即使
+  // negative-control 已有 mutation_id，也不能被點擊觸發第二個並行呼叫。
+  it('同一 task 任一 kind 執行中時，兩顆 run 按鈕都 disabled（per-task 互斥）', async () => {
+    let resolveRed: (id: string) => void = () => {}
+    const runEvidence = vi.fn().mockImplementation((_p: string, _t: string, _c: string, kind: string) => {
+      if (kind === 'expected_red') return new Promise<string>(r => { resolveRed = r })
+      return Promise.resolve('ev-neg')
+    })
+    const props = baseProps({ runEvidence })
+    const w = mountWithI18n(TcaWorkspace, { props })
+    await flushPromises()
+
+    await w.find('[data-test=mutation-patch-T1]').setValue('diff --git a/x b/x')
+    await w.find('[data-test=register-mutation-T1]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=run-negative_control-T1]').attributes('disabled')).toBeUndefined() // mutation 已登記，本該可點
+
+    void w.find('[data-test=run-expected_red-T1]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=run-expected_red-T1]').attributes('disabled')).toBeDefined()
+    expect(w.find('[data-test=run-negative_control-T1]').attributes('disabled')).toBeDefined() // 另一顆也必須 disabled
+    await w.find('[data-test=run-negative_control-T1]').trigger('click') // 點了也不該觸發第二個並行呼叫
+    expect(runEvidence).toHaveBeenCalledTimes(1)
+
+    resolveRed('ev-red')
+    await flushPromises()
+    expect(w.find('[data-test=run-negative_control-T1]').attributes('disabled')).toBeUndefined() // 執行完畢後恢復可用
+  })
+
   it('result=error 顯示錯誤標示原文＋重跑按鈕，點擊重跑再次呼叫 RunEvidence', async () => {
     const runEvidence = vi.fn().mockRejectedValue(new Error('evidence: no active Gate 2 approval for plan "P1"'))
     const props = baseProps({ runEvidence })

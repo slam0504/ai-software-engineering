@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -163,6 +164,18 @@ func TestRunEvidenceExpectedRed_AppendsJournalAndEmitsProgress(t *testing.T) {
 	}
 	if events[0].Scope != "workspace" {
 		t.Errorf("evidence_run event scope = %q, want workspace", events[0].Scope)
+	}
+
+	// review finding（同一 task 兩顆 run 按鈕互不 disable 時，前端只靠
+	// pendingKey FIFO 配對 started/finished 會錯位）：finished payload 也必須
+	// 帶 plan_id/task_id/kind，讓前端能直接用這三個欄位定位是哪一格，不必猜
+	// 「最近一筆 started」。
+	var finishedPayload map[string]any
+	if err := json.Unmarshal(events[1].Payload, &finishedPayload); err != nil {
+		t.Fatalf("unmarshal finished payload: %v", err)
+	}
+	if finishedPayload["plan_id"] != "P1" || finishedPayload["task_id"] != "T1" || finishedPayload["kind"] != "expected_red" {
+		t.Errorf("finished payload = %+v, want plan_id=P1 task_id=T1 kind=expected_red", finishedPayload)
 	}
 
 	assertNoZombieWorktrees(t, a.workspaceDir)

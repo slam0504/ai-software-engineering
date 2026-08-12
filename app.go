@@ -1990,7 +1990,10 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 	if finalErr == nil {
 		finalErr = appendErr
 	}
-	payload := map[string]any{"phase": "finished", "evidence_id": evidenceID}
+	payload := map[string]any{
+		"phase": "finished", "evidence_id": evidenceID,
+		"plan_id": planID, "task_id": taskID, "kind": kind,
+	}
 	if finalErr != nil {
 		payload["error"] = finalErr.Error()
 	} else {

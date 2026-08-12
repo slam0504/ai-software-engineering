@@ -114,8 +114,18 @@ async function registerMutationFor(taskId: string) {
   }
 }
 
+// isRunBusy：這個 kind 本身正在跑（顯示「執行中…」進度指示）。
 function isRunBusy(taskId: string, kind: string): boolean {
   return evidence.runOf(planId.value, taskId, kind)?.status === 'running'
+}
+// isTaskBusy：review fix（Medium correctness finding）——RunEvidence 是同步
+// 長呼叫，同一 task 的 expected_red／negative_control 原本互不 disable：先按
+// red 再按 negative_control，兩筆 started 依序抵達會讓只認「最近一筆
+// started」的配對邏輯錯位（見 stores/evidence.ts 的修法說明）。per-task 互斥
+// 更貼近實際：同一 task 任一 kind 執行中時，兩顆 run 按鈕都 disabled，不能
+// 同時觸發第二個 RunEvidence 呼叫。
+function isTaskBusy(taskId: string): boolean {
+  return evidence.taskHasRunInFlight(planId.value, taskId)
 }
 
 // run：RunEvidence 只回傳 evidence_id，不帶 result（RunEvidence 的返回值刻意
@@ -206,7 +216,7 @@ async function submit(taskId: string) {
           <div v-for="kind in ['expected_red', 'negative_control']" :key="kind" class="run-row">
             <button
               type="button" :data-test="'run-' + kind + '-' + task.task_id"
-              :disabled="isRunBusy(task.task_id, kind) || (kind === 'negative_control' && !mutationIds[task.task_id])"
+              :disabled="isTaskBusy(task.task_id) || (kind === 'negative_control' && !mutationIds[task.task_id])"
               @click="run(task.task_id, kind)"
             >{{ kind === 'expected_red' ? t('tcaWorkspace.action.runExpectedRed') : t('tcaWorkspace.action.runNegativeControl') }}</button>
             <span v-if="isRunBusy(task.task_id, kind)" class="busy" :data-test="'run-busy-' + kind + '-' + task.task_id">
@@ -222,9 +232,10 @@ async function submit(taskId: string) {
               </span>
               <template v-if="evidence.runOf(planId, task.task_id, kind)!.status === 'error'">
                 <span class="err" :data-test="'run-error-' + kind + '-' + task.task_id">{{ evidence.runOf(planId, task.task_id, kind)!.error }}</span>
-                <button type="button" :data-test="'retry-' + kind + '-' + task.task_id" @click="run(task.task_id, kind)">
-                  {{ t('tcaWorkspace.action.retry') }}
-                </button>
+                <button
+                  type="button" :data-test="'retry-' + kind + '-' + task.task_id" :disabled="isTaskBusy(task.task_id)"
+                  @click="run(task.task_id, kind)"
+                >{{ t('tcaWorkspace.action.retry') }}</button>
               </template>
             </template>
           </div>
