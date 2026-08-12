@@ -90,11 +90,16 @@ export default {
     },
     reasonHint: 'Enter a reason before rejecting',
     degradedNotice: 'Approval journal degraded: approve/reject paused, view only',
-    empty: 'No Gate 1 items',
+    empty: 'No approval items',
     label: {
       approvalId: 'approval_id',
       baseCommit: 'base_commit',
       specManifest: 'spec_manifest',
+    },
+    risk: {
+      minimum: 'Minimum risk tier',
+      planner: 'Planner risk tier',
+      overrideReasonPlaceholder: 'Override reason (required when selected is below planner)',
     },
   },
   spec: {

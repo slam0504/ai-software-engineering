@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateDecisionContext, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
@@ -10,7 +10,7 @@ import { useAssist } from './stores/assist'
 import { usePlan } from './stores/plan'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
-import type { GateEntry } from './types'
+import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import Timeline from './components/Timeline.vue'
@@ -40,25 +40,38 @@ async function refreshGate() {
     gateDegraded.value = list.some(e => e.journal_degraded === true)
     const next: Record<string, GateEntry> = {}
     for (const e of list) {
-      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, bindings: e.bindings, base_commit: e.base_commit }
+      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, subject: e.subject, bindings: e.bindings, base_commit: e.base_commit }
     }
     gate.entries = next
   } catch { /* dev 無綁定時忽略 */ }
 }
 
-async function decideGate(id: string, decision: string, reason: string) {
+async function decideGate(id: string, decision: string, reason: string, riskSelections: RiskSelection[]) {
   gateError.value = ''
   try {
-    await GateDecide(id, decision, reason, [])
+    await GateDecide(id, decision, reason, riskSelections)
   } catch (e) {
     gateError.value = String(e)
   }
   await refreshGate()
 }
 const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag'>('chat')
-// Task 14：任務 DAG 表示圖層——select-task 先 no-op 佔位，導航到 GateConsole 對應項是 Task 15 的範圍
-function onSelectTask(taskId: string) {
-  console.log('select-task', taskId)
+// Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
+// GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
+// 本身是常駐側欄，不是分頁，故「導航」在此語意上就是高亮＋不動 tab）。查不到對應
+// 卡片就保留現狀，不拋錯（M3a 單一 active plan 假設下最多命中一筆）。
+const highlightedApprovalId = ref('')
+async function onSelectTask(taskId: string) {
+  for (const e of gate.list) {
+    if (e.gate !== 'gate2' || e.state !== 'pending') continue
+    try {
+      const ctx = await GateDecisionContext(e.approval_id)
+      if (ctx.tasks.some(t => t.task_id === taskId)) {
+        highlightedApprovalId.value = e.approval_id
+        return
+      }
+    } catch { /* 該卡片載入失敗就跳過，繼續找下一筆，不炸 */ }
+  }
 }
 // Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
 const diagramFiles = ref<string[]>([])
@@ -179,7 +192,10 @@ onMounted(async () => {
       </main>
       <div class="gate-resize" :title="t('app.resize.width')" @mousedown.prevent="onGateResizeStart" />
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
-        <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
+        <GateConsole
+          :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
+          :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
+        />
         <p v-if="gateError" class="gate-err">{{ gateError }}</p>
       </aside>
     </div>

@@ -32,6 +32,7 @@ export const useGate = defineStore('gate', {
             approval_id: id,
             state: 'pending',
             gate: typeof p.gate === 'string' ? p.gate : undefined,
+            subject: typeof p.subject === 'string' ? p.subject : undefined,
             bindings: env.bindings,
             base_commit: typeof p.base_commit === 'string' ? p.base_commit : undefined,
           }

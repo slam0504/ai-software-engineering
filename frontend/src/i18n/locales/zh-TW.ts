@@ -90,11 +90,16 @@ export default {
     },
     reasonHint: '請先填理由再退回',
     degradedNotice: '核可記錄異常：核可與退回功能已暫停，目前僅供查看',
-    empty: '目前沒有 Gate 1 項目',
+    empty: '目前沒有核可項目',
     label: {
       approvalId: '核可編號（approval_id）',
       baseCommit: '基準 commit（base_commit）',
       specManifest: '規格 manifest（spec_manifest）',
+    },
+    risk: {
+      minimum: '最低風險層級',
+      planner: '規劃風險層級',
+      overrideReasonPlaceholder: '覆寫理由（selected 低於 planner 時必填）',
     },
   },
   spec: {
