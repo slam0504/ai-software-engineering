@@ -1,4 +1,3 @@
-import { mount } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -12,7 +11,7 @@ vi.mock('../../wailsjs/go/main/App', () => mocks)
 
 import SettingsBar from './SettingsBar.vue'
 import { useSession } from '../stores/session'
-import { i18n } from '../i18n'
+import { mountWithI18n } from '../test/i18n'
 
 describe('SettingsBar provider tabs', () => {
   beforeEach(() => {
@@ -21,7 +20,7 @@ describe('SettingsBar provider tabs', () => {
   })
 
   it('tab click switches active view without backend calls', async () => {
-    const wrapper = mount(SettingsBar, { global: { plugins: [i18n] } })
+    const wrapper = mountWithI18n(SettingsBar)
     const s = useSession()
     const tabs = wrapper.findAll('.tab')
     expect(tabs.length).toBe(2)
@@ -35,7 +34,7 @@ describe('SettingsBar provider tabs', () => {
   })
 
   it('shows unread badge and approval flag per tab', async () => {
-    const wrapper = mount(SettingsBar, { global: { plugins: [i18n] } })
+    const wrapper = mountWithI18n(SettingsBar)
     const s = useSession()
     s.apply({ event_id: 'e1', ts: 't', provider: 'codex', kind: 'result' })
     s.apply({ event_id: 'e2', ts: 't', provider: 'codex', kind: 'state_change', state: 'awaiting_approval' })
