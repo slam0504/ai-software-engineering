@@ -109,6 +109,21 @@ func NewWorktree(repoRoot, commitOID, registryPath, evidenceID string) (*Worktre
 // git's standard "rename from "/"copy from " extended-header lines and
 // folds those old paths in too, so touched always contains both sides of a
 // rename/copy regardless of what --numstat -z actually emits.
+//
+// Those header paths go through unquoteCStyle before being folded in.
+// `-z` disables numstat's own path quoting, but it has no effect on the
+// "rename from "/"copy from " lines — those come from the patch text
+// itself, which git quotes (core.quotepath default) whenever a path
+// contains a byte it considers unsafe: any non-ASCII UTF-8 byte, a
+// backslash, a double quote, or a control character. An unquoted rename
+// header on a non-ASCII path (e.g. rename from "t\303\244b.txt") would
+// otherwise land in touched as that literal escaped string instead of the
+// real path, silently diverging from the raw bytes numstat -z returns for
+// the same file. Left unhandled, this is also an oracle-surface bypass: an
+// attacker can hand-craft a patch with an already-quoted, non-escaped old
+// path (rename from "src/oracle.txt") and rely on git apply accepting it
+// verbatim while a caller comparing touched against the oracle surface sees
+// only the quoted literal and never matches.
 func (w *Worktree) ApplyPatch(patch []byte) (touched []string, err error) {
 	if _, err := runGit(w.Dir, patch, "apply", "--check"); err != nil {
 		return nil, fmt.Errorf("evidence: apply patch: check failed: %w", err)
@@ -146,13 +161,69 @@ func parseTouchedPaths(numstatZ []byte, patch []byte) []string {
 		}
 	}
 	for _, line := range strings.Split(string(patch), "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		if p, ok := strings.CutPrefix(line, "rename from "); ok {
-			add(p)
+			add(unquoteCStyle(p))
 		} else if p, ok := strings.CutPrefix(line, "copy from "); ok {
-			add(p)
+			add(unquoteCStyle(p))
 		}
 	}
 	return out
+}
+
+// unquoteCStyle reverses git's quote_c_style path quoting, which
+// "rename from "/"copy from " extended-header lines are subject to (see
+// ApplyPatch's doc comment). A path is only ever wrapped in quotes when git
+// decided quoting was necessary, so a string that isn't wrapped in a
+// leading and trailing '"' is returned unchanged — including the
+// adversarial case of a hand-crafted header with no matching outer quotes
+// at all.
+func unquoteCStyle(s string) string {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s
+	}
+	inner := s[1 : len(s)-1]
+	out := make([]byte, 0, len(inner))
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if c != '\\' || i+1 >= len(inner) {
+			out = append(out, c)
+			continue
+		}
+		i++
+		switch e := inner[i]; {
+		case e == 'a':
+			out = append(out, '\a')
+		case e == 'b':
+			out = append(out, '\b')
+		case e == 'f':
+			out = append(out, '\f')
+		case e == 'n':
+			out = append(out, '\n')
+		case e == 'r':
+			out = append(out, '\r')
+		case e == 't':
+			out = append(out, '\t')
+		case e == 'v':
+			out = append(out, '\v')
+		case e == '\\' || e == '"':
+			out = append(out, e)
+		case e >= '0' && e <= '7':
+			// \NNN: up to 3 octal digits encoding one raw byte.
+			val := int(e - '0')
+			for k := 0; k < 2 && i+1 < len(inner) && inner[i+1] >= '0' && inner[i+1] <= '7'; k++ {
+				i++
+				val = val*8 + int(inner[i]-'0')
+			}
+			out = append(out, byte(val))
+		default:
+			// Unknown escape: not a form git itself ever produces; keep it
+			// literally rather than guess, so an unexpected input is never
+			// silently misparsed into some other path.
+			out = append(out, '\\', e)
+		}
+	}
+	return string(out)
 }
 
 // Remove tears down the worktree (git worktree remove --force + prune) and

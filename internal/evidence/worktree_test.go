@@ -283,6 +283,138 @@ func TestApplyPatchRenameNumstatReturnsBothPaths(t *testing.T) {
 	}
 }
 
+// TestApplyPatchRenameNonASCIIPathUnquoted guards the HIGH finding from
+// Task 18 review: git quotes "rename from "/"rename to " header paths
+// (core.quotepath default) whenever a path contains a non-ASCII byte,
+// emitting C-style octal escapes like "t\303\244b.txt". Without unquoting,
+// touched would contain that literal escaped string instead of the real
+// path, diverging from the raw UTF-8 bytes numstat -z returns for the same
+// file.
+func TestApplyPatchRenameNonASCIIPathUnquoted(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q")
+	runGitT(t, root, "config", "user.email", "t@t.com")
+	runGitT(t, root, "config", "user.name", "t")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const oldName, newName = "src/täb.txt", "src/bäz.txt"
+	writeFileT(t, root, oldName, "line1\nline2\nline3\n")
+	runGitT(t, root, "add", "-A")
+	runGitT(t, root, "commit", "-q", "-m", "init")
+	head := strings.TrimSpace(string(mustRunGitT(t, root, "rev-parse", "HEAD")))
+
+	runGitT(t, root, "mv", oldName, newName)
+	writeFileT(t, root, newName, "line1\nlineX\nline3\n")
+	patch := mustRunGitT(t, root, "diff", "-M", "HEAD")
+	if !strings.Contains(string(patch), `\303\244`) {
+		t.Fatalf("test setup: expected patch to contain a C-style quoted non-ASCII escape, got:\n%s", patch)
+	}
+	runGitT(t, root, "checkout", "--", ".")
+	runGitT(t, root, "clean", "-fd")
+
+	registryPath := filepath.Join(t.TempDir(), "registry.jsonl")
+	evidenceID := evID(t, "wt")
+	t.Cleanup(func() { removeEvidenceDirLeftover(t, evidenceID) })
+
+	w, err := NewWorktree(root, head, registryPath, evidenceID)
+	if err != nil {
+		t.Fatalf("NewWorktree: %v", err)
+	}
+	defer func() { _ = w.Remove(root, registryPath) }()
+
+	touched, err := w.ApplyPatch(patch)
+	if err != nil {
+		t.Fatalf("ApplyPatch(non-ASCII rename patch): %v", err)
+	}
+	want := map[string]bool{oldName: false, newName: false}
+	for _, p := range touched {
+		if _, ok := want[p]; ok {
+			want[p] = true
+		}
+		if strings.Contains(p, `\`) || strings.Contains(p, `"`) {
+			t.Errorf("touched entry %q still looks quoted/escaped, want raw UTF-8 path", p)
+		}
+	}
+	for p, found := range want {
+		if !found {
+			t.Errorf("touched = %v, missing unquoted rename side %q", touched, p)
+		}
+	}
+}
+
+// TestApplyPatchAdversarialSelfQuotedRenameHeaderStillCanonical guards the
+// evasion the reviewer confirmed: an attacker can hand-craft a patch whose
+// "rename from " header wraps a plain ASCII path in quotes with no escapes
+// needed (git apply accepts this — quoting is optional, not required, for
+// an unescaped path). Without C-style unquoting, the literal quoted string
+// `"src/oracle.txt"` would land in touched instead of the canonical
+// `src/oracle.txt`, letting an oracle-surface rename evade detection.
+func TestApplyPatchAdversarialSelfQuotedRenameHeaderStillCanonical(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q")
+	runGitT(t, root, "config", "user.email", "t@t.com")
+	runGitT(t, root, "config", "user.name", "t")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileT(t, root, "src/oracle.txt", "hello oracle\n")
+	runGitT(t, root, "add", "-A")
+	runGitT(t, root, "commit", "-q", "-m", "init")
+	head := strings.TrimSpace(string(mustRunGitT(t, root, "rev-parse", "HEAD")))
+
+	registryPath := filepath.Join(t.TempDir(), "registry.jsonl")
+	evidenceID := evID(t, "wt")
+	t.Cleanup(func() { removeEvidenceDirLeftover(t, evidenceID) })
+
+	w, err := NewWorktree(root, head, registryPath, evidenceID)
+	if err != nil {
+		t.Fatalf("NewWorktree: %v", err)
+	}
+	defer func() { _ = w.Remove(root, registryPath) }()
+
+	// Hand-crafted: quotes with no escaped bytes inside, which git never
+	// emits itself (it only quotes when an escape is actually needed) but
+	// git apply accepts anyway.
+	patch := []byte(`diff --git a/src/oracle.txt b/src/oracle2.txt
+similarity index 100%
+rename from "src/oracle.txt"
+rename to "src/oracle2.txt"
+`)
+	touched, err := w.ApplyPatch(patch)
+	if err != nil {
+		t.Fatalf("ApplyPatch(self-quoted rename patch): %v", err)
+	}
+	found := false
+	for _, p := range touched {
+		if p == "src/oracle.txt" {
+			found = true
+		}
+		if p == `"src/oracle.txt"` {
+			t.Errorf("touched contains literal quoted string %q, unquoting was not applied", p)
+		}
+	}
+	if !found {
+		t.Errorf("touched = %v, missing canonical old path %q (oracle-surface bypass)", touched, "src/oracle.txt")
+	}
+}
+
+func TestUnquoteCStyle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`src/plain.txt`, `src/plain.txt`},     // not quoted: unchanged
+		{`"src/oracle.txt"`, `src/oracle.txt`}, // quoted, no escapes needed: unwrapped
+		{`"t\303\244b.txt"`, "t\xc3\xa4b.txt"}, // octal escapes: raw UTF-8 bytes
+		{`"a\tb"`, "a\tb"},                     // standard C escape
+		{`"a\\b\"c"`, `a\b"c`},                 // escaped backslash + quote
+		{`"`, `"`},                             // malformed (single quote char): unchanged
+	}
+	for _, c := range cases {
+		if got := unquoteCStyle(c.in); got != c.want {
+			t.Errorf("unquoteCStyle(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // ---- Step 1: crash windows, driven through CleanupOrphans ----
 
 // (a0) intent written, directory never created (crash before `worktree
