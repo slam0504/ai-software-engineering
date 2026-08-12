@@ -10,11 +10,15 @@ export function CLIInfo():Promise<Record<string, string>>;
 
 export function CancelLogin(arg1:string):Promise<void>;
 
+export function ConfirmPlanCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
+
 export function ConfirmSpecCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
 
 export function EndSession(arg1:string):Promise<void>;
 
 export function GateDecide(arg1:string,arg2:string,arg3:string,arg4:Array<gate.RiskSelection>):Promise<void>;
+
+export function GateDecisionContext(arg1:string):Promise<main.GateDecisionContextDTO>;
 
 export function GateList():Promise<Array<main.GateEntryDTO>>;
 
@@ -23,6 +27,16 @@ export function ListWorkspace(arg1:string):Promise<Array<main.FileNode>>;
 export function Logout(arg1:string):Promise<void>;
 
 export function NewSession(arg1:string):Promise<void>;
+
+export function PlanAssist(arg1:string,arg2:string):Promise<string>;
+
+export function PlanList():Promise<Array<main.FileNode>>;
+
+export function PlanRead(arg1:string):Promise<main.SpecFile>;
+
+export function PlanWrite(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function PreviewPlanCommit():Promise<main.SpecCommitPreview>;
 
 export function PreviewSpecCommit():Promise<main.SpecCommitPreview>;
 
@@ -51,5 +65,7 @@ export function StartLogin(arg1:string):Promise<void>;
 export function StartSession(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<void>;
 
 export function SubmitForApproval():Promise<string>;
+
+export function SubmitPlanForApproval(arg1:string):Promise<string>;
 
 export function TerminateSession(arg1:string):Promise<void>;

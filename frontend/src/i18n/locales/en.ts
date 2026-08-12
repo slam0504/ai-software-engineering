@@ -4,6 +4,7 @@ export default {
       chat: 'Chat',
       preview: 'Preview',
       spec: 'Spec',
+      plan: 'Plan',
       diagram: 'Diagram',
     },
     timeline: {
@@ -107,6 +108,32 @@ export default {
     },
     assist: {
       drafting: 'Generating…',
+    },
+    commitMessage: {
+      placeholder: 'commit message',
+    },
+    submittedApprovalId: 'approval_id: {id}',
+  },
+  planWorkspace: {
+    action: {
+      generateDraft: 'Generate plan draft',
+      applyDraft: 'Apply draft',
+      save: 'Save',
+      submit: 'Submit for Gate 2',
+      previewCommit: 'Preview commit',
+      confirmCommit: 'Confirm commit',
+    },
+    assist: {
+      drafting: 'Generating…',
+    },
+    provider: {
+      label: 'AI provider',
+    },
+    prompt: {
+      placeholder: 'Describe the plan to draft',
+    },
+    planId: {
+      placeholder: 'plan ID',
     },
     commitMessage: {
       placeholder: 'commit message',

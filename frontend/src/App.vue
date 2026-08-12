@@ -7,6 +7,7 @@ import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
+import { usePlan } from './stores/plan'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import type { GateEntry } from './types'
@@ -19,12 +20,14 @@ import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
+import PlanWorkspace from './components/PlanWorkspace.vue'
 import DiagramPane from './components/DiagramPane.vue'
 
 const { t } = useI18n()
 const s = useSession()
 const gate = useGate()
 const assist = useAssist()
+const plan = usePlan()
 const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
 const gateError = ref('')
 
@@ -51,7 +54,7 @@ async function decideGate(id: string, decision: string, reason: string) {
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview' | 'spec' | 'diagram'>('chat')
+const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram'>('chat')
 // Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
 const diagramFiles = ref<string[]>([])
 const diagramPath = ref('')
@@ -127,6 +130,7 @@ onMounted(async () => {
     const dst = routeEnvelope(e)
     if (dst === 'gate') gate.applyGateEvent(e)
     else if (dst === 'assist') assist.applyAssistEvent(e)
+    else if (dst === 'plan') plan.applyAssistEvent(e)
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
@@ -151,11 +155,13 @@ onMounted(async () => {
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
           <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">{{ t('app.tab.preview') }}</button>
           <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">{{ t('app.tab.spec') }}</button>
+          <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">{{ t('app.tab.plan') }}</button>
           <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
+        <PlanWorkspace v-if="tab === 'plan'" />
         <div v-show="tab === 'diagram'" class="diagram-tab">
           <div class="diagram-files">
             <button v-for="f in diagramFiles" :key="f" :class="{ active: f === diagramPath }"

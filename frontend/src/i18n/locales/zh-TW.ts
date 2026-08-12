@@ -4,6 +4,7 @@ export default {
       chat: '對話',
       preview: '預覽',
       spec: '規格',
+      plan: '計畫',
       diagram: '表示圖',
     },
     timeline: {
@@ -107,6 +108,32 @@ export default {
     },
     assist: {
       drafting: 'AI 產生中…',
+    },
+    commitMessage: {
+      placeholder: 'commit 訊息',
+    },
+    submittedApprovalId: '核可編號（approval_id）：{id}',
+  },
+  planWorkspace: {
+    action: {
+      generateDraft: '產生計畫草稿',
+      applyDraft: '套用草稿',
+      save: '儲存',
+      submit: '送核 Gate 2',
+      previewCommit: '預覽 commit',
+      confirmCommit: '建立 commit',
+    },
+    assist: {
+      drafting: 'AI 產生中…',
+    },
+    provider: {
+      label: 'AI provider',
+    },
+    prompt: {
+      placeholder: '描述要草擬的計畫內容',
+    },
+    planId: {
+      placeholder: '計畫編號（planID）',
     },
     commitMessage: {
       placeholder: 'commit 訊息',

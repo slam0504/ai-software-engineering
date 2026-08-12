@@ -14,6 +14,10 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
+export function ConfirmPlanCommit(arg1, arg2) {
+  return window['go']['main']['App']['ConfirmPlanCommit'](arg1, arg2);
+}
+
 export function ConfirmSpecCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
 }
@@ -24,6 +28,10 @@ export function EndSession(arg1) {
 
 export function GateDecide(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GateDecide'](arg1, arg2, arg3, arg4);
+}
+
+export function GateDecisionContext(arg1) {
+  return window['go']['main']['App']['GateDecisionContext'](arg1);
 }
 
 export function GateList() {
@@ -40,6 +48,26 @@ export function Logout(arg1) {
 
 export function NewSession(arg1) {
   return window['go']['main']['App']['NewSession'](arg1);
+}
+
+export function PlanAssist(arg1, arg2) {
+  return window['go']['main']['App']['PlanAssist'](arg1, arg2);
+}
+
+export function PlanList() {
+  return window['go']['main']['App']['PlanList']();
+}
+
+export function PlanRead(arg1) {
+  return window['go']['main']['App']['PlanRead'](arg1);
+}
+
+export function PlanWrite(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PlanWrite'](arg1, arg2, arg3);
+}
+
+export function PreviewPlanCommit() {
+  return window['go']['main']['App']['PreviewPlanCommit']();
 }
 
 export function PreviewSpecCommit() {
@@ -96,6 +124,10 @@ export function StartSession(arg1, arg2, arg3, arg4, arg5, arg6) {
 
 export function SubmitForApproval() {
   return window['go']['main']['App']['SubmitForApproval']();
+}
+
+export function SubmitPlanForApproval(arg1) {
+  return window['go']['main']['App']['SubmitPlanForApproval'](arg1);
 }
 
 export function TerminateSession(arg1) {

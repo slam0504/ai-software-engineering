@@ -69,10 +69,60 @@ export namespace main {
 	        this.isDir = source["isDir"];
 	    }
 	}
+	export class GateDecisionTaskDTO {
+	    task_id: string;
+	    title: string;
+	    minimum_risk_tier: string;
+	    planner_risk_tier: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new GateDecisionTaskDTO(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.task_id = source["task_id"];
+	        this.title = source["title"];
+	        this.minimum_risk_tier = source["minimum_risk_tier"];
+	        this.planner_risk_tier = source["planner_risk_tier"];
+	    }
+	}
+	export class GateDecisionContextDTO {
+	    tasks: GateDecisionTaskDTO[];
+	
+	    static createFrom(source: any = {}) {
+	        return new GateDecisionContextDTO(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tasks = this.convertValues(source["tasks"], GateDecisionTaskDTO);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
 	export class GateEntryDTO {
 	    approval_id: string;
 	    state: string;
 	    gate?: string;
+	    subject?: string;
 	    spec_manifest_digest?: string;
 	    base_commit?: string;
 	    created_at?: string;
@@ -91,6 +141,7 @@ export namespace main {
 	        this.approval_id = source["approval_id"];
 	        this.state = source["state"];
 	        this.gate = source["gate"];
+	        this.subject = source["subject"];
 	        this.spec_manifest_digest = source["spec_manifest_digest"];
 	        this.base_commit = source["base_commit"];
 	        this.created_at = source["created_at"];
@@ -173,6 +224,7 @@ export namespace spec {
 	export class CommitToken {
 	    HeadOID: string;
 	    TreeDigest: string;
+	    AnalysisBase: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new CommitToken(source);
@@ -182,6 +234,7 @@ export namespace spec {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.HeadOID = source["HeadOID"];
 	        this.TreeDigest = source["TreeDigest"];
+	        this.AnalysisBase = source["AnalysisBase"];
 	    }
 	}
 
