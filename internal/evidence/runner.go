@@ -136,6 +136,13 @@ func Run(ctx context.Context, repoRoot, casDir, registryPath string, ld ContextL
 	if rs.Kind != "expected_red" && rs.Kind != "negative_control" {
 		return EvidenceRun{}, fmt.Errorf("evidence: run: unknown RunSpec.Kind %q", rs.Kind)
 	}
+	if rs.Kind == "expected_red" && len(rs.MutationPatch) > 0 {
+		// A non-empty MutationPatch on an expected_red run would otherwise be
+		// silently dropped (only negative_control ever applies it) — the
+		// mutation intent must not vanish into a clean "passed" expected_red
+		// result. Fail closed instead (review HIGH-1).
+		return EvidenceRun{}, fmt.Errorf("evidence: run: expected_red must not carry a MutationPatch (got %d bytes)", len(rs.MutationPatch))
+	}
 	timeout := rs.Timeout
 	if timeout <= 0 {
 		timeout = defaultTimeout

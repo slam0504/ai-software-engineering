@@ -70,6 +70,41 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestClassify_EmptyExpectedFailureFailsClosed guards review finding
+// MEDIUM-2: an empty Matcher makes bytes.Contains trivially true against ANY
+// output, so a blank/malformed ExpectedFailure must never be able to reach
+// "passed" — including on a compile-error-style non-zero exit that carries
+// no real red-state characteristic at all. This must fail closed
+// regardless of exit code (checked at the very top of classify, before the
+// exit==0 "failed" branch).
+func TestClassify_EmptyExpectedFailureFailsClosed(t *testing.T) {
+	const wantObserved = "empty expected_failure matcher/test_ids"
+	cases := []struct {
+		name     string
+		exitCode int
+		ef       plan.ExpectedFailure
+	}{
+		{name: "empty matcher, non-empty test ids, exit != 0", exitCode: 2, ef: plan.ExpectedFailure{TestIDs: []string{"TestFoo"}, Matcher: ""}},
+		{name: "empty test ids, non-empty matcher, exit != 0", exitCode: 2, ef: plan.ExpectedFailure{TestIDs: nil, Matcher: "FAIL"}},
+		{name: "both empty, exit != 0", exitCode: 2, ef: plan.ExpectedFailure{}},
+		{name: "both empty, exit == 0", exitCode: 0, ef: plan.ExpectedFailure{}}, // must stay "error", not fall through to "failed"
+	}
+	output := []byte("# pkg\n./foo.go:10:2: undefined: bar\nFAIL\tpkg [build failed]\n")
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			result, observed := ClassifyExpectedRed(c.exitCode, output, c.ef)
+			if result != "error" || observed != wantObserved {
+				t.Errorf("ClassifyExpectedRed(%d, ef=%+v) = (%q, %q), want (\"error\", %q)", c.exitCode, c.ef, result, observed, wantObserved)
+			}
+			ncResult, ncObserved := ClassifyNegativeControl(c.exitCode, output, c.ef)
+			if ncResult != "error" || ncObserved != wantObserved {
+				t.Errorf("ClassifyNegativeControl(%d, ef=%+v) = (%q, %q), want (\"error\", %q)", c.exitCode, c.ef, ncResult, ncObserved, wantObserved)
+			}
+		})
+	}
+}
+
 func TestClassifyExpectedRed_ObservedIsMatcherHitLine(t *testing.T) {
 	ef := plan.ExpectedFailure{TestIDs: []string{"TestX"}, Matcher: "FAIL: TestX"}
 	output := "=== RUN TestX\nFAIL: TestX (0.00s)\nFAIL\n"

@@ -160,6 +160,24 @@ func TestRun_ExpectedRed_RedStatePasses(t *testing.T) {
 	assertNoZombieWorktrees(t, root)
 }
 
+// TestRun_ExpectedRed_RejectsMutationPatch guards review finding HIGH-1: a
+// non-empty MutationPatch on an expected_red RunSpec must never be silently
+// dropped (only negative_control ever applies a patch) — that would let a
+// caller's mutation intent vanish into a clean "passed" expected_red
+// result. Run must reject this before touching git/worktree state at all.
+func TestRun_ExpectedRed_RejectsMutationPatch(t *testing.T) {
+	casDir, registryPath := runFixtureDirs(t)
+	rs := RunSpec{
+		Kind: "expected_red", PlanID: "P1", TaskID: "T1",
+		PlanCommit: "irrelevant", TestCommit: "irrelevant",
+		MutationPatch: []byte("diff --git a/x b/x\n"),
+	}
+	_, err := Run(context.Background(), t.TempDir(), casDir, registryPath, nil, rs, func() string { return "ev" }, testNow)
+	if err == nil {
+		t.Fatal("Run: want error, expected_red must not silently accept a MutationPatch")
+	}
+}
+
 // ---- Step 2: timeout — worktree and process group must both be fully cleaned ----
 
 func TestRun_Timeout_KillsProcessGroupAndCleansWorktree(t *testing.T) {

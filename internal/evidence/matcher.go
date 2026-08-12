@@ -31,6 +31,15 @@ func ClassifyNegativeControl(exitCode int, output []byte, ef plan.ExpectedFailur
 
 // classify is the shared judgment behind both exported Classify* functions.
 func classify(exitCode int, output []byte, ef plan.ExpectedFailure) (result, observed string) {
+	// Fail closed on an empty ExpectedFailure (review MEDIUM-2): an empty
+	// Matcher makes bytes.Contains trivially true against ANY output — a
+	// compile error, a panic, anything — so a blank/malformed contract must
+	// never be able to reach "passed" just by having exit != 0. Task 21's
+	// plan validator is a second line of defense; this is the one at the
+	// point evidence is actually produced.
+	if ef.Matcher == "" || len(ef.TestIDs) == 0 {
+		return "error", "empty expected_failure matcher/test_ids"
+	}
 	if exitCode == 0 {
 		return "failed", "tests did not fail"
 	}
