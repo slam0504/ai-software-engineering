@@ -169,6 +169,7 @@ export default {
       toolResult: '工具結果',
     },
     raw: '原始資料',
+    systemEvents: '系統事件 ×{count}',
   },
   store: {
     bindingsNotReady: '綁定尚未就緒',

@@ -46,7 +46,7 @@ function toggle(set: Set<number> | Set<string>, key: never) {
     <template v-for="(r, idx) in rows" :key="idx">
       <div v-if="r.group !== undefined" class="row noise">
         <button @click="toggle(openGroups, r.group! as never)">
-          {{ openGroups.has(r.group!) ? '▾' : '▸' }} 系統事件 ×{{ r.count }}
+          {{ openGroups.has(r.group!) ? '▾' : '▸' }} {{ t('timeline.systemEvents', { count: r.count }) }}
         </button>
         <div v-if="openGroups.has(r.group!)" class="noise-items">
           <div v-for="g in groupItems(r.group!)" :key="g.env.event_id" class="row sub">

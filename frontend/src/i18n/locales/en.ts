@@ -169,6 +169,7 @@ export default {
       toolResult: 'tool result',
     },
     raw: 'raw',
+    systemEvents: 'System events ×{count}',
   },
   store: {
     bindingsNotReady: 'bindings not ready',
