@@ -26,6 +26,10 @@ const (
 	KindUsage            Kind = "usage"             // token 用量事件
 	KindStateChange      Kind = "state_change"      // state reducer 輸出
 	KindApprovalDecision Kind = "approval_decision" // 核可決定入事件流
+
+	// M2 新增（additive；Stage A §3.4c）：workspace scope 事件，不進 provider slot。
+	KindGateRequest  Kind = "gate_request"  // gate 待決：Manager.EmitWorkspace 出口
+	KindBindingStale Kind = "binding_stale" // binding digest 過期通知
 )
 
 type Event struct {

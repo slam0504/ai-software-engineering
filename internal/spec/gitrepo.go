@@ -1,0 +1,174 @@
+package spec
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// GitRepo is the git-backed implementation of Repo. HEAD-tree reads go
+// through the git object database (git cat-file), never the worktree — this
+// is the TOCTOU-safety boundary: a dirty worktree must never leak into a
+// committed snapshot's digest.
+type GitRepo struct {
+	root string
+}
+
+func NewGitRepo(root string) *GitRepo {
+	return &GitRepo{root: root}
+}
+
+// git runs `git -C root <args>` and returns raw stdout bytes.
+func (g *GitRepo) git(args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", g.root}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("git %v: %s", args, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("git %v: %w", args, err)
+	}
+	return out, nil
+}
+
+func (g *GitRepo) HeadCommit() (string, error) {
+	out, err := g.git("rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// ScopedClean reports whether the managed spec/ paths (per InScope) have no
+// staged, unstaged, or untracked changes. --untracked-files=all expands
+// untracked directories into individual file paths so InScope filtering
+// works on file granularity.
+func (g *GitRepo) ScopedClean() (bool, error) {
+	out, err := g.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		if InScope(statusPath(line)) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// statusPath extracts the path from a `git status --porcelain` line
+// ("XY path" or "XY old -> new" for renames).
+func statusPath(line string) string {
+	if len(line) < 4 {
+		return ""
+	}
+	rest := line[3:]
+	if idx := strings.Index(rest, " -> "); idx >= 0 {
+		rest = rest[idx+4:]
+	}
+	return strings.Trim(rest, "\"")
+}
+
+// ReadScopedHeadTree enumerates the HEAD tree and reads each in-scope blob
+// straight from the object database via `git cat-file blob <head>:<path>`.
+// It never touches the worktree, so it is stable regardless of uncommitted
+// worktree edits.
+func (g *GitRepo) ReadScopedHeadTree(head string) ([]FileEntry, error) {
+	out, err := g.git("ls-tree", "-r", "--name-only", head)
+	if err != nil {
+		return nil, err
+	}
+	var entries []FileEntry
+	for _, path := range strings.Split(string(out), "\n") {
+		if path == "" || !InScope(path) {
+			continue
+		}
+		blob, err := g.git("cat-file", "blob", head+":"+path)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, FileEntry{Path: path, SHA256: HashBytes(blob)})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, nil
+}
+
+// ReadScopedWorktree enumerates exactly the files git considers in scope —
+// tracked (--cached) plus untracked-but-not-ignored (--others
+// --exclude-standard) — via `git ls-files`, so its view of the managed scope
+// matches ScopedClean and ReadScopedHeadTree. This is the fix for the false
+// permanent-STALE bug: a raw filesystem walk also enumerated git-ignored
+// files (e.g. macOS `.DS_Store`), which the HEAD-tree manifest never contains,
+// so the digests diverged with zero real spec change. Deferring enumeration to
+// git makes .gitignore / global ignore / .git/info/exclude apply uniformly.
+//
+// It still rejects symlinks and any non-regular file (fail loud, never
+// silently skip) and refuses to read files under a nested-repo boundary so a
+// submodule/embedded repo under scope cannot be read as plain files.
+func (g *GitRepo) ReadScopedWorktree() ([]FileEntry, error) {
+	out, err := g.git("ls-files", "--cached", "--others", "--exclude-standard", "-z",
+		"--", "spec/features", "spec/nfr", "spec/glossary.md", "spec/context-map")
+	if err != nil {
+		return nil, err
+	}
+	var entries []FileEntry
+	checkedDirs := map[string]bool{} // memo: dir already verified free of nested .git
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" || !InScope(rel) {
+			continue
+		}
+		if err := g.rejectNestedRepo(rel, checkedDirs); err != nil {
+			return nil, err
+		}
+		abs := filepath.Join(g.root, filepath.FromSlash(rel))
+		info, err := os.Lstat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // tracked (--cached) but deleted from the worktree — not present content
+			}
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("spec: symlink not allowed in scoped tree: %s", rel)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("spec: non-regular file not allowed in scoped tree: %s", rel)
+		}
+		raw, err := os.ReadFile(abs)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, FileEntry{Path: rel, SHA256: HashBytes(raw)})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, nil
+}
+
+// rejectNestedRepo fails loud if any in-scope ancestor directory of rel holds a
+// `.git` marker. A submodule working tree has a `.git` FILE (gitdir pointer);
+// an embedded repo has a `.git` DIR. When that pointer is not itself a live
+// repo, `git ls-files` still lists the files beneath it, so this explicit guard
+// preserves Task 6's boundary — a nested repo under scope must never be read as
+// plain spec files. Checked dirs are memoised so shared ancestors stat once.
+func (g *GitRepo) rejectNestedRepo(rel string, checked map[string]bool) error {
+	for dir := path.Dir(rel); dir != "." && dir != "/" && InScope(dir); dir = path.Dir(dir) {
+		if checked[dir] {
+			continue
+		}
+		checked[dir] = true
+		marker := filepath.Join(g.root, filepath.FromSlash(dir), ".git")
+		if _, err := os.Lstat(marker); err == nil {
+			return fmt.Errorf("spec: submodule/nested repo not allowed in scope: %s", dir)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}

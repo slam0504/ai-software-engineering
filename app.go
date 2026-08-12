@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,14 @@ import (
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
+	"github.com/slam0504/sdlc-workbench/internal/assist"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/gate"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
+	"github.com/slam0504/sdlc-workbench/internal/spec"
 )
 
 type pendingApproval struct {
@@ -75,13 +79,54 @@ type App struct {
 	shuttingDown bool
 	inflight     sync.WaitGroup
 
-	emitUI                 func(name string, data any) // 測試注入；nil = wails runtime
-	hookAfterProviderStart func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
-	hookDuringReset        func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
-	hookBeforeProviderStart func()                     // 測試注入：start ownership 取得後、provider 啟動前
-	hookInServerTxn         func()                     // 測試注入：server 交易已登記、Ensure 未開始
-	codexHostOverride      codexHost                   // 測試注入：fake wire 走 production StartSession 分支
+	emitUI                  func(name string, data any) // 測試注入；nil = wails runtime
+	hookAfterProviderStart  func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
+	hookDuringReset         func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
+	hookBeforeProviderStart func()                      // 測試注入：start ownership 取得後、provider 啟動前
+	hookInServerTxn         func()                      // 測試注入：server 交易已登記、Ensure 未開始
+	codexHostOverride       codexHost                   // 測試注入：fake wire 走 production StartSession 分支
+
+	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
+	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
+	// （gitignored app state；不隨測試覆寫的 stateDir 漂移，永遠綁 workspace 本身）。
+	specRepo            *spec.GitRepo
+	gateSvc             *gate.Service
+	gateJournal         *gate.Journal
+	gateOnce            sync.Once
+	gateInitErr         error
+	gitIdentityOverride func() (name, email string, err error) // 測試注入：略過真實 git config 查詢
+
+	// SpecAssist（Task 11：Stage A §5.1）——per-provider 至多一個 active 隔離
+	// one-shot。assistActive 在 assistMu 下管理獨佔性；每個 generation 的 cancel
+	// 供 shutdown reclaim，once 保證 result／abort／timeout／shutdown 任一先觸發
+	// 即收一次（清 active flag＋endAppTxn＋close done）。
+	assistMu            sync.Mutex
+	assistActive        map[string]*assistGen
+	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
+	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
+
+	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
+	// 觸發 ReconcileGate1()。specWatchStop／specWatchDone 在 a.mu 下管理，供
+	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
+	// 呼叫 watcher.Close() 後才 close(specWatchDone)，shutdown 等 done 保證
+	// watcher 真的關閉、goroutine 真的結束（不留 orphan）。
+	specWatchStop chan struct{}
+	specWatchDone chan struct{}
 }
+
+// assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
+type assistGen struct {
+	correlationID string
+	cancel        context.CancelFunc
+	done          chan struct{} // teardown 完成後關閉（shutdown reclaim 等待點）
+	once          sync.Once
+}
+
+// ErrAssistActive：同一 provider 已有 active SpecAssist（獨佔性；第二個請求回此）。
+var ErrAssistActive = errors.New("assist already active for provider")
+
+// assistTimeout：單一 one-shot 草擬的上限（timeout 為 once/token 收尾觸發之一）。
+const assistTimeout = 3 * time.Minute
 
 // beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
 // 建立／替換 codex server 或啟動 provider 的操作（StartSession、ensureAppServer、
@@ -111,7 +156,8 @@ func (a *App) emit(name string, data any) {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{apprPending: map[string]*pendingApproval{}}
+	return &App{apprPending: map[string]*pendingApproval{},
+		assistActive: map[string]*assistGen{}}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -156,9 +202,10 @@ func (a *App) startup(ctx context.Context) {
 	a.nodePath = resolveNodePath()
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
 		"startup_error": a.startupErr, "node_path": a.nodePath,
-		"tools_dir":     a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
+		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
+	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 ReconcileGate1()
 }
 
 // failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
@@ -194,11 +241,198 @@ func (a *App) watchDiagram(path string) {
 	}()
 }
 
+// specWatchDebounce：連續 fsnotify 事件合併視窗——macOS 對 atomic save 常見
+// 短時間內成對送出 Create／Rename，避免每個事件各自觸發一次 reconcile。
+const specWatchDebounce = 200 * time.Millisecond
+
+// watchSpecTree 對納管的 spec/ 樹（spec.ScopePatterns 範圍）遞迴監看，變更
+// debounce 後觸發 ReconcileGate1()（spec §4：通知層）。只重用 watchDiagram 的
+// 概念，修正其三個缺陷：(1) 這裡遞迴 Add 整棵子樹、新目錄 Create 時再 Add，
+// 不只監看單一 parent；(2) watcher／Add／讀取錯誤一律 fail-loud（audit＋
+// EmitWorkspace stream_error），不吞聲；(3) 透過 specWatchStop／specWatchDone
+// 掛進 shutdown，goroutine 保證退出、watcher.Close() 保證被呼叫。
+//
+// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 ReconcileGate1()（best-effort），
+// 目的是讓已核可的 Gate 1 儘快在 UI 顯示 STALE；權威重算永遠在讀取路徑
+// （gate.Service.List／GateList，Task 10），watcher 失敗不影響正確性。
+//
+// fix round 2（acceptance smoke 發現的落差）：spec/ 在 watchSpecTree() 啟動
+// 當下可能還不存在（例如全新 workspace，尚未有人寫過第一個納管檔）——一律
+// Add workspace root，才能觀察到 <root>/spec 這個 CREATE；spec/ 若已存在則
+// 額外遞迴 Add 進去（同今行為）。root 底下同時有 .workbench/（gate journal／
+// events 持續寫入）與 .git/，事件必須在 runSpecWatch 過濾到 spec/ 子樹以內，
+// 否則 reconcile 寫 journal → 觸發自己的 watch 事件 → 無窮迴圈。
+func (a *App) watchSpecTree() {
+	a.stopSpecWatch() // 冪等：若先前已在監看（重複呼叫），先收掉舊的、不留 orphan goroutine
+
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		a.failLoudSpecWatch("normalize workspace: " + err.Error())
+		return
+	}
+	specRoot := filepath.Join(root, "spec")
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		a.failLoudSpecWatch("fsnotify.NewWatcher: " + err.Error())
+		return
+	}
+	if aerr := w.Add(root); aerr != nil {
+		a.failLoudSpecWatch("watch workspace root: " + aerr.Error())
+		// 繼續：root 沒加成功仍嘗試把已存在的 spec/ 加進去，能看多少算多少。
+	}
+	if _, statErr := os.Stat(specRoot); statErr == nil {
+		if aerr := addRecursiveWatch(w, specRoot); aerr != nil {
+			a.failLoudSpecWatch("watch spec/: " + aerr.Error())
+			// 已成功 Add 的目錄仍持續監看；不因單一子目錄失敗放棄整棵樹。
+		}
+	} else if !os.IsNotExist(statErr) {
+		a.failLoudSpecWatch("stat spec/: " + statErr.Error())
+	}
+	// spec/ 尚不存在也不 return：root 已在監看範圍內，之後 spec/ 被建立會是
+	// root 上的一個 CREATE 事件，runSpecWatch 收到後會遞迴 Add 進去。
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	a.mu.Lock()
+	a.specWatchStop = stop
+	a.specWatchDone = done
+	a.mu.Unlock()
+
+	go a.runSpecWatch(w, specRoot, stop, done)
+}
+
+// addRecursiveWatch 對 dir 底下每個目錄（含自身）呼叫 watcher.Add；WalkDir
+// 中途錯誤（例如 race 中被刪）記錄第一個但不中止整趟 walk，盡量多加。
+func addRecursiveWatch(w *fsnotify.Watcher, dir string) error {
+	var firstErr error
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil // 略過這個節點，繼續 walk 其餘部分
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if aerr := w.Add(path); aerr != nil && firstErr == nil {
+			firstErr = aerr
+		}
+		return nil
+	})
+	return firstErr
+}
+
+// specEventInScope：事件路徑是否落在 spec/ 子樹內（含 spec/ 自身）——watcher
+// 必須 Add workspace root 才能觀察到 spec/ 被晚建立，但 root 底下同時有
+// .workbench/（gate journal／events 持續寫入）與 .git/：reconcile 觸發的
+// journal append 若被自己的 watch 事件再次撿到，會形成無窮迴圈。所有
+// reconcile／emit 都必須先經這個過濾。
+func specEventInScope(specRoot, name string) bool {
+	return name == specRoot || strings.HasPrefix(name, specRoot+string(filepath.Separator))
+}
+
+// runSpecWatch：watcher 事件迴圈——只處理落在 spec/ 子樹內的事件
+// （specEventInScope；root 上其餘事件如 .workbench/、.git/ 一律忽略，避免
+// reconcile 寫 journal 又觸發自己的 watch 造成無窮迴圈）。debounce 合併連續
+// 事件後觸發 ReconcileGate1()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
+// 新子樹，也涵蓋 spec/ 自身被晚建立的情況）；Rename／Remove 的路徑可能已
+// 消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由重算反映）；
+// error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，defer 保證
+// watcher.Close() 恰好呼叫一次、done 保證 shutdown 等得到。
+func (a *App) runSpecWatch(w *fsnotify.Watcher, specRoot string, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	defer w.Close()
+	var debounceC <-chan time.Time
+	var lastChanged string
+	for {
+		select {
+		case <-stop:
+			return
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if !specEventInScope(specRoot, ev.Name) {
+				continue // root 上的非 spec/ 事件（.workbench/、.git/ 等）：忽略，避免自我觸發迴圈
+			}
+			if ev.Op&fsnotify.Create != 0 {
+				if fi, statErr := os.Stat(ev.Name); statErr == nil && fi.IsDir() {
+					if aerr := addRecursiveWatch(w, ev.Name); aerr != nil {
+						a.failLoudSpecWatch("watch new dir: " + aerr.Error())
+					}
+				}
+			}
+			lastChanged = ev.Name
+			debounceC = time.After(specWatchDebounce)
+		case werr, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			a.failLoudSpecWatch("fsnotify: " + werr.Error())
+		case <-debounceC:
+			debounceC = nil
+			a.reconcileGate1NotifyOnly()
+			// Task 16 fix round 1（spec §5.2）：spec/ 樹（含 context-map/*.mmd）變更時
+			// 額外送一個輕量 UI 訊號，讓 DiagramPane 等監看層自行重讀重渲染——與上面
+			// 的 reconcile 共用同一個 debounce 視窗，不影響 reconcile 邏輯或 fail-loud
+			// 錯誤處理。payload 只是「目前所知的最後變更路徑」，非權威；接收端一律
+			// 重讀自己目前開啟的檔案，不依賴 payload 內容。
+			a.emit("spec:changed", lastChanged)
+		}
+	}
+}
+
+// reconcileGate1NotifyOnly：watcher 觸發的 best-effort reconcile——失敗只
+// fail-loud UI，不影響權威（GateList 讀取路徑永遠自己重算一次）。
+func (a *App) reconcileGate1NotifyOnly() {
+	svc, err := a.ensureGate()
+	if err != nil {
+		a.failLoudSpecWatch("ensureGate: " + err.Error())
+		return
+	}
+	if err := svc.ReconcileGate1(); err != nil {
+		a.failLoudSpecWatch("ReconcileGate1: " + err.Error())
+	}
+}
+
+// failLoudSpecWatch：spec watcher 錯誤的唯一出口——audit 落一筆稽核 ＋
+// workspace-scope stream_error（EmitWorkspace，同 gateEmitter 的出口）。只影響
+// NOTIFICATION，權威重算（GateList）不受任何 watcher 錯誤影響。
+func (a *App) failLoudSpecWatch(msg string) {
+	a.audit("spec_watch_error", map[string]any{"error": msg})
+	if a.manager != nil {
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
+	}
+}
+
+// stopSpecWatch：shutdown／重新啟動 watch 前的收尾——關閉 stop 訊號、等
+// goroutine 真正退出（其 defer 已呼叫 watcher.Close()），保證不留背景
+// goroutine、watcher 一定被關閉。未啟動過時是 no-op。
+func (a *App) stopSpecWatch() {
+	a.mu.Lock()
+	stop := a.specWatchStop
+	done := a.specWatchDone
+	a.specWatchStop = nil
+	a.specWatchDone = nil
+	a.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	if done != nil {
+		<-done
+	}
+}
+
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
-	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer
+	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
 	a.shutMu.Unlock()
-	a.inflight.Wait() // 2) 等已取得 start ownership 的交易 accept／abort 完成
+	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
+	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
@@ -497,6 +731,550 @@ func (a *App) ReadWorkspaceFile(rel string) (string, error) {
 	return string(b), nil
 }
 
+// ---- 納管 spec 檔（spec/features/**、spec/nfr/**、spec/glossary.md、spec/context-map/**）----
+
+// specDigestPrefix：SpecRead／SpecWrite 共用的 digest 格式，對齊
+// internal/spec.ManifestDigest 與 internal/gate 既有的 "sha256:<64hex>" 慣例
+// （見 internal/gate/project.go reSHA256）——不是自創格式。
+const specDigestPrefix = "sha256:"
+
+func specDigestOf(raw []byte) string { return specDigestPrefix + spec.HashBytes(raw) }
+
+// ErrSpecWriteConflict：既有納管檔的 expected_digest 與目前內容不符（optimistic
+// concurrency 撞鎖）。新檔（磁碟上尚不存在）帶非空 expected_digest 視同過期假設，
+// 同樣回這個錯誤。
+var ErrSpecWriteConflict = errors.New("spec write conflict: expected_digest does not match current file")
+
+// SpecList 列出納管 spec 樹（spec.InScope 過濾），供前端 spec 瀏覽器初始載入。
+// 沿用 internal/spec.GitRepo.ReadScopedWorktree 的 walk 慣例：spec/ 尚不存在時
+// 回空清單、不是錯誤。
+func (a *App) SpecList() ([]FileNode, error) {
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	specRoot := filepath.Join(root, "spec")
+	var out []FileNode
+	err = filepath.WalkDir(specRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			if os.IsNotExist(werr) && path == specRoot {
+				return nil // spec/ 尚未建立：無納管檔
+			}
+			return werr
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() || !spec.InScope(rel) {
+			return nil
+		}
+		out = append(out, FileNode{Name: d.Name(), Path: rel, IsDir: false})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SpecFile：SpecRead 的 JSON-friendly 回傳。Wails v2 對 Go 端多回傳值只保留
+// 第一個（App.d.ts 會生成 Promise<string>、實際 runtime 回陣列），前端無法穩定
+// 拿到 digest——SpecWrite 的 expectedDigest 卻仰賴它。單一 struct 回傳沒有這個
+// multi-return 陷阱（見 Task 14 review parked issue）。
+type SpecFile struct {
+	Content string `json:"content"`
+	Digest  string `json:"digest"`
+}
+
+// SpecRead 讀既有納管檔；Digest 為 specDigestOf(raw bytes)，與 SpecWrite 的
+// expected_digest／回傳值同格式。
+func (a *App) SpecRead(rel string) (SpecFile, error) {
+	if !spec.InScope(rel) {
+		return SpecFile{}, fmt.Errorf("path %q is not a managed spec file", rel)
+	}
+	p, err := a.resolveInWorkspace(rel)
+	if err != nil {
+		return SpecFile{}, err
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return SpecFile{}, err
+	}
+	return SpecFile{Content: string(raw), Digest: specDigestOf(raw)}, nil
+}
+
+// deepestExistingAncestor walks up from dir until it finds a path segment
+// that already exists on disk (os.Lstat succeeds; does NOT follow the final
+// symlink component — presence is all that matters here). Every component
+// below the returned ancestor is guaranteed not to exist yet, so it cannot be
+// a pre-planted symlink. Terminates at root at the latest (root always exists).
+func deepestExistingAncestor(dir, root string) (string, error) {
+	for {
+		if _, err := os.Lstat(dir); err == nil {
+			return dir, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(dir)
+		if dir == root || parent == dir {
+			return dir, nil
+		}
+		dir = parent
+	}
+}
+
+// SpecWrite 寫納管檔（新檔或既有檔覆寫），atomic rename＋optimistic concurrency。
+//
+// 不能重用 resolveInWorkspace：它對「完整目標路徑」做 EvalSymlinks，新檔尚不
+// 存在時必然出錯。改為驗證 PARENT 目錄——但驗證必須在任何檔案系統異動之前完成：
+// 若 target 的某個中繼目錄（例如納管的 "spec/features"）是預先植入、指向
+// workspace 外部的 symlink，MkdirAll 會直接跟著 symlink 在外部建立真實目錄，
+// 內容寫入雖然被 InScope／containment 擋住，目錄本身早就逃逸了（deterministic
+// escape，不需要 race——一個固定的 symlink 每次都會觸發）。修法：先找 PARENT
+// 最深的「已存在」祖先目錄（其下所有路徑段必然尚不存在，不可能是 symlink），
+// 對這個祖先做 EvalSymlinks 確認仍在 root 之內，通過才 MkdirAll——之後新建的
+// 每一段路徑都在已驗證 contained 的祖先之下、且是全新建立（不是 symlink）。
+func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+	if !spec.InScope(rel) {
+		return "", fmt.Errorf("path %q is not a managed spec file", rel)
+	}
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		// resolveInWorkspace 同款顯式拒絕（Clean 會把 /.. 中和成 root，不能無聲重導）
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	target := filepath.Join(root, filepath.Clean("/"+rel))
+	parent := filepath.Dir(target)
+
+	if raw, rerr := os.ReadFile(target); rerr == nil {
+		if expectedDigest != specDigestOf(raw) {
+			return "", ErrSpecWriteConflict
+		}
+	} else if os.IsNotExist(rerr) {
+		if expectedDigest != "" { // 新檔：非空 expected_digest＝呼叫端假設過期
+			return "", ErrSpecWriteConflict
+		}
+	} else {
+		return "", rerr
+	}
+
+	// containment 驗證在任何 mutation 之前：找 parent 最深已存在祖先、EvalSymlinks
+	// 驗證仍在 root 內，通過才允許 MkdirAll（見上方函式註解——擋 pre-existing
+	// symlink 逃逸，不是事後補救）。
+	ancestor, aerr := deepestExistingAncestor(parent, root)
+	if aerr != nil {
+		return "", aerr
+	}
+	resolvedAncestor, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if resolvedAncestor != root && !strings.HasPrefix(resolvedAncestor, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	canonicalParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
+	if canonicalParent != root && !strings.HasPrefix(canonicalParent, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	finalTarget := filepath.Join(canonicalParent, filepath.Base(target))
+
+	tmp, err := os.CreateTemp(canonicalParent, ".spec-write-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // rename 成功後 no-op（原路徑已不存在）
+	if _, werr := tmp.WriteString(content); werr != nil {
+		_ = tmp.Close()
+		return "", werr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return "", cerr
+	}
+	if rerr := os.Rename(tmpPath, finalTarget); rerr != nil {
+		return "", rerr
+	}
+	return specDigestOf([]byte(content)), nil
+}
+
+// ---- Gate 1（M2 Stage A：spec §3.5／§5.4）----
+
+// gateEmitter：gate.Emitter → Manager.EmitWorkspace，轉 []gate.Binding →
+// []contract.Binding（同欄位，無新語意）。
+type gateEmitter struct{ a *App }
+
+func (g gateEmitter) EmitGateEvent(kind string, bindings []gate.Binding, payload any) {
+	cb := make([]contract.Binding, len(bindings))
+	for i, b := range bindings {
+		cb[i] = contract.Binding{Kind: b.Kind, Ref: b.Ref, Digest: b.Digest}
+	}
+	g.a.manager.EmitWorkspace(kind, cb, payload)
+}
+
+// ensureGate 惰性初始化 gate.Service／spec.GitRepo：journal 落在 workspace 的
+// .workbench/gate.jsonl（spec §5.4：第 2 層 app state、gitignored）——刻意綁
+// a.workspaceDir 而非 a.stateDir，兩者production 下同值，但測試會為
+// unix socket 路徑長度另配 stateDir，Gate journal 仍必須跟著 workspace 走。
+func (a *App) ensureGate() (*gate.Service, error) {
+	a.gateOnce.Do(func() {
+		root, err := claude.NormalizeCWD(a.workspaceDir)
+		if err != nil {
+			a.gateInitErr = err
+			return
+		}
+		wbDir := filepath.Join(root, ".workbench")
+		if merr := os.MkdirAll(wbDir, 0o755); merr != nil {
+			a.gateInitErr = merr
+			return
+		}
+		j, jerr := gate.OpenJournal(filepath.Join(wbDir, "gate.jsonl"))
+		if jerr != nil {
+			a.gateInitErr = jerr
+			return
+		}
+		a.specRepo = spec.NewGitRepo(root)
+		a.gateJournal = j
+		current := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
+		ulidFn := func() string { return contract.NewULID(time.Now()) }
+		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+		a.gateSvc = gate.NewService(j, current, ulidFn, nowFn, gateEmitter{a})
+	})
+	return a.gateSvc, a.gateInitErr
+}
+
+// gate1Bindings：Gate 1 標準綁定組合（spec §3.5）——committed spec 快照的
+// spec_manifest digest ＋ base_commit（spec.BuildCommittedSnapshot 的回傳值）。
+func gate1Bindings(manifestDigest, baseCommit string) []gate.Binding {
+	return []gate.Binding{
+		{Kind: "spec_manifest", Ref: "spec/", Digest: manifestDigest},
+		{Kind: "base_commit", Ref: "HEAD", Digest: baseCommit},
+	}
+}
+
+// SubmitForApproval 以目前 committed spec 快照送出 Gate 1 核可申請。
+// dirty tree／HEAD 位移等錯誤原樣自 spec.BuildCommittedSnapshot 傳回。
+func (a *App) SubmitForApproval() (string, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return "", err
+	}
+	manifestDigest, baseCommit, err := spec.BuildCommittedSnapshot(a.specRepo)
+	if err != nil {
+		return "", err
+	}
+	return svc.Submit(manifestDigest, baseCommit, gate1Bindings(manifestDigest, baseCommit))
+}
+
+// ---- SpecCommit（Task 15：spec §5.1 兩階段 commit UI，wraps internal/spec.GitRepo）----
+
+// SpecCommitPreview：PreviewSpecCommit 的 JSON-friendly 回傳。同 SpecRead 的
+// multi-return 教訓——spec.GitRepo.PreviewSpecCommit 回傳 (CommitToken, string,
+// error) 三個值，Wails 只保留第一個，struct 回傳才能把 diff 穩定帶給前端。
+type SpecCommitPreview struct {
+	Token spec.CommitToken `json:"token"`
+	Diff  string           `json:"diff"`
+}
+
+// PreviewSpecCommit 回傳目前納管樹相對 HEAD 的 diff，並附上綁定當下狀態的
+// CommitToken——前端保留此 token，未改動地傳給 ConfirmSpecCommit。
+func (a *App) PreviewSpecCommit() (SpecCommitPreview, error) {
+	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.specRepo（同 SubmitForApproval 路徑）
+		return SpecCommitPreview{}, err
+	}
+	tok, diff, err := a.specRepo.PreviewSpecCommit()
+	if err != nil {
+		return SpecCommitPreview{}, err
+	}
+	return SpecCommitPreview{Token: tok, Diff: diff}, nil
+}
+
+// ConfirmSpecCommit 以 PreviewSpecCommit 回傳的 token 提交納管樹異動；token
+// 與目前 repo 狀態不符（HEAD 移動或內容變更）回 spec.ErrCommitStale。
+func (a *App) ConfirmSpecCommit(tok spec.CommitToken, message string) error {
+	if _, err := a.ensureGate(); err != nil {
+		return err
+	}
+	return a.specRepo.ConfirmSpecCommit(tok, message)
+}
+
+// GateEntryDTO：GateList 的 JSON-friendly projection（前端消費）。
+type GateEntryDTO struct {
+	ApprovalID         string         `json:"approval_id"`
+	State              string         `json:"state"`
+	Gate               string         `json:"gate,omitempty"`
+	SpecManifestDigest string         `json:"spec_manifest_digest,omitempty"`
+	BaseCommit         string         `json:"base_commit,omitempty"`
+	CreatedAt          string         `json:"created_at,omitempty"`
+	Bindings           []gate.Binding `json:"bindings,omitempty"`
+	Decision           string         `json:"decision,omitempty"`
+	Reason             string         `json:"reason,omitempty"`
+	Approver           *gate.Approver `json:"approver,omitempty"`
+	JournalDegraded    bool           `json:"journal_degraded,omitempty"`
+}
+
+// GateList 回傳 Gate 1 projection。Service.List 內部先 ReconcileGate1 才
+// Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
+// degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
+func (a *App) GateList() ([]GateEntryDTO, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.List()
+	if err != nil {
+		return nil, err
+	}
+	degraded := a.gateJournal != nil && a.gateJournal.Degraded()
+	out := make([]GateEntryDTO, 0, len(entries))
+	for _, e := range entries {
+		dto := GateEntryDTO{ApprovalID: e.ApprovalID, State: string(e.State), JournalDegraded: degraded}
+		if e.Request != nil {
+			dto.Gate = e.Request.Gate
+			dto.SpecManifestDigest = e.Request.SpecManifestDigest
+			dto.BaseCommit = e.Request.BaseCommit
+			dto.CreatedAt = e.Request.CreatedAt
+		}
+		if e.Record != nil {
+			if dto.Gate == "" {
+				dto.Gate = e.Record.Gate
+			}
+			dto.Bindings = e.Record.Bindings
+			dto.Decision = e.Record.Decision
+			dto.Reason = e.Record.Reason
+			approver := e.Record.Approver
+			dto.Approver = &approver
+		}
+		out = append(out, dto)
+	}
+	return out, nil
+}
+
+// gitConfigValue：`git -C workspace config <key>`；missing key → ""（不是錯誤，
+// 由呼叫端判斷是否視為身分缺失）。
+func (a *App) gitConfigValue(key string) string {
+	out, err := exec.Command("git", "-C", a.workspaceDir, "config", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitIdentity：approver 身分來源，預設查 git config；可測試覆寫
+// （gitIdentityOverride）以避免依賴執行機器的全域 git 設定。
+func (a *App) gitIdentity() (name, email string, err error) {
+	if a.gitIdentityOverride != nil {
+		return a.gitIdentityOverride()
+	}
+	return a.gitConfigValue("user.name"), a.gitConfigValue("user.email"), nil
+}
+
+// GateDecide 對 pending approval 記錄核可／駁回決議。approver 一律取 git
+// identity——name／email 皆缺一律拒絕，不生成假 approver ID（spec §5.4）。
+// 核可時的 Gate 1 bindings 重用 pending request 當初記錄的 spec_manifest
+// digest／base_commit（不在 decide 當下重掃 worktree——避免決議內容漂移到
+// 「核可時」而非「申請時」的快照，也不要求 decide 當下 worktree 仍乾淨）。
+func (a *App) GateDecide(approvalID, decision, reason string) error {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return err
+	}
+	name, email, err := a.gitIdentity()
+	if err != nil {
+		return err
+	}
+	id := name
+	if id == "" {
+		id = email
+	}
+	if id == "" {
+		return errors.New("gate: git identity not configured — set git config user.name (or user.email) before approving")
+	}
+	approver := gate.Approver{ID: id, Method: "app-local"}
+
+	var bindings []gate.Binding
+	if decision == "approved" {
+		entries, lerr := svc.List()
+		if lerr != nil {
+			return lerr
+		}
+		var req *gate.GateRequest
+		for _, e := range entries {
+			if e.ApprovalID == approvalID {
+				req = e.Request
+				break
+			}
+		}
+		if req == nil {
+			return gate.ErrNotPending
+		}
+		bindings = gate1Bindings(req.SpecManifestDigest, req.BaseCommit)
+	}
+	return svc.Decide(approvalID, decision, reason, approver, bindings)
+}
+
+// ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----
+
+// SpecAssist 以隔離的一次性 AI 呼叫草擬 spec 內容，帶 provider 端強制的零 workspace
+// 變更保證（Claude `--tools ""`／Codex readOnly+never，見 internal/assist）。
+//
+// lifecycle 不變量：
+//   - 獨佔性：每個 provider 至多一個 active；第二個併發請求回 ErrAssistActive。
+//   - 交易閘：beginAppTxn 於啟動（shutdown 後拒新），endAppTxn 於收尾一次。
+//   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endAppTxn）
+//     後才 Manager.Close（reclaimAssists＋inflight.Wait）。
+//   - ownership 隔離：不寫 a.claudeSess／a.runner／a.codexConn（runner 為獨立 process）；
+//     晚到舊 generation 事件（correlation 不符）丟棄並發 stream_error（fail loud）。
+//   - once/token 收尾：result／abort／timeout／shutdown 任一先觸發即收一次。
+//
+// 事件經 Manager.EmitAssist 出口（scope=session、provider、correlation_id、
+// purpose="spec_assist"）——保留稽核＋檔案級 event_id，但**不進 provider slot**
+// （前端依 purpose 二次分流，不污染 reducer／Chat／totals）。
+func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
+	if provider != "claude" && provider != "codex" {
+		return "", fmt.Errorf("unknown provider %q", provider)
+	}
+	// Pin the assist purpose at the emit boundary (defense in depth): this is the
+	// isolated assist lane, so every emitted envelope MUST carry
+	// purpose="spec_assist" regardless of the caller-supplied argument. Trusting
+	// the caller would let a future caller passing "" or another value leak
+	// assist (scope=session) events into the provider slot — restore.go's
+	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
+	purpose = "spec_assist"
+	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
+
+	// gen（含 cancel）必須早於 beginAppTxn 進 assistActive——shutdown 的 reclaim
+	// 掃描此結構。若 txn 先登記進 inflight、gen 卻尚不可見，reclaim 會掃到空集合、
+	// cancel 不到，inflight.Wait 卻等到 assistTimeout（~3min stall）。反轉順序後：
+	// 任何會被 inflight.Wait 等到的 assist，其 gen 必已可被 reclaim cancel。
+	a.assistMu.Lock()
+	if _, exists := a.assistActive[provider]; exists { // 獨佔性：第二個併發請求被拒
+		a.assistMu.Unlock()
+		cancel()
+		return "", ErrAssistActive
+	}
+	a.assistActive[provider] = gen
+	a.assistMu.Unlock()
+
+	if h := a.hookAssistBeforeTxn; h != nil { // 測試 barrier：gen 已可見、txn 未登記
+		h()
+	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新請求
+		a.assistMu.Lock() // rollback：未取得交易閘，撤下 gen（reclaim 若已 cancel 亦冪等）
+		if a.assistActive[provider] == gen {
+			delete(a.assistActive, provider)
+		}
+		a.assistMu.Unlock()
+		cancel()
+		return "", err
+	}
+
+	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
+	teardown := func() {
+		gen.once.Do(func() {
+			cancel()
+			a.assistMu.Lock()
+			if a.assistActive[provider] == gen {
+				delete(a.assistActive, provider)
+			}
+			a.assistMu.Unlock()
+			a.endAppTxn()
+			close(gen.done)
+		})
+	}
+	defer teardown()
+
+	runner, err := a.newAssistRunner(provider)
+	if err != nil {
+		return gen.correlationID, err
+	}
+
+	prov := contract.Provider(provider)
+	sink := func(env contract.Envelope) {
+		a.assistMu.Lock()
+		cur, ok := a.assistActive[provider]
+		a.assistMu.Unlock()
+		if !ok || cur != gen { // 晚到舊 generation：丟棄並 fail loud（不進 provider slot）
+			a.manager.EmitAssist(prov, gen.correlationID, purpose,
+				contract.Event{Provider: prov, Kind: contract.KindStreamError,
+					Raw: []byte(`{"assist":"stale_generation_event_dropped"}`),
+					Err: errors.New("assist: late event from stale generation dropped")})
+			return
+		}
+		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
+	}
+	err = runner.Run(ctx, prompt, sink)
+	return gen.correlationID, err
+}
+
+// newAssistRunner：production 造 provider 專屬隔離 one-shot Runner；測試以
+// assistRunnerFactory 注入 fake。
+func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
+	if a.assistRunnerFactory != nil {
+		return a.assistRunnerFactory(provider)
+	}
+	cwd, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	if provider == "claude" {
+		return assist.NewClaudeAssist(a.claudeCLIPath(), cwd, a.childEnv()), nil
+	}
+	return assist.NewCodexAssist(a.codexCLIPath(), cwd, a.childEnv()), nil
+}
+
+// reclaimAssists：shutdown 對 in-flight SpecAssist 的收束——cancel 每個 active
+// generation（runner 界限內退出 → teardown 清 active＋endAppTxn＋close done）。
+// 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
+// （稽核收尾在 sink 關閉前完成）。bounded 由 runner 尊重 ctx（proc TermGrace）保證。
+func (a *App) reclaimAssists() {
+	a.assistMu.Lock()
+	gens := make([]*assistGen, 0, len(a.assistActive))
+	for _, g := range a.assistActive {
+		gens = append(gens, g)
+	}
+	a.assistMu.Unlock()
+	for _, g := range gens {
+		g.cancel()
+	}
+}
+
+// assistEnvelopeToEvent：Runner 送出的 envelope → Event（EmitAssist 於出口重蓋
+// 檔案級 event_id／ts／scope／correlation／purpose）。rich 內容原樣保留。
+func assistEnvelopeToEvent(prov contract.Provider, env contract.Envelope) contract.Event {
+	ev := contract.Event{
+		Provider:  prov,
+		Kind:      contract.Kind(env.Kind),
+		SessionID: env.SessionID,
+		Role:      env.Role,
+		Text:      env.Text,
+		Thinking:  env.Thinking,
+		IsError:   env.IsError,
+		CostUSD:   env.CostUSD,
+		Usage:     env.Usage,
+		Raw:       []byte(env.Raw),
+	}
+	if env.Error != "" {
+		ev.Err = errors.New(env.Error)
+	}
+	if len(ev.Raw) == 0 { // Wrap 對空 Raw 無妨，但保守給合法 JSON
+		ev.Raw = []byte(`{}`)
+	}
+	return ev
+}
+
 // ---- approvals（雙 provider 共用 UI 流；envelope 一律經 Manager）----
 
 func (a *App) registerApproval(id, provider string, resolve func(bool, string) error) {
@@ -582,7 +1360,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		}
 		aerr := a.manager.AcceptSubmit(prov, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
-		if aerr == nil { // Accept 成功才 commit（staged candidate；D6）
+		if aerr == nil {    // Accept 成功才 commit（staged candidate；D6）
 			if cerr := a.restore.CommitResume("claude", a.claudeSessionIDSnapshot(), taskLabel); cerr != nil {
 				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
 			}
@@ -1326,7 +2104,8 @@ func (a *App) failLoudRestore(p contract.Provider, err error) {
 // commitClaudeResume：claude init 抵達時 commit resumeSessionID。guard：
 // (1) sess 仍是目前 session（late init 於 NewSession 之後 → pointer 不符、不寫）
 // (2) session 已 accepted（init-before-Accept 只暫存於 claudeSessionID，
-//     由 StartSession Accept 成功後補 commit）。
+//
+//	由 StartSession Accept 成功後補 commit）。
 func (a *App) commitClaudeResume(sess *claude.Session, sessionID string) {
 	a.mu.Lock()
 	current := a.claudeSess == sess

@@ -78,3 +78,44 @@ func TestWrapValidRawKeptVerbatim(t *testing.T) {
 		t.Fatalf("valid raw must be verbatim: %s", env.Raw)
 	}
 }
+
+func TestEnvelopeWorkspaceFieldsOmitemptyAndPopulated(t *testing.T) {
+	empty := Envelope{EventID: "e1", TS: "t1", Kind: "message"}
+	b, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"scope"`, `"bindings"`, `"payload"`, `"correlation_id"`, `"purpose"`} {
+		if strings.Contains(string(b), key) {
+			t.Fatalf("zero-value additive field must be omitted, found %s in %s", key, b)
+		}
+	}
+
+	filled := Envelope{
+		EventID: "e2", TS: "t2", Kind: string(KindGateRequest),
+		Scope:         "workspace",
+		Bindings:      []Binding{{Kind: "spec_manifest", Ref: "spec/", Digest: "sha256:x"}},
+		Payload:       json.RawMessage(`{"approval_id":"A"}`),
+		CorrelationID: "A",
+		Purpose:       "gate approval",
+	}
+	fb, err := json.Marshal(filled)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back Envelope
+	if err := json.Unmarshal(fb, &back); err != nil {
+		t.Fatalf("roundtrip: %v", err)
+	}
+	if back.Scope != "workspace" || len(back.Bindings) != 1 ||
+		back.Bindings[0].Kind != "spec_manifest" || back.Bindings[0].Ref != "spec/" || back.Bindings[0].Digest != "sha256:x" ||
+		back.CorrelationID != "A" || back.Purpose != "gate approval" {
+		t.Fatalf("workspace fields not roundtripped: %+v", back)
+	}
+	if !strings.Contains(string(fb), `"kind":"gate_request"`) {
+		t.Fatalf("KindGateRequest constant mismatch: %s", fb)
+	}
+	if KindBindingStale != "binding_stale" {
+		t.Fatalf("KindBindingStale constant mismatch: %q", KindBindingStale)
+	}
+}

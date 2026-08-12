@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, RestoreViews } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
+import { useGate } from './stores/gate'
+import { useAssist } from './stores/assist'
+import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
+import type { GateEntry } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import Timeline from './components/Timeline.vue'
@@ -12,15 +16,61 @@ import StatusBar from './components/StatusBar.vue'
 import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
+import GateConsole from './components/GateConsole.vue'
+import SpecWorkspace from './components/SpecWorkspace.vue'
+import DiagramPane from './components/DiagramPane.vue'
 
 const s = useSession()
-const tab = ref<'chat' | 'preview'>('chat')
+const gate = useGate()
+const assist = useAssist()
+const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
+const gateError = ref('')
+
+// GateList 為權威重算（每次都 ReconcileGate1 後 project），refresh 後直接覆蓋 store
+// projection——比等下一筆 workspace 事件更即時，也修正 decide 失敗後的畫面落後。
+async function refreshGate() {
+  try {
+    const list = await GateList()
+    gateDegraded.value = list.some(e => e.journal_degraded === true)
+    const next: Record<string, GateEntry> = {}
+    for (const e of list) {
+      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, bindings: e.bindings, base_commit: e.base_commit }
+    }
+    gate.entries = next
+  } catch { /* dev 無綁定時忽略 */ }
+}
+
+async function decideGate(id: string, decision: string, reason: string) {
+  gateError.value = ''
+  try {
+    await GateDecide(id, decision, reason)
+  } catch (e) {
+    gateError.value = String(e)
+  }
+  await refreshGate()
+}
+const tab = ref<'chat' | 'preview' | 'spec' | 'diagram'>('chat')
+// Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
+const diagramFiles = ref<string[]>([])
+const diagramPath = ref('')
+async function refreshDiagramFiles() {
+  try {
+    const files = (await SpecList()) ?? []
+    diagramFiles.value = files
+      .map(f => f.path)
+      .filter(p => p.startsWith('spec/context-map/') && p.endsWith('.mmd'))
+    if (!diagramPath.value && diagramFiles.value.length) diagramPath.value = diagramFiles.value[0]
+  } catch { /* dev 無綁定時忽略 */ }
+}
+watch(tab, t => { if (t === 'diagram') void refreshDiagramFiles() }) // 切到表示圖 tab 時重新掃 spec/context-map/*.mmd，避免新增檔案要重啟才看得到
 const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可摺疊＋記憶
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
+const gateWidth = ref(load('wb.gate.width', 280)) // gate 面板拖寬＋記憶（同 timeline 拖高 pattern）
 const selectedFile = ref('')
 const cliInfo = ref<Record<string, string>>({})
 watch(timelineOpen, v => save('wb.tl.open', v))
 watch(timelineHeight, v => save('wb.tl.height', v))
+watch(gateWidth, v => save('wb.gate.width', v))
 
 // Timeline 拖高：resize handle 垂直拖曳
 let dragStartY = 0
@@ -39,6 +89,23 @@ function onResizeStart(e: MouseEvent) {
   window.addEventListener('mouseup', onResizeEnd)
 }
 
+// Gate 面板拖寬：resize handle 水平拖曳（往左拖＝變寬，鏡射 timeline 拖高 pattern）
+let dragStartX = 0
+let dragStartW = 0
+function onGateResizeMove(e: MouseEvent) {
+  gateWidth.value = Math.min(600, Math.max(200, dragStartW + (dragStartX - e.clientX)))
+}
+function onGateResizeEnd() {
+  window.removeEventListener('mousemove', onGateResizeMove)
+  window.removeEventListener('mouseup', onGateResizeEnd)
+}
+function onGateResizeStart(e: MouseEvent) {
+  dragStartX = e.clientX
+  dragStartW = gateWidth.value
+  window.addEventListener('mousemove', onGateResizeMove)
+  window.addEventListener('mouseup', onGateResizeEnd)
+}
+
 // 快捷鍵：Cmd+1/2 切 provider tab、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
 function onGlobalKeydown(e: KeyboardEvent) {
   if (!e.metaKey) return
@@ -54,10 +121,17 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
   s.setBindings(makeBindings())
-  EventsOn('workbench:event', (e: any) => s.apply(e))
+  EventsOn('workbench:event', (e: any) => {
+    const dst = routeEnvelope(e)
+    if (dst === 'gate') gate.applyGateEvent(e)
+    else if (dst === 'assist') assist.applyAssistEvent(e)
+    else s.apply(e)
+  })
   EventsOn('session:done', (d: any) => s.applyDone(d))
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
+  await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
+  await refreshDiagramFiles()
 })
 </script>
 
@@ -74,10 +148,25 @@ onMounted(async () => {
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">Chat</button>
           <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">Preview</button>
+          <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">Spec</button>
+          <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">表示圖</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
+        <SpecWorkspace v-if="tab === 'spec'" />
+        <div v-show="tab === 'diagram'" class="diagram-tab">
+          <div class="diagram-files">
+            <button v-for="f in diagramFiles" :key="f" :class="{ active: f === diagramPath }"
+              @click="diagramPath = f">{{ f }}</button>
+          </div>
+          <DiagramPane :path="diagramPath" />
+        </div>
       </main>
+      <div class="gate-resize" title="拖曳調整寬度" @mousedown.prevent="onGateResizeStart" />
+      <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
+        <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
+        <p v-if="gateError" class="gate-err">{{ gateError }}</p>
+      </aside>
     </div>
     <div v-show="timelineOpen" class="tl-resize" title="拖曳調整高度" @mousedown.prevent="onResizeStart" />
     <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
@@ -100,11 +189,19 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
+.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
+.gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
+.gate-resize { width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0; }
+.gate-resize:hover { background: var(--accent); }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); }
 nav button { border: none; background: transparent; color: var(--text-muted); }
 nav .active { background: var(--bg-bubble-user); color: #fff; }
 main > :not(nav) { flex: 1; min-height: 0; }
+.diagram-tab { display: flex; flex-direction: column; min-height: 0; }
+.diagram-files { display: flex; gap: 4px; flex-wrap: wrap; padding: var(--space-1) var(--space-2); }
+.diagram-files button.active { background: var(--bg-bubble-user); color: #fff; }
+.diagram-tab > :not(.diagram-files) { flex: 1; min-height: 0; }
 .tl { border-top: 1px solid var(--border); overflow: hidden; }
 .tl-resize { height: 4px; cursor: row-resize; background: transparent; }
 .tl-resize:hover { background: var(--accent); }

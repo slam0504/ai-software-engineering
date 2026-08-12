@@ -1,6 +1,7 @@
 package appcore
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -374,6 +375,51 @@ func (m *Manager) flushLocked(sl *slot) {
 	}
 }
 
+// EmitWorkspace：workspace scope 事件出口（gate/binding 等）——不帶 provider/session
+// id、不碰任何 slot／reducer，只走 writeAndEmitLocked 取得檔案級單調 event_id。
+func (m *Manager) EmitWorkspace(kind string, bindings []contract.Binding, payload any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先
+		m.emitClosedDroppedLocked(kind, "")
+		return
+	}
+	raw, _ := json.Marshal(payload)
+	now := time.Now()
+	env := contract.Envelope{
+		EventID:  contract.NewULID(now),
+		TS:       now.UTC().Format(time.RFC3339Nano),
+		Scope:    "workspace",
+		Kind:     kind,
+		Bindings: bindings,
+		Payload:  raw,
+	}
+	m.writeAndEmitLocked(env)
+}
+
+// EmitAssist：SpecAssist 隔離 one-shot 的事件出口（Task 11；Stage A §5.1）。與
+// EmitWorkspace 同構——同一 mutex 下走 writeAndEmitLocked 取得檔案級單調 event_id
+// ＋稽核，但**不碰任何 slot／reducer／totals**：assist 事件雖 scope="session" 且帶
+// provider，卻不得污染 provider session slot（前端依 purpose="spec_assist" 二次分流，
+// 不進 reducer／Chat／totals／unread）。correlationID 貫穿該 one-shot 全部事件
+// （init／delta／message／result／stream_error／abort），供前端關聯與稽核。additive-only。
+func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose string, evs ...contract.Event) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先——與其他出口一致（單一 UI stream_error、不寫 sink）
+		m.emitClosedDroppedLocked(string(contract.KindStreamError), string(provider))
+		return
+	}
+	for _, ev := range evs {
+		env := contract.Wrap(ev, "") // rich 內容保留＋新的檔案級單調 event_id
+		env.Scope = "session"
+		env.Provider = string(provider)
+		env.CorrelationID = correlationID
+		env.Purpose = purpose
+		m.writeAndEmitLocked(env) // 不觸及 slot：無 totals／reducer／state_change
+	}
+}
+
 func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, toolName string, raw []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -493,6 +539,13 @@ func (m *Manager) AuditErr() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.auditErr
+}
+
+// Closed 回報 Manager 是否已 Close（shutdown 收束序 assert 用）。
+func (m *Manager) Closed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 // Close：同一 mutex、closed 旗標。對**所有** slot 執行 abort+flush（sink 關閉前
