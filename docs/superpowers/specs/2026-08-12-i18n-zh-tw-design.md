@@ -11,7 +11,7 @@
 
 把前端所有**固定、user-visible 字串**語系化（vue-i18n），預設 **zh-TW**，同時建立完整 **en** locale，讓介面可整套切換（本階段不做 UI 切換鈕）。
 
-**範圍（owner 拍板，2026-08-12）**：**所有固定 user-visible 字串**（含目前硬編英文 **與** 目前硬編中文，約 24 中文＋英文字串）皆納入雙 locale，讓 `en` 是**完整英文介面**、`zh-TW` 是完整中文介面。
+**範圍（owner 拍板，2026-08-12）**：**所有固定 user-visible 字串**（含目前硬編英文 **與** 目前硬編中文；涵蓋按鈕、tab、placeholder、title/tooltip、空狀態、前端錯誤前綴、store 產生的固定訊息）皆納入雙 locale，讓 `en` 是**完整英文介面**、`zh-TW` 是完整中文介面。**確切字串清單以 writing-plans 的完整 inventory 為準**（不預設數量）。
 
 **不翻譯（維持原文）**：後端原始錯誤內容、provider 名（`claude`/`codex`）、wire 值（`on-request`/`never`/`untrusted`）、事件 `kind`、稽核／資料契約的**欄位值**與 bindings `kind`、技術術語（`Gherkin`/`oracle`/`session`/`tokens`/`commit`）。
 
@@ -32,6 +32,10 @@
   })
   ```
   `legacy: false` → 所有 `<script setup>` 統一用 `useI18n()`（不用 legacy `$t`）。
+- **非元件呼叫規則（P1-1，凍結）**：不是每個產生固定 UI 字串的地方都是元件。
+  - **元件（`<script setup>`）**：`useI18n()` 的 `t`。
+  - **Pinia store／一般 TS 模組**（產生固定 UI 訊息，如 `session.ts` 目前直接 emit 的 `bindings not ready`）：用 **`i18n.global.t()`**（從 `i18n/index.ts` export `i18n` 實例）。
+  - **後端／provider 回傳的動態錯誤內容**：原樣保留、不經 i18n（只有固定前綴翻譯，見 §5）。
 - 佈局：
   - `frontend/src/i18n/index.ts`— `createI18n(...)` 與 export。
   - `frontend/src/i18n/locales/zh-TW.ts`、`frontend/src/i18n/locales/en.ts`— 訊息物件（**runtime 唯一權威**）。
@@ -49,8 +53,9 @@
 app.tab.chat / app.tab.preview / app.tab.spec
 app.timeline.label
 settings.action.new / settings.action.terminate / settings.action.end
-settings.action.login / settings.action.logout / settings.action.cancel / settings.action.auth
-settings.operation.success            # 帶 {action} interpolation
+settings.action.login / settings.action.logout / settings.action.cancelLogin / settings.action.authStatus
+settings.operationAction.new / ...authStatus / ...cancelLogin / ...   # 句中動作（與按鈕文字分開，見 §7）
+settings.operation.success / settings.operation.failure   # 帶 {action}（+ {error}）interpolation
 approval.action.allow / approval.action.deny
 approval.reason.placeholder
 gate.action.approve / gate.action.reject
@@ -62,7 +67,7 @@ spec.assist.drafting                  # 「AI 產生中…」
 spec.commitMessage.placeholder
 chat.thinking / chat.input.placeholder
 session.state.idle / session.state.waiting / ...
-timeline.result.failed / timeline.result.ok
+timeline.result.failed / timeline.result.completed
 timeline.toolStatus.completed / timeline.toolStatus.inProgress / timeline.toolStatus.failed
 timeline.raw
 ```
@@ -95,7 +100,9 @@ export const codexToolStatusKeys = {
 ## 5. Interpolation（凍結）
 
 用 `{action}`／`{error}`／`{status}` 組**完整句子**，**不在元件內自行串接標點**。例：
-- `settings.operation.success` = `zh-TW: "{action}成功"` / `en: "{action} ok"`，呼叫 `t('settings.operation.success', { action: t('settings.action.new') })`。
+- `settings.operation.success` = `zh-TW: "{action}成功"` / `en: "{action} ok"`
+- `settings.operation.failure` = `zh-TW: "{action}失敗：{error}"` / `en: "{action} failed: {error}"`
+- 呼叫時 `{action}` 帶**句中動作**（§7 的 `settings.operationAction.*`，非按鈕文字），`{error}` 帶原始英文錯誤內容。
 - 固定錯誤前綴翻譯、**後端原始錯誤內容維持英文**：如 `app.startupError` = `"啟動：{error}"`，`{error}` 帶原始英文內容。
 
 ## 6. 中英並列標籤（凍結）
@@ -107,9 +114,18 @@ export const codexToolStatusKeys = {
 
 詳細 bindings／稽核畫面**直接顯示原始欄位名與值**（不經 i18n），確保與 `.workbench/*.jsonl` 對照。
 
-## 7. SettingsBar 操作結果事件
+## 7. SettingsBar 操作結果事件（P1-2，凍結）
 
-SettingsBar 在 **emit 當下翻譯**操作結果（`new`/`auth`/`login`/`logout`/`terminate`/`end` 各結果），用 §5 的 `settings.operation.success` interpolation。實作時定位確切 emit 來源與完整清單。
+SettingsBar 在 **emit 當下翻譯**操作結果，成功走 `settings.operation.success`、**失敗走 `settings.operation.failure`**（§5）。
+
+**完整操作清單（8 項）**：`new` / `terminate` / `end` / `auth` / `login` / `cancel-login` / `logout` / `b1-probe`。每項都有成功與失敗兩條路徑。
+
+**按鈕文字與句中動作分開**（避免「登入狀態成功」不自然）：
+- `settings.action.authStatus` = `"登入狀態"`（**按鈕**）
+- `settings.operationAction.authStatus` = `"查詢登入狀態"`（**句中動作**，餵給 `{action}` → 「查詢登入狀態成功」）
+- 其餘操作同理各有 `settings.action.*`（按鈕）與 `settings.operationAction.*`（句中）兩支 key。
+
+實作時定位確切 emit 來源，確認 8 項 × {成功,失敗} 全覆蓋。
 
 ---
 
@@ -121,9 +137,16 @@ SettingsBar 在 **emit 當下翻譯**操作結果（`new`/`auth`/`login`/`logout
 - **遞迴**比較 `zh-TW` 與 `en` 的**所有 leaf path**：key 集合一致、且每個 path 的**型別一致**（object vs string 不可錯位）。
 - **動態狀態全覆蓋**：測 `sessionStateKeys`／`gateStateKeys`／`codexToolStatusKeys` 的**所有已知 raw value** 都有對應 key 且能 `t()` 出非-key 字串；**加測 unknown passthrough**（未知值回退 raw、不顯示缺漏 key）。不能只驗幾個代表值。
 
+**元件引用正確性（實作要求 3，P1-3）**：parity 只證兩 locale key 集合一致——若元件誤寫 `t('gate.action.aprove')`，兩份 locale 仍過 parity 但畫面漏 key。需**至少一種保證**：
+- (a) **TypeScript 層**：以 message schema 型別限制 `t()` 接受的 key union（`vue-i18n` 的型別擴充／`DefineLocaleMessage`），誤 key 編譯即報；**或**
+- (b) **測試掃描**：掃所有 literal `t('...')` 引用，斷言每個 literal key 都存在於 locale leaf paths。
+（動態 key 由三份映射測試負責，不在此列。）
+
+**`en` 完整性（P1-3）**：加**代表性 `locale: 'en'` render 測試**，確認原本硬編中文的畫面（如 GateConsole degraded 通知、SpecWorkspace「AI 產生中…」）能**完整轉為英文**——只驗預設 zh-TW 不足以支撐「完整英文介面」的宣稱。
+
 **行為**：預設 locale = zh-TW；代表性元件 render 出中文；interpolation 組句正確（標點在 locale 內、非元件串接）。
 
-**收尾 gate**：`cd frontend && npx vitest run` 全綠、`npm run build`（vue-tsc）乾淨。Go 端不受影響。
+**收尾 gate**：`cd frontend && npx vitest run` 全綠、`npm run build`（vue-tsc）乾淨、**`wails build` 成功**（本次改相依＋`main.ts` plugin 掛載＋production bundle，須驗桌面封裝整合，非只 vitest/vite build）。Go 端不受影響。
 
 ---
 
