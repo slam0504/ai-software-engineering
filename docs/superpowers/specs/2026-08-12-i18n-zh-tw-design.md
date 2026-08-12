@@ -137,10 +137,7 @@ SettingsBar 在 **emit 當下翻譯**操作結果，成功走 `settings.operatio
 - **遞迴**比較 `zh-TW` 與 `en` 的**所有 leaf path**：key 集合一致、且每個 path 的**型別一致**（object vs string 不可錯位）。
 - **動態狀態全覆蓋**：測 `sessionStateKeys`／`gateStateKeys`／`codexToolStatusKeys` 的**所有已知 raw value** 都有對應 key 且能 `t()` 出非-key 字串；**加測 unknown passthrough**（未知值回退 raw、不顯示缺漏 key）。不能只驗幾個代表值。
 
-**元件引用正確性（實作要求 3，P1-3）**：parity 只證兩 locale key 集合一致——若元件誤寫 `t('gate.action.aprove')`，兩份 locale 仍過 parity 但畫面漏 key。需**至少一種保證**：
-- (a) **TypeScript 層**：以 message schema 型別限制 `t()` 接受的 key union（`vue-i18n` 的型別擴充／`DefineLocaleMessage`），誤 key 編譯即報；**或**
-- (b) **測試掃描**：掃所有 literal `t('...')` 引用，斷言每個 literal key 都存在於 locale leaf paths。
-（動態 key 由三份映射測試負責，不在此列。）
+**元件引用正確性（實作要求 3，P1-3；owner 定案採方案 b）**：parity 只證兩 locale key 集合一致——若元件誤寫 `t('gate.action.aprove')`，兩份 locale 仍過 parity 但畫面漏 key。**固定採測試掃描**：掃所有 literal `t('...')`／`i18n.global.t('...')` 引用（含元件與 store），斷言每個 literal key 都存在於 locale leaf paths（誤 key 即測試失敗）。（動態 key 由三份映射測試負責，不在此列；不重開 TS-union 二選一。）
 
 **`en` 完整性（P1-3）**：加**代表性 `locale: 'en'` render 測試**，確認原本硬編中文的畫面（如 GateConsole degraded 通知、SpecWorkspace「AI 產生中…」）能**完整轉為英文**——只驗預設 zh-TW 不足以支撐「完整英文介面」的宣稱。
 
