@@ -106,7 +106,7 @@ type App struct {
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
 
 	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
-	// 觸發 ReconcileGate1()。specWatchStop／specWatchDone 在 a.mu 下管理，供
+	// 觸發 Reconcile()。specWatchStop／specWatchDone 在 a.mu 下管理，供
 	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
 	// 呼叫 watcher.Close() 後才 close(specWatchDone)，shutdown 等 done 保證
 	// watcher 真的關閉、goroutine 真的結束（不留 orphan）。
@@ -205,7 +205,7 @@ func (a *App) startup(ctx context.Context) {
 		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
-	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 ReconcileGate1()
+	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 Reconcile()
 }
 
 // failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
@@ -246,13 +246,13 @@ func (a *App) watchDiagram(path string) {
 const specWatchDebounce = 200 * time.Millisecond
 
 // watchSpecTree 對納管的 spec/ 樹（spec.ScopePatterns 範圍）遞迴監看，變更
-// debounce 後觸發 ReconcileGate1()（spec §4：通知層）。只重用 watchDiagram 的
+// debounce 後觸發 Reconcile()（spec §4：通知層）。只重用 watchDiagram 的
 // 概念，修正其三個缺陷：(1) 這裡遞迴 Add 整棵子樹、新目錄 Create 時再 Add，
 // 不只監看單一 parent；(2) watcher／Add／讀取錯誤一律 fail-loud（audit＋
 // EmitWorkspace stream_error），不吞聲；(3) 透過 specWatchStop／specWatchDone
 // 掛進 shutdown，goroutine 保證退出、watcher.Close() 保證被呼叫。
 //
-// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 ReconcileGate1()（best-effort），
+// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 Reconcile()（best-effort），
 // 目的是讓已核可的 Gate 1 儘快在 UI 顯示 STALE；權威重算永遠在讀取路徑
 // （gate.Service.List／GateList，Task 10），watcher 失敗不影響正確性。
 //
@@ -336,7 +336,7 @@ func specEventInScope(specRoot, name string) bool {
 // runSpecWatch：watcher 事件迴圈——只處理落在 spec/ 子樹內的事件
 // （specEventInScope；root 上其餘事件如 .workbench/、.git/ 一律忽略，避免
 // reconcile 寫 journal 又觸發自己的 watch 造成無窮迴圈）。debounce 合併連續
-// 事件後觸發 ReconcileGate1()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
+// 事件後觸發 Reconcile()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
 // 新子樹，也涵蓋 spec/ 自身被晚建立的情況）；Rename／Remove 的路徑可能已
 // 消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由重算反映）；
 // error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，defer 保證
@@ -392,8 +392,8 @@ func (a *App) reconcileGate1NotifyOnly() {
 		a.failLoudSpecWatch("ensureGate: " + err.Error())
 		return
 	}
-	if err := svc.ReconcileGate1(); err != nil {
-		a.failLoudSpecWatch("ReconcileGate1: " + err.Error())
+	if err := svc.Reconcile(); err != nil {
+		a.failLoudSpecWatch("Reconcile: " + err.Error())
 	}
 }
 
@@ -949,7 +949,8 @@ func (a *App) ensureGate() (*gate.Service, error) {
 		current := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
 		ulidFn := func() string { return contract.NewULID(time.Now()) }
 		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
-		a.gateSvc = gate.NewService(j, current, ulidFn, nowFn, gateEmitter{a})
+		reg := gate.Registry{"gate1": gate.NewGate1Policy(current)}
+		a.gateSvc = gate.NewService(j, reg, ulidFn, nowFn, gateEmitter{a})
 	})
 	return a.gateSvc, a.gateInitErr
 }
@@ -974,7 +975,7 @@ func (a *App) SubmitForApproval() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return svc.Submit(manifestDigest, baseCommit, gate1Bindings(manifestDigest, baseCommit))
+	return svc.Submit("gate1", "workspace", gate1Bindings(manifestDigest, baseCommit))
 }
 
 // ---- SpecCommit（Task 15：spec §5.1 兩階段 commit UI，wraps internal/spec.GitRepo）----
@@ -1024,7 +1025,7 @@ type GateEntryDTO struct {
 	JournalDegraded    bool           `json:"journal_degraded,omitempty"`
 }
 
-// GateList 回傳 Gate 1 projection。Service.List 內部先 ReconcileGate1 才
+// GateList 回傳 Gate 1 projection。Service.List 內部先 Reconcile 才
 // Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
 // degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
 func (a *App) GateList() ([]GateEntryDTO, error) {
@@ -1045,6 +1046,7 @@ func (a *App) GateList() ([]GateEntryDTO, error) {
 			dto.SpecManifestDigest = e.Request.SpecManifestDigest
 			dto.BaseCommit = e.Request.BaseCommit
 			dto.CreatedAt = e.Request.CreatedAt
+			dto.Bindings = e.Request.Bindings // v2 request carries bindings even while still pending
 		}
 		if e.Record != nil {
 			if dto.Gate == "" {
@@ -1082,10 +1084,11 @@ func (a *App) gitIdentity() (name, email string, err error) {
 
 // GateDecide 對 pending approval 記錄核可／駁回決議。approver 一律取 git
 // identity——name／email 皆缺一律拒絕，不生成假 approver ID（spec §5.4）。
-// 核可時的 Gate 1 bindings 重用 pending request 當初記錄的 spec_manifest
-// digest／base_commit（不在 decide 當下重掃 worktree——避免決議內容漂移到
-// 「核可時」而非「申請時」的快照，也不要求 decide 當下 worktree 仍乾淨）。
-func (a *App) GateDecide(approvalID, decision, reason string) error {
+// 核可時的 bindings 由 Service 內部從 pending request 複製（不在 decide 當下
+// 重掃 worktree——避免決議內容漂移到「核可時」而非「申請時」的快照，也不要求
+// decide 當下 worktree 仍乾淨），並以 policy 的 current-binding validation
+// 擋掉待核期間已過期的請求（§3.1）。riskSelections 供 gate2 用；gate1 傳空即可。
+func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection) error {
 	svc, err := a.ensureGate()
 	if err != nil {
 		return err
@@ -1102,26 +1105,7 @@ func (a *App) GateDecide(approvalID, decision, reason string) error {
 		return errors.New("gate: git identity not configured — set git config user.name (or user.email) before approving")
 	}
 	approver := gate.Approver{ID: id, Method: "app-local"}
-
-	var bindings []gate.Binding
-	if decision == "approved" {
-		entries, lerr := svc.List()
-		if lerr != nil {
-			return lerr
-		}
-		var req *gate.GateRequest
-		for _, e := range entries {
-			if e.ApprovalID == approvalID {
-				req = e.Request
-				break
-			}
-		}
-		if req == nil {
-			return gate.ErrNotPending
-		}
-		bindings = gate1Bindings(req.SpecManifestDigest, req.BaseCommit)
-	}
-	return svc.Decide(approvalID, decision, reason, approver, bindings)
+	return svc.Decide(approvalID, decision, reason, approver, gate.DecisionInput{RiskSelections: riskSelections})
 }
 
 // ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----

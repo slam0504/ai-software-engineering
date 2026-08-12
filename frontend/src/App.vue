@@ -45,7 +45,7 @@ async function refreshGate() {
 async function decideGate(id: string, decision: string, reason: string) {
   gateError.value = ''
   try {
-    await GateDecide(id, decision, reason)
+    await GateDecide(id, decision, reason, [])
   } catch (e) {
     gateError.value = String(e)
   }

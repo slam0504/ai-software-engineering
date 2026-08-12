@@ -16,6 +16,7 @@ export namespace gate {
 	}
 	export class Binding {
 	    kind: string;
+	    role?: string;
 	    ref: string;
 	    digest: string;
 	
@@ -26,8 +27,25 @@ export namespace gate {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.kind = source["kind"];
+	        this.role = source["role"];
 	        this.ref = source["ref"];
 	        this.digest = source["digest"];
+	    }
+	}
+	export class RiskSelection {
+	    TaskID: string;
+	    SelectedRiskTier: string;
+	    OverrideReason: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RiskSelection(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.TaskID = source["TaskID"];
+	        this.SelectedRiskTier = source["SelectedRiskTier"];
+	        this.OverrideReason = source["OverrideReason"];
 	    }
 	}
 

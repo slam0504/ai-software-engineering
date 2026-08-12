@@ -2,6 +2,9 @@ package gate
 
 import "fmt"
 
+// ManifestFn returns the digest of the currently active spec manifest.
+type ManifestFn func() (string, error)
+
 // StaleCause describes why an active approval's bindings no longer match
 // current state (mirrors the transition fields written by ReconcileGate1).
 type StaleCause struct{ Cause, EvidenceRef string }

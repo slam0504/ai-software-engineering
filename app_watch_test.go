@@ -22,7 +22,7 @@ func TestWatcherTriggersReconcileOnSpecChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
 		t.Fatal(err)
 	}
 	a.watchSpecTree()
@@ -77,7 +77,7 @@ func TestWatcherReAddsNewSubdirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
 		t.Fatal(err)
 	}
 	a.watchSpecTree()
@@ -127,7 +127,7 @@ func TestWatcherPicksUpLateCreatedSpecDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +166,7 @@ func TestWatcherIgnoresNonSpecWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
 		t.Fatal(err)
 	}
 

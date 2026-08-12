@@ -22,8 +22,8 @@ export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
 
-export function GateDecide(arg1, arg2, arg3) {
-  return window['go']['main']['App']['GateDecide'](arg1, arg2, arg3);
+export function GateDecide(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['GateDecide'](arg1, arg2, arg3, arg4);
 }
 
 export function GateList() {
