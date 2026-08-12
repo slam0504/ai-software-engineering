@@ -6,6 +6,7 @@ export default {
       spec: 'Spec',
       plan: 'Plan',
       diagram: 'Diagram',
+      dag: 'Task DAG',
     },
     timeline: {
       label: 'Timeline',
@@ -153,6 +154,10 @@ export default {
   },
   diagram: {
     empty: 'No diagram to display',
+  },
+  dag: {
+    empty: 'No task DAG to display',
+    parseError: 'Could not parse the current plan content',
   },
   preview: {
     empty: 'Select a file on the left to preview',

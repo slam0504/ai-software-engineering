@@ -22,6 +22,7 @@ import GateConsole from './components/GateConsole.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
 import PlanWorkspace from './components/PlanWorkspace.vue'
 import DiagramPane from './components/DiagramPane.vue'
+import DagPane from './components/DagPane.vue'
 
 const { t } = useI18n()
 const s = useSession()
@@ -54,7 +55,11 @@ async function decideGate(id: string, decision: string, reason: string) {
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram'>('chat')
+const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag'>('chat')
+// Task 14：任務 DAG 表示圖層——select-task 先 no-op 佔位，導航到 GateConsole 對應項是 Task 15 的範圍
+function onSelectTask(taskId: string) {
+  console.log('select-task', taskId)
+}
 // Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
 const diagramFiles = ref<string[]>([])
 const diagramPath = ref('')
@@ -157,6 +162,7 @@ onMounted(async () => {
           <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">{{ t('app.tab.spec') }}</button>
           <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">{{ t('app.tab.plan') }}</button>
           <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
+          <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
@@ -169,6 +175,7 @@ onMounted(async () => {
           </div>
           <DiagramPane :path="diagramPath" />
         </div>
+        <DagPane v-if="tab === 'dag'" @select-task="onSelectTask" />
       </main>
       <div class="gate-resize" :title="t('app.resize.width')" @mousedown.prevent="onGateResizeStart" />
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">

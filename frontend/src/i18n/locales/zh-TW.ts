@@ -6,6 +6,7 @@ export default {
       spec: '規格',
       plan: '計畫',
       diagram: '表示圖',
+      dag: '任務 DAG',
     },
     timeline: {
       label: '執行時間軸',
@@ -153,6 +154,10 @@ export default {
   },
   diagram: {
     empty: '尚無可顯示的圖表',
+  },
+  dag: {
+    empty: '尚無可顯示的任務 DAG',
+    parseError: '無法解析目前的 plan 內容',
   },
   preview: {
     empty: '在左側選擇檔案以預覽',
