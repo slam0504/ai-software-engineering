@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,8 +101,19 @@ func TestWatcherReAddsNewSubdirectory(t *testing.T) {
 // 落差）——watchSpecTree() 啟動當下 spec/ 尚不存在（全新 workspace，尚未有人
 // 寫過第一個納管檔）。watcher 必須觀察到 workspace root 上 spec/ 這個 CREATE
 // 並遞迴 Add 進去，而不是啟動當下看一次「不存在」就永遠不看了。
+//
+// fix round 3（re-review 抓到 false positive）：斷言改成直接檢查 watcher 觸發
+// 的 binding_stale envelope（同 TestWatcherIgnoresNonSpecWrites 的手法），
+// wait/assert 路徑完全不呼叫 a.GateList()——GateList() 每次呼叫都會自己做
+// 權威 reconcile（Task 10），先前版本用 waitFor+GateList 斷言，即使 watcher
+// 完全沒接住晚建立的 spec/、單靠 GateList 自己的 reconcile 也會通過，等於沒測
+// 到 watcher 本身。red-check：暫時還原成 early-return 的舊版 watchSpecTree，
+// 這版斷言會 FAIL；復原修復後轉 PASS（見 task-12-report.md fix round 3）。
 func TestWatcherPicksUpLateCreatedSpecDir(t *testing.T) {
-	a := newTestAppGit(t) // 全新 git repo，尚無 spec/
+	a, ui := newTestApp(t)
+	runGit(t, a, "init")
+	runGit(t, a, "config", "user.name", "Test User")
+	runGit(t, a, "config", "user.email", "test@example.com")
 
 	a.watchSpecTree() // spec/ 還不存在時就先啟動——只看得到 workspace root
 	t.Cleanup(a.stopSpecWatch)
@@ -121,9 +133,17 @@ func TestWatcherPicksUpLateCreatedSpecDir(t *testing.T) {
 
 	a.SpecWrite("spec/glossary.md", "v2", digestOf(t, a, "spec/glossary.md"))
 	commitAll(t, a)
-	waitFor(t, "gate goes stale after change under a spec/ tree created after watchSpecTree() started", func() bool {
-		l, _ := a.GateList()
-		return stateOf(l, id) == "stale"
+
+	waitFor(t, "watcher emits binding_stale for the approval after a change under a spec/ tree created post-watchSpecTree()", func() bool {
+		for _, ev := range ui.findEnvKind("binding_stale") {
+			var payload struct {
+				ApprovalID string `json:"approval_id"`
+			}
+			if err := json.Unmarshal(ev.Payload, &payload); err == nil && payload.ApprovalID == id {
+				return true
+			}
+		}
+		return false
 	})
 }
 
