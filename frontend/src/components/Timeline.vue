@@ -25,7 +25,7 @@ function summary(i: TimelineItem) {
   if (e.kind === 'tool_use') { // BAT AgentToolRow（normative）：工具名＋參數節錄＋狀態
     const status = (e.raw as any)?.params?.item?.status // codex item 狀態，best-effort
     const label = e.text || t('timeline.summary.toolCall') // adapter 已填「名稱(參數節錄)」（Task 2）
-    return status ? `${label}（${resolveState(codexToolStatusKeys, status, t)}）` : label
+    return status ? t('timeline.summary.toolWithStatus', { label, status: resolveState(codexToolStatusKeys, status, t) }) : label
   }
   if (e.kind === 'result') return e.is_error ? t('timeline.result.failed') : t('timeline.result.completed')
   if (e.kind === 'approval') return t('timeline.summary.approvalRequest', { text: e.text })

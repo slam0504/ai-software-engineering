@@ -121,8 +121,8 @@ export default {
     reason: {
       placeholder: 'Reason (suggested when denying)',
     },
-    toolRequest: 'Tool permission request',
-    pendingCount: '{n} pending',
+    toolRequest: 'Tool permission request: {tool}',
+    pendingCount: '+{n} pending',
   },
   diagram: {
     empty: 'No diagram to display',
@@ -162,6 +162,7 @@ export default {
     },
     summary: {
       toolCall: 'tool call',
+      toolWithStatus: '{label} ({status})',
       approvalRequest: 'Approval request: {text}',
       approvalDecision: 'Approval decision: {text}',
       stateChange: 'State → {state}',

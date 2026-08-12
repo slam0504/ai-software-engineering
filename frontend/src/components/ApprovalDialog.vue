@@ -68,13 +68,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <div v-if="current" class="overlay">
     <div class="dialog">
-      <h3>[{{ current.provider }}] {{ t('approval.toolRequest') }}：{{ current.toolName }}</h3>
+      <h3>[{{ current.provider }}] {{ t('approval.toolRequest', { tool: current.toolName }) }}</h3>
       <pre>{{ current.inputJson }}</pre>
       <input v-model="reason" :placeholder="t('approval.reason.placeholder')" />
       <div class="actions">
         <button class="allow" @click="decide(true)">{{ t('approval.action.allow') }}</button>
         <button class="deny" @click="decide(false)">{{ t('approval.action.deny') }}</button>
-        <span v-if="queue.length > 1" class="pending">＋{{ t('approval.pendingCount', { n: queue.length - 1 }) }}</span>
+        <span v-if="queue.length > 1" class="pending">{{ t('approval.pendingCount', { n: queue.length - 1 }) }}</span>
       </div>
       <p v-if="error" class="error">{{ error }}</p>
     </div>

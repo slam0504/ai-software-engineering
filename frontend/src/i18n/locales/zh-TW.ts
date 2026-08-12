@@ -121,8 +121,8 @@ export default {
     reason: {
       placeholder: '理由（拒絕時建議填寫）',
     },
-    toolRequest: '工具權限請求',
-    pendingCount: '{n} 筆等待中',
+    toolRequest: '工具權限請求：{tool}',
+    pendingCount: '＋{n} 筆等待中',
   },
   diagram: {
     empty: '尚無可顯示的圖表',
@@ -162,6 +162,7 @@ export default {
     },
     summary: {
       toolCall: '工具呼叫',
+      toolWithStatus: '{label}（{status}）',
       approvalRequest: '核可請求：{text}',
       approvalDecision: '核可決定：{text}',
       stateChange: '狀態 → {state}',
