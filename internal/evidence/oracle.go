@@ -49,14 +49,22 @@ func ParseOracleDecl(b []byte) (OracleDecl, error) {
 // validateOraclePattern enforces the frozen M3a pattern semantics: only a
 // directory prefix ("dir/**", dir itself free of wildcards) or an exact file
 // path (no wildcard characters at all) is accepted. Mid-segment wildcards
-// (internal/*/testdata/**), single-segment globs (*.go), empty patterns, and
-// absolute paths are all rejected here so they can never reach Match/Scope.
+// (internal/*/testdata/**), single-segment globs (*.go), empty patterns,
+// absolute paths, and any path-traversal segment (".." or ".") are all
+// rejected here so they can never reach Match/Scope — Scope().Roots feeds
+// downstream git pathspecs (ScopedClean, ReadScopedHeadTree/Worktree), and a
+// ".." there must never be allowed to escape the scoped tree.
 func validateOraclePattern(p string) error {
 	if p == "" {
 		return fmt.Errorf("empty oracle pattern")
 	}
 	if strings.HasPrefix(p, "/") {
 		return fmt.Errorf("oracle pattern must be relative, got %q", p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." || seg == "." {
+			return fmt.Errorf("oracle pattern must not contain path-traversal segment %q, got %q", seg, p)
+		}
 	}
 	if strings.HasSuffix(p, "/**") {
 		dir := strings.TrimSuffix(p, "/**")

@@ -71,6 +71,19 @@ patterns:
 	}
 }
 
+// TestParseOracleDeclRejectsPathTraversal guards the Scope().Roots
+// downstream usage (Task 19 runner, GitRepo.ScopedClean pathspec): a ".."
+// segment must be rejected at Parse time, not surface later as an
+// unexpected git pathspec error at some other call site.
+func TestParseOracleDeclRejectsPathTraversal(t *testing.T) {
+	for _, pattern := range []string{"../x/**", "a/../b/**", "../../etc/passwd"} {
+		b := []byte("version: 1\npatterns:\n  - \"" + pattern + "\"\n")
+		if _, err := ParseOracleDecl(b); err == nil {
+			t.Errorf("want path-traversal pattern %q rejected", pattern)
+		}
+	}
+}
+
 func TestParseOracleDeclRejectsUnknownField(t *testing.T) {
 	b := []byte(`
 version: 1
