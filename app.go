@@ -1219,6 +1219,200 @@ func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
 	return assist.NewCodexAssist(a.codexCLIPath(), cwd, a.childEnv()), nil
 }
 
+// ---- PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot；spec §5）----
+
+// nonPlanDirtyPaths 回傳 workspace 中「不在 plan/** 範圍內」的未提交變更路徑
+// （staged／unstaged／untracked 皆算，--untracked-files=all 展開目錄到檔案級）。
+// 空回傳表示除 plan/** 外整棵樹乾淨——PlannerAssist 唯讀分析的前置條件。
+// .workbench/ 是 app state（gate journal 等），不屬受管 code，比照
+// assertWorkspaceUnchanged（app_assist_test.go）同一慣例排除，不計入 dirty。
+func (a *App) nonPlanDirtyPaths() ([]string, error) {
+	out, err := exec.Command("git", "-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all").Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("assist: git status: %w", err)
+	}
+	var dirty []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		p := gitStatusPath(line)
+		if p == "" || p == ".workbench" || strings.HasPrefix(p, ".workbench/") {
+			continue
+		}
+		if !spec.PlanScope.Match(p) {
+			dirty = append(dirty, p)
+		}
+	}
+	return dirty, nil
+}
+
+// gitStatusPath 從 `git status --porcelain` 一行擷取路徑（"XY path" 或 rename
+// 的 "XY old -> new" 取新路徑）。與 internal/spec/gitrepo.go 的私有 statusPath
+// 邏輯相同——app 層無法引用該未匯出函式，此為此檔唯一需要解析 status 行之處，
+// 複製比新增 spec 匯出面來得省事。
+func gitStatusPath(line string) string {
+	if len(line) < 4 {
+		return ""
+	}
+	rest := line[3:]
+	if idx := strings.Index(rest, " -> "); idx >= 0 {
+		rest = rest[idx+4:]
+	}
+	return strings.Trim(rest, "\"")
+}
+
+// activeGate1SpecManifestDigest 在 gate.List() 內找 gate1 的 active 項，回傳其
+// spec_manifest binding digest；無 active gate1 項回 ok=false。
+func activeGate1SpecManifestDigest(entries []GateEntryDTO) (digest string, ok bool) {
+	for _, e := range entries {
+		if e.Gate != "gate1" || e.State != string(gate.Active) {
+			continue
+		}
+		return e.SpecManifestDigest, true
+	}
+	return "", false
+}
+
+// PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot；spec §5）以隔離的一次
+// 性 AI 呼叫唯讀探索 workspace 並草擬 plan YAML。lifecycle 鏡射 SpecAssist
+// （corr_id、EmitAssist、reclaim——見其 doc，此處不重複展開），差異僅：
+//   - Runner 換唯讀白名單／sandbox（Claude ClaudePlannerArgs／Codex readOnly+
+//     never 原樣，見 internal/assist）；
+//   - purpose 固定 "plan_draft"（前端依 purpose 二次分流，不進 provider slot）；
+//   - 呼叫 runner 前有兩項前置檢查，任一不符即 fail closed、完全不啟動
+//     runner／不佔用 assist 獨佔性：
+//     (a) 存在 active Gate 1（§5 輸入即其 spec_manifest digest；無則回錯）；
+//     (b) workspace 除 plan/** 外無未提交變更（PlannerAssist 需在乾淨 code
+//     tree 上分析——plan/** 本身允許 dirty，因為草稿要寫回這裡）。
+//
+// 通過後把 analysis_base_commit=HEAD（完整 OID）與 active Gate 1 的
+// spec_manifest digest 明文注入 prompt 前綴：模型草擬的 plan YAML 之
+// analysis_base_commit 欄位須等於此處注入的值（§9 契約，Task 12 的
+// VerifyLineage 以此為 lineage 起點）。
+func (a *App) PlanAssist(provider, prompt string) (string, error) {
+	if provider != "claude" && provider != "codex" {
+		return "", fmt.Errorf("unknown provider %q", provider)
+	}
+
+	if _, err := a.ensureGate(); err != nil {
+		return "", err
+	}
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	specManifestDigest, hasActiveGate1 := activeGate1SpecManifestDigest(entries)
+	if !hasActiveGate1 {
+		return "", errors.New("assist: 無生效規格核可——先完成 Gate 1")
+	}
+
+	dirty, err := a.nonPlanDirtyPaths()
+	if err != nil {
+		return "", err
+	}
+	if len(dirty) > 0 {
+		return "", errors.New("assist: workspace 有未提交的非 plan 變更——PlannerAssist 需在乾淨 code tree 上分析")
+	}
+
+	headOID, err := a.specRepo.HeadCommit()
+	if err != nil {
+		return "", fmt.Errorf("assist: resolve HEAD: %w", err)
+	}
+	prompt = fmt.Sprintf(
+		"analysis_base_commit=%s\nspec_manifest_digest=%s\n\n"+
+			"以上為本次唯讀分析的基準 commit（analysis_base_commit）與目前生效 Gate 1 核可的"+
+			" spec manifest digest；產出的 plan YAML 草稿其 analysis_base_commit 欄位須等於"+
+			"上述 analysis_base_commit 值。\n\n%s",
+		headOID, specManifestDigest, prompt)
+
+	const purpose = "plan_draft"
+	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
+
+	// 同 SpecAssist：gen 先入 assistActive 才 beginAppTxn（shutdown reclaim 窗口
+	// 不變量，見 SpecAssist doc）。共用同一張 a.assistActive／同一把 a.assistMu
+	// ——每個 provider 至多一個 active（SpecAssist／PlanAssist 共用同一獨佔性
+	// 與 reclaim 基礎設施，reclaimAssists 無需另行改動即涵蓋兩者）。
+	a.assistMu.Lock()
+	if _, exists := a.assistActive[provider]; exists {
+		a.assistMu.Unlock()
+		cancel()
+		return "", ErrAssistActive
+	}
+	a.assistActive[provider] = gen
+	a.assistMu.Unlock()
+
+	if h := a.hookAssistBeforeTxn; h != nil {
+		h()
+	}
+	if err := a.beginAppTxn(); err != nil {
+		a.assistMu.Lock()
+		if a.assistActive[provider] == gen {
+			delete(a.assistActive, provider)
+		}
+		a.assistMu.Unlock()
+		cancel()
+		return "", err
+	}
+
+	teardown := func() {
+		gen.once.Do(func() {
+			cancel()
+			a.assistMu.Lock()
+			if a.assistActive[provider] == gen {
+				delete(a.assistActive, provider)
+			}
+			a.assistMu.Unlock()
+			a.endAppTxn()
+			close(gen.done)
+		})
+	}
+	defer teardown()
+
+	runner, err := a.newPlanAssistRunner(provider)
+	if err != nil {
+		return gen.correlationID, err
+	}
+
+	prov := contract.Provider(provider)
+	sink := func(env contract.Envelope) {
+		a.assistMu.Lock()
+		cur, ok := a.assistActive[provider]
+		a.assistMu.Unlock()
+		if !ok || cur != gen { // 晚到舊 generation：丟棄並 fail loud（不進 provider slot）
+			a.manager.EmitAssist(prov, gen.correlationID, purpose,
+				contract.Event{Provider: prov, Kind: contract.KindStreamError,
+					Raw: []byte(`{"assist":"stale_generation_event_dropped"}`),
+					Err: errors.New("assist: late event from stale generation dropped")})
+			return
+		}
+		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
+	}
+	err = runner.Run(ctx, prompt, sink)
+	return gen.correlationID, err
+}
+
+// newPlanAssistRunner：production 造 provider 專屬唯讀 PlannerAssist Runner；
+// 測試沿用 assistRunnerFactory 注入 fake（同 newAssistRunner 的注入點——單一
+// factory 欄位涵蓋 SpecAssist／PlanAssist 兩條 one-shot 路徑）。
+func (a *App) newPlanAssistRunner(provider string) (assist.Runner, error) {
+	if a.assistRunnerFactory != nil {
+		return a.assistRunnerFactory(provider)
+	}
+	cwd, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	if provider == "claude" {
+		return assist.NewClaudePlanner(a.claudeCLIPath(), cwd, a.childEnv()), nil
+	}
+	return assist.NewCodexPlanner(a.codexCLIPath(), cwd, a.childEnv()), nil
+}
+
 // reclaimAssists：shutdown 對 in-flight SpecAssist 的收束——cancel 每個 active
 // generation（runner 界限內退出 → teardown 清 active＋endAppTxn＋close done）。
 // 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
