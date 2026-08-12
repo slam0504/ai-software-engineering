@@ -142,6 +142,13 @@ type App struct {
 	evidenceJournal      *evidence.Journal
 	evidenceCASDir       string
 	evidenceRegistryPath string
+
+	// evidenceContextLoaderOverride：測試注入，換掉 RunEvidence 傳給
+	// evidence.Run 的 evidence.ContextLoader（production 用 a.planLoader）。
+	// 唯一用途是讓測試能在 LoadAt／LoadOracleAt（ulid mint 之前執行）安插一個
+	// barrier，重現「beginAppTxn 成功到 evidenceActive 登記之間」的 TOCTOU
+	// 窗（task-20 review M1）。
+	evidenceContextLoaderOverride evidence.ContextLoader
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -1789,14 +1796,22 @@ func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
 // shutdown 後拒新 run）；執行 context 衍生自 a.ctx（app 的 shutdown-scoped
 // context，同 SpecAssist／StartSession 的既定用法），供 reclaimEvidenceRuns
 // 手動 cancel。evidence.Run 內部才會 mint evidence_id（ulid callback），所以
-// active-run registry 的登記時機挪進 ulid callback 本身——一旦 ulid 被呼叫，
-// evidence_id 立即可見於 a.evidenceActive，比 NewWorktree／實際執行都早。
+// active-run registry 的登記時機挪進 ulid callback 本身。
+//
+// beginAppTxn 成功到 ulid callback 執行之間，evidence.Run 已經先跑了
+// LoadAt／LoadOracleAt／VerifyLineage／OracleDigestAt 這串 git 呼叫——這段
+// 窗口 evidenceActive 還沒有這筆 run 的登記，若 shutdown 的 reclaimEvidenceRuns
+// snapshot 剛好落在這裡，它會拿到空清單、cancel 永遠送不到這個 run（review
+// M1）。ulid callback 因此在登記進 a.evidenceActive 之後，於 shutMu 下複查
+// a.shuttingDown：若已經在 shutdown 中（不論 reclaimEvidenceRuns 是否已經跑
+// 過、還是根本還沒開始），就自我 cancel——不依賴任何人「之後」再來 cancel
+// 一次，因為 reclaimEvidenceRuns 那一次性的 snapshot 可能已經錯過。
 // registry 移除與 journal finalize（AppendEvidenceRun）在同一個 evidenceMu
 // 臨界區內完成：這是「恰一次 finalize」的落點。若 ctx 在 Run 返回時已被取消
-// （shutdown reclaim 造成），即使 evidence.Run 本身回傳了一筆語意完整的
-// EvidenceRun（ctx 取消走的是 abortReason="context canceled"，不是 Go
-// error），也視為未完成、不 finalize——一個被 shutdown 中止的 run 不能被當成
-// 有效證據收進 journal。
+// （shutdown reclaim 或上述自我 cancel 造成），即使 evidence.Run 本身回傳了
+// 一筆語意完整的 EvidenceRun（ctx 取消走的是 abortReason="context
+// canceled"，不是 Go error），也視為未完成、不 finalize——一個被 shutdown
+// 中止的 run 不能被當成有效證據收進 journal。
 func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (string, error) {
 	if kind != "expected_red" && kind != "negative_control" {
 		return "", fmt.Errorf("evidence: unknown kind %q", kind)
@@ -1852,16 +1867,30 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 		a.evidenceActive[id] = cancel
 		a.evidenceMu.Unlock()
 		evidenceID = id
+
+		// review M1：登記後立刻複查 shuttingDown——若 shutdown 已經開始（不論
+		// reclaimEvidenceRuns 的 snapshot 是落在登記之前還是之後），自我
+		// cancel，不指望還會有第二次 reclaim 機會來 cancel 這筆剛登記的 run。
+		a.shutMu.Lock()
+		shuttingDown := a.shuttingDown
+		a.shutMu.Unlock()
+		if shuttingDown {
+			cancel()
+		}
 		return id
 	}
 	nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+	ld := evidence.ContextLoader(a.planLoader)
+	if a.evidenceContextLoaderOverride != nil { // 測試注入：見 evidenceContextLoaderOverride 欄位 doc
+		ld = a.evidenceContextLoaderOverride
+	}
 	rs := evidence.RunSpec{
 		Kind: kind, PlanID: planID, TaskID: taskID,
 		PlanCommit: planCommit, TestCommit: testCommit, MutationPatch: mutationPatch,
 	}
 	run, runErr := evidence.Run(ctx, a.workspaceDir, a.evidenceCASDir, a.evidenceRegistryPath,
-		a.planLoader, rs, ulidFn, nowFn)
+		ld, rs, ulidFn, nowFn)
 	if runErr == nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			runErr = fmt.Errorf("evidence: run canceled: %w", ctxErr)

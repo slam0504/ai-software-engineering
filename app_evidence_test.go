@@ -7,11 +7,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/evidence"
 	"github.com/slam0504/sdlc-workbench/internal/gate"
+	"github.com/slam0504/sdlc-workbench/internal/plan"
 )
 
 // ---- test fixtures／helpers（鏡射 app_plan_test.go／app_gate_test.go 慣例）----
@@ -322,4 +324,99 @@ func TestShutdownReclaimsInFlightRunEvidence(t *testing.T) {
 		t.Fatalf("CleanupOrphans: %v", err)
 	}
 	assertNoZombieWorktrees(t, a.workspaceDir)
+}
+
+// ---- shutdown TOCTOU window: beginAppTxn 成功到 ulid mint 之間（review M1）----
+
+// barrierContextLoader wraps a real evidence.ContextLoader and blocks inside
+// its first LoadAt call until release is closed — LoadAt runs inside
+// evidence.Run before the ulid callback ever fires (see runner.go's frozen
+// step order), so parking here reliably reproduces the window between
+// RunEvidence's beginAppTxn() succeeding and evidenceActive's registration:
+// the exact gap review finding M1 flagged (a shutdown whose
+// reclaimEvidenceRuns snapshot lands here sees an empty registry and can
+// never deliver a cancel to this run).
+type barrierContextLoader struct {
+	inner   evidence.ContextLoader
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (b *barrierContextLoader) LoadAt(commitOID, planID string) (plan.Plan, plan.RiskPolicy, error) {
+	b.once.Do(func() {
+		close(b.entered)
+		<-b.release
+	})
+	return b.inner.LoadAt(commitOID, planID)
+}
+
+func (b *barrierContextLoader) LoadOracleAt(commitOID string) (evidence.OracleDecl, error) {
+	return b.inner.LoadOracleAt(commitOID)
+}
+
+// TestShutdownDuringPreUlidWindowStillBoundsRunEvidence reproduces review
+// finding M1: shutdown must observe a bounded return and RunEvidence must
+// end in error even when reclaimEvidenceRuns's cancel snapshot lands before
+// evidenceActive has this run's entry — the fix is RunEvidence's ulid
+// callback self-canceling once it sees a.shuttingDown already true.
+func TestShutdownDuringPreUlidWindowStillBoundsRunEvidence(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.evidenceContextLoaderOverride = &barrierContextLoader{inner: a.planLoader, entered: entered, release: release}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+		errCh <- err
+	}()
+
+	select { // beginAppTxn 已成功、still 卡在 LoadAt——ulid 尚未 mint，evidenceActive 空
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for RunEvidence to enter the barrier LoadAt call")
+	}
+	a.evidenceMu.Lock()
+	nActiveBeforeShutdown := len(a.evidenceActive)
+	a.evidenceMu.Unlock()
+	if nActiveBeforeShutdown != 0 {
+		t.Fatalf("evidenceActive must still be empty at this point (pre-ulid window), got %d", nActiveBeforeShutdown)
+	}
+
+	shutdownDone := make(chan struct{})
+	shutdownStart := time.Now()
+	go func() { a.shutdown(context.Background()); close(shutdownDone) }()
+
+	// 等 shutdown 真的把 shuttingDown 設成 true——reclaimEvidenceRuns 的空
+	// snapshot 這時已經跑過（或正在跑），驗證的正是「之後才登記」也還能被收。
+	waitFor(t, "shutdown to set shuttingDown", func() bool {
+		a.shutMu.Lock()
+		defer a.shutMu.Unlock()
+		return a.shuttingDown
+	})
+	close(release) // 放行 LoadAt：RunEvidence 繼續跑到 ulid callback，自我 cancel
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("shutdown stalled: pre-ulid window run was never bounded (review M1 regression)")
+	}
+	if elapsed := time.Since(shutdownStart); elapsed > 20*time.Second {
+		t.Fatalf("shutdown took %s, want bounded", elapsed)
+	}
+
+	if runErr := <-errCh; runErr == nil {
+		t.Fatal("RunEvidence must end in error once shutdown observes it mid-flight, even in the pre-ulid window")
+	}
+
+	a.evidenceMu.Lock()
+	nActiveAfter := len(a.evidenceActive)
+	a.evidenceMu.Unlock()
+	if nActiveAfter != 0 {
+		t.Fatalf("active-run registry must be empty after reclaim, got %d", nActiveAfter)
+	}
 }
