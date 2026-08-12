@@ -320,10 +320,12 @@ func NewService(j *Journal, reg Registry, ulid func() string, now func() string,
 func (s *Service) Submit(gateName, subject string, bindings []Binding) (string, error)
 // Decide 拆為兩段，供 §3.10 的權威順序（reconcile→validator→blocker→append）在 app 層編排：
 // PrepareDecision 在 mutex 內 Project→pending 檢查→normalizeRequest→
-// **current-binding validation**（以 pending request 的 bindings 建 pseudo-record 跑該 gate 的
-// policy.ReconcileBindings——Reconcile() 只掃 active projection，涵蓋不到 pending；待核期間
-// plan／oracle／上游 Gate 2 改變時，此步以任何 stale cause 拒絕核可，fail closed）→
-// policy.BuildDecision（硬性 decision validator）→回傳組好的 record（尚未 append）。
+// **current-binding validation（僅 decision=="approved" 時執行）**（以 pending request 的
+// bindings 建 pseudo-record 跑該 gate 的 policy.ReconcileBindings——Reconcile() 只掃 active
+// projection，涵蓋不到 pending；待核期間 plan／oracle／上游 Gate 2 改變時，此步以任何
+// stale cause 拒絕核可，fail closed。**rejected 不做此驗證**：依 spec 駁回只需 reason，
+// 過期 request 必須仍可駁回）→ policy.BuildDecision（硬性 decision validator）→
+// 回傳組好的 record（尚未 append）。
 // CommitDecision 驗 prepared 仍為 pending 後 append record＋scoped supersession transitions。
 // 兩段之間由呼叫端（app.workflowMu）保證無其他 blocking 狀態生產者插入。
 type PreparedDecision struct{ Record ApprovalRecord }
@@ -385,8 +387,24 @@ func TestRejectedNeedsOnlyReason(t *testing.T) {
 }
 ```
 
+- [ ] **Step 1b: 補兩測（pending 新鮮度）**：
+
+```go
+func TestStalePendingApproveFailsRejectSucceeds(t *testing.T) {
+	s := newTestServiceWithGates(t) // gate1 policy 的 current manifest 可由測試切換
+	id, _ := s.Submit("gate1", "workspace", gate1Bindings())
+	s.mutateCurrentManifest() // 待核期間規格變更 → pending bindings 過期
+	if _, err := s.PrepareDecision(id, "approved", "", approver(), DecisionInput{}); err == nil {
+		t.Fatal("approve on stale pending must fail (current-binding validation)")
+	}
+	if _, err := s.PrepareDecision(id, "rejected", "已過期", approver(), DecisionInput{}); err != nil {
+		t.Fatalf("reject on stale pending must still succeed: %v", err) // rejected 免驗證
+	}
+}
+```
+
 - [ ] **Step 2: 跑測試確認失敗**。
-- [ ] **Step 3: 實作**：`Submit` 查 registry→`ValidateRequest`→寫 v2 request（SchemaVersion=2）；`Decide` 在 mutex 內 Project→找 pending→`normalizeRequest`→`policy.BuildDecision`→組 `ApprovalRecord{SchemaVersion:2, Gate/Subject/Bindings 複製自 request, Metadata}`→approved 時只對 `SupersessionKey` 相同的 active entry append superseded transition；`Reconcile` 逐 active entry 呼叫其 gate policy 的 `ReconcileBindings`，每個 cause append stale transition＋`EmitGateEvent("binding_stale", …)`（沿現行「至多一次」語意）。`List()` 改呼叫 `Reconcile()`。
+- [ ] **Step 3: 實作**：`Submit` 查 registry→`ValidateRequest`→寫 v2 request（SchemaVersion=2）。`PrepareDecision` 在 mutex 內 Project→找 pending→`normalizeRequest`→**approved 時執行 current-binding validation**（pseudo-record 跑 `policy.ReconcileBindings`，任何 stale cause 即回錯；rejected 跳過）→`policy.BuildDecision`→組 `ApprovalRecord{SchemaVersion:2, Gate/Subject/Bindings 複製自 request, Metadata}` 回傳 prepared。`CommitDecision` 驗仍 pending→append record→approved 時只對 `SupersessionKey` 相同的 active entry append superseded transition。`Decide`＝Prepare→Commit 包裝。`Reconcile` 逐 active entry 呼叫其 gate policy 的 `ReconcileBindings`，每個 cause append stale transition＋`EmitGateEvent("binding_stale", …)`（沿現行「至多一次」語意）。`List()` 改呼叫 `Reconcile()`。
 - [ ] **Step 4: 更新 app.go 呼叫點**：`ensureGate` 以 `Registry{"gate1": NewGate1Policy(...)}` 建 Service；`SubmitForApproval` 改組 bindings 後呼叫 `Submit("gate1", "workspace", bindings)`；`GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection)`。
 - [ ] **Step 5: 同 task 內同步前端（可執行基線）**：`wails dev` 或 `wails generate module` 重生 `frontend/wailsjs` bindings；`GateConsole.vue` 的 `GateDecide` 呼叫改為第四參數傳 `[]`（gate1 空 risk）；vitest 中對應 mock 簽名更新。**本 task commit 後 app 必須可跑 M2 既有 Gate 1 流程**（production adapter 測試：`app_gate_test.go` 走一輪 submit→decide→stale）。
 - [ ] **Step 6: 全套通過**：`go vet ./... && go test -race ./... -count=1 && npm --prefix frontend run test && npm --prefix frontend run build`。
@@ -614,6 +632,8 @@ func NewGate2Policy(loader PlanLoader, g plan.GitRunner, // package gatepolicy
 	currentSpecManifest func() (string, error),
 	currentRiskPolicyDigest func() (string, error),
 	currentPermissionManifest func() (string, error)) gate.GatePolicy
+
+var _ gate.GatePolicy = (*Gate2Policy)(nil) // 編譯期斷言
 ```
 
 - `ValidateRequest`：必填 bindings（spec_manifest、plan、base_commit、risk_policy、permission_manifest，格式照 Task 1 helper）＋ subject 前綴 `plan:` ＋ lineage：`analysis_base_commit..plan_commit` 限 `plan/**`（§3.0）。
@@ -884,10 +904,12 @@ type EvidenceStore interface {
 	Get(evidenceID string) (evidence.EvidenceRun, error)
 	MutationDigest(mutationID string) (string, error)
 }
-type GateReader interface { // 供 gate2_approval resolver 查 projection＋原始 record
-	Lookup(approvalID string) (rec *ApprovalRecord, state State, err error)
+type GateReader interface { // 供 gate2_approval resolver 查 projection＋原始 record（package gatepolicy：gate 型別需限定）
+	Lookup(approvalID string) (rec *gate.ApprovalRecord, state gate.State, err error)
 }
-func NewTCAPolicy(ev EvidenceStore, gates GateReader, loader PlanLoader, g plan.GitRunner) gate.GatePolicy // package gatepolicy
+func NewTCAPolicy(ev EvidenceStore, gates GateReader, loader PlanLoader, g plan.GitRunner) gate.GatePolicy
+
+var _ gate.GatePolicy = (*TCAPolicy)(nil) // 編譯期斷言（Gate2Policy 同，見 Task 10）
 ```
 
 - `ValidateRequest` bindings 必填：`gate2_approval`（ref=`approval:<ULID>`、digest=sha256）＋`base_commit`＋`oracle_surface`（ref=git OID）＋`evidence_run`×2（role 區分）＋`mutation`。
@@ -903,8 +925,9 @@ func NewTCAPolicy(ev EvidenceStore, gates GateReader, loader PlanLoader, g plan.
 - Create: `frontend/src/components/TcaWorkspace.vue`＋`TcaWorkspace.test.ts`——**Stage C 全程可從 app 完成的操作面**（A4／SC4 方向）：從 active Gate 2 的 committed plan 列出 tasks（`GateDecisionContext`）→ 每 task 一列：test_commit 輸入（下拉近期 commits＋手動輸入，送出前呼叫後端 lineage 預檢）、mutation patch 貼上→`RegisterMutation`、「跑 expected-red」「跑 negative-control」按鈕（`RunEvidence`，進度顯示 workspace lane 的 `evidence_run` 事件、完成顯示 result 徽章）、兩筆 evidence 皆 passed 後啟用「送核 TCA」→`SubmitTestContract`
 - Create: `frontend/src/stores/evidence.ts`（mutation／evidence run 狀態，by plan/task）
 - Create: `frontend/src/components/EvidenceDetail.vue`（EvidenceGet 顯示完整 record＋recording ref）
+- Modify: `app.go`——UI 依賴的兩個後端綁定於本 task 新增：`ValidateTestCommit(planID, taskID, testCommit string) error`（lineage 預檢：呼叫 Task 9 `VerifyLineage`＋oracle 路徑檢查，只驗不執行）、`EvidenceCommitCandidates(planID string) ([]CommitInfo, error)`（`git log --format=%H%x00%s -n 20 <plan_commit>..HEAD`，`CommitInfo{OID, Subject string}`——近期 commit 下拉的資料源）
 - Modify: `frontend/src/components/GateConsole.vue`（tca 卡片：subject、gate2_approval 連結、兩筆 evidence 摘要（kind／result／test_commit 短 SHA→點開詳情）、mutation digest）、`frontend/src/stores/gate.ts`、`types.ts`、`App.vue`（TcaWorkspace tab）、locales
-- Test: `GateConsole.test.ts` 擴充＋`app_evidence_test.go` 補 production adapter 測試（Wails 綁定簽名與前端呼叫一致：`RegisterMutation`／`RunEvidence`／`EvidenceGet`／`SubmitTestContract` 走一輪）
+- Test: `GateConsole.test.ts` 擴充＋`app_evidence_test.go` 補 production adapter 測試（Go 側：`RegisterMutation`／`RunEvidence`／`EvidenceGet`／`SubmitTestContract`／`ValidateTestCommit`／`EvidenceCommitCandidates` 走一輪）＋**`frontend/src/lib/bindings.test.ts`**（TS 側鎖定跨 Wails 參數形狀：mock wailsjs module，斷言每個 adapter 呼叫逐參數轉發、參數順序與名稱與 Go 綁定一致——Go test 驗不到 TS adapter 的轉發正確性）
 
 - [ ] **Step 1: 失敗測試**：TcaWorkspace 對兩筆 evidence 未齊時「送核」disabled；result=error 顯示錯誤標示＋重跑按鈕；tca 卡片渲染兩筆 evidence role；production adapter 測試走 mutation→兩 run→送核全流程。
 - [ ] **Step 2–4: TDD＋vitest／build＋`go test -race`。** → **Step 5: Commit**：`feat(frontend): TCA workspace（Stage C 入口）＋卡片＋evidence 詳情（§6／A4）`
@@ -961,12 +984,20 @@ func OpenKeyed(entries []Entry, conditionKey string) *Entry // 未 resolved 的�
 - Modify: `app.go`：新增 `workflowMu sync.Mutex`；`GateDecide` 依 spec §3.10 凍結順序編排（用 Task 5 的 Prepare／Commit 拆分）：
 
 ```go
-// GateDecide（app 層編排；順序 = spec §3.10：reconcile → validator → blocker → append）
+// GateDecide（app 層編排；順序 = spec §3.10：reconcile → validator → [stale 修復解除] → blocker → append）
 a.workflowMu.Lock(); defer a.workflowMu.Unlock()
 if err := svc.Reconcile(); err != nil { return err }                    // 1. reconcile bindings
-prepared, err := svc.PrepareDecision(id, decision, reason, appr, input) // 2. 硬性 validator（含 gate policy）
-if err != nil { return err }
+prepared, err := svc.PrepareDecision(id, decision, reason, appr, input) // 2. 硬性 validator＋approved 的
+if err != nil { return err }                                            //    current-binding validation
 scope := scopeForSubject(prepared.Record.Gate, prepared.Record.Subject)
+if prepared.Record.Decision == "approved" {                             // 2b. 修復解除（凍結時點）：
+	// current-binding validation 已通過 ＝ 同 subject 的 stale 條件已被此修正版修復；
+	// 在 blocker 檢查前系統解除舊 stale blocker。resolve 寫入失敗 → 拒絕核可（fail closed）。
+	key := "stale:" + prepared.Record.Gate + ":" + prepared.Record.Subject
+	if err := a.escResolveByKeyLocked(key, "superseded-by:"+prepared.Record.ApprovalID); err != nil {
+		return err
+	}
+}
 if items := escBlockingFor(scope); len(items) > 0 {                     // 3. blocking escalation
 	return fmt.Errorf("blocked by %d escalation item(s): %s", len(items), summarize(items))
 }
@@ -974,10 +1005,12 @@ if a.decideBarrierHook != nil { a.decideBarrierHook() }                 // 測�
 return svc.CommitDecision(prepared)                                     // 4. append
 ```
 
+（`escResolveByKeyLocked` 對不存在的 key 為 no-op nil——多數核可沒有舊 stale blocker。）
+
   `RunEvidence` 的 finalize、escalation Create／Ack／Resolve、watcher 觸發的 `Reconcile` 全部先取 `workflowMu`（lock ordering：workflowMu → gate journal → escalation journal）。
 - **自動來源接線（spec §3.8 九條逐一對應，缺一即 spec 缺口；持 workflowMu 的路徑一律走 `createSystemLocked`）**：(1) plan.Validate 的 risk 分類失敗（minimum 無法重算）→ `createSystemLocked("risk-unclassifiable:<plan_id>", "gate2:<plan_id>", hard=true)`；(2) 送核缺必要 binding（ValidateRequest 失敗且來源為系統組裝）→ `"missing-binding:<gate>:<subject>"`；(3)(4) `Reconcile` 產生的 stale → `"stale:<gate>:<subject>"`（hard=true，scope 對應 gate2:<plan_id>／tca:<plan_id>/<task_id>）；(5) runner 逾時／環境錯誤／輸出超限 → `"evidence-error:<plan_id>/<task_id>/<kind>"`（**key 綁 plan/task/kind 而非 evidence_id**——新 run 成功即可 `ResolveByKey` 舊項，A8 才可實現；hard=false）；(6) expected-red 錯誤原因（result=error 且非環境類）→ 同 (5) key；(7) negative-control 未抓到（result=failed）→ `"negative-control-missed:<plan_id>/<task_id>"`；(8) journal degraded／read error → `"journal-degraded:<which>"`（workspace、hard=true）；(9) PlannerAssist enforcement 失敗 → `"planner-enforcement:<provider>"`。
 - **啟動／讀取補建（§3.8）**：`Reconcile` 與 app startup 依權威狀態掃描——已 stale 的 active 核可、degraded journal 等若無對應未 resolved 項（`OpenKeyed`）即補建。
-- **九條來源的權威修復條件（缺一即該 blocker 永久卡死替代核可，逐條凍結）**：(1) risk-unclassifiable → 新版 plan commit 後 `plan.Validate` 通過即 `resolveByKeyLocked`；(2) missing-binding → 同 subject 新 request `ValidateRequest` 通過；(3)(4) **stale:<gate>:<subject> → 同 `(gate, subject)` 出現新 pending request 且其 current-binding validation（Task 5）通過即系統解除舊 blocker**——stale record 本身是終態，修復載體是修正版送核，否則新版永遠被舊 blocker 擋住；(5)(6) evidence-error → 同 key 新 run result=passed（A8）；(7) negative-control-missed → 同上；(8) journal-degraded → 重啟後 journal 開啟成功且 tail 修復完成；(9) planner-enforcement → 該 provider probe 重新通過。每一條由對應的權威路徑（submit／validate／run finalize／startup）在持有 workflowMu 時呼叫 `resolveByKeyLocked`。
+- **九條來源的權威修復條件（缺一即該 blocker 永久卡死替代核可，逐條凍結）**：(1) risk-unclassifiable → 新版 plan commit 後 `plan.Validate` 通過即 `resolveByKeyLocked`；(2) missing-binding → 同 subject 新 request `ValidateRequest` 通過；(3)(4) **stale:<gate>:<subject> → 修正版核可時解除（時點凍結於 GateDecide 編排 2b）**：approved 的 `PrepareDecision`（含 current-binding validation）成功後、blocker 檢查前，`resolveByKeyLocked` 解除同 subject 的舊 stale blocker，寫入失敗即拒絕核可——stale record 本身是終態，修復載體是修正版的核可流程，否則新版永遠被舊 blocker 擋住；(5)(6) evidence-error → 同 key 新 run result=passed（A8）；(7) negative-control-missed → 同上；(8) journal-degraded → 重啟後 journal 開啟成功且 tail 修復完成；(9) planner-enforcement → 該 provider probe 重新通過。每一條由對應的權威路徑（submit／validate／run finalize／startup）在持有 workflowMu 時呼叫 `resolveByKeyLocked`。
 - Test: `app_escalation_test.go`
 
 **Interfaces:**
@@ -999,28 +1032,33 @@ func TestGateDecideBlockedByEscalation(t *testing.T) {
 }
 
 func TestGateDecideBarrierWindowInjected(t *testing.T) {
-	// 可重現的 injected barrier（無 time.Sleep）：兩個 production seam——
-	// a.decideBarrierHook：GateDecide 在 blocker 檢查後、CommitDecision 前呼叫（Task 24 編排碼）；
-	// a.onWorkflowMuAcquired：public EscalationCreate 取得 workflowMu 後、寫入前呼叫（test-only seam）。
-	// 兩份 JSONL 無共同總序可斷言——改驗「blocker 取得 mutex 後觀察到的 gate 狀態」。
+	// 可重現的 injected barrier（無 time.Sleep、無排程競態）：三個 test seam——
+	// a.decideBarrierHook：GateDecide 在 blocker 檢查後、CommitDecision 前（Task 24 編排碼）；
+	// a.onWorkflowMuAttempt：public EscalationCreate 於 mutex.Lock() **前**呼叫；
+	// a.onWorkflowMuAcquired：public EscalationCreate 取得 mutex 後、寫入前呼叫。
+	// 順序控制：先啟動 Decide 等它進窗口（持有 mutex），才啟動 blocker 並等 attempted
+	// 訊號——保證 blocker 的 Lock() 嘗試發生在 release 之前、必然排在 decide 之後。
 	a := newTestApp(t)
-	inWindow := make(chan struct{})  // hook 已進窗口
-	release := make(chan struct{})   // 放行 CommitDecision
+	inWindow := make(chan struct{})   // decide 已過 blocker 檢查、持有 mutex
+	release := make(chan struct{})    // 放行 CommitDecision
+	attempted := make(chan struct{})  // blocker 已到達 Lock() 前
 	created := make(chan error, 1)
 	var stateSeenByBlocker gate.State
+	a.onWorkflowMuAttempt = func() { close(attempted) }
 	a.onWorkflowMuAcquired = func() { // blocker 真正進入臨界區的時點
 		entries, _ := a.gateSvc.List()
 		stateSeenByBlocker = stateOf(entries, pendingID)
 	}
 	a.decideBarrierHook = func() { close(inWindow); <-release }
-	go func() { _, err := a.EscalationCreate("plan:P1", "gate2:P1", "窗口內阻擋"); created <- err }()
 	decideDone := make(chan error, 1)
 	go func() {
 		decideDone <- a.GateDecide(pendingID, "approved", "",
 			[]gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}})
 	}()
-	<-inWindow      // decide 已過 blocker 檢查、持有 mutex；EscalationCreate 此刻必然阻塞於 mutex
-	close(release)  // 放行 append
+	<-inWindow // decide 持有 mutex、位於窗口內
+	go func() { _, err := a.EscalationCreate("plan:P1", "gate2:P1", "窗口內阻擋"); created <- err }()
+	<-attempted    // blocker 已嘗試取鎖（在 release 前）——此刻必然阻塞於 mutex
+	close(release) // 放行 append
 	if err := <-decideDone; err != nil {
 		t.Fatalf("decide must succeed: %v", err)
 	}
@@ -1033,18 +1071,21 @@ func TestGateDecideBarrierWindowInjected(t *testing.T) {
 }
 // 執行：go test -race -count=30 ./... -run TestGateDecideBarrier（收尾 gate 必跑）
 
-func TestStaleBlockerReleasedByResubmission(t *testing.T) { // P1：stale blocker 不得永久擋住修正版
+func TestStaleBlockerReleasedByReplacementApproval(t *testing.T) { // P1：stale blocker 不得永久擋住修正版
 	a := newTestApp(t)
 	a.approveGate2(t, "P1")            // v1 核可
 	a.mutateSpec(t)                    // spec 變更 → Gate 2 stale → hard blocker（stale:gate2:plan:P1）
 	a.reapproveGate1AndRevisePlan(t)   // 修復：Gate 1 重核、plan 修訂 commit
-	id2 := a.submitPlan(t, "P1")       // 修正版送核：current-binding validation 通過 → 系統解除舊 blocker
-	if item := a.openItemByKey("stale:gate2:plan:P1"); item != nil {
-		t.Fatal("corrected resubmission must system-resolve the stale blocker")
+	id2 := a.submitPlan(t, "P1")       // 修正版送核（送核本身不解除 blocker）
+	if item := a.openItemByKey("stale:gate2:plan:P1"); item == nil {
+		t.Fatal("blocker must remain until replacement approval") // 解除時點在 GateDecide 2b
 	}
 	if err := a.GateDecide(id2, "approved", "",
 		[]gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}}); err != nil {
-		t.Fatalf("replacement approval must succeed: %v", err)
+		t.Fatalf("replacement approval must succeed: %v", err) // 2b 解除 → blocker check 通過 → append
+	}
+	if item := a.openItemByKey("stale:gate2:plan:P1"); item != nil {
+		t.Fatal("replacement approval must system-resolve the stale blocker")
 	}
 }
 
@@ -1111,10 +1152,14 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 | A10 | App 重啟 | gate／evidence／escalation projection 完整重建；orphan worktree／temp 清理 |
 
 - [ ] **Step 1: 逐項執行並記錄**（含失敗與偏差；不得只寫 PASS）。
-- [ ] **Step 2: 最終 gate**：`go vet ./...`、`go test -race ./... -count=1`、`npm --prefix frontend run test`、`npm --prefix frontend run build`、`wails build`、`./scripts/bundle-clis.sh` 後實機 .app 冒煙。
+- [ ] **Step 2: 最終 gate**：`go vet ./...`、`go test -race ./... -count=1`、**`go test -race -count=30 ./... -run 'TestGateDecideBarrier|TestStaleBlockerReleased'`**（Task 24 競態壓力）、`npm --prefix frontend run test`、`npm --prefix frontend run build`、`wails build`、`./scripts/bundle-clis.sh` 後實機 .app 冒煙。
 - [ ] **Step 3: Commit**：`docs: M3a 驗收結果`；併版（merge to main）依 repo 慣例由 owner 決定。
 
 ---
+
+## Self-Review 記錄（v4）
+
+**v4 修訂（第三輪 plan 審閱 5 P1＋1 P2）**：Task 5 Step 3 同步 Prepare/Commit 新流程＋current-binding validation 限 approved（rejected 免驗，補 stale pending 核可失敗／駁回成功雙測）；gatepolicy 內 `gate.ApprovalRecord`／`gate.State` 限定名＋兩個 policy 的 `var _ gate.GatePolicy` 編譯期斷言；stale blocker 解除時點凍結於 GateDecide 編排 2b（approved Prepare 成功後、blocker 檢查前 `resolveByKeyLocked`，寫入失敗拒核；測試改為核可後驗證解除、送核當下 blocker 仍在）；barrier 測試改「先 Decide 進窗口→再啟動 blocker→等 `onWorkflowMuAttempt` 訊號→release」消除排程競態；Task 22 補 `ValidateTestCommit`／`EvidenceCommitCandidates` 後端綁定＋`bindings.test.ts` 鎖 TS adapter 參數形狀；Task 27 最終 gate 補 `-race -count=30` 競態壓力指令。
 
 ## Self-Review 記錄（v3）
 
