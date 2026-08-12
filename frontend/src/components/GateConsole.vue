@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { reactive } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { GateEntry } from '../types'
+import { resolveState, gateStateKeys } from '../i18n/stateKeys'
+
+const { t } = useI18n()
 
 // Gate 1 主控台（spec §5.3）：entries／decide 走 props 注入（測試以 props 驅動，
 // 不依賴 live Wails binding）；真實 wiring 在 App.vue（GateDecide＋GateList refresh）。
@@ -30,28 +34,28 @@ function onReject(id: string) {
 
 <template>
   <div class="gate-console">
-    <p v-if="degraded" class="degraded-notice">journal degraded：核可／駁回暫停，僅供讀取（spec §3.2）</p>
-    <p v-if="entries.length === 0" class="empty">目前沒有 Gate 1 項目</p>
+    <p v-if="degraded" class="degraded-notice">{{ t('gate.degradedNotice') }}</p>
+    <p v-if="entries.length === 0" class="empty">{{ t('gate.empty') }}</p>
     <div v-for="e in entries" :key="e.approval_id" class="entry">
       <div class="head">
         <span class="id">{{ e.approval_id }}</span>
         <span v-if="e.gate" class="gate">{{ e.gate }}</span>
-        <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ e.state.toUpperCase() }}</span>
+        <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ resolveState(gateStateKeys, e.state, t) }}</span>
       </div>
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + b.ref">{{ b.kind }}: {{ b.digest }}</li>
       </ul>
-      <p v-else-if="e.base_commit" class="bindings">base_commit: {{ e.base_commit }}</p>
+      <p v-else-if="e.base_commit" class="bindings">{{ t('gate.label.baseCommit') }}: {{ e.base_commit }}</p>
       <div v-if="e.state === 'pending'" class="actions">
         <input
           v-model="reasons[e.approval_id]"
           data-test="reason"
-          placeholder="理由（reject 必填）"
+          :placeholder="t('gate.reason.placeholder')"
           :disabled="degraded"
         />
-        <button data-test="approve" :disabled="degraded" @click="onApprove(e.approval_id)">Approve</button>
-        <button data-test="reject" :disabled="degraded" @click="onReject(e.approval_id)">Reject</button>
-        <span v-if="hints[e.approval_id]" class="hint">請先填理由再駁回</span>
+        <button data-test="approve" :disabled="degraded" @click="onApprove(e.approval_id)">{{ t('gate.action.approve') }}</button>
+        <button data-test="reject" :disabled="degraded" @click="onReject(e.approval_id)">{{ t('gate.action.reject') }}</button>
+        <span v-if="hints[e.approval_id]" class="hint">{{ t('gate.reasonHint') }}</span>
       </div>
     </div>
   </div>

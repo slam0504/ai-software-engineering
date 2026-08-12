@@ -1,9 +1,9 @@
-import { mount } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it } from 'vitest'
 import ChatPanel from './ChatPanel.vue'
 import { useSession } from '../stores/session'
 import type { Envelope } from '../types'
+import { mountWithI18n } from '../test/i18n'
 
 const env = (over: Partial<Envelope>): Envelope => ({
   event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta', ...over,
@@ -18,7 +18,7 @@ describe('ChatPanel thinking fold', () => {
   })
 
   it('renders accumulated thinking inside a collapsed details block', async () => {
-    const wrapper = mount(ChatPanel)
+    const wrapper = mountWithI18n(ChatPanel)
     const s = useSession()
     s.apply(env({ kind: 'delta', text: 'ans-', thinking: 'step one; ' }))
     s.apply(env({ kind: 'delta', text: 'wer', thinking: 'step two' }))
@@ -32,7 +32,7 @@ describe('ChatPanel thinking fold', () => {
   })
 
   it('omits details when message has no thinking', async () => {
-    const wrapper = mount(ChatPanel)
+    const wrapper = mountWithI18n(ChatPanel)
     const s = useSession()
     s.apply(env({ kind: 'delta', text: 'plain' }))
     await wrapper.vm.$nextTick()

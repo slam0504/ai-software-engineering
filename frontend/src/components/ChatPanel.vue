@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, nextTick, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useSession } from '../stores/session'
 import { isAtBottom } from '../lib/scroll'
 
+const { t } = useI18n()
 const s = useSession()
 const draft = ref('')
 const listEl = ref<HTMLElement | null>(null)
@@ -31,7 +33,7 @@ watch(() => s.chat.length + (s.chat.at(-1)?.text.length ?? 0), () =>
   <div class="chat">
     <div ref="listEl" class="msgs" @scroll.passive="onScroll">
       <div v-for="(m, i) in s.chat" :key="i" :class="['bubble', m.role]">
-        <details v-if="m.thinking" class="thinking"><summary>thinking</summary>
+        <details v-if="m.thinking" class="thinking"><summary>{{ t('chat.thinking') }}</summary>
           <pre>{{ m.thinking }}</pre>
         </details>
         <div class="text">{{ m.text }}<span v-if="m.streaming" class="cursor">▌</span></div>
@@ -39,9 +41,9 @@ watch(() => s.chat.length + (s.chat.at(-1)?.text.length ?? 0), () =>
     </div>
     <div class="composer">
       <textarea v-model="draft" rows="2" :disabled="s.busy"
-        placeholder="輸入訊息，Enter 送出（Shift+Enter 換行）"
+        :placeholder="t('chat.input.placeholder')"
         @keydown.enter.exact.prevent="send" />
-      <button :disabled="s.busy || !draft.trim()" @click="send">送出</button>
+      <button :disabled="s.busy || !draft.trim()" @click="send">{{ t('chat.action.send') }}</button>
     </div>
   </div>
 </template>

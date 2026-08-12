@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { t } from '../i18n'
 import type { Bindings, ChatItem, Envelope, TimelineItem } from '../types'
 
 const NOISE_KINDS = new Set(['system_other', 'unknown'])
@@ -170,7 +171,7 @@ export const useSession = defineStore('session', {
       const v = this.views[p]
       if (v.busy) return
       if (!this.bindings) {
-        this.pushError('bindings not ready')
+        this.pushError(t('store.bindingsNotReady'))
         return
       }
       v.busy = true

@@ -1,4 +1,3 @@
-import { mount } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -13,6 +12,7 @@ vi.mock('../../wailsjs/go/main/App', () => ({ ResolveApproval: h.ResolveApproval
 
 import ApprovalDialog from './ApprovalDialog.vue'
 import { useSession } from '../stores/session'
+import { mountWithI18n } from '../test/i18n'
 
 const req = (id: string, provider: string) => ({ id, provider, toolName: 'Bash', inputJson: '{}' })
 
@@ -24,7 +24,7 @@ describe('ApprovalDialog FIFO queue (M1.5 D7)', () => {
   })
 
   it('does not overwrite the displayed request; queues the second', async () => {
-    const w = mount(ApprovalDialog)
+    const w = mountWithI18n(ApprovalDialog)
     const s = useSession()
     h.handlers['approval:request'](req('a1', 'codex'))
     h.handlers['approval:request'](req('a2', 'claude'))
@@ -35,7 +35,7 @@ describe('ApprovalDialog FIFO queue (M1.5 D7)', () => {
   })
 
   it('promotes the next request after resolve and switches tab then', async () => {
-    const w = mount(ApprovalDialog)
+    const w = mountWithI18n(ApprovalDialog)
     const s = useSession()
     h.handlers['approval:request'](req('a1', 'codex'))
     h.handlers['approval:request'](req('a2', 'claude'))
@@ -48,7 +48,7 @@ describe('ApprovalDialog FIFO queue (M1.5 D7)', () => {
   })
 
   it('removes a queued item by id on timeout without touching the displayed one', async () => {
-    const w = mount(ApprovalDialog)
+    const w = mountWithI18n(ApprovalDialog)
     h.handlers['approval:request'](req('a1', 'codex'))
     h.handlers['approval:request'](req('a2', 'claude'))
     await w.vm.$nextTick()
@@ -59,7 +59,7 @@ describe('ApprovalDialog FIFO queue (M1.5 D7)', () => {
   })
 
   it('Esc denies only the displayed request with reason esc', async () => {
-    const w = mount(ApprovalDialog)
+    const w = mountWithI18n(ApprovalDialog)
     h.handlers['approval:request'](req('a1', 'codex'))
     h.handlers['approval:request'](req('a2', 'claude'))
     await w.vm.$nextTick()

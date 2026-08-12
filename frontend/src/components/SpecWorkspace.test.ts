@@ -1,8 +1,9 @@
-import { flushPromises, mount } from '@vue/test-utils'
+import { flushPromises } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SpecWorkspace from './SpecWorkspace.vue'
 import { useAssist } from '../stores/assist'
+import { mountWithI18n } from '../test/i18n'
 
 // wailsjs 綁定 mock：控制 SpecAssist 的 resolve 時機，模擬「assist 進行中操作者
 // 切檔」的競態（fix round 2）。SpecList/SpecRead 給穩定預設值，避免 onMounted
@@ -28,7 +29,7 @@ describe('SpecWorkspace draft accept', () => {
 
   it('accept writes draft via SpecWrite, not before', async () => {
     const write = vi.fn().mockResolvedValue('sha256:x')
-    const w = mount(SpecWorkspace, { props: {
+    const w = mountWithI18n(SpecWorkspace, { props: {
       path: 'spec/glossary.md', draft: 'AI draft content', write,
     }})
     expect(write).not.toHaveBeenCalled() // 草稿不自動寫檔
@@ -46,7 +47,7 @@ describe('SpecWorkspace draft accept', () => {
     let resolveAssist: (id: string) => void = () => {}
     mocks.SpecAssist.mockImplementation(() => new Promise<string>(r => { resolveAssist = r }))
 
-    const w = mount(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
     await flushPromises()
 
     await w.find('[data-test=assist-draft]').trigger('click') // 對 A 發起 assist，尚未 resolve
@@ -72,7 +73,7 @@ describe('SpecWorkspace draft accept', () => {
   it('binds the draft via the correlation_id returned by SpecAssist', async () => {
     mocks.SpecAssist.mockResolvedValue('corr-a')
 
-    const w = mount(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
     await flushPromises()
 
     const assist = useAssist()

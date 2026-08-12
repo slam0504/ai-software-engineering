@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ResolveApproval } from '../../wailsjs/go/main/App'
 import { useSession } from '../stores/session'
 
 interface Req { id: string; provider: string; toolName: string; inputJson: string }
 
+const { t } = useI18n()
 const s = useSession()
 // FIFO queue（M1.5 plan D7）：[0] 為顯示中；顯示中的請求不被後到覆蓋。
 const queue = ref<Req[]>([])
@@ -66,13 +68,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <div v-if="current" class="overlay">
     <div class="dialog">
-      <h3>[{{ current.provider }}] 工具權限請求：{{ current.toolName }}</h3>
+      <h3>[{{ current.provider }}] {{ t('approval.toolRequest', { tool: current.toolName }) }}</h3>
       <pre>{{ current.inputJson }}</pre>
-      <input v-model="reason" placeholder="理由（deny 建議填）" />
+      <input v-model="reason" :placeholder="t('approval.reason.placeholder')" />
       <div class="actions">
-        <button class="allow" @click="decide(true)">Allow</button>
-        <button class="deny" @click="decide(false)">Deny</button>
-        <span v-if="queue.length > 1" class="pending">＋{{ queue.length - 1 }} 筆等待中</span>
+        <button class="allow" @click="decide(true)">{{ t('approval.action.allow') }}</button>
+        <button class="deny" @click="decide(false)">{{ t('approval.action.deny') }}</button>
+        <span v-if="queue.length > 1" class="pending">{{ t('approval.pendingCount', { n: queue.length - 1 }) }}</span>
       </div>
       <p v-if="error" class="error">{{ error }}</p>
     </div>
