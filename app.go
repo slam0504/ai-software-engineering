@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1847,7 +1848,9 @@ func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
 // commit，落地交給呼叫端（wailsjs 重生留給 Task 6 前端任務）。digest 一律
 // 後端 sha256(buffer) 自算：BumpToken 沒有欄位讓前端塞自己算的值，Confirm
 // 重算 currentBuffer 才拿去跟 token 比對，前端不可能偽造出一個能通過驗證
-// 的 token。
+// 的 token。Confirm 通過後、儲存前 HEAD 再動的 TOCTOU，由呼叫端接下來要走
+// 的 ConfirmPlanCommit 的 commit token 鏈（HeadOID／TreeDigest staleness
+// 檢查）接手防護——本函式只保證回傳當下 updatedBuffer 的內容正確。
 
 // BumpToken binds a PreviewAnalysisBaseBump result to the exact plan path,
 // old analysis_base_commit value, HEAD, and buffer digest at preview time —
@@ -1943,33 +1946,67 @@ func verifyIsAncestor(g plan.GitRunner, ancestor, descendant string) error {
 	return nil
 }
 
-// bumpTouchedFiles lists paths changed in old..head (`git diff --name-only`),
-// skipping the trailing empty line the command's output always ends with.
-func bumpTouchedFiles(g plan.GitRunner, old, head string) ([]string, error) {
-	out, err := g.Git("diff", "--name-only", old+".."+head)
-	if err != nil {
-		return nil, err
+// splitBumpNULFields splits a `git diff --name-status -z` record stream on
+// NUL. Mirrors internal/plan/lineage.go's unexported splitNULFields
+// (duplicated rather than exported cross-package for this single caller,
+// to keep plan's I/O-free package boundary unchanged) — real output always
+// ends with a trailing NUL after the last field, which must be dropped.
+func splitBumpNULFields(out []byte) []string {
+	trimmed := bytes.TrimRight(out, "\x00")
+	if len(trimmed) == 0 {
+		return nil
 	}
-	var paths []string
-	for _, p := range strings.Split(string(out), "\n") {
-		if p != "" {
-			paths = append(paths, p)
-		}
-	}
-	return paths, nil
+	return strings.Split(string(trimmed), "\x00")
 }
 
-// allPlanScope reports whether every path in paths stays inside plan/**
-// (spec.PlanScope) — used to detect the "old..HEAD only touched plan/**"
-// no-bump-needed case. Vacuously true for an empty slice: no changes at all
-// also means nothing for a bump to move.
-func allPlanScope(paths []string) bool {
-	for _, p := range paths {
-		if !spec.PlanScope.Match(p) {
-			return false
+// bumpTouchedFiles lists paths changed in old..head via
+// `git diff --name-status -z --find-renames` — same record shape
+// plan.VerifyLineage parses (NUL-delimited; an R/C rename/copy record
+// carries two paths, everything else carries one). paths is the flat list
+// for display (a rename contributes its new path only — what an operator
+// wants to see changed); allPlanOnly folds in BOTH sides of every
+// rename/copy record, because a path that moved from outside plan/** into
+// plan/** (or vice versa) is a real change to the non-plan tree even though
+// its post-rename path alone would satisfy spec.PlanScope.Match (review F2:
+// `git diff --name-only` alone only reports the new path and would
+// misclassify such a move as plan-only).
+func bumpTouchedFiles(g plan.GitRunner, old, head string) (paths []string, allPlanOnly bool, err error) {
+	out, err := g.Git("diff", "--name-status", "-z", "--find-renames", old+".."+head)
+	if err != nil {
+		return nil, false, err
+	}
+	fields := splitBumpNULFields(out)
+	allPlanOnly = true
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		if status == "" {
+			continue
+		}
+		switch status[0] {
+		case 'R', 'C':
+			if i+1 >= len(fields) {
+				return nil, false, fmt.Errorf("plan: bump: malformed diff entry: status %q missing paths", status)
+			}
+			oldPath, newPath := fields[i], fields[i+1]
+			i += 2
+			paths = append(paths, newPath)
+			if !spec.PlanScope.Match(oldPath) || !spec.PlanScope.Match(newPath) {
+				allPlanOnly = false
+			}
+		default:
+			if i >= len(fields) {
+				return nil, false, fmt.Errorf("plan: bump: malformed diff entry: status %q missing path", status)
+			}
+			p := fields[i]
+			i++
+			paths = append(paths, p)
+			if !spec.PlanScope.Match(p) {
+				allPlanOnly = false
+			}
 		}
 	}
-	return true
+	return paths, allPlanOnly, nil
 }
 
 // PreviewAnalysisBaseBump（§3.2）reads buffer's analysis_base_commit (never
@@ -2005,11 +2042,11 @@ func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, erro
 		return BumpPreview{}, err
 	}
 
-	touched, err := bumpTouchedFiles(a.planGit, old, head)
+	touched, allPlanOnly, err := bumpTouchedFiles(a.planGit, old, head)
 	if err != nil {
 		return BumpPreview{}, err
 	}
-	if allPlanScope(touched) {
+	if allPlanOnly {
 		return BumpPreview{Old: old, Head: head, TouchedFiles: touched, NoBumpNeeded: true}, nil
 	}
 
@@ -2028,38 +2065,101 @@ func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, erro
 	}, nil
 }
 
-// analysisBaseCommitLineRe locates an analysis_base_commit: line's value:
-// group 1 is everything up to and including the separating whitespace
-// (indentation + key + colon + spaces), group 2 is the value token itself,
-// group 3 is whatever follows it (inline comment, trailing whitespace).
-// Replacing only group 2 leaves every other byte on the line untouched.
-var analysisBaseCommitLineRe = regexp.MustCompile(`^(\s*analysis_base_commit:\s*)(\S+)(.*)$`)
+// analysisBaseCommitKey is the plan schema's analysis_base_commit key,
+// including its trailing colon — the string-anchor every step below keys
+// off of (isAnalysisBaseCommitLine's prefix check and
+// parseAnalysisBaseCommitLine's split point).
+const analysisBaseCommitKey = "analysis_base_commit:"
 
 // isAnalysisBaseCommitLine reports whether line's trimmed content begins
-// with the plan schema's analysis_base_commit key — the string-anchor
-// ConfirmAnalysisBaseBump's "恰一處" check scans for.
+// with the plan schema's analysis_base_commit key. This is only a
+// structural/textual filter — a multi-line block scalar's content line can
+// coincidentally satisfy it too (review F1); parseAnalysisBaseCommitLine's
+// extracted value must additionally equal the expected old value before a
+// line is trusted as the real key.
 func isAnalysisBaseCommitLine(line string) bool {
-	return strings.HasPrefix(strings.TrimSpace(line), "analysis_base_commit:")
+	return strings.HasPrefix(strings.TrimSpace(line), analysisBaseCommitKey)
+}
+
+// parseAnalysisBaseCommitLine splits a line isAnalysisBaseCommitLine has
+// already confirmed into: prefix (indentation + key + colon + separating
+// whitespace, kept verbatim), quote (0 for a bare/plain scalar, or the
+// quote byte — a double or single quote character — the value is wrapped
+// in), value (the scalar's literal content — dequoted, so it is directly
+// comparable to a BumpToken's Old/Head, which are always bare Go strings
+// regardless of how the source YAML quoted them), and rest (everything
+// after the value: inline comment,
+// trailing whitespace, kept verbatim). ok is false for anything this
+// deliberately-not-a-YAML-parser line scan cannot safely handle — no value
+// at all, or an unterminated quote — so callers never index into a failed
+// parse (review F3: the previous regex-based version indexed a nil
+// submatch and panicked on exactly this shape).
+func parseAnalysisBaseCommitLine(line string) (prefix string, quote byte, value string, rest string, ok bool) {
+	idx := strings.Index(line, analysisBaseCommitKey)
+	if idx < 0 {
+		return "", 0, "", "", false
+	}
+	prefix = line[:idx+len(analysisBaseCommitKey)]
+	remainder := line[idx+len(analysisBaseCommitKey):]
+	sp := 0
+	for sp < len(remainder) && (remainder[sp] == ' ' || remainder[sp] == '\t') {
+		sp++
+	}
+	prefix += remainder[:sp]
+	remainder = remainder[sp:]
+	if remainder == "" {
+		return "", 0, "", "", false
+	}
+	if remainder[0] == '"' || remainder[0] == '\'' {
+		q := remainder[0]
+		end := strings.IndexByte(remainder[1:], q)
+		if end < 0 {
+			return "", 0, "", "", false
+		}
+		return prefix, q, remainder[1 : 1+end], remainder[1+end+1:], true
+	}
+	if end := strings.IndexAny(remainder, " \t"); end >= 0 {
+		return prefix, 0, remainder[:end], remainder[end:], true
+	}
+	return prefix, 0, remainder, "", true
 }
 
 // replaceAnalysisBaseCommitLine returns line with only its
-// analysis_base_commit value replaced by newVal. Callers must only pass a
-// line isAnalysisBaseCommitLine already confirmed (guarantees
-// analysisBaseCommitLineRe matches).
-func replaceAnalysisBaseCommitLine(line, newVal string) string {
-	m := analysisBaseCommitLineRe.FindStringSubmatch(line)
-	return m[1] + newVal + m[3]
+// analysis_base_commit value replaced by newVal, preserving the original
+// quote characters verbatim if the value was quoted (review F4: a bare
+// `(\S+)` replacement previously swallowed a `"..."` value's closing quote,
+// corrupting the YAML). ok is false when line does not parse as an
+// analysis_base_commit line at all (see parseAnalysisBaseCommitLine).
+func replaceAnalysisBaseCommitLine(line, newVal string) (string, bool) {
+	prefix, quote, _, rest, ok := parseAnalysisBaseCommitLine(line)
+	if !ok {
+		return "", false
+	}
+	if quote != 0 {
+		return prefix + string(quote) + newVal + string(quote) + rest, true
+	}
+	return prefix + newVal + rest, true
 }
 
 // ConfirmAnalysisBaseBump（§3.2）re-verifies every field of tok against the
 // caller's current state — planRel unchanged, currentBuffer's backend-
 // recomputed digest still matches (never trusts a caller-supplied digest),
-// HEAD unmoved since preview — then requires currentBuffer to contain
-// exactly one analysis_base_commit: line (0 or ≥2 rejects: string-position
-// replacement is only well-defined with exactly one). On success, replaces
-// only that line's value with tok.Head and returns the full updatedBuffer —
-// every other byte, including comments and formatting, untouched. Does not
-// write to disk or commit; the caller decides when to land the result.
+// HEAD unmoved since preview — then scans currentBuffer for
+// analysis_base_commit lines. Any such line whose extracted (dequoted)
+// value does not equal tok.Old rejects immediately and specifically: it
+// is either malformed (review F3) or, as it stands, most likely
+// unrelated text that coincidentally starts with the same key text — e.g.
+// inside a block scalar (review F1) — which the previous count-only "恰
+// 一處" check could not tell apart from the real key, permanently rejecting
+// (re-running preview never changes a buffer's own text, so that was a
+// dead-end retry loop, not a recoverable staleness error). Once every
+// matching line's value is confirmed consistent, exactly one such line must
+// remain (0 or ≥2 still rejects: string-position replacement is only
+// well-defined with exactly one). On success, replaces only that line's
+// value with tok.Head — preserving quotes if the value was quoted (review
+// F4) — and returns the full updatedBuffer; every other byte, including
+// comments and formatting, untouched. Does not write to disk or commit; the
+// caller decides when to land the result.
 func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer string) (string, error) {
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
@@ -2079,19 +2179,29 @@ func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer stri
 	}
 
 	lines := strings.Split(currentBuffer, "\n")
-	matchIdx := -1
-	count := 0
+	var matchIdx []int
 	for i, l := range lines {
-		if isAnalysisBaseCommitLine(l) {
-			count++
-			matchIdx = i
+		if !isAnalysisBaseCommitLine(l) {
+			continue
 		}
+		_, _, value, _, ok := parseAnalysisBaseCommitLine(l)
+		if !ok {
+			return "", fmt.Errorf("plan: bump: line %d looks like an analysis_base_commit key but its value could not be parsed: %q — re-run preview", i+1, l)
+		}
+		if value != tok.Old {
+			return "", fmt.Errorf("plan: bump: line %d looks like an analysis_base_commit key but holds %q, not the expected old value %q — likely unrelated text coincidentally starting with the same key (e.g. inside a block scalar); edit the buffer to remove the ambiguity, then re-run preview", i+1, value, tok.Old)
+		}
+		matchIdx = append(matchIdx, i)
 	}
-	if count != 1 {
-		return "", fmt.Errorf("plan: bump: buffer must contain exactly one analysis_base_commit line, found %d — re-run preview", count)
+	if len(matchIdx) != 1 {
+		return "", fmt.Errorf("plan: bump: buffer must contain exactly one analysis_base_commit line holding the expected old value %q, found %d — re-run preview", tok.Old, len(matchIdx))
 	}
 
-	lines[matchIdx] = replaceAnalysisBaseCommitLine(lines[matchIdx], tok.Head)
+	newLine, ok := replaceAnalysisBaseCommitLine(lines[matchIdx[0]], tok.Head)
+	if !ok {
+		return "", fmt.Errorf("plan: bump: line %d could not be rewritten: %q", matchIdx[0]+1, lines[matchIdx[0]])
+	}
+	lines[matchIdx[0]] = newLine
 	return strings.Join(lines, "\n"), nil
 }
 

@@ -672,3 +672,138 @@ func TestConfirmAnalysisBaseBumpRejectsDuplicateAnalysisBaseCommitLine(t *testin
 		t.Fatal("buffer with two analysis_base_commit lines must reject confirm (恰一處 rule)")
 	}
 }
+
+// TestConfirmAnalysisBaseBumpRejectsBlockScalarFalsePositiveNotDeadlock
+// (review F1)：一個 block scalar（`notes: |`）內容行若恰好以
+// "analysis_base_commit:" 開頭，舊版純計數的「恰一處」規則會把它跟真正的
+// key 行一起算成 2 處，永遠拒絕——即使 buffer 完全沒變、重跑 Preview 也拿
+// 不到能通過的新 token，形成死鎖。現在的規則要求每一處匹配到的行，其值都
+// 必須等於 tok.Old；這裡的假匹配行值不等於 tok.Old，預期得到一個明確指出
+// 「值不符」的拒絕（而非舊版那種暗示「重跑 preview」但其實永遠無效的訊
+// 息），驗證行為是可診斷的拒絕，不是死鎖。
+func TestConfirmAnalysisBaseBumpRejectsBlockScalarFalsePositiveNotDeadlock(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+
+	buffer := "plan_id: P1\n" +
+		"notes: |\n" +
+		"  analysis_base_commit: this line is prose inside a block scalar, not a real key\n" +
+		"analysis_base_commit: " + oldOID + "\n" +
+		"spec_manifest: sha256:" + strings.Repeat("a", 64) + "\n"
+
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatalf("preview must succeed — real yaml decoding must see through the block scalar, got %v", err)
+	}
+	if preview.NoBumpNeeded {
+		t.Fatal("expected a normal (non-NoBumpNeeded) preview for this fixture")
+	}
+
+	_, err = a.ConfirmAnalysisBaseBump(preview.Token, "plan/P1.yaml", buffer)
+	if err == nil {
+		t.Fatal("a block-scalar line that coincidentally starts with analysis_base_commit: but holds a different value must reject confirm")
+	}
+	if !strings.Contains(err.Error(), "not the expected old value") {
+		t.Fatalf("rejection must diagnose the value mismatch specifically (not a generic 'found N, re-run preview'), got %v", err)
+	}
+}
+
+// TestConfirmAnalysisBaseBumpRejectsMalformedEmptyValueLine (review F3)：偽造
+// 一個帶有 analysis_base_commit: 但值為空的行（冒號後沒有任何 token）——
+// 舊版 replaceAnalysisBaseCommitLine 對 FindStringSubmatch 回傳 nil 直接
+// m[1] 會 panic；新版必須回傳一個明確錯誤，不能 panic。
+func TestConfirmAnalysisBaseBumpRejectsMalformedEmptyValueLine(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	headOID := revParseHead(t, a)
+
+	buffer := "analysis_base_commit:\n"
+	tok := BumpToken{
+		PlanRel:      "plan/P1.yaml",
+		Old:          headOID,
+		Head:         headOID,
+		BufferDigest: spec.HashBytes([]byte(buffer)),
+	}
+
+	if _, err := a.ConfirmAnalysisBaseBump(tok, "plan/P1.yaml", buffer); err == nil {
+		t.Fatal("an analysis_base_commit line with no value must reject confirm, not panic")
+	}
+}
+
+// TestConfirmAnalysisBaseBumpPreservesQuotesAroundValue (review F4)：值以雙
+// 引號包住時，替換後引號本身必須保留（舊版 `(\S+)` 會把值連著結尾引號一起
+// 當成 value 吃掉，破壞輸出的引號結構）。
+func TestConfirmAnalysisBaseBumpPreservesQuotesAroundValue(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+	headOID := revParseHead(t, a)
+
+	buffer := "plan_id: P1\n" +
+		"analysis_base_commit: \"" + oldOID + "\"\n" +
+		"spec_manifest: sha256:" + strings.Repeat("a", 64) + "\n"
+
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := a.ConfirmAnalysisBaseBump(preview.Token, "plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "plan_id: P1\n" +
+		"analysis_base_commit: \"" + headOID + "\"\n" +
+		"spec_manifest: sha256:" + strings.Repeat("a", 64) + "\n"
+	if updated != want {
+		t.Fatalf("quoted value replacement must preserve the surrounding quotes\nwant:\n%s\ngot:\n%s", want, updated)
+	}
+}
+
+// TestPreviewAnalysisBaseBumpRenameIntoPlanIsNotNoBumpNeeded (review F2)：
+// `git diff --name-only` 只回傳 rename 後的新路徑；一個從 plan/ 外搬進
+// plan/ 的檔案（`git mv src.txt plan/moved.txt`），舊版判斷邏輯只看新路徑
+// 落在 plan/** 內就誤判成 NoBumpNeeded——但實質上 code tree（src.txt 所在
+// 位置）確實變了。改用 --name-status -z --find-renames 後，rename 記錄的
+// 兩側路徑都要落在 plan/** 內才算 plan-only。
+func TestPreviewAnalysisBaseBumpRenameIntoPlanIsNotNoBumpNeeded(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "src.txt"), strings.Repeat("x", 200))
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	if err := os.MkdirAll(filepath.Join(a.workspaceDir, "plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, a, "mv", "src.txt", "plan/moved.txt")
+	runGit(t, a, "commit", "-m", "move src.txt into plan/")
+	headOID := revParseHead(t, a)
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.NoBumpNeeded {
+		t.Fatalf("a rename whose old path is outside plan/** must not be treated as plan-only, got %+v", preview)
+	}
+	if preview.Head != headOID || preview.Token.Old != oldOID {
+		t.Fatalf("unexpected preview: %+v", preview)
+	}
+}
