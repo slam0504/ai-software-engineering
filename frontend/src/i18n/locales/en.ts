@@ -89,6 +89,7 @@ export default {
       active: 'ACTIVE',
       stale: 'STALE',
       superseded: 'SUPERSEDED',
+      rejected: 'REJECTED',
     },
     reason: {
       placeholder: 'Reason (required to reject)',
@@ -201,14 +202,14 @@ export default {
       mutationDigest: 'mutation_digest',
       command: 'command',
       cwd: 'cwd',
-      startedAt: 'started at',
-      finishedAt: 'finished at',
+      startedAt: 'started_at',
+      finishedAt: 'finished_at',
       exitCode: 'exit_code',
       expectedFailure: 'expected_failure',
       observedFailure: 'observed_failure',
       stdoutDigest: 'stdout_digest',
       stderrDigest: 'stderr_digest',
-      recordingRef: 'recording ref',
+      recordingRef: 'recording_ref',
       runnerVersion: 'runner_version',
     },
   },
@@ -229,6 +230,13 @@ export default {
   dag: {
     empty: 'No task DAG to display',
     parseError: 'Could not parse the current plan content',
+  },
+  risk: {
+    tier: {
+      low: 'low',
+      medium: 'medium',
+      high: 'high',
+    },
   },
   preview: {
     empty: 'Select a file on the left to preview',

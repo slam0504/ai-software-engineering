@@ -7,6 +7,10 @@ export const sessionStateKeys: Record<string, string> = {
 export const gateStateKeys: Record<string, string> = {
   pending: 'gate.state.pending', active: 'gate.state.active',
   stale: 'gate.state.stale', superseded: 'gate.state.superseded',
+  rejected: 'gate.state.rejected',
+}
+export const riskTierKeys: Record<string, string> = {
+  low: 'risk.tier.low', medium: 'risk.tier.medium', high: 'risk.tier.high',
 }
 export const codexToolStatusKeys: Record<string, string> = {
   completed: 'timeline.toolStatus.completed', inProgress: 'timeline.toolStatus.inProgress',

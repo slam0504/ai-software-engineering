@@ -24,6 +24,24 @@ describe('GateConsole', () => {
     const w = mountWithI18n(GateConsole, { props: { entries: [{ approval_id: 'A', state: 'stale' }], decide: vi.fn() } })
     expect(w.find('[data-test=badge-A]').text()).toContain('已失效') // zh-TW 預設 locale：gate.state.stale
   })
+  it('shows rejected badge', () => {
+    const w = mountWithI18n(GateConsole, { props: { entries: [{ approval_id: 'A', state: 'rejected' }], decide: vi.fn() } })
+    expect(w.find('[data-test=badge-A]').text()).toContain('已退回') // zh-TW 預設 locale：gate.state.rejected
+  })
+  it('gate2 卡片 risk tier 下拉與唯讀欄位皆走 riskTierKeys 翻譯（zh-TW：低／中／高）', async () => {
+    const loadDecisionContext = vi.fn().mockResolvedValue({
+      tasks: [gate2Task({ minimum_risk_tier: 'low', planner_risk_tier: 'low' })],
+    })
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'pending', gate: 'gate2' }], decide: vi.fn(), loadDecisionContext },
+    })
+    await flushPromises()
+    expect(w.find('[data-test=minimum]').text()).toContain('低')
+    expect(w.find('[data-test=planner]').text()).toContain('低')
+    const options = w.find('[data-test=selected-T1]').findAll('option')
+    expect(options.map(o => o.attributes('value'))).toEqual(['low', 'medium', 'high']) // value 維持 raw tier
+    expect(options[0].text()).toBe('低') // 顯示文字走翻譯
+  })
 
   it('gate1 卡片不顯示 risk 列（回歸）', async () => {
     const decide = vi.fn()
@@ -51,8 +69,8 @@ describe('GateConsole', () => {
     await flushPromises()
     expect(loadDecisionContext).toHaveBeenCalledWith('A')
     expect(w.find('[data-test=risk-row-T1]').exists()).toBe(true)
-    expect(w.find('[data-test=minimum]').text()).toContain('medium')
-    expect(w.find('[data-test=planner]').text()).toContain('high')
+    expect(w.find('[data-test=minimum]').text()).toContain('中') // riskTierKeys：medium → zh-TW 中
+    expect(w.find('[data-test=planner]').text()).toContain('高') // riskTierKeys：high → zh-TW 高
 
     // 預設 selected=planner，不需要 override reason，核可可用
     expect(w.find('[data-test=approve]').attributes('disabled')).toBeUndefined()

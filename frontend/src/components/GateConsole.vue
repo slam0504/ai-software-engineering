@@ -3,7 +3,7 @@ import { reactive, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { GateEntry, GateDecisionTask, RiskSelection } from '../types'
 import type { evidence } from '../../wailsjs/go/models'
-import { resolveState, gateStateKeys, evidenceResultKeys } from '../i18n/stateKeys'
+import { resolveState, gateStateKeys, evidenceResultKeys, riskTierKeys } from '../i18n/stateKeys'
 
 const { t } = useI18n()
 
@@ -232,14 +232,14 @@ function shortDigest(d: string): string {
           >
             <span class="task-id">{{ task.task_id }}</span>
             <span class="task-title">{{ task.title }}</span>
-            <span class="tier-ro" data-test="minimum">{{ t('gate.risk.minimum') }}: {{ task.minimum_risk_tier }}</span>
-            <span class="tier-ro" data-test="planner">{{ t('gate.risk.planner') }}: {{ task.planner_risk_tier }}</span>
+            <span class="tier-ro" data-test="minimum">{{ t('gate.risk.minimum') }}: {{ resolveState(riskTierKeys, task.minimum_risk_tier, t) }}</span>
+            <span class="tier-ro" data-test="planner">{{ t('gate.risk.planner') }}: {{ resolveState(riskTierKeys, task.planner_risk_tier, t) }}</span>
             <select
               v-model="selectedTier[e.approval_id][task.task_id]"
               :data-test="'selected-' + task.task_id"
               :disabled="degraded"
             >
-              <option v-for="tier in tierOptions(task)" :key="tier" :value="tier">{{ tier }}</option>
+              <option v-for="tier in tierOptions(task)" :key="tier" :value="tier">{{ resolveState(riskTierKeys, tier, t) }}</option>
             </select>
             <textarea
               v-if="needsOverride(e.approval_id, task)"

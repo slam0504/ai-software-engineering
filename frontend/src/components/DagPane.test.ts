@@ -45,6 +45,18 @@ describe('DagPane', () => {
     expect(w.find('.rendered').exists()).toBe(false)
   })
 
+  it('DAG 節點標籤的 risk tier 走 riskTierKeys 翻譯（zh-TW 預設 locale：low → 低）', async () => {
+    const mermaid = (await import('mermaid')).default as unknown as { render: ReturnType<typeof vi.fn> }
+    mermaid.render.mockClear()
+    const plan = usePlan()
+    const w = mountWithI18n(DagPane)
+    plan.setCurrentFile('plan/a.yaml', validYaml('T1'), 'sha256:x')
+    await flushPromises()
+    const mermaidText = mermaid.render.mock.calls[0][1] as string
+    expect(mermaidText).toContain('低') // minimum/planner_risk_tier: low → zh-TW 低
+    expect(mermaidText).not.toContain('· low"]')
+  })
+
   it('plan store 內容更新自動重渲染', async () => {
     const mermaid = (await import('mermaid')).default as unknown as { render: ReturnType<typeof vi.fn> }
     mermaid.render.mockClear()

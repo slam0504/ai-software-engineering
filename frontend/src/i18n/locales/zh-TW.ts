@@ -6,11 +6,11 @@ export default {
       spec: '規格',
       plan: '計畫',
       diagram: '表示圖',
-      dag: '任務 DAG',
-      tca: 'TCA',
+      dag: '任務相依圖',
+      tca: '測試契約核可',
     },
     sideTab: {
-      gate: 'Gate',
+      gate: '核可',
       escalation: '升級收件匣',
     },
     timeline: {
@@ -89,6 +89,7 @@ export default {
       active: '已生效',
       stale: '已失效',
       superseded: '已取代',
+      rejected: '已退回',
     },
     reason: {
       placeholder: '理由（退回時必填）',
@@ -114,9 +115,9 @@ export default {
   },
   spec: {
     action: {
-      draftGherkin: '草擬 Gherkin',
-      detectAmbiguity: '歧義偵測',
-      checkOracle: 'oracle 覆蓋檢查',
+      draftGherkin: '產生驗收情境草稿',
+      detectAmbiguity: '檢查規格歧義',
+      checkOracle: '檢查驗收條件涵蓋度',
       acceptDraft: '套用草稿',
       submit: '送核',
       previewCommit: '預覽 commit',
@@ -149,7 +150,7 @@ export default {
       placeholder: '描述要草擬的計畫內容',
     },
     planId: {
-      placeholder: '計畫編號（planID）',
+      placeholder: '計畫編號（plan_id）',
     },
     commitMessage: {
       placeholder: 'commit 訊息',
@@ -161,20 +162,20 @@ export default {
     testCommit: {
       pick: '選擇近期 commit…',
       placeholder: 'test commit（手動輸入）',
-      precheckOk: 'lineage 預檢通過',
+      precheckOk: 'commit 版本關係預檢通過',
     },
     action: {
       precheck: '預檢',
       registerMutation: '登記 mutation',
-      runExpectedRed: '跑 expected-red',
-      runNegativeControl: '跑 negative-control',
+      runExpectedRed: '執行 expected-red',
+      runNegativeControl: '執行 negative-control',
       retry: '重跑',
       submit: '送核 TCA',
     },
     mutationPatch: {
       placeholder: 'negative-control 用的 unified diff patch',
     },
-    mutationId: 'mutation_id：{id}',
+    mutationId: 'mutation 編號（mutation_id）：{id}',
     submittedApprovalId: '核可編號（approval_id）：{id}',
   },
   evidence: {
@@ -194,21 +195,21 @@ export default {
     label: {
       evidenceId: 'evidence_id',
       kind: 'kind',
-      result: '結果',
+      result: 'result',
       baseCommit: 'base_commit',
       testCommit: 'test_commit',
       oracleSurfaceDigest: 'oracle_surface_digest',
       mutationDigest: 'mutation_digest',
       command: 'command',
       cwd: 'cwd',
-      startedAt: '開始時間',
-      finishedAt: '結束時間',
+      startedAt: 'started_at',
+      finishedAt: 'finished_at',
       exitCode: 'exit_code',
       expectedFailure: 'expected_failure',
       observedFailure: 'observed_failure',
       stdoutDigest: 'stdout_digest',
       stderrDigest: 'stderr_digest',
-      recordingRef: 'recording ref',
+      recordingRef: 'recording_ref',
       runnerVersion: 'runner_version',
     },
   },
@@ -229,6 +230,13 @@ export default {
   dag: {
     empty: '尚無可顯示的任務 DAG',
     parseError: '無法解析目前的 plan 內容',
+  },
+  risk: {
+    tier: {
+      low: '低',
+      medium: '中',
+      high: '高',
+    },
   },
   preview: {
     empty: '在左側選擇檔案以預覽',
@@ -281,32 +289,32 @@ export default {
   escalation: {
     section: {
       open: '待處理',
-      acknowledged: '已認知',
+      acknowledged: '已知悉',
       resolved: '已解除（{n}）',
     },
     empty: {
       open: '目前沒有待處理的升級項目',
-      acknowledged: '目前沒有已認知的升級項目',
+      acknowledged: '目前沒有已知悉的升級項目',
       resolved: '目前沒有已解除的升級項目',
     },
     action: {
       retry: '重試',
-      ack: '認知',
+      ack: '標記為已知悉',
     },
     badge: {
       source: {
         system: '系統',
         manual: '手動',
       },
-      hard: '硬性',
+      hard: '系統強制',
       occurrence: '第 {n} 次',
     },
     label: {
-      blockScope: 'block scope',
-      sourceRef: '來源',
+      blockScope: '阻擋範圍（block_scope）',
+      sourceRef: '來源參照（source_ref）',
       noScope: '（不阻擋）',
     },
-    hardNotice: '硬性項目：僅系統可解除',
+    hardNotice: '系統強制項目：僅能由系統解除',
     resolve: {
       resolutionPlaceholder: '選擇解除方式…',
       resolution: {
@@ -328,8 +336,8 @@ export default {
         custom: '自由輸入',
       },
       scopeIdPlaceholder: 'ID',
-      scopeCustomPlaceholder: '完整 block scope',
-      scopeIdRequired: '已選範圍但未填 ID／內容，這個 block scope 不會生效',
+      scopeCustomPlaceholder: '完整阻擋範圍（block_scope）',
+      scopeIdRequired: '請填寫阻擋範圍的 ID 或完整值',
       summaryPlaceholder: '摘要（必填）',
       submit: '建立',
       buttonFrom: '建立升級項目',
