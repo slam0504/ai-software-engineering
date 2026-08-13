@@ -2,7 +2,6 @@ package gate
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"regexp"
 )
@@ -11,6 +10,28 @@ var (
 	reSHA256 = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	reGitOID = regexp.MustCompile(`^git:(sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})$`)
 )
+
+type BindingReq struct {
+	Kind     string
+	Role     string
+	DigestRe *regexp.Regexp
+}
+
+// normalizeRequest 將 v1 形狀（無 schema_version、有 spec_manifest_digest／
+// base_commit legacy 欄位）正規化為 v2 形狀（schema_version=2、
+// subject="workspace"、bindings=[spec_manifest, base_commit]）。純函式，僅
+// 影響 in-memory projection，不回寫 journal。已是 v2 的請求原樣回傳。
+func normalizeRequest(r GateRequest) GateRequest {
+	if r.SchemaVersion == 0 && r.SpecManifestDigest != "" {
+		r.SchemaVersion = 2
+		r.Subject = "workspace"
+		r.Bindings = []Binding{
+			{Kind: "spec_manifest", Digest: r.SpecManifestDigest},
+			{Kind: "base_commit", Digest: r.BaseCommit},
+		}
+	}
+	return r
+}
 
 func Project(ops []GateOp) ([]GateEntry, error) {
 	order := []string{}
@@ -36,6 +57,7 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 			case "gate_request":
 				var r GateRequest
 				_ = json.Unmarshal(raw, &r)
+				r = normalizeRequest(r)
 				e := get(r.ApprovalID)
 				e.Request = &r // 仍 pending
 			case "approval_record":
@@ -46,17 +68,22 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 				if e.State == Pending && r.Decision == "approved" {
 					e.State = Active
 				}
+				if e.State == Pending && r.Decision == "rejected" {
+					e.State = Rejected
+				}
 			case "transition":
 				var tr Transition
 				_ = json.Unmarshal(raw, &tr)
 				e := get(tr.ApprovalID)
-				switch tr.To { // stale/superseded 皆終態，不復活
+				switch tr.To { // stale/superseded/rejected 皆終態，不復活
 				case "stale":
-					if e.State != Superseded {
+					if e.State != Superseded && e.State != Rejected {
 						e.State = Stale
 					}
 				case "superseded":
-					e.State = Superseded
+					if e.State != Rejected {
+						e.State = Superseded
+					}
 				}
 			default:
 				return nil, fmt.Errorf("unknown record _type %q", probe.Type)
@@ -70,27 +97,41 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 	return out, nil
 }
 
-func ValidateGate1Bindings(bs []Binding) error {
-	seen := map[string]Binding{}
+func validateBindingSet(bs []Binding, required []BindingReq) error {
+	// 檢查 (kind, role) 唯一性
+	seen := map[[2]string]bool{}
 	for _, b := range bs {
-		if _, dup := seen[b.Kind]; dup {
-			return fmt.Errorf("duplicate binding kind %q", b.Kind)
+		key := [2]string{b.Kind, b.Role}
+		if seen[key] {
+			return fmt.Errorf("duplicate binding (kind, role): (%q, %q)", b.Kind, b.Role)
 		}
-		seen[b.Kind] = b
+		seen[key] = true
 	}
-	sm, ok := seen["spec_manifest"]
-	if !ok {
-		return errors.New("missing spec_manifest binding")
+
+	// 檢查所有 required binding 都存在且 digest 符合
+	for _, req := range required {
+		found := false
+		for _, b := range bs {
+			if b.Kind == req.Kind && b.Role == req.Role {
+				found = true
+				if !req.DigestRe.MatchString(b.Digest) {
+					return fmt.Errorf("binding (%q, %q) digest %q does not match expected pattern", req.Kind, req.Role, b.Digest)
+				}
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("missing required binding (kind, role): (%q, %q)", req.Kind, req.Role)
+		}
 	}
-	if !reSHA256.MatchString(sm.Digest) {
-		return fmt.Errorf("spec_manifest digest must be sha256:<64hex>: %q", sm.Digest)
-	}
-	bc, ok := seen["base_commit"]
-	if !ok {
-		return errors.New("missing base_commit binding")
-	}
-	if !reGitOID.MatchString(bc.Digest) {
-		return fmt.Errorf("base_commit digest must be git:<algo>:<full oid>: %q", bc.Digest)
-	}
+
 	return nil
+}
+
+func ValidateGate1Bindings(bs []Binding) error {
+	gate1Reqs := []BindingReq{
+		{Kind: "spec_manifest", Role: "", DigestRe: reSHA256},
+		{Kind: "base_commit", Role: "", DigestRe: reGitOID},
+	}
+	return validateBindingSet(bs, gate1Reqs)
 }

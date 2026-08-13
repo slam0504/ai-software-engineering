@@ -35,9 +35,19 @@ var managedScopeRoots = []string{"spec/features", "spec/nfr", "spec/glossary.md"
 // file mode — so it binds content (path + content hash) over the managed scope,
 // NOT file mode. Any scoped add/delete/rename/content change, or any HEAD move,
 // changes at least one field, which ConfirmSpecCommit uses to detect staleness.
+//
+// AnalysisBase is not populated or verified by this package — spec must not
+// import plan (that would be a reverse dependency; plan is downstream of
+// spec's scope machinery). For a PlanScope-backed GitRepo, the caller (app
+// layer, Task 12) fills AnalysisBase from the previewed plan YAML's
+// analysis_base_commit and is responsible for re-checking it against the
+// worktree's current plan YAML before calling ConfirmSpecCommit. HEAD
+// having moved between preview and confirm is already caught by the
+// HeadOID comparison below (see TestConfirmRejectsWhenHeadMovedAfterPreview).
 type CommitToken struct {
-	HeadOID    string
-	TreeDigest string
+	HeadOID      string
+	TreeDigest   string
+	AnalysisBase string
 }
 
 // headOIDOrUnborn returns the current HEAD commit OID, or "" if HEAD does
@@ -62,7 +72,7 @@ func (r *GitRepo) scopedTreeDigest() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ManifestDigest(entries)
+	return r.sc.ManifestDigest(entries)
 }
 
 // activeScopePathspecs returns the managedScopeRoots entries that are safe
@@ -77,7 +87,7 @@ func (r *GitRepo) scopedTreeDigest() (string, error) {
 // on disk nor in HEAD are omitted instead.
 func (r *GitRepo) activeScopePathspecs(headOID string) ([]string, error) {
 	var out []string
-	for _, p := range managedScopeRoots {
+	for _, p := range r.sc.Roots {
 		if _, err := os.Stat(filepath.Join(r.root, p)); err == nil {
 			out = append(out, p)
 			continue
@@ -116,9 +126,9 @@ func (r *GitRepo) scopedDiffForDisplay(headOID string) (string, error) {
 			b.Write(out)
 		}
 	}
-	statusOut, err := r.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
+	statusOut, err := r.git(append([]string{"status", "--porcelain", "--untracked-files=all", "--"}, r.sc.Roots...)...)
 	if err != nil {
-		// No spec/ path tracked/existing yet — nothing more to show.
+		// No scoped path tracked/existing yet — nothing more to show.
 		return b.String(), nil
 	}
 	for _, line := range strings.Split(string(statusOut), "\n") {
@@ -126,7 +136,7 @@ func (r *GitRepo) scopedDiffForDisplay(headOID string) (string, error) {
 			continue
 		}
 		path := statusPath(line)
-		if !InScope(path) {
+		if !r.sc.Match(path) {
 			continue
 		}
 		content, err := os.ReadFile(filepath.Join(r.root, path))
@@ -152,7 +162,7 @@ func (r *GitRepo) checkNoOutOfScopeStaged() error {
 		if path == "" {
 			continue
 		}
-		if !InScope(path) {
+		if !r.sc.Match(path) {
 			return ErrStagedChangesPresent
 		}
 	}

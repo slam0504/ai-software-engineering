@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Milestone](https://img.shields.io/badge/milestone-M2%20Stage%20A%20%2B%20i18n-blue.svg)
+![Milestone](https://img.shields.io/badge/milestone-M3a-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Wails](https://img.shields.io/badge/wails-2.x-DF0000.svg)
 ![Go](https://img.shields.io/badge/go-1.26+-00ADD8.svg)
@@ -27,6 +27,12 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 
 **Codex session** — 同一介面、provider 最新 usage（`*` 標示）、長駐 app-server
 <img src="docs/spikes/evidence/v2-codex-statusbar.png" alt="Codex session" width="800">
+
+**Gate 2 主控台** — 逐 task risk 決議（selected < planner 需 override_reason）
+<img src="docs/spikes/evidence/m3a-stage-b-gate2-risk.png" alt="Gate 2 risk decision" width="800">
+
+**TCA workspace** — Stage C 測試契約核可入口，expected-red／negative-control 兩型 evidence
+<img src="docs/spikes/evidence/m3a-stage-c-tca-workspace.png" alt="TCA workspace" width="800">
 
 </div>
 
@@ -64,6 +70,41 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - **SpecAssist（隔離 one-shot）** — AI 輔助以獨立 one-shot 執行，provider 端強制零 workspace 變更
   （Claude `--tools ""`、Codex `sandboxPolicy=readOnly`）；輸出不進一般對話、不污染 provider 用量
 - **表示圖層** — 瀏覽／監看 `spec/context-map/*.mmd`，變更自動重渲染（重用 mermaid strict 設定）
+
+### 計畫工作區與 Gate 2（M3a Stage B）
+- **Plan Workspace** — 結構化 plan YAML 編輯（CodeMirror 6）＋PlannerAssist 唯讀 one-shot 產草稿進草稿區、人 accept 才寫檔；
+  沿用 SpecWorkspace 的兩階段 Preview／Confirm scoped commit（產生 `plan_commit`，dirty-tree 拒核）
+- **DagPane** — plan 解析為 mermaid flowchart 的唯讀 projection，plan 檔變更自動重渲染
+- **確定性驗證器** — plan schema／DAG 無環／依賴存在／task ID 唯一／risk floor（`minimum_risk_tier` 依 risk policy 重算、
+  `planner_risk_tier ≥ minimum`）／scenario ref 存在於 active Gate 1 spec manifest
+- **Lineage 封閉** — `analysis_base_commit..plan_commit` 只能改 `plan/**`，混入其他 code 變更即拒核
+- **Gate 2 主控台** — 送核綁定 spec_manifest／plan／base_commit（＝plan_commit）／risk_policy／permission_manifest；
+  核可時逐 task 選定 `selected_risk_tier`（低於 planner 建議需 `override_reason`、低於 minimum 一律拒絕），
+  核可記錄含依 task_id 排序的完整 `risk_decisions`
+- **STALE** — spec／plan／risk policy／權限清單變更即失效；`base_commit` 為歷史錨點，HEAD 前移不觸發失效
+
+### Test Contract Approval（本機 evidence runner）
+- **Oracle-surface 宣告** — path patterns 與每個 task 的 test contract descriptor（command／matcher）在 Stage B、
+  Gate 2 送核前完成宣告，隨 plan 一併核可
+- **Evidence runner** — 每次執行使用唯一 detached worktree（系統暫存目錄）、結構化 `executable+argv[]`（不接受 shell 字串）、
+  清理敏感環境變數、輸出上限與 timeout（超限／逾時判定為 `result: error`）
+- **兩型 evidence** — `expected_red`（紅燈特徵匹配已核可 descriptor）／`negative_control`（登記 mutation 後在同一
+  `test_commit` 套用，驗證同一組測試能抓到回歸）；判定一律依已核可 test contract descriptor，不接受臨場輸入
+- **TCA 核可** — 七＋條一致性 validator（role 與 kind 相符、兩筆皆 passed、snapshot 一致、descriptor 精確相符、
+  mutation 綁定對齊等）拒收不相干證據；綁定所依 `gate2_approval` 的完整記錄 digest 與 `plan_commit`，
+  Gate 2 STALE／superseded 時連動 STALE
+- **誠實邊界** — 本機可重建、可稽核的記錄，**非 CI enforcement**；runner **不宣稱 sandbox**，不限制測試程式的網路與
+  檔案系統能力
+
+### 升級收件匣
+- **三態處置** — `open → acknowledged → resolved`，append-only transition＋projection；resolved 必填
+  resolution／reason／actor
+- **系統自動來源** — risk 無法分類、binding 缺漏、Gate 2／TCA 綁定 STALE、evidence runner 錯誤／逾時／輸出超限、
+  negative-control 未抓到 mutation、journal degraded 等（condition key 只對尚未 resolved 的項目去重）
+- **阻擋規則** — 每項有 `block_scope`；未 resolve 的 blocking 項目擋下對應核可（`GateDecide` 固定順序：
+  reconcile → 硬性 validator → 修正版核可解除同 scope 舊 stale blocker → blocking 檢查 → append）
+- **硬性項目** — STALE／缺 binding／journal degraded 等使用者不能手動 resolve，只能修復後由系統重新驗證解除；
+  可 acknowledge 但不解除阻擋
 
 ### 繁體中文介面（i18n）
 - 以 vue-i18n（Composition API）語系化，預設繁體中文並保留完整英文 locale
@@ -157,9 +198,17 @@ internal/
   appcore/               可測核心：Manager（單一序列化 emit 入口）、submission coordinator、
                          session lifecycle 狀態機、RecordingLease、EmitWorkspace／EmitAssist
   spec/                  規格庫：canonical manifest、committed snapshot、git repo、兩階段 SpecCommit
-  gate/                  Gate 1 引擎：ApprovalRecord／transition、projection reducer、
-                         gate_op 單交易 journal（append-only ＋ tail 修復）、reconcile service
-  assist/                SpecAssist 隔離 one-shot（Claude／Codex，provider-enforced 零變更）
+  gate/                  Gate 引擎（泛化 gate1／gate2／tca）：GatePolicy registry、ApprovalRecord v2／
+                         transition、projection reducer、gate_op 單交易 journal（append-only ＋ tail 修復）
+  plan/                  Plan 領域（純核心）：YAML 解析、確定性驗證器（schema／cycle／依賴／risk floor）、
+                         lineage 驗證、risk policy 重算
+  gatepolicy/            Gate2／TCA policy（讀 plan／evidence 的 ACL）：bindings schema、decision
+                         validator、STALE resolver
+  evidence/              Test Contract 證據鏈：oracle-surface 宣告、CAS store、mutation 登記、
+                         detached worktree runner、matcher／結果分類
+  escalation/            升級收件匣：item journal、append-only transition、projection、
+                         block_scope 查詢
+  assist/                SpecAssist／PlanAssist 隔離 one-shot（Claude／Codex，provider-enforced 零變更）
   ports/                 consumer-owned 介面（Turns、Exit）
   claude/                Claude CLI adapter：stream-json decode、多輪 session、resume registry
   codex/                 Codex app-server adapter：JSON-RPC conn、ThreadRunner、錄流 tee
@@ -200,10 +249,16 @@ flowchart TB
     contract["contract<br/>【Shared Kernel】Envelope v1 ／ reducer"]
     ca["claude adapter<br/>【ACL】stream-json → Event"]
     xa["codex adapter<br/>【ACL】JSON-RPC → Event"]
+    plan["plan<br/>【Plan context】YAML 解析／確定性驗證器／lineage"]
+    gate["gate（泛化）<br/>【Gate context】GatePolicy registry／journal／projection"]
+    gp["gatepolicy<br/>【ACL】gate2／tca policy（讀 plan／evidence）"]
+    evd["evidence<br/>【Evidence context】oracle-surface／CAS／runner／mutation"]
+    esc["escalation<br/>【Escalation context】收件匣 journal／projection"]
   end
   cli1[("claude 子行程")]
   cli2[("codex app-server")]
   sink[("events.jsonl ／ recordings")]
+  sink2[("gate.jsonl ／ escalation.jsonl ／ evidence/")]
   ui <-->|"Wails events ／ bindings"| host
   host --> core
   core --> contract
@@ -212,6 +267,13 @@ flowchart TB
   host --> ca --> cli1
   host --> xa --> cli2
   core --> sink
+  host --> plan & gate & evd & esc
+  gp --> gate
+  gp --> plan
+  gp --> evd
+  gate --> sink2
+  evd --> sink2
+  esc --> sink2
 ```
 
 **Session lifecycle（per provider slot）**
@@ -260,7 +322,9 @@ stateDiagram-v2
 | 檔案 | 內容 |
 |---|---|
 | `events.jsonl` | Envelope v1 稽核事件流（UI 所見即所錄） |
-| `gate.jsonl` | Gate 1 的 gate_op 稽核（append-only：gate_request／approval_record／transition） |
+| `gate.jsonl` | Gate（gate1／gate2／tca 泛化）的 gate_op 稽核（append-only：gate_request／approval_record／transition） |
+| `escalation.jsonl` | 升級收件匣稽核（append-only：escalation_item／escalation_transition） |
+| `evidence/` | evidence journal（evidence.jsonl）＋mutation／stdout／stderr 的 CAS 內容定址儲存 |
 | `audit.jsonl` | App 層稽核（啟動資訊、核可決定、登入事件） |
 | `recordings/` | wire 錄流與 meta |
 | `sessions.json` | Claude resume registry（session id ↔ cwd 綁定） |
@@ -276,7 +340,7 @@ stateDiagram-v2
 | **M1.5** 雙 session | ✅ merged | Provider 切換時對話視窗跟著切、雙 session 並存、重啟自動恢復、design token＋視覺 polish（[結果](docs/spikes/m1.5-results.md)） |
 | **M2** Stage A 閉環 | ✅ merged | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ merged | vue-i18n 語系化，預設繁體中文＋完整英文 locale |
-| **M3** 計畫與測試契約 | 未開始 | 任務 DAG、Gate 2、Test Contract Approval、升級收件匣（SC3 擴及 Gate 2／TCA） |
+| **M3a** 計畫與測試契約閉環 | ✅ merged | 任務 DAG、Gate 2、Test Contract Approval（本機 evidence runner）、升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；多 session 並看延後至 **M3b**） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、forge adapter（SC4：單任務全程不切出 app） |
 
 每個里程碑的執行計畫經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`SHA256SUMS` 可驗證），

@@ -248,3 +248,122 @@ type nullSink struct{}
 
 func (nullSink) Write(contract.Envelope) error { return nil }
 func (nullSink) Close() error                  { return nil }
+
+// ---- PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot）測試 ----
+
+// newTestAppGitAssist：git init'd workspace（PlanAssist 的 Gate 1／git status
+// 前置檢查與 headOID 都需要真實 git repo，同 newTestAppGit）＋ assist Runner
+// 注入點；events 走 captureEnvs（同 TestSpecAssistStaleGenerationEventDropped
+// 的簡化 pattern，直接掛 manager Emit，略過 a.emit／emitUI 中介層）。
+func newTestAppGitAssist(t *testing.T, r assist.Runner) (*App, *captureEnvs) {
+	t.Helper()
+	a, _ := newTestApp(t)
+	runGit(t, a, "init")
+	runGit(t, a, "config", "user.name", "Test User")
+	runGit(t, a, "config", "user.email", "test@example.com")
+	cap := &captureEnvs{}
+	a.manager = appcore.New(appcore.Config{Sink: nullSink{}, Emit: cap.add})
+	a.assistRunnerFactory = func(string) (assist.Runner, error) { return r, nil }
+	return a, cap
+}
+
+// runnerMustNotBeCalled：precondition-failure 測試用 fake Runner——若被呼叫，
+// 代表 fail-closed 前置檢查沒有真的擋在 runner 啟動之前（bug，而非驗證通過）。
+func runnerMustNotBeCalled(t *testing.T) assist.Runner {
+	t.Helper()
+	return runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		t.Fatal("PlanAssist runner must not be invoked when a precondition check fails")
+		return nil
+	})
+}
+
+func TestPlanAssistRejectsWithoutActiveGate1(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	_, err := a.PlanAssist("claude", "draft plan")
+	if err == nil || !strings.Contains(err.Error(), "Gate 1") {
+		t.Fatalf("PlanAssist without active Gate 1 must be rejected, got: %v", err)
+	}
+}
+
+func TestPlanAssistRejectsNonPlanDirtyTree(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	// send＋approve 後 spec/ 已乾淨；再動一個非 plan 檔案且不提交 → non-plan dirty。
+	if err := os.WriteFile(filepath.Join(a.workspaceDir, "README.md"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.PlanAssist("claude", "draft plan")
+	if err == nil || !strings.Contains(err.Error(), "非 plan") {
+		t.Fatalf("PlanAssist with non-plan dirty tree must be rejected, got: %v", err)
+	}
+}
+
+func TestPlanAssistInjectsAnalysisBaseAndSpecDigest(t *testing.T) {
+	var capturedPrompt string
+	capture := runnerFunc(func(_ context.Context, prompt string, sink func(contract.Envelope)) error {
+		capturedPrompt = prompt
+		sink(contract.Wrap(contract.Event{Provider: contract.ProviderClaude,
+			Kind: contract.KindDelta, Text: "draft", Raw: []byte(`{}`)}, ""))
+		return nil
+	})
+	a, cap := newTestAppGitAssist(t, capture)
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	list, err := a.GateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, ok := activeGate1SpecManifestDigest(list)
+	if !ok {
+		t.Fatal("expected an active gate1 entry after approve")
+	}
+	headOID, err := a.specRepo.HeadCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	corrID, err := a.PlanAssist("claude", "draft the plan")
+	if err != nil {
+		t.Fatalf("PlanAssist with active Gate 1 and a clean (non-plan) tree must succeed, got: %v", err)
+	}
+	if !strings.Contains(capturedPrompt, "analysis_base_commit="+headOID) {
+		t.Fatalf("prompt must carry analysis_base_commit=%s, got: %s", headOID, capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, "spec_manifest_digest="+wantDigest) {
+		t.Fatalf("prompt must carry spec_manifest_digest=%s, got: %s", wantDigest, capturedPrompt)
+	}
+	if !strings.HasSuffix(capturedPrompt, "draft the plan") {
+		t.Fatalf("caller's original prompt must be preserved verbatim as a suffix, got: %s", capturedPrompt)
+	}
+
+	var sawPlanDraft bool
+	for _, env := range cap.envs {
+		if env.CorrelationID != corrID {
+			continue
+		}
+		if env.Purpose == "spec_assist" {
+			t.Fatal("PlanAssist events must not carry purpose=spec_assist")
+		}
+		if env.Purpose == "plan_draft" {
+			sawPlanDraft = true
+		}
+	}
+	if !sawPlanDraft {
+		t.Fatal("PlanAssist events must be emitted with purpose=plan_draft")
+	}
+}

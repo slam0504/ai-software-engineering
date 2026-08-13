@@ -4,7 +4,14 @@ export default {
       chat: 'Chat',
       preview: 'Preview',
       spec: 'Spec',
+      plan: 'Plan',
       diagram: 'Diagram',
+      dag: 'Task DAG',
+      tca: 'TCA',
+    },
+    sideTab: {
+      gate: 'Gate',
+      escalation: 'Escalation Inbox',
     },
     timeline: {
       label: 'Timeline',
@@ -88,11 +95,21 @@ export default {
     },
     reasonHint: 'Enter a reason before rejecting',
     degradedNotice: 'Approval journal degraded: approve/reject paused, view only',
-    empty: 'No Gate 1 items',
+    empty: 'No approval items',
     label: {
       approvalId: 'approval_id',
       baseCommit: 'base_commit',
       specManifest: 'spec_manifest',
+    },
+    risk: {
+      minimum: 'Minimum risk tier',
+      planner: 'Planner risk tier',
+      overrideReasonPlaceholder: 'Override reason (required when selected is below planner)',
+    },
+    tca: {
+      gate2Link: 'Gate 2: {id}',
+      viewEvidence: 'View evidence',
+      mutationDigest: 'mutation digest',
     },
   },
   spec: {
@@ -113,6 +130,88 @@ export default {
     },
     submittedApprovalId: 'approval_id: {id}',
   },
+  planWorkspace: {
+    action: {
+      generateDraft: 'Generate plan draft',
+      applyDraft: 'Apply draft',
+      save: 'Save',
+      submit: 'Submit for Gate 2',
+      previewCommit: 'Preview commit',
+      confirmCommit: 'Confirm commit',
+    },
+    assist: {
+      drafting: 'Generating…',
+    },
+    provider: {
+      label: 'AI provider',
+    },
+    prompt: {
+      placeholder: 'Describe the plan to draft',
+    },
+    planId: {
+      placeholder: 'plan ID',
+    },
+    commitMessage: {
+      placeholder: 'commit message',
+    },
+    submittedApprovalId: 'approval_id: {id}',
+  },
+  tcaWorkspace: {
+    empty: 'No active Gate 2 plan to work on',
+    testCommit: {
+      pick: 'Pick a recent commit…',
+      placeholder: 'test commit (manual entry)',
+      precheckOk: 'Lineage precheck passed',
+    },
+    action: {
+      precheck: 'Precheck',
+      registerMutation: 'Register mutation',
+      runExpectedRed: 'Run expected-red',
+      runNegativeControl: 'Run negative-control',
+      retry: 'Retry',
+      submit: 'Submit TCA',
+    },
+    mutationPatch: {
+      placeholder: 'unified diff patch for negative-control',
+    },
+    mutationId: 'mutation_id: {id}',
+    submittedApprovalId: 'approval_id: {id}',
+  },
+  evidence: {
+    title: 'evidence: {id}',
+    loading: 'Loading…',
+    result: {
+      passed: 'passed',
+      failed: 'failed',
+      error: 'error',
+    },
+    run: {
+      running: 'Running…',
+    },
+    action: {
+      close: 'Close',
+    },
+    label: {
+      evidenceId: 'evidence_id',
+      kind: 'kind',
+      result: 'result',
+      baseCommit: 'base_commit',
+      testCommit: 'test_commit',
+      oracleSurfaceDigest: 'oracle_surface_digest',
+      mutationDigest: 'mutation_digest',
+      command: 'command',
+      cwd: 'cwd',
+      startedAt: 'started at',
+      finishedAt: 'finished at',
+      exitCode: 'exit_code',
+      expectedFailure: 'expected_failure',
+      observedFailure: 'observed_failure',
+      stdoutDigest: 'stdout_digest',
+      stderrDigest: 'stderr_digest',
+      recordingRef: 'recording ref',
+      runnerVersion: 'runner_version',
+    },
+  },
   approval: {
     action: {
       allow: 'Allow',
@@ -126,6 +225,10 @@ export default {
   },
   diagram: {
     empty: 'No diagram to display',
+  },
+  dag: {
+    empty: 'No task DAG to display',
+    parseError: 'Could not parse the current plan content',
   },
   preview: {
     empty: 'Select a file on the left to preview',
@@ -174,5 +277,62 @@ export default {
   },
   store: {
     bindingsNotReady: 'bindings not ready',
+  },
+  escalation: {
+    section: {
+      open: 'Open',
+      acknowledged: 'Acknowledged',
+      resolved: 'Resolved ({n})',
+    },
+    empty: {
+      open: 'No open escalation items',
+      acknowledged: 'No acknowledged escalation items',
+      resolved: 'No resolved escalation items',
+    },
+    action: {
+      retry: 'Retry',
+      ack: 'Acknowledge',
+    },
+    badge: {
+      source: {
+        system: 'system',
+        manual: 'manual',
+      },
+      hard: 'hard',
+      occurrence: 'occurrence {n}',
+    },
+    label: {
+      blockScope: 'block scope',
+      sourceRef: 'source',
+      noScope: '(non-blocking)',
+    },
+    hardNotice: 'Hard item: only the system may resolve it',
+    resolve: {
+      resolutionPlaceholder: 'Pick a resolution…',
+      resolution: {
+        fixed: 'Fixed',
+        accepted_risk: 'Accepted risk',
+        other: 'Other',
+      },
+      reasonPlaceholder: 'Reason (required)',
+      submit: 'Resolve',
+    },
+    create: {
+      title: 'Create escalation item',
+      sourceRefPlaceholder: 'Source ref (required, e.g. plan_id/task_id)',
+      scope: {
+        none: '(non-blocking)',
+        workspace: 'workspace',
+        gate2: 'gate2:<id>',
+        tca: 'tca:<plan>/<task>',
+        custom: 'Custom',
+      },
+      scopeIdPlaceholder: 'ID',
+      scopeCustomPlaceholder: 'Full block scope',
+      scopeIdRequired: 'A scope is selected but its ID/value is empty — this block scope will not take effect',
+      summaryPlaceholder: 'Summary (required)',
+      submit: 'Create',
+      buttonFrom: 'Create escalation item',
+    },
   },
 }

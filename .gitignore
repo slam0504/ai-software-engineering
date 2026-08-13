@@ -23,3 +23,6 @@ node_modules/
 tools/claude-cli/node_modules/
 tools/codex-cli/node_modules/
 .playwright-mcp/
+
+# 本機 agent tooling state（serena LSP cache）
+.serena/

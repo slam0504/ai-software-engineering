@@ -3,16 +3,15 @@ package gate
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 )
 
 var (
 	ErrNotPending        = errors.New("gate: no pending request for approval id")
 	ErrRejectNeedsReason = errors.New("gate: rejected decision requires reason")
+	ErrUnknownGate       = errors.New("gate: unknown gate")
 )
-
-// ManifestFn returns the digest of the currently active spec manifest.
-type ManifestFn func() (string, error)
 
 // Emitter is notified of gate events AFTER the corresponding journal append
 // has durably succeeded. Emitter failures never roll back the journal.
@@ -21,101 +20,203 @@ type Emitter interface {
 }
 
 // Service is the gate application layer: it ties the Journal (crash-durable
-// append log) and Project (pure reducer) together to provide Submit/Decide/
-// List/ReconcileGate1 with the concurrency guarantees required by spec
-// §3.2/§3.3/§3.5.
+// append log) and Project (pure reducer) together to provide
+// Submit/PrepareDecision/CommitDecision/Decide/List/Reconcile with the
+// concurrency guarantees required by spec §3.2/§3.3/§3.5. Per-gate rules
+// (request validation, decision metadata, supersession scoping, staleness)
+// live in the Registry's GatePolicy implementations — Service itself is
+// gate-agnostic (§2.1/§3.1).
 type Service struct {
-	mu      sync.Mutex
-	j       *Journal
-	current ManifestFn
-	ulid    func() string
-	now     func() string
-	em      Emitter
+	mu   sync.Mutex
+	j    *Journal
+	reg  Registry
+	ulid func() string
+	now  func() string
+	em   Emitter
 }
 
-func NewService(j *Journal, current ManifestFn, ulid func() string, now func() string, em Emitter) *Service {
-	return &Service{j: j, current: current, ulid: ulid, now: now, em: em}
+func NewService(j *Journal, reg Registry, ulid func() string, now func() string, em Emitter) *Service {
+	return &Service{j: j, reg: reg, ulid: ulid, now: now, em: em}
 }
 
-// Submit appends a gate_request op and returns its approval id.
-func (s *Service) Submit(manifestDigest, baseCommit string, bindings []Binding) (string, error) {
-	if err := ValidateGate1Bindings(bindings); err != nil {
+// Submit appends a gate_request op under gateName and returns its approval
+// id. The request is validated (in v2 shape) against gateName's policy
+// before anything is written; unknown gates are rejected outright.
+func (s *Service) Submit(gateName, subject string, bindings []Binding) (string, error) {
+	policy, ok := s.reg[gateName]
+	if !ok {
+		return "", fmt.Errorf("%w %q", ErrUnknownGate, gateName)
+	}
+	req := GateRequest{Type: "gate_request", SchemaVersion: 2, Gate: gateName,
+		Subject: subject, Bindings: bindings}
+	if err := policy.ValidateRequest(req); err != nil {
 		return "", err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := s.ulid()
-	req := GateRequest{Type: "gate_request", ApprovalID: id, Gate: "gate1",
-		SpecManifestDigest: manifestDigest, BaseCommit: baseCommit, CreatedAt: s.now()}
+	req.ApprovalID = s.ulid()
+	req.CreatedAt = s.now()
 	if err := s.appendOp(req); err != nil {
 		return "", err
 	}
-	s.em.EmitGateEvent("gate_request", bindings, map[string]string{"approval_id": id, "gate": "gate1"})
-	return id, nil
+	s.em.EmitGateEvent("gate_request", bindings, map[string]string{"approval_id": req.ApprovalID, "gate": gateName})
+	return req.ApprovalID, nil
 }
 
-// Decide records an approval/rejection decision for a pending approval id.
-// Concurrency correctness: the pending-check and the append happen while
-// holding s.mu, so concurrent Decide calls for the same id race on the
-// mutex, not on the journal — exactly one observes the id as still pending.
-func (s *Service) Decide(id, decision, reason string, approver Approver, bindings []Binding) error {
+// PreparedDecision is the not-yet-durable result of PrepareDecision, ready
+// to be appended by CommitDecision.
+type PreparedDecision struct{ Record ApprovalRecord }
+
+// PrepareDecision validates a decision against a pending approval and
+// builds (but does not append) its ApprovalRecord.
+//
+// Concurrency: runs entirely under s.mu — Project → pending check →
+// normalizeRequest → (approved only) current-binding validation → hard
+// decision validation, all observe a single consistent journal snapshot.
+//
+// Current-binding validation (approved only): Reconcile only scans the
+// active projection, so it cannot catch a pending request whose bindings
+// went stale (plan/oracle/upstream gate changed) while awaiting approval.
+// PrepareDecision closes that gap by running the pending request's gate
+// policy ReconcileBindings against a pseudo-record built from the request's
+// own gate/subject/bindings; any stale cause or read error fails the
+// approval closed. Rejected decisions skip this — a rejection only needs a
+// reason and must still succeed on an otherwise-expired request.
+func (s *Service) PrepareDecision(id, decision, reason string, approver Approver, input DecisionInput) (PreparedDecision, error) {
 	if decision == "rejected" && reason == "" {
-		return ErrRejectNeedsReason
+		return PreparedDecision{}, ErrRejectNeedsReason
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := Project(s.j.Ops())
+	if err != nil {
+		return PreparedDecision{}, err
+	}
+	e := findEntry(entries, id)
+	if e == nil || e.Record != nil || e.Request == nil { // must be pending: has request, no record yet
+		return PreparedDecision{}, ErrNotPending
+	}
+	req := normalizeRequest(*e.Request)
+	policy, ok := s.reg[req.Gate]
+	if !ok {
+		return PreparedDecision{}, fmt.Errorf("%w %q", ErrUnknownGate, req.Gate)
 	}
 	if decision == "approved" {
-		if err := ValidateGate1Bindings(bindings); err != nil {
-			return err
+		pseudo := ApprovalRecord{Gate: req.Gate, Subject: req.Subject, Bindings: req.Bindings}
+		causes, rerr := policy.ReconcileBindings(pseudo)
+		if rerr != nil {
+			return PreparedDecision{}, rerr // fail closed (§3.9)
+		}
+		if len(causes) > 0 {
+			return PreparedDecision{}, fmt.Errorf("gate: pending request bindings are stale: %s", causes[0].Cause)
 		}
 	}
+	meta, berr := policy.BuildDecision(req, decision, input)
+	if berr != nil {
+		return PreparedDecision{}, berr
+	}
+	rec := ApprovalRecord{Type: "approval_record", SchemaVersion: 2, ApprovalID: id, Gate: req.Gate,
+		Subject: req.Subject, Decision: decision, Approver: approver, Reason: reason,
+		Bindings: req.Bindings, Metadata: meta, CreatedAt: s.now()}
+	return PreparedDecision{Record: rec}, nil
+}
+
+// CommitDecision re-verifies the prepared record's approval id is still
+// pending, then durably appends it. On approval, it also appends a
+// "superseded" transition for every currently-Active entry whose own gate
+// policy computes the same SupersessionKey as the new record — scoped by
+// (gate, subject) rather than gate-wide, so e.g. approving a TCA request
+// for one plan/task never supersedes an unrelated gate1 approval or a TCA
+// approval for a different plan/task (§3.1). The record and any
+// supersession transitions land in a single gate_op.
+func (s *Service) CommitDecision(p PreparedDecision) error {
+	rec := p.Record
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entries, err := Project(s.j.Ops())
 	if err != nil {
 		return err
 	}
-	e := findEntry(entries, id)
-	if e == nil || e.Record != nil || e.Request == nil { // must be pending: has request, no record yet
+	e := findEntry(entries, rec.ApprovalID)
+	if e == nil || e.Record != nil || e.Request == nil {
 		return ErrNotPending
 	}
-	recs := []any{ApprovalRecord{Type: "approval_record", ApprovalID: id, Gate: "gate1",
-		Decision: decision, Approver: approver, Reason: reason, Bindings: bindings, CreatedAt: s.now()}}
-	if decision == "approved" { // supersede any previously active approval in the same gate_op
+	policy, ok := s.reg[rec.Gate]
+	if !ok {
+		return fmt.Errorf("%w %q", ErrUnknownGate, rec.Gate)
+	}
+	recs := []any{rec}
+	if rec.Decision == "approved" {
+		newKey := policy.SupersessionKey(rec.Gate, rec.Subject)
 		for _, prev := range entries {
-			if prev.State == Active {
+			if prev.State != Active || prev.Record == nil {
+				continue
+			}
+			prevPolicy, pok := s.reg[prev.Record.Gate]
+			if !pok {
+				continue // unknown gate on an existing active record: leave it alone rather than guess
+			}
+			if prevPolicy.SupersessionKey(prev.Record.Gate, prev.Record.Subject) == newKey {
 				recs = append(recs, Transition{Type: "transition", ApprovalID: prev.ApprovalID,
-					To: "superseded", At: s.now(), Cause: "new approved gate1 " + id})
+					To: "superseded", At: s.now(), Cause: "new approved " + rec.Gate + " " + rec.ApprovalID})
 			}
 		}
 	}
 	if err := s.appendOp(recs...); err != nil {
 		return err
 	}
-	s.em.EmitGateEvent("approval_decision", bindings, map[string]any{
-		"approval_id": id, "gate": "gate1", "decision": decision,
-		"approver": approver, "reason": reason})
+	s.em.EmitGateEvent("approval_decision", rec.Bindings, map[string]any{
+		"approval_id": rec.ApprovalID, "gate": rec.Gate, "decision": rec.Decision,
+		"approver": rec.Approver, "reason": rec.Reason})
 	return nil
 }
 
-// List reconciles gate1 bindings against the current manifest, then returns
+// Decide is the Prepare→Commit convenience wrapper — no blocker checks
+// beyond what Prepare/Commit already do, for tests and the gate1
+// compatibility path (spec §3.10 leaves the full reconcile→validator→
+// blocker→append ordering to app-level callers that need blockers).
+func (s *Service) Decide(id, decision, reason string, approver Approver, input DecisionInput) error {
+	p, err := s.PrepareDecision(id, decision, reason, approver, input)
+	if err != nil {
+		return err
+	}
+	return s.CommitDecision(p)
+}
+
+// List reconciles every gate's bindings against current state, then returns
 // the projection.
 func (s *Service) List() ([]GateEntry, error) {
-	if err := s.ReconcileGate1(); err != nil {
+	if err := s.Reconcile(); err != nil {
 		return nil, err
 	}
 	return Project(s.j.Ops())
 }
 
-// ReconcileGate1 marks any Active entry whose bound spec_manifest digest no
-// longer matches the current manifest as stale. A ManifestFn read error
-// (e.g. ErrConcurrentModification) is returned WITHOUT appending stale
-// (fail closed, not permanent stale). The active-check and the append
-// happen atomically under s.mu so racing calls produce at most one stale
-// transition per entry.
-func (s *Service) ReconcileGate1() error {
-	cur, err := s.current()
+// Lookup returns the (possibly nil, if still pending) record and current
+// state for approvalID. Used by the TCA gate2_approval resolver to look up
+// an approval by id without pulling the whole projection.
+func (s *Service) Lookup(approvalID string) (*ApprovalRecord, State, error) {
+	entries, err := Project(s.j.Ops())
 	if err != nil {
-		return err
+		return nil, "", err
 	}
+	e := findEntry(entries, approvalID)
+	if e == nil {
+		return nil, "", fmt.Errorf("gate: approval id %q not found", approvalID)
+	}
+	return e.Record, e.State, nil
+}
+
+// Reconcile marks any Active entry whose bindings its gate's policy reports
+// as stale — replacing the old gate1-only ReconcileGate1. Each entry is
+// checked against `reg[entry's gate]`'s ReconcileBindings; a read error
+// from any policy aborts the whole call WITHOUT appending further stale
+// transitions (fail closed, not permanent stale — already-appended
+// transitions from earlier entries in this pass stand, matching the
+// at-most-once semantics below). The active-check and the append happen
+// atomically under s.mu (the whole pass holds the lock throughout) so
+// racing calls produce at most one stale transition per entry.
+func (s *Service) Reconcile() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entries, err := Project(s.j.Ops())
@@ -126,22 +227,24 @@ func (s *Service) ReconcileGate1() error {
 		if e.State != Active || e.Record == nil {
 			continue
 		}
-		bound := ""
-		for _, b := range e.Record.Bindings {
-			if b.Kind == "spec_manifest" {
-				bound = b.Digest
-			}
+		policy, ok := s.reg[e.Record.Gate]
+		if !ok {
+			return fmt.Errorf("%w %q", ErrUnknownGate, e.Record.Gate)
 		}
-		if bound != "" && bound != cur { // active-check happened under lock above: at most one stale
+		causes, rerr := policy.ReconcileBindings(*e.Record)
+		if rerr != nil {
+			return rerr // fail closed (§3.9)
+		}
+		for _, c := range causes {
 			tr := Transition{Type: "transition", ApprovalID: e.ApprovalID, To: "stale",
-				At: s.now(), Cause: "spec_manifest changed", EvidenceRef: cur}
+				At: s.now(), Cause: c.Cause, EvidenceRef: c.EvidenceRef}
 			if err := s.appendOp(tr); err != nil {
 				return err
 			}
 			// durable append succeeded before we notify; Emitter failure never rolls back the journal
 			s.em.EmitGateEvent("binding_stale", nil, map[string]string{
 				"approval_id": e.ApprovalID, "to": "stale",
-				"cause": "spec_manifest changed", "evidence_ref": cur})
+				"cause": c.Cause, "evidence_ref": c.EvidenceRef})
 		}
 	}
 	return nil

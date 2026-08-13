@@ -16,10 +16,11 @@ import (
 // committed snapshot's digest.
 type GitRepo struct {
 	root string
+	sc   Scope
 }
 
-func NewGitRepo(root string) *GitRepo {
-	return &GitRepo{root: root}
+func NewGitRepo(root string, sc Scope) *GitRepo {
+	return &GitRepo{root: root, sc: sc}
 }
 
 // git runs `git -C root <args>` and returns raw stdout bytes.
@@ -43,12 +44,12 @@ func (g *GitRepo) HeadCommit() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// ScopedClean reports whether the managed spec/ paths (per InScope) have no
-// staged, unstaged, or untracked changes. --untracked-files=all expands
-// untracked directories into individual file paths so InScope filtering
-// works on file granularity.
+// ScopedClean reports whether the managed scope's paths (per r.sc.Match)
+// have no staged, unstaged, or untracked changes. --untracked-files=all
+// expands untracked directories into individual file paths so Match
+// filtering works on file granularity.
 func (g *GitRepo) ScopedClean() (bool, error) {
-	out, err := g.git("status", "--porcelain", "--untracked-files=all", "--", "spec/")
+	out, err := g.git(append([]string{"status", "--porcelain", "--untracked-files=all", "--"}, g.sc.Roots...)...)
 	if err != nil {
 		return false, err
 	}
@@ -56,7 +57,7 @@ func (g *GitRepo) ScopedClean() (bool, error) {
 		if line == "" {
 			continue
 		}
-		if InScope(statusPath(line)) {
+		if g.sc.Match(statusPath(line)) {
 			return false, nil
 		}
 	}
@@ -87,7 +88,7 @@ func (g *GitRepo) ReadScopedHeadTree(head string) ([]FileEntry, error) {
 	}
 	var entries []FileEntry
 	for _, path := range strings.Split(string(out), "\n") {
-		if path == "" || !InScope(path) {
+		if path == "" || !g.sc.Match(path) {
 			continue
 		}
 		blob, err := g.git("cat-file", "blob", head+":"+path)
@@ -113,15 +114,14 @@ func (g *GitRepo) ReadScopedHeadTree(head string) ([]FileEntry, error) {
 // silently skip) and refuses to read files under a nested-repo boundary so a
 // submodule/embedded repo under scope cannot be read as plain files.
 func (g *GitRepo) ReadScopedWorktree() ([]FileEntry, error) {
-	out, err := g.git("ls-files", "--cached", "--others", "--exclude-standard", "-z",
-		"--", "spec/features", "spec/nfr", "spec/glossary.md", "spec/context-map")
+	out, err := g.git(append([]string{"ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"}, g.sc.Roots...)...)
 	if err != nil {
 		return nil, err
 	}
 	var entries []FileEntry
 	checkedDirs := map[string]bool{} // memo: dir already verified free of nested .git
 	for _, rel := range strings.Split(string(out), "\x00") {
-		if rel == "" || !InScope(rel) {
+		if rel == "" || !g.sc.Match(rel) {
 			continue
 		}
 		if err := g.rejectNestedRepo(rel, checkedDirs); err != nil {
@@ -158,7 +158,7 @@ func (g *GitRepo) ReadScopedWorktree() ([]FileEntry, error) {
 // preserves Task 6's boundary — a nested repo under scope must never be read as
 // plain spec files. Checked dirs are memoised so shared ancestors stat once.
 func (g *GitRepo) rejectNestedRepo(rel string, checked map[string]bool) error {
-	for dir := path.Dir(rel); dir != "." && dir != "/" && InScope(dir); dir = path.Dir(dir) {
+	for dir := path.Dir(rel); dir != "." && dir != "/" && g.sc.Match(dir); dir = path.Dir(dir) {
 		if checked[dir] {
 			continue
 		}

@@ -71,7 +71,7 @@ func TestGateLiveLoopSubmitApproveThenStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.GateDecide(id, "approved", "ok"); err != nil {
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
 		t.Fatal(err)
 	}
 	list, _ := a.GateList()
@@ -91,7 +91,7 @@ func TestGateDecideRejectsWithoutGitIdentity(t *testing.T) {
 	a.SpecWrite("spec/glossary.md", "x", "")
 	commitAll(t, a)
 	id, _ := a.SubmitForApproval()
-	if err := a.GateDecide(id, "approved", ""); err == nil {
+	if err := a.GateDecide(id, "approved", "", nil); err == nil {
 		t.Fatal("missing git identity must reject approval")
 	}
 }

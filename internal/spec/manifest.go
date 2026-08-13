@@ -3,8 +3,6 @@ package spec
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"sort"
 	"strings"
 )
 
@@ -27,16 +25,14 @@ type canonical struct {
 	Files        []FileEntry `json:"files"`
 }
 
+// ManifestDigest is the package-level SpecScope wrapper (kept for existing
+// callers). It copies SpecScope and overrides Version with scopeVersion —
+// not SpecScope directly — so setScopeVersionForTest's override still takes
+// effect here without mutating the shared SpecScope value.
 func ManifestDigest(entries []FileEntry) (string, error) {
-	files := append([]FileEntry(nil), entries...)
-	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	c := canonical{ScopeVersion: scopeVersion, Patterns: ScopePatterns, Files: files}
-	b, err := json.Marshal(c) // struct 欄位序固定 → canonical；無時間欄位
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
+	sc := SpecScope
+	sc.Version = scopeVersion
+	return sc.ManifestDigest(entries)
 }
 
 func HashBytes(b []byte) string {
@@ -44,9 +40,16 @@ func HashBytes(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// InScope：`**` 語意＝該目錄下任意深度。純前綴比對 ＋ glossary.md 精確比對即可，
-// 不需 glob 函式庫；`..` 已在 app 層 resolveInWorkspace 擋掉。
+// InScope is the package-level SpecScope.Match wrapper (kept for existing
+// callers).
 func InScope(rel string) bool {
+	return SpecScope.Match(rel)
+}
+
+// specInScope is SpecScope's Match implementation. `**` 語意＝該目錄下任意
+// 深度。純前綴比對 ＋ glossary.md 精確比對即可，不需 glob 函式庫；`..` 已在
+// app 層 resolveInWorkspace 擋掉。
+func specInScope(rel string) bool {
 	rel = strings.TrimPrefix(rel, "./")
 	if rel == "spec/glossary.md" {
 		return true

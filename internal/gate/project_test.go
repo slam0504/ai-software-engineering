@@ -3,6 +3,8 @@ package gate
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -57,8 +59,8 @@ func entryByID(entries []GateEntry, id string) GateEntry {
 
 func gate1B(mDigest, bDigest string) []Binding {
 	return []Binding{
-		{"spec_manifest", "spec/", mDigest},
-		{"base_commit", "HEAD", bDigest},
+		{Kind: "spec_manifest", Ref: "spec/", Digest: mDigest},
+		{Kind: "base_commit", Ref: "HEAD", Digest: bDigest},
 	}
 }
 
@@ -69,7 +71,10 @@ func TestProjectPendingThenActiveThenStale(t *testing.T) {
 	ops := []GateOp{
 		opWith(t, GateRequest{ApprovalID: "A", Gate: "gate1", SpecManifestDigest: "sha256:x", BaseCommit: "git:sha1:c1"}),
 		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
-			Bindings: []Binding{{"spec_manifest", "spec/", "sha256:x"}, {"base_commit", "HEAD", "git:sha1:c1"}}}),
+			Bindings: []Binding{
+				{Kind: "spec_manifest", Ref: "spec/", Digest: "sha256:x"},
+				{Kind: "base_commit", Ref: "HEAD", Digest: "git:sha1:c1"},
+			}}),
 	}
 	e := entryByID(mustProject(t, ops), "A")
 	if e.State != Active {
@@ -113,6 +118,26 @@ func TestProjectStaleAfterSupersededDoesNotDowngrade(t *testing.T) {
 	}
 }
 
+func TestProjectRejectedNotDowngradedByStale(t *testing.T) {
+	ops := []GateOp{
+		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "rejected"}),
+		opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "changed"}),
+	}
+	if got := entryByID(mustProject(t, ops), "A").State; got != Rejected {
+		t.Fatalf("want rejected (stale must not overwrite terminal rejected), got %s", got)
+	}
+}
+
+func TestProjectRejectedNotDowngradedBySuperseded(t *testing.T) {
+	ops := []GateOp{
+		opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "rejected"}),
+		opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approval"}),
+	}
+	if got := entryByID(mustProject(t, ops), "A").State; got != Rejected {
+		t.Fatalf("want rejected (superseded must not overwrite terminal rejected), got %s", got)
+	}
+}
+
 func TestProjectUnknownTypeErrors(t *testing.T) {
 	ops := []GateOp{
 		{OpID: "op-x", At: "t", Records: []json.RawMessage{
@@ -129,16 +154,83 @@ func TestValidateGate1Bindings(t *testing.T) {
 		t.Fatalf("valid should pass: %v", err)
 	}
 	// 重複 kind 拒絕
-	dup := []Binding{{"spec_manifest", "spec/", "sha256:" + hex64()}, {"spec_manifest", "spec/", "sha256:" + hex64()}, {"base_commit", "HEAD", "git:sha1:" + hex40()}}
+	dup := []Binding{
+		{Kind: "spec_manifest", Ref: "spec/", Digest: "sha256:" + hex64()},
+		{Kind: "spec_manifest", Ref: "spec/", Digest: "sha256:" + hex64()},
+		{Kind: "base_commit", Ref: "HEAD", Digest: "git:sha1:" + hex40()},
+	}
 	if ValidateGate1Bindings(dup) == nil {
 		t.Fatal("duplicate kind must be rejected")
 	}
 	// 缺 base_commit 拒絕
-	if ValidateGate1Bindings([]Binding{{"spec_manifest", "spec/", "sha256:" + hex64()}}) == nil {
+	if ValidateGate1Bindings([]Binding{{Kind: "spec_manifest", Ref: "spec/", Digest: "sha256:" + hex64()}}) == nil {
 		t.Fatal("missing base_commit must be rejected")
 	}
 	// 短 SHA 拒絕
 	if ValidateGate1Bindings(gate1B("sha256:"+hex64(), "git:sha1:abc123")) == nil {
 		t.Fatal("short SHA must be rejected")
+	}
+}
+
+func TestBindingKindRoleUniqueness(t *testing.T) {
+	bs := []Binding{
+		{Kind: "evidence_run", Role: "expected_red", Ref: "evidence:01A", Digest: "sha256:" + strings.Repeat("a", 64)},
+		{Kind: "evidence_run", Role: "negative_control", Ref: "evidence:01B", Digest: "sha256:" + strings.Repeat("b", 64)},
+	}
+	req := []BindingReq{
+		{Kind: "evidence_run", Role: "expected_red", DigestRe: reSHA256},
+		{Kind: "evidence_run", Role: "negative_control", DigestRe: reSHA256},
+	}
+	if err := validateBindingSet(bs, req); err != nil {
+		t.Fatalf("distinct roles must pass: %v", err)
+	}
+	bs[1].Role = "expected_red" // 同 (kind,role) 重複
+	if err := validateBindingSet(bs, req); err == nil {
+		t.Fatal("duplicate (kind,role) must fail")
+	}
+}
+
+func TestProjectNormalizesV1AndRejectedTerminal(t *testing.T) {
+	data, err := os.ReadFile("testdata/m2-gate-v1.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	// parseOps moved into internal/journal as part of the M3a Task 6
+	// generalization; reload via OpenJournal from a scratch copy instead of
+	// calling the (now generic, raw-line) parser directly.
+	p := filepath.Join(t.TempDir(), "gate.jsonl")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("write scratch copy: %v", err)
+	}
+	j, err := OpenJournal(p)
+	if err != nil {
+		t.Fatalf("fixture must parse: %v", err)
+	}
+	entries, err := Project(j.Ops())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := entries[0].Request
+	if req.Subject != "workspace" || len(req.Bindings) != 2 {
+		t.Fatalf("v1 request must normalize to subject=workspace + 2 bindings, got %+v", req)
+	}
+	var rejected *GateEntry
+	for i := range entries {
+		if entries[i].Record != nil && entries[i].Record.Decision == "rejected" {
+			rejected = &entries[i]
+		}
+	}
+	if rejected == nil || rejected.State != Rejected {
+		t.Fatalf("rejected must be terminal state, got %+v", rejected)
+	}
+}
+
+func TestGate1LegacyEmptyRoleStillValid(t *testing.T) {
+	bs := []Binding{
+		{Kind: "spec_manifest", Digest: "sha256:" + strings.Repeat("a", 64)},
+		{Kind: "base_commit", Digest: "git:sha1:" + strings.Repeat("b", 40)},
+	}
+	if err := ValidateGate1Bindings(bs); err != nil {
+		t.Fatalf("legacy role=\"\" must stay valid: %v", err)
 	}
 }

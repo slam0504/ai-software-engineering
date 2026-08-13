@@ -9,26 +9,41 @@ const (
 	Active     State = "active"
 	Stale      State = "stale"
 	Superseded State = "superseded"
+	Rejected   State = "rejected"
 )
 
 type Binding struct {
 	Kind   string `json:"kind"`
+	Role   string `json:"role,omitempty"`
 	Ref    string `json:"ref"`
 	Digest string `json:"digest"`
+}
+type RiskDecision struct {
+	TaskID           string `json:"task_id"`
+	MinimumRiskTier  string `json:"minimum_risk_tier"`
+	PlannerRiskTier  string `json:"planner_risk_tier"`
+	SelectedRiskTier string `json:"selected_risk_tier"`
+	OverrideReason   string `json:"override_reason,omitempty"`
+}
+type Metadata struct {
+	RiskDecisions []RiskDecision `json:"risk_decisions,omitempty"`
 }
 type Approver struct {
 	ID     string `json:"id"`
 	Method string `json:"method"`
 }
 type ApprovalRecord struct {
-	Type       string    `json:"_type"` // "approval_record"
-	ApprovalID string    `json:"approval_id"`
-	Gate       string    `json:"gate"`
-	Decision   string    `json:"decision"`
-	Approver   Approver  `json:"approver"`
-	Reason     string    `json:"reason"`
-	Bindings   []Binding `json:"bindings"`
-	CreatedAt  string    `json:"created_at"`
+	Type          string    `json:"_type"` // "approval_record"
+	SchemaVersion int       `json:"schema_version,omitempty"`
+	ApprovalID    string    `json:"approval_id"`
+	Gate          string    `json:"gate"`
+	Subject       string    `json:"subject,omitempty"`
+	Decision      string    `json:"decision"`
+	Approver      Approver  `json:"approver"`
+	Reason        string    `json:"reason"`
+	Bindings      []Binding `json:"bindings"`
+	Metadata      *Metadata `json:"metadata,omitempty"`
+	CreatedAt     string    `json:"created_at"`
 }
 type Transition struct {
 	Type        string `json:"_type"` // "transition"
@@ -39,12 +54,15 @@ type Transition struct {
 	EvidenceRef string `json:"evidence_ref"`
 }
 type GateRequest struct {
-	Type               string `json:"_type"` // "gate_request"
-	ApprovalID         string `json:"approval_id"`
-	Gate               string `json:"gate"`
-	SpecManifestDigest string `json:"spec_manifest_digest"`
-	BaseCommit         string `json:"base_commit"`
-	CreatedAt          string `json:"created_at"`
+	Type               string    `json:"_type"` // "gate_request"
+	SchemaVersion      int       `json:"schema_version,omitempty"`
+	ApprovalID         string    `json:"approval_id"`
+	Gate               string    `json:"gate"`
+	Subject            string    `json:"subject,omitempty"`
+	Bindings           []Binding `json:"bindings,omitempty"`
+	SpecManifestDigest string    `json:"spec_manifest_digest,omitempty"`
+	BaseCommit         string    `json:"base_commit,omitempty"`
+	CreatedAt          string    `json:"created_at"`
 }
 type GateOp struct {
 	OpID    string            `json:"op_id"`

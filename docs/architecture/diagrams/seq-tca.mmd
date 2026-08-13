@@ -1,0 +1,31 @@
+sequenceDiagram
+  participant Dev as 開發者
+  participant App as app.go
+  participant Runner as evidence.Run
+  participant EJ as evidence journal
+  participant Gate as gate.Service
+  participant Esc as escalation.Service
+  Dev->>App: commit test_commit（oracle-surface 範圍內）
+  Dev->>App: RegisterMutation(taskRef, patch)
+  App->>EJ: append mutation
+  Dev->>App: RunEvidence(expected_red, test_commit)
+  App->>Runner: Run(RunSpec kind=expected_red)
+  Runner-->>App: EvidenceRun（result）
+  App->>EJ: append EvidenceRun
+  App->>Esc: wireEvidenceEscalation（passed／error／failed）
+  Dev->>App: RunEvidence(negative_control, test_commit, mutationID)
+  App->>Runner: Run(RunSpec kind=negative_control)
+  Runner-->>App: EvidenceRun（result）
+  App->>EJ: append EvidenceRun
+  App->>Esc: wireEvidenceEscalation
+  Dev->>App: SubmitTestContract(...)
+  App->>Gate: Submit(test_contract_approval, subject, bindings)
+  Gate-->>App: approval_id（pending）
+  Dev->>App: GateDecide(approval_id, approved)
+  Note over App,Gate: §3.10 凍結順序
+  App->>Gate: 1. reconcile bindings
+  App->>Gate: 2. PrepareDecision（TCAPolicy 硬性 validator）
+  App->>Esc: 2b. escResolveByKey（修復解除）
+  App->>Esc: 3. escBlockingFor（blocking 檢查）
+  App->>Gate: 4. CommitDecision（append）
+  Gate-->>App: active

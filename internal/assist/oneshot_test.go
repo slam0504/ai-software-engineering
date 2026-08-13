@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,6 +76,44 @@ func TestClaudeAssistFailsLoudOnOversizedLine(t *testing.T) {
 	})
 	if !sawStreamErr {
 		t.Fatalf("oversized line must surface a stream_error (fail loud); run err=%v", err)
+	}
+}
+
+// PlannerAssist（Task 11）：argv 級斷言，同 TestClaudeAssistArgvDisablesTools
+// pattern——白名單只含唯讀工具 Read/Glob/Grep，明確斷言不含 Write/Edit/Bash。
+func TestClaudePlannerArgvWhitelistsReadOnlyTools(t *testing.T) {
+	args := ClaudePlannerArgs()
+	idx := -1
+	for i, s := range args {
+		if s == "--tools" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || idx+1 >= len(args) {
+		t.Fatalf("claude planner argv must carry --tools <whitelist>: %#v", args)
+	}
+	whitelist := args[idx+1]
+	if whitelist != "Read,Glob,Grep" {
+		t.Fatalf("claude planner --tools whitelist must be exactly %q, got %q", "Read,Glob,Grep", whitelist)
+	}
+	for _, forbidden := range []string{"Write", "Edit", "Bash"} {
+		if strings.Contains(whitelist, forbidden) {
+			t.Fatalf("claude planner whitelist must not include %s (workspace mutation): %#v", forbidden, args)
+		}
+	}
+	if NewClaudePlanner("claude", "/tmp", nil) == nil {
+		t.Fatal("NewClaudePlanner must return a Runner")
+	}
+}
+
+// Codex planner turn wire 與 SpecAssist 的 Codex Runner 完全同構
+// （NewCodexPlanner 直接複用 NewCodexAssist），故其 turn/thread wire 的
+// readOnly+never enforcement 已由 TestCodexAssistTurnParamsEnforceReadOnlyNoApproval／
+// TestCodexAssistThreadParamsEnforceNever 覆蓋；此處只需斷言建構路徑存在。
+func TestCodexPlannerReturnsReadOnlyRunner(t *testing.T) {
+	if NewCodexPlanner("codex", "/tmp", nil) == nil {
+		t.Fatal("NewCodexPlanner must return a Runner")
 	}
 }
 

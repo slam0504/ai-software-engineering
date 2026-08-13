@@ -24,7 +24,11 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/escalation"
+	"github.com/slam0504/sdlc-workbench/internal/evidence"
 	"github.com/slam0504/sdlc-workbench/internal/gate"
+	"github.com/slam0504/sdlc-workbench/internal/gatepolicy"
+	"github.com/slam0504/sdlc-workbench/internal/plan"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
@@ -96,6 +100,14 @@ type App struct {
 	gateInitErr         error
 	gitIdentityOverride func() (name, email string, err error) // 測試注入：略過真實 git config 查詢
 
+	// Plan workspace（Task 12：spec §7 Stage B）——planRepo 為 PlanScope 版
+	// spec.GitRepo（plan/ 樹的 Preview/Confirm 兩階段 commit）；planGit／
+	// planLoader 供 gate2 policy 與 SubmitPlanForApproval 的 committed-context
+	// 讀取（git show／lineage），皆在 ensureGate() 內與 specRepo 同步惰性初始化。
+	planRepo   *spec.GitRepo
+	planGit    appGitRunner
+	planLoader appPlanLoader
+
 	// SpecAssist（Task 11：Stage A §5.1）——per-provider 至多一個 active 隔離
 	// one-shot。assistActive 在 assistMu 下管理獨佔性；每個 generation 的 cancel
 	// 供 shutdown reclaim，once 保證 result／abort／timeout／shutdown 任一先觸發
@@ -106,12 +118,63 @@ type App struct {
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
 
 	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
-	// 觸發 ReconcileGate1()。specWatchStop／specWatchDone 在 a.mu 下管理，供
+	// 觸發 Reconcile()。specWatchStop／specWatchDone 在 a.mu 下管理，供
 	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
 	// 呼叫 watcher.Close() 後才 close(specWatchDone)，shutdown 等 done 保證
 	// watcher 真的關閉、goroutine 真的結束（不留 orphan）。
 	specWatchStop chan struct{}
 	specWatchDone chan struct{}
+
+	// plan/ watcher（Task 12：watchSpecTree 模式鏡射，見其上方 doc——差異僅
+	// 監看根換成 plan/、變更事件為 "plan:changed"）。獨立的 stop／done 欄位：
+	// 兩個 watcher 各自獨立 goroutine，可同時運行、各自被 shutdown 收斂。
+	planWatchStop chan struct{}
+	planWatchDone chan struct{}
+
+	// Evidence run（Task 20：M3a §4-5）——evidenceMu 保護 active run registry
+	// （evidence_id → cancel func，供 shutdown reclaim，鏡射 assistActive）；
+	// finalize（journal append）與 registry 移除在 RunEvidence 內同一臨界區
+	// 完成，這是「恰一次 finalize」保證的落點。evidenceJournal／
+	// evidenceCASDir／evidenceRegistryPath 於 startup 惰性建立於
+	// .workbench/evidence/ 下（journal＝evidence.jsonl，worktree registry＝
+	// worktrees.jsonl，同時做一次 CleanupOrphans／CleanOrphanTemps）。
+	evidenceMu           sync.Mutex
+	evidenceActive       map[string]context.CancelFunc
+	evidenceJournal      *evidence.Journal
+	evidenceCASDir       string
+	evidenceRegistryPath string
+
+	// evidenceContextLoaderOverride：測試注入，換掉 RunEvidence 傳給
+	// evidence.Run 的 evidence.ContextLoader（production 用 a.planLoader）。
+	// 唯一用途是讓測試能在 LoadAt／LoadOracleAt（ulid mint 之前執行）安插一個
+	// barrier，重現「beginAppTxn 成功到 evidenceActive 登記之間」的 TOCTOU
+	// 窗（task-20 review M1）。
+	evidenceContextLoaderOverride evidence.ContextLoader
+
+	// Escalation（Task 24：spec §3.8／§3.10）——workflowMu 是跨 journal 編排的
+	// 唯一互斥：GateDecide 的凍結順序（reconcile→validator→stale 修復解除→
+	// blocker→append）、escalation 收件匣的全部寫入、evidence finalize 的自動
+	// 來源接線、watcher 觸發的 Reconcile 全部序列化在它底下。
+	//
+	// lock ordering：workflowMu → gate journal（gate.Service 內部 mu）→
+	// escalation journal（escalation.Service 內部 mu）。evidenceMu 與 workflowMu
+	// 不巢狀——RunEvidence 的 finalize 臨界區（evidenceMu）先完整結束，才另取
+	// workflowMu 做 §3.8 (5)(6)(7) 接線（見 wireEvidenceEscalation）。
+	//
+	// 重入規約：public EscalationCreate／EscalationAck／EscalationResolve／
+	// EscalationList 先取 workflowMu；已持有 workflowMu 的路徑（GateDecide 編排、
+	// reconcileLocked、wireEvidenceEscalation）只准呼叫 esc*Locked 內部變體，
+	// 否則同一 mutex 重入即死鎖。
+	workflowMu sync.Mutex
+	escSvc     *escalation.Service
+	escJournal *escalation.Journal
+	escOnce    sync.Once
+	escInitErr error
+	gateReg    gate.Registry // ensureGate 建好的 policy registry（§3.8 (2) 的 pre-validation 用）
+
+	decideBarrierHook    func() // 測試注入：GateDecide blocker 檢查後、CommitDecision 前
+	onWorkflowMuAttempt  func() // 測試注入：public EscalationCreate 於 workflowMu.Lock() 前
+	onWorkflowMuAcquired func() // 測試注入：public EscalationCreate 取得 workflowMu 後、寫入前
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -157,7 +220,8 @@ func (a *App) emit(name string, data any) {
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{apprPending: map[string]*pendingApproval{},
-		assistActive: map[string]*assistGen{}}
+		assistActive:   map[string]*assistGen{},
+		evidenceActive: map[string]context.CancelFunc{}}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -205,7 +269,49 @@ func (a *App) startup(ctx context.Context) {
 		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
-	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 ReconcileGate1()
+	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 Reconcile()
+	a.watchPlanTree() // Task 12：plan/ 遞迴監看，鏡射 watchSpecTree（同一 Reconcile()，涵蓋 gate1／gate2）
+	a.startupEvidence()
+	// Task 24（§3.8 啟動補建）：依權威狀態掃描——已 stale 的核可、degraded
+	// journal 若無對應未 resolved escalation 項即補建、journal 重開成功即系統
+	// 解除 journal-degraded 項。只在 gate journal 已存在（workspace 曾用過
+	// gate）時觸發：全新／非 git workspace 不強迫 ensureGate 的 git 依賴在
+	// startup 就 fail loud。
+	if _, statErr := os.Stat(filepath.Join(a.workspaceDir, ".workbench", "gate.jsonl")); statErr == nil {
+		a.reconcileGate1NotifyOnly()
+	}
+}
+
+// startupEvidence（Task 20）：惰性 gate/plan 之外少數在 startup 就建立的狀態——
+// evidence journal／CAS／worktree registry 路徑都落在 .workbench/evidence/
+// 下，且 CleanupOrphans／CleanOrphanTemps 必須在任何 RunEvidence 呼叫之前跑
+// 過一次，才能收乾淨上次程序異常結束留下的 worktree／temp 殘留（brief 凍結：
+// 下次啟動兜底逾時 forcedShutdown 未清乾淨的窗口）。liveIDs 傳空 map：啟動當下
+// 不可能有任何 in-flight run，registry 裡的每個 active 項目都是孤兒。這幾步
+// 全是檔案操作＋（僅在真有孤兒殘留時）git worktree 指令；一個尚未 git init 的
+// 全新 workspace（registry 檔不存在或是空檔）不會觸發任何 git 呼叫，因此可以
+// 安全地在 ensureGate() 惰性初始化之前無條件執行。
+func (a *App) startupEvidence() {
+	dir := filepath.Join(a.workspaceDir, ".workbench", "evidence")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		if a.startupErr == "" {
+			a.startupErr = "evidence dir init failed: " + err.Error()
+		}
+		return
+	}
+	a.evidenceCASDir = filepath.Join(dir, "cas")
+	a.evidenceRegistryPath = filepath.Join(dir, "worktrees.jsonl")
+	if j, jerr := evidence.OpenJournal(filepath.Join(dir, "evidence.jsonl")); jerr == nil {
+		a.evidenceJournal = j
+	} else if a.startupErr == "" {
+		a.startupErr = "evidence journal init failed: " + jerr.Error()
+	}
+	if oerr := evidence.CleanupOrphans(a.workspaceDir, a.evidenceRegistryPath, map[string]bool{}); oerr != nil && a.startupErr == "" {
+		a.startupErr = "evidence orphan worktree cleanup failed: " + oerr.Error()
+	}
+	if _, terr := evidence.CleanOrphanTemps(a.evidenceCASDir); terr != nil && a.startupErr == "" {
+		a.startupErr = "evidence orphan temp cleanup failed: " + terr.Error()
+	}
 }
 
 // failedSink：events.jsonl 開檔失敗時的替身——每次寫入回同一錯誤，
@@ -246,13 +352,13 @@ func (a *App) watchDiagram(path string) {
 const specWatchDebounce = 200 * time.Millisecond
 
 // watchSpecTree 對納管的 spec/ 樹（spec.ScopePatterns 範圍）遞迴監看，變更
-// debounce 後觸發 ReconcileGate1()（spec §4：通知層）。只重用 watchDiagram 的
+// debounce 後觸發 Reconcile()（spec §4：通知層）。只重用 watchDiagram 的
 // 概念，修正其三個缺陷：(1) 這裡遞迴 Add 整棵子樹、新目錄 Create 時再 Add，
 // 不只監看單一 parent；(2) watcher／Add／讀取錯誤一律 fail-loud（audit＋
 // EmitWorkspace stream_error），不吞聲；(3) 透過 specWatchStop／specWatchDone
 // 掛進 shutdown，goroutine 保證退出、watcher.Close() 保證被呼叫。
 //
-// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 ReconcileGate1()（best-effort），
+// 這是 NOTIFICATION 層，不是權威：觸發只呼叫 Reconcile()（best-effort），
 // 目的是讓已核可的 Gate 1 儘快在 UI 顯示 STALE；權威重算永遠在讀取路徑
 // （gate.Service.List／GateList，Task 10），watcher 失敗不影響正確性。
 //
@@ -336,7 +442,7 @@ func specEventInScope(specRoot, name string) bool {
 // runSpecWatch：watcher 事件迴圈——只處理落在 spec/ 子樹內的事件
 // （specEventInScope；root 上其餘事件如 .workbench/、.git/ 一律忽略，避免
 // reconcile 寫 journal 又觸發自己的 watch 造成無窮迴圈）。debounce 合併連續
-// 事件後觸發 ReconcileGate1()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
+// 事件後觸發 Reconcile()；spec/ 子樹內 Create 為目錄時 re-add（遞迴涵蓋
 // 新子樹，也涵蓋 spec/ 自身被晚建立的情況）；Rename／Remove 的路徑可能已
 // 消失，不視為 fatal，一樣 debounce 後 reconcile（消失或變更皆由重算反映）；
 // error channel 的錯誤 fail-loud 但不中止迴圈；stop 關閉時退出，defer 保證
@@ -385,15 +491,25 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, specRoot string, stop <-chan str
 }
 
 // reconcileGate1NotifyOnly：watcher 觸發的 best-effort reconcile——失敗只
-// fail-loud UI，不影響權威（GateList 讀取路徑永遠自己重算一次）。
+// fail-loud UI，不影響權威（GateList 讀取路徑永遠自己重算一次）。名稱沿用
+// M2 舊名（gate1 尚是唯一 gate 時所取），但 svc.Reconcile() 本身早已泛化為
+// 對 Registry 內所有已註冊 gate（gate1／gate2／tca）重算 stale——
+// watchSpecTree／watchPlanTree（Task 12）共用同一個呼叫點，任一棵樹變更都會
+// 讓所有 gate 的綁定一併被重新檢查。
+//
+// Task 24：watcher 觸發的 Reconcile 也屬 workflowMu 序列化的編排路徑——先取
+// workflowMu 再走 reconcileLocked（§3.8 stale／journal-degraded 補建接在同一
+// 呼叫點；重入規約見 workflowMu 欄位 doc）。
 func (a *App) reconcileGate1NotifyOnly() {
 	svc, err := a.ensureGate()
 	if err != nil {
 		a.failLoudSpecWatch("ensureGate: " + err.Error())
 		return
 	}
-	if err := svc.ReconcileGate1(); err != nil {
-		a.failLoudSpecWatch("ReconcileGate1: " + err.Error())
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if err := a.reconcileLocked(svc); err != nil {
+		a.failLoudSpecWatch("Reconcile: " + err.Error())
 	}
 }
 
@@ -426,12 +542,131 @@ func (a *App) stopSpecWatch() {
 	}
 }
 
+// ---- plan/ watcher（Task 12：watchSpecTree 模式鏡射；spec §7 Stage B 通知層）----
+//
+// 結構逐字對照 watchSpecTree／runSpecWatch／specEventInScope／stopSpecWatch／
+// failLoudSpecWatch（見上方各自 doc comment，此處不重複展開設計理由）；差異僅：
+// 監看根換成 <root>/plan、事件過濾用 planEventInScope、UI 訊號為 "plan:changed"、
+// audit kind 為 "plan_watch_error"、stop／done 換 a.planWatchStop／a.planWatchDone。
+// reconcile 呼叫點與 watchSpecTree 共用同一個 a.reconcileGate1NotifyOnly()——
+// svc.Reconcile() 本身對 gate1／gate2 一視同仁，不需要兩份 reconcile 邏輯。
+
+func (a *App) watchPlanTree() {
+	a.stopPlanWatch()
+
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		a.failLoudPlanWatch("normalize workspace: " + err.Error())
+		return
+	}
+	planRoot := filepath.Join(root, "plan")
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		a.failLoudPlanWatch("fsnotify.NewWatcher: " + err.Error())
+		return
+	}
+	if aerr := w.Add(root); aerr != nil {
+		a.failLoudPlanWatch("watch workspace root: " + aerr.Error())
+	}
+	if _, statErr := os.Stat(planRoot); statErr == nil {
+		if aerr := addRecursiveWatch(w, planRoot); aerr != nil {
+			a.failLoudPlanWatch("watch plan/: " + aerr.Error())
+		}
+	} else if !os.IsNotExist(statErr) {
+		a.failLoudPlanWatch("stat plan/: " + statErr.Error())
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	a.mu.Lock()
+	a.planWatchStop = stop
+	a.planWatchDone = done
+	a.mu.Unlock()
+
+	go a.runPlanWatch(w, planRoot, stop, done)
+}
+
+// planEventInScope mirrors specEventInScope — see its doc comment for why
+// the workspace root must stay in scope for the initial CREATE of plan/, and
+// why .workbench/／.git/ events on root must be filtered out here (self-
+// triggering reconcile → journal append → watch event loop).
+func planEventInScope(planRoot, name string) bool {
+	return name == planRoot || strings.HasPrefix(name, planRoot+string(filepath.Separator))
+}
+
+func (a *App) runPlanWatch(w *fsnotify.Watcher, planRoot string, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	defer w.Close()
+	var debounceC <-chan time.Time
+	var lastChanged string
+	for {
+		select {
+		case <-stop:
+			return
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if !planEventInScope(planRoot, ev.Name) {
+				continue
+			}
+			if ev.Op&fsnotify.Create != 0 {
+				if fi, statErr := os.Stat(ev.Name); statErr == nil && fi.IsDir() {
+					if aerr := addRecursiveWatch(w, ev.Name); aerr != nil {
+						a.failLoudPlanWatch("watch new dir: " + aerr.Error())
+					}
+				}
+			}
+			lastChanged = ev.Name
+			debounceC = time.After(specWatchDebounce)
+		case werr, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			a.failLoudPlanWatch("fsnotify: " + werr.Error())
+		case <-debounceC:
+			debounceC = nil
+			a.reconcileGate1NotifyOnly()
+			a.emit("plan:changed", lastChanged)
+		}
+	}
+}
+
+// failLoudPlanWatch：plan watcher 錯誤的唯一出口，鏡射 failLoudSpecWatch
+// （見其 doc comment），audit kind 改 "plan_watch_error" 以便區分兩棵樹。
+func (a *App) failLoudPlanWatch(msg string) {
+	a.audit("plan_watch_error", map[string]any{"error": msg})
+	if a.manager != nil {
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
+	}
+}
+
+// stopPlanWatch mirrors stopSpecWatch — see its doc comment.
+func (a *App) stopPlanWatch() {
+	a.mu.Lock()
+	stop := a.planWatchStop
+	done := a.planWatchDone
+	a.planWatchStop = nil
+	a.planWatchDone = nil
+	a.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	if done != nil {
+		<-done
+	}
+}
+
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
 	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
 	a.shutMu.Unlock()
 	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
+	a.stopPlanWatch()                          // 1a′) 停 plan/ watcher，同上理由
 	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.reclaimEvidenceRuns()                    // 1b′) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
 	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
@@ -944,12 +1179,37 @@ func (a *App) ensureGate() (*gate.Service, error) {
 			a.gateInitErr = jerr
 			return
 		}
-		a.specRepo = spec.NewGitRepo(root)
+		a.specRepo = spec.NewGitRepo(root, spec.SpecScope)
+		a.planRepo = spec.NewGitRepo(root, spec.PlanScope)
+		a.planGit = appGitRunner{root: root}
+		a.planLoader = appPlanLoader{git: a.planGit}
 		a.gateJournal = j
-		current := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
+		currentSpecManifest := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
+		currentPlanManifest := func() (string, error) {
+			return spec.BuildCurrentManifestScoped(a.planRepo, spec.PlanScope)
+		}
+		currentRiskPolicyDigest := func() (string, error) { return worktreeRiskPolicyDigest(root) }
+		currentPermissionManifest := func() (string, error) { return worktreePermissionManifestDigest(root) }
+		// currentOracleDigest（Task 21：§3.9 持續重算）：decl 一律來自 TCA 綁定的
+		// gate2 approval plan_commit（TCALoader.LoadOracleAt），這裡只負責對「目前
+		// 工作區」重算其 manifest digest——鏡射 currentPlanManifest／
+		// currentSpecManifest 建 spec.GitRepo(root, scope) 再走
+		// BuildCurrentManifestScoped 的既定用法，scope 換成 decl.Scope()（每次呼叫
+		// 依 decl 動態決定，不像 Spec／PlanScope 是套件層級常數）。
+		currentOracleDigest := func(decl evidence.OracleDecl) (string, error) {
+			return spec.BuildCurrentManifestScoped(spec.NewGitRepo(root, decl.Scope()), decl.Scope())
+		}
 		ulidFn := func() string { return contract.NewULID(time.Now()) }
 		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
-		a.gateSvc = gate.NewService(j, current, ulidFn, nowFn, gateEmitter{a})
+		reg := gate.Registry{
+			"gate1": gate.NewGate1Policy(currentSpecManifest),
+			"gate2": gatepolicy.NewGate2Policy(a.planLoader, a.planGit,
+				currentPlanManifest, currentSpecManifest, currentRiskPolicyDigest, currentPermissionManifest),
+			"test_contract_approval": gatepolicy.NewTCAPolicy(appEvidenceStore{a: a}, appGateReader{a: a},
+				a.planLoader, a.planGit, currentOracleDigest),
+		}
+		a.gateReg = reg // Task 24：submitGateRequest 的 §3.8 (2) pre-validation 用
+		a.gateSvc = gate.NewService(j, reg, ulidFn, nowFn, gateEmitter{a})
 	})
 	return a.gateSvc, a.gateInitErr
 }
@@ -974,7 +1234,7 @@ func (a *App) SubmitForApproval() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return svc.Submit(manifestDigest, baseCommit, gate1Bindings(manifestDigest, baseCommit))
+	return a.submitGateRequest(svc, "gate1", "workspace", gate1Bindings(manifestDigest, baseCommit))
 }
 
 // ---- SpecCommit（Task 15：spec §5.1 兩階段 commit UI，wraps internal/spec.GitRepo）----
@@ -1009,11 +1269,1115 @@ func (a *App) ConfirmSpecCommit(tok spec.CommitToken, message string) error {
 	return a.specRepo.ConfirmSpecCommit(tok, message)
 }
 
+// ---- Plan workspace（Task 12：plan/ 綁定＋Gate 2 送核；spec §7 Stage B）----
+//
+// PlanList／PlanRead／PlanWrite／PreviewPlanCommit／ConfirmPlanCommit 逐字鏡射
+// 上方 SpecList／SpecRead／SpecWrite／PreviewSpecCommit／ConfirmSpecCommit（見
+// 各自 doc comment 的設計理由，此處不重複展開），scope 換成 spec.PlanScope、
+// repo 換成 a.planRepo。SubmitPlanForApproval／GateDecisionContext 是committed
+// context 閉環的核心：兩者都只信任 committed（git object database）內容，絕不
+// 以 worktree 目前狀態代替已核可／待核的版本。
+
+// appGitRunner 實作 plan.GitRunner（同時也是 gatepolicy.NewGate2Policy 的
+// g 參數），走裸 exec.Command(...).Output()、直接回傳未包裝的錯誤——不同於
+// spec.GitRepo.git()：後者對 *exec.ExitError 用 %s 攤平成純文字錯誤，會讓
+// errors.As(*exec.ExitError) 在呼叫端全部失效（task-12 brief 明確警示）。
+// plan.VerifyLineage（merge-base --is-ancestor 的 exit 1 判斷）與
+// gatepolicy.Gate2Policy.ReconcileBindings（rev-parse --verify 的 exit 1 vs
+// exit 128 判斷）都仰賴 *exec.ExitError 留在 error chain 內，所以這裡刻意
+// 不重用 spec.GitRepo 的私有 git()。
+type appGitRunner struct{ root string }
+
+func (r appGitRunner) Git(args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", r.root}, args...)...)
+	return cmd.Output()
+}
+
+// appPlanLoader 實作 gatepolicy.PlanLoader：讀 committed plan／risk policy，
+// 一律經 `git show <oid>:plan/<planID>.yaml`／`git show <oid>:plan/risk-policy.yaml`
+// ——絕不讀 worktree，確保 Gate 2 送核與之後任何 decide-time 重驗都綁在同一份
+// 不可變的 commit 內容上（committed context 閉環）。檔名慣例：plan/<plan_id>.yaml。
+type appPlanLoader struct{ git plan.GitRunner }
+
+func (l appPlanLoader) LoadAt(commitOID, planID string) (plan.Plan, plan.RiskPolicy, error) {
+	planRaw, err := l.git.Git("show", commitOID+":plan/"+planID+".yaml")
+	if err != nil {
+		return plan.Plan{}, plan.RiskPolicy{}, fmt.Errorf("plan: load plan %q at %s: %w", planID, commitOID, err)
+	}
+	pl, err := plan.Parse(planRaw)
+	if err != nil {
+		return plan.Plan{}, plan.RiskPolicy{}, err
+	}
+	riskRaw, err := l.git.Git("show", commitOID+":plan/risk-policy.yaml")
+	if err != nil {
+		return plan.Plan{}, plan.RiskPolicy{}, fmt.Errorf("plan: load risk policy at %s: %w", commitOID, err)
+	}
+	pol, err := plan.ParseRiskPolicy(riskRaw)
+	if err != nil {
+		return plan.Plan{}, plan.RiskPolicy{}, err
+	}
+	return pl, pol, nil
+}
+
+// LoadOracleAt 實作 evidence.ContextLoader：讀 committed oracle-surface 宣告，
+// 同 LoadAt 一律 `git show <oid>:plan/oracle-surface.yaml`——絕不讀 worktree，
+// 理由與 LoadAt 相同（committed context 閉環，見上方 doc）。
+func (l appPlanLoader) LoadOracleAt(commitOID string) (evidence.OracleDecl, error) {
+	raw, err := l.git.Git("show", commitOID+":plan/oracle-surface.yaml")
+	if err != nil {
+		return evidence.OracleDecl{}, fmt.Errorf("plan: load oracle surface at %s: %w", commitOID, err)
+	}
+	return evidence.ParseOracleDecl(raw)
+}
+
+// appEvidenceStore implements gatepolicy.EvidenceStore over a's evidence
+// journal/CAS. Holds a reference to *App (not a value snapshot of
+// a.evidenceJournal/a.evidenceCASDir) because those fields are populated by
+// startupEvidence(), a function independent of ensureGate()'s lazy init —
+// reading through a keeps every call bound to whatever the fields hold at
+// call time. Get/Mutation each re-verify the CAS artifacts their journal
+// record references (stdout/stderr for a run, the patch for a mutation)
+// before returning, folding §3.9's "CAS artifact reread" into the two reads
+// TCAPolicy already needs (see gatepolicy.EvidenceStore's doc comment).
+type appEvidenceStore struct{ a *App }
+
+func (s appEvidenceStore) Get(evidenceID string) (evidence.EvidenceRun, error) {
+	if s.a.evidenceJournal == nil {
+		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
+	}
+	run, err := s.a.evidenceJournal.Get(evidenceID)
+	if err != nil {
+		return evidence.EvidenceRun{}, err
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, run.StdoutDigest); verr != nil {
+		return evidence.EvidenceRun{}, fmt.Errorf("evidence: verify stdout artifact for %s: %w", evidenceID, verr)
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, run.StderrDigest); verr != nil {
+		return evidence.EvidenceRun{}, fmt.Errorf("evidence: verify stderr artifact for %s: %w", evidenceID, verr)
+	}
+	return run, nil
+}
+
+func (s appEvidenceStore) Mutation(mutationID string) (evidence.Mutation, error) {
+	if s.a.evidenceJournal == nil {
+		return evidence.Mutation{}, errors.New("evidence: not initialized")
+	}
+	m, err := s.a.evidenceJournal.GetMutation(mutationID)
+	if err != nil {
+		return evidence.Mutation{}, err
+	}
+	if _, verr := evidence.OpenCAS(s.a.evidenceCASDir, m.Digest); verr != nil {
+		return evidence.Mutation{}, fmt.Errorf("evidence: verify mutation artifact %s: %w", mutationID, verr)
+	}
+	return m, nil
+}
+
+// appGateReader implements gatepolicy.GateReader by delegating to
+// a.gateSvc.Lookup. A thin indirection (rather than passing a.gateSvc
+// directly) because the registry that wires TCAPolicy is itself being built
+// inside the same ensureGate() call that will assign a.gateSvc — by the time
+// any TCAPolicy method runs (always after ensureGate() has returned),
+// a.gateSvc is set.
+type appGateReader struct{ a *App }
+
+func (r appGateReader) Lookup(approvalID string) (*gate.ApprovalRecord, gate.State, error) {
+	return r.a.gateSvc.Lookup(approvalID)
+}
+
+// planIDFromSubject／bindingDigest／gitOIDFromDigest mirror
+// internal/gatepolicy 的同名未匯出 helper——app 層無法引用其他 package 的未
+// 匯出識別字，複製這三個各 4-10 行的小函式比為單一呼叫端擴大 gatepolicy 的
+// export surface 更省事（同 gitStatusPath 複製 internal/spec 私有邏輯的先例）。
+func planIDFromSubject(subject string) (string, bool) {
+	id, ok := strings.CutPrefix(subject, "plan:")
+	if !ok || id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+func bindingDigest(bs []gate.Binding, kind string) string {
+	for _, b := range bs {
+		if b.Kind == kind && b.Role == "" {
+			return b.Digest
+		}
+	}
+	return ""
+}
+
+func gitOIDFromDigest(digest string) string {
+	if s, ok := strings.CutPrefix(digest, "git:sha1:"); ok {
+		return s
+	}
+	if s, ok := strings.CutPrefix(digest, "git:sha256:"); ok {
+		return s
+	}
+	return digest
+}
+
+// activeGate1Binding 在 GateList() 的 projection 中找 active gate1 項，回傳
+// 其 spec_manifest／base_commit binding digest（從 Bindings 讀，不是
+// GateEntryDTO.SpecManifestDigest／BaseCommit ——那兩個欄位鏡射 v1 legacy
+// GateRequest 頂層欄位，Submit() 的 v2 路徑從未填過，對 v2 送出的 gate1 請求
+// 永遠是空字串；Bindings 才是 pending／active 兩種狀態下都正確的來源）。
+func activeGate1Binding(entries []GateEntryDTO) (specManifest, baseCommit string, ok bool) {
+	for _, e := range entries {
+		if e.Gate != "gate1" || e.State != string(gate.Active) {
+			continue
+		}
+		return bindingDigest(e.Bindings, "spec_manifest"), bindingDigest(e.Bindings, "base_commit"), true
+	}
+	return "", "", false
+}
+
+// activeGate2PlanCommit：RunEvidence 唯一信任的 plan_commit 來源——active
+// gate2（subject="plan:"+planID）綁定的 base_commit，即 SubmitPlanForApproval
+// 當下的 planHeadOID。evidence.Run 的 ContextLoader 一律以此為 rs.PlanCommit
+// 讀取 committed TestContract／oracle-surface，絕不信任 caller 傳入或目前
+// worktree 的 plan 內容（鏡射 GateDecisionContext 的 committed context 閉環）。
+func activeGate2PlanCommit(entries []GateEntryDTO, planID string) (planCommit string, ok bool) {
+	subject := "plan:" + planID
+	for _, e := range entries {
+		if e.Gate != "gate2" || e.State != string(gate.Active) || e.Subject != subject {
+			continue
+		}
+		return gitOIDFromDigest(bindingDigest(e.Bindings, "base_commit")), true
+	}
+	return "", false
+}
+
+// activeGate2ApprovalID：SubmitTestContract 唯一信任的 gate2_approval 來源
+// ——active gate2（subject="plan:"+planID）的 approval_id，用來反查完整
+// ApprovalRecord（RecordDigest 需要全部欄位，GateEntryDTO 不夠）。
+func activeGate2ApprovalID(entries []GateEntryDTO, planID string) (approvalID string, ok bool) {
+	subject := "plan:" + planID
+	for _, e := range entries {
+		if e.Gate != "gate2" || e.State != string(gate.Active) || e.Subject != subject {
+			continue
+		}
+		return e.ApprovalID, true
+	}
+	return "", false
+}
+
+// worktreePlanDoc 在 worktree 的 plan/ 底下找「唯一」一份可解析為 plan.Plan
+// 的 plan/*.yaml（直接子層，不遞迴進 permissions/）——risk-policy.yaml／
+// 未來的 oracle-surface.yaml 等其他 plan/ scope 內的 YAML 因 schema 不同
+// （plan.Parse 的 KnownFields(true) 會擋掉未知欄位）自然被排除，不需要另外
+// 硬編排除檔名。零份或多於一份視為無法判定，fail loud——M3a 假設一個
+// workspace 同時只有一份 active plan 草稿（多 plan／多 session 屬 M3b）。
+func worktreePlanDoc(root string) (relPath string, doc plan.Plan, err error) {
+	matches, err := filepath.Glob(filepath.Join(root, "plan", "*.yaml"))
+	if err != nil {
+		return "", plan.Plan{}, err
+	}
+	var found []string
+	var docs []plan.Plan
+	for _, m := range matches {
+		raw, rerr := os.ReadFile(m)
+		if rerr != nil {
+			continue
+		}
+		p, perr := plan.Parse(raw)
+		if perr != nil || p.PlanID == "" {
+			continue
+		}
+		found = append(found, m)
+		docs = append(docs, p)
+	}
+	switch len(found) {
+	case 0:
+		return "", plan.Plan{}, errors.New("plan: no plan document found under plan/ (expected exactly one plan/<plan_id>.yaml)")
+	case 1:
+		rel, rerr := filepath.Rel(root, found[0])
+		if rerr != nil {
+			return "", plan.Plan{}, rerr
+		}
+		return filepath.ToSlash(rel), docs[0], nil
+	default:
+		return "", plan.Plan{}, fmt.Errorf("plan: ambiguous plan documents under plan/: %v", found)
+	}
+}
+
+// worktreeRiskPolicyDigest reads plan/risk-policy.yaml straight from the
+// worktree (§3.9 "持續重算" — the risk_policy binding's current comparator).
+func worktreeRiskPolicyDigest(root string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(root, "plan", "risk-policy.yaml"))
+	if err != nil {
+		return "", err
+	}
+	return specDigestOf(raw), nil
+}
+
+// permissionManifestScope: canonical digest formula for the permission_manifest
+// binding — an ad-hoc Scope (not spec.PlanScope itself; only the permission
+// files a plan's tasks actually reference, not every file under plan/) reusing
+// the same {scope_version,patterns,files} canonical formula every other
+// manifest-shaped binding in this codebase uses (spec.Scope.ManifestDigest).
+var permissionManifestScope = spec.Scope{Version: 1, Patterns: []string{"plan/permissions/**"}}
+
+// taskPermissionRefs collects each task's permissions_ref (in task order;
+// duplicates across tasks are fine — permissionRefEntries dedups by path).
+func taskPermissionRefs(pl plan.Plan) []string {
+	refs := make([]string, 0, len(pl.Tasks))
+	for _, t := range pl.Tasks {
+		refs = append(refs, t.PermissionsRef)
+	}
+	return refs
+}
+
+// permissionRefEntries builds the sorted-by-ManifestDigest FileEntry list for
+// refs (paths relative to plan/, e.g. "permissions/T1.yaml"), reading raw
+// bytes via read. An empty ref or a read failure (missing file) fails loud —
+// §「所有 task permissions_ref 檔案的 canonical manifest digest，缺檔即拒」.
+func permissionRefEntries(refs []string, read func(relToPlan string) ([]byte, error)) ([]spec.FileEntry, error) {
+	seen := map[string]bool{}
+	var entries []spec.FileEntry
+	for _, ref := range refs {
+		if ref == "" {
+			return nil, errors.New("plan: task permissions_ref must not be empty")
+		}
+		full := "plan/" + ref
+		if seen[full] {
+			continue
+		}
+		seen[full] = true
+		raw, err := read(ref)
+		if err != nil {
+			return nil, fmt.Errorf("plan: permissions_ref %q: %w", ref, err)
+		}
+		entries = append(entries, spec.FileEntry{Path: full, SHA256: spec.HashBytes(raw)})
+	}
+	return entries, nil
+}
+
+// worktreePermissionManifestDigest recomputes the permission_manifest
+// binding's current digest against the worktree's current plan document and
+// worktree permission files (§3.9 "持續重算").
+func worktreePermissionManifestDigest(root string) (string, error) {
+	_, pl, err := worktreePlanDoc(root)
+	if err != nil {
+		return "", err
+	}
+	entries, err := permissionRefEntries(taskPermissionRefs(pl), func(rel string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(root, "plan", filepath.FromSlash(rel)))
+	})
+	if err != nil {
+		return "", err
+	}
+	return permissionManifestScope.ManifestDigest(entries)
+}
+
+// parseScenarioTags extracts scenario IDs from Gherkin feature content: the
+// @Tag token(s) on the line immediately above a "Scenario:"/"Scenario Outline:"
+// line become that scenario's ID(s). A scenario with no tag line directly
+// above it contributes no ID — such a scenario cannot be referenced by a
+// plan task (task-12 brief: 無 tag 的 scenario 不可引用).
+func parseScenarioTags(content string) map[string]bool {
+	ids := map[string]bool{}
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "Scenario:") && !strings.HasPrefix(trimmed, "Scenario Outline:") {
+			continue
+		}
+		if i == 0 {
+			continue
+		}
+		prev := strings.TrimSpace(lines[i-1])
+		if !strings.HasPrefix(prev, "@") {
+			continue
+		}
+		for _, tok := range strings.Fields(prev) {
+			if id, ok := strings.CutPrefix(tok, "@"); ok && id != "" {
+				ids[id] = true
+			}
+		}
+	}
+	return ids
+}
+
+// gate1ScenarioIDs enumerates every spec/features/** file at gate1HeadOID
+// (the active Gate 1 approval's committed spec tree — never the worktree)
+// and unions parseScenarioTags across all of them. A missing spec/features/
+// directory at that commit is not an error — `git ls-tree` on a non-existent
+// pathspec returns empty output, exit 0 — it just yields no scenario IDs.
+func gate1ScenarioIDs(g plan.GitRunner, gate1HeadOID string) (map[string]bool, error) {
+	out, err := g.Git("ls-tree", "-r", "--name-only", gate1HeadOID, "--", "spec/features")
+	if err != nil {
+		return nil, fmt.Errorf("plan: list spec/features at %s: %w", gate1HeadOID, err)
+	}
+	ids := map[string]bool{}
+	for _, path := range strings.Split(string(out), "\n") {
+		if path == "" {
+			continue
+		}
+		content, err := g.Git("show", gate1HeadOID+":"+path)
+		if err != nil {
+			return nil, fmt.Errorf("plan: read %s at %s: %w", path, gate1HeadOID, err)
+		}
+		for id := range parseScenarioTags(string(content)) {
+			ids[id] = true
+		}
+	}
+	return ids, nil
+}
+
+// PlanList 列出納管 plan 樹（spec.PlanScope.Match 過濾），鏡射 SpecList。
+func (a *App) PlanList() ([]FileNode, error) {
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	planRoot := filepath.Join(root, "plan")
+	var out []FileNode
+	err = filepath.WalkDir(planRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			if os.IsNotExist(werr) && path == planRoot {
+				return nil // plan/ 尚未建立：無納管檔
+			}
+			return werr
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() || !spec.PlanScope.Match(rel) {
+			return nil
+		}
+		out = append(out, FileNode{Name: d.Name(), Path: rel, IsDir: false})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PlanRead 讀既有納管 plan 檔；Digest 格式同 SpecRead（specDigestOf）。
+func (a *App) PlanRead(rel string) (SpecFile, error) {
+	if !spec.PlanScope.Match(rel) {
+		return SpecFile{}, fmt.Errorf("path %q is not a managed plan file", rel)
+	}
+	p, err := a.resolveInWorkspace(rel)
+	if err != nil {
+		return SpecFile{}, err
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return SpecFile{}, err
+	}
+	return SpecFile{Content: string(raw), Digest: specDigestOf(raw)}, nil
+}
+
+// ErrPlanWriteConflict：PlanWrite 版的 ErrSpecWriteConflict（同一 optimistic
+// concurrency 語意，見其 doc comment），獨立錯誤值供呼叫端以 errors.Is 區分
+// 是 spec 樹還是 plan 樹撞鎖。
+var ErrPlanWriteConflict = errors.New("plan write conflict: expected_digest does not match current file")
+
+// PlanWrite 逐字鏡射 SpecWrite（atomic rename＋optimistic concurrency＋
+// symlink-escape containment；完整威脅模型與逐步理由見 SpecWrite 的 doc
+// comment，此處不重複），差異僅：scope 檢查換 spec.PlanScope.Match、衝突錯誤
+// 換 ErrPlanWriteConflict、暫存檔前綴換 ".plan-write-*.tmp"。
+func (a *App) PlanWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+	if !spec.PlanScope.Match(rel) {
+		return "", fmt.Errorf("path %q is not a managed plan file", rel)
+	}
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	target := filepath.Join(root, filepath.Clean("/"+rel))
+	parent := filepath.Dir(target)
+
+	if raw, rerr := os.ReadFile(target); rerr == nil {
+		if expectedDigest != specDigestOf(raw) {
+			return "", ErrPlanWriteConflict
+		}
+	} else if os.IsNotExist(rerr) {
+		if expectedDigest != "" {
+			return "", ErrPlanWriteConflict
+		}
+	} else {
+		return "", rerr
+	}
+
+	ancestor, aerr := deepestExistingAncestor(parent, root)
+	if aerr != nil {
+		return "", aerr
+	}
+	resolvedAncestor, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if resolvedAncestor != root && !strings.HasPrefix(resolvedAncestor, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	canonicalParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
+	if canonicalParent != root && !strings.HasPrefix(canonicalParent, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace", rel)
+	}
+	finalTarget := filepath.Join(canonicalParent, filepath.Base(target))
+
+	tmp, err := os.CreateTemp(canonicalParent, ".plan-write-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, werr := tmp.WriteString(content); werr != nil {
+		_ = tmp.Close()
+		return "", werr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return "", cerr
+	}
+	if rerr := os.Rename(tmpPath, finalTarget); rerr != nil {
+		return "", rerr
+	}
+	return specDigestOf([]byte(content)), nil
+}
+
+// PreviewPlanCommit 回傳目前 plan/ 樹相對 HEAD 的 diff與 CommitToken；
+// token.AnalysisBase 取自 worktree 唯一 plan 文件的 analysis_base_commit——
+// 讀不到（plan/ 沒有或有多份候選文件）或欄位為空即拒絕（§3.0：lineage 驗證
+// 的起點必須先在 worktree 就確立，Confirm 時再核對是否漂移）。
+func (a *App) PreviewPlanCommit() (SpecCommitPreview, error) {
+	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.planRepo
+		return SpecCommitPreview{}, err
+	}
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return SpecCommitPreview{}, err
+	}
+	_, pl, err := worktreePlanDoc(root)
+	if err != nil {
+		return SpecCommitPreview{}, fmt.Errorf("preview plan commit: %w", err)
+	}
+	if pl.AnalysisBaseCommit == "" {
+		return SpecCommitPreview{}, errors.New("plan: analysis_base_commit missing in worktree plan — run PlannerAssist and keep its value before commit")
+	}
+	tok, diff, err := a.planRepo.PreviewSpecCommit()
+	if err != nil {
+		return SpecCommitPreview{}, err
+	}
+	tok.AnalysisBase = pl.AnalysisBaseCommit
+	return SpecCommitPreview{Token: tok, Diff: diff}, nil
+}
+
+// ConfirmPlanCommit 以 PreviewPlanCommit 回傳的 token 提交 plan/ 樹異動。除
+// planRepo.ConfirmSpecCommit 既有的 HeadOID／TreeDigest staleness 檢查外，
+// 額外重讀 worktree plan 的 analysis_base_commit：與 token.AnalysisBase 不符
+// （含此時讀不到）視同 token 過期，回 spec.ErrCommitStale——commit 期間
+// analysis_base_commit 被改動，Preview 當下核對過的 lineage 起點已不可信。
+func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
+	if _, err := a.ensureGate(); err != nil {
+		return err
+	}
+	root, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return err
+	}
+	_, pl, err := worktreePlanDoc(root)
+	if err != nil || pl.AnalysisBaseCommit == "" || pl.AnalysisBaseCommit != tok.AnalysisBase {
+		return spec.ErrCommitStale
+	}
+	return a.planRepo.ConfirmSpecCommit(tok, message)
+}
+
+// gate2Bindings assembles the five §3.3 required Gate 2 bindings.
+func gate2Bindings(specManifest, planManifest, baseCommit, riskPolicyDigest, permissionManifestDigest string) []gate.Binding {
+	return []gate.Binding{
+		{Kind: "spec_manifest", Ref: "spec/", Digest: specManifest},
+		{Kind: "plan", Ref: "plan/", Digest: planManifest},
+		{Kind: "base_commit", Ref: "HEAD", Digest: baseCommit},
+		{Kind: "risk_policy", Ref: "plan/risk-policy.yaml", Digest: riskPolicyDigest},
+		{Kind: "permission_manifest", Ref: "plan/permissions/", Digest: permissionManifestDigest},
+	}
+}
+
+// SubmitPlanForApproval 送出 Gate 2 核可申請（committed context 閉環，凍結
+// 順序，見 task-12-brief.md）：
+//  1. 存在 active Gate 1；spec_manifest／base_commit 直接取自其 binding
+//     （不重算 worktree——兩者不一致由 Gate 1 STALE 機制處理，非本函式職責）
+//  2. plan/ scope dirty-tree 拒核（BuildCommittedSnapshot with PlanScope）
+//  3. 讀 committed plan（LoadAt(plan_commit=HEAD, planID)）
+//  4. scenario 集合取自 active Gate 1 綁定的 committed spec tree
+//  5. plan.Validate（fail 即拒）
+//  6. lineage 驗證（analysis_base_commit..plan_commit 限 plan/**）
+//  7. 組五筆 bindings → Submit("gate2","plan:"+planID,bindings)
+func (a *App) SubmitPlanForApproval(planID string) (string, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return "", err
+	}
+
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	gate1SpecManifest, gate1BaseCommit, ok := activeGate1Binding(entries)
+	if !ok {
+		return "", errors.New("plan: no active Gate 1 approval — approve the spec before submitting a plan for Gate 2")
+	}
+
+	planManifestDigest, planBaseCommit, err := spec.BuildCommittedSnapshotScoped(a.planRepo, spec.PlanScope)
+	if err != nil {
+		return "", err
+	}
+	planHeadOID := gitOIDFromDigest(planBaseCommit)
+
+	pl, pol, err := a.planLoader.LoadAt(planHeadOID, planID)
+	if err != nil {
+		return "", fmt.Errorf("plan: load committed plan %q at %s: %w", planID, planHeadOID, err)
+	}
+	if pl.PlanID != planID {
+		return "", fmt.Errorf("plan: committed plan.yaml plan_id %q does not match filename-derived plan ID %q", pl.PlanID, planID)
+	}
+
+	gate1HeadOID := gitOIDFromDigest(gate1BaseCommit)
+	specScenarios, err := gate1ScenarioIDs(a.planGit, gate1HeadOID)
+	if err != nil {
+		return "", err
+	}
+
+	if errs := plan.Validate(pl, pol, specScenarios); len(errs) > 0 {
+		verr := fmt.Errorf("plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: %w", errors.Join(errs...))
+		if hasRiskClassificationError(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
+			a.workflowMu.Lock()
+			_, cerr := a.escCreateSystemLocked("risk-unclassifiable:"+planID, "gate2:"+planID, true,
+				"plan "+planID+" 的 risk 分類驗證失敗（minimum 無法重算）", "plan:"+planID)
+			a.workflowMu.Unlock()
+			if cerr != nil {
+				return "", errors.Join(verr, cerr)
+			}
+		}
+		return "", verr
+	}
+	// (1) 權威修復：新版 committed plan 通過 plan.Validate 即系統解除同 key
+	// （無未 resolved 項時 no-op）。
+	a.workflowMu.Lock()
+	riskResolveErr := a.escResolveByKeyLocked("risk-unclassifiable:"+planID, "validated:"+planHeadOID)
+	a.workflowMu.Unlock()
+	if riskResolveErr != nil {
+		return "", riskResolveErr
+	}
+
+	if err := plan.VerifyLineage(a.planGit, pl.AnalysisBaseCommit, planHeadOID, spec.PlanScope.Match); err != nil {
+		return "", err
+	}
+
+	riskPolicyRaw, err := a.planGit.Git("show", planHeadOID+":plan/risk-policy.yaml")
+	if err != nil {
+		return "", fmt.Errorf("plan: read committed risk policy at %s: %w", planHeadOID, err)
+	}
+	riskPolicyDigest := specDigestOf(riskPolicyRaw)
+
+	permEntries, err := permissionRefEntries(taskPermissionRefs(pl), func(rel string) ([]byte, error) {
+		return a.planGit.Git("show", planHeadOID+":plan/"+rel)
+	})
+	if err != nil {
+		return "", err
+	}
+	permissionManifestDigest, err := permissionManifestScope.ManifestDigest(permEntries)
+	if err != nil {
+		return "", err
+	}
+
+	bindings := gate2Bindings(gate1SpecManifest, planManifestDigest, planBaseCommit, riskPolicyDigest, permissionManifestDigest)
+	return a.submitGateRequest(svc, "gate2", "plan:"+planID, bindings)
+}
+
+// hasRiskClassificationError：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk
+// 分類失敗（minimum 重算不符、tier 名稱未知）。plan.Validate 回傳未型別化的
+// inline errors，這裡以訊息片段比對——脆弱點已知（validate.go 措辭改動需同步），
+// 換 typed error 屬 internal/plan 的 API 擴張，非本 task scope。
+func hasRiskClassificationError(errs []error) bool {
+	for _, e := range errs {
+		msg := e.Error()
+		if strings.Contains(msg, "does not match recomputed") ||
+			strings.Contains(msg, "unknown minimum_risk_tier") ||
+			strings.Contains(msg, "unknown planner_risk_tier") {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- Evidence run（Task 20：M3a §4-5，wraps internal/evidence）----
+
+// RegisterMutation 把一份 negative_control 用的 patch 存進 evidence CAS
+// store，再把描述它的 Mutation 記錄 append 進 evidence journal，回傳新產生的
+// mutation_id。RunEvidence 的 negative_control 路徑只接受 mutation_id（不接受
+// 原始 patch bytes）——patch 內容一律經由此登記，落盤與可稽核的紀錄同時成立
+// （鏡射 Task 17 CAS＋Task 20 journal 的既定順序：CAS 先落盤才 append）。
+func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+	digest, _, err := evidence.PutCAS(a.evidenceCASDir, []byte(patch))
+	if err != nil {
+		return "", fmt.Errorf("evidence: put mutation patch in CAS: %w", err)
+	}
+	m := evidence.Mutation{
+		MutationID: contract.NewULID(time.Now()),
+		TaskRef:    taskRef,
+		Digest:     digest,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := a.evidenceJournal.AppendMutation(m); err != nil {
+		return "", fmt.Errorf("evidence: append mutation: %w", err)
+	}
+	return m.MutationID, nil
+}
+
+// RunEvidence 同步執行 planID/taskID 已核可（Gate 2 active）的 TestContract，
+// 對 testCommit 的 committed tree 產生一筆 EvidenceRun，回傳 evidence_id。
+// kind="negative_control" 時 mutationID 必填，其登記的 patch（RegisterMutation）
+// 會被套用；kind="expected_red" 時 mutationID 必須為空（evidence.Run 本身拒絕
+// 帶 mutation 的 expected_red，見 runner.go）。
+//
+// Lifecycle ownership（task-20-brief.md 凍結，不依賴 Task 24 的
+// workflowMu）：beginAppTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
+// shutdown 後拒新 run）；執行 context 衍生自 a.ctx（app 的 shutdown-scoped
+// context，同 SpecAssist／StartSession 的既定用法），供 reclaimEvidenceRuns
+// 手動 cancel。evidence.Run 內部才會 mint evidence_id（ulid callback），所以
+// active-run registry 的登記時機挪進 ulid callback 本身。
+//
+// beginAppTxn 成功到 ulid callback 執行之間，evidence.Run 已經先跑了
+// LoadAt／LoadOracleAt／VerifyLineage／OracleDigestAt 這串 git 呼叫——這段
+// 窗口 evidenceActive 還沒有這筆 run 的登記，若 shutdown 的 reclaimEvidenceRuns
+// snapshot 剛好落在這裡，它會拿到空清單、cancel 永遠送不到這個 run（review
+// M1）。ulid callback 因此在登記進 a.evidenceActive 之後，於 shutMu 下複查
+// a.shuttingDown：若已經在 shutdown 中（不論 reclaimEvidenceRuns 是否已經跑
+// 過、還是根本還沒開始），就自我 cancel——不依賴任何人「之後」再來 cancel
+// 一次，因為 reclaimEvidenceRuns 那一次性的 snapshot 可能已經錯過。
+// registry 移除與 journal finalize（AppendEvidenceRun）在同一個 evidenceMu
+// 臨界區內完成：這是「恰一次 finalize」的落點。若 ctx 在 Run 返回時已被取消
+// （shutdown reclaim 或上述自我 cancel 造成），即使 evidence.Run 本身回傳了
+// 一筆語意完整的 EvidenceRun（ctx 取消走的是 abortReason="context
+// canceled"，不是 Go error），也視為未完成、不 finalize——一個被 shutdown
+// 中止的 run 不能被當成有效證據收進 journal。
+func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (string, error) {
+	if kind != "expected_red" && kind != "negative_control" {
+		return "", fmt.Errorf("evidence: unknown kind %q", kind)
+	}
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+
+	var mutationPatch []byte
+	if kind == "negative_control" {
+		if mutationID == "" {
+			return "", errors.New("evidence: negative_control requires a mutation_id")
+		}
+		m, merr := a.evidenceJournal.GetMutation(mutationID)
+		if merr != nil {
+			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
+		}
+		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
+		if oerr != nil {
+			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
+		}
+		mutationPatch = patch
+	} else if mutationID != "" {
+		return "", errors.New("evidence: expected_red must not carry a mutation_id")
+	}
+
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 run
+		return "", err
+	}
+	defer a.endAppTxn()
+
+	ctx, cancel := context.WithCancel(a.ctx)
+	defer cancel()
+
+	a.manager.EmitWorkspace(evidenceRunEventKind, nil, map[string]any{
+		"phase": "started", "plan_id": planID, "task_id": taskID,
+		"kind": kind, "test_commit": testCommit,
+	})
+
+	var evidenceID string
+	ulidFn := func() string {
+		id := contract.NewULID(time.Now())
+		a.evidenceMu.Lock()
+		a.evidenceActive[id] = cancel
+		a.evidenceMu.Unlock()
+		evidenceID = id
+
+		// review M1：登記後立刻複查 shuttingDown——若 shutdown 已經開始（不論
+		// reclaimEvidenceRuns 的 snapshot 是落在登記之前還是之後），自我
+		// cancel，不指望還會有第二次 reclaim 機會來 cancel 這筆剛登記的 run。
+		a.shutMu.Lock()
+		shuttingDown := a.shuttingDown
+		a.shutMu.Unlock()
+		if shuttingDown {
+			cancel()
+		}
+		return id
+	}
+	nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+	ld := evidence.ContextLoader(a.planLoader)
+	if a.evidenceContextLoaderOverride != nil { // 測試注入：見 evidenceContextLoaderOverride 欄位 doc
+		ld = a.evidenceContextLoaderOverride
+	}
+	rs := evidence.RunSpec{
+		Kind: kind, PlanID: planID, TaskID: taskID,
+		PlanCommit: planCommit, TestCommit: testCommit, MutationPatch: mutationPatch,
+	}
+	run, runErr := evidence.Run(ctx, a.workspaceDir, a.evidenceCASDir, a.evidenceRegistryPath,
+		ld, rs, ulidFn, nowFn)
+	if runErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			runErr = fmt.Errorf("evidence: run canceled: %w", ctxErr)
+		}
+	}
+
+	a.evidenceMu.Lock()
+	if evidenceID != "" {
+		delete(a.evidenceActive, evidenceID)
+	}
+	var appendErr error
+	if runErr == nil {
+		appendErr = a.evidenceJournal.AppendEvidenceRun(run)
+	}
+	a.evidenceMu.Unlock()
+
+	finalErr := runErr
+	if finalErr == nil {
+		finalErr = appendErr
+	}
+
+	// Task 24（§3.8 (5)(6)(7)＋A8）：finalize 成功（run 已 durable）才接線
+	// escalation 自動來源。workflowMu 在 evidenceMu 臨界區之外另取（lock
+	// ordering：兩把鎖不巢狀，見 workflowMu 欄位 doc）；escalation 寫入失敗
+	// fail loud——run 記錄本身已 durable，但自動來源沒記上不得無聲。
+	if finalErr == nil {
+		if escErr := a.wireEvidenceEscalation(planID, taskID, kind, evidenceID, run.Result); escErr != nil {
+			finalErr = escErr
+		}
+	} else if runErr != nil && ctx.Err() == nil {
+		// review Medium（§3.8 (5) 環境錯誤子類補洞）：command 無法啟動等
+		// runner-level error 不產 EvidenceRun（journal 未寫、上面的 result 分流
+		// 走不到）——同 key 開 evidence-error 項，key 同構故 A8 的「同 key 新
+		// run passed → resolveByKey」自然涵蓋解除。shutdown cancel
+		// （ctx.Err()!=nil）不開項：那是 reclaim，不是環境錯誤。appendErr
+		// （runErr==nil 但 journal 寫入失敗）也不在此開項——那屬 (8)
+		// journal-degraded，由 reconcileLocked 的掃描補建。
+		a.workflowMu.Lock()
+		_, cerr := a.escCreateSystemLocked("evidence-error:"+planID+"/"+taskID+"/"+kind,
+			"tca:"+planID+"/"+taskID, false,
+			"evidence run（"+kind+"）啟動失敗："+runErr.Error(), "run:"+planID+"/"+taskID+"/"+kind)
+		a.workflowMu.Unlock()
+		if cerr != nil {
+			finalErr = errors.Join(finalErr, cerr)
+		}
+	}
+
+	payload := map[string]any{
+		"phase": "finished", "evidence_id": evidenceID,
+		"plan_id": planID, "task_id": taskID, "kind": kind,
+	}
+	if finalErr != nil {
+		payload["error"] = finalErr.Error()
+	} else {
+		payload["result"] = run.Result
+	}
+	a.manager.EmitWorkspace(evidenceRunEventKind, nil, payload)
+
+	if finalErr != nil {
+		return "", finalErr
+	}
+	return evidenceID, nil
+}
+
+// evidenceRunEventKind：RunEvidence 進度事件的 EmitWorkspace kind——additive
+// only（每次呼叫各發一筆 started／finished，從不覆寫既有事件）。
+const evidenceRunEventKind = "evidence_run"
+
+// EvidenceGet 回傳 journal 內 evidenceID 對應的完整 EvidenceRun（含 journal
+// 重播後重建的紀錄）。
+func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
+	if a.evidenceJournal == nil {
+		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
+	}
+	return a.evidenceJournal.Get(evidenceID)
+}
+
+// CommitInfo is a single candidate for TcaWorkspace's test_commit dropdown
+// (Task 22): OID/Subject only — the UI shows a short OID + subject, the full
+// value goes into ValidateTestCommit/RunEvidence untouched.
+type CommitInfo struct {
+	OID     string `json:"oid"`
+	Subject string `json:"subject"`
+}
+
+// ValidateTestCommit is the UI's pre-flight lineage check (Task 22, §6/A4):
+// before spending a worktree checkout + command run on RunEvidence, let
+// TcaWorkspace surface a plan_commit..testCommit lineage error immediately.
+// It reuses exactly the checks evidence.Run performs before ever touching a
+// worktree — LoadAt (task must exist in the committed plan) and
+// LoadOracleAt+plan.VerifyLineage (every path touched in that range must
+// stay within the declared oracle surface) — against the same active Gate 2
+// plan_commit RunEvidence trusts (activeGate2PlanCommit), never the
+// caller-supplied testCommit's own ancestry. Validate only: no worktree, no
+// command execution.
+func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
+	entries, err := a.GateList()
+	if err != nil {
+		return err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	pl, _, err := a.planLoader.LoadAt(planCommit, planID)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, t := range pl.Tasks {
+		if t.ID == taskID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("evidence: task %q not found in plan %q at %s", taskID, planID, planCommit)
+	}
+	oracleDecl, err := a.planLoader.LoadOracleAt(planCommit)
+	if err != nil {
+		return err
+	}
+	return plan.VerifyLineage(a.planGit, planCommit, testCommit, oracleDecl.Match)
+}
+
+// EvidenceCommitCandidates lists the most recent commits after the active
+// Gate 2 plan_commit (Task 22): the data source for TcaWorkspace's
+// test_commit dropdown — `git log --format=%H%x00%s -n 20 <plan_commit>..HEAD`,
+// newest first (git log's default order). Returns an empty (non-nil) slice
+// when the range has no commits, never nil, so the frontend can render it
+// without a null-check.
+func (a *App) EvidenceCommitCandidates(planID string) ([]CommitInfo, error) {
+	entries, err := a.GateList()
+	if err != nil {
+		return nil, err
+	}
+	planCommit, ok := activeGate2PlanCommit(entries, planID)
+	if !ok {
+		return nil, fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	out, err := a.planGit.Git("log", "--format=%H%x00%s", "-n", "20", planCommit+"..HEAD")
+	if err != nil {
+		return nil, err
+	}
+	return parseCommitCandidates(out), nil
+}
+
+// parseCommitCandidates parses `git log --format=%H%x00%s` output (one
+// "<oid>\x00<subject>" record per line, newline-delimited — git log's
+// default record separator, unlike the -z NUL-delimited format
+// plan.VerifyLineage's diff parsing needs).
+func parseCommitCandidates(out []byte) []CommitInfo {
+	trimmed := strings.TrimRight(string(out), "\n")
+	if trimmed == "" {
+		return []CommitInfo{}
+	}
+	lines := strings.Split(trimmed, "\n")
+	result := make([]CommitInfo, 0, len(lines))
+	for _, ln := range lines {
+		parts := strings.SplitN(ln, "\x00", 2)
+		ci := CommitInfo{OID: parts[0]}
+		if len(parts) > 1 {
+			ci.Subject = parts[1]
+		}
+		result = append(result, ci)
+	}
+	return result
+}
+
+// tcaBindings assembles the six §3.4 required test_contract_approval
+// bindings (Task 21). gate2ApprovalID/gate2RecordDigest/gate2BaseCommitDigest
+// anchor this contract to the specific gate2 ApprovalRecord it was decided
+// under (§3.0); the evidence_run/mutation digests are read straight from
+// already-computed journal/CAS values — SubmitTestContract never re-derives
+// or pre-validates them itself, that is entirely TCAPolicy's job.
+func tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest string,
+	testCommit, oracleSurfaceDigest string,
+	redEvidenceID, redDigest, negEvidenceID, negDigest, mutationID, mutationDigest string) []gate.Binding {
+	return []gate.Binding{
+		{Kind: "gate2_approval", Ref: "approval:" + gate2ApprovalID, Digest: gate2RecordDigest},
+		{Kind: "base_commit", Ref: "plan_commit", Digest: gate2BaseCommitDigest},
+		{Kind: "oracle_surface", Ref: testCommit, Digest: oracleSurfaceDigest},
+		{Kind: "evidence_run", Role: "expected_red", Ref: redEvidenceID, Digest: redDigest},
+		{Kind: "evidence_run", Role: "negative_control", Ref: negEvidenceID, Digest: negDigest},
+		{Kind: "mutation", Ref: mutationID, Digest: mutationDigest},
+	}
+}
+
+// SubmitTestContract 送出 TCA（test_contract_approval）核可申請（Task 21，
+// §3.4）：讀 active gate2（subject="plan:"+planID）取得其完整 ApprovalRecord
+// ——gate2_approval binding 的 ref/digest 來源，base_commit binding 原樣複製
+// 其 base_commit（§3.0 錨定，TCAPolicy.BuildDecision 另外覆核兩者相符）；再讀
+// expectedRedID／negativeControlID 兩筆 EvidenceRun（EvidenceRunDigest 現算）
+// 與 mutationID 的 Mutation（digest 直接取 CAS digest），組六筆 bindings 後
+// Submit——bindings 本身是否彼此一致（role/kind、兩筆 passed、descriptor 等）
+// 全交給 TCAPolicy.ValidateRequest／BuildDecision，這裡只負責組裝已有的值。
+func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID string) (string, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return "", err
+	}
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
+
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	gate2ApprovalID, ok := activeGate2ApprovalID(entries, planID)
+	if !ok {
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	gate2Rec, _, err := svc.Lookup(gate2ApprovalID)
+	if err != nil {
+		return "", err
+	}
+	if gate2Rec == nil {
+		return "", fmt.Errorf("gate: gate2 approval %q has no record", gate2ApprovalID)
+	}
+	gate2RecordDigest, err := gate.RecordDigest(*gate2Rec)
+	if err != nil {
+		return "", err
+	}
+	gate2BaseCommitDigest := bindingDigest(gate2Rec.Bindings, "base_commit")
+
+	redRun, err := a.evidenceJournal.Get(expectedRedID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load expected_red evidence %q: %w", expectedRedID, err)
+	}
+	redDigest, err := evidence.EvidenceRunDigest(redRun)
+	if err != nil {
+		return "", err
+	}
+	negRun, err := a.evidenceJournal.Get(negativeControlID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load negative_control evidence %q: %w", negativeControlID, err)
+	}
+	negDigest, err := evidence.EvidenceRunDigest(negRun)
+	if err != nil {
+		return "", err
+	}
+	m, err := a.evidenceJournal.GetMutation(mutationID)
+	if err != nil {
+		return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, err)
+	}
+
+	bindings := tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest,
+		testCommit, redRun.OracleSurfaceDigest,
+		expectedRedID, redDigest, negativeControlID, negDigest, mutationID, m.Digest)
+	return a.submitGateRequest(svc, "test_contract_approval", "task:"+planID+"/"+taskID, bindings)
+}
+
+// reclaimEvidenceRuns：shutdown 對 in-flight RunEvidence 的收束——cancel 每個
+// active run 的 context（鏡射 reclaimAssists，task-20-brief.md 凍結順序：必須
+// 早於 inflight.Wait，RunEvidence 持 txn，否則長時 runner 會讓 Wait 死等）。
+// runner 的 ctx cancel 路徑（evidence.Run→runCommand）負責收拾 process group
+// 與 worktree；下次啟動的 CleanupOrphans／CleanOrphanTemps 兜底任何未收乾淨
+// 的殘留（見 startupEvidence）。
+func (a *App) reclaimEvidenceRuns() {
+	a.evidenceMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(a.evidenceActive))
+	for _, c := range a.evidenceActive {
+		cancels = append(cancels, c)
+	}
+	a.evidenceMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+}
+
+// GateDecisionTaskDTO：GateDecisionContext 的單一 task risk 列，供 Gate 2
+// 卡片渲染 risk decision 輸入介面。
+type GateDecisionTaskDTO struct {
+	TaskID          string `json:"task_id"`
+	Title           string `json:"title"`
+	MinimumRiskTier string `json:"minimum_risk_tier"`
+	PlannerRiskTier string `json:"planner_risk_tier"`
+}
+
+type GateDecisionContextDTO struct {
+	Tasks []GateDecisionTaskDTO `json:"tasks"`
+}
+
+// GateDecisionContext 回傳 approvalID（gate2 的 pending request 或 approved
+// record）所綁 committed plan 之 task risk 列。一律從該筆的 base_commit
+// （plan_commit）binding 用 PlanLoader.LoadAt 讀 committed plan——絕不讀
+// worktree：送核後修改 worktree plan 不得改變這裡的回傳值（committed 才是
+// 核可對象），前端不得以目前 worktree plan 推導 minimum／planner。
+func (a *App) GateDecisionContext(approvalID string) (GateDecisionContextDTO, error) {
+	entries, err := a.GateList()
+	if err != nil {
+		return GateDecisionContextDTO{}, err
+	}
+	var found *GateEntryDTO
+	for i := range entries {
+		if entries[i].ApprovalID == approvalID {
+			found = &entries[i]
+			break
+		}
+	}
+	if found == nil {
+		return GateDecisionContextDTO{}, fmt.Errorf("gate: approval id %q not found", approvalID)
+	}
+	planID, ok := planIDFromSubject(found.Subject)
+	if !ok {
+		return GateDecisionContextDTO{}, fmt.Errorf("gate: approval %q is not a gate2 plan approval (subject %q)", approvalID, found.Subject)
+	}
+	planCommit := gitOIDFromDigest(bindingDigest(found.Bindings, "base_commit"))
+	if planCommit == "" {
+		return GateDecisionContextDTO{}, fmt.Errorf("gate: approval %q missing base_commit binding", approvalID)
+	}
+	pl, _, err := a.planLoader.LoadAt(planCommit, planID)
+	if err != nil {
+		return GateDecisionContextDTO{}, err
+	}
+	tasks := make([]GateDecisionTaskDTO, 0, len(pl.Tasks))
+	for _, t := range pl.Tasks {
+		tasks = append(tasks, GateDecisionTaskDTO{TaskID: t.ID, Title: t.Title,
+			MinimumRiskTier: t.MinimumRiskTier, PlannerRiskTier: t.PlannerRiskTier})
+	}
+	return GateDecisionContextDTO{Tasks: tasks}, nil
+}
+
 // GateEntryDTO：GateList 的 JSON-friendly projection（前端消費）。
 type GateEntryDTO struct {
 	ApprovalID         string         `json:"approval_id"`
 	State              string         `json:"state"`
 	Gate               string         `json:"gate,omitempty"`
+	Subject            string         `json:"subject,omitempty"` // Task 12：gate2 為 "plan:<plan_id>"（v1 gate1 請求無此欄位）
 	SpecManifestDigest string         `json:"spec_manifest_digest,omitempty"`
 	BaseCommit         string         `json:"base_commit,omitempty"`
 	CreatedAt          string         `json:"created_at,omitempty"`
@@ -1024,7 +2388,7 @@ type GateEntryDTO struct {
 	JournalDegraded    bool           `json:"journal_degraded,omitempty"`
 }
 
-// GateList 回傳 Gate 1 projection。Service.List 內部先 ReconcileGate1 才
+// GateList 回傳 Gate 1 projection。Service.List 內部先 Reconcile 才
 // Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
 // degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
 func (a *App) GateList() ([]GateEntryDTO, error) {
@@ -1042,13 +2406,18 @@ func (a *App) GateList() ([]GateEntryDTO, error) {
 		dto := GateEntryDTO{ApprovalID: e.ApprovalID, State: string(e.State), JournalDegraded: degraded}
 		if e.Request != nil {
 			dto.Gate = e.Request.Gate
+			dto.Subject = e.Request.Subject
 			dto.SpecManifestDigest = e.Request.SpecManifestDigest
 			dto.BaseCommit = e.Request.BaseCommit
 			dto.CreatedAt = e.Request.CreatedAt
+			dto.Bindings = e.Request.Bindings // v2 request carries bindings even while still pending
 		}
 		if e.Record != nil {
 			if dto.Gate == "" {
 				dto.Gate = e.Record.Gate
+			}
+			if dto.Subject == "" {
+				dto.Subject = e.Record.Subject
 			}
 			dto.Bindings = e.Record.Bindings
 			dto.Decision = e.Record.Decision
@@ -1082,10 +2451,16 @@ func (a *App) gitIdentity() (name, email string, err error) {
 
 // GateDecide 對 pending approval 記錄核可／駁回決議。approver 一律取 git
 // identity——name／email 皆缺一律拒絕，不生成假 approver ID（spec §5.4）。
-// 核可時的 Gate 1 bindings 重用 pending request 當初記錄的 spec_manifest
-// digest／base_commit（不在 decide 當下重掃 worktree——避免決議內容漂移到
-// 「核可時」而非「申請時」的快照，也不要求 decide 當下 worktree 仍乾淨）。
-func (a *App) GateDecide(approvalID, decision, reason string) error {
+// 核可時的 bindings 由 Service 內部從 pending request 複製（不在 decide 當下
+// 重掃 worktree——避免決議內容漂移到「核可時」而非「申請時」的快照，也不要求
+// decide 當下 worktree 仍乾淨），並以 policy 的 current-binding validation
+// 擋掉待核期間已過期的請求（§3.1）。riskSelections 供 gate2 用；gate1 傳空即可。
+//
+// Task 24（spec §3.10 凍結順序，app 層編排）：整段在 workflowMu 下執行——
+// reconcile → validator（PrepareDecision）→ [approved 時 2b：stale 修復解除]
+// → blocking escalation 檢查 → append（CommitDecision）。blocker 只能在
+// workflowMu 之外排隊，不存在「檢查後、append 前」被插入的窗口。
+func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection) error {
 	svc, err := a.ensureGate()
 	if err != nil {
 		return err
@@ -1103,25 +2478,353 @@ func (a *App) GateDecide(approvalID, decision, reason string) error {
 	}
 	approver := gate.Approver{ID: id, Method: "app-local"}
 
-	var bindings []gate.Binding
-	if decision == "approved" {
-		entries, lerr := svc.List()
-		if lerr != nil {
-			return lerr
-		}
-		var req *gate.GateRequest
-		for _, e := range entries {
-			if e.ApprovalID == approvalID {
-				req = e.Request
-				break
-			}
-		}
-		if req == nil {
-			return gate.ErrNotPending
-		}
-		bindings = gate1Bindings(req.SpecManifestDigest, req.BaseCommit)
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if err := a.reconcileLocked(svc); err != nil { // 1. reconcile bindings（含 §3.8 stale／journal-degraded 補建）
+		return err
 	}
-	return svc.Decide(approvalID, decision, reason, approver, bindings)
+	prepared, err := svc.PrepareDecision(approvalID, decision, reason, approver,
+		gate.DecisionInput{RiskSelections: riskSelections}) // 2. 硬性 validator＋approved 的 current-binding validation
+	if err != nil {
+		return err
+	}
+	scope := scopeForSubject(prepared.Record.Gate, prepared.Record.Subject)
+	if prepared.Record.Decision == "approved" { // 2b. 修復解除（凍結時點）：
+		// current-binding validation 已通過 ＝ 同 subject 的 stale 條件已被此修正版
+		// 修復；在 blocker 檢查前系統解除舊 stale blocker（stale record 本身是終態，
+		// 修復載體是修正版的核可流程）。resolve 寫入失敗 → 拒絕核可（fail closed，
+		// §3.10：escalation journal 寫不進去時 Gate 不得放行）。
+		key := "stale:" + prepared.Record.Gate + ":" + prepared.Record.Subject
+		if rerr := a.escResolveByKeyLocked(key, "superseded-by:"+prepared.Record.ApprovalID); rerr != nil {
+			return rerr
+		}
+	}
+	items, berr := a.escBlockingForLocked(scope) // 3. blocking escalation（Project 失敗＝收件匣不可用，一樣拒——不裝空）
+	if berr != nil {
+		return berr
+	}
+	if len(items) > 0 {
+		return fmt.Errorf("blocked by %d escalation item(s): %s", len(items), summarizeEscalations(items))
+	}
+	if h := a.decideBarrierHook; h != nil { // 測試 seam：blocker 檢查後、append 前
+		h()
+	}
+	return svc.CommitDecision(prepared) // 4. append
+}
+
+// ---- Escalation inbox（Task 24：spec §3.8／§3.10）----
+
+// ensureEscalation 惰性初始化 escalation.Service，journal 落在 workspace 的
+// .workbench/escalation.jsonl（同 ensureGate 之於 gate.jsonl——綁 workspace，
+// 不隨測試 stateDir 漂移）。
+func (a *App) ensureEscalation() (*escalation.Service, error) {
+	a.escOnce.Do(func() {
+		root, err := claude.NormalizeCWD(a.workspaceDir)
+		if err != nil {
+			a.escInitErr = err
+			return
+		}
+		wbDir := filepath.Join(root, ".workbench")
+		if merr := os.MkdirAll(wbDir, 0o755); merr != nil {
+			a.escInitErr = merr
+			return
+		}
+		j, jerr := escalation.OpenJournal(filepath.Join(wbDir, "escalation.jsonl"))
+		if jerr != nil {
+			a.escInitErr = jerr
+			return
+		}
+		a.escJournal = j
+		a.escSvc = escalation.NewService(j,
+			func() string { return contract.NewULID(time.Now()) },
+			func() string { return time.Now().UTC().Format(time.RFC3339Nano) })
+	})
+	return a.escSvc, a.escInitErr
+}
+
+// scopeForSubject 把 (gate, subject) 映射到 escalation block scope（§3.8）：
+// gate1→"workspace"、gate2 "plan:<id>"→"gate2:<id>"、tca "task:<p>/<t>"→
+// "tca:<p>/<t>"。未知 gate 一律映到 "workspace"（最寬 scope，fail closed）。
+func scopeForSubject(gateName, subject string) string {
+	switch gateName {
+	case "gate1":
+		return "workspace"
+	case "gate2":
+		if id, ok := planIDFromSubject(subject); ok {
+			return "gate2:" + id
+		}
+		return "gate2:" + subject
+	case "test_contract_approval":
+		if rest, ok := strings.CutPrefix(subject, "task:"); ok {
+			return "tca:" + rest
+		}
+		return "tca:" + subject
+	default:
+		return "workspace"
+	}
+}
+
+// summarizeEscalations：blocker 拒絕訊息的項目摘要（key＋summary；手動項無
+// key 用 escalation_id）。
+func summarizeEscalations(items []escalation.Entry) string {
+	parts := make([]string, 0, len(items))
+	for _, e := range items {
+		label := e.Item.ConditionKey
+		if label == "" {
+			label = e.Item.EscalationID
+		}
+		parts = append(parts, label+"（"+e.Item.Summary+"）")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// esc*Locked：已持有 workflowMu 的路徑專用（重入規約見 workflowMu 欄位 doc）。
+
+func (a *App) escCreateSystemLocked(conditionKey, blockScope string, hard bool, summary, sourceRef string) (string, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return "", err
+	}
+	return svc.CreateSystem(conditionKey, blockScope, hard, summary, sourceRef)
+}
+
+func (a *App) escResolveByKeyLocked(conditionKey, evidenceRef string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	return svc.ResolveByKey(conditionKey, evidenceRef)
+}
+
+// escBlockingForLocked 回傳覆蓋 scope 的未 resolved blocking 項。escalation
+// 初始化失敗或 Project 失敗都回錯——收件匣不可用時 Gate 決議 fail closed，
+// 絕不把「讀不到」當成「沒有 blocker」（§3.8）。
+func (a *App) escBlockingForLocked(scope string) ([]escalation.Entry, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.Entries()
+	if err != nil {
+		return nil, err
+	}
+	return escalation.BlockingFor(entries, scope), nil
+}
+
+// reconcileLocked（呼叫端持 workflowMu）：svc.List()（= Reconcile＋Project）
+// 之後依權威 projection 補建 §3.8 自動來源——
+//
+//	(3)(4) stale：State==Stale 且同 (gate,subject) 沒有 Active 修正版核可的
+//	  項目 → "stale:<gate>:<subject>"（hard=true，scope 依 scopeForSubject）。
+//	  同 key 去重由 escalation.Service.CreateSystem 保證，重複掃描冪等；已被
+//	  修正版核可（同 subject 有 Active）者不補建——其修復時點凍結在 GateDecide
+//	  2b，補建在這裡再開會讓已修復的 blocker 復活。
+//	(8) journal degraded：gate／evidence journal 已 degraded → workspace hard
+//	  項；journal 健康（例如重啟後重開成功）→ 系統解除同 key（修復條件）。
+//	  escalation journal 自身 degraded 無法寫入自己的 journal-degraded 項——
+//	  它的 fail-closed 由 esc* 呼叫端回錯（Gate 拒核）承擔。
+//
+// 接線點選擇（brief 給兩案：比對 Reconcile 前後 projection vs. 掛
+// EmitGateEvent binding_stale hook）：選權威狀態掃描——binding_stale 事件在
+// gate.Service 持內部 mu 時發出，hook 內回讀 gate（Lookup 補 gate/subject）
+// 必死鎖，且事件是通知層、掃描才符合「啟動／讀取補建」的冪等語意。
+func (a *App) reconcileLocked(svc *gate.Service) error {
+	entries, err := svc.List()
+	if err != nil {
+		return err
+	}
+	// (8) journal-degraded 補建／修復
+	if a.gateJournal != nil {
+		if err := a.escJournalDegradedLocked("gate", a.gateJournal.Degraded(), ".workbench/gate.jsonl"); err != nil {
+			return err
+		}
+	}
+	if a.evidenceJournal != nil {
+		if err := a.escJournalDegradedLocked("evidence", a.evidenceJournal.Degraded(), ".workbench/evidence/evidence.jsonl"); err != nil {
+			return err
+		}
+	}
+	// (3)(4) stale 補建
+	active := map[string]bool{}
+	for _, e := range entries {
+		if e.State == gate.Active && e.Record != nil {
+			active[e.Record.Gate+":"+e.Record.Subject] = true
+		}
+	}
+	for _, e := range entries {
+		if e.State != gate.Stale || e.Record == nil {
+			continue
+		}
+		gs := e.Record.Gate + ":" + e.Record.Subject
+		if active[gs] {
+			continue
+		}
+		if _, cerr := a.escCreateSystemLocked("stale:"+gs, scopeForSubject(e.Record.Gate, e.Record.Subject), true,
+			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——需修正版重核",
+			e.ApprovalID); cerr != nil {
+			return cerr
+		}
+	}
+	return nil
+}
+
+// escJournalDegradedLocked：§3.8 (8) 單一 journal 的補建／修復（呼叫端持
+// workflowMu）。degraded → workspace hard 項；健康 → 系統解除同 key（no-op
+// 若本無未 resolved 項）。
+func (a *App) escJournalDegradedLocked(which string, degraded bool, ref string) error {
+	key := "journal-degraded:" + which
+	if degraded {
+		_, err := a.escCreateSystemLocked(key, "workspace", true,
+			which+" journal 寫入已 degraded——重啟修復前拒絕新核可", ref)
+		return err
+	}
+	return a.escResolveByKeyLocked(key, "journal-reopened")
+}
+
+// wireEvidenceEscalation：§3.8 (5)(6)(7) 的 evidence finalize 接線＋A8 修復。
+// 呼叫端不得持 evidenceMu 或 workflowMu（lock ordering：finalize 臨界區結束
+// 後才進來，evidenceMu 與 workflowMu 不巢狀）。key 綁 plan/task/kind 而非
+// evidence_id——新 run 成功即可 ResolveByKey 舊項（A8）。
+func (a *App) wireEvidenceEscalation(planID, taskID, kind, evidenceID, result string) error {
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	scope := "tca:" + planID + "/" + taskID
+	errKey := "evidence-error:" + planID + "/" + taskID + "/" + kind
+	ncKey := "negative-control-missed:" + planID + "/" + taskID
+	switch result {
+	case "passed": // A8：同 key 新 run 通過＝權威修復，系統解除
+		if err := a.escResolveByKeyLocked(errKey, "passed:"+evidenceID); err != nil {
+			return err
+		}
+		if kind == "negative_control" {
+			return a.escResolveByKeyLocked(ncKey, "passed:"+evidenceID)
+		}
+		return nil
+	case "error": // (5)(6)：runner 逾時／環境錯誤／輸出超限／expected-red error 原因
+		_, err := a.escCreateSystemLocked(errKey, scope, false,
+			"evidence run "+evidenceID+"（"+kind+"）結果為 error", "evidence:"+evidenceID)
+		return err
+	case "failed":
+		if kind == "negative_control" { // (7)：negative control 未抓到 mutation
+			_, err := a.escCreateSystemLocked(ncKey, scope, false,
+				"negative control run "+evidenceID+" 未抓到 mutation（result=failed）", "evidence:"+evidenceID)
+			return err
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// submitGateRequest：svc.Submit 的 §3.8 (2) 接線包裝——系統組裝的送核請求先
+// 過該 gate policy 的 ValidateRequest：失敗即開 "missing-binding:<gate>:<subject>"
+// 項（同 key 去重）；通過且 Submit 成功即系統解除同 key（同 subject 新 request
+// 通過驗證＝(2) 的權威修復條件）。Submit 內部會再驗一次同一 policy——重複驗證
+// 是刻意的：app 層需要把「ValidateRequest 失敗」從其他 Submit 錯誤（journal
+// 寫入失敗等）中區分出來，而不擴大 gate.Service 的介面。
+func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bindings []gate.Binding) (string, error) {
+	key := "missing-binding:" + gateName + ":" + subject
+	if policy, ok := a.gateReg[gateName]; ok {
+		req := gate.GateRequest{Type: "gate_request", SchemaVersion: 2, Gate: gateName,
+			Subject: subject, Bindings: bindings}
+		if verr := policy.ValidateRequest(req); verr != nil {
+			a.workflowMu.Lock()
+			_, cerr := a.escCreateSystemLocked(key, scopeForSubject(gateName, subject), true,
+				"系統組裝的送核請求缺必要 binding："+verr.Error(), subject)
+			a.workflowMu.Unlock()
+			if cerr != nil {
+				return "", errors.Join(verr, cerr)
+			}
+			return "", verr
+		}
+	}
+	id, err := svc.Submit(gateName, subject, bindings)
+	if err != nil {
+		return "", err
+	}
+	a.workflowMu.Lock()
+	rerr := a.escResolveByKeyLocked(key, "request:"+id)
+	a.workflowMu.Unlock()
+	if rerr != nil { // 已送出但修復解除寫不進去：fail loud（不無聲留下已修復的 blocker）
+		return "", rerr
+	}
+	return id, nil
+}
+
+// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement probe 失敗的
+// condition key。現況 PlanAssist 沒有 enforcement probe 結果 hook（唯讀
+// sandbox 由 provider 端 flags 強制、無失敗回報路徑）——觸發點待 probe 接線
+// 後補（task-24-report.md 列明），key 與建立函式先凍結在此，不假接。
+func plannerEnforcementKey(provider string) string { return "planner-enforcement:" + provider }
+
+// escPlannerEnforcementFailedLocked：(9) 的建立函式（呼叫端持 workflowMu）。
+func (a *App) escPlannerEnforcementFailedLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", false,
+		"PlannerAssist enforcement 失敗（"+provider+"）："+detail, "provider:"+provider)
+}
+
+// EscalationList 回傳收件匣 projection（Wails 綁定）。Project 失敗回錯——
+// 收件匣標不可用，絕不裝空（§3.8）。
+func (a *App) EscalationList() ([]escalation.Entry, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return nil, err
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Entries()
+}
+
+// EscalationCreate 建立手動 escalation 項（Wails 綁定；sourceRef 必填，
+// blockScope 空字串＝非阻擋資訊項）。
+func (a *App) EscalationCreate(sourceRef, blockScope, summary string) (string, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return "", err
+	}
+	if h := a.onWorkflowMuAttempt; h != nil { // 測試 seam：Lock() 前
+		h()
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if h := a.onWorkflowMuAcquired; h != nil { // 測試 seam：取得 mutex 後、寫入前
+		h()
+	}
+	return svc.CreateManual(sourceRef, blockScope, summary)
+}
+
+// EscalationAck 標記已認知（不解除 block，§3.8）。
+func (a *App) EscalationAck(id string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Ack(id)
+}
+
+// EscalationResolve 手動 resolve（Wails 綁定）。actor 一律取 git identity
+// （同 GateDecide 的 approver 來源）；hard 項由 Service 拒絕（僅系統可 resolve）。
+func (a *App) EscalationResolve(id, resolution, reason string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	name, email, err := a.gitIdentity()
+	if err != nil {
+		return err
+	}
+	actor := name
+	if actor == "" {
+		actor = email
+	}
+	if actor == "" {
+		return errors.New("escalation: git identity not configured — set git config user.name (or user.email) before resolving")
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Resolve(id, resolution, reason, actor)
 }
 
 // ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----
@@ -1233,6 +2936,200 @@ func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
 		return assist.NewClaudeAssist(a.claudeCLIPath(), cwd, a.childEnv()), nil
 	}
 	return assist.NewCodexAssist(a.codexCLIPath(), cwd, a.childEnv()), nil
+}
+
+// ---- PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot；spec §5）----
+
+// nonPlanDirtyPaths 回傳 workspace 中「不在 plan/** 範圍內」的未提交變更路徑
+// （staged／unstaged／untracked 皆算，--untracked-files=all 展開目錄到檔案級）。
+// 空回傳表示除 plan/** 外整棵樹乾淨——PlannerAssist 唯讀分析的前置條件。
+// .workbench/ 是 app state（gate journal 等），不屬受管 code，比照
+// assertWorkspaceUnchanged（app_assist_test.go）同一慣例排除，不計入 dirty。
+func (a *App) nonPlanDirtyPaths() ([]string, error) {
+	out, err := exec.Command("git", "-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all").Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("assist: git status: %w", err)
+	}
+	var dirty []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		p := gitStatusPath(line)
+		if p == "" || p == ".workbench" || strings.HasPrefix(p, ".workbench/") {
+			continue
+		}
+		if !spec.PlanScope.Match(p) {
+			dirty = append(dirty, p)
+		}
+	}
+	return dirty, nil
+}
+
+// gitStatusPath 從 `git status --porcelain` 一行擷取路徑（"XY path" 或 rename
+// 的 "XY old -> new" 取新路徑）。與 internal/spec/gitrepo.go 的私有 statusPath
+// 邏輯相同——app 層無法引用該未匯出函式，此為此檔唯一需要解析 status 行之處，
+// 複製比新增 spec 匯出面來得省事。
+func gitStatusPath(line string) string {
+	if len(line) < 4 {
+		return ""
+	}
+	rest := line[3:]
+	if idx := strings.Index(rest, " -> "); idx >= 0 {
+		rest = rest[idx+4:]
+	}
+	return strings.Trim(rest, "\"")
+}
+
+// activeGate1SpecManifestDigest 在 gate.List() 內找 gate1 的 active 項，回傳其
+// spec_manifest binding digest；無 active gate1 項回 ok=false。
+func activeGate1SpecManifestDigest(entries []GateEntryDTO) (digest string, ok bool) {
+	for _, e := range entries {
+		if e.Gate != "gate1" || e.State != string(gate.Active) {
+			continue
+		}
+		return e.SpecManifestDigest, true
+	}
+	return "", false
+}
+
+// PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot；spec §5）以隔離的一次
+// 性 AI 呼叫唯讀探索 workspace 並草擬 plan YAML。lifecycle 鏡射 SpecAssist
+// （corr_id、EmitAssist、reclaim——見其 doc，此處不重複展開），差異僅：
+//   - Runner 換唯讀白名單／sandbox（Claude ClaudePlannerArgs／Codex readOnly+
+//     never 原樣，見 internal/assist）；
+//   - purpose 固定 "plan_draft"（前端依 purpose 二次分流，不進 provider slot）；
+//   - 呼叫 runner 前有兩項前置檢查，任一不符即 fail closed、完全不啟動
+//     runner／不佔用 assist 獨佔性：
+//     (a) 存在 active Gate 1（§5 輸入即其 spec_manifest digest；無則回錯）；
+//     (b) workspace 除 plan/** 外無未提交變更（PlannerAssist 需在乾淨 code
+//     tree 上分析——plan/** 本身允許 dirty，因為草稿要寫回這裡）。
+//
+// 通過後把 analysis_base_commit=HEAD（完整 OID）與 active Gate 1 的
+// spec_manifest digest 明文注入 prompt 前綴：模型草擬的 plan YAML 之
+// analysis_base_commit 欄位須等於此處注入的值（§9 契約，Task 12 的
+// VerifyLineage 以此為 lineage 起點）。
+func (a *App) PlanAssist(provider, prompt string) (string, error) {
+	if provider != "claude" && provider != "codex" {
+		return "", fmt.Errorf("unknown provider %q", provider)
+	}
+
+	if _, err := a.ensureGate(); err != nil {
+		return "", err
+	}
+	entries, err := a.GateList()
+	if err != nil {
+		return "", err
+	}
+	specManifestDigest, hasActiveGate1 := activeGate1SpecManifestDigest(entries)
+	if !hasActiveGate1 {
+		return "", errors.New("assist: 無生效規格核可——先完成 Gate 1")
+	}
+
+	dirty, err := a.nonPlanDirtyPaths()
+	if err != nil {
+		return "", err
+	}
+	if len(dirty) > 0 {
+		return "", errors.New("assist: workspace 有未提交的非 plan 變更——PlannerAssist 需在乾淨 code tree 上分析")
+	}
+
+	headOID, err := a.specRepo.HeadCommit()
+	if err != nil {
+		return "", fmt.Errorf("assist: resolve HEAD: %w", err)
+	}
+	prompt = fmt.Sprintf(
+		"analysis_base_commit=%s\nspec_manifest_digest=%s\n\n"+
+			"以上為本次唯讀分析的基準 commit（analysis_base_commit）與目前生效 Gate 1 核可的"+
+			" spec manifest digest；產出的 plan YAML 草稿其 analysis_base_commit 欄位須等於"+
+			"上述 analysis_base_commit 值。\n\n%s",
+		headOID, specManifestDigest, prompt)
+
+	const purpose = "plan_draft"
+	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
+
+	// 同 SpecAssist：gen 先入 assistActive 才 beginAppTxn（shutdown reclaim 窗口
+	// 不變量，見 SpecAssist doc）。共用同一張 a.assistActive／同一把 a.assistMu
+	// ——每個 provider 至多一個 active（SpecAssist／PlanAssist 共用同一獨佔性
+	// 與 reclaim 基礎設施，reclaimAssists 無需另行改動即涵蓋兩者）。
+	a.assistMu.Lock()
+	if _, exists := a.assistActive[provider]; exists {
+		a.assistMu.Unlock()
+		cancel()
+		return "", ErrAssistActive
+	}
+	a.assistActive[provider] = gen
+	a.assistMu.Unlock()
+
+	if h := a.hookAssistBeforeTxn; h != nil {
+		h()
+	}
+	if err := a.beginAppTxn(); err != nil {
+		a.assistMu.Lock()
+		if a.assistActive[provider] == gen {
+			delete(a.assistActive, provider)
+		}
+		a.assistMu.Unlock()
+		cancel()
+		return "", err
+	}
+
+	teardown := func() {
+		gen.once.Do(func() {
+			cancel()
+			a.assistMu.Lock()
+			if a.assistActive[provider] == gen {
+				delete(a.assistActive, provider)
+			}
+			a.assistMu.Unlock()
+			a.endAppTxn()
+			close(gen.done)
+		})
+	}
+	defer teardown()
+
+	runner, err := a.newPlanAssistRunner(provider)
+	if err != nil {
+		return gen.correlationID, err
+	}
+
+	prov := contract.Provider(provider)
+	sink := func(env contract.Envelope) {
+		a.assistMu.Lock()
+		cur, ok := a.assistActive[provider]
+		a.assistMu.Unlock()
+		if !ok || cur != gen { // 晚到舊 generation：丟棄並 fail loud（不進 provider slot）
+			a.manager.EmitAssist(prov, gen.correlationID, purpose,
+				contract.Event{Provider: prov, Kind: contract.KindStreamError,
+					Raw: []byte(`{"assist":"stale_generation_event_dropped"}`),
+					Err: errors.New("assist: late event from stale generation dropped")})
+			return
+		}
+		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
+	}
+	err = runner.Run(ctx, prompt, sink)
+	return gen.correlationID, err
+}
+
+// newPlanAssistRunner：production 造 provider 專屬唯讀 PlannerAssist Runner；
+// 測試沿用 assistRunnerFactory 注入 fake（同 newAssistRunner 的注入點——單一
+// factory 欄位涵蓋 SpecAssist／PlanAssist 兩條 one-shot 路徑）。
+func (a *App) newPlanAssistRunner(provider string) (assist.Runner, error) {
+	if a.assistRunnerFactory != nil {
+		return a.assistRunnerFactory(provider)
+	}
+	cwd, err := claude.NormalizeCWD(a.workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	if provider == "claude" {
+		return assist.NewClaudePlanner(a.claudeCLIPath(), cwd, a.childEnv()), nil
+	}
+	return assist.NewCodexPlanner(a.codexCLIPath(), cwd, a.childEnv()), nil
 }
 
 // reclaimAssists：shutdown 對 in-flight SpecAssist 的收束——cancel 每個 active

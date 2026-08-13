@@ -8,6 +8,21 @@ describe('routeEnvelope', () => {
   it('session + spec_assist → assist', () => {
     expect(routeEnvelope({ scope: 'session', provider: 'claude', purpose: 'spec_assist' } as any)).toBe('assist')
   })
+  it('session + plan_draft → plan', () => {
+    expect(routeEnvelope({ scope: 'session', provider: 'claude', purpose: 'plan_draft' } as any)).toBe('plan')
+  })
+  it('no-scope + plan_draft → plan', () => {
+    expect(routeEnvelope({ provider: 'codex', purpose: 'plan_draft' } as any)).toBe('plan')
+  })
+  it('workspace + plan_draft → gate (scope takes precedence)', () => {
+    expect(routeEnvelope({ scope: 'workspace', purpose: 'plan_draft' } as any)).toBe('gate')
+  })
+  it('workspace + kind=evidence_run → evidence', () => {
+    expect(routeEnvelope({ scope: 'workspace', kind: 'evidence_run' } as any)).toBe('evidence')
+  })
+  it('workspace without kind=evidence_run → gate (other workspace kinds unaffected)', () => {
+    expect(routeEnvelope({ scope: 'workspace', kind: 'approval_decision' } as any)).toBe('gate')
+  })
   it('normal session → session', () => {
     expect(routeEnvelope({ scope: 'session', provider: 'claude', kind: 'message' } as any)).toBe('session')
   })

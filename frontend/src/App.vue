@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateDecisionContext, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
+import { usePlan } from './stores/plan'
+import { useEvidence } from './stores/evidence'
+import { useEscalation } from './stores/escalation'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
-import type { GateEntry } from './types'
+import { escalationBadge } from './lib/escalationBadge'
+import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import Timeline from './components/Timeline.vue'
@@ -18,13 +22,23 @@ import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
+import EscalationInbox from './components/EscalationInbox.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
+import PlanWorkspace from './components/PlanWorkspace.vue'
+import TcaWorkspace from './components/TcaWorkspace.vue'
+import EvidenceDetail from './components/EvidenceDetail.vue'
 import DiagramPane from './components/DiagramPane.vue'
+import DagPane from './components/DagPane.vue'
 
 const { t } = useI18n()
 const s = useSession()
 const gate = useGate()
 const assist = useAssist()
+const plan = usePlan()
+const evidence = useEvidence()
+const escalation = useEscalation()
+const wailsBindings = makeBindings() // Task 22：TCA workspace 六個綁定＋Task 25：escalation 收件匣四個綁定的唯一 production 來源（見 bindings.test.ts）
+const selectedEvidenceId = ref('')
 const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
 const gateError = ref('')
 
@@ -36,22 +50,59 @@ async function refreshGate() {
     gateDegraded.value = list.some(e => e.journal_degraded === true)
     const next: Record<string, GateEntry> = {}
     for (const e of list) {
-      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, bindings: e.bindings, base_commit: e.base_commit }
+      next[e.approval_id] = { approval_id: e.approval_id, state: e.state, gate: e.gate, subject: e.subject, bindings: e.bindings, base_commit: e.base_commit }
     }
     gate.entries = next
   } catch { /* dev 無綁定時忽略 */ }
 }
 
-async function decideGate(id: string, decision: string, reason: string) {
+async function decideGate(id: string, decision: string, reason: string, riskSelections: RiskSelection[]) {
   gateError.value = ''
   try {
-    await GateDecide(id, decision, reason)
+    await GateDecide(id, decision, reason, riskSelections)
   } catch (e) {
     gateError.value = String(e)
   }
   await refreshGate()
 }
-const tab = ref<'chat' | 'preview' | 'spec' | 'diagram'>('chat')
+// Task 25：escalation 收件匣——沒有專屬事件 lane（brief 明講不加），沿用
+// refreshGate 的重載慣例，operations after ack/resolve/create 由 EscalationInbox
+// 自己呼叫 reload（見 wiring below），此處只是唯一的 EscalationList 呼叫點。
+async function refreshEscalation() {
+  await escalation.load(wailsBindings.EscalationList)
+}
+const sidePanel = ref<'gate' | 'escalation'>('gate') // 右側欄 Gate／Escalation 並列 tab（§6）
+// escalatePrefill：review fix（spec §3.8 回填）——PlanWorkspace／GateConsole／
+// EvidenceDetail 的「建立升級項目」按鈕 emit 的 payload，轉發給
+// EscalationInbox 的建立表單，並切到 escalation side panel 讓使用者立刻
+// 看到已預填的表單（不做 inline dialog，重用既有表單）。
+const escalatePrefill = ref<{ sourceRef: string; blockScope: string } | null>(null)
+function onEscalate(payload: { sourceRef: string; blockScope: string }) {
+  escalatePrefill.value = payload
+  sidePanel.value = 'escalation'
+}
+// escalationBadgeState：委給 lib/escalationBadge.ts 的純函式（見該檔說明），
+// 這裡只是把 store 的兩個欄位接進去——邏輯本身直接單元測試，不靠 App.vue
+// mount。
+const escalationBadgeState = computed(() => escalationBadge(escalation.unavailable, escalation.unresolvedCount))
+const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'>('chat')
+// Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
+// GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
+// 本身是常駐側欄，不是分頁，故「導航」在此語意上就是高亮＋不動 tab）。查不到對應
+// 卡片就保留現狀，不拋錯（M3a 單一 active plan 假設下最多命中一筆）。
+const highlightedApprovalId = ref('')
+async function onSelectTask(taskId: string) {
+  for (const e of gate.list) {
+    if (e.gate !== 'gate2' || e.state !== 'pending') continue
+    try {
+      const ctx = await GateDecisionContext(e.approval_id)
+      if (ctx.tasks.some(t => t.task_id === taskId)) {
+        highlightedApprovalId.value = e.approval_id
+        return
+      }
+    } catch { /* 該卡片載入失敗就跳過，繼續找下一筆，不炸 */ }
+  }
+}
 // Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
 const diagramFiles = ref<string[]>([])
 const diagramPath = ref('')
@@ -122,17 +173,20 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
-  s.setBindings(makeBindings())
+  s.setBindings(wailsBindings)
   EventsOn('workbench:event', (e: any) => {
     const dst = routeEnvelope(e)
     if (dst === 'gate') gate.applyGateEvent(e)
     else if (dst === 'assist') assist.applyAssistEvent(e)
+    else if (dst === 'plan') plan.applyAssistEvent(e)
+    else if (dst === 'evidence') evidence.applyEvidenceEvent(e)
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
+  await refreshEscalation()
   await refreshDiagramFiles()
 })
 </script>
@@ -151,11 +205,21 @@ onMounted(async () => {
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
           <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">{{ t('app.tab.preview') }}</button>
           <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">{{ t('app.tab.spec') }}</button>
+          <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">{{ t('app.tab.plan') }}</button>
           <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
+          <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
+          <button :class="{ active: tab === 'tca' }" @click="tab = 'tca'">{{ t('app.tab.tca') }}</button>
         </nav>
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
+        <PlanWorkspace v-if="tab === 'plan'" @escalate="onEscalate" />
+        <TcaWorkspace
+          v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
+          :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"
+          :register-mutation="wailsBindings.RegisterMutation" :run-evidence="wailsBindings.RunEvidence"
+          :get-evidence="wailsBindings.EvidenceGet" :submit-test-contract="wailsBindings.SubmitTestContract"
+        />
         <div v-show="tab === 'diagram'" class="diagram-tab">
           <div class="diagram-files">
             <button v-for="f in diagramFiles" :key="f" :class="{ active: f === diagramPath }"
@@ -163,11 +227,31 @@ onMounted(async () => {
           </div>
           <DiagramPane :path="diagramPath" />
         </div>
+        <DagPane v-if="tab === 'dag'" @select-task="onSelectTask" />
       </main>
       <div class="gate-resize" :title="t('app.resize.width')" @mousedown.prevent="onGateResizeStart" />
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
-        <GateConsole :entries="gate.list" :decide="decideGate" :degraded="gateDegraded" />
-        <p v-if="gateError" class="gate-err">{{ gateError }}</p>
+        <nav class="side-nav">
+          <button :class="{ active: sidePanel === 'gate' }" @click="sidePanel = 'gate'">{{ t('app.sideTab.gate') }}</button>
+          <button :class="{ active: sidePanel === 'escalation' }" data-test="side-tab-escalation" @click="sidePanel = 'escalation'">
+            {{ t('app.sideTab.escalation') }}
+            <span v-if="escalationBadgeState?.kind === 'warn'" class="badge-count badge-warn" data-test="escalation-badge-warn">!</span>
+            <span v-else-if="escalationBadgeState?.kind === 'count'" class="badge-count" data-test="escalation-badge">{{ escalationBadgeState.n }}</span>
+          </button>
+        </nav>
+        <GateConsole
+          v-show="sidePanel === 'gate'"
+          :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
+          :get-evidence="wailsBindings.EvidenceGet" :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
+          @open-evidence="selectedEvidenceId = $event" @escalate="onEscalate"
+        />
+        <p v-if="gateError && sidePanel === 'gate'" class="gate-err">{{ gateError }}</p>
+        <EscalationInbox
+          v-show="sidePanel === 'escalation'"
+          :entries="escalation.entries" :unavailable="escalation.unavailable" :prefill="escalatePrefill"
+          :ack="wailsBindings.EscalationAck" :resolve="wailsBindings.EscalationResolve"
+          :create="wailsBindings.EscalationCreate" :reload="refreshEscalation"
+        />
       </aside>
     </div>
     <div v-show="timelineOpen" class="tl-resize" :title="t('app.resize.height')" @mousedown.prevent="onResizeStart" />
@@ -177,6 +261,10 @@ onMounted(async () => {
     </button>
     <StatusBar />
     <ApprovalDialog />
+    <EvidenceDetail
+      :evidence-id="selectedEvidenceId" :get="wailsBindings.EvidenceGet"
+      @close="selectedEvidenceId = ''" @escalate="onEscalate"
+    />
   </div>
 </template>
 
@@ -191,7 +279,12 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
-.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
+.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+.gate-panel .side-nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.gate-panel .side-nav button { border: none; background: transparent; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
+.gate-panel .side-nav .active { background: var(--bg-bubble-user); color: #fff; }
+.badge-count { background: var(--err); color: #2a0d0b; border-radius: 999px; padding: 0 5px; font-size: 10px; font-weight: 700; }
+.badge-warn { padding: 0 6px; } /* 警示徽章沿用 badge-count 底色，僅加寬容納「!」 */
 .gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
 .gate-resize { width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0; }
 .gate-resize:hover { background: var(--accent); }

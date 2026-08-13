@@ -49,6 +49,20 @@ func ClaudeAssistArgs() []string {
 	}
 }
 
+// ClaudePlannerArgs 回傳 PlannerAssist 隔離 Claude one-shot 的 argv（不含
+// binary）：唯讀工具白名單（pin 2.1.223；spec §9 待驗證假設——live probe 步驟
+// 見 task-11-brief.md Step 5，尚未經真實 CLI 驗證）。enforcement 仍在 argv：
+// 白名單只含 Read/Glob/Grep，無 Write/Edit/Bash → 無法變更 workspace。
+func ClaudePlannerArgs() []string {
+	return []string{
+		"-p",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--tools", "Read,Glob,Grep", // 唯讀白名單（argv 級強制，非 prompt 文字）
+	}
+}
+
 // codexReadOnlySandbox：pinned schema SandboxPolicy 的 readOnly variant
 // （schemas/codex/v2/TurnStartParams.json，networkAccess 預設 false）。
 func codexReadOnlySandbox() map[string]any {
@@ -87,19 +101,27 @@ func assistClientInfo() codex.ClientInfo {
 // ---- Claude 隔離 one-shot ----
 
 type claudeAssist struct {
-	bin string
-	cwd string
-	env []string
+	bin  string
+	cwd  string
+	env  []string
+	args []string // argv 白名單來源：ClaudeAssistArgs（SpecAssist）或 ClaudePlannerArgs（PlannerAssist）
 }
 
 // NewClaudeAssist 回傳以獨立 one-shot Claude process 草擬的 Runner（argv 含
 // `--tools ""`）。此為 NEW 隔離 process，不是長駐 session。
 func NewClaudeAssist(bin, cwd string, env []string) Runner {
-	return &claudeAssist{bin: bin, cwd: cwd, env: env}
+	return &claudeAssist{bin: bin, cwd: cwd, env: env, args: ClaudeAssistArgs()}
+}
+
+// NewClaudePlanner 回傳 PlannerAssist 用的獨立 one-shot Claude Runner（argv 帶
+// 唯讀工具白名單 ClaudePlannerArgs）。與 NewClaudeAssist 共用 Run／process
+// 生命週期，僅 argv 白名單不同——enforcement 一樣在 argv，不在 prompt。
+func NewClaudePlanner(bin, cwd string, env []string) Runner {
+	return &claudeAssist{bin: bin, cwd: cwd, env: env, args: ClaudePlannerArgs()}
 }
 
 func (c *claudeAssist) Run(ctx context.Context, prompt string, sink func(contract.Envelope)) error {
-	p, err := proc.Start(ctx, proc.Config{Binary: c.bin, Args: ClaudeAssistArgs(), Dir: c.cwd, Env: c.env})
+	p, err := proc.Start(ctx, proc.Config{Binary: c.bin, Args: c.args, Dir: c.cwd, Env: c.env})
 	if err != nil {
 		return err
 	}
@@ -161,6 +183,13 @@ type codexAssist struct {
 // approvalPolicy=never；任何 escalation／approval request 一律 fail closed。
 func NewCodexAssist(bin, cwd string, env []string) Runner {
 	return &codexAssist{bin: bin, cwd: cwd, env: env}
+}
+
+// NewCodexPlanner 回傳 PlannerAssist 用的獨立 ephemeral Codex Runner。turn
+// wire（CodexAssistTurnParams）本已是 readOnly sandbox＋approvalPolicy=never，
+// 對唯讀探索與草擬皆已足夠——不需要另一組唯讀白名單，同構造即可。
+func NewCodexPlanner(bin, cwd string, env []string) Runner {
+	return NewCodexAssist(bin, cwd, env)
 }
 
 func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract.Envelope)) error {

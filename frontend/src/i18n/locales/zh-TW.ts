@@ -4,7 +4,14 @@ export default {
       chat: '對話',
       preview: '預覽',
       spec: '規格',
+      plan: '計畫',
       diagram: '表示圖',
+      dag: '任務 DAG',
+      tca: 'TCA',
+    },
+    sideTab: {
+      gate: 'Gate',
+      escalation: '升級收件匣',
     },
     timeline: {
       label: '執行時間軸',
@@ -88,11 +95,21 @@ export default {
     },
     reasonHint: '請先填理由再退回',
     degradedNotice: '核可記錄異常：核可與退回功能已暫停，目前僅供查看',
-    empty: '目前沒有 Gate 1 項目',
+    empty: '目前沒有核可項目',
     label: {
       approvalId: '核可編號（approval_id）',
       baseCommit: '基準 commit（base_commit）',
       specManifest: '規格 manifest（spec_manifest）',
+    },
+    risk: {
+      minimum: '最低風險層級',
+      planner: '規劃風險層級',
+      overrideReasonPlaceholder: '覆寫理由（selected 低於 planner 時必填）',
+    },
+    tca: {
+      gate2Link: '對應 Gate 2：{id}',
+      viewEvidence: '查看證據',
+      mutationDigest: 'mutation digest',
     },
   },
   spec: {
@@ -113,6 +130,88 @@ export default {
     },
     submittedApprovalId: '核可編號（approval_id）：{id}',
   },
+  planWorkspace: {
+    action: {
+      generateDraft: '產生計畫草稿',
+      applyDraft: '套用草稿',
+      save: '儲存',
+      submit: '送核 Gate 2',
+      previewCommit: '預覽 commit',
+      confirmCommit: '建立 commit',
+    },
+    assist: {
+      drafting: 'AI 產生中…',
+    },
+    provider: {
+      label: 'AI provider',
+    },
+    prompt: {
+      placeholder: '描述要草擬的計畫內容',
+    },
+    planId: {
+      placeholder: '計畫編號（planID）',
+    },
+    commitMessage: {
+      placeholder: 'commit 訊息',
+    },
+    submittedApprovalId: '核可編號（approval_id）：{id}',
+  },
+  tcaWorkspace: {
+    empty: '目前沒有已生效的 Gate 2 計畫可操作',
+    testCommit: {
+      pick: '選擇近期 commit…',
+      placeholder: 'test commit（手動輸入）',
+      precheckOk: 'lineage 預檢通過',
+    },
+    action: {
+      precheck: '預檢',
+      registerMutation: '登記 mutation',
+      runExpectedRed: '跑 expected-red',
+      runNegativeControl: '跑 negative-control',
+      retry: '重跑',
+      submit: '送核 TCA',
+    },
+    mutationPatch: {
+      placeholder: 'negative-control 用的 unified diff patch',
+    },
+    mutationId: 'mutation_id：{id}',
+    submittedApprovalId: '核可編號（approval_id）：{id}',
+  },
+  evidence: {
+    title: 'evidence：{id}',
+    loading: '載入中…',
+    result: {
+      passed: '通過',
+      failed: '失敗',
+      error: '錯誤',
+    },
+    run: {
+      running: '執行中…',
+    },
+    action: {
+      close: '關閉',
+    },
+    label: {
+      evidenceId: 'evidence_id',
+      kind: 'kind',
+      result: '結果',
+      baseCommit: 'base_commit',
+      testCommit: 'test_commit',
+      oracleSurfaceDigest: 'oracle_surface_digest',
+      mutationDigest: 'mutation_digest',
+      command: 'command',
+      cwd: 'cwd',
+      startedAt: '開始時間',
+      finishedAt: '結束時間',
+      exitCode: 'exit_code',
+      expectedFailure: 'expected_failure',
+      observedFailure: 'observed_failure',
+      stdoutDigest: 'stdout_digest',
+      stderrDigest: 'stderr_digest',
+      recordingRef: 'recording ref',
+      runnerVersion: 'runner_version',
+    },
+  },
   approval: {
     action: {
       allow: '允許',
@@ -126,6 +225,10 @@ export default {
   },
   diagram: {
     empty: '尚無可顯示的圖表',
+  },
+  dag: {
+    empty: '尚無可顯示的任務 DAG',
+    parseError: '無法解析目前的 plan 內容',
   },
   preview: {
     empty: '在左側選擇檔案以預覽',
@@ -174,5 +277,62 @@ export default {
   },
   store: {
     bindingsNotReady: '綁定尚未就緒',
+  },
+  escalation: {
+    section: {
+      open: '待處理',
+      acknowledged: '已認知',
+      resolved: '已解除（{n}）',
+    },
+    empty: {
+      open: '目前沒有待處理的升級項目',
+      acknowledged: '目前沒有已認知的升級項目',
+      resolved: '目前沒有已解除的升級項目',
+    },
+    action: {
+      retry: '重試',
+      ack: '認知',
+    },
+    badge: {
+      source: {
+        system: '系統',
+        manual: '手動',
+      },
+      hard: '硬性',
+      occurrence: '第 {n} 次',
+    },
+    label: {
+      blockScope: 'block scope',
+      sourceRef: '來源',
+      noScope: '（不阻擋）',
+    },
+    hardNotice: '硬性項目：僅系統可解除',
+    resolve: {
+      resolutionPlaceholder: '選擇解除方式…',
+      resolution: {
+        fixed: '已修復（fixed）',
+        accepted_risk: '接受風險（accepted_risk）',
+        other: '其他（other）',
+      },
+      reasonPlaceholder: '理由（必填）',
+      submit: '解除',
+    },
+    create: {
+      title: '建立升級項目',
+      sourceRefPlaceholder: '來源 ref（必填，例如 plan_id/task_id）',
+      scope: {
+        none: '（不阻擋）',
+        workspace: 'workspace',
+        gate2: 'gate2:<id>',
+        tca: 'tca:<plan>/<task>',
+        custom: '自由輸入',
+      },
+      scopeIdPlaceholder: 'ID',
+      scopeCustomPlaceholder: '完整 block scope',
+      scopeIdRequired: '已選範圍但未填 ID／內容，這個 block scope 不會生效',
+      summaryPlaceholder: '摘要（必填）',
+      submit: '建立',
+      buttonFrom: '建立升級項目',
+    },
   },
 }
