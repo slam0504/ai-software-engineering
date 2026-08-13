@@ -2074,6 +2074,22 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 		if escErr := a.wireEvidenceEscalation(planID, taskID, kind, evidenceID, run.Result); escErr != nil {
 			finalErr = escErr
 		}
+	} else if runErr != nil && ctx.Err() == nil {
+		// review Medium（§3.8 (5) 環境錯誤子類補洞）：command 無法啟動等
+		// runner-level error 不產 EvidenceRun（journal 未寫、上面的 result 分流
+		// 走不到）——同 key 開 evidence-error 項，key 同構故 A8 的「同 key 新
+		// run passed → resolveByKey」自然涵蓋解除。shutdown cancel
+		// （ctx.Err()!=nil）不開項：那是 reclaim，不是環境錯誤。appendErr
+		// （runErr==nil 但 journal 寫入失敗）也不在此開項——那屬 (8)
+		// journal-degraded，由 reconcileLocked 的掃描補建。
+		a.workflowMu.Lock()
+		_, cerr := a.escCreateSystemLocked("evidence-error:"+planID+"/"+taskID+"/"+kind,
+			"tca:"+planID+"/"+taskID, false,
+			"evidence run（"+kind+"）啟動失敗："+runErr.Error(), "run:"+planID+"/"+taskID+"/"+kind)
+		a.workflowMu.Unlock()
+		if cerr != nil {
+			finalErr = errors.Join(finalErr, cerr)
+		}
 	}
 
 	payload := map[string]any{

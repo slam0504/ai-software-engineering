@@ -292,6 +292,78 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	}
 }
 
+// ---- §3.8 (5) 環境錯誤子類（review Medium）：command 無法啟動 ----
+
+func TestEvidenceStartFailureOpensEscalationItem(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), redOKScript)
+	// committed plan 的 test_contract command 指向不存在的 executable——
+	// runCommand 的 cmd.Start() 失敗屬 runner-level error，不產 EvidenceRun。
+	writeFile(t, filepath.Join(a.workspaceDir, "spec", "glossary.md"), "term v1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "baseline")
+	gate1ID, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(gate1ID, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	headOID := revParseHead(t, a)
+	badPlan := strings.ReplaceAll(evidencePlanYAML("P1", headOID),
+		"executable: sh", "executable: /nonexistent-task24-binary")
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "P1.yaml"), badPlan)
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "risk-policy.yaml"), testRiskPolicyYAML)
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "permissions", "T1.yaml"), "allow: []\n")
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "oracle-surface.yaml"), "version: 1\npatterns: [run_test.sh]\n")
+	commitAllPlan(t, a)
+	planCommit1 := revParseHead(t, a)
+	gate2ID, err := a.SubmitPlanForApproval("P1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(gate2ID, "approved", "ok", mediumSel()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.RunEvidence("P1", "T1", planCommit1, "expected_red", ""); err == nil {
+		t.Fatal("RunEvidence must fail when the contract command cannot even start")
+	}
+	item := openItemByKey(t, a, "evidence-error:P1/T1/expected_red")
+	if item == nil {
+		t.Fatal("a runner-level start failure must open an evidence-error item (§3.8 (5) 環境錯誤)")
+	}
+	if item.Item.Hard {
+		t.Fatal("evidence-error item must be hard=false")
+	}
+
+	// 修復：plan 修正 executable → gate2 修正版核可 → 同 key 新 run passed 解除（A8）
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "P1.yaml"), evidencePlanYAML("P1", headOID))
+	commitAllPlan(t, a)
+	planCommit2 := revParseHead(t, a)
+	gate2ID2, err := a.SubmitPlanForApproval("P1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(gate2ID2, "approved", "ok", mediumSel()); err != nil {
+		t.Fatalf("replacement gate2 approval must succeed (evidence-error is tca-scoped, not gate2-scoped): %v", err)
+	}
+	id, err := a.RunEvidence("P1", "T1", planCommit2, "expected_red", "")
+	if err != nil {
+		t.Fatalf("RunEvidence (fixed contract): %v", err)
+	}
+	run, err := a.EvidenceGet(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Result != "passed" {
+		t.Fatalf("fixed rerun must pass, got %q (%q)", run.Result, run.ObservedFailure)
+	}
+	if openItemByKey(t, a, "evidence-error:P1/T1/expected_red") != nil {
+		t.Fatal("a passing rerun under the same key must system-resolve the start-failure item")
+	}
+}
+
 // ---- §3.8 (1)：risk-unclassifiable 的開啟與權威修復 ----
 
 func TestRiskUnclassifiableEscalationLifecycle(t *testing.T) {
