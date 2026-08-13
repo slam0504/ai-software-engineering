@@ -340,7 +340,7 @@ stateDiagram-v2
 | **M1.5** 雙 session | ✅ merged | Provider 切換時對話視窗跟著切、雙 session 並存、重啟自動恢復、design token＋視覺 polish（[結果](docs/spikes/m1.5-results.md)） |
 | **M2** Stage A 閉環 | ✅ merged | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ merged | vue-i18n 語系化，預設繁體中文＋完整英文 locale |
-| **M3a** 計畫與測試契約閉環 | ✅ merged | 任務 DAG、Gate 2、Test Contract Approval（本機 evidence runner）、升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；多 session 並看延後至 **M3b**） |
+| **M3a** 計畫與測試契約閉環 | ✅ 核心閉環完成（本分支，待 merge） | 任務 DAG、Gate 2、Test Contract Approval（本機 evidence runner）、升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；多 session 並看延後至 **M3b**） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、forge adapter（SC4：單任務全程不切出 app） |
 
 每個里程碑的執行計畫經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`SHA256SUMS` 可驗證），
