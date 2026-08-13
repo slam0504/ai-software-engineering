@@ -45,7 +45,11 @@ rules: []
 function oracleSurfaceSkeleton(): string {
   return `version: 1
 patterns:
-  - "example/oracle/**"  # 改成需要 lineage 保護的 test/oracle 檔案或目錄，dir/** 或精確路徑
+  - "example/oracle/**"  # 改成需要 lineage 保護的 test/oracle 檔案或目錄，dir/** 或精確路徑——
+    # 不改此值送核後，Gate 2 本身不會擋下；等到 TCA 預檢（ValidateTestCommit／RunEvidence）
+    # 對實際 test_contract.command.argv 指到的檔案做 lineage 檢查時，才會因該檔案不在
+    # example/oracle/** 範圍內，拒絕並回「path outside allowed scope」（實機重現見
+    # docs/spikes/m3a1-results.md 現場發現缺陷 1）
 `
 }
 
@@ -71,9 +75,12 @@ tasks:
       contexts: []
       modules: []
     completion: []
-    minimum_risk_tier: low
-    planner_risk_tier: low
-    permissions_ref: plan/permissions/T1.yaml
+    minimum_risk_tier: medium  # 對齊 risk-policy.yaml 骨架的 default_tier: medium——兩份骨架都
+    planner_risk_tier: medium  # 原樣不改直接送核時，plan.Validate() 才不會判定 risk 分類不符
+    permissions_ref: permissions/T1.yaml  # 相對 plan/（非 "plan/permissions/T1.yaml"）——
+    # app.go 的 permissionRefEntries 讀檔時會自行補上 plan/ 前綴，帶前綴會變成雙重路徑
+    # plan/plan/permissions/T1.yaml，git show 找不到檔案（實機重現見
+    # docs/spikes/m3a1-results.md 現場發現缺陷 2）
     test_contract:
       command:
         executable: ""
