@@ -9,6 +9,7 @@ import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
 import { usePlan } from './stores/plan'
 import { useEvidence } from './stores/evidence'
+import { useEscalation } from './stores/escalation'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import type { GateEntry, RiskSelection } from './types'
@@ -20,6 +21,7 @@ import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
 import GateConsole from './components/GateConsole.vue'
+import EscalationInbox from './components/EscalationInbox.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
 import PlanWorkspace from './components/PlanWorkspace.vue'
 import TcaWorkspace from './components/TcaWorkspace.vue'
@@ -33,7 +35,8 @@ const gate = useGate()
 const assist = useAssist()
 const plan = usePlan()
 const evidence = useEvidence()
-const wailsBindings = makeBindings() // Task 22：TCA workspace 六個綁定的唯一 production 來源（見 bindings.test.ts）
+const escalation = useEscalation()
+const wailsBindings = makeBindings() // Task 22：TCA workspace 六個綁定＋Task 25：escalation 收件匣四個綁定的唯一 production 來源（見 bindings.test.ts）
 const selectedEvidenceId = ref('')
 const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
 const gateError = ref('')
@@ -61,6 +64,13 @@ async function decideGate(id: string, decision: string, reason: string, riskSele
   }
   await refreshGate()
 }
+// Task 25：escalation 收件匣——沒有專屬事件 lane（brief 明講不加），沿用
+// refreshGate 的重載慣例，operations after ack/resolve/create 由 EscalationInbox
+// 自己呼叫 reload（見 wiring below），此處只是唯一的 EscalationList 呼叫點。
+async function refreshEscalation() {
+  await escalation.load(wailsBindings.EscalationList)
+}
+const sidePanel = ref<'gate' | 'escalation'>('gate') // 右側欄 Gate／Escalation 並列 tab（§6）
 const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'>('chat')
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
@@ -162,6 +172,7 @@ onMounted(async () => {
   try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
+  await refreshEscalation()
   await refreshDiagramFiles()
 })
 </script>
@@ -206,12 +217,26 @@ onMounted(async () => {
       </main>
       <div class="gate-resize" :title="t('app.resize.width')" @mousedown.prevent="onGateResizeStart" />
       <aside class="gate-panel" :style="{ width: gateWidth + 'px' }">
+        <nav class="side-nav">
+          <button :class="{ active: sidePanel === 'gate' }" @click="sidePanel = 'gate'">{{ t('app.sideTab.gate') }}</button>
+          <button :class="{ active: sidePanel === 'escalation' }" data-test="side-tab-escalation" @click="sidePanel = 'escalation'">
+            {{ t('app.sideTab.escalation') }}
+            <span v-if="escalation.unresolvedCount > 0" class="badge-count" data-test="escalation-badge">{{ escalation.unresolvedCount }}</span>
+          </button>
+        </nav>
         <GateConsole
+          v-show="sidePanel === 'gate'"
           :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
           :get-evidence="wailsBindings.EvidenceGet" :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
           @open-evidence="selectedEvidenceId = $event"
         />
-        <p v-if="gateError" class="gate-err">{{ gateError }}</p>
+        <p v-if="gateError && sidePanel === 'gate'" class="gate-err">{{ gateError }}</p>
+        <EscalationInbox
+          v-show="sidePanel === 'escalation'"
+          :entries="escalation.entries" :unavailable="escalation.unavailable"
+          :ack="wailsBindings.EscalationAck" :resolve="wailsBindings.EscalationResolve"
+          :create="wailsBindings.EscalationCreate" :reload="refreshEscalation"
+        />
       </aside>
     </div>
     <div v-show="timelineOpen" class="tl-resize" :title="t('app.resize.height')" @mousedown.prevent="onResizeStart" />
@@ -236,7 +261,11 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
-.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
+.gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+.gate-panel .side-nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.gate-panel .side-nav button { border: none; background: transparent; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
+.gate-panel .side-nav .active { background: var(--bg-bubble-user); color: #fff; }
+.badge-count { background: var(--err); color: #2a0d0b; border-radius: 999px; padding: 0 5px; font-size: 10px; font-weight: 700; }
 .gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
 .gate-resize { width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0; }
 .gate-resize:hover { background: var(--accent); }

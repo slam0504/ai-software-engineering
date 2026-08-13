@@ -9,6 +9,10 @@ export default {
       dag: '任務 DAG',
       tca: 'TCA',
     },
+    sideTab: {
+      gate: 'Gate',
+      escalation: '升級收件匣',
+    },
     timeline: {
       label: '執行時間軸',
     },
@@ -273,5 +277,60 @@ export default {
   },
   store: {
     bindingsNotReady: '綁定尚未就緒',
+  },
+  escalation: {
+    section: {
+      open: '待處理',
+      acknowledged: '已認知',
+      resolved: '已解除（{n}）',
+    },
+    empty: {
+      open: '目前沒有待處理的升級項目',
+      acknowledged: '目前沒有已認知的升級項目',
+      resolved: '目前沒有已解除的升級項目',
+    },
+    action: {
+      retry: '重試',
+      ack: '認知',
+    },
+    badge: {
+      source: {
+        system: '系統',
+        manual: '手動',
+      },
+      hard: '硬性',
+      occurrence: '第 {n} 次',
+    },
+    label: {
+      blockScope: 'block scope',
+      sourceRef: '來源',
+      noScope: '（不阻擋）',
+    },
+    hardNotice: '硬性項目：僅系統可解除',
+    resolve: {
+      resolutionPlaceholder: '選擇解除方式…',
+      resolution: {
+        fixed: '已修復（fixed）',
+        accepted_risk: '接受風險（accepted_risk）',
+        other: '其他（other）',
+      },
+      reasonPlaceholder: '理由（必填）',
+      submit: '解除',
+    },
+    create: {
+      title: '建立升級項目',
+      sourceRefPlaceholder: '來源 ref（必填，例如 plan_id/task_id）',
+      scope: {
+        none: '（不阻擋）',
+        workspace: 'workspace',
+        gate2: 'gate2:<id>',
+        tca: 'tca:<plan>/<task>',
+        custom: '自由輸入',
+      },
+      scopeIdPlaceholder: 'ID',
+      scopeCustomPlaceholder: '完整 block scope',
+      summaryPlaceholder: '摘要（必填）',
+      submit: '建立',
+    },
   },
 }

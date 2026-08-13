@@ -1,4 +1,4 @@
-import type { evidence } from '../wailsjs/go/models'
+import type { evidence, escalation } from '../wailsjs/go/models'
 
 // Envelope v1（M1 凍結契約）：欄位名對齊 Go contract.Envelope 的 json tag。
 export interface Usage { input_tokens: number; output_tokens: number; cached_input_tokens?: number }
@@ -54,4 +54,12 @@ export interface EvidenceBindings {
     expectedRedID: string, negativeControlID: string, mutationID: string): Promise<string>
   ValidateTestCommit(planID: string, taskID: string, testCommit: string): Promise<void>
   EvidenceCommitCandidates(planID: string): Promise<CommitCandidate[]>
+}
+// EscalationBindings：Task 25 EscalationInbox 四個綁定——同 EvidenceBindings
+// 的既定教訓，逐參數轉發、順序鎖在 bindings.test.ts。
+export interface EscalationBindings {
+  EscalationList(): Promise<escalation.Entry[]>
+  EscalationCreate(sourceRef: string, blockScope: string, summary: string): Promise<string>
+  EscalationAck(id: string): Promise<void>
+  EscalationResolve(id: string, resolution: string, reason: string): Promise<void>
 }

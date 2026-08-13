@@ -9,6 +9,10 @@ const h = vi.hoisted(() => ({
   SubmitTestContract: vi.fn(async () => 'approval-id'),
   ValidateTestCommit: vi.fn(async () => {}),
   EvidenceCommitCandidates: vi.fn(async () => []),
+  EscalationList: vi.fn(async () => []),
+  EscalationCreate: vi.fn(async () => 'esc-id'),
+  EscalationAck: vi.fn(async () => {}),
+  EscalationResolve: vi.fn(async () => {}),
 }))
 vi.mock('../../wailsjs/go/main/App', () => h)
 
@@ -68,5 +72,30 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.EvidenceCommitCandidates('P1')
     expect(h.EvidenceCommitCandidates).toHaveBeenCalledWith('P1')
+  })
+
+  // Task 25：escalation 收件匣四個新綁定，同一教訓套用。
+  it('forwards zero EscalationList arguments', async () => {
+    const b = makeBindings()
+    await b.EscalationList()
+    expect(h.EscalationList).toHaveBeenCalledWith()
+  })
+
+  it('forwards all three EscalationCreate arguments positionally', async () => {
+    const b = makeBindings()
+    await b.EscalationCreate('P1/T1', 'gate2:P1', 'summary text')
+    expect(h.EscalationCreate).toHaveBeenCalledWith('P1/T1', 'gate2:P1', 'summary text')
+  })
+
+  it('forwards the single EscalationAck argument', async () => {
+    const b = makeBindings()
+    await b.EscalationAck('esc-1')
+    expect(h.EscalationAck).toHaveBeenCalledWith('esc-1')
+  })
+
+  it('forwards all three EscalationResolve arguments positionally', async () => {
+    const b = makeBindings()
+    await b.EscalationResolve('esc-1', 'fixed', 'because reasons')
+    expect(h.EscalationResolve).toHaveBeenCalledWith('esc-1', 'fixed', 'because reasons')
   })
 })

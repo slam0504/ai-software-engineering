@@ -9,6 +9,10 @@ export default {
       dag: 'Task DAG',
       tca: 'TCA',
     },
+    sideTab: {
+      gate: 'Gate',
+      escalation: 'Escalation Inbox',
+    },
     timeline: {
       label: 'Timeline',
     },
@@ -273,5 +277,60 @@ export default {
   },
   store: {
     bindingsNotReady: 'bindings not ready',
+  },
+  escalation: {
+    section: {
+      open: 'Open',
+      acknowledged: 'Acknowledged',
+      resolved: 'Resolved ({n})',
+    },
+    empty: {
+      open: 'No open escalation items',
+      acknowledged: 'No acknowledged escalation items',
+      resolved: 'No resolved escalation items',
+    },
+    action: {
+      retry: 'Retry',
+      ack: 'Acknowledge',
+    },
+    badge: {
+      source: {
+        system: 'system',
+        manual: 'manual',
+      },
+      hard: 'hard',
+      occurrence: 'occurrence {n}',
+    },
+    label: {
+      blockScope: 'block scope',
+      sourceRef: 'source',
+      noScope: '(non-blocking)',
+    },
+    hardNotice: 'Hard item: only the system may resolve it',
+    resolve: {
+      resolutionPlaceholder: 'Pick a resolution…',
+      resolution: {
+        fixed: 'Fixed',
+        accepted_risk: 'Accepted risk',
+        other: 'Other',
+      },
+      reasonPlaceholder: 'Reason (required)',
+      submit: 'Resolve',
+    },
+    create: {
+      title: 'Create escalation item',
+      sourceRefPlaceholder: 'Source ref (required, e.g. plan_id/task_id)',
+      scope: {
+        none: '(non-blocking)',
+        workspace: 'workspace',
+        gate2: 'gate2:<id>',
+        tca: 'tca:<plan>/<task>',
+        custom: 'Custom',
+      },
+      scopeIdPlaceholder: 'ID',
+      scopeCustomPlaceholder: 'Full block scope',
+      summaryPlaceholder: 'Summary (required)',
+      submit: 'Create',
+    },
   },
 }
