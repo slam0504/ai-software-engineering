@@ -1,7 +1,7 @@
 # M3a.1 — M3a 閉環完整度收尾設計
 
 - 日期：2026-08-13
-- 狀態：設計定稿 rev2（第一輪：新檔建立規則／bump preview token／TCA generation 隔離／planner enforcement 接線點；第二輪：bump API 後端自算 digest＋祖先驗證／preflight 契約凍結（exact pin＋argv/wire 等值＋快取失效條件）／非法 role 單一答案／STALE 引導實作契約）
+- 狀態：rev3，待 closure review（第一輪：新檔建立規則／bump preview token／TCA generation 隔離／planner enforcement 接線點；第二輪：bump API 後端自算 digest＋祖先驗證／preflight 契約凍結／非法 role 單一答案／STALE 引導實作契約；第三輪：RunEvidence CAS 前置＋ErrStaleGeneration／§7 preflight 分岔封閉）
 - 上游依據：`docs/superpowers/specs/2026-08-12-m3a-plan-test-contract-design.md`（rev4＋erratum）；`docs/spikes/m3a-results.md` 已知缺口 1–6 與最終 review triage
 - 前置：M3a ✅ merged（`cfa5a20`）＋post-merge P1/P2/i18n 修正 ✅
 
@@ -54,7 +54,7 @@
 以 **gate2 approval id 作為 view generation／run identity 的一部分**：
 
 1. TcaWorkspace 監看 active gate2 的 `approval_id`（非只 planId）；換版時：重載 test_commit 候選與 task context，並**清除**——test commit 輸入與預檢結果、mutation ID、expected-red／negative-control 結果、送核結果與錯誤、尚未完成的舊 async response（generation guard 丟棄晚到回應）。
-2. evidence store 的 run key 納入 `gate2_approval_id`（`(approval_id, plan_id, task_id, kind)`）；**`gate2_approval_id` 由後端在 `RunEvidence` 開始時從 active Gate 2 擷取並固定到 started/finished 事件（additive 欄位）——不接受前端傳入作為權威**。store 對非當前 generation 的晚到事件直接丟棄。舊 approval 的兩筆 PASS 不得在新版畫面顯示或啟用送核（後端 validator 本就會拒，本契約消 UI 假訊號）。
+2. evidence store 的 run key 納入 `gate2_approval_id`（`(approval_id, plan_id, task_id, kind)`）。**RunEvidence 換版 CAS（凍結）**：簽名擴為 `RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID string)`——前端傳入**它當下顯示的** approval ID，但該值只作 CAS 前置條件、**不是權威來源**；後端在 workflowMu 下取得權威 active Gate 2，與 expected 比對並固定本次 approval ID／plan commit——**不一致回 `ErrStaleGeneration`，不得建立 worktree、不得發 started event**。成功後 started／finished 事件都使用該次固定的 approval ID（additive 欄位）。store 對非當前 generation 的晚到事件直接丟棄。舊 approval 的兩筆 PASS 不得在新版畫面顯示或啟用送核。**測試**：Gate 2 換版 × RunEvidence 的 channel-barrier `-race` 測試（換版落在按下與後端讀取之間 → ErrStaleGeneration、零 side effect）。
 3. GateConsole tca 卡片的 evidence 控制項（**單一答案，凍結**）：binding 的 role 不是 `expected_red`｜`negative_control`，或任一必要 role 缺漏時——該 TCA 卡片顯示**資料完整性錯誤**、**不呼叫 EvidenceGet**、**不渲染「查看證據」控制項**；上方 raw binding 清單仍保留供診斷。**不得靜默略過**。並修 data-test 根因＋測試。
 
 ### 3.4 Planner enforcement probe＋接線
@@ -111,6 +111,6 @@ gate2 三條拒絕路徑（minimum 重算不符／planner<minimum／未知 tier�
 
 ## 7. 風險與待驗證假設
 
-1. Claude pin CLI 的工具白名單旗標實際行為（probe 才能確認）——若 `--tools` 白名單語意與假設不符，preflight 證明方式需在 implementation plan 調整，fail closed 原則不變。
+1. Claude pin CLI 的工具白名單旗標實際行為（probe 才能確認）——**若 `--tools` 白名單 live probe 失敗，Claude PlannerAssist 維持 NO-GO，implementation plan 僅實作 fail-closed 路徑；替代 enforcement 方案必須退回 spec gate 另行核可**（與 §3.4.2 一致，不留實作階段分岔）。
 2. `ConfirmAnalysisBaseBump` 的 buffer 替換以「精準替換單一欄位值」為契約——YAML 註解與排版不得被重排（實作以字串定位而非重新序列化）。
 3. evidence store run key 擴充涉及 Task 22 既有測試 baseline 更新——additive 欄位不破壞既有 workspace 事件消費者。
