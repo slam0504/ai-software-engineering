@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"gopkg.in/yaml.v3"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
@@ -1833,6 +1835,264 @@ func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
 		return spec.ErrCommitStale
 	}
 	return a.planRepo.ConfirmSpecCommit(tok, message)
+}
+
+// ---- analysis_base bump（Task 5，spec §3.2）----
+//
+// PreviewAnalysisBaseBump／ConfirmAnalysisBaseBump 是唯讀-then-write-back 的
+// 兩段式流程：Preview 只讀（不動任何檔案），把驗證過的 old／head／後端自算
+// 的 buffer digest 綁進 BumpToken；Confirm 拿著這個 token 重驗一次目前狀態
+// （buffer／planRel／HEAD 皆須與 Preview 當下一致），通過後才用字串定位把
+// buffer 內那一行的值換成新的 HEAD，回傳 updatedBuffer——不寫檔、不
+// commit，落地交給呼叫端（wailsjs 重生留給 Task 6 前端任務）。digest 一律
+// 後端 sha256(buffer) 自算：BumpToken 沒有欄位讓前端塞自己算的值，Confirm
+// 重算 currentBuffer 才拿去跟 token 比對，前端不可能偽造出一個能通過驗證
+// 的 token。
+
+// BumpToken binds a PreviewAnalysisBaseBump result to the exact plan path,
+// old analysis_base_commit value, HEAD, and buffer digest at preview time —
+// every field ConfirmAnalysisBaseBump re-verifies before touching anything,
+// so a stale preview (HEAD moved, buffer edited elsewhere, wrong plan) fails
+// loud instead of silently replacing the wrong value.
+type BumpToken struct {
+	PlanRel      string `json:"plan_rel"`
+	Old          string `json:"old"`
+	Head         string `json:"head"`
+	BufferDigest string `json:"buffer_digest"` // 後端 sha256(buffer)，hex
+}
+
+// BumpPreview is PreviewAnalysisBaseBump's result. NoBumpNeeded true means
+// no token was issued (Token stays the zero value) — old already equals
+// HEAD, or every path old..HEAD touched stays inside plan/**, so there is
+// nothing for a bump to move.
+type BumpPreview struct {
+	Token        BumpToken    `json:"token"`
+	Old          string       `json:"old"`
+	Head         string       `json:"head"`
+	Commits      []CommitInfo `json:"commits"`
+	TouchedFiles []string     `json:"touched_files"`
+	NoBumpNeeded bool         `json:"no_bump_needed"`
+}
+
+// fullOIDPattern rejects abbreviated/short OIDs — a bump must anchor to an
+// unambiguous, fully-qualified commit id, never a prefix that could resolve
+// to a different object as the repository grows.
+var fullOIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// bumpPlanDoc is a minimal decode target for extracting analysis_base_commit
+// out of a plan buffer — deliberately not plan.Parse's KnownFields(true)
+// schema: bump only needs this one field and must not reject on unrelated
+// schema drift elsewhere in an in-progress editor buffer (task-5-brief:
+// buffer 解析 analysis_base_commit，yaml 解析取值即可).
+type bumpPlanDoc struct {
+	AnalysisBaseCommit string `yaml:"analysis_base_commit"`
+}
+
+// parseAnalysisBaseCommit extracts buffer's analysis_base_commit and
+// validates it is a full 40-hex commit OID — a prerequisite for the
+// existence／ancestor checks PreviewAnalysisBaseBump performs next. Neither
+// check touches git; a malformed/empty value fails here without spawning a
+// process.
+func parseAnalysisBaseCommit(buffer string) (string, error) {
+	var doc bumpPlanDoc
+	if err := yaml.Unmarshal([]byte(buffer), &doc); err != nil {
+		return "", fmt.Errorf("plan: bump: parse buffer: %w", err)
+	}
+	old := doc.AnalysisBaseCommit
+	if !fullOIDPattern.MatchString(old) {
+		return "", fmt.Errorf("plan: bump: analysis_base_commit %q is not a full commit id — re-run PlannerAssist", old)
+	}
+	return old, nil
+}
+
+// bumpExitCoder matches *exec.ExitError's ExitCode() method structurally —
+// same trick as plan.VerifyLineage／gatepolicy.Gate2Policy.ReconcileBindings
+// — so an expected git exit code ("commit missing", "not an ancestor") can
+// be told apart from a fatal/unrecognized failure without importing os/exec.
+type bumpExitCoder interface{ ExitCode() int }
+
+// verifyCommitExists checks oid names a real commit object, via
+// `git rev-parse --verify --quiet <oid>^{commit}` — the same existence
+// check gatepolicy.Gate2Policy.ReconcileBindings uses for base_commit
+// (exit 1 = missing, anything else = fatal, fail closed).
+func verifyCommitExists(g plan.GitRunner, oid string) error {
+	if _, err := g.Git("rev-parse", "--verify", "--quiet", oid+"^{commit}"); err != nil {
+		var ec bumpExitCoder
+		if errors.As(err, &ec) && ec.ExitCode() == 1 {
+			return fmt.Errorf("plan: bump: analysis_base_commit %s not found in this repository — re-run PlannerAssist", oid)
+		}
+		return err
+	}
+	return nil
+}
+
+// verifyIsAncestor checks ancestor is a git ancestor of descendant, via
+// `git merge-base --is-ancestor` — same exit-code split as
+// plan.VerifyLineage, but deliberately not VerifyLineage itself: that
+// function also rejects any touched path outside an allow scope, the
+// opposite of what a bump needs (a bump exists precisely because something
+// outside plan/** changed).
+func verifyIsAncestor(g plan.GitRunner, ancestor, descendant string) error {
+	if _, err := g.Git("merge-base", "--is-ancestor", ancestor, descendant); err != nil {
+		var ec bumpExitCoder
+		if errors.As(err, &ec) && ec.ExitCode() == 1 {
+			return fmt.Errorf("plan: bump: analysis_base_commit %s is not an ancestor of HEAD — re-run PlannerAssist", ancestor)
+		}
+		return err
+	}
+	return nil
+}
+
+// bumpTouchedFiles lists paths changed in old..head (`git diff --name-only`),
+// skipping the trailing empty line the command's output always ends with.
+func bumpTouchedFiles(g plan.GitRunner, old, head string) ([]string, error) {
+	out, err := g.Git("diff", "--name-only", old+".."+head)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(string(out), "\n") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// allPlanScope reports whether every path in paths stays inside plan/**
+// (spec.PlanScope) — used to detect the "old..HEAD only touched plan/**"
+// no-bump-needed case. Vacuously true for an empty slice: no changes at all
+// also means nothing for a bump to move.
+func allPlanScope(paths []string) bool {
+	for _, p := range paths {
+		if !spec.PlanScope.Match(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// PreviewAnalysisBaseBump（§3.2）reads buffer's analysis_base_commit (never
+// trusts a caller-supplied value) and validates it is a full, existing
+// commit OID that is an ancestor of the current HEAD — any failure rejects
+// with guidance to re-run PlannerAssist. old == HEAD, or every path
+// old..HEAD touched staying inside plan/**, both mean there is nothing to
+// bump (NoBumpNeeded: true, no token issued). Otherwise returns a BumpToken
+// (carrying a backend-computed sha256(buffer) digest, never a
+// caller-supplied one) plus the commit log and touched files for the
+// operator to review before confirming.
+func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, error) {
+	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.planGit
+		return BumpPreview{}, err
+	}
+	old, err := parseAnalysisBaseCommit(buffer)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	if err := verifyCommitExists(a.planGit, old); err != nil {
+		return BumpPreview{}, err
+	}
+	headOut, err := a.planGit.Git("rev-parse", "HEAD")
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	head := strings.TrimSpace(string(headOut))
+
+	if old == head {
+		return BumpPreview{Old: old, Head: head, NoBumpNeeded: true}, nil
+	}
+	if err := verifyIsAncestor(a.planGit, old, head); err != nil {
+		return BumpPreview{}, err
+	}
+
+	touched, err := bumpTouchedFiles(a.planGit, old, head)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	if allPlanScope(touched) {
+		return BumpPreview{Old: old, Head: head, TouchedFiles: touched, NoBumpNeeded: true}, nil
+	}
+
+	logOut, err := a.planGit.Git("log", "--format=%H%x00%s", "-n", "50", old+".."+head)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+
+	tok := BumpToken{PlanRel: planRel, Old: old, Head: head, BufferDigest: spec.HashBytes([]byte(buffer))}
+	return BumpPreview{
+		Token:        tok,
+		Old:          old,
+		Head:         head,
+		Commits:      parseCommitCandidates(logOut),
+		TouchedFiles: touched,
+	}, nil
+}
+
+// analysisBaseCommitLineRe locates an analysis_base_commit: line's value:
+// group 1 is everything up to and including the separating whitespace
+// (indentation + key + colon + spaces), group 2 is the value token itself,
+// group 3 is whatever follows it (inline comment, trailing whitespace).
+// Replacing only group 2 leaves every other byte on the line untouched.
+var analysisBaseCommitLineRe = regexp.MustCompile(`^(\s*analysis_base_commit:\s*)(\S+)(.*)$`)
+
+// isAnalysisBaseCommitLine reports whether line's trimmed content begins
+// with the plan schema's analysis_base_commit key — the string-anchor
+// ConfirmAnalysisBaseBump's "恰一處" check scans for.
+func isAnalysisBaseCommitLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "analysis_base_commit:")
+}
+
+// replaceAnalysisBaseCommitLine returns line with only its
+// analysis_base_commit value replaced by newVal. Callers must only pass a
+// line isAnalysisBaseCommitLine already confirmed (guarantees
+// analysisBaseCommitLineRe matches).
+func replaceAnalysisBaseCommitLine(line, newVal string) string {
+	m := analysisBaseCommitLineRe.FindStringSubmatch(line)
+	return m[1] + newVal + m[3]
+}
+
+// ConfirmAnalysisBaseBump（§3.2）re-verifies every field of tok against the
+// caller's current state — planRel unchanged, currentBuffer's backend-
+// recomputed digest still matches (never trusts a caller-supplied digest),
+// HEAD unmoved since preview — then requires currentBuffer to contain
+// exactly one analysis_base_commit: line (0 or ≥2 rejects: string-position
+// replacement is only well-defined with exactly one). On success, replaces
+// only that line's value with tok.Head and returns the full updatedBuffer —
+// every other byte, including comments and formatting, untouched. Does not
+// write to disk or commit; the caller decides when to land the result.
+func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer string) (string, error) {
+	if _, err := a.ensureGate(); err != nil {
+		return "", err
+	}
+	if planRel != tok.PlanRel {
+		return "", errors.New("plan: bump: plan path changed since preview — re-run preview")
+	}
+	if spec.HashBytes([]byte(currentBuffer)) != tok.BufferDigest {
+		return "", errors.New("plan: bump: buffer changed since preview — re-run preview")
+	}
+	headOut, err := a.planGit.Git("rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(headOut)) != tok.Head {
+		return "", errors.New("plan: bump: HEAD moved since preview — re-run preview")
+	}
+
+	lines := strings.Split(currentBuffer, "\n")
+	matchIdx := -1
+	count := 0
+	for i, l := range lines {
+		if isAnalysisBaseCommitLine(l) {
+			count++
+			matchIdx = i
+		}
+	}
+	if count != 1 {
+		return "", fmt.Errorf("plan: bump: buffer must contain exactly one analysis_base_commit line, found %d — re-run preview", count)
+	}
+
+	lines[matchIdx] = replaceAnalysisBaseCommitLine(lines[matchIdx], tok.Head)
+	return strings.Join(lines, "\n"), nil
 }
 
 // gate2Bindings assembles the five §3.3 required Gate 2 bindings.

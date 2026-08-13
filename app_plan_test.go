@@ -407,3 +407,268 @@ func TestGateDecideRejectsMutationBeforeDecide(t *testing.T) {
 		t.Fatal("plan mutated after submit but before decide must reject GateDecide (current-binding validation)")
 	}
 }
+
+// ---- PreviewAnalysisBaseBump／ConfirmAnalysisBaseBump（Task 5, §3.2）----
+
+func TestPreviewAnalysisBaseBumpRejectsNonFullOID(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+
+	buffer := testPlanYAML("P1", "abc123", nil)
+	if _, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer); err == nil || !strings.Contains(err.Error(), "PlannerAssist") {
+		t.Fatalf("non-full-OID old must reject with PlannerAssist guidance, got %v", err)
+	}
+}
+
+func TestPreviewAnalysisBaseBumpRejectsNonexistentOID(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+
+	buffer := testPlanYAML("P1", strings.Repeat("f", 40), nil)
+	if _, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer); err == nil || !strings.Contains(err.Error(), "PlannerAssist") {
+		t.Fatalf("nonexistent old OID must reject with PlannerAssist guidance, got %v", err)
+	}
+}
+
+func TestPreviewAnalysisBaseBumpRejectsNonAncestor(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+
+	// 岔開一條分支，其 head 不是原分支後續 commit 的祖先。
+	runGit(t, a, "checkout", "-b", "other")
+	writeFile(t, filepath.Join(a.workspaceDir, "other.txt"), "x")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "other")
+	otherOID := revParseHead(t, a)
+	runGit(t, a, "checkout", "-")
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+
+	buffer := testPlanYAML("P1", otherOID, nil)
+	if _, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer); err == nil || !strings.Contains(err.Error(), "PlannerAssist") {
+		t.Fatalf("non-ancestor old must reject with PlannerAssist guidance, got %v", err)
+	}
+}
+
+func TestPreviewAnalysisBaseBumpNoBumpNeededWhenOldEqualsHead(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	headOID := revParseHead(t, a)
+
+	buffer := testPlanYAML("P1", headOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preview.NoBumpNeeded {
+		t.Fatal("old == HEAD must report NoBumpNeeded")
+	}
+	if preview.Token != (BumpToken{}) {
+		t.Fatalf("NoBumpNeeded must not issue a token, got %+v", preview.Token)
+	}
+}
+
+func TestPreviewAnalysisBaseBumpNoBumpNeededWhenOnlyPlanChanged(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writePlanFixture(t, a, "P1", oldOID, nil)
+	commitAllPlan(t, a)
+	headOID := revParseHead(t, a)
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preview.NoBumpNeeded {
+		t.Fatalf("old..HEAD touching only plan/** must report NoBumpNeeded, got %+v", preview)
+	}
+	if preview.Head != headOID {
+		t.Fatalf("Head must equal current HEAD, want %q got %q", headOID, preview.Head)
+	}
+	if preview.Token != (BumpToken{}) {
+		t.Fatal("NoBumpNeeded must not issue a token")
+	}
+}
+
+func TestPreviewAnalysisBaseBumpSucceeds(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1: touch non-plan file")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+	headOID := revParseHead(t, a)
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.NoBumpNeeded {
+		t.Fatal("touching a non-plan/** file must not report NoBumpNeeded")
+	}
+	if preview.Token.PlanRel != "plan/P1.yaml" || preview.Token.Old != oldOID || preview.Token.Head != headOID {
+		t.Fatalf("unexpected token: %+v", preview.Token)
+	}
+	if wantDigest := spec.HashBytes([]byte(buffer)); preview.Token.BufferDigest != wantDigest {
+		t.Fatalf("token digest must be backend sha256(buffer), want %q got %q", wantDigest, preview.Token.BufferDigest)
+	}
+	if len(preview.Commits) != 1 || preview.Commits[0].OID != headOID {
+		t.Fatalf("commits must list old..HEAD, got %+v", preview.Commits)
+	}
+	if len(preview.TouchedFiles) != 1 || preview.TouchedFiles[0] != "README.md" {
+		t.Fatalf("touchedFiles must list README.md, got %v", preview.TouchedFiles)
+	}
+}
+
+func TestConfirmAnalysisBaseBumpReplacesValuePreservingBytes(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+	headOID := revParseHead(t, a)
+
+	buffer := "plan_id: P1\n" +
+		"# analysis base comment\n" +
+		"analysis_base_commit: " + oldOID + "  # base commit\n" +
+		"spec_manifest: sha256:" + strings.Repeat("a", 64) + "\n"
+
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := a.ConfirmAnalysisBaseBump(preview.Token, "plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "plan_id: P1\n" +
+		"# analysis base comment\n" +
+		"analysis_base_commit: " + headOID + "  # base commit\n" +
+		"spec_manifest: sha256:" + strings.Repeat("a", 64) + "\n"
+	if updated != want {
+		t.Fatalf("updated buffer must byte-for-byte match except the replaced value\nwant:\n%s\ngot:\n%s", want, updated)
+	}
+}
+
+func TestConfirmAnalysisBaseBumpRejectsHeadMovedAfterPreview(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// HEAD 在 preview 之後前移。
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c2")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c2")
+
+	if _, err := a.ConfirmAnalysisBaseBump(preview.Token, "plan/P1.yaml", buffer); err == nil {
+		t.Fatal("HEAD moved since preview must reject confirm")
+	}
+}
+
+func TestConfirmAnalysisBaseBumpRejectsBufferChanged(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changedBuffer := buffer + "# edited after preview\n"
+	if _, err := a.ConfirmAnalysisBaseBump(preview.Token, "plan/P1.yaml", changedBuffer); err == nil {
+		t.Fatal("buffer changed since preview (digest mismatch) must reject confirm")
+	}
+}
+
+func TestConfirmAnalysisBaseBumpRejectsPlanRelMismatch(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	oldOID := revParseHead(t, a)
+
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c1")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c1")
+
+	buffer := testPlanYAML("P1", oldOID, nil)
+	preview, err := a.PreviewAnalysisBaseBump("plan/P1.yaml", buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.ConfirmAnalysisBaseBump(preview.Token, "plan/P2.yaml", buffer); err == nil {
+		t.Fatal("planRel mismatch must reject confirm")
+	}
+}
+
+// TestConfirmAnalysisBaseBumpRejectsDuplicateAnalysisBaseCommitLine 直接建構
+// token（而非透過 Preview）：一份含兩處 analysis_base_commit: 的 buffer 在
+// Preview 階段就會因 yaml 重複鍵值而解析失敗，無法走到這裡；這裡驗證的是
+// Confirm 自己獨立守住的「恰一處」不變量——digest／planRel／HEAD 全部對得
+// 上時，仍必須靠這條規則擋下無法安全定位替換的 buffer。
+func TestConfirmAnalysisBaseBumpRejectsDuplicateAnalysisBaseCommitLine(t *testing.T) {
+	a := newTestAppGit(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "README.md"), "c0")
+	runGit(t, a, "add", "-A")
+	runGit(t, a, "commit", "-m", "c0")
+	headOID := revParseHead(t, a)
+
+	buffer := "analysis_base_commit: " + headOID + "\n" +
+		"analysis_base_commit: " + headOID + "\n"
+	tok := BumpToken{
+		PlanRel:      "plan/P1.yaml",
+		Old:          headOID,
+		Head:         headOID,
+		BufferDigest: spec.HashBytes([]byte(buffer)),
+	}
+
+	if _, err := a.ConfirmAnalysisBaseBump(tok, "plan/P1.yaml", buffer); err == nil {
+		t.Fatal("buffer with two analysis_base_commit lines must reject confirm (恰一處 rule)")
+	}
+}
