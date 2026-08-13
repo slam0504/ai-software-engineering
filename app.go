@@ -99,7 +99,7 @@ type App struct {
 	// 以下三個 hook 只服務 claude 自然收尾 reaper／forcedShutdown 的 ErrEndInProgress
 	// benign 裁定（review P2：TestShutdownForcedWaitsForBoth flaky）——讓測試能
 	// deterministic 驅動兩個時序分支，不靠 time.Sleep 猜。
-	hookClaudeTeardownBarrier          func() // 測試注入：claudeTeardownFn（shared OnceValue）真正執行開始時
+	hookClaudeTeardownBarrier          func() // 測試注入：任一 claudeTeardown 真正執行的進入點（OnceValue 與 fresh 閉包皆經此）
 	hookClaudeReaperBeforeEndFlow      func() // 測試注入：reaper 的 <-done 解除之後、呼叫 EndSessionFlow 之前
 	hookForcedShutdownClaudeBeforeFlow func() // 測試注入：forcedShutdown 的 sess.Terminate() 之後、呼叫 EndSessionFlow 之前
 	hookForcedShutdownClaudeBenign     func() // 測試注入：forcedShutdown 判定 ErrEndInProgress 為 benign、等待收斂之前
@@ -675,7 +675,7 @@ func (a *App) stopPlanWatch() {
 
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
-	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist
+	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
 	a.shutMu.Unlock()
 	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
 	a.stopPlanWatch()                          // 1a′) 停 plan/ watcher，同上理由
@@ -3371,10 +3371,38 @@ func (a *App) SendMessage(provider, prompt string) error {
 
 // EndSession：指定 provider 的收尾編排（appcore.EndSessionFlow）。冪等；
 // ErrProviderBusy 等真實錯誤原樣回 UI。
+//
+// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginAppTxn／
+// endAppTxn，沿 app.go:213 慣例，同 StartSession／ensureAppServer／B1 probe）。
+// 修前的 gap：EndSession 完全不在 shutdown gate 之內——使用者已呼叫的 EndSession
+// 若跟 shutdown() 同時發生，shutdown 的 inflight.Wait() 不會等它，會直接往下讀
+// a.claudeSess 進 forcedShutdown；forcedShutdown 見到 BeginEndSession 失敗會
+// 套用 ErrEndInProgress benign 規則（review P2），但那條規則的前提是「贏家是
+// startClaude 內建的自然收尾 reaper、且與 forcedShutdown 共用同一份
+// claudeTeardownFn」——這裡贏家其實是 EndSession 自己建的另一份獨立閉包，
+// forcedShutdown 等的 teardownFn 從未被觸發，於是變成對同一個 session 並行跑
+// 兩份 CloseSequence、重複發 session:done。納入 app transaction 後這個 race
+// window 直接消失：EndSession 在 shuttingDown 之後一律被拒（不會冒出新的
+// in-flight teardown）；EndSession 若已在 shuttingDown 之前開始，
+// inflight.Wait() 保證等它完整返回（含 teardown／FinishEndSession）才會往下
+// 讀 a.claudeSess——forcedShutdown 執行時看到的必是 EndSession 已經收乾淨的
+// 狀態，兩者時間上不再重疊。
+//
+// 沒有讓 EndSession 改共用 claudeTeardownFn（那個 OnceValue 只服務
+// forcedShutdown「BeginEndSession 失敗仍重跑 teardown 兜底」的模式）：
+// EndSession 本身沒有這種 fallback，appcore.BeginEndSession 失敗時
+// EndSessionFlow 根本不會呼叫 teardown、直接把錯誤原樣回給呼叫端，不管閉包
+// 是否共用都不會有第二次真正執行——與自然收尾 reaper 競速（跟 shutdown 無關
+// 的既有情境，見 fix/shutdown-end-in-progress report concern 3）因此維持原行為
+// 未變動，殘留面已知、非本輪修復範圍。
 func (a *App) EndSession(provider string) error {
 	if provider != "claude" && provider != "codex" {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：見上方 doc
+		return err
+	}
+	defer a.endAppTxn()
 	a.mu.Lock()
 	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
 	runner, klease := a.runner, a.codexLease
@@ -3594,7 +3622,7 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 		if sess == nil {
 			return errors.New("no active claude session")
 		}
-		if h := a.hookClaudeTeardownBarrier; h != nil { // 測試 barrier：見 App 欄位 doc；shared OnceValue 唯一一次真正執行的起點
+		if h := a.hookClaudeTeardownBarrier; h != nil { // 測試 barrier：見 App 欄位 doc；任一呼叫端（OnceValue 或 fresh 閉包）真正執行的進入點
 			h()
 		}
 		fin := func(ex ports.Exit) error {
@@ -4092,10 +4120,19 @@ func (a *App) RestoreViews() map[string]RestoredView {
 // NewSession：New 專用原子流程（plan D4）。收尾成功才重設恢復視窗；失敗回錯、
 // UI 不重設；另一 provider 完全不受影響。resetting phase 涵蓋
 // 「teardown → restore reset」整段（期間 Start 回 ErrResetInProgress）。
+//
+// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginAppTxn／
+// endAppTxn）——理由與 EndSession 上方 doc 完全相同（同一類 shutdown race，
+// NewSession 也是「BeginEndSession 成功才會呼叫 teardown、失敗就直接回錯」，
+// 沒有 fallback 兜底重跑，故同樣不需要共用 claudeTeardownFn）。
 func (a *App) NewSession(provider string) error {
 	if provider != "claude" && provider != "codex" {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
+	if err := a.beginAppTxn(); err != nil { // shutdown gate：見 EndSession doc
+		return err
+	}
+	defer a.endAppTxn()
 	pv := contract.Provider(provider)
 	a.mu.Lock()
 	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
