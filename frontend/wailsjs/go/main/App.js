@@ -26,6 +26,22 @@ export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
 
+export function EscalationAck(arg1) {
+  return window['go']['main']['App']['EscalationAck'](arg1);
+}
+
+export function EscalationCreate(arg1, arg2, arg3) {
+  return window['go']['main']['App']['EscalationCreate'](arg1, arg2, arg3);
+}
+
+export function EscalationList() {
+  return window['go']['main']['App']['EscalationList']();
+}
+
+export function EscalationResolve(arg1, arg2, arg3) {
+  return window['go']['main']['App']['EscalationResolve'](arg1, arg2, arg3);
+}
+
 export function EvidenceCommitCandidates(arg1) {
   return window['go']['main']['App']['EvidenceCommitCandidates'](arg1);
 }

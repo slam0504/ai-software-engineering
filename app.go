@@ -24,6 +24,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/escalation"
 	"github.com/slam0504/sdlc-workbench/internal/evidence"
 	"github.com/slam0504/sdlc-workbench/internal/gate"
 	"github.com/slam0504/sdlc-workbench/internal/gatepolicy"
@@ -149,6 +150,31 @@ type App struct {
 	// barrier，重現「beginAppTxn 成功到 evidenceActive 登記之間」的 TOCTOU
 	// 窗（task-20 review M1）。
 	evidenceContextLoaderOverride evidence.ContextLoader
+
+	// Escalation（Task 24：spec §3.8／§3.10）——workflowMu 是跨 journal 編排的
+	// 唯一互斥：GateDecide 的凍結順序（reconcile→validator→stale 修復解除→
+	// blocker→append）、escalation 收件匣的全部寫入、evidence finalize 的自動
+	// 來源接線、watcher 觸發的 Reconcile 全部序列化在它底下。
+	//
+	// lock ordering：workflowMu → gate journal（gate.Service 內部 mu）→
+	// escalation journal（escalation.Service 內部 mu）。evidenceMu 與 workflowMu
+	// 不巢狀——RunEvidence 的 finalize 臨界區（evidenceMu）先完整結束，才另取
+	// workflowMu 做 §3.8 (5)(6)(7) 接線（見 wireEvidenceEscalation）。
+	//
+	// 重入規約：public EscalationCreate／EscalationAck／EscalationResolve／
+	// EscalationList 先取 workflowMu；已持有 workflowMu 的路徑（GateDecide 編排、
+	// reconcileLocked、wireEvidenceEscalation）只准呼叫 esc*Locked 內部變體，
+	// 否則同一 mutex 重入即死鎖。
+	workflowMu sync.Mutex
+	escSvc     *escalation.Service
+	escJournal *escalation.Journal
+	escOnce    sync.Once
+	escInitErr error
+	gateReg    gate.Registry // ensureGate 建好的 policy registry（§3.8 (2) 的 pre-validation 用）
+
+	decideBarrierHook    func() // 測試注入：GateDecide blocker 檢查後、CommitDecision 前
+	onWorkflowMuAttempt  func() // 測試注入：public EscalationCreate 於 workflowMu.Lock() 前
+	onWorkflowMuAcquired func() // 測試注入：public EscalationCreate 取得 workflowMu 後、寫入前
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -246,6 +272,14 @@ func (a *App) startup(ctx context.Context) {
 	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 Reconcile()
 	a.watchPlanTree() // Task 12：plan/ 遞迴監看，鏡射 watchSpecTree（同一 Reconcile()，涵蓋 gate1／gate2）
 	a.startupEvidence()
+	// Task 24（§3.8 啟動補建）：依權威狀態掃描——已 stale 的核可、degraded
+	// journal 若無對應未 resolved escalation 項即補建、journal 重開成功即系統
+	// 解除 journal-degraded 項。只在 gate journal 已存在（workspace 曾用過
+	// gate）時觸發：全新／非 git workspace 不強迫 ensureGate 的 git 依賴在
+	// startup 就 fail loud。
+	if _, statErr := os.Stat(filepath.Join(a.workspaceDir, ".workbench", "gate.jsonl")); statErr == nil {
+		a.reconcileGate1NotifyOnly()
+	}
 }
 
 // startupEvidence（Task 20）：惰性 gate/plan 之外少數在 startup 就建立的狀態——
@@ -459,16 +493,22 @@ func (a *App) runSpecWatch(w *fsnotify.Watcher, specRoot string, stop <-chan str
 // reconcileGate1NotifyOnly：watcher 觸發的 best-effort reconcile——失敗只
 // fail-loud UI，不影響權威（GateList 讀取路徑永遠自己重算一次）。名稱沿用
 // M2 舊名（gate1 尚是唯一 gate 時所取），但 svc.Reconcile() 本身早已泛化為
-// 對 Registry 內所有已註冊 gate（gate1／gate2）重算 stale——watchSpecTree／
-// watchPlanTree（Task 12）共用同一個呼叫點，任一棵樹變更都會讓兩個 gate 的
-// 綁定一併被重新檢查。
+// 對 Registry 內所有已註冊 gate（gate1／gate2／tca）重算 stale——
+// watchSpecTree／watchPlanTree（Task 12）共用同一個呼叫點，任一棵樹變更都會
+// 讓所有 gate 的綁定一併被重新檢查。
+//
+// Task 24：watcher 觸發的 Reconcile 也屬 workflowMu 序列化的編排路徑——先取
+// workflowMu 再走 reconcileLocked（§3.8 stale／journal-degraded 補建接在同一
+// 呼叫點；重入規約見 workflowMu 欄位 doc）。
 func (a *App) reconcileGate1NotifyOnly() {
 	svc, err := a.ensureGate()
 	if err != nil {
 		a.failLoudSpecWatch("ensureGate: " + err.Error())
 		return
 	}
-	if err := svc.Reconcile(); err != nil {
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if err := a.reconcileLocked(svc); err != nil {
 		a.failLoudSpecWatch("Reconcile: " + err.Error())
 	}
 }
@@ -1168,6 +1208,7 @@ func (a *App) ensureGate() (*gate.Service, error) {
 			"test_contract_approval": gatepolicy.NewTCAPolicy(appEvidenceStore{a: a}, appGateReader{a: a},
 				a.planLoader, a.planGit, currentOracleDigest),
 		}
+		a.gateReg = reg // Task 24：submitGateRequest 的 §3.8 (2) pre-validation 用
 		a.gateSvc = gate.NewService(j, reg, ulidFn, nowFn, gateEmitter{a})
 	})
 	return a.gateSvc, a.gateInitErr
@@ -1193,7 +1234,7 @@ func (a *App) SubmitForApproval() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return svc.Submit("gate1", "workspace", gate1Bindings(manifestDigest, baseCommit))
+	return a.submitGateRequest(svc, "gate1", "workspace", gate1Bindings(manifestDigest, baseCommit))
 }
 
 // ---- SpecCommit（Task 15：spec §5.1 兩階段 commit UI，wraps internal/spec.GitRepo）----
@@ -1809,7 +1850,25 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	}
 
 	if errs := plan.Validate(pl, pol, specScenarios); len(errs) > 0 {
-		return "", fmt.Errorf("plan: validation failed: %w", errors.Join(errs...))
+		verr := fmt.Errorf("plan: validation failed: %w", errors.Join(errs...))
+		if hasRiskClassificationError(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
+			a.workflowMu.Lock()
+			_, cerr := a.escCreateSystemLocked("risk-unclassifiable:"+planID, "gate2:"+planID, true,
+				"plan "+planID+" 的 risk 分類驗證失敗（minimum 無法重算）", "plan:"+planID)
+			a.workflowMu.Unlock()
+			if cerr != nil {
+				return "", errors.Join(verr, cerr)
+			}
+		}
+		return "", verr
+	}
+	// (1) 權威修復：新版 committed plan 通過 plan.Validate 即系統解除同 key
+	// （無未 resolved 項時 no-op）。
+	a.workflowMu.Lock()
+	riskResolveErr := a.escResolveByKeyLocked("risk-unclassifiable:"+planID, "validated:"+planHeadOID)
+	a.workflowMu.Unlock()
+	if riskResolveErr != nil {
+		return "", riskResolveErr
 	}
 
 	if err := plan.VerifyLineage(a.planGit, pl.AnalysisBaseCommit, planHeadOID, spec.PlanScope.Match); err != nil {
@@ -1834,7 +1893,23 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	}
 
 	bindings := gate2Bindings(gate1SpecManifest, planManifestDigest, planBaseCommit, riskPolicyDigest, permissionManifestDigest)
-	return svc.Submit("gate2", "plan:"+planID, bindings)
+	return a.submitGateRequest(svc, "gate2", "plan:"+planID, bindings)
+}
+
+// hasRiskClassificationError：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk
+// 分類失敗（minimum 重算不符、tier 名稱未知）。plan.Validate 回傳未型別化的
+// inline errors，這裡以訊息片段比對——脆弱點已知（validate.go 措辭改動需同步），
+// 換 typed error 屬 internal/plan 的 API 擴張，非本 task scope。
+func hasRiskClassificationError(errs []error) bool {
+	for _, e := range errs {
+		msg := e.Error()
+		if strings.Contains(msg, "does not match recomputed") ||
+			strings.Contains(msg, "unknown minimum_risk_tier") ||
+			strings.Contains(msg, "unknown planner_risk_tier") {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- Evidence run（Task 20：M3a §4-5，wraps internal/evidence）----
@@ -1990,6 +2065,17 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 	if finalErr == nil {
 		finalErr = appendErr
 	}
+
+	// Task 24（§3.8 (5)(6)(7)＋A8）：finalize 成功（run 已 durable）才接線
+	// escalation 自動來源。workflowMu 在 evidenceMu 臨界區之外另取（lock
+	// ordering：兩把鎖不巢狀，見 workflowMu 欄位 doc）；escalation 寫入失敗
+	// fail loud——run 記錄本身已 durable，但自動來源沒記上不得無聲。
+	if finalErr == nil {
+		if escErr := a.wireEvidenceEscalation(planID, taskID, kind, evidenceID, run.Result); escErr != nil {
+			finalErr = escErr
+		}
+	}
+
 	payload := map[string]any{
 		"phase": "finished", "evidence_id": evidenceID,
 		"plan_id": planID, "task_id": taskID, "kind": kind,
@@ -2193,7 +2279,7 @@ func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, nega
 	bindings := tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest,
 		testCommit, redRun.OracleSurfaceDigest,
 		expectedRedID, redDigest, negativeControlID, negDigest, mutationID, m.Digest)
-	return svc.Submit("test_contract_approval", "task:"+planID+"/"+taskID, bindings)
+	return a.submitGateRequest(svc, "test_contract_approval", "task:"+planID+"/"+taskID, bindings)
 }
 
 // reclaimEvidenceRuns：shutdown 對 in-flight RunEvidence 的收束——cancel 每個
@@ -2350,6 +2436,11 @@ func (a *App) gitIdentity() (name, email string, err error) {
 // 重掃 worktree——避免決議內容漂移到「核可時」而非「申請時」的快照，也不要求
 // decide 當下 worktree 仍乾淨），並以 policy 的 current-binding validation
 // 擋掉待核期間已過期的請求（§3.1）。riskSelections 供 gate2 用；gate1 傳空即可。
+//
+// Task 24（spec §3.10 凍結順序，app 層編排）：整段在 workflowMu 下執行——
+// reconcile → validator（PrepareDecision）→ [approved 時 2b：stale 修復解除]
+// → blocking escalation 檢查 → append（CommitDecision）。blocker 只能在
+// workflowMu 之外排隊，不存在「檢查後、append 前」被插入的窗口。
 func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection) error {
 	svc, err := a.ensureGate()
 	if err != nil {
@@ -2367,7 +2458,354 @@ func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []g
 		return errors.New("gate: git identity not configured — set git config user.name (or user.email) before approving")
 	}
 	approver := gate.Approver{ID: id, Method: "app-local"}
-	return svc.Decide(approvalID, decision, reason, approver, gate.DecisionInput{RiskSelections: riskSelections})
+
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if err := a.reconcileLocked(svc); err != nil { // 1. reconcile bindings（含 §3.8 stale／journal-degraded 補建）
+		return err
+	}
+	prepared, err := svc.PrepareDecision(approvalID, decision, reason, approver,
+		gate.DecisionInput{RiskSelections: riskSelections}) // 2. 硬性 validator＋approved 的 current-binding validation
+	if err != nil {
+		return err
+	}
+	scope := scopeForSubject(prepared.Record.Gate, prepared.Record.Subject)
+	if prepared.Record.Decision == "approved" { // 2b. 修復解除（凍結時點）：
+		// current-binding validation 已通過 ＝ 同 subject 的 stale 條件已被此修正版
+		// 修復；在 blocker 檢查前系統解除舊 stale blocker（stale record 本身是終態，
+		// 修復載體是修正版的核可流程）。resolve 寫入失敗 → 拒絕核可（fail closed，
+		// §3.10：escalation journal 寫不進去時 Gate 不得放行）。
+		key := "stale:" + prepared.Record.Gate + ":" + prepared.Record.Subject
+		if rerr := a.escResolveByKeyLocked(key, "superseded-by:"+prepared.Record.ApprovalID); rerr != nil {
+			return rerr
+		}
+	}
+	items, berr := a.escBlockingForLocked(scope) // 3. blocking escalation（Project 失敗＝收件匣不可用，一樣拒——不裝空）
+	if berr != nil {
+		return berr
+	}
+	if len(items) > 0 {
+		return fmt.Errorf("blocked by %d escalation item(s): %s", len(items), summarizeEscalations(items))
+	}
+	if h := a.decideBarrierHook; h != nil { // 測試 seam：blocker 檢查後、append 前
+		h()
+	}
+	return svc.CommitDecision(prepared) // 4. append
+}
+
+// ---- Escalation inbox（Task 24：spec §3.8／§3.10）----
+
+// ensureEscalation 惰性初始化 escalation.Service，journal 落在 workspace 的
+// .workbench/escalation.jsonl（同 ensureGate 之於 gate.jsonl——綁 workspace，
+// 不隨測試 stateDir 漂移）。
+func (a *App) ensureEscalation() (*escalation.Service, error) {
+	a.escOnce.Do(func() {
+		root, err := claude.NormalizeCWD(a.workspaceDir)
+		if err != nil {
+			a.escInitErr = err
+			return
+		}
+		wbDir := filepath.Join(root, ".workbench")
+		if merr := os.MkdirAll(wbDir, 0o755); merr != nil {
+			a.escInitErr = merr
+			return
+		}
+		j, jerr := escalation.OpenJournal(filepath.Join(wbDir, "escalation.jsonl"))
+		if jerr != nil {
+			a.escInitErr = jerr
+			return
+		}
+		a.escJournal = j
+		a.escSvc = escalation.NewService(j,
+			func() string { return contract.NewULID(time.Now()) },
+			func() string { return time.Now().UTC().Format(time.RFC3339Nano) })
+	})
+	return a.escSvc, a.escInitErr
+}
+
+// scopeForSubject 把 (gate, subject) 映射到 escalation block scope（§3.8）：
+// gate1→"workspace"、gate2 "plan:<id>"→"gate2:<id>"、tca "task:<p>/<t>"→
+// "tca:<p>/<t>"。未知 gate 一律映到 "workspace"（最寬 scope，fail closed）。
+func scopeForSubject(gateName, subject string) string {
+	switch gateName {
+	case "gate1":
+		return "workspace"
+	case "gate2":
+		if id, ok := planIDFromSubject(subject); ok {
+			return "gate2:" + id
+		}
+		return "gate2:" + subject
+	case "test_contract_approval":
+		if rest, ok := strings.CutPrefix(subject, "task:"); ok {
+			return "tca:" + rest
+		}
+		return "tca:" + subject
+	default:
+		return "workspace"
+	}
+}
+
+// summarizeEscalations：blocker 拒絕訊息的項目摘要（key＋summary；手動項無
+// key 用 escalation_id）。
+func summarizeEscalations(items []escalation.Entry) string {
+	parts := make([]string, 0, len(items))
+	for _, e := range items {
+		label := e.Item.ConditionKey
+		if label == "" {
+			label = e.Item.EscalationID
+		}
+		parts = append(parts, label+"（"+e.Item.Summary+"）")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// esc*Locked：已持有 workflowMu 的路徑專用（重入規約見 workflowMu 欄位 doc）。
+
+func (a *App) escCreateSystemLocked(conditionKey, blockScope string, hard bool, summary, sourceRef string) (string, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return "", err
+	}
+	return svc.CreateSystem(conditionKey, blockScope, hard, summary, sourceRef)
+}
+
+func (a *App) escResolveByKeyLocked(conditionKey, evidenceRef string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	return svc.ResolveByKey(conditionKey, evidenceRef)
+}
+
+// escBlockingForLocked 回傳覆蓋 scope 的未 resolved blocking 項。escalation
+// 初始化失敗或 Project 失敗都回錯——收件匣不可用時 Gate 決議 fail closed，
+// 絕不把「讀不到」當成「沒有 blocker」（§3.8）。
+func (a *App) escBlockingForLocked(scope string) ([]escalation.Entry, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.Entries()
+	if err != nil {
+		return nil, err
+	}
+	return escalation.BlockingFor(entries, scope), nil
+}
+
+// reconcileLocked（呼叫端持 workflowMu）：svc.List()（= Reconcile＋Project）
+// 之後依權威 projection 補建 §3.8 自動來源——
+//
+//	(3)(4) stale：State==Stale 且同 (gate,subject) 沒有 Active 修正版核可的
+//	  項目 → "stale:<gate>:<subject>"（hard=true，scope 依 scopeForSubject）。
+//	  同 key 去重由 escalation.Service.CreateSystem 保證，重複掃描冪等；已被
+//	  修正版核可（同 subject 有 Active）者不補建——其修復時點凍結在 GateDecide
+//	  2b，補建在這裡再開會讓已修復的 blocker 復活。
+//	(8) journal degraded：gate／evidence journal 已 degraded → workspace hard
+//	  項；journal 健康（例如重啟後重開成功）→ 系統解除同 key（修復條件）。
+//	  escalation journal 自身 degraded 無法寫入自己的 journal-degraded 項——
+//	  它的 fail-closed 由 esc* 呼叫端回錯（Gate 拒核）承擔。
+//
+// 接線點選擇（brief 給兩案：比對 Reconcile 前後 projection vs. 掛
+// EmitGateEvent binding_stale hook）：選權威狀態掃描——binding_stale 事件在
+// gate.Service 持內部 mu 時發出，hook 內回讀 gate（Lookup 補 gate/subject）
+// 必死鎖，且事件是通知層、掃描才符合「啟動／讀取補建」的冪等語意。
+func (a *App) reconcileLocked(svc *gate.Service) error {
+	entries, err := svc.List()
+	if err != nil {
+		return err
+	}
+	// (8) journal-degraded 補建／修復
+	if a.gateJournal != nil {
+		if err := a.escJournalDegradedLocked("gate", a.gateJournal.Degraded(), ".workbench/gate.jsonl"); err != nil {
+			return err
+		}
+	}
+	if a.evidenceJournal != nil {
+		if err := a.escJournalDegradedLocked("evidence", a.evidenceJournal.Degraded(), ".workbench/evidence/evidence.jsonl"); err != nil {
+			return err
+		}
+	}
+	// (3)(4) stale 補建
+	active := map[string]bool{}
+	for _, e := range entries {
+		if e.State == gate.Active && e.Record != nil {
+			active[e.Record.Gate+":"+e.Record.Subject] = true
+		}
+	}
+	for _, e := range entries {
+		if e.State != gate.Stale || e.Record == nil {
+			continue
+		}
+		gs := e.Record.Gate + ":" + e.Record.Subject
+		if active[gs] {
+			continue
+		}
+		if _, cerr := a.escCreateSystemLocked("stale:"+gs, scopeForSubject(e.Record.Gate, e.Record.Subject), true,
+			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——需修正版重核",
+			e.ApprovalID); cerr != nil {
+			return cerr
+		}
+	}
+	return nil
+}
+
+// escJournalDegradedLocked：§3.8 (8) 單一 journal 的補建／修復（呼叫端持
+// workflowMu）。degraded → workspace hard 項；健康 → 系統解除同 key（no-op
+// 若本無未 resolved 項）。
+func (a *App) escJournalDegradedLocked(which string, degraded bool, ref string) error {
+	key := "journal-degraded:" + which
+	if degraded {
+		_, err := a.escCreateSystemLocked(key, "workspace", true,
+			which+" journal 寫入已 degraded——重啟修復前拒絕新核可", ref)
+		return err
+	}
+	return a.escResolveByKeyLocked(key, "journal-reopened")
+}
+
+// wireEvidenceEscalation：§3.8 (5)(6)(7) 的 evidence finalize 接線＋A8 修復。
+// 呼叫端不得持 evidenceMu 或 workflowMu（lock ordering：finalize 臨界區結束
+// 後才進來，evidenceMu 與 workflowMu 不巢狀）。key 綁 plan/task/kind 而非
+// evidence_id——新 run 成功即可 ResolveByKey 舊項（A8）。
+func (a *App) wireEvidenceEscalation(planID, taskID, kind, evidenceID, result string) error {
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	scope := "tca:" + planID + "/" + taskID
+	errKey := "evidence-error:" + planID + "/" + taskID + "/" + kind
+	ncKey := "negative-control-missed:" + planID + "/" + taskID
+	switch result {
+	case "passed": // A8：同 key 新 run 通過＝權威修復，系統解除
+		if err := a.escResolveByKeyLocked(errKey, "passed:"+evidenceID); err != nil {
+			return err
+		}
+		if kind == "negative_control" {
+			return a.escResolveByKeyLocked(ncKey, "passed:"+evidenceID)
+		}
+		return nil
+	case "error": // (5)(6)：runner 逾時／環境錯誤／輸出超限／expected-red error 原因
+		_, err := a.escCreateSystemLocked(errKey, scope, false,
+			"evidence run "+evidenceID+"（"+kind+"）結果為 error", "evidence:"+evidenceID)
+		return err
+	case "failed":
+		if kind == "negative_control" { // (7)：negative control 未抓到 mutation
+			_, err := a.escCreateSystemLocked(ncKey, scope, false,
+				"negative control run "+evidenceID+" 未抓到 mutation（result=failed）", "evidence:"+evidenceID)
+			return err
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// submitGateRequest：svc.Submit 的 §3.8 (2) 接線包裝——系統組裝的送核請求先
+// 過該 gate policy 的 ValidateRequest：失敗即開 "missing-binding:<gate>:<subject>"
+// 項（同 key 去重）；通過且 Submit 成功即系統解除同 key（同 subject 新 request
+// 通過驗證＝(2) 的權威修復條件）。Submit 內部會再驗一次同一 policy——重複驗證
+// 是刻意的：app 層需要把「ValidateRequest 失敗」從其他 Submit 錯誤（journal
+// 寫入失敗等）中區分出來，而不擴大 gate.Service 的介面。
+func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bindings []gate.Binding) (string, error) {
+	key := "missing-binding:" + gateName + ":" + subject
+	if policy, ok := a.gateReg[gateName]; ok {
+		req := gate.GateRequest{Type: "gate_request", SchemaVersion: 2, Gate: gateName,
+			Subject: subject, Bindings: bindings}
+		if verr := policy.ValidateRequest(req); verr != nil {
+			a.workflowMu.Lock()
+			_, cerr := a.escCreateSystemLocked(key, scopeForSubject(gateName, subject), false,
+				"系統組裝的送核請求缺必要 binding："+verr.Error(), subject)
+			a.workflowMu.Unlock()
+			if cerr != nil {
+				return "", errors.Join(verr, cerr)
+			}
+			return "", verr
+		}
+	}
+	id, err := svc.Submit(gateName, subject, bindings)
+	if err != nil {
+		return "", err
+	}
+	a.workflowMu.Lock()
+	rerr := a.escResolveByKeyLocked(key, "request:"+id)
+	a.workflowMu.Unlock()
+	if rerr != nil { // 已送出但修復解除寫不進去：fail loud（不無聲留下已修復的 blocker）
+		return "", rerr
+	}
+	return id, nil
+}
+
+// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement probe 失敗的
+// condition key。現況 PlanAssist 沒有 enforcement probe 結果 hook（唯讀
+// sandbox 由 provider 端 flags 強制、無失敗回報路徑）——觸發點待 probe 接線
+// 後補（task-24-report.md 列明），key 與建立函式先凍結在此，不假接。
+func plannerEnforcementKey(provider string) string { return "planner-enforcement:" + provider }
+
+// escPlannerEnforcementFailedLocked：(9) 的建立函式（呼叫端持 workflowMu）。
+func (a *App) escPlannerEnforcementFailedLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", false,
+		"PlannerAssist enforcement 失敗（"+provider+"）："+detail, "provider:"+provider)
+}
+
+// EscalationList 回傳收件匣 projection（Wails 綁定）。Project 失敗回錯——
+// 收件匣標不可用，絕不裝空（§3.8）。
+func (a *App) EscalationList() ([]escalation.Entry, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return nil, err
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Entries()
+}
+
+// EscalationCreate 建立手動 escalation 項（Wails 綁定；sourceRef 必填，
+// blockScope 空字串＝非阻擋資訊項）。
+func (a *App) EscalationCreate(sourceRef, blockScope, summary string) (string, error) {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return "", err
+	}
+	if h := a.onWorkflowMuAttempt; h != nil { // 測試 seam：Lock() 前
+		h()
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	if h := a.onWorkflowMuAcquired; h != nil { // 測試 seam：取得 mutex 後、寫入前
+		h()
+	}
+	return svc.CreateManual(sourceRef, blockScope, summary)
+}
+
+// EscalationAck 標記已認知（不解除 block，§3.8）。
+func (a *App) EscalationAck(id string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Ack(id)
+}
+
+// EscalationResolve 手動 resolve（Wails 綁定）。actor 一律取 git identity
+// （同 GateDecide 的 approver 來源）；hard 項由 Service 拒絕（僅系統可 resolve）。
+func (a *App) EscalationResolve(id, resolution, reason string) error {
+	svc, err := a.ensureEscalation()
+	if err != nil {
+		return err
+	}
+	name, email, err := a.gitIdentity()
+	if err != nil {
+		return err
+	}
+	actor := name
+	if actor == "" {
+		actor = email
+	}
+	if actor == "" {
+		return errors.New("escalation: git identity not configured — set git config user.name (or user.email) before resolving")
+	}
+	a.workflowMu.Lock()
+	defer a.workflowMu.Unlock()
+	return svc.Resolve(id, resolution, reason, actor)
 }
 
 // ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----

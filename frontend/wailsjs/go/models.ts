@@ -1,3 +1,70 @@
+export namespace escalation {
+	
+	export class Item {
+	    _type: string;
+	    escalation_id: string;
+	    condition_key: string;
+	    occurrence: number;
+	    source: string;
+	    source_ref: string;
+	    block_scope: string;
+	    hard: boolean;
+	    summary: string;
+	    created_at: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Item(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this._type = source["_type"];
+	        this.escalation_id = source["escalation_id"];
+	        this.condition_key = source["condition_key"];
+	        this.occurrence = source["occurrence"];
+	        this.source = source["source"];
+	        this.source_ref = source["source_ref"];
+	        this.block_scope = source["block_scope"];
+	        this.hard = source["hard"];
+	        this.summary = source["summary"];
+	        this.created_at = source["created_at"];
+	    }
+	}
+	export class Entry {
+	    Item: Item;
+	    State: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Entry(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Item = this.convertValues(source["Item"], Item);
+	        this.State = source["State"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
 export namespace evidence {
 	
 	export class EvidenceRun {
