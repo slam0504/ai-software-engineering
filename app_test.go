@@ -496,6 +496,13 @@ func TestEndOneProviderLeavesOtherActive(t *testing.T) {
 	}
 }
 
+// TestShutdownForcedWaitsForBoth：分支 (b)——claude 自然收尾 reaper 不搶先
+// （用 hookClaudeReaperBeforeEndFlow 卡住它，直到 forcedShutdown 已完整跑
+// 完），forced teardown 本身必須正常完成兩邊收尾。reaper 是否搶先本是不受控的
+// goroutine 排程競速（review P2：曾在完整 race suite 中量到一次 flaky FAIL）——
+// 這裡用既有 test hook 把它釘死在單一分支，不再讓測試結果看排程臉色。
+// 分支 (a)（自然收尾先贏、forced 撞見 benign ErrEndInProgress）見下方
+// TestShutdownForcedBenignWhenNaturalEndRaces。
 func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	a, ui := newTestApp(t)
 	writeMultiTurnClaude(t, a)
@@ -523,9 +530,16 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 		t.Fatal("precondition: codex turn must be active")
 	}
 
+	// 分支 (b) barrier：卡住自然收尾 reaper，直到 forcedShutdown 整個跑完再放行
+	// ——保證這裡驗證的是「forced teardown 自己做完」，不是恰巧贏了排程。
+	releaseReaper := make(chan struct{})
+	a.hookClaudeReaperBeforeEndFlow = func() { <-releaseReaper }
+
 	if err := a.forcedShutdown(); err != nil {
 		t.Fatalf("forced shutdown: %v", err)
 	}
+	close(releaseReaper) // 放行 reaper：BeginEndSession 此刻必為 ErrNoSession（session 已被 forced 收乾），no-op
+
 	if !wire.sawMethod(codex.MethodTurnInterrupt) { // busy turn 先被 interrupt
 		t.Fatal("forced shutdown must interrupt the active codex turn")
 	}
@@ -539,6 +553,67 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	}
 	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
 		t.Fatal("both sessions must be ended")
+	}
+}
+
+// TestShutdownForcedBenignWhenNaturalEndRaces：分支 (a)——claude 自然收尾
+// reaper 搶先取得 BeginEndSession ownership（forcedShutdown 自己的
+// sess.Terminate() 就是觸發它甦醒的原因），forcedShutdown 的 EndSessionFlow
+// 撞見 ErrEndInProgress 時必須裁定為 benign（見 forcedShutdown doc：review
+// P2），只等那份「唯一一次」的 teardown 收斂，不視為 shutdown 錯誤、也不會
+// 對同一個 session 重跑第二次 CloseSequence（用 session:done 恰好一次佐證）。
+//
+// 用四個 test-only hook 把兩條 goroutine 的交錯釘死成確定性序列（不靠
+// time.Sleep 猜時序）：
+//  1. hookForcedShutdownClaudeBeforeFlow 卡住 forced 的 EndSessionFlow 呼叫，
+//     直到已確認 reaper 已經進入 teardown（BeginEndSession 必已成功）。
+//  2. hookClaudeTeardownBarrier 卡住 reaper 那份真正的 teardown 執行，直到已
+//     確認 forced 也撞見了 ErrEndInProgress benign 分支。
+//  3. hookForcedShutdownClaudeBenign 標記 forced 已進入 benign 分支。
+func TestShutdownForcedBenignWhenNaturalEndRaces(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	if err := a.StartSession("claude", "hi", "", "claude-benign", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	teardownStarted := make(chan struct{})
+	releaseTeardown := make(chan struct{})
+	releaseForced := make(chan struct{})
+	benignHit := make(chan struct{})
+
+	a.hookClaudeTeardownBarrier = func() { // reaper 那份真正執行卡在這裡
+		close(teardownStarted)
+		<-releaseTeardown
+	}
+	a.hookForcedShutdownClaudeBeforeFlow = func() { <-releaseForced } // forced 卡住，直到 reaper 已握有 ownership
+	a.hookForcedShutdownClaudeBenign = func() { close(benignHit) }
+
+	fsResult := make(chan error, 1)
+	go func() { fsResult <- a.forcedShutdown() }() // sess.Terminate() 先跑，process 死掉喚醒 reaper；隨即卡在 hookForcedShutdownClaudeBeforeFlow
+
+	<-teardownStarted      // reaper 已贏得 BeginEndSession、正卡在真正 teardown 之前
+	close(releaseForced)   // 放行 forced：此刻呼叫 EndSessionFlow 必定撞見 ErrEndInProgress（reaper 尚未 FinishEndSession）
+	<-benignHit            // 確認 forced 真的走到 benign 分支
+	close(releaseTeardown) // 放行 reaper：完成唯一一次真正的 CloseSequence
+
+	if err := <-fsResult; err != nil {
+		t.Fatalf("forced shutdown must treat raced ErrEndInProgress as benign, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-benign.meta.json")); err != nil {
+		t.Fatalf("lease must still be finalized by the natural-end path: %v", err)
+	}
+	claudeDone := 0
+	for _, e := range ui.find("session:done") {
+		if d, ok := e.data.(map[string]any); ok && d["provider"] == "claude" {
+			claudeDone++
+		}
+	}
+	if claudeDone != 1 { // shared OnceValue 保證 CloseSequence 只真正跑一次
+		t.Fatalf("claude session:done count = %d, want exactly 1 (no double teardown)", claudeDone)
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) {
+		t.Fatal("claude session must be ended")
 	}
 }
 
