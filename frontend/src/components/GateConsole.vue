@@ -125,17 +125,22 @@ async function ensureEvidence(evidenceId: string) {
 // watch()／template），raw bindings 清單不受影響（GateConsole 既有渲染，
 // 獨立於這個函式之外）。
 //
-// 根因（M3a review「data-test 偶發 -undefined」，Task 10 追查）：後端
-// TCAPolicy.ValidateRequest（internal/gatepolicy/tca.go）在 Submit 時已強制
-// schema——role 缺漏／未知在目前程式路徑下進不了 journal，所以 M3a review
-// 靜態追不到「資料哪裡漏了 role」。真正的缺口在前端本身：GateConsole 的
-// tca-section 模板（data-test="'tca-evidence-' + b.role" 等）過去無條件信任
-// upstream 保證、直接把 b.role 接進 data-test／DOM——一旦繞過後端驗證的資料
-// 進來（journal 手動修補、schema 未來演進、非 production 呼叫路徑等），
-// `b.role` 是 JS `undefined`，字串樣板會把它 toString 成字面 "undefined"，
-// 且結果照樣渲染「查看證據」按鈕、照樣呼叫 EvidenceGet——沒有任何錯誤浮現。
-// spec §3.3.3 的修正就是把這個隱性假設變成前端自己的顯式契約：不管 upstream
-// 是否保證，UI 收到不完整的 role 一律 fail loud，不再靜默組出 undefined。
+// 根因（M3a review「data-test 偶發 -undefined」，Task 10 追查，review 修正）：
+// 後端 validateTCABindings（internal/gatepolicy/tca.go）只鎖「必要 (kind,role)
+// 存在＋不重複」——遍歷 tcaBindingReqs 逐筆 findBinding 確認在，並用
+// map[(kind,role)]bool 擋重複——**沒有鎖白名單、不拒絕清單外的額外
+// binding**（M3a ledger 已記錄此 laxness）。一筆 role 為空字串的第三筆
+// evidence_run（kind/role 都不撞既有必要項的 key）可以直接通過 Submit 進
+// journal；`gate.Binding.Role` 帶 `json:"role,omitempty"`，空字串序列化時整個
+// key 被省略，前端 `Binding.role` 因此是 JS `undefined`——**這是正常請求路徑
+// 就能產生的資料形狀，不需要繞過驗證**。GateConsole 的 tca-section 模板
+// （data-test="'tca-evidence-' + b.role" 等）過去無條件信任每筆
+// evidence_run binding 都帶合法 role、直接把 b.role 接進 data-test／DOM，
+// 字串樣板把 undefined toString 成字面 "undefined"，且照樣渲染「查看證據」
+// 按鈕、照樣呼叫 EvidenceGet——沒有任何錯誤浮現。spec §3.3.3 的修正就是在後端
+// 目前只鎖必要項存在＋不重複、未鎖無額外項的前提下，前端自己補上這層防線：
+// 不管後端未來是否收緊白名單，UI 收到不完整（含「有額外未知 role」）的
+// evidence_run bindings 一律 fail loud，不再靜默組出 undefined。
 function evidenceIntegrityOf(e: GateEntry): { ok: boolean; missing: string[]; duplicate: string[]; unknown: string[] } {
   const required = ['expected_red', 'negative_control']
   const counts: Record<string, number> = {}

@@ -256,12 +256,27 @@ describe('GateConsole', () => {
     { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red-2', digest: 'sha256:' + 'd'.repeat(64) },
     { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
   ]
+  // review 修正：validateTCABindings（internal/gatepolicy/tca.go）只鎖必要
+  // (kind,role) 存在＋不重複，不拒絕清單外的額外 binding——兩個必要 role 齊全
+  // 之外再帶一筆 role 省略（omitempty 序列化後前端拿到 undefined）的第三筆
+  // evidence_run，是後端目前這道缺口在正常請求路徑下就能產生的真實資料形狀，
+  // 不是繞過驗證才會出現，integrity 檢查的 unknown 分支必須擋下它。
+  const tcaBindingsExtraUnknownRoleBinding = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'evidence_run', ref: 'ev-extra', digest: 'sha256:' + 'd'.repeat(64) }, // role 省略（後端 omitempty 序列化後的真實形狀）
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
 
   it.each([
     ['role 完全缺漏（-undefined 根因重現）', tcaBindingsMissingRole],
     ['缺 negative_control', tcaBindingsMissingNegativeControl],
     ['未知 role', tcaBindingsUnknownRole],
     ['雙份同 role', tcaBindingsDuplicateRole],
+    ['兩必要 role 齊全＋額外一筆 role 省略的第三筆 evidence_run（後端白名單缺口的真實資料形狀）', tcaBindingsExtraUnknownRoleBinding],
   ])('tca 卡片：evidence bindings 不完整（%s）→ 資料完整性錯誤、零呼叫 EvidenceGet、不渲染查看證據', async (_label, bindingsFactory) => {
     const decide = vi.fn()
     const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
