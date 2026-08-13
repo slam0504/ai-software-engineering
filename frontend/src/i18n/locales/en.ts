@@ -111,6 +111,10 @@ export default {
       gate2Link: 'Gate 2: {id}',
       viewEvidence: 'View evidence',
       mutationDigest: 'mutation digest',
+      evidenceIntegrityError: 'Data integrity error: evidence binding roles are incomplete, evidence cannot be shown',
+      evidenceIntegrityMissing: 'missing: {roles}',
+      evidenceIntegrityDuplicate: 'duplicate: {roles}',
+      evidenceIntegrityUnknown: 'unknown role: {roles}',
     },
   },
   spec: {

@@ -111,6 +111,10 @@ export default {
       gate2Link: '對應 Gate 2：{id}',
       viewEvidence: '查看證據',
       mutationDigest: 'mutation digest',
+      evidenceIntegrityError: '資料完整性錯誤：evidence binding role 不完整，無法顯示證據',
+      evidenceIntegrityMissing: '缺漏：{roles}',
+      evidenceIntegrityDuplicate: '重複：{roles}',
+      evidenceIntegrityUnknown: '未知 role：{roles}',
     },
   },
   spec: {

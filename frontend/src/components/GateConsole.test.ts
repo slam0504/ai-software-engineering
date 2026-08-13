@@ -219,6 +219,87 @@ describe('GateConsole', () => {
     expect(w.find('[data-test=tca-evidence-error-expected_red]').text()).toContain('evidence: not found: evidence_id ev-red')
   })
 
+  // Task 10（§3.3.3）：role 完整性 fail loud——根因是 GateConsole 過去無條件信任
+  // binding.role、直接把它接進 data-test／DOM；bindings[].role 缺漏／未知／重複時
+  // 一律不得靜默組出 "...-undefined"，改顯示資料完整性錯誤、零呼叫 EvidenceGet、
+  // 不渲染「查看證據」控制項，raw bindings 清單仍保留診斷。
+  const tcaBindingsMissingRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    // role 欄位完全缺漏（重現 M3a review 記錄的 data-test="...-undefined"：
+    // b.role 是 JS undefined，字串樣板把它 toString 成字面 "undefined"）。
+    { kind: 'evidence_run', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsMissingNegativeControl = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsUnknownRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'bogus_role', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsDuplicateRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red-2', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+
+  it.each([
+    ['role 完全缺漏（-undefined 根因重現）', tcaBindingsMissingRole],
+    ['缺 negative_control', tcaBindingsMissingNegativeControl],
+    ['未知 role', tcaBindingsUnknownRole],
+    ['雙份同 role', tcaBindingsDuplicateRole],
+  ])('tca 卡片：evidence bindings 不完整（%s）→ 資料完整性錯誤、零呼叫 EvidenceGet、不渲染查看證據', async (_label, bindingsFactory) => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'pending', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: bindingsFactory() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(getEvidence).not.toHaveBeenCalled() // EvidenceGet 零呼叫
+    expect(w.find('[data-test=tca-evidence-integrity-error]').exists()).toBe(true)
+    expect(w.find('[data-test=tca-evidence-integrity-error]').text()).not.toContain('undefined') // 不得靜默組出 "-undefined"
+    expect(w.find('button[data-test^="tca-evidence-open-"]').exists()).toBe(false) // 不渲染「查看證據」控制項
+    expect(w.html()).not.toContain('-undefined') // data-test 屬性本身也不得出現 undefined
+    // raw bindings 清單仍保留供診斷
+    expect(w.find('.bindings').exists()).toBe(true)
+    expect(w.find('.bindings').text()).toContain('evidence_run')
+  })
+
+  it('tca 卡片：evidence bindings 完整（雙 role 各恰一）→ 查看證據控制項正常渲染（回歸）', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'pending', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(w.find('[data-test=tca-evidence-integrity-error]').exists()).toBe(false)
+    expect(getEvidence).toHaveBeenCalledWith('ev-red')
+    expect(getEvidence).toHaveBeenCalledWith('ev-neg')
+    expect(w.find('[data-test=tca-evidence-open-expected_red]').exists()).toBe(true)
+  })
+
   it('gate2／gate1 卡片不渲染 tca-section（回歸）', async () => {
     const w = mountWithI18n(GateConsole, {
       props: { entries: [{ approval_id: 'A', state: 'active', gate: 'gate2', subject: 'plan:P1' }], decide: vi.fn() },
