@@ -1,7 +1,7 @@
 # M3a.1 — M3a 閉環完整度收尾設計
 
 - 日期：2026-08-13
-- 狀態：rev3，待 closure review（第一輪：新檔建立規則／bump preview token／TCA generation 隔離／planner enforcement 接線點；第二輪：bump API 後端自算 digest＋祖先驗證／preflight 契約凍結／非法 role 單一答案／STALE 引導實作契約；第三輪：RunEvidence CAS 前置＋ErrStaleGeneration／§7 preflight 分岔封閉）
+- 狀態：rev3，closure review APPROVED 2026-08-13（第一輪：新檔建立規則／bump preview token／TCA generation 隔離／planner enforcement 接線點；第二輪：bump API 後端自算 digest＋祖先驗證／preflight 契約凍結／非法 role 單一答案／STALE 引導實作契約；第三輪：RunEvidence CAS 前置＋ErrStaleGeneration／§7 preflight 分岔封閉）
 - 上游依據：`docs/superpowers/specs/2026-08-12-m3a-plan-test-contract-design.md`（rev4＋erratum）；`docs/spikes/m3a-results.md` 已知缺口 1–6 與最終 review triage
 - 前置：M3a ✅ merged（`cfa5a20`）＋post-merge P1/P2/i18n 修正 ✅
 
