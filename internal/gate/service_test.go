@@ -260,6 +260,36 @@ func TestReconcileSingleStaleUnderConcurrency(t *testing.T) {
 	}
 }
 
+// TestPrepareDecisionRejectsUnknownDecision guards against a decision value
+// outside {"approved","rejected"} silently falling through PrepareDecision's
+// switch (BuildDecision/CommitDecision downstream only ever branch on
+// "approved" vs. else-is-rejected) — the check must run before the pending
+// lookup, so an unknown decision is rejected on its own terms rather than as
+// ErrNotPending, and the error must name the value actually received.
+func TestPrepareDecisionRejectsUnknownDecision(t *testing.T) {
+	s, _ := newTestService(t)
+	_, err := s.PrepareDecision("x", "maybe", "", approver(), DecisionInput{})
+	if err == nil {
+		t.Fatal("PrepareDecision: want error for unknown decision value \"maybe\"")
+	}
+	if !strings.Contains(err.Error(), "maybe") {
+		t.Errorf("error = %v, want it to mention the received decision value %q", err, "maybe")
+	}
+}
+
+// TestDecideRejectsUnknownDecision guards the same path through Decide
+// (Prepare→Commit convenience wrapper), which app-level callers use.
+func TestDecideRejectsUnknownDecision(t *testing.T) {
+	s, _ := newTestService(t)
+	id, err := s.Submit("gate1", "workspace", gate1BWith("sha256:"+hex64()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(id, "maybe", "", approver(), DecisionInput{}); err == nil {
+		t.Fatal("Decide: want error for unknown decision value \"maybe\"")
+	}
+}
+
 func TestRejectNeedsReason(t *testing.T) {
 	s, _ := newTestService(t)
 	id, _ := s.Submit("gate1", "workspace", gate1BWith("sha256:"+hex64()))

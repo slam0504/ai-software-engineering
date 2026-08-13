@@ -229,7 +229,12 @@ func Run(ctx context.Context, repoRoot, casDir, registryPath string, ld ContextL
 	if abortReason != "" {
 		result, observed = "error", abortReason
 	} else {
-		combined := append(append([]byte{}, stdoutBytes...), stderrBytes...)
+		// A NUL separator sits between the two streams so a matcher
+		// characteristic that never appears in stdout or stderr alone can
+		// never "appear" by accident wherever stdout's tail happens to
+		// complete stderr's head (or vice versa) once naively concatenated
+		// (review defense).
+		combined := append(append(append([]byte{}, stdoutBytes...), 0x00), stderrBytes...)
 		switch rs.Kind {
 		case "expected_red":
 			result, observed = ClassifyExpectedRed(exitCode, combined, task.TestContract.ExpectedFailure)

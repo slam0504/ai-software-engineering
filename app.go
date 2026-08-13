@@ -1893,7 +1893,7 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 
 	if errs := plan.Validate(pl, pol, specScenarios); len(errs) > 0 {
 		verr := fmt.Errorf("plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: %w", errors.Join(errs...))
-		if hasRiskClassificationError(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
+		if isRiskUnclassifiable(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
 			a.workflowMu.Lock()
 			_, cerr := a.escCreateSystemLocked("risk-unclassifiable:"+planID, "gate2:"+planID, true,
 				"plan "+planID+" 的 risk 分類驗證失敗（minimum 無法重算）", "plan:"+planID)
@@ -1938,16 +1938,13 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	return a.submitGateRequest(svc, "gate2", "plan:"+planID, bindings)
 }
 
-// hasRiskClassificationError：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk
-// 分類失敗（minimum 重算不符、tier 名稱未知）。plan.Validate 回傳未型別化的
-// inline errors，這裡以訊息片段比對——脆弱點已知（validate.go 措辭改動需同步），
-// 換 typed error 屬 internal/plan 的 API 擴張，非本 task scope。
-func hasRiskClassificationError(errs []error) bool {
+// isRiskUnclassifiable：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk 分類
+// 失敗（minimum 重算不符、planner 低於 minimum、tier 名稱未知）。改用
+// errors.Is 對 plan.ErrRiskUnclassifiable 判定（review 補強），取代先前以訊息
+// 片段比對的脆弱作法。
+func isRiskUnclassifiable(errs []error) bool {
 	for _, e := range errs {
-		msg := e.Error()
-		if strings.Contains(msg, "does not match recomputed") ||
-			strings.Contains(msg, "unknown minimum_risk_tier") ||
-			strings.Contains(msg, "unknown planner_risk_tier") {
+		if errors.Is(e, plan.ErrRiskUnclassifiable) {
 			return true
 		}
 	}

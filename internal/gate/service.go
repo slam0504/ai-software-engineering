@@ -83,6 +83,9 @@ type PreparedDecision struct{ Record ApprovalRecord }
 // approval closed. Rejected decisions skip this — a rejection only needs a
 // reason and must still succeed on an otherwise-expired request.
 func (s *Service) PrepareDecision(id, decision, reason string, approver Approver, input DecisionInput) (PreparedDecision, error) {
+	if decision != "approved" && decision != "rejected" {
+		return PreparedDecision{}, fmt.Errorf("gate: unknown decision %q, want \"approved\" or \"rejected\"", decision)
+	}
 	if decision == "rejected" && reason == "" {
 		return PreparedDecision{}, ErrRejectNeedsReason
 	}
