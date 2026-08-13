@@ -3581,9 +3581,13 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 }
 
 // claudeTeardown：CloseSequence（close → quiesce → 必要時 terminate → Wait →
-// lease.Finalize(ex)），並發 session:done（Exit 為證據）。呼叫端一律經
-// startClaude 建的 sync.OnceValue（a.claudeTeardownFn）呼叫，不直接呼叫這個
-// factory 回傳的閉包本身——見 startClaude／forcedShutdown 的 doc（review P2）。
+// lease.Finalize(ex)），並發 session:done（Exit 為證據）。自然收尾 reaper／
+// forcedShutdown 一律經 startClaude 建的 sync.OnceValue（a.claudeTeardownFn）
+// 呼叫這個 factory 回傳的閉包，保證兩者對同一個 session 共用同一份真正執行
+// ——見 startClaude／forcedShutdown 的 doc（review P2）。EndSession／
+// NewSession 仍直接呼叫這個 factory 回傳的新閉包（各自持有排他的
+// BeginEndSession token，不在 review P2 描述的競速對之內，刻意未改動，見
+// review report concern 3）。
 func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 	lease *appcore.RecordingLease) func() error {
 	return func() error {
