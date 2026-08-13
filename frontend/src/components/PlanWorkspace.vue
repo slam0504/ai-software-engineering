@@ -29,11 +29,20 @@ const props = defineProps<{
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
 }>()
+const emit = defineEmits<{ (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void }>()
 
 const plan = usePlan()
 
 const selectedPath = ref('')
 const effectivePath = computed(() => props.path ?? selectedPath.value)
+
+// escalate：review fix（spec §3.8 回填）——sourceRef 帶目前 plan 檔的 rel path
+// （effectivePath，永遠可得；planIdInput 只在 plan/<id>.yaml 才推得出來，見
+// deriveDefaultPlanId），blockScope 留空——建立與這份 plan 檔相關的升級項目
+// 不預設它一定阻擋某個 gate scope，由操作者自行選。
+function onEscalate() {
+  emit('escalate', { sourceRef: effectivePath.value, blockScope: '' })
+}
 
 const loadError = ref('')
 
@@ -255,6 +264,7 @@ async function confirmCommit() {
       <input v-model="planIdInput" data-test="plan-id" :placeholder="t('planWorkspace.planId.placeholder')" />
       <button data-test="submit-gate2" :disabled="submitBusy || !planIdInput" @click="submitForApproval">{{ t('planWorkspace.action.submit') }}</button>
       <span v-if="submitResult" class="ok">{{ t('planWorkspace.submittedApprovalId', { id: submitResult }) }}</span>
+      <button v-if="effectivePath" type="button" data-test="escalate" @click="onEscalate">{{ t('escalation.create.buttonFrom') }}</button>
     </div>
 
     <div class="commit">

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { escalation } from '../../wailsjs/go/models'
 
@@ -20,6 +20,10 @@ const props = defineProps<{
   resolve: (id: string, resolution: string, reason: string) => Promise<void>
   create: (sourceRef: string, blockScope: string, summary: string) => Promise<string>
   reload: () => Promise<void>
+  // prefill：review fix（spec §3.8 回填）——PlanWorkspace／GateConsole／
+  // EvidenceDetail 的「建立升級項目」按鈕透過 App.vue 轉發到這裡，帶入建立
+  // 表單。新物件參照即觸發 watch（見下），同一按鈕連續點兩次也會重新套用。
+  prefill?: { sourceRef: string; blockScope: string } | null
 }>()
 
 const openEntries = computed(() => props.entries.filter(e => e.State === 'open'))
@@ -68,6 +72,26 @@ const newScopeId = ref('')
 const newSummary = ref('')
 const createError = ref('')
 
+// prefill：sourceRef 直接帶入；blockScope 非空時一律落在「自由輸入」欄位——
+// 呼叫端（GateConsole／EvidenceDetail）已經算好完整字串（如 gate2:P1、
+// evidence:EV1），不用再倒推回 gate2/tca 下拉＋id 兩欄。
+watch(() => props.prefill, (p) => {
+  if (!p) return
+  newSourceRef.value = p.sourceRef
+  if (p.blockScope) {
+    newScopeKind.value = 'custom'
+    newScopeId.value = p.blockScope
+  } else {
+    newScopeKind.value = ''
+    newScopeId.value = ''
+  }
+}, { immediate: true })
+
+// scopeNeedsId：gate2／tca／custom 三種下拉都要求另填 id／完整字串——選了
+// 卻沒填時絕不能靜默送出「未生效」的 blockScope（review fix Low UX finding）。
+function scopeNeedsId(): boolean {
+  return newScopeKind.value === 'gate2' || newScopeKind.value === 'tca' || newScopeKind.value === 'custom'
+}
 function computedBlockScope(): string {
   switch (newScopeKind.value) {
     case 'workspace': return 'workspace'
@@ -78,7 +102,9 @@ function computedBlockScope(): string {
   }
 }
 function createDisabled(): boolean {
-  return !newSourceRef.value.trim() || !newSummary.value.trim()
+  if (!newSourceRef.value.trim() || !newSummary.value.trim()) return true
+  if (scopeNeedsId() && !newScopeId.value.trim()) return true
+  return false
 }
 async function onCreate() {
   if (createDisabled()) return
@@ -123,6 +149,9 @@ async function onCreate() {
           v-model="newScopeId" data-test="create-scope-id" :placeholder="t('escalation.create.scopeCustomPlaceholder')"
         />
         <textarea v-model="newSummary" data-test="create-summary" :placeholder="t('escalation.create.summaryPlaceholder')" />
+        <p v-if="scopeNeedsId() && !newScopeId.trim()" class="hint" data-test="create-scope-warning">
+          {{ t('escalation.create.scopeIdRequired') }}
+        </p>
         <button type="button" data-test="create-submit" :disabled="createDisabled()" @click="onCreate">
           {{ t('escalation.create.submit') }}
         </button>
@@ -252,6 +281,7 @@ async function onCreate() {
 <style scoped>
 .escalation-inbox { text-align: left; padding: 8px; overflow-y: auto; height: 100%; }
 .err { color: var(--err); font-size: var(--fs-s); }
+.hint { color: var(--err); font-size: var(--fs-s); margin: 0; }
 .empty { color: var(--text-faint); font-size: var(--fs-s); }
 .create-form { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius-s); padding: 8px; margin-bottom: 10px; }
 .create-form h4 { margin: 0 0 2px; font-size: var(--fs-s); }

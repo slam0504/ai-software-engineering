@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import { CLIInfo, GateDecide, GateDecisionContext, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
@@ -12,6 +12,7 @@ import { useEvidence } from './stores/evidence'
 import { useEscalation } from './stores/escalation'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
+import { escalationBadge } from './lib/escalationBadge'
 import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
@@ -71,6 +72,19 @@ async function refreshEscalation() {
   await escalation.load(wailsBindings.EscalationList)
 }
 const sidePanel = ref<'gate' | 'escalation'>('gate') // 右側欄 Gate／Escalation 並列 tab（§6）
+// escalatePrefill：review fix（spec §3.8 回填）——PlanWorkspace／GateConsole／
+// EvidenceDetail 的「建立升級項目」按鈕 emit 的 payload，轉發給
+// EscalationInbox 的建立表單，並切到 escalation side panel 讓使用者立刻
+// 看到已預填的表單（不做 inline dialog，重用既有表單）。
+const escalatePrefill = ref<{ sourceRef: string; blockScope: string } | null>(null)
+function onEscalate(payload: { sourceRef: string; blockScope: string }) {
+  escalatePrefill.value = payload
+  sidePanel.value = 'escalation'
+}
+// escalationBadgeState：委給 lib/escalationBadge.ts 的純函式（見該檔說明），
+// 這裡只是把 store 的兩個欄位接進去——邏輯本身直接單元測試，不靠 App.vue
+// mount。
+const escalationBadgeState = computed(() => escalationBadge(escalation.unavailable, escalation.unresolvedCount))
 const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'>('chat')
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
@@ -199,7 +213,7 @@ onMounted(async () => {
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
-        <PlanWorkspace v-if="tab === 'plan'" />
+        <PlanWorkspace v-if="tab === 'plan'" @escalate="onEscalate" />
         <TcaWorkspace
           v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
           :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"
@@ -221,19 +235,20 @@ onMounted(async () => {
           <button :class="{ active: sidePanel === 'gate' }" @click="sidePanel = 'gate'">{{ t('app.sideTab.gate') }}</button>
           <button :class="{ active: sidePanel === 'escalation' }" data-test="side-tab-escalation" @click="sidePanel = 'escalation'">
             {{ t('app.sideTab.escalation') }}
-            <span v-if="escalation.unresolvedCount > 0" class="badge-count" data-test="escalation-badge">{{ escalation.unresolvedCount }}</span>
+            <span v-if="escalationBadgeState?.kind === 'warn'" class="badge-count badge-warn" data-test="escalation-badge-warn">!</span>
+            <span v-else-if="escalationBadgeState?.kind === 'count'" class="badge-count" data-test="escalation-badge">{{ escalationBadgeState.n }}</span>
           </button>
         </nav>
         <GateConsole
           v-show="sidePanel === 'gate'"
           :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
           :get-evidence="wailsBindings.EvidenceGet" :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
-          @open-evidence="selectedEvidenceId = $event"
+          @open-evidence="selectedEvidenceId = $event" @escalate="onEscalate"
         />
         <p v-if="gateError && sidePanel === 'gate'" class="gate-err">{{ gateError }}</p>
         <EscalationInbox
           v-show="sidePanel === 'escalation'"
-          :entries="escalation.entries" :unavailable="escalation.unavailable"
+          :entries="escalation.entries" :unavailable="escalation.unavailable" :prefill="escalatePrefill"
           :ack="wailsBindings.EscalationAck" :resolve="wailsBindings.EscalationResolve"
           :create="wailsBindings.EscalationCreate" :reload="refreshEscalation"
         />
@@ -246,7 +261,10 @@ onMounted(async () => {
     </button>
     <StatusBar />
     <ApprovalDialog />
-    <EvidenceDetail :evidence-id="selectedEvidenceId" :get="wailsBindings.EvidenceGet" @close="selectedEvidenceId = ''" />
+    <EvidenceDetail
+      :evidence-id="selectedEvidenceId" :get="wailsBindings.EvidenceGet"
+      @close="selectedEvidenceId = ''" @escalate="onEscalate"
+    />
   </div>
 </template>
 
@@ -266,6 +284,7 @@ aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
 .gate-panel .side-nav button { border: none; background: transparent; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
 .gate-panel .side-nav .active { background: var(--bg-bubble-user); color: #fff; }
 .badge-count { background: var(--err); color: #2a0d0b; border-radius: 999px; padding: 0 5px; font-size: 10px; font-weight: 700; }
+.badge-warn { padding: 0 6px; } /* 警示徽章沿用 badge-count 底色，僅加寬容納「!」 */
 .gate-err { color: var(--err); font-size: 11px; padding: 0 8px 8px; }
 .gate-resize { width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0; }
 .gate-resize:hover { background: var(--accent); }

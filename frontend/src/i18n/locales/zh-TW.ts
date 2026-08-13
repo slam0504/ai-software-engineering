@@ -329,8 +329,10 @@ export default {
       },
       scopeIdPlaceholder: 'ID',
       scopeCustomPlaceholder: '完整 block scope',
+      scopeIdRequired: '已選範圍但未填 ID／內容，這個 block scope 不會生效',
       summaryPlaceholder: '摘要（必填）',
       submit: '建立',
+      buttonFrom: '建立升級項目',
     },
   },
 }

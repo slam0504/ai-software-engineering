@@ -100,4 +100,41 @@ describe('EscalationInbox', () => {
     await w.find('[data-test=toggle-resolved]').trigger('click')
     expect(w.find('[data-test=entry-E-res]').exists()).toBe(true)
   })
+
+  // review fix（spec §3.8 回填）：PlanWorkspace／GateConsole／EvidenceDetail 的
+  // 「建立升級項目」按鈕透過 App.vue 轉發 prefill prop，表單要正確帶入。
+  it('prefill prop 帶入建立表單：sourceRef 直填，blockScope 非空時落在自由輸入欄位', async () => {
+    const props = baseProps()
+    const w = mountWithI18n(EscalationInbox, { props })
+    await w.setProps({ prefill: { sourceRef: 'approval:G2-1', blockScope: 'gate2:P1' } })
+    await w.vm.$nextTick()
+
+    expect((w.find('[data-test=create-source-ref]').element as HTMLInputElement).value).toBe('approval:G2-1')
+    expect((w.find('[data-test=create-scope-select]').element as HTMLSelectElement).value).toBe('custom')
+    expect((w.find('[data-test=create-scope-id]').element as HTMLInputElement).value).toBe('gate2:P1')
+    expect(w.find('[data-test=create-submit]').attributes('disabled')).toBeDefined() // summary 仍空
+
+    await w.find('[data-test=create-summary]').setValue('needs review')
+    await w.find('[data-test=create-submit]').trigger('click')
+    expect(props.create).toHaveBeenCalledWith('approval:G2-1', 'gate2:P1', 'needs review')
+  })
+
+  it('blockScope 選 gate2/tca/custom 但未填 id 時送出 disabled 並顯示提示（不得靜默忽略）', async () => {
+    const props = baseProps()
+    const w = mountWithI18n(EscalationInbox, { props })
+    await w.find('[data-test=create-source-ref]').setValue('P1/T1')
+    await w.find('[data-test=create-summary]').setValue('manual escalation summary')
+    expect(w.find('[data-test=create-submit]').attributes('disabled')).toBeUndefined() // 未選範圍：可送出
+
+    await w.find('[data-test=create-scope-select]').setValue('gate2')
+    expect(w.find('[data-test=create-scope-warning]').exists()).toBe(true)
+    expect(w.find('[data-test=create-submit]').attributes('disabled')).toBeDefined()
+
+    await w.find('[data-test=create-scope-id]').setValue('P1')
+    expect(w.find('[data-test=create-scope-warning]').exists()).toBe(false)
+    expect(w.find('[data-test=create-submit]').attributes('disabled')).toBeUndefined()
+
+    await w.find('[data-test=create-submit]').trigger('click')
+    expect(props.create).toHaveBeenCalledWith('P1/T1', 'gate2:P1', 'manual escalation summary')
+  })
 })

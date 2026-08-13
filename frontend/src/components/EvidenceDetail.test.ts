@@ -59,4 +59,16 @@ describe('EvidenceDetail', () => {
     expect(get).toHaveBeenCalledWith('ev-2')
     expect(get).toHaveBeenCalledTimes(2)
   })
+
+  // review fix（spec §3.8 回填）：「建立升級項目」帶 sourceRef=evidence:<id>、
+  // blockScope=evidence:<id>（同一份 id 兩用——收件匣沒有另外的 evidence
+  // scope 下拉，直接用完整字串當 block scope）。
+  it('點擊「建立升級項目」emit escalate，sourceRef／blockScope 都是 evidence:<id>', async () => {
+    const get = vi.fn().mockResolvedValue(record)
+    const w = mountWithI18n(EvidenceDetail, { props: { evidenceId: 'ev-1', get } })
+    await flushPromises()
+
+    await w.find('[data-test=escalate]').trigger('click')
+    expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'evidence:ev-1', blockScope: 'evidence:ev-1' }]])
+  })
 })

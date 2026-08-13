@@ -15,7 +15,13 @@ const props = defineProps<{
   evidenceId: string
   get: (evidenceId: string) => Promise<evidence.EvidenceRun>
 }>()
-const emit = defineEmits<{ (e: 'close'): void }>()
+// escalate：review fix（spec §3.8 回填）——帶 sourceRef=evidence:<id>／
+// blockScope=evidence:<id> 開啟收件匣建立表單（App.vue 接手切 side panel＋
+// 預填，這裡只負責發出正確的 payload，不直接碰 escalation store／wails）。
+const emit = defineEmits<{ (e: 'close'): void; (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void }>()
+function onEscalate() {
+  emit('escalate', { sourceRef: 'evidence:' + props.evidenceId, blockScope: 'evidence:' + props.evidenceId })
+}
 
 const record = ref<evidence.EvidenceRun | null>(null)
 const error = ref('')
@@ -48,6 +54,7 @@ function shortDigest(d: string | undefined): string {
     <div class="dialog">
       <div class="head">
         <h3>{{ t('evidence.title', { id: evidenceId }) }}</h3>
+        <button type="button" data-test="escalate" @click="onEscalate">{{ t('escalation.create.buttonFrom') }}</button>
         <button type="button" data-test="close" @click="emit('close')">{{ t('evidence.action.close') }}</button>
       </div>
       <p v-if="busy" class="busy" data-test="evidence-loading">{{ t('evidence.loading') }}</p>

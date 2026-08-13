@@ -19,7 +19,29 @@ const props = defineProps<{
   degraded?: boolean
   highlightId?: string
 }>()
-const emit = defineEmits<{ (e: 'open-evidence', evidenceId: string): void }>()
+const emit = defineEmits<{
+  (e: 'open-evidence', evidenceId: string): void
+  (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
+}>()
+
+// scopeForEntry：review fix（spec §3.8 回填）——鏡射後端 app.go 的
+// scopeForSubject（gate1／未知 gate→workspace、gate2 "plan:<id>"→
+// "gate2:<id>"、tca "task:<p>/<t>"→"tca:<p>/<t>"），讓「建立升級項目」按鈕
+// 預填的 blockScope 與後端阻擋語意一致，不是憑空編一個字串。
+function scopeForEntry(e: GateEntry): string {
+  if (e.gate === 'gate2') {
+    const id = e.subject?.startsWith('plan:') ? e.subject.slice('plan:'.length) : (e.subject ?? '')
+    return 'gate2:' + id
+  }
+  if (e.gate === 'test_contract_approval') {
+    const rest = e.subject?.startsWith('task:') ? e.subject.slice('task:'.length) : (e.subject ?? '')
+    return 'tca:' + rest
+  }
+  return 'workspace'
+}
+function onEscalate(e: GateEntry) {
+  emit('escalate', { sourceRef: 'approval:' + e.approval_id, blockScope: scopeForEntry(e) })
+}
 
 const reasons = reactive<Record<string, string>>({}) // 理由欄：per approval_id 獨立輸入
 const hints = reactive<Record<string, boolean>>({}) // reject 無理由時的提示旗標
@@ -192,6 +214,7 @@ function shortDigest(d: string): string {
         <span v-if="e.gate" class="gate">{{ e.gate }}</span>
         <span v-if="e.subject" class="subject">{{ e.subject }}</span>
         <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ resolveState(gateStateKeys, e.state, t) }}</span>
+        <button type="button" :data-test="'escalate-' + e.approval_id" @click="onEscalate(e)">{{ t('escalation.create.buttonFrom') }}</button>
       </div>
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + (b.role ?? '') + b.ref" :title="b.digest">

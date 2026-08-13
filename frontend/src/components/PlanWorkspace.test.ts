@@ -96,4 +96,14 @@ describe('PlanWorkspace', () => {
 
     expect(w.find('[data-test=plan-errors]').text()).toContain('assist: 無生效規格核可——先完成 Gate 1')
   })
+
+  // review fix（spec §3.8 回填）：「建立升級項目」帶目前 plan 檔 rel path 當
+  // sourceRef，blockScope 留空（不預設阻擋哪個 gate scope）。
+  it('點擊「建立升級項目」emit escalate，sourceRef=目前 plan 檔 rel path', async () => {
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/my-plan.yaml' } })
+    await flushPromises()
+
+    await w.find('[data-test=escalate]').trigger('click')
+    expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'plan/my-plan.yaml', blockScope: '' }]])
+  })
 })

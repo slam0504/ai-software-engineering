@@ -208,4 +208,34 @@ describe('GateConsole', () => {
     await flushPromises()
     expect(w.find('[data-test=tca-section]').exists()).toBe(false)
   })
+
+  // review fix（spec §3.8 回填）：每張卡片的「建立升級項目」按鈕帶
+  // sourceRef=approval:<id>，blockScope 依卡片的 gate/subject 換算——鏡射
+  // 後端 app.go 的 scopeForSubject，讓預填值與實際阻擋語意一致。
+  it('gate2 卡片點擊「建立升級項目」emit escalate，blockScope=gate2:<planID>', async () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'G2-1', state: 'pending', gate: 'gate2', subject: 'plan:P1' }], decide: vi.fn() },
+    })
+    await w.find('[data-test=escalate-G2-1]').trigger('click')
+    expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'approval:G2-1', blockScope: 'gate2:P1' }]])
+  })
+
+  it('tca 卡片點擊「建立升級項目」emit escalate，blockScope=tca:<planID>/<taskID>', async () => {
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'active', gate: 'test_contract_approval', subject: 'task:P1/T1' }],
+        decide: vi.fn(),
+      },
+    })
+    await w.find('[data-test=escalate-TCA-1]').trigger('click')
+    expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'approval:TCA-1', blockScope: 'tca:P1/T1' }]])
+  })
+
+  it('gate1 卡片點擊「建立升級項目」emit escalate，blockScope=workspace', async () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'pending', gate: 'gate1' }], decide: vi.fn() },
+    })
+    await w.find('[data-test=escalate-A]').trigger('click')
+    expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'approval:A', blockScope: 'workspace' }]])
+  })
 })

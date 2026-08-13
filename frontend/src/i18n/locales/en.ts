@@ -329,8 +329,10 @@ export default {
       },
       scopeIdPlaceholder: 'ID',
       scopeCustomPlaceholder: 'Full block scope',
+      scopeIdRequired: 'A scope is selected but its ID/value is empty — this block scope will not take effect',
       summaryPlaceholder: 'Summary (required)',
       submit: 'Create',
+      buttonFrom: 'Create escalation item',
     },
   },
 }
