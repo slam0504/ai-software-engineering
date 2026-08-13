@@ -228,7 +228,7 @@ export default {
     empty: '尚無可顯示的圖表',
   },
   dag: {
-    empty: '尚無可顯示的任務 DAG',
+    empty: '尚無可顯示的任務相依圖',
     parseError: '無法解析目前的 plan 內容',
   },
   risk: {
