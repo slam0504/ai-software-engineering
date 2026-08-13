@@ -50,15 +50,20 @@ func ClaudeAssistArgs() []string {
 }
 
 // ClaudePlannerArgs 回傳 PlannerAssist 隔離 Claude one-shot 的 argv（不含
-// binary）：唯讀工具白名單（pin 2.1.223；spec §9 待驗證假設——live probe 步驟
-// 見 task-11-brief.md Step 5，尚未經真實 CLI 驗證）。enforcement 仍在 argv：
-// 白名單只含 Read/Glob/Grep，無 Write/Edit/Bash → 無法變更 workspace。
+// binary）：唯讀工具白名單（pin 2.1.223；M3a.1 Task 0 live probe 已驗證——
+// Write 在 CLI 層被拒、written.txt 未產生，見 docs/spikes/m3a1-planner-probe.md）。
+// enforcement 仍在 argv：白名單只含 Read/Glob/Grep，無 Write/Edit/Bash →
+// 無法變更 workspace。`--setting-sources ""` 隔離使用者全域／project／local
+// settings 的 hook（probe 附註的 SessionStart 副作用；Task 7 實測隔離生效），
+// 堵住 hook 這條不受 --tools 過濾的寫入路徑。此 argv 必須與 preflight 凍結
+// 基準 probeApprovedClaudeArgs（preflight.go）逐字一致，偏離即 fail closed。
 func ClaudePlannerArgs() []string {
 	return []string{
 		"-p",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose",
+		"--setting-sources", "", // 空 setting sources：隔離 hook 副作用（見上）
 		"--tools", "Read,Glob,Grep", // 唯讀白名單（argv 級強制，非 prompt 文字）
 	}
 }
@@ -200,15 +205,17 @@ func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract
 	defer func() { _ = srv.Terminate(); srv.Wait() }()
 	conn := srv.Conn()
 
-	escalated := make(chan struct{}, 1)
+	escalated := make(chan *EnforcementViolation, 1)
 	conn.OnServerRequest(func(method string, _ json.RawMessage) (any, error) {
 		// fail closed：readOnly＋never 下不應出現任何 approval／escalation；若仍
 		// 收到，回錯讓 provider 中止，絕不讓使用者核可升級（破壞 zero-mutation）。
+		// typed violation：app 層 errors.As 判定後建 planner-enforcement hard 項。
+		v := &EnforcementViolation{Provider: "codex", Detail: method}
 		select {
-		case escalated <- struct{}{}:
+		case escalated <- v:
 		default:
 		}
-		return nil, fmt.Errorf("assist: escalation/approval refused (fail closed): %s", method)
+		return nil, v
 	})
 	turnDone := make(chan struct{})
 	conn.OnNotification(func(method string, params json.RawMessage) {
@@ -253,8 +260,8 @@ func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract
 	select {
 	case <-turnDone: // turn/completed：草擬結束
 		return nil
-	case <-escalated: // escalation/approval：fail closed
-		return errors.New("assist: codex requested escalation/approval — failing closed")
+	case v := <-escalated: // escalation/approval：fail closed（typed violation）
+		return v
 	case <-ctx.Done(): // cancel／timeout／shutdown reclaim
 		return ctx.Err()
 	case <-conn.Done(): // wire EOF（server 死亡）

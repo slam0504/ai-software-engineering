@@ -134,6 +134,13 @@ type App struct {
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
 
+	// PlanAssist provider capability preflight（M3a.1 Task 7：spec §3.4）——
+	// key=binPath+"|"+完整 binary SHA-256 hex（不截斷）；只快取 OK 結果
+	// （失敗每次重驗，binary 換回 pin 版即恢復）。binary 內容變更 → digest
+	// 變 → miss 重驗。
+	preflightMu    sync.Mutex
+	preflightCache map[string]assist.PreflightResult
+
 	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
 	// 觸發 Reconcile()。specWatchStop／specWatchDone 在 a.mu 下管理，供
 	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
@@ -238,6 +245,7 @@ func (a *App) emit(name string, data any) {
 func NewApp() *App {
 	return &App{apprPending: map[string]*pendingApproval{},
 		assistActive:   map[string]*assistGen{},
+		preflightCache: map[string]assist.PreflightResult{},
 		evidenceActive: map[string]context.CancelFunc{}}
 }
 
@@ -3157,15 +3165,18 @@ func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bin
 	return id, nil
 }
 
-// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement probe 失敗的
-// condition key。現況 PlanAssist 沒有 enforcement probe 結果 hook（唯讀
-// sandbox 由 provider 端 flags 強制、無失敗回報路徑）——觸發點待 probe 接線
-// 後補（task-24-report.md 列明），key 與建立函式先凍結在此，不假接。
+// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement 失敗的
+// condition key。觸發點（M3a.1 Task 7 接線）：(a) PlanAssist spawn 前
+// preflight 驗不過（planPreflight）；(b) runner 回 typed
+// *assist.EnforcementViolation（Codex runtime 違規）。修復條件：同 provider
+// 的 preflight 重新通過 → 系統解除（escResolveByKeyLocked）。
 func plannerEnforcementKey(provider string) string { return "planner-enforcement:" + provider }
 
 // escPlannerEnforcementFailedLocked：(9) 的建立函式（呼叫端持 workflowMu）。
+// hard=true：enforcement 未證明是安全不變量缺口，僅系統（preflight 重新通過）
+// 可解除，UI 不可手動 resolve。
 func (a *App) escPlannerEnforcementFailedLocked(provider, detail string) (string, error) {
-	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", false,
+	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", true,
 		"PlannerAssist enforcement 失敗（"+provider+"）："+detail, "provider:"+provider)
 }
 
@@ -3443,6 +3454,32 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		return "", errors.New("assist: workspace 有未提交的非 plan 變更——PlannerAssist 需在乾淨 code tree 上分析")
 	}
 
+	// provider capability preflight（M3a.1 Task 7：spec §3.4）：spawn 前驗 pin
+	// 版本＋argv 凍結基準。失敗 → fail closed：不啟動 runner、workflowMu 下建
+	// hard planner-enforcement 項並回明確錯誤；escalation 寫入失敗仍不啟動且
+	// 錯誤含 journal 失敗。重新通過 → 系統解除同 key（修復條件）。
+	pf, pferr := a.planPreflight(provider)
+	if pferr != nil || !pf.OK {
+		reason := pf.Reason
+		if pferr != nil {
+			reason = pferr.Error()
+		}
+		failErr := fmt.Errorf("%w：%s preflight 失敗：%s", assist.ErrEnforcementUnproven, provider, reason)
+		a.workflowMu.Lock()
+		_, cerr := a.escPlannerEnforcementFailedLocked(provider, reason)
+		a.workflowMu.Unlock()
+		if cerr != nil {
+			return "", errors.Join(failErr, cerr)
+		}
+		return "", failErr
+	}
+	a.workflowMu.Lock()
+	rerr := a.escResolveByKeyLocked(plannerEnforcementKey(provider), "preflight-pass:"+pf.BinaryDigest)
+	a.workflowMu.Unlock()
+	if rerr != nil { // 已重新通過但修復解除寫不進去：fail loud（不無聲留下已修復的 blocker）
+		return "", rerr
+	}
+
 	headOID, err := a.specRepo.HeadCommit()
 	if err != nil {
 		return "", fmt.Errorf("assist: resolve HEAD: %w", err)
@@ -3518,7 +3555,53 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
 	}
 	err = runner.Run(ctx, prompt, sink)
+	// 誤分類禁止（§3.4）：preflight 通過後的 runner 啟動失敗／逾時是一般錯誤，
+	// 不建 enforcement 項；只有 typed *EnforcementViolation（Codex 在
+	// readOnly+never 下仍送 escalation/approval request）才接 hard 項（同
+	// condition key，修復同樣走 preflight 重新通過的系統解除）。
+	var viol *assist.EnforcementViolation
+	if errors.As(err, &viol) {
+		a.workflowMu.Lock()
+		_, cerr := a.escPlannerEnforcementFailedLocked(viol.Provider, viol.Detail)
+		a.workflowMu.Unlock()
+		if cerr != nil { // fail loud：違規發生但 journal 寫不進去，錯誤要帶出來
+			err = errors.Join(err, cerr)
+		}
+	}
 	return gen.correlationID, err
+}
+
+// planPreflight（§3.4）：provider 的 PlanAssist spawn 前 capability preflight，
+// 帶 digest-keyed 快取（見 preflightCache 欄位 doc）。cache miss 時 hash 會在
+// Preflight* 內重算一次——只發生在 miss，維持單一實作比省一次 hash 值得。
+func (a *App) planPreflight(provider string) (assist.PreflightResult, error) {
+	bin := a.claudeCLIPath()
+	if provider == "codex" {
+		bin = a.codexCLIPath()
+	}
+	digest, err := assist.BinarySHA256(bin)
+	if err != nil {
+		return assist.PreflightResult{Provider: provider, BinaryPath: bin}, err
+	}
+	key := bin + "|" + digest
+	a.preflightMu.Lock()
+	cached, hit := a.preflightCache[key]
+	a.preflightMu.Unlock()
+	if hit {
+		return cached, nil
+	}
+	var res assist.PreflightResult
+	if provider == "claude" {
+		res, err = assist.PreflightClaude(bin, assist.ClaudePlannerArgs())
+	} else {
+		res, err = assist.PreflightCodex(bin)
+	}
+	if err == nil && res.OK { // 只快取 OK：失敗每次重驗（恢復即刻可見）
+		a.preflightMu.Lock()
+		a.preflightCache[key] = res
+		a.preflightMu.Unlock()
+	}
+	return res, err
 }
 
 // newPlanAssistRunner：production 造 provider 專屬唯讀 PlannerAssist Runner；
