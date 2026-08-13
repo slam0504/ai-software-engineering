@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -130,6 +131,55 @@ func TestPutCASReplayIsIdempotent(t *testing.T) {
 	}
 	if string(got) != string(data) {
 		t.Errorf("content after replay = %q, want %q", got, data)
+	}
+}
+
+// TestPutCASConcurrentSameContentConverges runs 8 goroutines concurrently
+// PutCAS-ing the SAME content into a shared dir (run with -race): each
+// creates its own temp file (os.CreateTemp is unique per call) and renames
+// it onto the same final <dir>/sha256/<hex> path, so this exercises the
+// rename-onto-existing-target overwrite path PutCAS's doc comment describes
+// as its idempotent-replay strategy, but under genuine concurrency rather
+// than sequential replay (which TestPutCASReplayIsIdempotent already
+// covers). Every goroutine must see the same digest and path, no goroutine
+// may error, and the resulting CAS object must round-trip the original
+// content.
+func TestPutCASConcurrentSameContentConverges(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("concurrent identical content")
+	const n = 8
+
+	digests := make([]string, n)
+	paths := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			digests[i], paths[i], errs[i] = PutCAS(dir, data)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: PutCAS: %v", i, err)
+		}
+		if digests[i] != digests[0] {
+			t.Errorf("goroutine %d digest = %q, want %q", i, digests[i], digests[0])
+		}
+		if paths[i] != paths[0] {
+			t.Errorf("goroutine %d path = %q, want %q", i, paths[i], paths[0])
+		}
+	}
+
+	got, err := OpenCAS(dir, digests[0])
+	if err != nil {
+		t.Fatalf("OpenCAS after concurrent PutCAS: %v", err)
+	}
+	if string(got) != string(data) {
+		t.Errorf("content after concurrent PutCAS = %q, want %q", got, data)
 	}
 }
 

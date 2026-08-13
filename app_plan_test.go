@@ -276,6 +276,38 @@ func TestSubmitPlanForApprovalRejectsPlanIDMismatch(t *testing.T) {
 	}
 }
 
+// TestSubmitPlanForApprovalRejectsMissingPermissionsRef guards
+// permissionRefEntries' load-time check (app.go): a task's permissions_ref
+// must resolve to a committed file at the plan's HEAD, or submission must
+// fail loud with the offending path in the error — not silently proceed
+// with an incomplete permission_manifest binding. Mirrors
+// setupApprovedGate1AndPlan/writePlanFixture but deliberately omits
+// plan/permissions/T1.yaml.
+func TestSubmitPlanForApprovalRejectsMissingPermissionsRef(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.SpecWrite("spec/glossary.md", "term v1", ""); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, a)
+	gate1ID, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(gate1ID, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	headOID := revParseHead(t, a)
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "P1.yaml"), testPlanYAML("P1", headOID, nil))
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "risk-policy.yaml"), testRiskPolicyYAML)
+	// deliberately no plan/permissions/T1.yaml
+	commitAllPlan(t, a)
+
+	_, err = a.SubmitPlanForApproval("P1")
+	if err == nil || !strings.Contains(err.Error(), "permissions/T1.yaml") {
+		t.Fatalf("missing permissions_ref file must reject submission with the path in the error, got %v", err)
+	}
+}
+
 func TestSubmitPlanForApprovalSucceeds(t *testing.T) {
 	a := newTestAppGit(t)
 	setupApprovedGate1AndPlan(t, a, "P1", "", nil)

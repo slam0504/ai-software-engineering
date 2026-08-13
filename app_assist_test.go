@@ -306,6 +306,46 @@ func TestPlanAssistRejectsNonPlanDirtyTree(t *testing.T) {
 	}
 }
 
+// TestPlanAssistAllowsPlanDirtyTree is the positive counterpart to
+// TestPlanAssistRejectsNonPlanDirtyTree: nonPlanDirtyPaths (app.go) filters
+// out anything under spec.PlanScope ("plan/**") before deciding a tree is
+// dirty, so an uncommitted change under plan/ must NOT block PlanAssist —
+// only a dirty file outside plan/ does.
+func TestPlanAssistAllowsPlanDirtyTree(t *testing.T) {
+	var called bool
+	capture := runnerFunc(func(_ context.Context, _ string, sink func(contract.Envelope)) error {
+		called = true
+		sink(contract.Wrap(contract.Event{Provider: contract.ProviderClaude,
+			Kind: contract.KindDelta, Text: "draft", Raw: []byte(`{}`)}, ""))
+		return nil
+	})
+	a, _ := newTestAppGitAssist(t, capture)
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// plan/ has an uncommitted change — must be allowed, not rejected as dirty.
+	if err := os.MkdirAll(filepath.Join(a.workspaceDir, "plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a.workspaceDir, "plan", "P1.yaml"), []byte("plan_id: P1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
+		t.Fatalf("PlanAssist must not be rejected by an uncommitted plan/** change, got: %v", err)
+	}
+	if !called {
+		t.Fatal("PlanAssist preconditions passed but the runner was never invoked")
+	}
+}
+
 func TestPlanAssistInjectsAnalysisBaseAndSpecDigest(t *testing.T) {
 	var capturedPrompt string
 	capture := runnerFunc(func(_ context.Context, prompt string, sink func(contract.Envelope)) error {

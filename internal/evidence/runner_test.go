@@ -372,4 +372,14 @@ func TestEvidenceRunDigest_DeterministicAndTamperEvident(t *testing.T) {
 	if d4 == d1 {
 		t.Fatal("ObservedFailure tamper must change digest")
 	}
+
+	// Non-string field: ExitCode is an int, not a string — a digest that
+	// only canonicalizes/hashes string fields (or drops non-string ones)
+	// would miss this tamper.
+	tampered3 := run
+	tampered3.ExitCode = 2
+	d5, _ := EvidenceRunDigest(tampered3)
+	if d5 == d1 {
+		t.Fatal("ExitCode tamper must change digest")
+	}
 }
