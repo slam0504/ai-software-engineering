@@ -8,6 +8,7 @@ import type { main, spec } from '../../wailsjs/go/models'
 import { useSession } from '../stores/session'
 import { useAssist } from '../stores/assist'
 import { extractGherkin } from '../lib/gherkin'
+import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
 
 const { t } = useI18n()
 
@@ -125,6 +126,35 @@ function selectFile(p: string) {
   if (!props.path) void loadFile()
 }
 
+// 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope
+// 預驗（四 pattern，UI 提示用——後端 SpecWrite 的 spec.InScope 仍是權威驗證）＋
+// 送出呼叫 SpecWrite(path, templateFor(path), '')（新檔：expectedDigest 留空，
+// 見 app.go SpecWrite 對「檔案不存在時 expectedDigest 必須為空」的樂觀鎖語意）。
+// 成功後才重載清單並選取新檔；失敗顯示錯誤原文，清單不動（catch 內不觸碰
+// files／selectedPath）。
+const newFilePath = ref('')
+const newFileBusy = ref(false)
+const newFileError = ref('')
+const newFileInScope = computed(() => newFilePath.value !== '' && inScope(newFilePath.value, SPEC_SCOPE_PATTERNS))
+
+async function createNewFile() {
+  newFileError.value = ''
+  if (!newFilePath.value || !newFileInScope.value) return
+  const path = newFilePath.value
+  const writer = props.write ?? SpecWrite
+  newFileBusy.value = true
+  try {
+    await writer(path, templateFor(path), '')
+    await loadFileList()
+    selectFile(path)
+    newFilePath.value = ''
+  } catch (e) {
+    newFileError.value = String(e)
+  } finally {
+    newFileBusy.value = false
+  }
+}
+
 // 三個 AI 輔助按鈕：呼叫 SpecAssist(provider,'spec_assist',prompt)，輸出經
 // EventsOn('workbench:event') → App.vue routeEnvelope → assist store 累積。
 // SpecAssist 現在直接回傳這次呼叫的 correlation_id（app.go 的 gen.correlationID）
@@ -224,6 +254,16 @@ async function confirmCommit() {
 
 <template>
   <div class="spec-workspace">
+    <div class="new-file">
+      <input v-model="newFilePath" data-test="new-file-path" :placeholder="t('newFile.path.placeholder')" />
+      <button
+        type="button" data-test="new-file-submit" :disabled="newFileBusy || !newFilePath || !newFileInScope"
+        @click="createNewFile"
+      >{{ t('newFile.action.create') }}</button>
+      <span v-if="newFilePath && !newFileInScope" class="err" data-test="new-file-scope-hint">{{ t('newFile.scopeHint') }}</span>
+    </div>
+    <p v-if="newFileError" class="err" data-test="new-file-error">{{ newFileError }}</p>
+
     <div class="files">
       <button v-for="f in files" :key="f.path" :class="{ active: f.path === effectivePath }"
         @click="selectFile(f.path)">{{ f.name }}</button>
@@ -266,6 +306,7 @@ async function confirmCommit() {
 
 <style scoped>
 .spec-workspace { display: flex; flex-direction: column; gap: 8px; padding: 8px; text-align: left; height: 100%; overflow-y: auto; }
+.new-file { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .files { display: flex; gap: 4px; flex-wrap: wrap; }
 .files button.active { background: var(--bg-bubble-user); color: #fff; }
 .editor { height: 280px; min-height: 120px; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }

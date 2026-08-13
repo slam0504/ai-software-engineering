@@ -343,4 +343,14 @@ export default {
       buttonFrom: '建立升級項目',
     },
   },
+  newFile: {
+    path: {
+      placeholder: '路徑（例如 spec/features/foo.feature 或 plan/my-plan.yaml）',
+    },
+    action: {
+      create: '建立檔案',
+    },
+    scopeHint: '路徑不在管理範圍內',
+    singlePlanBlocked: '已存在主要 plan 文件，一次僅允許一份主要 plan（單一 plan 限制）',
+  },
 }

@@ -343,4 +343,14 @@ export default {
       buttonFrom: 'Create escalation item',
     },
   },
+  newFile: {
+    path: {
+      placeholder: 'Path (e.g. spec/features/foo.feature or plan/my-plan.yaml)',
+    },
+    action: {
+      create: 'Create file',
+    },
+    scopeHint: 'Path is outside the managed scope',
+    singlePlanBlocked: 'A primary plan file already exists — only one primary plan is allowed at a time',
+  },
 }

@@ -107,3 +107,88 @@ describe('PlanWorkspace', () => {
     expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'plan/my-plan.yaml', blockScope: '' }]])
   })
 })
+
+// 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope
+// 預驗（plan/**）＋單一 plan 擋＋送出 PlanWrite(path, templateFor(path), '')，
+// 成功後重載清單並選取新檔，失敗經 plan.pushError 原樣顯示、清單不動。
+describe('PlanWorkspace 新增檔案', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.PlanList.mockResolvedValue([])
+    mocks.PlanRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('scope 外路徑即時提示，送出 disabled', async () => {
+    const w = mountWithI18n(PlanWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('spec/features/x.feature')
+    await flushPromises()
+
+    expect(w.find('[data-test=new-file-scope-hint]').exists()).toBe(true)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeDefined()
+    expect(mocks.PlanWrite).not.toHaveBeenCalled()
+  })
+
+  it('scope 內路徑送出成功後重載清單並選取新檔', async () => {
+    mocks.PlanWrite.mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('plan/risk-policy.yaml')
+    await flushPromises()
+    expect(w.find('[data-test=new-file-scope-hint]').exists()).toBe(false)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeUndefined()
+
+    await w.find('[data-test=new-file-submit]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.PlanWrite).toHaveBeenCalledWith('plan/risk-policy.yaml', expect.stringContaining('default_tier: medium'), '')
+    expect(mocks.PlanList).toHaveBeenCalledTimes(2) // mount 一次＋成功後重載一次
+    expect(mocks.PlanRead).toHaveBeenCalledWith('plan/risk-policy.yaml') // 選取新檔＋載入內容
+  })
+
+  it('失敗（PlanWrite 樂觀鎖衝突）錯誤原文顯示，清單不動', async () => {
+    mocks.PlanWrite.mockRejectedValue(new Error('plan write conflict: expected_digest does not match current file'))
+    const w = mountWithI18n(PlanWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('plan/dup-plan.yaml')
+    await w.find('[data-test=new-file-submit]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=plan-errors]').text()).toContain('plan write conflict: expected_digest does not match current file')
+    expect(mocks.PlanList).toHaveBeenCalledTimes(1) // 只有 mount 那次，失敗後不重載
+  })
+
+  it('單一 plan 擋：清單已有主要 plan 時，再輸入另一個主要 plan 路徑送出 disabled＋提示', async () => {
+    mocks.PlanList.mockResolvedValue([{ name: 'existing.yaml', path: 'plan/existing.yaml' }])
+    const w = mountWithI18n(PlanWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('plan/another.yaml')
+    await flushPromises()
+
+    expect(w.find('[data-test=new-file-single-plan-hint]').exists()).toBe(true)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeDefined()
+    expect(mocks.PlanWrite).not.toHaveBeenCalled()
+  })
+
+  it('單一 plan 擋不影響 oracle-surface／risk-policy／permissions 路徑', async () => {
+    mocks.PlanList.mockResolvedValue([{ name: 'existing.yaml', path: 'plan/existing.yaml' }])
+    mocks.PlanWrite.mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('plan/oracle-surface.yaml')
+    await flushPromises()
+
+    expect(w.find('[data-test=new-file-single-plan-hint]').exists()).toBe(false)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeUndefined()
+
+    await w.find('[data-test=new-file-submit]').trigger('click')
+    await flushPromises()
+    expect(mocks.PlanWrite).toHaveBeenCalledWith('plan/oracle-surface.yaml', expect.stringContaining('patterns:'), '')
+  })
+})

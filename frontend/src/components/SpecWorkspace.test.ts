@@ -89,3 +89,58 @@ describe('SpecWorkspace draft accept', () => {
     expect(w.find('[data-test=assist-busy]').exists()).toBe(false)
   })
 })
+
+// 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope
+// 預驗（spec 四 pattern）＋送出 SpecWrite(path, templateFor(path), '')，成功後
+// 重載清單並選取新檔，失敗顯示錯誤原文、清單不動。
+describe('SpecWorkspace 新增檔案', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('scope 外路徑即時提示，送出 disabled', async () => {
+    const w = mountWithI18n(SpecWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('spec/other/x.feature')
+    await flushPromises()
+
+    expect(w.find('[data-test=new-file-scope-hint]').exists()).toBe(true)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeDefined()
+    expect(mocks.SpecWrite).not.toHaveBeenCalled()
+  })
+
+  it('scope 內路徑送出成功後重載清單並選取新檔', async () => {
+    mocks.SpecWrite.mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('spec/features/new.feature')
+    await flushPromises()
+    expect(w.find('[data-test=new-file-scope-hint]').exists()).toBe(false)
+    expect(w.find('[data-test=new-file-submit]').attributes('disabled')).toBeUndefined()
+
+    await w.find('[data-test=new-file-submit]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.SpecWrite).toHaveBeenCalledWith('spec/features/new.feature', '', '') // spec 路徑 templateFor 回空字串
+    expect(mocks.SpecList).toHaveBeenCalledTimes(2) // mount 一次＋成功後重載一次
+    expect(mocks.SpecRead).toHaveBeenCalledWith('spec/features/new.feature') // 選取新檔＋載入內容
+  })
+
+  it('失敗顯示錯誤原文，清單不動', async () => {
+    mocks.SpecWrite.mockRejectedValue(new Error('path "spec/features/dup.feature" write conflict: expected_digest does not match current file'))
+    const w = mountWithI18n(SpecWorkspace, {})
+    await flushPromises()
+
+    await w.find('[data-test=new-file-path]').setValue('spec/features/dup.feature')
+    await w.find('[data-test=new-file-submit]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=new-file-error]').text()).toContain('write conflict: expected_digest does not match current file')
+    expect(mocks.SpecList).toHaveBeenCalledTimes(1) // 只有 mount 那次，失敗後不重載
+  })
+})

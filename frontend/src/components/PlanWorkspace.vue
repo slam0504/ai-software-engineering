@@ -10,6 +10,7 @@ import { usePlan } from '../stores/plan'
 // tag）一律走通用 fence 擷取路徑——對 plan YAML 草稿一樣適用，別名匯入避免誤讀成
 // domain 耦合（沿用既有、已測試涵蓋的 fence 擷取邏輯，不重複實作）。
 import { extractGherkin as extractDraftContent } from '../lib/gherkin'
+import { templateFor, inScope, PLAN_SCOPE_PATTERNS } from '../lib/planTemplates'
 
 const { t } = useI18n()
 
@@ -144,6 +145,44 @@ function selectFile(p: string) {
   if (!props.path) void loadFile()
 }
 
+// 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope
+// 預驗（plan/**，UI 提示用——後端 PlanWrite 的 spec.PlanScope.Match 仍是權威
+// 驗證）＋單一 plan 擋（見下方 isPrimaryPlanPath／hasPrimaryPlan：清單已存在
+// 一份主要 plan 文件時，再輸入另一個主要 plan 路徑禁止送出——risk-policy／
+// oracle-surface／permissions 不算主要 plan，不受限）＋送出呼叫
+// PlanWrite(path, templateFor(path), '')（新檔：expectedDigest 留空）。成功後
+// 才重載清單並選取新檔；失敗經 plan.pushError 原樣顯示（同 saveFile／
+// submitForApproval 等既有 write 路徑慣例），清單不動。
+const newFilePath = ref('')
+const newFileBusy = ref(false)
+const newFileInScope = computed(() => newFilePath.value !== '' && inScope(newFilePath.value, PLAN_SCOPE_PATTERNS))
+
+// isPrimaryPlanPath：符合單一 plan 限制檢查的「主要 plan 文件」——plan/<id>.yaml，
+// 排除 risk-policy.yaml／oracle-surface.yaml（brief Step 3：清單中已存在符合
+// /^plan\/[^/]+\.yaml$/ 且非 risk-policy/oracle-surface 的檔案）。
+function isPrimaryPlanPath(path: string): boolean {
+  return /^plan\/[^/]+\.yaml$/.test(path) && path !== 'plan/risk-policy.yaml' && path !== 'plan/oracle-surface.yaml'
+}
+const hasPrimaryPlan = computed(() => plan.files.some(f => isPrimaryPlanPath(f.path)))
+const singlePlanBlocked = computed(() => hasPrimaryPlan.value && isPrimaryPlanPath(newFilePath.value))
+
+async function createNewFile() {
+  if (!newFilePath.value || !newFileInScope.value || singlePlanBlocked.value) return
+  const path = newFilePath.value
+  const writer = props.write ?? PlanWrite
+  newFileBusy.value = true
+  try {
+    await writer(path, templateFor(path), '')
+    await loadFileList()
+    selectFile(path)
+    newFilePath.value = ''
+  } catch (e) {
+    plan.pushError(String(e))
+  } finally {
+    newFileBusy.value = false
+  }
+}
+
 // runAssist：呼叫 PlanAssist(provider, prompt)，輸出經 EventsOn('workbench:event')
 // → App.vue routeEnvelope（purpose=plan_draft）→ plan store 累積。PlanAssist 直接
 // 回傳這次呼叫的 correlation_id（同 SpecAssist），換檔競態處理同 SpecWorkspace：
@@ -232,6 +271,16 @@ async function confirmCommit() {
 
 <template>
   <div class="plan-workspace">
+    <div class="new-file">
+      <input v-model="newFilePath" data-test="new-file-path" :placeholder="t('newFile.path.placeholder')" />
+      <button
+        type="button" data-test="new-file-submit" :disabled="newFileBusy || !newFilePath || !newFileInScope || singlePlanBlocked"
+        @click="createNewFile"
+      >{{ t('newFile.action.create') }}</button>
+      <span v-if="newFilePath && !newFileInScope" class="err" data-test="new-file-scope-hint">{{ t('newFile.scopeHint') }}</span>
+      <span v-else-if="singlePlanBlocked" class="err" data-test="new-file-single-plan-hint">{{ t('newFile.singlePlanBlocked') }}</span>
+    </div>
+
     <div class="files">
       <button v-for="f in plan.files" :key="f.path" :class="{ active: f.path === effectivePath }"
         @click="selectFile(f.path)">{{ f.name }}</button>
@@ -284,6 +333,7 @@ async function confirmCommit() {
 
 <style scoped>
 .plan-workspace { display: flex; flex-direction: column; gap: 8px; padding: 8px; text-align: left; height: 100%; overflow-y: auto; }
+.new-file { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .files { display: flex; gap: 4px; flex-wrap: wrap; }
 .files button.active { background: var(--bg-bubble-user); color: #fff; }
 .editor { height: 280px; min-height: 120px; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
