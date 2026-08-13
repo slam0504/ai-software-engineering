@@ -161,3 +161,7 @@
 - PlannerAssist Claude 唯讀白名單 live probe 未做（人工步驟）
 - (9) planner-enforcement escalation 觸發點缺（key＋函式已備）
 - 其餘 minor 級（測試覆蓋補強、cosmetic、pre-existing）詳見 .superpowers/sdd ledger——共約 30 條，均不影響核可正確性路徑
+
+## 最終裁決記錄（owner 2026-08-13）
+
+`oracle_surface.ref` 格式衝突裁決：**採裸 OID＋spec erratum**——ref 屬 reference 非 digest；凍結為：reference 類欄位（`oracle_surface.ref`、`EvidenceRun.test_commit`）＝完整裸 Git OID（SHA-1 40 hex／SHA-256 64 hex）；commit 類 `Binding.digest` 維持 `git:<algo>:<full-oid>`；既有 journal 不遷移不回寫。已同步修訂 spec §3.4（erratum）與 plan Global Constraints。

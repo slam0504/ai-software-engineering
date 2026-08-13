@@ -22,7 +22,7 @@
 - **核可權威順序**（§3.10）：GateDecide → reconcile → 硬性 validator → blocking escalation 檢查 → append；workflow mutex 覆蓋 GateDecide／reconcile／escalation create·resolve／evidence finalize；lock ordering：workflow mutex → gate journal → escalation journal。
 - **CAS 落盤順序**（§3.7）：temp file → 寫入＋算 digest → file Sync＋Close → atomic rename → directory Sync → append＋Sync journal。
 - **Evidence runner 邊界**（§4）：結構化 `executable+argv[]`、系統暫存目錄 detached worktree、process group timeout、輸出超限＝`result:error`、恰一次 finalize、啟動清 orphan；**非 sandbox、非 CI enforcement**。
-- **digest 格式**：manifest／CAS＝`sha256:<64hex>`；commit＝`git:<algo>:<full oid>`（禁短 SHA）。
+- **digest 格式**：manifest／CAS＝`sha256:<64hex>`；commit 類 Binding.digest＝`git:<algo>:<full oid>`（禁短 SHA）；reference 類欄位（oracle_surface.ref、EvidenceRun.test_commit）＝完整裸 Git OID（spec §3.4 erratum 2026-08-13）。
 - **i18n**：所有新 UI 字串進 `zh-TW`＋`en` 雙 locale，維持 key parity（既有 `locales.parity.test.ts` 會抓）。
 - **驗證基線**：每個 Phase 收尾 gate 跑 `go vet ./...`、`go test -race ./... -count=1`、`npm --prefix frontend run test`、`npm --prefix frontend run build`；最終加 `wails build`。不得只驗新測試。
 

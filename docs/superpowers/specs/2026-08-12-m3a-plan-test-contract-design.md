@@ -177,7 +177,8 @@ risk_decisions: [{task_id, minimum_risk_tier, planner_risk_tier, selected_risk_t
 
 **測試快照重建規則（凍結）**：
 
-1. `oracle_surface.ref` 必須是**完整的 test commit OID**（`git:<algo>:<oid>`）；digest 為 oracle-surface 路徑集的 canonical manifest digest（演算法同 app plan §5.3）。
+1. `oracle_surface.ref` 必須是**完整的 test commit OID**；digest 為 oracle-surface 路徑集的 canonical manifest digest（演算法同 app plan §5.3）。
+   > **Erratum（2026-08-13，owner 核定）**：reference 類欄位（`oracle_surface.ref`、`EvidenceRun.test_commit`）凍結為**完整裸 Git OID**（SHA-1＝40 hex、SHA-256＝64 hex），非本節初版所寫的 `git:<algo>:<oid>`——ref 是參照非 digest，實作、測試與 journal 自 Task 19 起已一致採裸 OID。commit 類 `Binding.digest`（`base_commit` 等）**維持** `git:<algo>:<full-oid>`。既有 journal 不遷移、不回寫。§3.2 的 `evidence:<ULID>`／`mutation:<ULID>` ref 前綴同屬示例、非約束。
 2. Runner 驗證 test commit 以 `plan_commit` 為祖先。
 3. `plan_commit..test_commit` 只能修改已核可宣告的 oracle-surface 路徑（超出即拒絕）。
 4. expected-red 直接 checkout **test commit**（＝base code＋紅燈測試）；negative-control 在同一 snapshot 上套用 mutation。
