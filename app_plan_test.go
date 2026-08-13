@@ -261,6 +261,21 @@ func TestSubmitPlanForApprovalRejectsDirtyPlanTree(t *testing.T) {
 	}
 }
 
+func TestSubmitPlanForApprovalRejectsPlanIDMismatch(t *testing.T) {
+	a := newTestAppGit(t)
+	setupApprovedGate1AndPlan(t, a, "P1", "", nil)
+
+	// plan/P1.yaml（檔名派生 ID＝P1）內容的 plan_id 欄位改成 P2——
+	// committed plan 與檔名派生 ID 不符，須拒核。
+	writeFile(t, filepath.Join(a.workspaceDir, "plan", "P1.yaml"),
+		testPlanYAML("P2", revParseHead(t, a), nil))
+	commitAllPlan(t, a)
+
+	if _, err := a.SubmitPlanForApproval("P1"); err == nil || !strings.Contains(err.Error(), "plan_id") {
+		t.Fatalf("plan_id/filename mismatch must reject submission, got %v", err)
+	}
+}
+
 func TestSubmitPlanForApprovalSucceeds(t *testing.T) {
 	a := newTestAppGit(t)
 	setupApprovedGate1AndPlan(t, a, "P1", "", nil)

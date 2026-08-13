@@ -34,6 +34,7 @@ func OpenJournal(path string) (*Journal, error) {
 	for _, ln := range lines {
 		var op GateOp
 		if err := json.Unmarshal(ln, &op); err != nil {
+			j.Close()
 			return nil, err
 		}
 		ops = append(ops, op)

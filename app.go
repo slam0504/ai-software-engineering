@@ -1842,6 +1842,9 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("plan: load committed plan %q at %s: %w", planID, planHeadOID, err)
 	}
+	if pl.PlanID != planID {
+		return "", fmt.Errorf("plan: committed plan.yaml plan_id %q does not match filename-derived plan ID %q", pl.PlanID, planID)
+	}
 
 	gate1HeadOID := gitOIDFromDigest(gate1BaseCommit)
 	specScenarios, err := gate1ScenarioIDs(a.planGit, gate1HeadOID)
@@ -2726,7 +2729,7 @@ func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bin
 			Subject: subject, Bindings: bindings}
 		if verr := policy.ValidateRequest(req); verr != nil {
 			a.workflowMu.Lock()
-			_, cerr := a.escCreateSystemLocked(key, scopeForSubject(gateName, subject), false,
+			_, cerr := a.escCreateSystemLocked(key, scopeForSubject(gateName, subject), true,
 				"系統組裝的送核請求缺必要 binding："+verr.Error(), subject)
 			a.workflowMu.Unlock()
 			if cerr != nil {
