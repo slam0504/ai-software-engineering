@@ -680,6 +680,144 @@ func TestShutdownHungProviderIsBounded(t *testing.T) {
 	}
 }
 
+// TestEndSessionInFlightShutdownNoDoubleTeardown（review P1，fix/lifecycle-app-txn）：
+// EndSession 現在整段納入 app transaction（見其 doc）——shutdown 與一個已經在
+// 途中的 EndSession 競速時，shutdown 的 inflight.Wait() 必須等 EndSession 完整
+// 返回（含 teardown／FinishEndSession）才往下讀 a.claudeSess／進 forcedShutdown。
+// 用既有的 hookClaudeTeardownBarrier（claudeTeardown 真正執行的唯一進入點，
+// EndSession／NewSession／自然收尾 reaper／forcedShutdown 共用同一個 hook 位置）
+// 卡住 EndSession 的 teardown 中段，確定性驅動兩條 goroutine 的交錯，不用
+// time.Sleep 猜時序；bounded 斷言沿用既有 TestShutdownGateBlocksLateCodexStart
+// 的 select+timeout 慣例（只用來斷言「此刻仍卡著」，不是拿來同步排序本身）。
+func TestEndSessionInFlightShutdownNoDoubleTeardown(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	if err := a.StartSession("claude", "hi", "", "claude-endrace", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var teardownCount atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookClaudeTeardownBarrier = func() { // claudeTeardown 真正執行的唯一進入點
+		teardownCount.Add(1)
+		close(entered)
+		<-release
+	}
+
+	endErr := make(chan error, 1)
+	go func() { endErr <- a.EndSession("claude") }()
+	<-entered // EndSession 已握有 app-txn、正卡在真正 teardown（CloseSequence）之前
+
+	shutDone := make(chan struct{})
+	go func() {
+		a.shutdown(context.Background())
+		close(shutDone)
+	}()
+	select { // shutdown 必須等 EndSession 的 app-txn 離場，不能搶先讀 a.claudeSess
+	case <-shutDone:
+		t.Fatal("shutdown must wait for the in-flight EndSession transaction")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if a.manager.Closed() {
+		t.Fatal("manager must not be closed while EndSession's app transaction is still in flight")
+	}
+
+	close(release) // 放行：EndSession 完成唯一一次真正的 CloseSequence
+	if err := <-endErr; err != nil {
+		t.Fatalf("EndSession must succeed: %v", err)
+	}
+	<-shutDone // 此刻 FinishEndSession／Manager.Close() 皆已跑完，順序見上方 doc
+
+	if n := teardownCount.Load(); n != 1 { // 沒有第二份並行的 CloseSequence
+		t.Fatalf("CloseSequence executed %d times, want exactly 1 (no double teardown)", n)
+	}
+	if !a.manager.Closed() {
+		t.Fatal("manager must be closed after shutdown returns")
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) {
+		t.Fatal("claude session must be ended")
+	}
+	claudeDone := 0
+	for _, e := range ui.find("session:done") {
+		if d, ok := e.data.(map[string]any); ok && d["provider"] == "claude" {
+			claudeDone++
+		}
+	}
+	if claudeDone != 1 { // forcedShutdown 對 claude 完全無事可做，不會重複發 session:done
+		t.Fatalf("claude session:done count = %d, want exactly 1 (no duplicate)", claudeDone)
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-endrace.meta.json")); err != nil {
+		t.Fatalf("lease must be finalized: %v", err)
+	}
+}
+
+// TestNewSessionInFlightShutdownNoDoubleTeardown：NewSession 版的上一個測試——
+// NewSession 同樣整段納入 app transaction（見其 doc），teardown 完成後走
+// FinishEndSessionIntoReset（不是 FinishEndSession），驗證方式相同。
+func TestNewSessionInFlightShutdownNoDoubleTeardown(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	if err := a.StartSession("claude", "hi", "", "claude-newrace", "task-c", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var teardownCount atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookClaudeTeardownBarrier = func() {
+		teardownCount.Add(1)
+		close(entered)
+		<-release
+	}
+
+	newErr := make(chan error, 1)
+	go func() { newErr <- a.NewSession("claude") }()
+	<-entered // NewSession 已握有 app-txn、正卡在真正 teardown（CloseSequence）之前
+
+	shutDone := make(chan struct{})
+	go func() {
+		a.shutdown(context.Background())
+		close(shutDone)
+	}()
+	select { // shutdown 必須等 NewSession 的 app-txn 離場
+	case <-shutDone:
+		t.Fatal("shutdown must wait for the in-flight NewSession transaction")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if a.manager.Closed() {
+		t.Fatal("manager must not be closed while NewSession's app transaction is still in flight")
+	}
+
+	close(release)
+	if err := <-newErr; err != nil {
+		t.Fatalf("NewSession must succeed: %v", err)
+	}
+	<-shutDone
+
+	if n := teardownCount.Load(); n != 1 {
+		t.Fatalf("CloseSequence executed %d times, want exactly 1 (no double teardown)", n)
+	}
+	if !a.manager.Closed() {
+		t.Fatal("manager must be closed after shutdown returns")
+	}
+	if a.manager.SessionActive(contract.ProviderClaude) {
+		t.Fatal("claude session must not be active")
+	}
+	claudeDone := 0
+	for _, e := range ui.find("session:done") {
+		if d, ok := e.data.(map[string]any); ok && d["provider"] == "claude" {
+			claudeDone++
+		}
+	}
+	if claudeDone != 1 {
+		t.Fatalf("claude session:done count = %d, want exactly 1 (no duplicate)", claudeDone)
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-newrace.meta.json")); err != nil {
+		t.Fatalf("lease must be finalized: %v", err)
+	}
+}
+
 // ---- M1.5-T6：重啟恢復（view window／staged candidate）與 NewSession ----
 
 func TestRestoreViewWindowReplay(t *testing.T) {
