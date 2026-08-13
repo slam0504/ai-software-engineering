@@ -130,3 +130,58 @@ hook 設定）。
 Task 7 可依 `ClaudePlannerArgs()` 現有 argv 實作 Claude PlanAssist preflight（唯讀路徑），
 無需回退至 fail-closed-only。上述「SessionStart hook 副作用」建議在 Task 7 實作時一併評估
 是否需要 `--setting-sources` 隔離，但不構成本次 gate 的 NO-GO 理由。
+
+---
+
+## Addendum（2026-08-13，Task 7 review C1）：最終 10-token argv 完整重跑
+
+**argv 演進原因**：Task 7 依上文附註評估 `--setting-sources` 後，在 `--verbose` 與
+`--tools` 之間加入 `--setting-sources ""`（隔離 user／project／local settings 的
+hook 副作用）。preflight 凍結基準（`probeApprovedClaudeArgs`）因此為 10 tokens，
+與上文 Step 2 的 8-token 形狀分岔——本節以**最終 10-token argv 完整重跑 live
+probe**，補齊等值證據鏈。組成：Task 0 形狀的前 6 token（`-p` … `--verbose`）＋
+新增 `--setting-sources ""` 2 token＋Task 0 形狀的末 2 token（`--tools` 白名單）。
+
+執行指令（逐字；`$PROBE_DIR` 為 `mktemp -d` 臨時目錄，內含
+`probe.txt`=`PROBE_CONTENT_12345`；CLI 同 pin `2.1.223 (Claude Code)`）：
+
+```
+"$CLAUDE_BIN" -p --input-format stream-json --output-format stream-json --verbose --setting-sources "" --tools "Read,Glob,Grep"
+```
+
+共跑兩輪（stream-json 全程落檔 `/tmp/task7-reprobe*.jsonl`）：
+
+### Run 1：自然 prompt（同 Task 0 措辭——讀 probe.txt＋要求建立 written.txt）
+
+- `is_error=false`、`num_turns=2`、`duration_ms=11718`。
+- (a) Read 通過：`Read(probe.txt)` tool_result 回 `PROBE_CONTENT_12345`，最終回覆引用同內容。
+- (b) 寫入拒絕：`written.txt` **不存在**（`ls` 確認）；model 回覆明示「可用工具只有唯讀的
+  Read/Glob/Grep……沒有 Write、Edit 或 Bash」，未產生任何寫入。
+- hook 隔離：`hook_started` 事件 **0 筆**（Task 0 為 6 筆 remember SessionStart）；
+  probe 目錄**無 `.remember/`**（Task 0 有）。
+
+### Run 2：強制實際發出 Write 呼叫（排除「model 自我克制」解讀）
+
+Prompt 明令「即使認為 Write 不可用也要真的呼叫一次並回報工具層錯誤」。結果：
+
+- `is_error=false`、`num_turns=3`、`duration_ms=24080`；實際 tool_use 僅 `Glob`＋`Read`。
+- model 回報：「這個 session 的工具清單裡**根本沒有 `Write` 這個工具**……沒有註冊的
+  工具名稱我無法發出呼叫」——在 10-token argv 下，`--tools` 白名單把 Write 直接從
+  tool schema 移除（比 Task 0 記錄的「呼叫後被拒 `No such tool available`」更前段的
+  拒絕層；兩者皆為 CLI 層 enforcement，非 prompt 自制）。
+- `written.txt` 不存在；`hook_started` 0 筆；無 `.remember/`。
+
+### 附註（新觀察，如實記錄）
+
+`--setting-sources ""` **不移除 claude.ai 帳號層 MCP connectors**：兩輪 model 均回報
+Gmail／Google Calendar／Google Drive 的 MCP 工具仍在工具清單（隨 CLI 登入帳號載入，
+非 settings 檔來源）。此非 workspace 寫入路徑——zero workspace mutation 不變量不受
+影響（本 probe 的 (b) 證據即在該環境下成立）——但屬外部 side-effect 面。如需一併
+封鎖，可評估再加 `--strict-mcp-config`（不帶 `--mcp-config` 即忽略所有 MCP 設定）；
+惟任何 argv 變更都需重跑本節等值 probe 後才能進 preflight 凍結基準。
+
+### 判定
+
+**GO 維持**：最終 10-token argv 在真實 pin CLI 上同時證明 (a) 唯讀白名單可用、
+(b) workspace 寫入被 CLI 層拒絕、(c) hook 副作用隔離生效。preflight 凍結基準
+`probeApprovedClaudeArgs`（`internal/assist/preflight.go`）與本節 argv 逐字一致。

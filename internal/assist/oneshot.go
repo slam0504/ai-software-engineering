@@ -217,6 +217,18 @@ func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract
 		}
 		return nil, v
 	})
+	// preferViolation：任何 return 前先 non-blocking drain escalated——violation
+	// 與 wire error 可能並存（handler 已填 channel 但 Call 先因 error response
+	// 返回；或 final select 多分支同時 ready 隨機取），runtime 違規不得被同時
+	// 發生的一般錯誤降級（app 層 errors.As 分類的 fail-closed 對偶）。
+	preferViolation := func(err error) error {
+		select {
+		case v := <-escalated:
+			return v
+		default:
+			return err
+		}
+	}
 	turnDone := make(chan struct{})
 	conn.OnNotification(func(method string, params json.RawMessage) {
 		sink(contract.Wrap(codex.MapEvent(method, params), ""))
@@ -236,14 +248,14 @@ func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract
 	hctx, hcancel := context.WithTimeout(ctx, 30*time.Second)
 	defer hcancel()
 	if herr := conn.Handshake(hctx, assistClientInfo()); herr != nil {
-		return herr
+		return preferViolation(herr)
 	}
 
 	sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
 	defer scancel()
 	res, err := conn.Call(sctx, codex.MethodThreadStart, CodexAssistThreadParams(""))
 	if err != nil {
-		return err
+		return preferViolation(err)
 	}
 	var tr struct {
 		Thread struct {
@@ -251,20 +263,20 @@ func (c *codexAssist) Run(ctx context.Context, prompt string, sink func(contract
 		} `json:"thread"`
 	}
 	if json.Unmarshal(res, &tr) != nil || tr.Thread.ID == "" {
-		return errors.New("assist: codex thread id missing in thread/start response")
+		return preferViolation(errors.New("assist: codex thread id missing in thread/start response"))
 	}
 	if _, err := conn.Call(sctx, codex.MethodTurnStart, CodexAssistTurnParams(tr.Thread.ID, prompt)); err != nil {
-		return err
+		return preferViolation(err)
 	}
 
 	select {
-	case <-turnDone: // turn/completed：草擬結束
-		return nil
+	case <-turnDone: // turn/completed：草擬結束（若違規已發生仍 fail closed）
+		return preferViolation(nil)
 	case v := <-escalated: // escalation/approval：fail closed（typed violation）
 		return v
 	case <-ctx.Done(): // cancel／timeout／shutdown reclaim
-		return ctx.Err()
+		return preferViolation(ctx.Err())
 	case <-conn.Done(): // wire EOF（server 死亡）
-		return errors.New("assist: codex connection closed before turn completed")
+		return preferViolation(errors.New("assist: codex connection closed before turn completed"))
 	}
 }

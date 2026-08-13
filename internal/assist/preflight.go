@@ -30,14 +30,15 @@ const (
 	codexPinVersion  = "0.146.1"
 )
 
-// probeApprovedClaudeArgs：Claude PlannerAssist 的凍結 argv 基準。前 8 個 token
-// 逐字抄自 Task 0 live probe（docs/spikes/m3a1-planner-probe.md §2(c)——probe
-// 與當時的 ClaudePlannerArgs() 完全一致），另加 `--setting-sources ""`
-// （Task 7 實測：pin 2.1.223 支援該旗標；空來源下 SessionStart hook 0 筆、無
-// .remember/ 檔案副作用——隔離使用者全域／project／local settings 的 hook，
-// 堵住非白名單路徑寫入）。白名單 enforcement 在 `--tools`（probe 的 GO 判定
-// 依據），不受新旗標影響。ClaudePlannerArgs() 改動而未同步此基準（或反之）
-// 即 preflight 失敗——argv 分岔 fail closed，不無聲放行。
+// probeApprovedClaudeArgs：Claude PlannerAssist 的凍結 argv 基準——**整組
+// 10 token 已以最終形狀完整重跑 live probe**（docs/spikes/m3a1-planner-probe.md
+// Addendum 2026-08-13：written.txt 拒寫＋Write 不在 tool schema＋hook_started
+// 0 筆＋無 .remember/ 皆實測通過）。組成：Task 0 probe 形狀的前 6 token
+// （`-p` … `--verbose`）＋Task 7 新增的 `--setting-sources ""` 2 token（隔離
+// user／project／local settings 的 hook 副作用）＋Task 0 形狀的末 2 token
+// （`--tools` 唯讀白名單，enforcement 落點）。ClaudePlannerArgs() 改動而未
+// 同步此基準（或反之）即 preflight 失敗——argv 分岔 fail closed，不無聲放行；
+// 任何 argv 變更需先重跑 probe addendum 等值驗證再更新此基準。
 var probeApprovedClaudeArgs = []string{
 	"-p",
 	"--input-format", "stream-json",

@@ -3597,8 +3597,11 @@ func (a *App) planPreflight(provider string) (assist.PreflightResult, error) {
 		res, err = assist.PreflightCodex(bin)
 	}
 	if err == nil && res.OK { // 只快取 OK：失敗每次重驗（恢復即刻可見）
+		// key 用 res.BinaryDigest（Preflight* 驗證當下同一次 hash 的結果），
+		// 不用上面 lookup 用的 digest——兩次 hash 之間 binary 若被抽換，存入
+		// 的 key 仍與驗證結果自洽，抽換後的 binary 下次 lookup 必 miss 重驗。
 		a.preflightMu.Lock()
-		a.preflightCache[key] = res
+		a.preflightCache[bin+"|"+res.BinaryDigest] = res
 		a.preflightMu.Unlock()
 	}
 	return res, err

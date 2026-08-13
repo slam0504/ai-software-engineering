@@ -132,11 +132,16 @@ func TestPreflightMissingBinaryErrors(t *testing.T) {
 // writeFakeCodexAppServer：stdio JSONL fake app-server。所有 client→server
 // frame 逐行落到 $FAKE_WIRE_LOG（wire 截取）；FAKE_APPROVAL=1 時在 turn/start
 // 後注入 approval request（驗 fail-closed typed violation），否則送
-// turn/completed 正常收尾。
+// turn/completed 正常收尾。FAKE_APPROVAL_THEN_ERROR=1：turn/start 先**不**回
+// response、只注入 approval request，等收到 client 對該 request（id 9001）的
+// error response——此刻 client 端 handler 必已跑完、violation 必已入 channel——
+// 才回 turn/start 的 JSON-RPC error，deterministic 構造「violation 與 Call
+// error 並存」情境（驗 wire error 不得蓋掉 typed violation）。
 func writeFakeCodexAppServer(t *testing.T, dir string) string {
 	t.Helper()
 	p := filepath.Join(dir, "fake-codex")
 	script := `#!/usr/bin/env bash
+turnid=""
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$FAKE_WIRE_LOG"
   id=$(printf '%s' "$line" | grep -oE '"id":[0-9]+' | head -1 | cut -d: -f2)
@@ -144,11 +149,20 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"t1"}}}\n' "$id" ;;
     *'"method":"turn/start"'*)
-      printf '{"id":%s,"result":{}}\n' "$id"
-      if [ -n "${FAKE_APPROVAL:-}" ]; then
+      if [ -n "${FAKE_APPROVAL_THEN_ERROR:-}" ]; then
+        turnid="$id"
+        printf '{"id":9001,"method":"item/commandExecution/requestApproval","params":{"threadId":"t1","itemId":"i1"}}\n'
+      elif [ -n "${FAKE_APPROVAL:-}" ]; then
+        printf '{"id":%s,"result":{}}\n' "$id"
         printf '{"id":9001,"method":"item/commandExecution/requestApproval","params":{"threadId":"t1","itemId":"i1"}}\n'
       else
+        printf '{"id":%s,"result":{}}\n' "$id"
         printf '{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1"}}}\n'
+      fi ;;
+    *'"id":9001'*)
+      if [ -n "$turnid" ]; then
+        printf '{"id":%s,"error":{"code":-32000,"message":"injected turn/start wire error"}}\n' "$turnid"
+        turnid=""
       fi ;;
   esac
 done
@@ -246,5 +260,27 @@ func TestCodexAssistProductionApprovalFailsClosedTyped(t *testing.T) {
 	}
 	if !strings.Contains(viol.Error(), "fail closed") {
 		t.Fatalf("violation Error() must keep the fail-closed wording, got: %s", viol.Error())
+	}
+}
+
+// violation 與 wire error 並存（approval request 已入 channel、turn/start Call
+// 隨後收到 error response）→ Run 必須回 typed violation，不得被 Call error
+// 蓋掉降級成一般錯誤（否則 app 層 errors.As 分類漏建 enforcement 項）。
+// fake 端 deterministic：等收到 client 對 approval request 的 error response
+// （handler 已跑完、violation 已入 channel）才回 turn/start error。
+func TestCodexAssistViolationNotMaskedByWireError(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCodexAppServer(t, dir)
+	logPath := filepath.Join(dir, "wire.jsonl")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := NewCodexPlanner(bin, dir, []string{"FAKE_WIRE_LOG=" + logPath, "FAKE_APPROVAL_THEN_ERROR=1"}).
+		Run(ctx, "draft the plan", func(contract.Envelope) {})
+	var viol *EnforcementViolation
+	if !errors.As(err, &viol) {
+		t.Fatalf("violation must win over the concurrent turn/start wire error, got: %v", err)
+	}
+	if viol.Provider != "codex" || viol.Detail != codex.MethodCmdExecRequestApproval {
+		t.Fatalf("violation must carry provider/method, got: %+v", viol)
 	}
 }
