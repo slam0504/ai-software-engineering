@@ -21,6 +21,9 @@ export default {
       height: '拖曳調整高度',
     },
     startupError: '啟動：{error}',
+    goResubmit: {
+      integrityError: '資料完整性錯誤：無法解析重新送核目標——已取消導航',
+    },
   },
   settings: {
     action: {
@@ -115,6 +118,10 @@ export default {
       evidenceIntegrityMissing: '缺漏：{roles}',
       evidenceIntegrityDuplicate: '重複：{roles}',
       evidenceIntegrityUnknown: '未知 role：{roles}',
+    },
+    stale: {
+      goResubmit: '前往重新送核',
+      navError: '資料完整性錯誤：無法判定重新送核目標',
     },
   },
   spec: {
@@ -348,6 +355,10 @@ export default {
       summaryPlaceholder: '摘要（必填）',
       submit: '建立',
       buttonFrom: '建立升級項目',
+    },
+    staleNav: {
+      goResubmit: '前往重新送核',
+      integrityError: '資料完整性錯誤：無法解析重新送核目標',
     },
   },
   newFile: {

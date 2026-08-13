@@ -13,6 +13,7 @@ import { useEscalation } from './stores/escalation'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import { escalationBadge } from './lib/escalationBadge'
+import { resolveResubmitTarget } from './lib/staleNav'
 import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
 import ChatPanel from './components/ChatPanel.vue'
@@ -101,6 +102,36 @@ async function onSelectTask(taskId: string) {
         return
       }
     } catch { /* 該卡片載入失敗就跳過，繼續找下一筆，不炸 */ }
+  }
+}
+
+// onGoResubmit（M3a.1 Task 11，spec §3.5）：STALE 重核引導——GateConsole 的
+// stale 卡片與 EscalationInbox 的系統 stale 項按下「前往重新送核」時觸發，
+// payload 已是結構化 (gate, subject)（GateConsole 直接給、EscalationInbox 已
+// 用 parseStaleTarget 切過 condition_key）。這裡只做二次解析（subject 形狀是
+// 否符合該 gate 的期待格式）＋純 view 導航（切 tab／選 plan 檔／聚焦 tca task
+// 列），完全不呼叫任何寫入 binding——不核可、不建立、不解除，只是把操作者帶到
+// 「該去哪裡重新送核」，實際動作仍要操作者在對應工作區自行完成。解析失敗（理論
+// 上不該發生——GateConsole／EscalationInbox 各自已經擋過一層，這裡是第二層
+// fail-safe）一律顯示錯誤、不導航，不猜一個目標出來。
+const planFocusPath = ref<string | undefined>(undefined)
+const tcaFocusTaskId = ref('')
+const goResubmitError = ref('')
+function onGoResubmit(payload: { gate: string; subject: string }) {
+  goResubmitError.value = ''
+  const target = resolveResubmitTarget(payload.gate, payload.subject)
+  if (!target) {
+    goResubmitError.value = t('app.goResubmit.integrityError')
+    return
+  }
+  if (target.kind === 'gate1') {
+    tab.value = 'spec'
+  } else if (target.kind === 'gate2') {
+    tab.value = 'plan'
+    planFocusPath.value = `plan/${target.planId}.yaml`
+  } else {
+    tab.value = 'tca'
+    tcaFocusTaskId.value = target.taskId
   }
 }
 // Task 16：表示圖層——spec/context-map/*.mmd 的瀏覽／監看／重渲染 view（M2 非圖形編輯器）
@@ -213,12 +244,13 @@ onMounted(async () => {
         <ChatPanel v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
-        <PlanWorkspace v-if="tab === 'plan'" @escalate="onEscalate" />
+        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" />
         <TcaWorkspace
           v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
           :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"
           :register-mutation="wailsBindings.RegisterMutation" :run-evidence="wailsBindings.RunEvidence"
           :get-evidence="wailsBindings.EvidenceGet" :submit-test-contract="wailsBindings.SubmitTestContract"
+          :focus-task-id="tcaFocusTaskId"
         />
         <div v-show="tab === 'diagram'" class="diagram-tab">
           <div class="diagram-files">
@@ -243,15 +275,16 @@ onMounted(async () => {
           v-show="sidePanel === 'gate'"
           :entries="gate.list" :decide="decideGate" :load-decision-context="GateDecisionContext"
           :get-evidence="wailsBindings.EvidenceGet" :degraded="gateDegraded" :highlight-id="highlightedApprovalId"
-          @open-evidence="selectedEvidenceId = $event" @escalate="onEscalate"
+          @open-evidence="selectedEvidenceId = $event" @escalate="onEscalate" @go-resubmit="onGoResubmit"
         />
         <p v-if="gateError && sidePanel === 'gate'" class="gate-err">{{ gateError }}</p>
         <EscalationInbox
           v-show="sidePanel === 'escalation'"
           :entries="escalation.entries" :unavailable="escalation.unavailable" :prefill="escalatePrefill"
           :ack="wailsBindings.EscalationAck" :resolve="wailsBindings.EscalationResolve"
-          :create="wailsBindings.EscalationCreate" :reload="refreshEscalation"
+          :create="wailsBindings.EscalationCreate" :reload="refreshEscalation" @go-resubmit="onGoResubmit"
         />
+        <p v-if="goResubmitError" class="gate-err" data-test="go-resubmit-error">{{ goResubmitError }}</p>
       </aside>
     </div>
     <div v-show="timelineOpen" class="tl-resize" :title="t('app.resize.height')" @mousedown.prevent="onResizeStart" />

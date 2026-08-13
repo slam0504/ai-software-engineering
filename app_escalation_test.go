@@ -191,6 +191,36 @@ func TestStaleBlockerReleasedByReplacementApproval(t *testing.T) { // P1：stale
 	}
 }
 
+// ---- M3a.1 Task 11（spec §3.5）：stale summary 措辭凍結——引導必須建立修正版
+// 重新送核，而非誤導操作者以為還原檔案內容能恢復舊核可 ----
+
+func TestStaleEscalationSummaryGuidesReplacementResubmission(t *testing.T) {
+	a := newTestAppGit(t)
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.SpecWrite("spec/glossary.md", "term v2", digestOf(t, a, "spec/glossary.md"))
+	commitAll(t, a)
+	a.reconcileGate1NotifyOnly() // 權威掃描：stale → hard item
+
+	item := openItemByKey(t, a, "stale:gate1:workspace")
+	if item == nil {
+		t.Fatal("stale reconcile must create a hard escalation item")
+	}
+	if !strings.Contains(item.Item.Summary, "必須建立修正版並重新送核") {
+		t.Fatalf("stale summary must instruct creating a replacement and resubmitting, got %q", item.Item.Summary)
+	}
+	if !strings.Contains(item.Item.Summary, "還原檔案內容不會讓舊核可恢復生效") {
+		t.Fatalf("stale summary must warn that reverting file content does not revive the old approval, got %q", item.Item.Summary)
+	}
+}
+
 // ---- §3.8：hard 項不可手動 resolve；ack 不解除 block ----
 
 func TestHardEscalationNotManuallyResolvable(t *testing.T) {

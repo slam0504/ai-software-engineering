@@ -193,6 +193,28 @@ describe('PlanWorkspace 新增檔案', () => {
     await flushPromises()
     expect(mocks.PlanWrite).toHaveBeenCalledWith('plan/oracle-surface.yaml', expect.stringContaining('patterns:'), '')
   })
+
+  // M3a.1 Task 11（spec §3.5）回歸：path prop 只當「seed」用一次——STALE 重核
+  // 引導會從 App.vue 傳入 path 導航到指定 plan 檔，但那之後操作者在檔案清單裡
+  // 點別的檔仍要能正常換檔，不能被殘留的 prop 值永久鎖死（否則導航一次之後，
+  // Plan 工作區的手動檔案瀏覽功能就整個壞掉）。
+  it('path prop 只 seed 一次，seed 後點檔案清單仍可正常換檔', async () => {
+    mocks.PlanList.mockResolvedValue([
+      { name: 'a.yaml', path: 'plan/a.yaml' },
+      { name: 'b.yaml', path: 'plan/b.yaml' },
+    ])
+    mocks.PlanRead.mockImplementation((path: string) =>
+      Promise.resolve({ content: path === 'plan/a.yaml' ? 'content-a' : 'content-b', digest: 'sha256:' + path }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushPromises()
+    expect(mocks.PlanRead).toHaveBeenCalledWith('plan/a.yaml')
+
+    const bButton = w.findAll('button').find(b => b.text() === 'b.yaml')
+    expect(bButton).toBeTruthy()
+    await bButton!.trigger('click')
+    await flushPromises()
+    expect(mocks.PlanRead).toHaveBeenCalledWith('plan/b.yaml') // 點清單裡的另一個檔仍能正常換檔，未被 path prop 鎖死
+  })
 })
 
 // analysis_base bump 引導 UI（M3a.1 Task 6，spec §3.2）：觸發時機（檔案載入／

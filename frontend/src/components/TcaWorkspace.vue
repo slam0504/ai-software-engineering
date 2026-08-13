@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { GateEntry, GateDecisionTask, CommitCandidate } from '../types'
 import { useEvidence } from '../stores/evidence'
@@ -27,6 +27,9 @@ const props = defineProps<{
   getEvidence: (evidenceId: string) => Promise<{ result: string }>
   submitTestContract: (planId: string, taskId: string, testCommit: string,
     expectedRedId: string, negativeControlId: string, mutationId: string) => Promise<string>
+  // focusTaskId（M3a.1 Task 11，spec §3.5）：STALE 重核引導從 App.vue 導航進來
+  // 時要聚焦的 task 列——scroll＋高亮，同 GateConsole highlightId 的既有慣例。
+  focusTaskId?: string
 }>()
 
 // active gate2：subject="plan:"+planID——同 app.go activeGate2PlanCommit／
@@ -201,6 +204,18 @@ async function run(taskId: string, kind: string) {
   }
 }
 
+// scrollToTask／focusTaskId watch：鏡射 GateConsole scrollToApproval 的既有
+// pattern——data-test 選 DOM 節點＋optional chaining（jsdom 測試環境不一定實作
+// scrollIntoView）。nextTick 等 tasks 完成渲染（loadTasks 是 async），避免目標
+// task 列還沒掛上 DOM 就 query 落空。
+function scrollToTask(id: string) {
+  const el = document.querySelector(`[data-test="tca-row-${id}"]`) as (HTMLElement & { scrollIntoView?: (opts?: unknown) => void }) | null
+  el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+}
+watch(() => props.focusTaskId, (id) => {
+  if (id) void nextTick(() => scrollToTask(id))
+})
+
 function bothPassed(taskId: string): boolean {
   return evidence.runOf(approvalId.value, planId.value, taskId, 'expected_red')?.status === 'passed'
     && evidence.runOf(approvalId.value, planId.value, taskId, 'negative_control')?.status === 'passed'
@@ -234,7 +249,11 @@ async function submit(taskId: string) {
       <p v-if="loadError" class="err" data-test="tca-load-error">{{ loadError }}</p>
       <p v-if="candidatesError" class="err" data-test="tca-candidates-error">{{ candidatesError }}</p>
 
-      <div v-for="task in tasks" :key="task.task_id" class="task-row" :data-test="'tca-row-' + task.task_id">
+      <div
+        v-for="task in tasks" :key="task.task_id" class="task-row"
+        :class="{ highlighted: !!focusTaskId && task.task_id === focusTaskId }"
+        :data-test="'tca-row-' + task.task_id"
+      >
         <div class="head">
           <span class="task-id">{{ task.task_id }}</span>
           <span class="task-title">{{ task.title }}</span>
@@ -323,6 +342,7 @@ async function submit(taskId: string) {
 .tca-workspace { display: flex; flex-direction: column; gap: 10px; padding: 8px; text-align: left; height: 100%; overflow-y: auto; }
 .empty { color: var(--text-faint); font-size: var(--fs-s); }
 .task-row { border: 1px solid var(--border); border-radius: var(--radius-s); padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.task-row.highlighted { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .head { display: flex; gap: 8px; align-items: baseline; }
 .head .task-id { font-weight: 600; }
 .head .task-title { color: var(--text-muted); font-size: var(--fs-s); }

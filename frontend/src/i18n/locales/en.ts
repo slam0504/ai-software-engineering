@@ -21,6 +21,9 @@ export default {
       height: 'Drag to resize height',
     },
     startupError: 'startup: {error}',
+    goResubmit: {
+      integrityError: 'Data integrity error: the resubmit target could not be parsed — navigation cancelled',
+    },
   },
   settings: {
     action: {
@@ -115,6 +118,10 @@ export default {
       evidenceIntegrityMissing: 'missing: {roles}',
       evidenceIntegrityDuplicate: 'duplicate: {roles}',
       evidenceIntegrityUnknown: 'unknown role: {roles}',
+    },
+    stale: {
+      goResubmit: 'Go to resubmit',
+      navError: 'Data integrity error: the resubmit target could not be determined',
     },
   },
   spec: {
@@ -348,6 +355,10 @@ export default {
       summaryPlaceholder: 'Summary (required)',
       submit: 'Create',
       buttonFrom: 'Create escalation item',
+    },
+    staleNav: {
+      goResubmit: 'Go to resubmit',
+      integrityError: 'Data integrity error: the resubmit target could not be parsed',
     },
   },
   newFile: {

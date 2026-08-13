@@ -3132,7 +3132,8 @@ func (a *App) reconcileLocked(svc *gate.Service) error {
 			continue
 		}
 		if _, cerr := a.escCreateSystemLocked("stale:"+gs, scopeForSubject(e.Record.Gate, e.Record.Subject), true,
-			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——需修正版重核",
+			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——"+
+				"修正後必須建立修正版並重新送核；還原檔案內容不會讓舊核可恢復生效",
 			e.ApprovalID); cerr != nil {
 			return cerr
 		}

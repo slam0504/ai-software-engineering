@@ -36,7 +36,10 @@ const emit = defineEmits<{ (e: 'escalate', payload: { sourceRef: string; blockSc
 const plan = usePlan()
 
 const selectedPath = ref('')
-const effectivePath = computed(() => props.path ?? selectedPath.value)
+// effectivePath：selectedPath 是唯一權威來源——props.path 只在 mount／變動時
+// seed 一次（見下方 onMounted／watch(props.path)），seed 完之後檔案清單的手動
+// selectFile 點擊照常生效，不會被 prop 永久蓋掉（見 watch(props.path) 註解）。
+const effectivePath = computed(() => selectedPath.value)
 
 // escalate：review fix（spec §3.8 回填）——sourceRef 帶目前 plan 檔的 rel path
 // （effectivePath，永遠可得；planIdInput 只在 plan/<id>.yaml 才推得出來，見
@@ -200,6 +203,7 @@ function onWindowFocus() {
 }
 
 onMounted(async () => {
+  if (props.path) selectedPath.value = props.path // 見下方 watch(props.path) 註解
   await loadFileList()
   await loadFile()
   await initEditor()
@@ -209,7 +213,15 @@ onBeforeUnmount(() => {
   cmView?.destroy()
   window.removeEventListener('focus', onWindowFocus)
 })
-watch(() => props.path, () => {
+// M3a.1 Task 11（spec §3.5）：STALE 重核引導從 App.vue 一次性帶入 path 導航到
+// 指定 plan 檔（例如 GateConsole／EscalationInbox 的「前往重新送核」）。path
+// 只當「seed」——寫入 selectedPath 後，effectivePath 就以 selectedPath 為準，
+// 之後操作者在檔案清單點別的檔（selectFile）仍照常生效，不會被 prop 永久鎖死
+// 在導航進來的那個檔案（原本 `props.path ?? selectedPath.value` 若不 seed，
+// 只要 path prop 還留著非空值，selectFile 點擊會被完全蓋掉——清單看起來能點，
+// 實際檔案永遠不換）。
+watch(() => props.path, (p) => {
+  if (p) selectedPath.value = p
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免套用草稿把 A 的草稿寫進 B（同 SpecWorkspace fix round 1）
   resetBump()
   void loadFile()
@@ -223,7 +235,7 @@ function selectFile(p: string) {
   selectedPath.value = p
   resetDraft()
   resetBump()
-  if (!props.path) void loadFile()
+  void loadFile()
 }
 
 // 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope

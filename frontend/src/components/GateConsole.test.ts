@@ -352,4 +352,47 @@ describe('GateConsole', () => {
     await w.find('[data-test=escalate-A]').trigger('click')
     expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'approval:A', blockScope: 'workspace' }]])
   })
+
+  // M3a.1 Task 11（spec §3.5）：stale 卡片「前往重新送核」——三種 gate 各 emit
+  // 正確的 (gate, subject)；畸形 subject 顯示資料完整性錯誤、不渲染按鈕、不
+  // emit；導航純 view 操作，不呼叫任何寫入 binding（decide 全程零呼叫）。
+  it.each([
+    ['gate1', { gate: 'gate1', subject: 'workspace' }],
+    ['gate2', { gate: 'gate2', subject: 'plan:P1' }],
+    ['test_contract_approval', { gate: 'test_contract_approval', subject: 'task:P1/T1' }],
+  ])('stale 卡片（%s）點擊「前往重新送核」emit go-resubmit 帶正確 gate/subject，且不呼叫 decide', async (_label, entry) => {
+    const decide = vi.fn()
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale', ...entry }], decide },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(false)
+    await w.find('[data-test=go-resubmit-A]').trigger('click')
+    expect(w.emitted('go-resubmit')).toEqual([[entry]])
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stale 卡片：畸形 subject（gate2 缺 plan id）顯示資料完整性錯誤、不渲染導航按鈕、不 emit', async () => {
+    const decide = vi.fn()
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale', gate: 'gate2', subject: 'plan:' }], decide },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-A]').exists()).toBe(false)
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stale 卡片：缺 gate/subject（未知形狀）顯示資料完整性錯誤、不渲染導航按鈕', () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale' }], decide: vi.fn() },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-A]').exists()).toBe(false)
+  })
+
+  it('非 stale 卡片不渲染 stale-section（正常，無導航）', () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'pending', gate: 'gate1' }], decide: vi.fn() },
+    })
+    expect(w.find('[data-test=stale-section]').exists()).toBe(false)
+  })
 })

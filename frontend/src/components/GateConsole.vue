@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import type { GateEntry, GateDecisionTask, RiskSelection } from '../types'
 import type { evidence } from '../../wailsjs/go/models'
 import { resolveState, gateStateKeys, evidenceResultKeys, riskTierKeys } from '../i18n/stateKeys'
+import { resolveResubmitTarget } from '../lib/staleNav'
 
 const { t } = useI18n()
 
@@ -22,6 +23,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'open-evidence', evidenceId: string): void
   (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
+  (e: 'go-resubmit', payload: { gate: string; subject: string }): void
 }>()
 
 // scopeForEntry：review fix（spec §3.8 回填）——鏡射後端 app.go 的
@@ -41,6 +43,18 @@ function scopeForEntry(e: GateEntry): string {
 }
 function onEscalate(e: GateEntry) {
   emit('escalate', { sourceRef: 'approval:' + e.approval_id, blockScope: scopeForEntry(e) })
+}
+
+// resubmitTargetOf／onGoResubmit（M3a.1 Task 11，spec §3.5）：stale 卡片的
+// 「前往重新送核」——entry 已經有結構化 gate/subject（不像 EscalationInbox 只有
+// condition_key 字串），直接用 resolveResubmitTarget 二次解析 subject 形狀。
+// 解析失敗（gate/subject 缺失或形狀不符）一律顯示資料完整性錯誤、不渲染按鈕、
+// 不 emit——fail loud，不讓操作者點了才發現導航不了。
+function resubmitTargetOf(e: GateEntry) {
+  return resolveResubmitTarget(e.gate ?? '', e.subject ?? '')
+}
+function onGoResubmit(e: GateEntry) {
+  emit('go-resubmit', { gate: e.gate ?? '', subject: e.subject ?? '' })
 }
 
 const reasons = reactive<Record<string, string>>({}) // 理由欄：per approval_id 獨立輸入
@@ -264,6 +278,14 @@ function shortDigest(d: string): string {
         <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ resolveState(gateStateKeys, e.state, t) }}</span>
         <button type="button" :data-test="'escalate-' + e.approval_id" @click="onEscalate(e)">{{ t('escalation.create.buttonFrom') }}</button>
       </div>
+      <div v-if="e.state === 'stale'" class="stale-section" data-test="stale-section">
+        <p v-if="!resubmitTargetOf(e)" class="err" :data-test="'stale-nav-error-' + e.approval_id">
+          {{ t('gate.stale.navError') }}
+        </p>
+        <button v-else type="button" :data-test="'go-resubmit-' + e.approval_id" @click="onGoResubmit(e)">
+          {{ t('gate.stale.goResubmit') }}
+        </button>
+      </div>
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + (b.role ?? '') + b.ref" :title="b.digest">
           {{ b.kind }}<template v-if="b.role">（{{ b.role }}）</template>: {{ shortDigest(b.digest) }}
@@ -366,6 +388,7 @@ function shortDigest(d: string): string {
 .badge-rejected { background: var(--rejected); color: #2a1708; }
 .bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); overflow-wrap: anywhere; word-break: break-all; }
 .bindings li { overflow-wrap: anywhere; word-break: break-all; }
+.stale-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; font-size: var(--fs-s); }
 .risk-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
 .risk-rows { display: flex; flex-direction: column; gap: 6px; }
 .risk-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--fs-s); }

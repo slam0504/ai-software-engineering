@@ -5,10 +5,10 @@ import { mountWithI18n } from '../test/i18n'
 // entry fixture：鏡射 wailsjs escalation.Entry（Item + State，見 models.ts）。
 const entry = (over: Partial<{
   escalation_id: string; source: string; source_ref: string; block_scope: string
-  hard: boolean; summary: string; occurrence: number; state: string
+  hard: boolean; summary: string; occurrence: number; state: string; condition_key: string
 }> = {}) => ({
   Item: {
-    _type: 'escalation_item', escalation_id: over.escalation_id ?? 'E1', condition_key: '',
+    _type: 'escalation_item', escalation_id: over.escalation_id ?? 'E1', condition_key: over.condition_key ?? '',
     occurrence: over.occurrence ?? 1, source: over.source ?? 'manual', source_ref: over.source_ref ?? 'P1/T1',
     block_scope: over.block_scope ?? 'workspace', hard: over.hard ?? false, summary: over.summary ?? 'summary text',
     created_at: '2026-01-01T00:00:00Z',
@@ -136,5 +136,54 @@ describe('EscalationInbox', () => {
 
     await w.find('[data-test=create-submit]').trigger('click')
     expect(props.create).toHaveBeenCalledWith('P1/T1', 'gate2:P1', 'manual escalation summary')
+  })
+
+  // M3a.1 Task 11（spec §3.5.4，凍結規則）：手動項／condition_key 不以 "stale:"
+  // 開頭 → 不顯示導航（正常）；source=system 且 "stale:" 開頭但解析失敗 → 顯示
+  // 資料完整性錯誤、禁止導航（不得靜默隱藏）；可解析 → 顯示導航按鈕，emit
+  // go-resubmit 帶正確 (gate, subject)，且不呼叫任何寫入 binding（ack／
+  // resolve／create 全程零呼叫）。
+  it('手動項（source=manual）不顯示導航，即使 condition_key 剛好長得像 stale key（正常）', () => {
+    const props = { ...baseProps(), entries: [entry({ escalation_id: 'E1', source: 'manual', condition_key: 'stale:gate1:workspace' })] }
+    const w = mountWithI18n(EscalationInbox, { props })
+    expect(w.find('[data-test=go-resubmit-E1]').exists()).toBe(false)
+    expect(w.find('[data-test=stale-nav-error-E1]').exists()).toBe(false)
+  })
+
+  it('系統項但 condition_key 不以 "stale:" 開頭 → 不顯示導航（正常，非 stale 系統項）', () => {
+    const props = { ...baseProps(), entries: [entry({ escalation_id: 'E1', source: 'system', condition_key: 'journal-degraded:gate' })] }
+    const w = mountWithI18n(EscalationInbox, { props })
+    expect(w.find('[data-test=go-resubmit-E1]').exists()).toBe(false)
+    expect(w.find('[data-test=stale-nav-error-E1]').exists()).toBe(false)
+  })
+
+  it('系統 stale 項但 parseStaleTarget 解析失敗（未知 gate）→ 顯示資料完整性錯誤、禁止導航', () => {
+    const props = { ...baseProps(), entries: [entry({ escalation_id: 'E1', source: 'system', hard: true, condition_key: 'stale:gate3:workspace' })] }
+    const w = mountWithI18n(EscalationInbox, { props })
+    expect(w.find('[data-test=stale-nav-error-E1]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-E1]').exists()).toBe(false)
+  })
+
+  it('系統 stale 項但 parseStaleTarget 解析失敗（空 subject）→ 顯示資料完整性錯誤、禁止導航', () => {
+    const props = { ...baseProps(), entries: [entry({ escalation_id: 'E1', source: 'system', hard: true, condition_key: 'stale:gate1:' })] }
+    const w = mountWithI18n(EscalationInbox, { props })
+    expect(w.find('[data-test=stale-nav-error-E1]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-E1]').exists()).toBe(false)
+  })
+
+  it.each([
+    ['gate1', 'stale:gate1:workspace', { gate: 'gate1', subject: 'workspace' }],
+    ['gate2（subject 含冒號）', 'stale:gate2:plan:P1', { gate: 'gate2', subject: 'plan:P1' }],
+    ['test_contract_approval', 'stale:test_contract_approval:task:P1/T1', { gate: 'test_contract_approval', subject: 'task:P1/T1' }],
+  ])('系統 stale 項（%s）可解析 → 顯示導航按鈕，emit go-resubmit 帶正確 gate/subject，不呼叫任何寫入 binding', async (_label, key, expected) => {
+    const props = { ...baseProps(), entries: [entry({ escalation_id: 'E1', source: 'system', hard: true, condition_key: key })] }
+    const w = mountWithI18n(EscalationInbox, { props })
+    expect(w.find('[data-test=stale-nav-error-E1]').exists()).toBe(false)
+    await w.find('[data-test=go-resubmit-E1]').trigger('click')
+    expect(w.emitted('go-resubmit')).toEqual([[expected]])
+    // 導航純 view 操作——ack／resolve／create 全程零呼叫（mock 全量斷言）
+    expect(props.ack).not.toHaveBeenCalled()
+    expect(props.resolve).not.toHaveBeenCalled()
+    expect(props.create).not.toHaveBeenCalled()
   })
 })
