@@ -310,6 +310,7 @@ function shortDigest(d: string): string {
 .badge-stale { background: var(--err); color: #2a0d0b; }
 .badge-pending { background: var(--warn); color: #2a2410; }
 .badge-superseded { background: var(--text-faint, #6b7280); color: #f0f0f0; }
+.badge-rejected { background: var(--rejected); color: #2a1708; }
 .bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); overflow-wrap: anywhere; word-break: break-all; }
 .bindings li { overflow-wrap: anywhere; word-break: break-all; }
 .risk-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
