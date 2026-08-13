@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import mermaid from 'mermaid'
 import { usePlan } from '../stores/plan'
 import { parsePlanDoc, planToMermaid, buildNodeIdMap, type PlanDoc } from '../lib/planDag'
+import { resolveState, riskTierKeys } from '../i18n/stateKeys'
 
 // DagPane（Task 14，spec §6）：plan store 目前檔內容（PlanWorkspace 已載入的
 // buffer）→ parsePlanDoc → planToMermaid → mermaid render，重用 DiagramPane.vue
@@ -57,7 +58,7 @@ async function render() {
   }
   const id = `dag-${++renderSeq}`
   try {
-    const { svg: rendered } = await mermaid.render(id, planToMermaid(doc)) // securityLevel:'strict' 已消毒
+    const { svg: rendered } = await mermaid.render(id, planToMermaid(doc, tier => resolveState(riskTierKeys, tier, t))) // securityLevel:'strict' 已消毒
     svg.value = rendered
   } catch (e) {
     error.value = `mermaid: ${String(e)}` // 錯誤走 textContent（{{ }}），不進 HTML sink

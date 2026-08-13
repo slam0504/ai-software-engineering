@@ -118,6 +118,15 @@ describe('planToMermaid', () => {
     expect(out).toContain('T2["T2 · Fix #quot;quoted#quot; bug · medium"]')
   })
 
+  it('translateTier 參數存在時，節點標籤的 tier 走翻譯；未提供時退回 identity（不翻譯）', () => {
+    const doc = parsePlanDoc(planYaml())!
+    const translated = planToMermaid(doc, tier => ({ low: '低', medium: '中', high: '高' })[tier] ?? tier)
+    expect(translated).toContain('T1["T1 · Task 1 · 低"]')
+    expect(translated).toContain('T2["T2 · Task 2 · 中"]')
+    const untranslated = planToMermaid(doc)
+    expect(untranslated).toContain('T1["T1 · Task 1 · low"]') // 未傳入 translateTier 時維持原行為
+  })
+
   it('沒有依賴的任務不產生入邊', () => {
     const doc = parsePlanDoc(planYaml({ dependsOn2: '[]' }))!
     const out = planToMermaid(doc)

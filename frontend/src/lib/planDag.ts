@@ -179,13 +179,17 @@ function escapeLabel(s: string): string {
 // planToMermaid：`flowchart TD`，節點 `T1["T1 · 標題 · tier"]`（tier 優先取
 // planner_risk_tier——planner 實際指派的風險等級較貼近「這個 task 現在是什麼
 // 風險」；缺值時退回 minimum_risk_tier；兩者皆空則該段省略），邊
-// `dep --> task`（依 depends_on 展開，缺依賴的任務不產生入邊）。
-export function planToMermaid(doc: PlanDoc): string {
+// `dep --> task`（依 depends_on 展開，缺依賴的任務不產生入邊）。translateTier：
+// 這裡刻意維持純函式、不直接 import i18n——呼叫端（DagPane）注入
+// `tier => resolveState(riskTierKeys, tier, t)`，未提供時退回 identity（不翻譯），
+// 讓既有呼叫端與測試維持原行為。
+export function planToMermaid(doc: PlanDoc, translateTier: (tier: string) => string = (tier) => tier): string {
   const nodeIds = buildNodeIdMap(doc)
   const lines = ['flowchart TD']
   for (const task of doc.tasks) {
     const nodeId = nodeIds.get(task.id)!
-    const tier = task.plannerRiskTier || task.minimumRiskTier
+    const tierRaw = task.plannerRiskTier || task.minimumRiskTier
+    const tier = tierRaw ? translateTier(tierRaw) : tierRaw
     const parts = [task.id, task.title, tier].filter(Boolean)
     lines.push(`  ${nodeId}["${escapeLabel(parts.join(' · '))}"]`)
   }
