@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -145,6 +146,16 @@ func (s *Session) Send(prompt string) error {
 }
 
 // Close 冪等關閉 stdin（「不再有輸入」）；CLI 隨後自然收尾。
+//
+// 冪等性涵蓋比 s.stdin == nil 更廣的情況：Terminate 若先於 Close 執行（例如
+// forced shutdown 與自然收尾 reaper 對同一個已死行程賽跑——見 app.go
+// forcedShutdown／claudeTeardown doc 的 ErrEndInProgress benign 裁定），
+// process 可能已經整組死亡，Go 的 os/exec 會在自己的 cmd.Wait() 偵測到行程
+// 結束時自動關掉 stdin pipe（不管呼叫端是否已經呼叫過 Close）。這種情況下
+// s.stdin 在本次呼叫仍是非 nil（Session 自己不知道 pipe 已被外部關閉），
+// stdin.Close() 會回 os.ErrClosed——目的（「不再接受輸入」）其實已經達成，
+// 視為成功，不應該被上游（appcore.CloseSequence／EndSessionFlow）當成真正
+// 的 teardown 失敗浮出。
 func (s *Session) Close() error {
 	s.stdinMu.Lock()
 	defer s.stdinMu.Unlock()
@@ -153,5 +164,8 @@ func (s *Session) Close() error {
 	}
 	err := s.stdin.Close()
 	s.stdin = nil
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
 	return err
 }

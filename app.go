@@ -65,6 +65,12 @@ type App struct {
 	claudeSessionID string
 	claudePumpDone  <-chan struct{}
 	claudeLease     *appcore.RecordingLease
+	// claudeTeardownFn：startClaude 為該 session 建的 sync.OnceValue 包裝
+	// teardown（見 startClaude 內建立處＋claudeTeardown doc）——自然收尾 reaper
+	// 與 forcedShutdown 共用同一份，保證同一個 session 的 CloseSequence 全程
+	// 恰好真正執行一次；輸掉 BeginEndSession 競速的一方呼叫它只是阻塞等收斂
+	// （bounded by CloseSequence 自身 quiesce/kill timeout），不會重跑第二次。
+	claudeTeardownFn func() error
 
 	codexSingle  codex.Single[*codex.Server]
 	codexConn    *codex.Conn // wireCodexConn 記錄；interrupt 用（fake wire 測試同路徑）
@@ -89,6 +95,14 @@ type App struct {
 	hookBeforeProviderStart func()                      // 測試注入：start ownership 取得後、provider 啟動前
 	hookInServerTxn         func()                      // 測試注入：server 交易已登記、Ensure 未開始
 	codexHostOverride       codexHost                   // 測試注入：fake wire 走 production StartSession 分支
+
+	// 以下三個 hook 只服務 claude 自然收尾 reaper／forcedShutdown 的 ErrEndInProgress
+	// benign 裁定（review P2：TestShutdownForcedWaitsForBoth flaky）——讓測試能
+	// deterministic 驅動兩個時序分支，不靠 time.Sleep 猜。
+	hookClaudeTeardownBarrier          func() // 測試注入：claudeTeardownFn（shared OnceValue）真正執行開始時
+	hookClaudeReaperBeforeEndFlow      func() // 測試注入：reaper 的 <-done 解除之後、呼叫 EndSessionFlow 之前
+	hookForcedShutdownClaudeBeforeFlow func() // 測試注入：forcedShutdown 的 sess.Terminate() 之後、呼叫 EndSessionFlow 之前
+	hookForcedShutdownClaudeBenign     func() // 測試注入：forcedShutdown 判定 ErrEndInProgress 為 benign、等待收斂之前
 
 	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
 	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
@@ -690,9 +704,21 @@ func (a *App) shutdown(ctx context.Context) {
 // submit 擋住，無法保證 E8）。每個 active provider：先 interrupt／terminate active
 // turn → 走收尾；EndSessionFlow 被 lifecycle 狀態拒絕時直接 teardown 兜底（lease
 // 冪等）。兩邊都被等待、錯誤 errors.Join 保留、一邊失敗不跳過另一邊。
+//
+// claude 側 ErrEndInProgress 裁定（review P2，TestShutdownForcedWaitsForBoth
+// flaky 的根因）：sess.Terminate() 會讓 process 死掉，喚醒 startClaude 內建的
+// 自然收尾 reaper（見其 doc）——它與這裡幾乎同時嘗試 BeginEndSession，輸家收到
+// ErrEndInProgress。這個 session 本就在收尾中，teardown 的目的（結束 session、
+// finalize 錄流）正被贏家那條路徑達成，不是 forced shutdown 真的失敗，故裁定
+// 為 benign、不計入 shutdown 錯誤——但仍要確認 teardown 真的收斂才能返回（見
+// switch 內對應分支）。claudeTeardownFn 是 startClaude 建的 sync.OnceValue：
+// 兩條路徑共用同一份，任一方呼叫它都只會執行一次真正的 CloseSequence，另一方
+// 只是阻塞等它做完（收斂上限即 CloseSequence 自身 quiesce/kill timeout），不會
+// double-Close／double-Terminate／double-Finalize。
 func (a *App) forcedShutdown() error {
 	a.mu.Lock()
-	sess, done, clease := a.claudeSess, a.claudePumpDone, a.claudeLease
+	sess := a.claudeSess
+	teardownFn := a.claudeTeardownFn
 	runner, klease := a.runner, a.codexLease
 	a.mu.Unlock()
 
@@ -702,10 +728,23 @@ func (a *App) forcedShutdown() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = sess.Terminate() // interrupt 先行：加速 CloseSequence quiesce
-			if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil,
-				a.claudeTeardown(sess, done, clease)); err != nil {
-				terr := a.claudeTeardown(sess, done, clease)() // lifecycle 擋住：直接收（冪等）
+			_ = sess.Terminate()                                     // interrupt 先行：加速 CloseSequence quiesce
+			if h := a.hookForcedShutdownClaudeBeforeFlow; h != nil { // 測試 barrier：見 App 欄位 doc
+				h()
+			}
+			err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, teardownFn)
+			switch {
+			case err == nil:
+				// forced shutdown 自己贏得 BeginEndSession、teardown 已完成。
+			case errors.Is(err, appcore.ErrEndInProgress):
+				if h := a.hookForcedShutdownClaudeBenign; h != nil { // 測試 barrier：見上方 doc
+					h()
+				}
+				if terr := teardownFn(); terr != nil { // 只等收斂；ErrEndInProgress 本身不計入錯誤
+					errs[0] = terr
+				}
+			default:
+				terr := teardownFn() // 其餘 lifecycle 擋住：直接收尾兜底（OnceValue 保證冪等）
 				errs[0] = errors.Join(err, terr)
 			}
 		}()
@@ -3499,8 +3538,16 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 		a.manager.Emit(ev)
 	})
 
+	// claudeTeardownFn：shared sync.OnceValue（review P2）——這個 goroutine
+	// 下方的自然收尾 reaper 與 forcedShutdown（見其 doc）都可能對同一個 session
+	// 呼叫 teardown；用同一份 memoized 執行保證 CloseSequence 對 sess/lease
+	// 全程恰好真正跑一次，另一方呼叫只是阻塞等收斂，不會 double-Close／
+	// double-Terminate／double-Finalize。
+	teardownFn := sync.OnceValue(a.claudeTeardown(sess, done, lease))
+
 	a.mu.Lock()
 	a.claudeSess, a.claudePumpDone, a.claudeLease = sess, done, lease
+	a.claudeTeardownFn = teardownFn
 	a.claudeSessionID = ""
 	a.mu.Unlock()
 
@@ -3510,7 +3557,7 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 		if !accepted {
 			// 交易 abort：MultiTurn CLI 可能仍在等下一輪輸入（done 不會自己關），
 			// 不能等 EOF——立即 teardown（CloseSequence 關 stdin → 界限內收乾）。
-			if err := a.claudeTeardown(sess, done, lease)(); err != nil {
+			if err := teardownFn(); err != nil {
 				a.audit("claude_aborted_start_cleanup_error", map[string]any{"error": err.Error()})
 			}
 			return
@@ -3522,7 +3569,10 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 		if !current { // EndSession 已接手
 			return
 		}
-		if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, a.claudeTeardown(sess, done, lease)); err != nil {
+		if h := a.hookClaudeReaperBeforeEndFlow; h != nil { // 測試 barrier：見 App 欄位 doc
+			h()
+		}
+		if err := appcore.EndSessionFlow(a.manager, contract.ProviderClaude, nil, teardownFn); err != nil {
 			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
 		}
 	}()
@@ -3531,12 +3581,17 @@ func (a *App) startClaude(prompt, resume, recordCase string) (func(accepted bool
 }
 
 // claudeTeardown：CloseSequence（close → quiesce → 必要時 terminate → Wait →
-// lease.Finalize(ex)），並發 session:done（Exit 為證據）。
+// lease.Finalize(ex)），並發 session:done（Exit 為證據）。呼叫端一律經
+// startClaude 建的 sync.OnceValue（a.claudeTeardownFn）呼叫，不直接呼叫這個
+// factory 回傳的閉包本身——見 startClaude／forcedShutdown 的 doc（review P2）。
 func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 	lease *appcore.RecordingLease) func() error {
 	return func() error {
 		if sess == nil {
 			return errors.New("no active claude session")
+		}
+		if h := a.hookClaudeTeardownBarrier; h != nil { // 測試 barrier：見 App 欄位 doc；shared OnceValue 唯一一次真正執行的起點
+			h()
 		}
 		fin := func(ex ports.Exit) error {
 			if lease != nil {
@@ -3549,6 +3604,7 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 		a.mu.Lock()
 		if a.claudeSess == sess {
 			a.claudeSess, a.claudePumpDone, a.claudeLease = nil, nil, nil
+			a.claudeTeardownFn = nil
 		}
 		br := a.broker
 		a.broker = nil
