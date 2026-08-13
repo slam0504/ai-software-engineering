@@ -199,6 +199,13 @@ type App struct {
 	decideBarrierHook    func() // 測試注入：GateDecide blocker 檢查後、CommitDecision 前
 	onWorkflowMuAttempt  func() // 測試注入：public EscalationCreate 於 workflowMu.Lock() 前
 	onWorkflowMuAcquired func() // 測試注入：public EscalationCreate 取得 workflowMu 後、寫入前
+
+	// runEvidenceCASHook（M3a.1 T8，§3.3.2）：測試注入，RunEvidence
+	// beginAppTxn 成功後、workflowMu.Lock 前觸發——刻意早於 Lock（而非沿
+	// decideBarrierHook 落在鎖內的位置），讓 hook 本體可以呼叫 GateDecide 之
+	// 類同樣要取 workflowMu 的操作來模擬「按下與讀取之間換版」而不致死鎖，
+	// 見 RunEvidence 函式 doc。
+	runEvidenceCASHook func()
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -2356,11 +2363,24 @@ func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
 	return m.MutationID, nil
 }
 
+// ErrStaleGeneration：RunEvidence 的 CAS 換版失敗——呼叫端（TcaWorkspace）
+// 讀取 active Gate 2 approval 當下的 approval_id（expectedGate2ApprovalID）到
+// 這次呼叫實際取得 workflowMu 之間，那筆 approval 已被換版（gate2 supersede：
+// 新 SubmitPlanForApproval→GateDecide 核可）。錯誤訊息前端原文顯示（§3.3.2）。
+var ErrStaleGeneration = errors.New("evidence: gate2 approval changed since view was loaded")
+
 // RunEvidence 同步執行 planID/taskID 已核可（Gate 2 active）的 TestContract，
 // 對 testCommit 的 committed tree 產生一筆 EvidenceRun，回傳 evidence_id。
 // kind="negative_control" 時 mutationID 必填，其登記的 patch（RegisterMutation）
 // 會被套用；kind="expected_red" 時 mutationID 必須為空（evidence.Run 本身拒絕
 // 帶 mutation 的 expected_red，見 runner.go）。
+//
+// expectedGate2ApprovalID：呼叫端（TcaWorkspace）觀察到的 active Gate 2
+// approval_id 快照——RunEvidence 以它跟自己在 workflowMu 下重讀的權威值做 CAS
+// 比對（§3.3.2）：不符即代表使用者按下按鈕後、這次呼叫真正取得 workflowMu
+// 之前，該 plan 的 Gate 2 已換版，回 ErrStaleGeneration，且**零 side
+// effect**——不發 started event、不載入 mutation、不建 worktree（凍結順序見
+// 下方 Step 2 分段）。
 //
 // Lifecycle ownership（task-20-brief.md 凍結，不依賴 Task 24 的
 // workflowMu）：beginAppTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
@@ -2383,37 +2403,30 @@ func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
 // 一筆語意完整的 EvidenceRun（ctx 取消走的是 abortReason="context
 // canceled"，不是 Go error），也視為未完成、不 finalize——一個被 shutdown
 // 中止的 run 不能被當成有效證據收進 journal。
-func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (string, error) {
+//
+// M3a.1 T8（§3.3.2）凍結順序：beginAppTxn → workflowMu.Lock → 讀取並固定
+// 權威 active gate2 approval_id／plan_commit（GateList 挪到 beginAppTxn 之
+// 後、workflowMu 下讀——不再信任呼叫前的快照）→ CAS 比對 expected（不符→
+// Unlock→endAppTxn→ErrStaleGeneration）→ workflowMu.Unlock → Step 2b：
+// shutMu 下重查 shuttingDown（沿 pre-ulid 窗自我 cancel 先例——CAS 通過後到
+// started event 之間若 shutdown 已開始，零副作用返回，不指望 ulid callback
+// 那次複查還來得及，因為這個 run 這時甚至還沒發過 started event）→ started
+// event／mutation 載入／worktree 建立／run → finalize → endAppTxn。
+// runEvidenceCASHook（測試 seam，沿 decideBarrierHook 命名慣例）在
+// beginAppTxn 成功後、workflowMu.Lock 前觸發——特意早於 Lock，讓 hook 內部
+// 可呼叫 GateDecide 之類同樣取 workflowMu 的操作換版，而不會跟本呼叫自己的
+// Lock 死鎖。
+func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID string) (string, error) {
 	if kind != "expected_red" && kind != "negative_control" {
 		return "", fmt.Errorf("evidence: unknown kind %q", kind)
 	}
 	if a.evidenceJournal == nil {
 		return "", errors.New("evidence: not initialized")
 	}
-
-	entries, err := a.GateList()
-	if err != nil {
-		return "", err
-	}
-	planCommit, ok := activeGate2PlanCommit(entries, planID)
-	if !ok {
-		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
-	}
-
-	var mutationPatch []byte
 	if kind == "negative_control" {
 		if mutationID == "" {
 			return "", errors.New("evidence: negative_control requires a mutation_id")
 		}
-		m, merr := a.evidenceJournal.GetMutation(mutationID)
-		if merr != nil {
-			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
-		}
-		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
-		if oerr != nil {
-			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
-		}
-		mutationPatch = patch
 	} else if mutationID != "" {
 		return "", errors.New("evidence: expected_red must not carry a mutation_id")
 	}
@@ -2423,12 +2436,57 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 	}
 	defer a.endAppTxn()
 
+	if h := a.runEvidenceCASHook; h != nil { // 測試 seam：見上方函式 doc
+		h()
+	}
+
+	a.workflowMu.Lock()
+	entries, err := a.GateList()
+	if err != nil {
+		a.workflowMu.Unlock()
+		return "", err
+	}
+	approvalID, aok := activeGate2ApprovalID(entries, planID)
+	planCommit, pok := activeGate2PlanCommit(entries, planID)
+	if !aok || !pok {
+		a.workflowMu.Unlock()
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	if approvalID != expectedGate2ApprovalID { // CAS：不符即換版，零 side effect
+		a.workflowMu.Unlock()
+		return "", ErrStaleGeneration
+	}
+	a.workflowMu.Unlock()
+
+	// Step 2b（review M1 pre-ulid 窗自我 cancel 的同一先例）：CAS 通過後、
+	// started event 之前重查 shutdown——已進 shutdown 即零副作用返回，不發
+	// started、不載入 mutation、不建 worktree。
+	a.shutMu.Lock()
+	shuttingDown := a.shuttingDown
+	a.shutMu.Unlock()
+	if shuttingDown {
+		return "", errors.New("app shutting down")
+	}
+
+	var mutationPatch []byte
+	if kind == "negative_control" {
+		m, merr := a.evidenceJournal.GetMutation(mutationID)
+		if merr != nil {
+			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
+		}
+		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
+		if oerr != nil {
+			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
+		}
+		mutationPatch = patch
+	}
+
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
 
 	a.manager.EmitWorkspace(evidenceRunEventKind, nil, map[string]any{
 		"phase": "started", "plan_id": planID, "task_id": taskID,
-		"kind": kind, "test_commit": testCommit,
+		"kind": kind, "test_commit": testCommit, "gate2_approval_id": approvalID,
 	})
 
 	var evidenceID string
@@ -2511,7 +2569,7 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 
 	payload := map[string]any{
 		"phase": "finished", "evidence_id": evidenceID,
-		"plan_id": planID, "task_id": taskID, "kind": kind,
+		"plan_id": planID, "task_id": taskID, "kind": kind, "gate2_approval_id": approvalID,
 	}
 	if finalErr != nil {
 		payload["error"] = finalErr.Error()

@@ -53,7 +53,7 @@ describe('TcaWorkspace', () => {
     await w.find('[data-test=test-commit-input-T1]').setValue('deadbeef00')
     await w.find('[data-test=run-expected_red-T1]').trigger('click')
     await flushPromises()
-    expect(props.runEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef00', 'expected_red', '')
+    expect(props.runEvidence).toHaveBeenCalledWith('G2-1', 'P1', 'T1', 'deadbeef00', 'expected_red', '')
     expect(w.find('[data-test=run-result-expected_red-T1]').text()).toContain('通過')
     expect(w.find('[data-test=submit-tca-T1]').attributes('disabled')).toBeDefined() // 只有一筆 passed，仍 disabled
 
@@ -69,7 +69,7 @@ describe('TcaWorkspace', () => {
 
     await w.find('[data-test=run-negative_control-T1]').trigger('click')
     await flushPromises()
-    expect(props.runEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef00', 'negative_control', 'mut-1')
+    expect(props.runEvidence).toHaveBeenCalledWith('G2-1', 'P1', 'T1', 'deadbeef00', 'negative_control', 'mut-1')
     expect(w.find('[data-test=submit-tca-T1]').attributes('disabled')).toBeUndefined() // 雙 passed，可送核
 
     await w.find('[data-test=submit-tca-T1]').trigger('click')
@@ -105,7 +105,7 @@ describe('TcaWorkspace', () => {
   // negative-control 已有 mutation_id，也不能被點擊觸發第二個並行呼叫。
   it('同一 task 任一 kind 執行中時，兩顆 run 按鈕都 disabled（per-task 互斥）', async () => {
     let resolveRed: (id: string) => void = () => {}
-    const runEvidence = vi.fn().mockImplementation((_p: string, _t: string, _c: string, kind: string) => {
+    const runEvidence = vi.fn().mockImplementation((_a: string, _p: string, _t: string, _c: string, kind: string) => {
       if (kind === 'expected_red') return new Promise<string>(r => { resolveRed = r })
       return Promise.resolve('ev-neg')
     })

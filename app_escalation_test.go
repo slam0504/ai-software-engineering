@@ -233,8 +233,9 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	// 編譯失敗 fixture：exit != 0 且輸出無 matcher（FAIL）→ result=error
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'compile err: syntax'\nexit 2\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
-	id1, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+	id1, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (error fixture): %v", err)
 	}
@@ -258,7 +259,7 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	runGit(t, a, "add", "run_test.sh")
 	runGit(t, a, "commit", "-m", "fix test script")
 	fixedCommit := revParseHead(t, a)
-	id2, err := a.RunEvidence("P1", "T1", fixedCommit, "expected_red", "")
+	id2, err := a.RunEvidence(approvalID, "P1", "T1", fixedCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (fixed): %v", err)
 	}
@@ -277,7 +278,7 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'compile err again'\nexit 2\n")
 	runGit(t, a, "add", "run_test.sh")
 	runGit(t, a, "commit", "-m", "break test script again")
-	if _, err := a.RunEvidence("P1", "T1", revParseHead(t, a), "expected_red", ""); err != nil {
+	if _, err := a.RunEvidence(approvalID, "P1", "T1", revParseHead(t, a), "expected_red", ""); err != nil {
 		t.Fatal(err)
 	}
 	item2 := openItemByKey(t, a, "evidence-error:P1/T1/expected_red")
@@ -326,7 +327,7 @@ func TestEvidenceStartFailureOpensEscalationItem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := a.RunEvidence("P1", "T1", planCommit1, "expected_red", ""); err == nil {
+	if _, err := a.RunEvidence(gate2ID, "P1", "T1", planCommit1, "expected_red", ""); err == nil {
 		t.Fatal("RunEvidence must fail when the contract command cannot even start")
 	}
 	item := openItemByKey(t, a, "evidence-error:P1/T1/expected_red")
@@ -348,7 +349,7 @@ func TestEvidenceStartFailureOpensEscalationItem(t *testing.T) {
 	if err := a.GateDecide(gate2ID2, "approved", "ok", mediumSel()); err != nil {
 		t.Fatalf("replacement gate2 approval must succeed (evidence-error is tca-scoped, not gate2-scoped): %v", err)
 	}
-	id, err := a.RunEvidence("P1", "T1", planCommit2, "expected_red", "")
+	id, err := a.RunEvidence(gate2ID2, "P1", "T1", planCommit2, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (fixed contract): %v", err)
 	}

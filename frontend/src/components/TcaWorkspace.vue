@@ -22,7 +22,8 @@ const props = defineProps<{
   listCandidates: (planId: string) => Promise<CommitCandidate[]>
   validateTestCommit: (planId: string, taskId: string, testCommit: string) => Promise<void>
   registerMutation: (taskRef: string, patch: string) => Promise<string>
-  runEvidence: (planId: string, taskId: string, testCommit: string, kind: string, mutationId: string) => Promise<string>
+  runEvidence: (expectedGate2ApprovalId: string, planId: string, taskId: string,
+    testCommit: string, kind: string, mutationId: string) => Promise<string>
   getEvidence: (evidenceId: string) => Promise<{ result: string }>
   submitTestContract: (planId: string, taskId: string, testCommit: string,
     expectedRedId: string, negativeControlId: string, mutationId: string) => Promise<string>
@@ -131,14 +132,19 @@ function isTaskBusy(taskId: string): boolean {
 // run：RunEvidence 只回傳 evidence_id，不帶 result（RunEvidence 的返回值刻意
 // 精簡）——成功後另呼叫 EvidenceGet 取得權威的 result，落地進 evidence store
 // （見 stores/evidence.ts 的 setResult 文件）。呼叫本身失敗（含 EmitWorkspace
-// 「started」之前就拒絕的早期驗證錯誤，例如無 active gate2）用 setError 落地，
-// 錯誤原文顯示，不吞。
+// 「started」之前就拒絕的早期驗證錯誤，例如無 active gate2 或 CAS 換版
+// ErrStaleGeneration）用 setError 落地，錯誤原文顯示，不吞。
+//
+// M3a.1 T8（§3.3.2）：第一參數傳目前畫面讀到的 active gate2 approval_id
+// （activeGate2，跟 loadTasks 用的是同一個計算屬性）——後端以此跟它自己在
+// workflowMu 下重讀的權威值做 CAS 比對，換版即 ErrStaleGeneration。
 async function run(taskId: string, kind: string) {
   const testCommit = testCommitInput[taskId] ?? ''
   const mutationId = kind === 'negative_control' ? (mutationIds[taskId] ?? '') : ''
+  const expectedApprovalId = activeGate2.value?.approval_id ?? ''
   evidence.setRunning(planId.value, taskId, kind)
   try {
-    const evidenceId = await props.runEvidence(planId.value, taskId, testCommit, kind, mutationId)
+    const evidenceId = await props.runEvidence(expectedApprovalId, planId.value, taskId, testCommit, kind, mutationId)
     const rec = await props.getEvidence(evidenceId)
     evidence.setResult(planId.value, taskId, kind, evidenceId, rec.result)
   } catch (e) {

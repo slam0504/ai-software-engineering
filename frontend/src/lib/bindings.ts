@@ -17,8 +17,8 @@ export function makeBindings(): Bindings & EvidenceBindings & EscalationBindings
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
     SendMessage: (p, t) => SendMessage(p, t),
     RegisterMutation: (taskRef, patch) => RegisterMutation(taskRef, patch),
-    RunEvidence: (planID, taskID, testCommit, kind, mutationID) =>
-      RunEvidence(planID, taskID, testCommit, kind, mutationID),
+    RunEvidence: (expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID) =>
+      RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID),
     EvidenceGet: (evidenceID) => EvidenceGet(evidenceID),
     SubmitTestContract: (planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID) =>
       SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID),

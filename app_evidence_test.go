@@ -111,6 +111,24 @@ func setupApprovedEvidencePlan(t *testing.T, a *App, planID string) (planCommit 
 	return planCommit
 }
 
+// activeApprovalIDFor：測試 helper——取得 RunEvidence CAS 現在信任的權威
+// active Gate 2 approval_id（M3a.1 T8，§3.3.2），鏡射 app.go
+// activeGate2ApprovalID 同一 subject/gate/state 篩選條件。多數呼叫端已核可
+// 剛好一次，直接用這個查詢當「按下當下讀到的 expected」即可；需要模擬換版
+// 競態的測試改用 runEvidenceCASHook（見下方 channel-barrier 測試）。
+func activeApprovalIDFor(t *testing.T, a *App, planID string) string {
+	t.Helper()
+	entries, err := a.GateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, ok := activeGate2ApprovalID(entries, planID)
+	if !ok {
+		t.Fatalf("no active Gate 2 approval for plan %q", planID)
+	}
+	return id
+}
+
 func assertNoZombieWorktrees(t *testing.T, root string) {
 	t.Helper()
 	out, err := exec.Command("git", "-C", root, "worktree", "list").Output()
@@ -133,8 +151,9 @@ func TestRunEvidenceExpectedRed_AppendsJournalAndEmitsProgress(t *testing.T) {
 	// 之後只被 plan/ 底下的異動 commit 帶過、內容不變。
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
-	evidenceID, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+	evidenceID, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence: %v", err)
 	}
@@ -179,6 +198,19 @@ func TestRunEvidenceExpectedRed_AppendsJournalAndEmitsProgress(t *testing.T) {
 		t.Errorf("finished payload = %+v, want plan_id=P1 task_id=T1 kind=expected_red", finishedPayload)
 	}
 
+	// M3a.1 T8（§3.3.2 Step 1(b)）：started／finished payload 都必須帶固定的
+	// gate2_approval_id（CAS 通過當下鎖定的權威值），additive 補欄不動既有欄位。
+	var startedPayload map[string]any
+	if err := json.Unmarshal(events[0].Payload, &startedPayload); err != nil {
+		t.Fatalf("unmarshal started payload: %v", err)
+	}
+	if startedPayload["gate2_approval_id"] != approvalID {
+		t.Errorf("started payload gate2_approval_id = %v, want %q", startedPayload["gate2_approval_id"], approvalID)
+	}
+	if finishedPayload["gate2_approval_id"] != approvalID {
+		t.Errorf("finished payload gate2_approval_id = %v, want %q", finishedPayload["gate2_approval_id"], approvalID)
+	}
+
 	assertNoZombieWorktrees(t, a.workspaceDir)
 }
 
@@ -188,6 +220,7 @@ func TestRunEvidenceRejectsNonOracleLineage(t *testing.T) {
 	a, _ := newTestAppEvidence(t)
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\nexit 0\n")
 	setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
 	// plan_commit 之後另立一筆 commit，把 oracle 檔（run_test.sh）改名移出
 	// oracle 宣告範圍——plan_commit..test_commit 的 lineage 驗證必須拒絕它。
@@ -195,7 +228,7 @@ func TestRunEvidenceRejectsNonOracleLineage(t *testing.T) {
 	runGit(t, a, "commit", "-m", "rename run_test.sh out of oracle scope")
 	testCommit := revParseHead(t, a)
 
-	if _, err := a.RunEvidence("P1", "T1", testCommit, "expected_red", ""); err == nil {
+	if _, err := a.RunEvidence(approvalID, "P1", "T1", testCommit, "expected_red", ""); err == nil {
 		t.Fatal("RunEvidence must reject a lineage range that renames the oracle file out of scope")
 	}
 	assertNoZombieWorktrees(t, a.workspaceDir)
@@ -203,9 +236,145 @@ func TestRunEvidenceRejectsNonOracleLineage(t *testing.T) {
 
 func TestRunEvidenceRejectsWithoutActiveGate2(t *testing.T) {
 	a, _ := newTestAppEvidence(t)
-	if _, err := a.RunEvidence("P1", "T1", strings.Repeat("0", 40), "expected_red", ""); err == nil {
+	if _, err := a.RunEvidence("irrelevant", "P1", "T1", strings.Repeat("0", 40), "expected_red", ""); err == nil {
 		t.Fatal("RunEvidence without an active Gate 2 approval for the plan must reject")
 	}
+}
+
+// ---- RunEvidence CAS（M3a.1 T8，§3.3.2）：換版偵測——ErrStaleGeneration＋零 side effect ----
+
+// TestRunEvidenceRejectsStaleGate2Approval covers task-8-brief.md Step 1(a):
+// expectedGate2ApprovalID no longer matches the authoritative active Gate 2
+// approval RunEvidence reads under workflowMu — must reject with
+// ErrStaleGeneration before touching anything (no worktree, no started
+// event, no journal line).
+func TestRunEvidenceRejectsStaleGate2Approval(t *testing.T) {
+	a, ui := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
+
+	if _, err := a.RunEvidence(approvalID+"-stale", "P1", "T1", planCommit, "expected_red", ""); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("RunEvidence with a mismatched expected approval id must reject with ErrStaleGeneration, got %v", err)
+	}
+
+	if events := ui.findEnvKind("evidence_run"); len(events) != 0 {
+		t.Fatalf("CAS mismatch must not emit any evidence_run event, got %d: %+v", len(events), events)
+	}
+	journalPath := filepath.Join(a.workspaceDir, ".workbench", "evidence", "evidence.jsonl")
+	data, rerr := os.ReadFile(journalPath)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		t.Fatalf("read evidence journal: %v", rerr)
+	}
+	if len(strings.TrimSpace(string(data))) != 0 {
+		t.Fatalf("evidence journal must have no entries for a CAS-rejected run, got: %s", data)
+	}
+	assertNoZombieWorktrees(t, a.workspaceDir)
+}
+
+// TestRunEvidenceCASBarrierRejectsSupersededApproval covers task-8-brief.md
+// Step 1(c): a channel-barrier test seam (runEvidenceCASHook, fired after
+// beginAppTxn but before workflowMu.Lock — deliberately earlier than
+// decideBarrierHook's own critical-section position, so the hook body can
+// itself call GateDecide, which takes workflowMu, without deadlocking)
+// reproduces "press (expected=A) races the actual gate2 supersede" — the
+// hook resubmits and approves a second Gate 2 for the same plan (mirroring
+// app_tca_test.go's TestTCADecideRejectsWhenGate2SupersededBeforeDecide)
+// while RunEvidence is parked immediately before it reads the authoritative
+// approval id. Run under -race to confirm the two goroutines' access to
+// a.workflowMu-guarded state is race-free.
+func TestRunEvidenceCASBarrierRejectsSupersededApproval(t *testing.T) {
+	a, ui := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalA := activeApprovalIDFor(t, a, "P1") // "按下" 當下讀到的 expected
+
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	a.runEvidenceCASHook = func() { close(inWindow); <-release }
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := a.RunEvidence(approvalA, "P1", "T1", planCommit, "expected_red", "")
+		runDone <- err
+	}()
+	<-inWindow // beginAppTxn 已成功，卡在 workflowMu.Lock 之前——尚未讀到權威值
+
+	gate2ID, err := a.SubmitPlanForApproval("P1")
+	if err != nil {
+		t.Fatalf("resubmit gate2: %v", err)
+	}
+	if err := a.GateDecide(gate2ID, "approved", "reapproved", mediumSel()); err != nil {
+		t.Fatalf("approve second gate2 (supersede): %v", err)
+	}
+	approvalB := activeApprovalIDFor(t, a, "P1")
+	if approvalB == approvalA {
+		t.Fatal("supersede must produce a new active approval id")
+	}
+
+	close(release) // 放行 RunEvidence：繼續往下取 workflowMu、讀到已換版的 B
+
+	if runErr := <-runDone; !errors.Is(runErr, ErrStaleGeneration) {
+		t.Fatalf("RunEvidence must reject with ErrStaleGeneration once gate2 is superseded mid-flight, got %v", runErr)
+	}
+	if events := ui.findEnvKind("evidence_run"); len(events) != 0 {
+		t.Fatalf("CAS mismatch must not emit any evidence_run event, got %d: %+v", len(events), events)
+	}
+	assertNoZombieWorktrees(t, a.workspaceDir)
+}
+
+// TestRunEvidenceCASBarrierBoundedByShutdown covers task-8-brief.md Step 2c:
+// the same runEvidenceCASHook parks RunEvidence before its CAS check
+// (expected id unchanged this time — no supersede), shutdown is triggered
+// while it's parked there, then release lets CAS pass — the assertion this
+// test needs (bounded shutdown, RunEvidence ends in error, zero side effect)
+// is only reachable because of Step 2b's post-CAS shutdown recheck: at the
+// point the hook fires, beginAppTxn already succeeded and no evidenceActive
+// registration exists yet for reclaimEvidenceRuns to cancel.
+func TestRunEvidenceCASBarrierBoundedByShutdown(t *testing.T) {
+	a, ui := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
+
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	a.runEvidenceCASHook = func() { close(inWindow); <-release }
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
+		runDone <- err
+	}()
+	<-inWindow // beginAppTxn 已成功，卡在 CAS 檢查（workflowMu.Lock）之前
+
+	shutdownDone := make(chan struct{})
+	shutdownStart := time.Now()
+	go func() { a.shutdown(context.Background()); close(shutdownDone) }()
+
+	waitFor(t, "shutdown to set shuttingDown", func() bool {
+		a.shutMu.Lock()
+		defer a.shutMu.Unlock()
+		return a.shuttingDown
+	})
+	close(release) // 放行：CAS 比對照樣通過（expected 未變），但 Step 2b 的重查會擋下
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("shutdown stalled on a CAS-barrier-blocked RunEvidence")
+	}
+	if elapsed := time.Since(shutdownStart); elapsed > 20*time.Second {
+		t.Fatalf("shutdown took %s, want bounded", elapsed)
+	}
+
+	if runErr := <-runDone; runErr == nil {
+		t.Fatal("RunEvidence must end in error once shutdown is observed by the post-CAS Step 2b recheck")
+	}
+	if events := ui.findEnvKind("evidence_run"); len(events) != 0 {
+		t.Fatalf("shutdown observed mid-CAS-barrier must not emit any evidence_run event, got %d: %+v", len(events), events)
+	}
+	assertNoZombieWorktrees(t, a.workspaceDir)
 }
 
 // ---- RegisterMutation ＋ RunEvidence negative_control ----
@@ -215,6 +384,7 @@ func TestRegisterMutationAndRunEvidenceNegativeControl(t *testing.T) {
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
 	writeFile(t, filepath.Join(a.workspaceDir, "other.txt"), "unrelated content\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
 	// 建一份真的 unified diff：修改一個非 oracle 檔案，diff 之後把 worktree
 	// 復原乾淨（鏡射 internal/evidence/runner_test.go 的 buildRenamePatch 手法）。
@@ -233,7 +403,7 @@ func TestRegisterMutationAndRunEvidenceNegativeControl(t *testing.T) {
 		t.Fatal("RegisterMutation must return a non-empty mutation_id")
 	}
 
-	evidenceID, err := a.RunEvidence("P1", "T1", planCommit, "negative_control", mutationID)
+	evidenceID, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "negative_control", mutationID)
 	if err != nil {
 		t.Fatalf("RunEvidence: %v", err)
 	}
@@ -266,10 +436,11 @@ func TestShutdownReclaimsInFlightRunEvidence(t *testing.T) {
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"),
 		"#!/bin/sh\ntouch \"$TMPDIR/started\"\nsleep "+sleepMarker+"\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+		_, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
 		errCh <- err
 	}()
 
@@ -378,6 +549,7 @@ func TestShutdownDuringPreUlidWindowStillBoundsRunEvidence(t *testing.T) {
 	a, _ := newTestAppEvidence(t)
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -385,7 +557,7 @@ func TestShutdownDuringPreUlidWindowStillBoundsRunEvidence(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+		_, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
 		errCh <- err
 	}()
 
