@@ -155,7 +155,7 @@
 
 ## Ledger deferred 清單（實作期間各 task review 的未阻斷項，供後續 triage）
 
-- 待 owner 決策：`oracle_surface.ref` 格式——spec §3.4 凍結 `git:<algo>:<oid>` vs 實作全線裸 OID（內部一致）；建議保留裸 OID＋spec erratum
+- ~~`oracle_surface.ref` 格式衝突~~ **已解決**——owner 2026-08-13 裁決採裸 OID＋spec §3.4 erratum（見下方「最終裁決記錄」）
 - SC4 完整度：SpecWorkspace／PlanWorkspace 無「新檔」UI（驗收以 binding 直呼建檔繞道）
 - OracleDigestAt 對 scope 不匹配無 runtime guard（doc 已明示前提）
 - PlannerAssist Claude 唯讀白名單 live probe 未做（人工步驟）
