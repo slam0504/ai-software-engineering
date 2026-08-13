@@ -6,10 +6,16 @@ flowchart TB
     contract["contract<br/>【Shared Kernel】Envelope v1 / reducer"]
     ca["claude adapter<br/>【ACL】stream-json → Event"]
     xa["codex adapter<br/>【ACL】JSON-RPC → Event"]
+    plan["plan<br/>【Plan context】YAML 解析／確定性驗證器／lineage"]
+    gate["gate（泛化）<br/>【Gate context】GatePolicy registry／journal／projection"]
+    gp["gatepolicy<br/>【ACL】gate2／tca policy（讀 plan／evidence）"]
+    evd["evidence<br/>【Evidence context】oracle-surface／CAS／runner／mutation"]
+    esc["escalation<br/>【Escalation context】收件匣 journal／projection"]
   end
   cli1[("claude 子程序")]
   cli2[("codex app-server")]
   sink[("events.jsonl / recordings")]
+  sink2[("gate.jsonl / escalation.jsonl / evidence/")]
   ui <-->|"Wails events / bindings"| host
   host --> core
   core --> contract
@@ -18,3 +24,10 @@ flowchart TB
   host --> ca --> cli1
   host --> xa --> cli2
   core --> sink
+  host --> plan & gate & evd & esc
+  gp --> gate
+  gp --> plan
+  gp --> evd
+  gate --> sink2
+  evd --> sink2
+  esc --> sink2

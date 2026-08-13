@@ -1850,7 +1850,7 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	}
 
 	if errs := plan.Validate(pl, pol, specScenarios); len(errs) > 0 {
-		verr := fmt.Errorf("plan: validation failed: %w", errors.Join(errs...))
+		verr := fmt.Errorf("plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: %w", errors.Join(errs...))
 		if hasRiskClassificationError(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
 			a.workflowMu.Lock()
 			_, cerr := a.escCreateSystemLocked("risk-unclassifiable:"+planID, "gate2:"+planID, true,

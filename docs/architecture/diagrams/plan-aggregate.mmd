@@ -1,0 +1,50 @@
+classDiagram
+  class Plan {
+    +planId string
+    +analysisBaseCommit string
+    +specManifest string
+    +riskPolicy string
+    +tasks Task[]
+  }
+  class Task {
+    +id string
+    +minimumRiskTier string
+    +plannerRiskTier string
+    +permissionsRef string
+    +testContract TestContract
+  }
+  class TestContract {
+    +command Command
+    +expectedFailure ExpectedFailure
+  }
+  class Gate2Approval {
+    +subject string
+    +baseCommit string
+    +riskDecisions RiskDecision[]
+  }
+  class TCAApproval {
+    +subject string
+    +baseCommit string
+  }
+  class EvidenceRun {
+    +evidenceId string
+    +kind string
+    +baseCommit string
+    +testCommit string
+    +oracleSurfaceDigest string
+    +mutationDigest string
+    +result string
+  }
+  class Mutation {
+    +mutationId string
+    +taskRef string
+    +digest string
+  }
+  Plan "1" *-- "1..*" Task : tasks
+  Task "1" *-- "1" TestContract
+  Plan "1" --> "1" Gate2Approval : plan_commit＝base_commit
+  Gate2Approval "1" --> "1..*" TCAApproval : gate2_approval binding（per task）
+  TCAApproval "1" --> "2" EvidenceRun : evidence_run binding（expected_red／negative_control）
+  TCAApproval "1" --> "1" Mutation : mutation binding
+  note for Gate2Approval "selected_risk_tier 只存在 metadata，不入 plan（§3.3）"
+  note for TCAApproval "base_commit 必精確等於 gate2_approval 的 plan_commit（§3.0）"
