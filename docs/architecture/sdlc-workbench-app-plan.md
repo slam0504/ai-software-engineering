@@ -256,6 +256,16 @@ gate3 的核可與 merge queue 驗證是兩件事（v1.2 拆分）：核可綁�
 
 導入節奏對齊自動化規劃 §11 第 4 點的漸進原則：M1–M2 支撐「AI 預審 + 全量人工 review」期，M3–M4 才擴到多個任務的編排；每個里程碑以實際使用回饋決定是否前進。
 
+### 7.1 主線完成後候選里程碑：ACP／多 Agent Runtime（2026-08-13 owner 定向）
+
+**明確不納入 M3a.1、M3b、M4 已凍結範圍**——主線依凍結計畫完成後，再規劃成獨立版本功能（屆時走 spec → plan gate 流程）。定位：**新增選擇，不是重寫現有架構**。要點：
+
+- 新增 **ACP client adapter**，OpenCode 為首個目標；**保留** Claude Code、Codex 原生 adapter。
+- 現有 `contract`／`ports`／Envelope 維持 **canonical 相容層**——ACP event 映射進既有 Envelope，不以 ACP event 取代 Workbench 契約；原始 payload 保留（稽核證據）。
+- 分離 `agent_id`／`transport`／`model_ref`（取代現行寫死的 claude｜codex 二值）。
+- **Capability negotiation**：只統一真正共有語意（session start/resume/end、turn submit/cancel、streaming、tool use、approval、result/usage/error、recorder/replay）；差異能力以 capability 宣告（resume、interactive_question、approval、model_selection、usage、subagents、skills、hooks、subscription_auth），前端依 capability 停用＋說明、不靜默模擬——避免把所有 agent 降成最低共同功能，也不採 BAT 的 Claude-shaped façade。
+- 前置 spike：`claude-agent-acp` 等價性驗證，再決定是否能取代部分原生 Claude 路徑；相容性測試套件（同組 session／核可／取消／resume／稽核案例跑三個實作）。抽象時機：等 OpenCode 成為第三個實作後再抽——抽的是真實共有契約。
+
 ## 8. 風險與待驗證假設
 
 1. **stream-json 協定穩定度**：協定由 Claude Code 版本決定，pin + contract test 是緩解不是消除；M0 spike 是第一個驗證點。permission tool 的精確 payload schema 官方 CLI reference 未載明，以 M0 錄流確認。
@@ -292,6 +302,10 @@ gate3 的核可與 merge queue 驗證是兩件事（v1.2 拆分）：核可綁�
 **仍待決**：CLI ownership 最終形式（待 M0 實測）；forge 選擇（M4 前）。（原「Anthropic 核准申請」行動項因自用定位撤下，僅在未來改變定位時重新浮出。）
 
 ## 10. 修訂記錄
+
+### v1.12（2026-08-13）— 新增 §7.1 主線後候選里程碑（ACP／多 Agent Runtime）
+
+Owner 2026-08-13 定向：以 additive 小節記錄「ACP／多 Agent Runtime 支援」候選里程碑的方向結論（ACP client adapter／OpenCode 首個目標／保留原生 adapter／canonical 相容層／agent_id・transport・model_ref 分離／capability negotiation／前置 spike），並**明確標示不納入 M3a.1、M3b、M4 已凍結範圍**——避免讀者誤以為在近期交付範圍。README roadmap 同步加「後續候選」列。其餘章節零變更；SHA256SUMS 同步更新本檔 hash。
 
 ### v1.11（2026-08-06）— 第十輪 plan gate APPROVED（狀態標記）
 
