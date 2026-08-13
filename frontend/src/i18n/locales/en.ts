@@ -353,4 +353,16 @@ export default {
     scopeHint: 'Path is outside the managed scope',
     singlePlanBlocked: 'A primary plan file already exists — only one primary plan is allowed at a time',
   },
+  bump: {
+    banner: {
+      message: 'analysis_base_commit is behind the current HEAD — an update is recommended',
+    },
+    noBumpNeeded: 'No update needed',
+    action: {
+      viewDiff: 'View diff',
+      rerunAssist: 'Re-run PlannerAssist',
+      confirm: 'Confirm update',
+    },
+    warning: 'Confirming means you have reviewed this code change and confirm the current plan still applies',
+  },
 }

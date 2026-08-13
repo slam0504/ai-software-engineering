@@ -353,4 +353,16 @@ export default {
     scopeHint: '路徑不在管理範圍內',
     singlePlanBlocked: '已存在主要 plan 文件，一次僅允許一份主要 plan（單一 plan 限制）',
   },
+  bump: {
+    banner: {
+      message: '分析基準（analysis_base_commit）落後目前 HEAD，建議更新',
+    },
+    noBumpNeeded: '不需要更新',
+    action: {
+      viewDiff: '檢視差異',
+      rerunAssist: '重新執行 PlannerAssist',
+      confirm: '確認更新',
+    },
+    warning: '更新代表你已檢視這段 code 變更，並確認現有計畫仍適用',
+  },
 }

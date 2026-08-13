@@ -14,6 +14,10 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
+export function ConfirmAnalysisBaseBump(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ConfirmAnalysisBaseBump'](arg1, arg2, arg3);
+}
+
 export function ConfirmPlanCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmPlanCommit'](arg1, arg2);
 }
@@ -88,6 +92,10 @@ export function PlanRead(arg1) {
 
 export function PlanWrite(arg1, arg2, arg3) {
   return window['go']['main']['App']['PlanWrite'](arg1, arg2, arg3);
+}
+
+export function PreviewAnalysisBaseBump(arg1, arg2) {
+  return window['go']['main']['App']['PreviewAnalysisBaseBump'](arg1, arg2);
 }
 
 export function PreviewPlanCommit() {

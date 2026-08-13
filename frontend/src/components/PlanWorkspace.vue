@@ -2,9 +2,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
-  ConfirmPlanCommit, PlanAssist, PlanList, PlanRead, PlanWrite, PreviewPlanCommit, SubmitPlanForApproval,
+  ConfirmAnalysisBaseBump, ConfirmPlanCommit, PlanAssist, PlanList, PlanRead, PlanWrite,
+  PreviewAnalysisBaseBump, PreviewPlanCommit, SubmitPlanForApproval,
 } from '../../wailsjs/go/main/App'
-import type { spec } from '../../wailsjs/go/models'
+import type { main, spec } from '../../wailsjs/go/models'
 import { usePlan } from '../stores/plan'
 // extractGherkin 只在 info tag 為 gherkin/feature 時才特殊處理，其餘（含無 tag／yaml
 // tag）一律走通用 fence 擷取路徑——對 plan YAML 草稿一樣適用，別名匯入避免誤讀成
@@ -67,6 +68,19 @@ const commitDiff = ref('')
 const commitMessage = ref('')
 const commitBusy = ref(false)
 
+// analysis_base bump 引導 UI（M3a.1 Task 6，spec §3.2）：bumpPreview 是
+// PreviewAnalysisBaseBump 目前結果的快取，只在「檔案載入／儲存成功／視窗
+// 聚焦」時機重新查（brief 凍結——不逐鍵擊呼叫），且只對主要 plan 文件查
+// （isPrimaryPlanPath；risk-policy／oracle-surface／permissions 沒有
+// analysis_base_commit 欄位，查了必錯，不是操作者需要看到的錯誤）。Preview
+// 本身失敗（例如 analysis_base_commit 尚未填、plan 還在草稿階段）視為正常
+// 過渡狀態，靜默清空 bumpPreview，不推進 plan.errors——那不是操作者這時要
+// 處理的問題（模板本就把這欄位留空，見 planTemplates.ts planSkeleton）。
+const bumpPreview = ref<main.BumpPreview | null>(null)
+const bumpPanelOpen = ref(false)
+const bumpConfirmBusy = ref(false)
+const bumpConfirmError = ref('')
+
 const editorHost = ref<HTMLElement | null>(null)
 let cmView: { destroy(): void; dispatch(spec: unknown): void; state: { doc: { length: number } } } | null = null
 
@@ -96,9 +110,64 @@ async function loadFile() {
     bufferDirty.value = false
     planIdInput.value = deriveDefaultPlanId(effectivePath.value)
     syncEditorDoc()
+    await checkBump()
   } catch (e) {
     loadError.value = String(e)
   }
+}
+
+// checkBump：analysis_base bump 觸發點之一（brief 凍結：檔案載入／儲存成功／
+// 視窗聚焦——見 loadFile／saveFile／onWindowFocus，非逐鍵擊）。只對主要 plan
+// 文件查（見上方 bumpPreview 宣告註解）。keepConfirmError 供 confirmBump 失敗
+// 後的重新預覽用：那次重查是為了刷新面板內容，不該連帶清掉剛顯示的錯誤訊息。
+async function checkBump(opts: { keepConfirmError?: boolean } = {}) {
+  if (!isPrimaryPlanPath(effectivePath.value)) {
+    bumpPreview.value = null
+  } else {
+    try {
+      bumpPreview.value = await PreviewAnalysisBaseBump(effectivePath.value, plan.currentContent)
+    } catch {
+      bumpPreview.value = null
+    }
+  }
+  if (!opts.keepConfirmError) bumpConfirmError.value = ''
+}
+
+function resetBump() {
+  bumpPreview.value = null
+  bumpPanelOpen.value = false
+  bumpConfirmError.value = ''
+}
+
+// confirmBump：ConfirmAnalysisBaseBump 通過後，editor buffer 直接被
+// updatedBuffer 取代（標記未儲存——落地仍要走既有「儲存」／PlanWrite 樂觀
+// 鎖，同 applyDraft 套用草稿的兩步慣例）。失敗（token 過期／buffer 或 HEAD
+// 變動）原文顯示錯誤，並重新查一次 Preview 讓面板內容回到目前實際狀態
+// （brief：「要求重新預覽」）。
+async function confirmBump() {
+  if (!bumpPreview.value || bumpPreview.value.no_bump_needed) return
+  bumpConfirmBusy.value = true
+  try {
+    const updated = await ConfirmAnalysisBaseBump(bumpPreview.value.token, effectivePath.value, plan.currentContent)
+    bumpConfirmError.value = ''
+    plan.currentContent = updated
+    bufferDirty.value = true
+    syncEditorDoc()
+    bumpPreview.value = null
+    bumpPanelOpen.value = false
+  } catch (e) {
+    bumpConfirmError.value = String(e)
+    await checkBump({ keepConfirmError: true })
+  } finally {
+    bumpConfirmBusy.value = false
+  }
+}
+
+// onBumpRerunAssist：bump 面板「重新執行 PlannerAssist」建議按鈕，直接觸發
+// 既有 PlanAssist 流程（runAssist）——不是另一條路徑，只是同一個動作在 bump
+// 情境下的入口。
+function onBumpRerunAssist() {
+  void runAssist()
 }
 
 function syncEditorDoc() {
@@ -124,14 +193,25 @@ async function initEditor() {
   }
 }
 
+// onWindowFocus：bump 觸發時機之三（brief 凍結：視窗聚焦）——操作者切回視窗
+// 時可能其他人已推進 HEAD，重查一次讓提示條反映目前狀態。
+function onWindowFocus() {
+  void checkBump()
+}
+
 onMounted(async () => {
   await loadFileList()
   await loadFile()
   await initEditor()
+  window.addEventListener('focus', onWindowFocus)
 })
-onBeforeUnmount(() => cmView?.destroy())
+onBeforeUnmount(() => {
+  cmView?.destroy()
+  window.removeEventListener('focus', onWindowFocus)
+})
 watch(() => props.path, () => {
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免套用草稿把 A 的草稿寫進 B（同 SpecWorkspace fix round 1）
+  resetBump()
   void loadFile()
 })
 
@@ -142,6 +222,7 @@ function resetDraft() {
 function selectFile(p: string) {
   selectedPath.value = p
   resetDraft()
+  resetBump()
   if (!props.path) void loadFile()
 }
 
@@ -222,6 +303,7 @@ async function saveFile() {
     const newDigest = await writer(effectivePath.value, plan.currentContent, plan.currentDigest)
     plan.currentDigest = newDigest
     bufferDirty.value = false
+    await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
   } catch (e) {
     plan.pushError(String(e))
   } finally {
@@ -309,6 +391,37 @@ async function confirmCommit() {
       <button data-test="save" :disabled="saveBusy || !bufferDirty" @click="saveFile">{{ t('planWorkspace.action.save') }}</button>
     </div>
 
+    <div v-if="bumpPreview || bumpConfirmError" class="bump-area">
+      <div v-if="bumpPreview && bumpPreview.no_bump_needed" class="bump-no-bump-needed" data-test="bump-no-bump-needed">
+        {{ t('bump.noBumpNeeded') }}
+      </div>
+      <div v-else-if="bumpPreview" class="bump-banner" data-test="bump-banner">
+        <span>{{ t('bump.banner.message') }}</span>
+        <button type="button" data-test="bump-toggle" @click="bumpPanelOpen = !bumpPanelOpen">{{ t('bump.action.viewDiff') }}</button>
+      </div>
+      <div v-if="bumpPreview && !bumpPreview.no_bump_needed && bumpPanelOpen" class="bump-panel" data-test="bump-panel">
+        <p class="bump-shas">
+          <span :title="bumpPreview.old" data-test="bump-old">{{ bumpPreview.old.slice(0, 10) }}</span>
+          →
+          <span :title="bumpPreview.head" data-test="bump-head">{{ bumpPreview.head.slice(0, 10) }}</span>
+        </p>
+        <ul class="bump-commits" data-test="bump-commits">
+          <li v-for="c in bumpPreview.commits" :key="c.oid">{{ c.oid.slice(0, 10) }} — {{ c.subject }}</li>
+        </ul>
+        <ul class="bump-touched-files" data-test="bump-touched-files">
+          <li v-for="f in bumpPreview.touched_files" :key="f">{{ f }}</li>
+        </ul>
+        <p class="bump-warning" data-test="bump-warning">{{ t('bump.warning') }}</p>
+        <button type="button" data-test="bump-rerun-assist" @click="onBumpRerunAssist">{{ t('bump.action.rerunAssist') }}</button>
+        <button type="button" data-test="bump-confirm" :disabled="bumpConfirmBusy" @click="confirmBump">{{ t('bump.action.confirm') }}</button>
+      </div>
+      <!-- bumpConfirmError 獨立於面板外層——Confirm 失敗後觸發的重新預覽
+           （checkBump keepConfirmError）若把狀態翻成 no_bump_needed 或本身也
+           失敗（bumpPreview 變 null），錯誤訊息仍要留著，不能因為面板收合／
+           消失就跟著靜默不見（Fail Loud）。 -->
+      <p v-if="bumpConfirmError" class="err" data-test="bump-confirm-error">{{ bumpConfirmError }}</p>
+    </div>
+
     <div class="approval">
       <input v-model="planIdInput" data-test="plan-id" :placeholder="t('planWorkspace.planId.placeholder')" />
       <button data-test="submit-gate2" :disabled="submitBusy || !planIdInput" @click="submitForApproval">{{ t('planWorkspace.action.submit') }}</button>
@@ -343,6 +456,12 @@ async function confirmCommit() {
 .draft-area { display: flex; flex-direction: column; gap: 4px; }
 .draft-text { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); min-height: 60px; max-height: 240px; overflow-y: auto; }
 .diff { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); max-height: 240px; overflow-y: auto; }
+.bump-area { display: flex; flex-direction: column; gap: 4px; }
+.bump-banner { display: flex; align-items: center; gap: 8px; background: var(--bg-inset); padding: 6px 8px; border-radius: var(--radius-s); }
+.bump-no-bump-needed { color: var(--text-muted); font-size: var(--fs-s); }
+.bump-panel { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-s); }
+.bump-commits, .bump-touched-files { margin: 0; padding-left: 16px; max-height: 160px; overflow-y: auto; }
+.bump-warning { font-weight: 600; }
 .assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }
