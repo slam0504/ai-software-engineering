@@ -38,22 +38,24 @@ const planId = computed(() => {
   if (!subject || !subject.startsWith('plan:')) return ''
   return subject.slice('plan:'.length)
 })
+// approvalId：目前這個「generation」的識別（Task 9，§3.3.1-2）——換版即
+// approval_id 改變。傳給 evidence store 當 run key 的一段，也是所有 async
+// 呼叫換版丟棄（generation guard）的快照比對基準。
+const approvalId = computed(() => activeGate2.value?.approval_id ?? '')
 
 const tasks = ref<GateDecisionTask[]>([])
 const loadError = ref('')
 async function loadTasks() {
   loadError.value = ''
   tasks.value = []
-  const approvalId = activeGate2.value?.approval_id
-  if (!approvalId) return
+  if (!approvalId.value) return
   try {
-    const ctx = await props.loadDecisionContext(approvalId)
+    const ctx = await props.loadDecisionContext(approvalId.value)
     tasks.value = ctx.tasks ?? []
   } catch (e) {
     loadError.value = String(e)
   }
 }
-watch(() => activeGate2.value?.approval_id, () => { void loadTasks() }, { immediate: true })
 
 const candidates = ref<CommitCandidate[]>([])
 const candidatesError = ref('')
@@ -67,7 +69,6 @@ async function loadCandidates() {
     candidatesError.value = String(e)
   }
 }
-watch(planId, () => { void loadCandidates() }, { immediate: true })
 
 const testCommitInput = reactive<Record<string, string>>({})
 const precheckBusy = reactive<Record<string, boolean>>({})
@@ -83,41 +84,75 @@ const submitBusy = reactive<Record<string, boolean>>({})
 const submitResult = reactive<Record<string, string>>({})
 const submitError = reactive<Record<string, string>>({})
 
+// clearTaskState：換版（approval_id 改變）時全清空 per-task 的暫存 UI 狀態
+// （Task 9 §3.3.1-2 step 1(c)）——不能只清「顯眼」的欄位：task_id 在 replan
+// 前後可能沿用同一值，殘留的舊 generation 草稿／忙碌旗標／錯誤訊息會在新畫面
+// 的同一格重新冒出來，不是真的乾淨換版。
+function clearTaskState() {
+  for (const dict of [testCommitInput, precheckBusy, precheckError, precheckOk,
+    patchInput, registerBusy, registerError, mutationIds, submitBusy, submitResult, submitError]) {
+    for (const k of Object.keys(dict)) delete dict[k]
+  }
+}
+
+// 換版守門：approval_id 一變就清空全部暫存狀態＋更新 store 的 generation
+// 標記＋重載 task context 與 commit 候選（Task 9 §3.3.1-2 step 1(c)）。原本
+// loadTasks／loadCandidates 分別掛在 approval_id／planId 兩個 watch 上——但
+// 同一 plan 換版（approval_id 變、planId 不變）時 planId watch 不會觸發，候
+// 選清單就不會重載，所以兩者都併進這個 watcher，以 approval_id 為唯一觸發源
+// （沿既有 watch planId 模式擴充）。
+watch(approvalId, (id) => {
+  clearTaskState()
+  evidence.setCurrentGeneration(id)
+  void loadTasks()
+  void loadCandidates()
+}, { immediate: true })
+
 function taskRefOf(taskId: string): string {
   return `${planId.value}/${taskId}`
 }
 
+// generation guard（Task 9 §3.3.1-2 step 1(d)）：呼叫當下記錄 approvalId 快
+// 照，Promise resolve/reject 時若目前的 approvalId 已不同——換版已經發生、
+// clearTaskState 已經清過場——這筆晚到的回應就丟棄，不寫入任何狀態，避免舊
+// generation 的結果覆蓋新畫面。
 async function runPrecheck(taskId: string) {
+  const expectedApprovalId = approvalId.value
   precheckError[taskId] = ''
   precheckOk[taskId] = false
   precheckBusy[taskId] = true
   try {
     await props.validateTestCommit(planId.value, taskId, testCommitInput[taskId] ?? '')
+    if (approvalId.value !== expectedApprovalId) return
     precheckOk[taskId] = true
   } catch (e) {
+    if (approvalId.value !== expectedApprovalId) return
     precheckError[taskId] = String(e)
   } finally {
-    precheckBusy[taskId] = false
+    if (approvalId.value === expectedApprovalId) precheckBusy[taskId] = false
   }
 }
 
 async function registerMutationFor(taskId: string) {
+  const expectedApprovalId = approvalId.value
   registerError[taskId] = ''
   registerBusy[taskId] = true
   try {
     const id = await props.registerMutation(taskRefOf(taskId), patchInput[taskId] ?? '')
+    if (approvalId.value !== expectedApprovalId) return
     mutationIds[taskId] = id
     evidence.registerMutation(id, taskRefOf(taskId))
   } catch (e) {
+    if (approvalId.value !== expectedApprovalId) return
     registerError[taskId] = String(e)
   } finally {
-    registerBusy[taskId] = false
+    if (approvalId.value === expectedApprovalId) registerBusy[taskId] = false
   }
 }
 
 // isRunBusy：這個 kind 本身正在跑（顯示「執行中…」進度指示）。
 function isRunBusy(taskId: string, kind: string): boolean {
-  return evidence.runOf(planId.value, taskId, kind)?.status === 'running'
+  return evidence.runOf(approvalId.value, planId.value, taskId, kind)?.status === 'running'
 }
 // isTaskBusy：review fix（Medium correctness finding）——RunEvidence 是同步
 // 長呼叫，同一 task 的 expected_red／negative_control 原本互不 disable：先按
@@ -126,7 +161,18 @@ function isRunBusy(taskId: string, kind: string): boolean {
 // 更貼近實際：同一 task 任一 kind 執行中時，兩顆 run 按鈕都 disabled，不能
 // 同時觸發第二個 RunEvidence 呼叫。
 function isTaskBusy(taskId: string): boolean {
-  return evidence.taskHasRunInFlight(planId.value, taskId)
+  return evidence.taskHasRunInFlight(approvalId.value, planId.value, taskId)
+}
+
+// STALE_GENERATION_MESSAGE：跟 app.go 的 ErrStaleGeneration 原文
+// （"evidence: gate2 approval changed since view was loaded"）比對，命中時額
+// 外顯示引導文案（Task 9 §3.3.1-2 step 1(e)）——這是「client 這次呼叫當下就
+// 已經換版」以外的另一種情況：後端在 workflowMu 下重讀到的權威值先變了，前端
+// 畫面（entries prop）還沒收到新事件，所以上面的 generation guard 不會攔到，
+// 錯誤會正常顯示，這裡只是加一句引導。
+const STALE_GENERATION_MESSAGE = 'evidence: gate2 approval changed since view was loaded'
+function isStaleGenerationError(message: string | undefined): boolean {
+  return !!message && message.includes(STALE_GENERATION_MESSAGE)
 }
 
 // run：RunEvidence 只回傳 evidence_id，不帶 result（RunEvidence 的返回值刻意
@@ -136,40 +182,47 @@ function isTaskBusy(taskId: string): boolean {
 // ErrStaleGeneration）用 setError 落地，錯誤原文顯示，不吞。
 //
 // M3a.1 T8（§3.3.2）：第一參數傳目前畫面讀到的 active gate2 approval_id
-// （activeGate2，跟 loadTasks 用的是同一個計算屬性）——後端以此跟它自己在
+// （approvalId，跟 loadTasks 用的是同一個計算屬性）——後端以此跟它自己在
 // workflowMu 下重讀的權威值做 CAS 比對，換版即 ErrStaleGeneration。
 async function run(taskId: string, kind: string) {
   const testCommit = testCommitInput[taskId] ?? ''
   const mutationId = kind === 'negative_control' ? (mutationIds[taskId] ?? '') : ''
-  const expectedApprovalId = activeGate2.value?.approval_id ?? ''
-  evidence.setRunning(planId.value, taskId, kind)
+  const expectedApprovalId = approvalId.value
+  evidence.setRunning(expectedApprovalId, planId.value, taskId, kind)
   try {
     const evidenceId = await props.runEvidence(expectedApprovalId, planId.value, taskId, testCommit, kind, mutationId)
+    if (approvalId.value !== expectedApprovalId) return
     const rec = await props.getEvidence(evidenceId)
-    evidence.setResult(planId.value, taskId, kind, evidenceId, rec.result)
+    if (approvalId.value !== expectedApprovalId) return
+    evidence.setResult(expectedApprovalId, planId.value, taskId, kind, evidenceId, rec.result)
   } catch (e) {
-    evidence.setError(planId.value, taskId, kind, String(e))
+    if (approvalId.value !== expectedApprovalId) return
+    evidence.setError(expectedApprovalId, planId.value, taskId, kind, String(e))
   }
 }
 
 function bothPassed(taskId: string): boolean {
-  return evidence.runOf(planId.value, taskId, 'expected_red')?.status === 'passed'
-    && evidence.runOf(planId.value, taskId, 'negative_control')?.status === 'passed'
+  return evidence.runOf(approvalId.value, planId.value, taskId, 'expected_red')?.status === 'passed'
+    && evidence.runOf(approvalId.value, planId.value, taskId, 'negative_control')?.status === 'passed'
 }
 
 async function submit(taskId: string) {
+  const expectedApprovalId = approvalId.value
   submitError[taskId] = ''
   submitBusy[taskId] = true
   try {
-    const redId = evidence.runOf(planId.value, taskId, 'expected_red')?.evidenceId ?? ''
-    const negId = evidence.runOf(planId.value, taskId, 'negative_control')?.evidenceId ?? ''
+    const redId = evidence.runOf(expectedApprovalId, planId.value, taskId, 'expected_red')?.evidenceId ?? ''
+    const negId = evidence.runOf(expectedApprovalId, planId.value, taskId, 'negative_control')?.evidenceId ?? ''
     const mutationId = mutationIds[taskId] ?? ''
     const testCommit = testCommitInput[taskId] ?? ''
-    submitResult[taskId] = await props.submitTestContract(planId.value, taskId, testCommit, redId, negId, mutationId)
+    const result = await props.submitTestContract(planId.value, taskId, testCommit, redId, negId, mutationId)
+    if (approvalId.value !== expectedApprovalId) return
+    submitResult[taskId] = result
   } catch (e) {
+    if (approvalId.value !== expectedApprovalId) return
     submitError[taskId] = String(e)
   } finally {
-    submitBusy[taskId] = false
+    if (approvalId.value === expectedApprovalId) submitBusy[taskId] = false
   }
 }
 </script>
@@ -228,16 +281,20 @@ async function submit(taskId: string) {
             <span v-if="isRunBusy(task.task_id, kind)" class="busy" :data-test="'run-busy-' + kind + '-' + task.task_id">
               {{ t('evidence.run.running') }}
             </span>
-            <template v-else-if="evidence.runOf(planId, task.task_id, kind)">
+            <template v-else-if="evidence.runOf(approvalId, planId, task.task_id, kind)">
               <span
-                :class="['badge', 'badge-' + evidence.runOf(planId, task.task_id, kind)!.status]"
+                :class="['badge', 'badge-' + evidence.runOf(approvalId, planId, task.task_id, kind)!.status]"
                 :data-test="'run-result-' + kind + '-' + task.task_id"
-              >{{ resolveState(evidenceResultKeys, evidence.runOf(planId, task.task_id, kind)!.status, t) }}</span>
-              <span v-if="evidence.runOf(planId, task.task_id, kind)!.evidenceId" class="evidence-id" :data-test="'evidence-id-' + kind + '-' + task.task_id">
-                {{ evidence.runOf(planId, task.task_id, kind)!.evidenceId }}
+              >{{ resolveState(evidenceResultKeys, evidence.runOf(approvalId, planId, task.task_id, kind)!.status, t) }}</span>
+              <span v-if="evidence.runOf(approvalId, planId, task.task_id, kind)!.evidenceId" class="evidence-id" :data-test="'evidence-id-' + kind + '-' + task.task_id">
+                {{ evidence.runOf(approvalId, planId, task.task_id, kind)!.evidenceId }}
               </span>
-              <template v-if="evidence.runOf(planId, task.task_id, kind)!.status === 'error'">
-                <span class="err" :data-test="'run-error-' + kind + '-' + task.task_id">{{ evidence.runOf(planId, task.task_id, kind)!.error }}</span>
+              <template v-if="evidence.runOf(approvalId, planId, task.task_id, kind)!.status === 'error'">
+                <span class="err" :data-test="'run-error-' + kind + '-' + task.task_id">{{ evidence.runOf(approvalId, planId, task.task_id, kind)!.error }}</span>
+                <span
+                  v-if="isStaleGenerationError(evidence.runOf(approvalId, planId, task.task_id, kind)!.error)"
+                  class="hint" :data-test="'run-stale-hint-' + kind + '-' + task.task_id"
+                >{{ t('tcaWorkspace.staleGeneration.hint') }}</span>
                 <button
                   type="button" :data-test="'retry-' + kind + '-' + task.task_id" :disabled="isTaskBusy(task.task_id)"
                   @click="run(task.task_id, kind)"
@@ -279,5 +336,6 @@ async function submit(taskId: string) {
 .evidence-id { color: var(--text-faint); font-size: var(--fs-s); overflow-wrap: anywhere; }
 .busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
+.hint { color: var(--text-muted); font-size: var(--fs-s); font-style: italic; }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }
 </style>

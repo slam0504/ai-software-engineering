@@ -177,6 +177,9 @@ export default {
     },
     mutationId: 'mutation_id: {id}',
     submittedApprovalId: 'approval_id: {id}',
+    staleGeneration: {
+      hint: 'State has changed — please re-check before running again',
+    },
   },
   evidence: {
     title: 'evidence: {id}',

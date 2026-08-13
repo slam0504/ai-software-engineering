@@ -177,6 +177,9 @@ export default {
     },
     mutationId: 'mutation 編號（mutation_id）：{id}',
     submittedApprovalId: '核可編號（approval_id）：{id}',
+    staleGeneration: {
+      hint: '狀態已更新，請重新確認後再執行',
+    },
   },
   evidence: {
     title: 'evidence：{id}',
