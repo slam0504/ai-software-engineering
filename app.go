@@ -99,7 +99,7 @@ type App struct {
 	// 以下三個 hook 只服務 claude 自然收尾 reaper／forcedShutdown 的 ErrEndInProgress
 	// benign 裁定（review P2：TestShutdownForcedWaitsForBoth flaky）——讓測試能
 	// deterministic 驅動兩個時序分支，不靠 time.Sleep 猜。
-	hookClaudeTeardownBarrier          func() // 測試注入：claudeTeardownFn（shared OnceValue）真正執行開始時
+	hookClaudeTeardownBarrier          func() // 測試注入：任一 claudeTeardown 真正執行的進入點（OnceValue 與 fresh 閉包皆經此）
 	hookClaudeReaperBeforeEndFlow      func() // 測試注入：reaper 的 <-done 解除之後、呼叫 EndSessionFlow 之前
 	hookForcedShutdownClaudeBeforeFlow func() // 測試注入：forcedShutdown 的 sess.Terminate() 之後、呼叫 EndSessionFlow 之前
 	hookForcedShutdownClaudeBenign     func() // 測試注入：forcedShutdown 判定 ErrEndInProgress 為 benign、等待收斂之前
@@ -3622,7 +3622,7 @@ func (a *App) claudeTeardown(sess *claude.Session, done <-chan struct{},
 		if sess == nil {
 			return errors.New("no active claude session")
 		}
-		if h := a.hookClaudeTeardownBarrier; h != nil { // 測試 barrier：見 App 欄位 doc；shared OnceValue 唯一一次真正執行的起點
+		if h := a.hookClaudeTeardownBarrier; h != nil { // 測試 barrier：見 App 欄位 doc；任一呼叫端（OnceValue 或 fresh 閉包）真正執行的進入點
 			h()
 		}
 		fin := func(ex ports.Exit) error {
