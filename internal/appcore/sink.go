@@ -26,11 +26,28 @@ type AuditSink interface {
 	Close() error
 }
 
+// jsonlWriter：JSONLSink 對底層檔案的最小需求，讓測試能注入會短寫的 fake
+// （production 一律是 *os.File）。
+type jsonlWriter interface {
+	io.Writer
+	io.Seeker
+	io.Closer
+}
+
 // JSONLSink：O_APPEND 檔案實作。offset 於開檔時以 Seek(0, io.SeekEnd) 取得
 // 初始值，之後單純累加寫入 byte 數——重開既有檔案時第一筆的 StartOffset
 // 必須接續既有檔案長度，不能從 0 開始。
+//
+// 不是 goroutine-safe：offset 累加器沒有自己的鎖，正確性完全依賴呼叫端
+// 序列化每一次 Write。目前唯一呼叫端是 Manager.writeAndEmitLocked，其
+// 序列化由 Manager 自身的單一 mutex 保證（全 repo 只有這一處 Sink.Write
+// 呼叫點）。若未來出現繞過 Manager 直接使用 JSONLSink 的呼叫端（例如獨立
+// 的 export／migration 工具），該呼叫端必須自行序列化寫入。
+//
+// 另假設同一時間只有一個 process／handle 持有這個檔案的寫入權——offset
+// 是本機累加值，不會偵測其他 process 對同一檔案的並行寫入。
 type JSONLSink struct {
-	f      *os.File
+	f      jsonlWriter
 	offset int64
 }
 
@@ -54,6 +71,13 @@ func (s *JSONLSink) Write(env contract.Envelope) (AppendReceipt, error) {
 	}
 	n, err := fmt.Fprintf(s.f, "%s\n", b)
 	if err != nil {
+		// 短寫可能已把部分 byte 落到檔案：如果不校正，s.offset 會永久落後
+		// 於檔案實際長度，之後每一筆 receipt 都會偏移（§3.5.2 凍結 receipt
+		// 是 ground truth，不能漂移）。用 Seek 重新對齊到檔案實際長度；若
+		// 連 Seek 都失敗，放棄校正並優先回報原始寫入錯誤（fail loud）。
+		if off, serr := s.f.Seek(0, io.SeekEnd); serr == nil {
+			s.offset = off
+		}
 		return AppendReceipt{}, err
 	}
 	start := s.offset
