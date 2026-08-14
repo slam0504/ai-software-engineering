@@ -37,6 +37,11 @@ var hookAfterPublishBeforeWatch func()
 // 任何路徑拿得到它去 finalize——錄流 meta 就此漏掉；而 Single.Ensure 遇到已關閉的
 // Done() 會直接建立並覆寫新 instance，舊 generation 連被察覺的機會都沒有。綁進
 // Single 持有的值之後，reaper／受控 restart／shutdown 總序三條路徑都拿得到它。
+//
+// **一律用 NewGenerationOwner 建構，不要直接寫 struct literal**：未匯出的 attached
+// 記錄「錄流 sink 是不是本 owner 自己掛上的」，直接建構會讓它恆為 false，收尾時就
+// **靜默**跳過 detach（不回錯、不計數）——generation 關檔後仍掛著的 sink 會把後續
+// frame 寫進已關閉的檔案，錯誤只 latch 進 writeErr，而 meta 早就寫完了。
 type GenerationOwner struct {
 	Server     probeTarget
 	Generation *wirelog.Generation
@@ -45,6 +50,28 @@ type GenerationOwner struct {
 	attached bool // 本 owner 自己成功掛上錄流 sink，收尾時才有資格 detach
 	done     bool
 	err      error
+}
+
+// NewGenerationOwner 建立 owner 並**同時**把 gen 掛成 srv 的錄流 sink——attach 這件
+// 事只有這一條路徑能做，attached 因此不可能與現實不符。
+//
+// 回傳的 owner **一律非 nil**，即使 attach 失敗也要拿它收尾（Terminate → Wait →
+// finalize）；attach 失敗時 attached 維持 false，收尾不會 detach 別人的 sink——
+// BeginRecording 可能正是因為「已有別人在錄流」而失敗的。
+func NewGenerationOwner(srv probeTarget, gen *wirelog.Generation) (*GenerationOwner, error) {
+	o := &GenerationOwner{Server: srv, Generation: gen}
+	if err := srv.BeginRecording(generationSink(gen)); err != nil {
+		return o, err
+	}
+	o.attached = true
+	return o, nil
+}
+
+// newUnstartedOwner 是 start 階段就失敗（還沒有 server）時的收尾載體：只帶
+// generation，收尾時跳過 terminate／wait／drain／detach，但 wire_log_id 與失敗
+// 原因照樣落進 meta。
+func newUnstartedOwner(gen *wirelog.Generation) *GenerationOwner {
+	return &GenerationOwner{Generation: gen}
 }
 
 // Done 讓 GenerationOwner 滿足 Alive（Single 的型別約束）。
@@ -59,7 +86,11 @@ func (o *GenerationOwner) Done() <-chan struct{} {
 
 // FinalizeWith 收尾本 owner，順序凍結為
 // **Terminate → Wait → stdout 汲取完成 → StopRecording → Generation.Finalize**
-// （§3.4.2；與 cmd/probe-codex-parallel/main.go:220-223 的收尾同序）。
+// （§3.4.2）。前後段沿用 repo 既有慣例——cmd/probe-codex-parallel/main.go:220-223
+// 是 Terminate → Wait → StopRecording；本函式在 Wait 與 Stop **之間多一步**等
+// Conn.Done（stdout 汲取完成），那個 probe driver 沒有這一步。差別在於 probe 是
+// 一次性程序、Stop 之後隨即退出，長駐 server 的受控 replacement 與死亡 reaper 則
+// 會續用同一條連線，尾端 frame 漏掉就永遠補不回來。
 //
 // 為什麼 detach 必須排在 server 死透之後：`Conn.record` 看到 sink == nil 會直接
 // return——無錯誤、無計數——所以任何提前 detach 都是**靜默漏錄**。提前 detach 會吃
@@ -212,16 +243,13 @@ func RunOwnedHandshake(ctx context.Context, single *Single[*GenerationOwner],
 		}
 		srv, err := start()
 		if err != nil { // 3. 尚無 server：generation 仍要 finalize，證據不丟
-			fin := (&GenerationOwner{Generation: gen}).FinalizeWith(err)
+			fin := newUnstartedOwner(gen).FinalizeWith(err)
 			return nil, false, errors.Join(err, fin, oldErr)
 		}
-		o := &GenerationOwner{Server: srv, Generation: gen}
-		if err := srv.BeginRecording(generationSink(gen)); err != nil { // 4. 不留未 handshake 的 server
-			// attached 仍為 false：BeginRecording 可能是因「已有別人在錄流」而失
-			// 敗，此時收尾若 StopRecording 會摘掉別人的 sink。
+		o, err := NewGenerationOwner(srv, gen) // 4. attach；失敗也不留未 handshake 的 server
+		if err != nil {
 			return nil, false, errors.Join(err, o.FinalizeWith(err), oldErr)
 		}
-		o.attached = true
 		if err := srv.Handshake(ctx, ci); err != nil { // 5. 同上
 			return nil, false, errors.Join(err, o.FinalizeWith(err), oldErr)
 		}

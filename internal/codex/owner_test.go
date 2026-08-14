@@ -50,6 +50,9 @@ func TestServerDeathAutoFinalizesGeneration(t *testing.T) {
 	if m := gen.FinalMeta(); m.ExitCode == nil || *m.ExitCode != 9 {
 		t.Fatalf("死亡收尾必須帶 exit 證據：%+v", m)
 	}
+	if _, stops, _, _ := stub.callCounts(); stops != 1 {
+		t.Fatalf("死亡收尾必須 detach 自己掛的 sink：stops=%d", stops)
+	}
 	if _, ok := single.Take(); ok {
 		t.Fatal("死亡的 owner 必須已從 Single 移除")
 	}
@@ -82,8 +85,9 @@ func TestReplacementFinalizesOldGenerationBeforePublishingNew(t *testing.T) {
 	if !reflect.DeepEqual(order, []string{"old_finalized", "new_gen_created"}) {
 		t.Fatalf("replacement 必須等舊 generation finalize 完才建新的並發布：%v", order)
 	}
-	if _, _, terms, waits := old.callCounts(); terms != 1 || waits != 1 {
-		t.Fatalf("被替換的 server 必須 terminate＋wait 各一次：term=%d wait=%d", terms, waits)
+	if _, stops, terms, waits := old.callCounts(); terms != 1 || waits != 1 || stops != 1 {
+		t.Fatalf("被替換的 server 必須 terminate＋wait＋detach 各一次：term=%d wait=%d stop=%d",
+			terms, waits, stops)
 	}
 	if o, ok := single.Take(); !ok || o.Generation != newGen {
 		t.Fatal("ownership 必須是新的 owner")
@@ -413,6 +417,56 @@ func TestFinalizeWithBoundedDrainTimeout(t *testing.T) {
 	if m := gen.FinalMeta(); !strings.Contains(m.FinalizeCause, "drain") {
 		t.Fatalf("逾時證據必須留在 meta：%+v", m)
 	}
+}
+
+// attached 未匯出，只有 NewGenerationOwner 會設它——package 外若直接寫 struct
+// literal，收尾會**靜默**跳過 detach。這條測試把兩種建構方式的差異釘住，
+// 免得 Task 13 在 package main 用 literal 建構而完全不會有徵兆。
+func TestNewGenerationOwnerIsTheOnlyPathThatDetaches(t *testing.T) {
+	t.Run("constructor", func(t *testing.T) {
+		stub := newStubServer()
+		gen := newTestGeneration(t)
+		o, err := NewGenerationOwner(stub, gen)
+		if err != nil || o == nil {
+			t.Fatalf("attach 應成功：%v", err)
+		}
+		if begins, _, _, _ := stub.callCounts(); begins != 1 {
+			t.Fatalf("constructor 必須自己掛 sink：begins=%d", begins)
+		}
+		if err := o.FinalizeWith(nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, stops, _, _ := stub.callCounts(); stops != 1 {
+			t.Fatalf("constructor 建的 owner 收尾必須 detach：stops=%d", stops)
+		}
+	})
+	t.Run("struct_literal_does_not_detach", func(t *testing.T) {
+		stub := newStubServer()
+		o := &GenerationOwner{Server: stub, Generation: newTestGeneration(t)}
+		if err := o.FinalizeWith(nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, stops, _, _ := stub.callCounts(); stops != 0 {
+			t.Fatalf("這正是 foot-gun：literal 建構的 attached 恆為 false，收尾靜默不 detach（stops=%d）", stops)
+		}
+	})
+	t.Run("attach_failure_still_returns_owner", func(t *testing.T) {
+		stub := newStubServer()
+		stub.beginErr = errors.New("recording already in progress")
+		o, err := NewGenerationOwner(stub, newTestGeneration(t))
+		if err == nil {
+			t.Fatal("attach 失敗必須回錯")
+		}
+		if o == nil {
+			t.Fatal("attach 失敗仍須回傳 owner 供收尾")
+		}
+		if err := o.FinalizeWith(err); err != nil {
+			t.Fatal(err)
+		}
+		if _, stops, terms, _ := stub.callCounts(); stops != 0 || terms != 1 {
+			t.Fatalf("未成功 attach：只 dispose、不得 detach 別人的 sink（stop=%d term=%d）", stops, terms)
+		}
+	})
 }
 
 // BeginRecording 失敗可能是因為「已有別人在錄流」——此時收尾不得 detach 別人的 sink。
