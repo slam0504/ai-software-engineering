@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -43,7 +45,7 @@ func mustStartClaude(t *testing.T, a *App, w appcore.WSID) {
 	t.Cleanup(func() { _ = a.EndSession("claude") })
 }
 
-// seedApproval：走真實 approval 路徑——dial 該 host 的 per-WSID socket 送一筆
+// seedApproval：走真實 approval 路徑——dial 該 host 自己的 approval socket 送一筆
 // 請求，等 pumpApprovals 把它登記進 apprPending，回傳 approval id。
 func seedApproval(t *testing.T, a *App, w appcore.WSID) string {
 	t.Helper()
@@ -104,6 +106,69 @@ func TestTwoClaudeSessionsDoNotShareSocketOrMCP(t *testing.T) {
 			t.Fatalf("路徑未建立：%s", p)
 		}
 	}
+	// 真正的隔離證據：w2 啟動之後，兩個 socket 都還要 dial 得到、各自把 approval
+	// 登記回自己的 WSID。上面的指標比較在 per-host 架構下恆為真，擋不住「第二個
+	// session 把第一個的 socket 蓋掉」——那正是 §3.3 要修的形狀。
+	id1, id2 := seedApproval(t, a, w1), seedApproval(t, a, w2)
+	if pa := a.pendingByID(id1); pa == nil || pa.wsid != w1 {
+		t.Fatalf("w1 的 broker 在 w2 啟動後必須仍可用：%+v", pa)
+	}
+	if pa := a.pendingByID(id2); pa == nil || pa.wsid != w2 {
+		t.Fatalf("w2 的 approval 必須回自己的 WSID：%+v", pa)
+	}
+	if err := a.ResolveApproval(id1, false, ""); err != nil {
+		t.Fatalf("resolve w1: %v", err)
+	}
+	if err := a.ResolveApproval(id2, false, ""); err != nil {
+		t.Fatalf("resolve w2: %v", err)
+	}
+}
+
+// unix sockaddr 的 sun_path 上限約 104 bytes（macOS／Linux 同量級）。newTestApp
+// 刻意用 /tmp 短路徑迴避這條限制（見 app_test.go 內註解），因此一般測試撐不到
+// 上限；production 的 resolveWorkspace() 用 `<cwd 或 home>/.workbench`，中等深度
+// 的專案目錄就有 70-90 bytes，socket 檔名只要多幾十 bytes 就會 bind 失敗、
+// Claude session 整個開不起來。本測試把 stateDir 撐到 production 量級守住它。
+func TestClaudeApprovalSocketFitsInLongStateDir(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+
+	const targetLen = 80 // production `<cwd>/.workbench` 的實測量級
+	base, err := os.MkdirTemp("/tmp", "wb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	pad := targetLen - len(base) - 1
+	if pad < 1 {
+		t.Fatalf("base 路徑已超過目標長度：%s", base)
+	}
+	deep := filepath.Join(base, strings.Repeat("d", pad))
+	if err := os.MkdirAll(filepath.Join(deep, "recordings"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.stateDir = deep
+
+	w := mustCreate(t, a, "claude")
+	// 自我校驗：這個 stateDir 必須真的長到會讓「帶完整 WSID 的 socket 檔名」爆掉，
+	// 否則本測試守不住任何東西。
+	if wsidForm := filepath.Join(deep, "approval-"+string(w)+".sock"); len(wsidForm) < 104 {
+		t.Fatalf("stateDir 不夠長，測試無效（帶 WSID 的路徑只有 %d bytes）", len(wsidForm))
+	}
+
+	commit, err := a.startClaude(w, "p", "", "")
+	if err != nil {
+		t.Fatalf("長 stateDir 下 approval socket 必須 bind 得起來：%v", err)
+	}
+	t.Cleanup(func() { commit(false) })
+	h := a.hostFor(w)
+	if len(h.sockPath) >= 104 {
+		t.Fatalf("socket 路徑撐破 sun_path 上限：%d bytes（%s）", len(h.sockPath), h.sockPath)
+	}
+	id := seedApproval(t, a, w) // 真的 dial 得到才算數
+	if err := a.ResolveApproval(id, false, "test"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
 }
 
 // approval 必須帶提出請求的 WSID——多 session 之後 provider 不足以定位它該回哪個
@@ -147,7 +212,9 @@ func TestExportedBindingSignatureUnchanged(t *testing.T) {
 	if !ok {
 		t.Fatal("SendMessage 必須仍是 exported binding")
 	}
-	if got := m.Type.In(1).Kind(); got != reflect.String {
+	// 比 reflect.Type 本身而非 Kind()：named string type（如 appcore.WSID）的
+	// Kind() 同樣是 reflect.String，用 Kind 守門擋不住 Task 26 最可能做的那個改動。
+	if got := m.Type.In(1); got != reflect.TypeOf("") {
 		t.Fatalf("SendMessage 第一參數型別不得改變：%v", got)
 	}
 	if err := a.SendMessage("claude", "hi"); err != nil {

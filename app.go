@@ -102,6 +102,12 @@ type App struct {
 	// dropHost／takeHost／snapshotHosts／hostsOf，在 a.mu 下操作。
 	sessionHosts map[appcore.WSID]*sessionHost
 
+	// sockIndexOwner：approval socket 槽位的 free-list（index → 佔用它的 host）。
+	// 在 a.mu 下讀寫，存取一律經 reserveSockIndex／releaseSockIndex。與
+	// sessionHosts 分開是刻意的——host 要等欄位填妥才 publish，光靠掃描
+	// sessionHosts 無法讓併發的 startClaude 原子地佔住槽位。
+	sockIndexOwner map[int]*sessionHost
+
 	// lastCreatedWSID：每個 provider 最近一次 CreateSession 成功的 WSID，供
 	// legacyWSIDFor 的第 2 順位使用（見其 doc）。在 a.mu 下讀寫；Task 26 前端
 	// 改為直接帶 WSID 之後連同 legacyWSIDFor 一併刪除。
@@ -1086,8 +1092,13 @@ func (a *App) shutdown(ctx context.Context) {
 		_ = srv.Terminate()
 		srv.Wait()
 	}
-	// 殘留 host 的 broker 兜底：teardown 成功的 host 已把自己從 registry 取出並
-	// 關掉 broker，這裡收的是 teardown 失敗／從未進入收尾的那些。
+	// 殘留 host 的 broker：teardown 成功的 host 已把自己從 registry 取出並關掉
+	// broker，留在這裡的是 teardown 失敗／從未進入收尾的那些。**這是 best effort、
+	// 不是完整收尾**——只關 broker（釋放 socket），不 Terminate sess、不 finalize
+	// lease：走到這一步代表 forcedShutdown 的 CloseSequence 已經失敗過一次，同樣
+	// 的操作在此重試沒有新的成功理由，而 app 即將退出、OS 會回收子行程。錄流
+	// meta 缺失是已知後果（CloseSequence 失敗時 finalize 本來就沒跑成）。行為與
+	// 遷移前的單例版同構。
 	for _, h := range a.snapshotHosts() {
 		if h.broker != nil {
 			_ = h.broker.Close()
@@ -3715,7 +3726,7 @@ func (a *App) EscalationResolve(id, resolution, reason string) error {
 //   - 交易閘：beginAppTxn 於啟動（shutdown 後拒新），endAppTxn 於收尾一次。
 //   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endAppTxn）
 //     後才 Manager.Close（reclaimAssists＋inflight.Wait）。
-//   - ownership 隔離：不寫 a.claudeSess／a.runner／a.codexConn（runner 為獨立 process）；
+//   - ownership 隔離：不碰 sessionHosts／a.runner／a.codexConn（runner 為獨立 process）；
 //     晚到舊 generation 事件（correlation 不符）丟棄並發 stream_error（fail loud）。
 //   - once/token 收尾：result／abort／timeout／shutdown 任一先觸發即收一次。
 //
@@ -4166,28 +4177,32 @@ func (a *App) ResolveApproval(id string, allow bool, reason string) error {
 	return err
 }
 
-// pumpApprovals：把某個 sessionHost 的 broker pending queue 轉成 UI 請求＋
-// pendingApproval 登記（M3b §3.3：每個 host 各自一份 broker／socket，pump 因此
-// 綁 host 而非 provider）。approval 事件一律發回該 host 的 WSID slot。
-func (a *App) pumpApprovals(h *sessionHost) {
-	provider := string(h.provider)
-	for req := range h.broker.Pending() {
+// pumpApprovals：把某個 session 的 broker pending queue 轉成 UI 請求＋
+// pendingApproval 登記（M3b §3.3：每個 session 各自一份 broker／socket，pump 因此
+// 綁單一 session 而非 provider）。approval 事件一律發回該 session 的 WSID slot。
+//
+// 刻意收窄值而非整個 *sessionHost（review Important #2）：這條 goroutine 在 host
+// publish 之前就啟動，拿到 host 指標就有機會讀到尚未寫入的欄位。sessionID 是由
+// startClaude 提供、內部走 a.mu 的存取器。
+func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
+	br *approval.Broker, sessionID func() string) {
+	for req := range br.Pending() {
 		id := req.ID
-		a.registerApproval(id, h.wsid, provider, func(allow bool, reason string) error {
+		a.registerApproval(id, w, string(provider), func(allow bool, reason string) error {
 			behavior := "deny"
 			decision := "deny"
 			if allow {
 				behavior, decision = "allow", "allow"
 			}
-			err := h.broker.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
-			a.noteWSEmitError("approval_decision", h.wsid,
-				a.manager.EmitApprovalDecisionWS(h.wsid, a.hostSessionID(h), decision, reason))
+			err := br.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
+			a.noteWSEmitError("approval_decision", w,
+				a.manager.EmitApprovalDecisionWS(w, sessionID(), decision, reason))
 			return err
 		})
-		a.noteWSEmitError("approval_request", h.wsid,
-			a.manager.EmitApprovalRequestWS(h.wsid, a.hostSessionID(h), req.ToolName, req.Input))
+		a.noteWSEmitError("approval_request", w,
+			a.manager.EmitApprovalRequestWS(w, sessionID(), req.ToolName, req.Input))
 		a.emit("approval:request", map[string]any{
-			"id": id, "provider": provider, "toolName": req.ToolName,
+			"id": id, "provider": string(provider), "toolName": req.ToolName,
 			"inputJson": string(req.Input),
 		})
 	}
@@ -4329,19 +4344,19 @@ func (a *App) SendMessage(provider, prompt string) error {
 // endAppTxn，沿 app.go:213 慣例，同 StartSession／ensureAppServer／B1 probe）。
 // 修前的 gap：EndSession 完全不在 shutdown gate 之內——使用者已呼叫的 EndSession
 // 若跟 shutdown() 同時發生，shutdown 的 inflight.Wait() 不會等它，會直接往下讀
-// a.claudeSess 進 forcedShutdown；forcedShutdown 見到 BeginEndSession 失敗會
-// 套用 ErrEndInProgress benign 規則（review P2），但那條規則的前提是「贏家是
-// startClaude 內建的自然收尾 reaper、且與 forcedShutdown 共用同一份
-// claudeTeardownFn」——這裡贏家其實是 EndSession 自己建的另一份獨立閉包，
-// forcedShutdown 等的 teardownFn 從未被觸發，於是變成對同一個 session 並行跑
-// 兩份 CloseSequence、重複發 session:done。納入 app transaction 後這個 race
-// window 直接消失：EndSession 在 shuttingDown 之後一律被拒（不會冒出新的
-// in-flight teardown）；EndSession 若已在 shuttingDown 之前開始，
+// 該 session 的 host（M3b 前為 a.claudeSess）進 forcedShutdown；forcedShutdown
+// 見到 BeginEndSession 失敗會套用 ErrEndInProgress benign 規則（review P2），但
+// 那條規則的前提是「贏家是 startClaude 內建的自然收尾 reaper、且與
+// forcedShutdown 共用同一份 host.teardownFn」——這裡贏家其實是 EndSession 自己
+// 建的另一份獨立閉包，forcedShutdown 等的 teardownFn 從未被觸發，於是變成對同一
+// 個 session 並行跑兩份 CloseSequence、重複發 session:done。納入 app transaction
+// 後這個 race window 直接消失：EndSession 在 shuttingDown 之後一律被拒（不會冒出
+// 新的 in-flight teardown）；EndSession 若已在 shuttingDown 之前開始，
 // inflight.Wait() 保證等它完整返回（含 teardown／FinishEndSession）才會往下
-// 讀 a.claudeSess——forcedShutdown 執行時看到的必是 EndSession 已經收乾淨的
-// 狀態，兩者時間上不再重疊。
+// snapshot host——forcedShutdown 執行時看到的必是 EndSession 已經收乾淨的
+// 狀態（host 已被 takeHost 取出），兩者時間上不再重疊。
 //
-// 沒有讓 EndSession 改共用 claudeTeardownFn（那個 OnceValue 只服務
+// 沒有讓 EndSession 改共用 host.teardownFn（那個 OnceValue 只服務
 // forcedShutdown「BeginEndSession 失敗仍重跑 teardown 兜底」的模式）：
 // EndSession 本身沒有這種 fallback，appcore.BeginEndSession 失敗時
 // EndSessionFlow 根本不會呼叫 teardown、直接把錯誤原樣回給呼叫端，不管閉包
@@ -4411,8 +4426,9 @@ func approvalTimeout() time.Duration { return approval.BrokerTimeout() }
 //
 // host 一律「填滿才 publish」（見 sessionHost doc 的併發規約）：sess／broker／
 // lease／teardownFn 全部就緒才 putHost，因此 registry 裡不會出現半成品，讀者
-// 可以在鎖外安全讀取這些欄位。start 失敗時 host 從未進 registry，rollback 只需
-// 關掉 broker。
+// 可以在鎖外安全讀取這些欄位。這條規約靠「publish 之前啟動的兩條 pump goroutine
+// 都拿不到 host 指標」維持——它們只收窄值與兩個在 a.mu 下操作的 closure。
+// start 失敗時 host 從未進 registry，rollback 只需關 broker ＋ 歸還 socket 槽位。
 func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (func(accepted bool), error) {
 	cwd, err := claude.NormalizeCWD(a.workspaceDir)
 	if err != nil {
@@ -4427,16 +4443,23 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		}
 	}
 	host := &sessionHost{
-		wsid: w, provider: contract.ProviderClaude,
-		sockPath: filepath.Join(a.stateDir, "approval-"+string(w)+".sock"),
-		mcpPath:  filepath.Join(a.stateDir, "mcp-"+string(w)+".json"),
+		wsid: w, provider: contract.ProviderClaude, sockIndex: -1,
+		mcpPath: filepath.Join(a.stateDir, "mcp-"+string(w)+".json"),
 	}
-	_ = os.Remove(host.sockPath)
-	if old := a.hostFor(w); old != nil && old.broker != nil {
-		_ = old.broker.Close() // 同一 WSID 重啟：先關上一輪的 broker（socket 讓位）
+	// socket 槽位由 free-list 配置，因此同一個 WSID 重啟時新舊 host 必然拿到不同
+	// 路徑——不需要（也不允許）在這裡去關還留在 registry 裡的舊 broker：那是
+	// take-then-dispose 契約禁止的形狀，而且舊 broker 的 listener 一關就會 unlink
+	// socket 檔案，若新舊剛好同路徑，反而會把剛建好的新 socket 刪掉、approval
+	// 靜默失效。舊 host 一律由它自己的 teardown 收（關 broker ＋ 歸還槽位）。
+	idx, err := a.reserveSockIndex(host)
+	if err != nil {
+		return nil, err // fail loud：不降級成共用 socket
 	}
+	host.sockIndex, host.sockPath = idx, approvalSockPath(a.stateDir, idx)
+	_ = os.Remove(host.sockPath) // 前一輪殘留的 socket 檔（行程被 kill 時不會 unlink）
 	br, err := approval.NewBroker(host.sockPath, approvalTimeout(), a.auditWriterFor())
 	if err != nil {
+		a.releaseSockIndex(host)
 		return nil, err
 	}
 	host.broker = br
@@ -4446,16 +4469,26 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			return
 		}
 		_ = br.Close() // host 尚未 putHost（只在最後一步 publish），無需自 registry 撤回
+		a.releaseSockIndex(host)
 	}()
+
+	// 以下兩條 goroutine 在 host publish 之前就啟動，因此刻意只給窄值與 closure、
+	// 不給 host 指標（見 sessionHost 併發規約）：sessionID／noteSessionID 內部一律
+	// 走 a.mu 下的存取器，goroutine 本體碰不到尚未寫入的 sess／pumpDone／lease。
+	sessionID := func() string { return a.hostSessionID(host) }
+	noteSessionID := func(id string) {
+		a.setHostSessionID(host, id)
+		a.commitClaudeResume(host, id) // accepted generation 才寫（late init guard）
+	}
 	br.SetTimeoutHook(func(id string) { // 逾時 deny 後收掉 UI 的過期彈窗
 		a.apprMu.Lock()
 		delete(a.apprPending, id)
 		a.apprMu.Unlock()
 		a.noteWSEmitError("approval_decision", w,
-			a.manager.EmitApprovalDecisionWS(w, a.hostSessionID(host), "timeout", ""))
+			a.manager.EmitApprovalDecisionWS(w, sessionID(), "timeout", ""))
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	})
-	go a.pumpApprovals(host)
+	go a.pumpApprovals(w, contract.ProviderClaude, br, sessionID)
 
 	self, _ := os.Executable()
 	if o := os.Getenv("WORKBENCH_MCP_COMMAND_OVERRIDE"); o != "" { // A6 注入點
@@ -4515,8 +4548,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		}
 		if info := claude.ParseInit(ev); info != nil {
 			_ = a.registry.Bind(info.SessionID, cwd)
-			a.setHostSessionID(host, info.SessionID)
-			a.commitClaudeResume(host, info.SessionID) // accepted generation 才寫（late init guard）
+			noteSessionID(info.SessionID)
 		}
 		a.noteWSEmitError("emit", w, a.manager.EmitWS(w, ev))
 	})
@@ -4585,13 +4617,14 @@ func (a *App) claudeTeardown(host *sessionHost) func() error {
 		ex, err := appcore.CloseSequence(host.sess.Close, host.pumpDone, 5*time.Second, 10*time.Second,
 			host.sess.Terminate, host.sess.Wait, fin)
 		// take-then-dispose（見 dropHost doc）：先把 host 自 registry 取出——之後
-		// 沒有新讀者能拿到它——才在鎖外關 broker。identity check 保證不會誤刪
-		// 同一 WSID 上已換代的新 host；broker 是本 host 自己的，無論是否仍在
-		// registry 都由這裡負責關掉（socket 檔案讓位給下一次 start）。
+		// 沒有新讀者能拿到它——才在鎖外處置。identity check 保證不會誤刪同一
+		// WSID 上已換代的新 host；broker 與 socket 槽位都是本 host 自己的，無論
+		// 是否仍在 registry 都由這裡負責回收（槽位歸還讓位給下一次 start）。
 		a.takeHost(host)
 		if host.broker != nil {
 			_ = host.broker.Close()
 		}
+		a.releaseSockIndex(host)
 		var recErrText string
 		if err != nil {
 			recErrText = err.Error()
@@ -5073,7 +5106,7 @@ func (a *App) RestoreViews() map[string]RestoredView {
 // review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginAppTxn／
 // endAppTxn）——理由與 EndSession 上方 doc 完全相同（同一類 shutdown race，
 // NewSession 也是「BeginEndSession 成功才會呼叫 teardown、失敗就直接回錯」，
-// 沒有 fallback 兜底重跑，故同樣不需要共用 claudeTeardownFn）。
+// 沒有 fallback 兜底重跑，故同樣不需要共用 host.teardownFn）。
 func (a *App) NewSession(provider string) error {
 	if provider != "claude" && provider != "codex" {
 		return fmt.Errorf("unknown provider %q", provider)

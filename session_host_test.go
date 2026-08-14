@@ -55,6 +55,48 @@ func TestTakeHostOnlyRemovesTheSameHost(t *testing.T) {
 	}
 }
 
+// socket 槽位 free-list：唯一性靠配置保證，歸還靠 identity check（見
+// reserveSockIndex／releaseSockIndex doc）。
+func TestSockIndexFreeList(t *testing.T) {
+	a, _ := newTestApp(t)
+	h1, h2 := &sessionHost{wsid: "w1", sockIndex: -1}, &sessionHost{wsid: "w2", sockIndex: -1}
+	i1, err := a.reserveSockIndex(h1)
+	if err != nil || i1 != 0 {
+		t.Fatalf("第一個槽位應為 0：%d %v", i1, err)
+	}
+	i2, err := a.reserveSockIndex(h2)
+	if err != nil || i2 != 1 {
+		t.Fatalf("併發配置不得撞號：%d %v", i2, err)
+	}
+	h1.sockIndex, h2.sockIndex = i1, i2
+
+	// identity check：h2 不能把 h1 的槽位放掉
+	stale := &sessionHost{wsid: "w1", sockIndex: i1}
+	a.releaseSockIndex(stale)
+	if next, _ := a.reserveSockIndex(&sessionHost{sockIndex: -1}); next == i1 {
+		t.Fatal("非擁有者不得歸還槽位（identity check 失效 → 兩個 session 共用 socket）")
+	}
+
+	a.releaseSockIndex(h1) // 真正的擁有者歸還後才可重用
+	h3 := &sessionHost{wsid: "w3", sockIndex: -1}
+	if got, err := a.reserveSockIndex(h3); err != nil || got != i1 {
+		t.Fatalf("釋放後的槽位必須可重用：%d %v", got, err)
+	}
+}
+
+// 上限用盡一律 fail loud，不降級成共用 socket。
+func TestSockIndexExhaustionFailsLoud(t *testing.T) {
+	a, _ := newTestApp(t)
+	for i := 0; i < maxApprovalSockets; i++ {
+		if _, err := a.reserveSockIndex(&sessionHost{sockIndex: -1}); err != nil {
+			t.Fatalf("第 %d 個槽位不該失敗：%v", i, err)
+		}
+	}
+	if _, err := a.reserveSockIndex(&sessionHost{sockIndex: -1}); err == nil {
+		t.Fatal("槽位用盡必須回錯")
+	}
+}
+
 func TestSnapshotHostsIsRaceFree(t *testing.T) {
 	a, _ := newTestApp(t)
 	var wg sync.WaitGroup

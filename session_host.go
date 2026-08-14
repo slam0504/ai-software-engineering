@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"path/filepath"
+	"strconv"
+
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
@@ -19,18 +23,28 @@ import (
 // 填好才登記，putHost 的 a.mu 釋放即為 happens-before 邊界，之後的讀者（hostFor／
 // snapshotHosts／hostsOf 拿到的指標）可以在鎖外安全讀取。
 //
+// 這條規約由「不把 host 指標交給任何在 publish 之前就啟動的 goroutine」來維持
+// （review Important #2）：startClaude 的兩條 pump goroutine 只拿到窄值（wsid／
+// provider／broker）與兩個在 a.mu 下操作的 closure，拿不到 host 本身，因此不可能
+// 讀到尚未寫入的 sess／pumpDone／lease／teardownFn。
+//
 // sessionID 是唯一 publish 後仍會變動的欄位（claude init 抵達時回填），一律經
 // hostSessionID／setHostSessionID 在 a.mu 下存取。
 //
-// teardown 會「寫」host（關 broker、finalize lease），因此必須先 takeHost 取出
-// ——取出後沒有任何新讀者能拿到該指標，才在鎖外獨佔處置（見 dropHost doc）。
+// 處置（teardown、關 broker、釋放 socket index）一律先 takeHost 取出——取出後沒有
+// 任何新讀者能拿到該指標，才在鎖外獨佔處置（見 dropHost doc）。
 type sessionHost struct {
 	wsid     appcore.WSID
 	provider contract.Provider
 
-	sess       *claude.Session
-	sockPath   string // per-WSID approval broker socket（§3.3；每個 WSID 各自獨立）
-	mcpPath    string // per-WSID Codex MCP socket（同上）
+	sess *claude.Session
+	// sockPath：per-host approval broker socket。檔名用 approval-<sockIndex>.sock
+	// 而**不是** WSID：unix sockaddr 的 sun_path 只有 ~104 bytes，26 字元的 ULID
+	// 會讓 production 的 `<cwd>/.workbench` 直接 bind 失敗（review Critical）。
+	// socket 是 ephemeral runtime 資源、不是 identity——identity 在 registry。
+	sockPath   string
+	sockIndex  int    // reserveSockIndex 配到的槽位（-1 = 未配置）
+	mcpPath    string // per-WSID MCP config（普通檔案，不受 sun_path 限制）
 	broker     *approval.Broker
 	pumpDone   <-chan struct{}
 	teardownFn func() error
@@ -38,6 +52,53 @@ type sessionHost struct {
 	threadID   string
 	track      appcore.TurnTrack
 	sessionID  string
+}
+
+// maxApprovalSockets：同時存在的 approval socket 上限——2 provider ×
+// appcore.MaxSessionsPerProvider。free-list 因此天然有界，配不到即 fail loud
+// （理論上不可達：Manager 的 slot 上限先擋住）。
+const maxApprovalSockets = 2 * appcore.MaxSessionsPerProvider
+
+// approvalSockPath：short-path socket 檔名（見 sessionHost.sockPath doc）。
+func approvalSockPath(stateDir string, index int) string {
+	return filepath.Join(stateDir, "approval-"+strconv.Itoa(index)+".sock")
+}
+
+// reserveSockIndex：配置一個目前沒人在用的最小 socket index 給 h，並把 h 登記為
+// 該 index 的擁有者。唯一性由**配置**保證（不是靠雜湊碰撞機率），釋放一律經
+// releaseSockIndex 的 identity check。
+//
+// 刻意不用「掃描 sessionHosts 找沒被用到的 index」：host 要等全部欄位填妥才
+// publish，掃描會讓兩個併發的 startClaude 配到同一個 index。獨立的 owner map 讓
+// 「檢查 ＋ 佔用」在同一個臨界區內原子完成。
+func (a *App) reserveSockIndex(h *sessionHost) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sockIndexOwner == nil {
+		a.sockIndexOwner = map[int]*sessionHost{}
+	}
+	for i := 0; i < maxApprovalSockets; i++ {
+		if a.sockIndexOwner[i] == nil {
+			a.sockIndexOwner[i] = h
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("app: approval socket 槽位已滿（上限 %d）", maxApprovalSockets)
+}
+
+// releaseSockIndex：歸還 h 佔用的 socket index（未配置或已被別人接手一律 no-op）。
+// identity check 是必要的：同一個 host 的 teardown 可能被走兩條路徑各跑一次
+// （OnceValue 之外還有 EndSession／NewSession 各自的 fresh 閉包），若無條件依
+// index 歸還，會把已經配給下一個 session 的槽位放掉，兩個 session 就會共用 socket。
+func (a *App) releaseSockIndex(h *sessionHost) {
+	if h == nil || h.sockIndex < 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sockIndexOwner[h.sockIndex] == h {
+		delete(a.sockIndexOwner, h.sockIndex)
+	}
 }
 
 // hostFor：回傳 wsid 對應的 sessionHost；不存在回 nil。呼叫端讀到的是指標本身
@@ -61,10 +122,12 @@ func (a *App) putHost(h *sessionHost) {
 // dropHost：移除 wsid 對應的 sessionHost 並回傳被移除的那個（不存在回 nil）。
 //
 // take-then-dispose（Task 8 凍結）：a.mu 只保護「map 裡放的是哪些指標」，不保護
-// 指標指向的物件；teardown 會寫 host（關 broker、finalize lease），若同時有別的
-// 路徑經 hostFor 拿到同一指標讀 sess／broker 就是 race。因此處置一律「先在鎖內
-// 取出（此後沒有新讀者能取得該指標）→ 再於鎖外 teardown」，沿用 repo 既有
-// codex.Single.Take() 的取出即獨佔語意。
+// 指標指向的物件。teardown 會把 host 持有的資源處置掉——關掉 broker（listener
+// 一關就 unlink socket 檔案）、finalize lease、歸還 socket index——處置之後這些
+// 欄位的值仍在，但指向的東西已經不能用了。若同時有別的路徑經 hostFor 拿到同一
+// 指標去 dial 那個 socket 或 Send 那個 sess，就會操作到正在消失的資源。因此處置
+// 一律「先在鎖內取出（此後沒有新讀者能取得該指標）→ 再於鎖外處置」，沿用 repo
+// 既有 codex.Single.Take() 的取出即獨佔語意。
 func (a *App) dropHost(wsid appcore.WSID) *sessionHost {
 	a.mu.Lock()
 	defer a.mu.Unlock()
