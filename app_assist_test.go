@@ -267,6 +267,51 @@ func newTestAppGitAssist(t *testing.T, r assist.Runner) (*App, *captureEnvs) {
 	return a, cap
 }
 
+// plantPlannerBinScript：把 fake provider CLI script 安到 planPreflight 會找的
+// pin 路徑（claudeCLIPath／codexCLIPath）。toolsDir 先移出 workspace——
+// newTestApp 預設 ws/tools，fake bin 會變成 non-plan dirty、誤觸 PlanAssist
+// 的乾淨樹前置檢查。回傳 bin 路徑（recovery 測試會原地換內容）。
+func plantPlannerBinScript(t *testing.T, a *App, provider, script string) string {
+	t.Helper()
+	if strings.HasPrefix(a.toolsDirPath, a.workspaceDir) {
+		a.toolsDirPath = filepath.Join(a.stateDir, "tools")
+	}
+	name := "claude"
+	if provider == "codex" {
+		name = "codex"
+	}
+	dir := filepath.Join(a.toolsDirPath, provider+"-cli", "node_modules", ".bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// plantPlannerBin：fake provider CLI，`--version` 回 versionLine。
+func plantPlannerBin(t *testing.T, a *App, provider, versionLine string) string {
+	t.Helper()
+	return plantPlannerBinScript(t, a, provider, "#!/bin/sh\necho \""+versionLine+"\"\n")
+}
+
+// approveGate1Spec：建 baseline spec → commit → gate1 送核＋核可（PlanAssist
+// 前置條件；同 TestPlanAssistRejectsNonPlanDirtyTree 的 inline 步驟）。
+func approveGate1Spec(t *testing.T, a *App) {
+	t.Helper()
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // runnerMustNotBeCalled：precondition-failure 測試用 fake Runner——若被呼叫，
 // 代表 fail-closed 前置檢查沒有真的擋在 runner 啟動之前（bug，而非驗證通過）。
 func runnerMustNotBeCalled(t *testing.T) assist.Runner {
@@ -306,6 +351,47 @@ func TestPlanAssistRejectsNonPlanDirtyTree(t *testing.T) {
 	}
 }
 
+// TestPlanAssistAllowsPlanDirtyTree is the positive counterpart to
+// TestPlanAssistRejectsNonPlanDirtyTree: nonPlanDirtyPaths (app.go) filters
+// out anything under spec.PlanScope ("plan/**") before deciding a tree is
+// dirty, so an uncommitted change under plan/ must NOT block PlanAssist —
+// only a dirty file outside plan/ does.
+func TestPlanAssistAllowsPlanDirtyTree(t *testing.T) {
+	var called bool
+	capture := runnerFunc(func(_ context.Context, _ string, sink func(contract.Envelope)) error {
+		called = true
+		sink(contract.Wrap(contract.Event{Provider: contract.ProviderClaude,
+			Kind: contract.KindDelta, Text: "draft", Raw: []byte(`{}`)}, ""))
+		return nil
+	})
+	a, _ := newTestAppGitAssist(t, capture)
+	plantPlannerBin(t, a, "claude", "2.1.223 (Claude Code)") // preflight（§3.4）需 pin bin
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// plan/ has an uncommitted change — must be allowed, not rejected as dirty.
+	if err := os.MkdirAll(filepath.Join(a.workspaceDir, "plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a.workspaceDir, "plan", "P1.yaml"), []byte("plan_id: P1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
+		t.Fatalf("PlanAssist must not be rejected by an uncommitted plan/** change, got: %v", err)
+	}
+	if !called {
+		t.Fatal("PlanAssist preconditions passed but the runner was never invoked")
+	}
+}
+
 func TestPlanAssistInjectsAnalysisBaseAndSpecDigest(t *testing.T) {
 	var capturedPrompt string
 	capture := runnerFunc(func(_ context.Context, prompt string, sink func(contract.Envelope)) error {
@@ -315,6 +401,7 @@ func TestPlanAssistInjectsAnalysisBaseAndSpecDigest(t *testing.T) {
 		return nil
 	})
 	a, cap := newTestAppGitAssist(t, capture)
+	plantPlannerBin(t, a, "claude", "2.1.223 (Claude Code)") // preflight（§3.4）需 pin bin
 	a.SpecWrite("spec/glossary.md", "term v1", "")
 	commitAll(t, a)
 	id, err := a.SubmitForApproval()
@@ -365,5 +452,241 @@ func TestPlanAssistInjectsAnalysisBaseAndSpecDigest(t *testing.T) {
 	}
 	if !sawPlanDraft {
 		t.Fatal("PlanAssist events must be emitted with purpose=plan_draft")
+	}
+}
+
+// ---- PlanAssist provider capability preflight（M3a.1 Task 7：spec §3.4）----
+
+// nilRunner：立即成功、不發事件的 fake Runner。
+func nilRunner() assist.Runner {
+	return runnerFunc(func(context.Context, string, func(contract.Envelope)) error { return nil })
+}
+
+// preflight 失敗 → PlanAssist 拒＋hard planner-enforcement 項＋runner 零呼叫；
+// bin 換回 pin 版 → 下一次 PlanAssist 前系統 resolve 舊項（修復條件閉環）。
+func TestPlanAssistPreflightFailureFailsClosedAndRecovers(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	approveGate1Spec(t, a)
+	bin := plantPlannerBin(t, a, "claude", "9.9.9 (Claude Code)") // 非 pin 版本
+
+	_, err := a.PlanAssist("claude", "draft plan")
+	if !errors.Is(err, assist.ErrEnforcementUnproven) {
+		t.Fatalf("preflight failure must reject with ErrEnforcementUnproven, got: %v", err)
+	}
+	e := openItemByKey(t, a, "planner-enforcement-preflight:claude")
+	if e == nil {
+		t.Fatal("preflight failure must open a planner-enforcement-preflight escalation item")
+	}
+	if !e.Item.Hard {
+		t.Fatal("planner-enforcement-preflight item must be hard (system-resolve only)")
+	}
+
+	// 恢復：bin 原地換回 pin 版（digest 變更 → cache miss 重驗）。
+	if werr := os.WriteFile(bin, []byte("#!/bin/sh\necho \"2.1.223 (Claude Code)\"\n"), 0o755); werr != nil {
+		t.Fatal(werr)
+	}
+	a.assistRunnerFactory = func(string) (assist.Runner, error) { return nilRunner(), nil }
+	if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
+		t.Fatalf("PlanAssist after pin-version recovery must succeed, got: %v", err)
+	}
+	if openItemByKey(t, a, "planner-enforcement-preflight:claude") != nil {
+		t.Fatal("a re-passing preflight must system-resolve the planner-enforcement-preflight item")
+	}
+}
+
+// 誤分類禁止：preflight 通過後的 runner 失敗是一般錯誤——不得建 enforcement 項。
+func TestPlanAssistRunnerFailureNotMisclassifiedAsEnforcement(t *testing.T) {
+	boom := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return errors.New("assist: runner spawn failed (generic)")
+	})
+	a, _ := newTestAppGitAssist(t, boom)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "claude", "2.1.223 (Claude Code)")
+
+	_, err := a.PlanAssist("claude", "draft plan")
+	if err == nil {
+		t.Fatal("runner failure must surface")
+	}
+	if errors.Is(err, assist.ErrEnforcementUnproven) {
+		t.Fatalf("post-preflight runner failure must not be classified as unproven enforcement: %v", err)
+	}
+	for _, key := range []string{"planner-enforcement-preflight:claude", "planner-enforcement-runtime:claude"} {
+		if openItemByKey(t, a, key) != nil {
+			t.Fatalf("post-preflight runner failure must NOT open %s (misclassification)", key)
+		}
+	}
+}
+
+// Codex runtime violation（typed *EnforcementViolation）→ runtime hard 項；
+// preflight key 不受影響（兩 key 條件隔離，spec §3.4 erratum）。
+func TestPlanAssistCodexRuntimeViolationOpensHardItem(t *testing.T) {
+	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
+	})
+	a, _ := newTestAppGitAssist(t, violating)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "codex", "codex-cli 0.146.1")
+
+	_, err := a.PlanAssist("codex", "draft plan")
+	var viol *assist.EnforcementViolation
+	if !errors.As(err, &viol) {
+		t.Fatalf("runtime violation must surface typed, got: %v", err)
+	}
+	e := openItemByKey(t, a, "planner-enforcement-runtime:codex")
+	if e == nil || !e.Item.Hard {
+		t.Fatalf("codex runtime violation must open a hard planner-enforcement-runtime item, got: %+v", e)
+	}
+	if openItemByKey(t, a, "planner-enforcement-preflight:codex") != nil {
+		t.Fatal("runtime violation must not touch the preflight condition key")
+	}
+}
+
+// escalation journal 寫入失敗：preflight 失敗的 hard 項寫不進去 → PlanAssist
+// 仍拒＋錯誤含 journal 失敗（§3.10 fail closed，不得只回 preflight 錯誤）。
+func TestPlanAssistPreflightJournalWriteFailureStillRejects(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "claude", "9.9.9 (Claude Code)")
+	if _, err := a.EscalationList(); err != nil { // 先初始化 escalation journal
+		t.Fatal(err)
+	}
+	if err := a.escJournal.Close(); err != nil { // 之後任何 append 都失敗
+		t.Fatal(err)
+	}
+
+	_, err := a.PlanAssist("claude", "draft plan")
+	if !errors.Is(err, assist.ErrEnforcementUnproven) {
+		t.Fatalf("preflight failure must still reject when the journal write fails, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("error must carry the escalation journal failure, got: %v", err)
+	}
+}
+
+// 快取契約：同 binary（同 digest）第二次 PlanAssist 走快取（--version 不重跑）；
+// binary 內容變更 → digest 變 → miss 重驗。
+func TestPlanAssistPreflightCachedUntilBinaryChanges(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, nilRunner())
+	approveGate1Spec(t, a)
+	countScript := "#!/bin/sh\necho x >> \"$0.count\"\necho \"2.1.223 (Claude Code)\"\n"
+	bin := plantPlannerBinScript(t, a, "claude", countScript)
+
+	countLines := func() int {
+		b, _ := os.ReadFile(bin + ".count")
+		return strings.Count(string(b), "\n")
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
+			t.Fatalf("PlanAssist #%d: %v", i+1, err)
+		}
+	}
+	if n := countLines(); n != 1 {
+		t.Fatalf("same-digest binary must be verified exactly once (cache hit), got %d --version runs", n)
+	}
+	// 內容變更（註解行）→ digest 變 → 必須重驗。
+	if err := os.WriteFile(bin, []byte(countScript+"# v2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
+		t.Fatal(err)
+	}
+	if n := countLines(); n != 2 {
+		t.Fatalf("changed binary digest must force re-verification, got %d --version runs", n)
+	}
+}
+
+// (a) channel-barrier（spec §3.4 erratum，owner 2026-08-14）：runtime blocker
+// 存在時發起乾淨恢復 run——run 尚未結束（runner 卡在 hook）期間 blocker 必須
+// 仍有效（Gate decision 被擋）；run 成功結束才系統解除；之後 Gate decision
+// 通過。守住「僅過靜態 preflight 就提前解除」的誤放行窗口。
+func TestPlanAssistRuntimeBlockerHeldUntilCleanRunCompletes(t *testing.T) {
+	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
+	})
+	a, _ := newTestAppGitAssist(t, violating)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "codex", "codex-cli 0.146.1")
+	// 同 manifest 再送一枚 pending gate1 決議（Submit 不受 blocker 影響），
+	// 供 blocker 生效期間／解除後的 GateDecide 對照。
+	pendingID, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) violation run → runtime blocker 建立。
+	if _, err := a.PlanAssist("codex", "draft plan"); err == nil {
+		t.Fatal("violation run must fail")
+	}
+	if e := openItemByKey(t, a, "planner-enforcement-runtime:codex"); e == nil || !e.Item.Hard {
+		t.Fatalf("violation must open the hard runtime blocker, got: %+v", e)
+	}
+
+	// 2) 乾淨恢復 run 進行中（preflight 已過、runner 卡住）：blocker 仍有效。
+	started := make(chan struct{})
+	release := make(chan struct{})
+	a.assistRunnerFactory = func(string) (assist.Runner, error) {
+		return runnerFunc(func(ctx context.Context, _ string, _ func(contract.Envelope)) error {
+			close(started)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}), nil
+	}
+	runErr := make(chan error, 1)
+	go func() { _, err := a.PlanAssist("codex", "recovery run"); runErr <- err }()
+	<-started // barrier：靜態 preflight 已通過、runner 執行中、run 未結束
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+		t.Fatal("runtime blocker must NOT be released while the recovery run is still in flight")
+	}
+	if derr := a.GateDecide(pendingID, "approved", "ok", nil); derr == nil || !strings.Contains(derr.Error(), "blocked by") {
+		t.Fatalf("gate decision during the in-flight recovery run must stay vetoed, got: %v", derr)
+	}
+
+	// 3) run 成功結束 → 系統解除 → Gate decision 通過。
+	close(release)
+	if err := <-runErr; err != nil {
+		t.Fatalf("clean recovery run must succeed, got: %v", err)
+	}
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") != nil {
+		t.Fatal("a fully clean PlanAssist run must system-resolve the runtime blocker")
+	}
+	if err := a.GateDecide(pendingID, "approved", "resolved", nil); err != nil {
+		t.Fatalf("gate decision after the clean run must pass, got: %v", err)
+	}
+}
+
+// (b) 一般錯誤與逾時／取消的 run 結束後 runtime blocker 仍在——只有「成功結束
+// 且全程無 violation」的 run 才是修復條件。
+func TestPlanAssistRuntimeBlockerSurvivesGenericFailures(t *testing.T) {
+	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
+	})
+	a, _ := newTestAppGitAssist(t, violating)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "codex", "codex-cli 0.146.1")
+	if _, err := a.PlanAssist("codex", "draft plan"); err == nil {
+		t.Fatal("violation run must fail")
+	}
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+		t.Fatal("violation must open the runtime blocker")
+	}
+
+	for name, rerr := range map[string]error{
+		"generic error":  errors.New("assist: runner exploded (generic)"),
+		"timeout/cancel": context.DeadlineExceeded,
+	} {
+		failing := rerr
+		a.assistRunnerFactory = func(string) (assist.Runner, error) {
+			return runnerFunc(func(context.Context, string, func(contract.Envelope)) error { return failing }), nil
+		}
+		if _, err := a.PlanAssist("codex", "retry"); err == nil {
+			t.Fatalf("%s: run must fail", name)
+		}
+		if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+			t.Fatalf("%s: a failed run must NOT release the runtime blocker", name)
+		}
 	}
 }

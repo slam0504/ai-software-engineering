@@ -2,14 +2,16 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
-  ConfirmPlanCommit, PlanAssist, PlanList, PlanRead, PlanWrite, PreviewPlanCommit, SubmitPlanForApproval,
+  ConfirmAnalysisBaseBump, ConfirmPlanCommit, PlanAssist, PlanList, PlanRead, PlanWrite,
+  PreviewAnalysisBaseBump, PreviewPlanCommit, SubmitPlanForApproval,
 } from '../../wailsjs/go/main/App'
-import type { spec } from '../../wailsjs/go/models'
+import type { main, spec } from '../../wailsjs/go/models'
 import { usePlan } from '../stores/plan'
 // extractGherkin 只在 info tag 為 gherkin/feature 時才特殊處理，其餘（含無 tag／yaml
 // tag）一律走通用 fence 擷取路徑——對 plan YAML 草稿一樣適用，別名匯入避免誤讀成
 // domain 耦合（沿用既有、已測試涵蓋的 fence 擷取邏輯，不重複實作）。
 import { extractGherkin as extractDraftContent } from '../lib/gherkin'
+import { templateFor, inScope, PLAN_SCOPE_PATTERNS } from '../lib/planTemplates'
 
 const { t } = useI18n()
 
@@ -34,7 +36,10 @@ const emit = defineEmits<{ (e: 'escalate', payload: { sourceRef: string; blockSc
 const plan = usePlan()
 
 const selectedPath = ref('')
-const effectivePath = computed(() => props.path ?? selectedPath.value)
+// effectivePath：selectedPath 是唯一權威來源——props.path 只在 mount／變動時
+// seed 一次（見下方 onMounted／watch(props.path)），seed 完之後檔案清單的手動
+// selectFile 點擊照常生效，不會被 prop 永久蓋掉（見 watch(props.path) 註解）。
+const effectivePath = computed(() => selectedPath.value)
 
 // escalate：review fix（spec §3.8 回填）——sourceRef 帶目前 plan 檔的 rel path
 // （effectivePath，永遠可得；planIdInput 只在 plan/<id>.yaml 才推得出來，見
@@ -66,6 +71,19 @@ const commitDiff = ref('')
 const commitMessage = ref('')
 const commitBusy = ref(false)
 
+// analysis_base bump 引導 UI（M3a.1 Task 6，spec §3.2）：bumpPreview 是
+// PreviewAnalysisBaseBump 目前結果的快取，只在「檔案載入／儲存成功／視窗
+// 聚焦」時機重新查（brief 凍結——不逐鍵擊呼叫），且只對主要 plan 文件查
+// （isPrimaryPlanPath；risk-policy／oracle-surface／permissions 沒有
+// analysis_base_commit 欄位，查了必錯，不是操作者需要看到的錯誤）。Preview
+// 本身失敗（例如 analysis_base_commit 尚未填、plan 還在草稿階段）視為正常
+// 過渡狀態，靜默清空 bumpPreview，不推進 plan.errors——那不是操作者這時要
+// 處理的問題（模板本就把這欄位留空，見 planTemplates.ts planSkeleton）。
+const bumpPreview = ref<main.BumpPreview | null>(null)
+const bumpPanelOpen = ref(false)
+const bumpConfirmBusy = ref(false)
+const bumpConfirmError = ref('')
+
 const editorHost = ref<HTMLElement | null>(null)
 let cmView: { destroy(): void; dispatch(spec: unknown): void; state: { doc: { length: number } } } | null = null
 
@@ -95,9 +113,64 @@ async function loadFile() {
     bufferDirty.value = false
     planIdInput.value = deriveDefaultPlanId(effectivePath.value)
     syncEditorDoc()
+    await checkBump()
   } catch (e) {
     loadError.value = String(e)
   }
+}
+
+// checkBump：analysis_base bump 觸發點之一（brief 凍結：檔案載入／儲存成功／
+// 視窗聚焦——見 loadFile／saveFile／onWindowFocus，非逐鍵擊）。只對主要 plan
+// 文件查（見上方 bumpPreview 宣告註解）。keepConfirmError 供 confirmBump 失敗
+// 後的重新預覽用：那次重查是為了刷新面板內容，不該連帶清掉剛顯示的錯誤訊息。
+async function checkBump(opts: { keepConfirmError?: boolean } = {}) {
+  if (!isPrimaryPlanPath(effectivePath.value)) {
+    bumpPreview.value = null
+  } else {
+    try {
+      bumpPreview.value = await PreviewAnalysisBaseBump(effectivePath.value, plan.currentContent)
+    } catch {
+      bumpPreview.value = null
+    }
+  }
+  if (!opts.keepConfirmError) bumpConfirmError.value = ''
+}
+
+function resetBump() {
+  bumpPreview.value = null
+  bumpPanelOpen.value = false
+  bumpConfirmError.value = ''
+}
+
+// confirmBump：ConfirmAnalysisBaseBump 通過後，editor buffer 直接被
+// updatedBuffer 取代（標記未儲存——落地仍要走既有「儲存」／PlanWrite 樂觀
+// 鎖，同 applyDraft 套用草稿的兩步慣例）。失敗（token 過期／buffer 或 HEAD
+// 變動）原文顯示錯誤，並重新查一次 Preview 讓面板內容回到目前實際狀態
+// （brief：「要求重新預覽」）。
+async function confirmBump() {
+  if (!bumpPreview.value || bumpPreview.value.no_bump_needed) return
+  bumpConfirmBusy.value = true
+  try {
+    const updated = await ConfirmAnalysisBaseBump(bumpPreview.value.token, effectivePath.value, plan.currentContent)
+    bumpConfirmError.value = ''
+    plan.currentContent = updated
+    bufferDirty.value = true
+    syncEditorDoc()
+    bumpPreview.value = null
+    bumpPanelOpen.value = false
+  } catch (e) {
+    bumpConfirmError.value = String(e)
+    await checkBump({ keepConfirmError: true })
+  } finally {
+    bumpConfirmBusy.value = false
+  }
+}
+
+// onBumpRerunAssist：bump 面板「重新執行 PlannerAssist」建議按鈕，直接觸發
+// 既有 PlanAssist 流程（runAssist）——不是另一條路徑，只是同一個動作在 bump
+// 情境下的入口。
+function onBumpRerunAssist() {
+  void runAssist()
 }
 
 function syncEditorDoc() {
@@ -123,14 +196,34 @@ async function initEditor() {
   }
 }
 
+// onWindowFocus：bump 觸發時機之三（brief 凍結：視窗聚焦）——操作者切回視窗
+// 時可能其他人已推進 HEAD，重查一次讓提示條反映目前狀態。
+function onWindowFocus() {
+  void checkBump()
+}
+
 onMounted(async () => {
+  if (props.path) selectedPath.value = props.path // 見下方 watch(props.path) 註解
   await loadFileList()
   await loadFile()
   await initEditor()
+  window.addEventListener('focus', onWindowFocus)
 })
-onBeforeUnmount(() => cmView?.destroy())
-watch(() => props.path, () => {
+onBeforeUnmount(() => {
+  cmView?.destroy()
+  window.removeEventListener('focus', onWindowFocus)
+})
+// M3a.1 Task 11（spec §3.5）：STALE 重核引導從 App.vue 一次性帶入 path 導航到
+// 指定 plan 檔（例如 GateConsole／EscalationInbox 的「前往重新送核」）。path
+// 只當「seed」——寫入 selectedPath 後，effectivePath 就以 selectedPath 為準，
+// 之後操作者在檔案清單點別的檔（selectFile）仍照常生效，不會被 prop 永久鎖死
+// 在導航進來的那個檔案（原本 `props.path ?? selectedPath.value` 若不 seed，
+// 只要 path prop 還留著非空值，selectFile 點擊會被完全蓋掉——清單看起來能點，
+// 實際檔案永遠不換）。
+watch(() => props.path, (p) => {
+  if (p) selectedPath.value = p
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免套用草稿把 A 的草稿寫進 B（同 SpecWorkspace fix round 1）
+  resetBump()
   void loadFile()
 })
 
@@ -141,7 +234,46 @@ function resetDraft() {
 function selectFile(p: string) {
   selectedPath.value = p
   resetDraft()
-  if (!props.path) void loadFile()
+  resetBump()
+  void loadFile()
+}
+
+// 新增檔案 inline 列（M3a.1 Task 4，spec §3.1 SC4 缺口 1）：路徑輸入＋即時 scope
+// 預驗（plan/**，UI 提示用——後端 PlanWrite 的 spec.PlanScope.Match 仍是權威
+// 驗證）＋單一 plan 擋（見下方 isPrimaryPlanPath／hasPrimaryPlan：清單已存在
+// 一份主要 plan 文件時，再輸入另一個主要 plan 路徑禁止送出——risk-policy／
+// oracle-surface／permissions 不算主要 plan，不受限）＋送出呼叫
+// PlanWrite(path, templateFor(path), '')（新檔：expectedDigest 留空）。成功後
+// 才重載清單並選取新檔；失敗經 plan.pushError 原樣顯示（同 saveFile／
+// submitForApproval 等既有 write 路徑慣例），清單不動。
+const newFilePath = ref('')
+const newFileBusy = ref(false)
+const newFileInScope = computed(() => newFilePath.value !== '' && inScope(newFilePath.value, PLAN_SCOPE_PATTERNS))
+
+// isPrimaryPlanPath：符合單一 plan 限制檢查的「主要 plan 文件」——plan/<id>.yaml，
+// 排除 risk-policy.yaml／oracle-surface.yaml（brief Step 3：清單中已存在符合
+// /^plan\/[^/]+\.yaml$/ 且非 risk-policy/oracle-surface 的檔案）。
+function isPrimaryPlanPath(path: string): boolean {
+  return /^plan\/[^/]+\.yaml$/.test(path) && path !== 'plan/risk-policy.yaml' && path !== 'plan/oracle-surface.yaml'
+}
+const hasPrimaryPlan = computed(() => plan.files.some(f => isPrimaryPlanPath(f.path)))
+const singlePlanBlocked = computed(() => hasPrimaryPlan.value && isPrimaryPlanPath(newFilePath.value))
+
+async function createNewFile() {
+  if (!newFilePath.value || !newFileInScope.value || singlePlanBlocked.value) return
+  const path = newFilePath.value
+  const writer = props.write ?? PlanWrite
+  newFileBusy.value = true
+  try {
+    await writer(path, templateFor(path), '')
+    await loadFileList()
+    selectFile(path)
+    newFilePath.value = ''
+  } catch (e) {
+    plan.pushError(String(e))
+  } finally {
+    newFileBusy.value = false
+  }
 }
 
 // runAssist：呼叫 PlanAssist(provider, prompt)，輸出經 EventsOn('workbench:event')
@@ -183,6 +315,7 @@ async function saveFile() {
     const newDigest = await writer(effectivePath.value, plan.currentContent, plan.currentDigest)
     plan.currentDigest = newDigest
     bufferDirty.value = false
+    await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
   } catch (e) {
     plan.pushError(String(e))
   } finally {
@@ -232,6 +365,16 @@ async function confirmCommit() {
 
 <template>
   <div class="plan-workspace">
+    <div class="new-file">
+      <input v-model="newFilePath" data-test="new-file-path" :placeholder="t('newFile.path.placeholder')" />
+      <button
+        type="button" data-test="new-file-submit" :disabled="newFileBusy || !newFilePath || !newFileInScope || singlePlanBlocked"
+        @click="createNewFile"
+      >{{ t('newFile.action.create') }}</button>
+      <span v-if="newFilePath && !newFileInScope" class="err" data-test="new-file-scope-hint">{{ t('newFile.scopeHint') }}</span>
+      <span v-else-if="singlePlanBlocked" class="err" data-test="new-file-single-plan-hint">{{ t('newFile.singlePlanBlocked') }}</span>
+    </div>
+
     <div class="files">
       <button v-for="f in plan.files" :key="f.path" :class="{ active: f.path === effectivePath }"
         @click="selectFile(f.path)">{{ f.name }}</button>
@@ -260,6 +403,37 @@ async function confirmCommit() {
       <button data-test="save" :disabled="saveBusy || !bufferDirty" @click="saveFile">{{ t('planWorkspace.action.save') }}</button>
     </div>
 
+    <div v-if="bumpPreview || bumpConfirmError" class="bump-area">
+      <div v-if="bumpPreview && bumpPreview.no_bump_needed" class="bump-no-bump-needed" data-test="bump-no-bump-needed">
+        {{ t('bump.noBumpNeeded') }}
+      </div>
+      <div v-else-if="bumpPreview" class="bump-banner" data-test="bump-banner">
+        <span>{{ t('bump.banner.message') }}</span>
+        <button type="button" data-test="bump-toggle" @click="bumpPanelOpen = !bumpPanelOpen">{{ t('bump.action.viewDiff') }}</button>
+      </div>
+      <div v-if="bumpPreview && !bumpPreview.no_bump_needed && bumpPanelOpen" class="bump-panel" data-test="bump-panel">
+        <p class="bump-shas">
+          <span :title="bumpPreview.old" data-test="bump-old">{{ bumpPreview.old.slice(0, 10) }}</span>
+          →
+          <span :title="bumpPreview.head" data-test="bump-head">{{ bumpPreview.head.slice(0, 10) }}</span>
+        </p>
+        <ul class="bump-commits" data-test="bump-commits">
+          <li v-for="c in bumpPreview.commits" :key="c.oid">{{ c.oid.slice(0, 10) }} — {{ c.subject }}</li>
+        </ul>
+        <ul class="bump-touched-files" data-test="bump-touched-files">
+          <li v-for="f in bumpPreview.touched_files" :key="f">{{ f }}</li>
+        </ul>
+        <p class="bump-warning" data-test="bump-warning">{{ t('bump.warning') }}</p>
+        <button type="button" data-test="bump-rerun-assist" @click="onBumpRerunAssist">{{ t('bump.action.rerunAssist') }}</button>
+        <button type="button" data-test="bump-confirm" :disabled="bumpConfirmBusy" @click="confirmBump">{{ t('bump.action.confirm') }}</button>
+      </div>
+      <!-- bumpConfirmError 獨立於面板外層——Confirm 失敗後觸發的重新預覽
+           （checkBump keepConfirmError）若把狀態翻成 no_bump_needed 或本身也
+           失敗（bumpPreview 變 null），錯誤訊息仍要留著，不能因為面板收合／
+           消失就跟著靜默不見（Fail Loud）。 -->
+      <p v-if="bumpConfirmError" class="err" data-test="bump-confirm-error">{{ bumpConfirmError }}</p>
+    </div>
+
     <div class="approval">
       <input v-model="planIdInput" data-test="plan-id" :placeholder="t('planWorkspace.planId.placeholder')" />
       <button data-test="submit-gate2" :disabled="submitBusy || !planIdInput" @click="submitForApproval">{{ t('planWorkspace.action.submit') }}</button>
@@ -284,6 +458,7 @@ async function confirmCommit() {
 
 <style scoped>
 .plan-workspace { display: flex; flex-direction: column; gap: 8px; padding: 8px; text-align: left; height: 100%; overflow-y: auto; }
+.new-file { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .files { display: flex; gap: 4px; flex-wrap: wrap; }
 .files button.active { background: var(--bg-bubble-user); color: #fff; }
 .editor { height: 280px; min-height: 120px; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
@@ -293,6 +468,12 @@ async function confirmCommit() {
 .draft-area { display: flex; flex-direction: column; gap: 4px; }
 .draft-text { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); min-height: 60px; max-height: 240px; overflow-y: auto; }
 .diff { white-space: pre-wrap; background: var(--bg-inset); padding: 8px; border-radius: var(--radius-s); max-height: 240px; overflow-y: auto; }
+.bump-area { display: flex; flex-direction: column; gap: 4px; }
+.bump-banner { display: flex; align-items: center; gap: 8px; background: var(--bg-inset); padding: 6px 8px; border-radius: var(--radius-s); }
+.bump-no-bump-needed { color: var(--text-muted); font-size: var(--fs-s); }
+.bump-panel { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-s); }
+.bump-commits, .bump-touched-files { margin: 0; padding-left: 16px; max-height: 160px; overflow-y: auto; }
+.bump-warning { font-weight: 600; }
 .assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }

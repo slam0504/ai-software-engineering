@@ -191,6 +191,36 @@ func TestStaleBlockerReleasedByReplacementApproval(t *testing.T) { // P1：stale
 	}
 }
 
+// ---- M3a.1 Task 11（spec §3.5）：stale summary 措辭凍結——引導必須建立修正版
+// 重新送核，而非誤導操作者以為還原檔案內容能恢復舊核可 ----
+
+func TestStaleEscalationSummaryGuidesReplacementResubmission(t *testing.T) {
+	a := newTestAppGit(t)
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.SpecWrite("spec/glossary.md", "term v2", digestOf(t, a, "spec/glossary.md"))
+	commitAll(t, a)
+	a.reconcileGate1NotifyOnly() // 權威掃描：stale → hard item
+
+	item := openItemByKey(t, a, "stale:gate1:workspace")
+	if item == nil {
+		t.Fatal("stale reconcile must create a hard escalation item")
+	}
+	if !strings.Contains(item.Item.Summary, "必須建立修正版並重新送核") {
+		t.Fatalf("stale summary must instruct creating a replacement and resubmitting, got %q", item.Item.Summary)
+	}
+	if !strings.Contains(item.Item.Summary, "還原檔案內容不會讓舊核可恢復生效") {
+		t.Fatalf("stale summary must warn that reverting file content does not revive the old approval, got %q", item.Item.Summary)
+	}
+}
+
 // ---- §3.8：hard 項不可手動 resolve；ack 不解除 block ----
 
 func TestHardEscalationNotManuallyResolvable(t *testing.T) {
@@ -233,8 +263,9 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	// 編譯失敗 fixture：exit != 0 且輸出無 matcher（FAIL）→ result=error
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'compile err: syntax'\nexit 2\n")
 	planCommit := setupApprovedEvidencePlan(t, a, "P1")
+	approvalID := activeApprovalIDFor(t, a, "P1")
 
-	id1, err := a.RunEvidence("P1", "T1", planCommit, "expected_red", "")
+	id1, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (error fixture): %v", err)
 	}
@@ -258,7 +289,7 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	runGit(t, a, "add", "run_test.sh")
 	runGit(t, a, "commit", "-m", "fix test script")
 	fixedCommit := revParseHead(t, a)
-	id2, err := a.RunEvidence("P1", "T1", fixedCommit, "expected_red", "")
+	id2, err := a.RunEvidence(approvalID, "P1", "T1", fixedCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (fixed): %v", err)
 	}
@@ -277,7 +308,7 @@ func TestEvidenceErrorAutoResolvedByRerun(t *testing.T) { // A8 閉環
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'compile err again'\nexit 2\n")
 	runGit(t, a, "add", "run_test.sh")
 	runGit(t, a, "commit", "-m", "break test script again")
-	if _, err := a.RunEvidence("P1", "T1", revParseHead(t, a), "expected_red", ""); err != nil {
+	if _, err := a.RunEvidence(approvalID, "P1", "T1", revParseHead(t, a), "expected_red", ""); err != nil {
 		t.Fatal(err)
 	}
 	item2 := openItemByKey(t, a, "evidence-error:P1/T1/expected_red")
@@ -326,7 +357,7 @@ func TestEvidenceStartFailureOpensEscalationItem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := a.RunEvidence("P1", "T1", planCommit1, "expected_red", ""); err == nil {
+	if _, err := a.RunEvidence(gate2ID, "P1", "T1", planCommit1, "expected_red", ""); err == nil {
 		t.Fatal("RunEvidence must fail when the contract command cannot even start")
 	}
 	item := openItemByKey(t, a, "evidence-error:P1/T1/expected_red")
@@ -348,7 +379,7 @@ func TestEvidenceStartFailureOpensEscalationItem(t *testing.T) {
 	if err := a.GateDecide(gate2ID2, "approved", "ok", mediumSel()); err != nil {
 		t.Fatalf("replacement gate2 approval must succeed (evidence-error is tca-scoped, not gate2-scoped): %v", err)
 	}
-	id, err := a.RunEvidence("P1", "T1", planCommit2, "expected_red", "")
+	id, err := a.RunEvidence(gate2ID2, "P1", "T1", planCommit2, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence (fixed contract): %v", err)
 	}

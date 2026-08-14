@@ -178,6 +178,47 @@ func TestRun_ExpectedRed_RejectsMutationPatch(t *testing.T) {
 	}
 }
 
+// TestRun_OutputMergeSeparatorBlocksCrossStreamMatch guards the merge of
+// stdout/stderr Run feeds to the matcher: naively concatenating the two
+// streams lets a matcher characteristic that never appeared in either stream
+// alone "appear" by accident wherever stdout's tail happens to complete
+// stderr's head (or vice versa). The command below writes "...SPL" to stdout
+// (no trailing newline) and "IT...\n" to stderr — concatenated without a
+// separator that reads as "SPLIT", but the two streams captured/classified
+// independently never contain "SPLIT" on their own. A separator byte between
+// them must keep this from being classified "passed".
+func TestRun_OutputMergeSeparatorBlocksCrossStreamMatch(t *testing.T) {
+	root := newRunnerFixtureRepo(t)
+	planCommit := headOID(t, root)
+	testCommit := commitRunTestSh(t, root, "#!/bin/sh\nprintf 'TestX SPL'\nprintf 'IT\\n' >&2\nexit 1\n")
+
+	casDir, registryPath := runFixtureDirs(t)
+	evidenceID := evID(t, "sep")
+	t.Cleanup(func() { removeEvidenceDirLeftover(t, evidenceID) })
+
+	pl := plan.Plan{
+		PlanID: "P1",
+		Tasks: []plan.Task{{
+			ID: "T1",
+			TestContract: plan.TestContract{
+				Command:         plan.Command{Executable: "sh", Argv: []string{"run_test.sh"}},
+				ExpectedFailure: plan.ExpectedFailure{TestIDs: []string{"TestX"}, Matcher: "SPLIT"},
+			},
+		}},
+	}
+	ld := fakeLoader{pl: pl, oracle: testOracle()}
+	rs := RunSpec{Kind: "expected_red", PlanID: "P1", TaskID: "T1", PlanCommit: planCommit, TestCommit: testCommit}
+
+	run, err := Run(context.Background(), root, casDir, registryPath, ld, rs, func() string { return evidenceID }, testNow)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if run.Result != "error" {
+		t.Fatalf("Result = %q (observed=%q), want error — a separator byte between stdout and stderr must block a match formed only by concatenating stdout's tail (\"...SPL\") with stderr's head (\"IT...\")", run.Result, run.ObservedFailure)
+	}
+	assertNoZombieWorktrees(t, root)
+}
+
 // ---- Step 2: timeout — worktree and process group must both be fully cleaned ----
 
 func TestRun_Timeout_KillsProcessGroupAndCleansWorktree(t *testing.T) {
@@ -371,5 +412,15 @@ func TestEvidenceRunDigest_DeterministicAndTamperEvident(t *testing.T) {
 	d4, _ := EvidenceRunDigest(tampered2)
 	if d4 == d1 {
 		t.Fatal("ObservedFailure tamper must change digest")
+	}
+
+	// Non-string field: ExitCode is an int, not a string — a digest that
+	// only canonicalizes/hashes string fields (or drops non-string ones)
+	// would miss this tamper.
+	tampered3 := run
+	tampered3.ExitCode = 2
+	d5, _ := EvidenceRunDigest(tampered3)
+	if d5 == d1 {
+		t.Fatal("ExitCode tamper must change digest")
 	}
 }

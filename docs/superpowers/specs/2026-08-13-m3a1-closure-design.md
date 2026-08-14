@@ -71,6 +71,20 @@ Live probe 文件本身不構成 runtime enforcement——凍結接線點：
 5. **Escalation 寫入失敗仍 fail closed**：hard escalation 建立或解除失敗時**仍不啟動 runner**，並保留 journal 錯誤（fail loud）。
 6. 權威條件恢復（preflight 重新通過）後由系統 `resolveByKey` 解除；使用者不可手動解除（hard）。
 
+   > **Erratum（2026-08-14，owner 核定）**：condition key 由本節第 2 點初版凍結的單一
+   > `planner-enforcement:<provider>` **分離為兩枚**（皆 hard、blockScope=workspace）：
+   > - `planner-enforcement-preflight:<provider>`——spawn 前靜態 preflight 驗不過時建立；
+   >   同 provider 的 preflight 重新通過（runner 啟動前，時點不變）即系統解除。
+   > - `planner-enforcement-runtime:<provider>`——第 3 點的 typed runtime violation 建立；
+   >   **只有一次完整 PlanAssist 成功結束（runner.Run 回 nil、全程無 violation）才系統
+   >   解除**。一般錯誤、逾時、取消與 escalation 寫入失敗皆不解除。
+   >
+   > 理由：共用 key 時，「上次已實證 runtime 違規」的 workspace blocker 會在下次
+   > PlanAssist 僅通過**靜態** preflight、runner 尚未證明安全的窗口內被提前解除，
+   > Gate decision 可能於該窗口通過——靜態 preflight（版本＋argv／wire 建構）證明
+   > 不了 runtime 行為已恢復。本點（第 6 點）的「preflight 重新通過即解除」自此僅
+   > 適用 preflight key；第 3 點「接到相同 condition key」改為接 runtime key。
+
 ### 3.5 STALE 重核引導（實作契約）
 
 1. **Stale 系統項的說明文字（凍結措辭要旨）**：「修正後必須建立修正版並重新送核；還原檔案內容不會讓舊核可恢復生效。」

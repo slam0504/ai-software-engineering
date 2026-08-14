@@ -42,12 +42,14 @@ describe('production bindings adapter', () => {
     expect(h.RegisterMutation).toHaveBeenCalledWith('P1/T1', 'diff --git a/x b/x')
   })
 
-  it('forwards all five RunEvidence arguments positionally', async () => {
+  // M3a.1 T8（§3.3.2）：換版 CAS 加了第一個參數 expectedGate2ApprovalID——
+  // 同一教訓，逐參數轉發、順序鎖死。
+  it('forwards all six RunEvidence arguments positionally', async () => {
     const b = makeBindings()
-    await b.RunEvidence('P1', 'T1', 'deadbeef', 'expected_red', '')
-    expect(h.RunEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef', 'expected_red', '')
-    await b.RunEvidence('P1', 'T1', 'deadbeef', 'negative_control', 'mut-1')
-    expect(h.RunEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef', 'negative_control', 'mut-1')
+    await b.RunEvidence('appr-1', 'P1', 'T1', 'deadbeef', 'expected_red', '')
+    expect(h.RunEvidence).toHaveBeenCalledWith('appr-1', 'P1', 'T1', 'deadbeef', 'expected_red', '')
+    await b.RunEvidence('appr-1', 'P1', 'T1', 'deadbeef', 'negative_control', 'mut-1')
+    expect(h.RunEvidence).toHaveBeenCalledWith('appr-1', 'P1', 'T1', 'deadbeef', 'negative_control', 'mut-1')
   })
 
   it('forwards the single EvidenceGet argument', async () => {

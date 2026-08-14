@@ -14,6 +14,10 @@ export function CancelLogin(arg1) {
   return window['go']['main']['App']['CancelLogin'](arg1);
 }
 
+export function ConfirmAnalysisBaseBump(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ConfirmAnalysisBaseBump'](arg1, arg2, arg3);
+}
+
 export function ConfirmPlanCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmPlanCommit'](arg1, arg2);
 }
@@ -90,6 +94,10 @@ export function PlanWrite(arg1, arg2, arg3) {
   return window['go']['main']['App']['PlanWrite'](arg1, arg2, arg3);
 }
 
+export function PreviewAnalysisBaseBump(arg1, arg2) {
+  return window['go']['main']['App']['PreviewAnalysisBaseBump'](arg1, arg2);
+}
+
 export function PreviewPlanCommit() {
   return window['go']['main']['App']['PreviewPlanCommit']();
 }
@@ -122,8 +130,8 @@ export function RestoreViews() {
   return window['go']['main']['App']['RestoreViews']();
 }
 
-export function RunEvidence(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['RunEvidence'](arg1, arg2, arg3, arg4, arg5);
+export function RunEvidence(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['RunEvidence'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
 export function SendMessage(arg1, arg2) {

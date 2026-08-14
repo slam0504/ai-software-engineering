@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"gopkg.in/yaml.v3"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
@@ -131,6 +134,13 @@ type App struct {
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
 
+	// PlanAssist provider capability preflight（M3a.1 Task 7：spec §3.4）——
+	// key=binPath+"|"+完整 binary SHA-256 hex（不截斷）；只快取 OK 結果
+	// （失敗每次重驗，binary 換回 pin 版即恢復）。binary 內容變更 → digest
+	// 變 → miss 重驗。
+	preflightMu    sync.Mutex
+	preflightCache map[string]assist.PreflightResult
+
 	// spec/ watcher（Task 12：spec §4 通知層）——遞迴監看納管樹，debounce 後
 	// 觸發 Reconcile()。specWatchStop／specWatchDone 在 a.mu 下管理，供
 	// shutdown 收斂：close(specWatchStop) 通知 goroutine 退出，goroutine defer
@@ -189,6 +199,13 @@ type App struct {
 	decideBarrierHook    func() // 測試注入：GateDecide blocker 檢查後、CommitDecision 前
 	onWorkflowMuAttempt  func() // 測試注入：public EscalationCreate 於 workflowMu.Lock() 前
 	onWorkflowMuAcquired func() // 測試注入：public EscalationCreate 取得 workflowMu 後、寫入前
+
+	// runEvidenceCASHook（M3a.1 T8，§3.3.2）：測試注入，RunEvidence
+	// beginAppTxn 成功後、workflowMu.Lock 前觸發——刻意早於 Lock（而非沿
+	// decideBarrierHook 落在鎖內的位置），讓 hook 本體可以呼叫 GateDecide 之
+	// 類同樣要取 workflowMu 的操作來模擬「按下與讀取之間換版」而不致死鎖，
+	// 見 RunEvidence 函式 doc。
+	runEvidenceCASHook func()
 }
 
 // assistGen：單一 SpecAssist 一次性執行的 generation（correlation 貫穿其全部事件）。
@@ -235,6 +252,7 @@ func (a *App) emit(name string, data any) {
 func NewApp() *App {
 	return &App{apprPending: map[string]*pendingApproval{},
 		assistActive:   map[string]*assistGen{},
+		preflightCache: map[string]assist.PreflightResult{},
 		evidenceActive: map[string]context.CancelFunc{}}
 }
 
@@ -1835,6 +1853,373 @@ func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
 	return a.planRepo.ConfirmSpecCommit(tok, message)
 }
 
+// ---- analysis_base bump（Task 5，spec §3.2）----
+//
+// PreviewAnalysisBaseBump／ConfirmAnalysisBaseBump 是唯讀-then-write-back 的
+// 兩段式流程：Preview 只讀（不動任何檔案），把驗證過的 old／head／後端自算
+// 的 buffer digest 綁進 BumpToken；Confirm 拿著這個 token 重驗一次目前狀態
+// （buffer／planRel／HEAD 皆須與 Preview 當下一致），通過後才用字串定位把
+// buffer 內那一行的值換成新的 HEAD，回傳 updatedBuffer——不寫檔、不
+// commit，落地交給呼叫端（wailsjs 重生留給 Task 6 前端任務）。digest 一律
+// 後端 sha256(buffer) 自算：BumpToken 沒有欄位讓前端塞自己算的值，Confirm
+// 重算 currentBuffer 才拿去跟 token 比對，前端不可能偽造出一個能通過驗證
+// 的 token。Confirm 通過後、儲存前 HEAD 再動的 TOCTOU，由呼叫端接下來要走
+// 的 ConfirmPlanCommit 的 commit token 鏈（HeadOID／TreeDigest staleness
+// 檢查）接手防護——本函式只保證回傳當下 updatedBuffer 的內容正確。
+
+// BumpToken binds a PreviewAnalysisBaseBump result to the exact plan path,
+// old analysis_base_commit value, HEAD, and buffer digest at preview time —
+// every field ConfirmAnalysisBaseBump re-verifies before touching anything,
+// so a stale preview (HEAD moved, buffer edited elsewhere, wrong plan) fails
+// loud instead of silently replacing the wrong value.
+type BumpToken struct {
+	PlanRel      string `json:"plan_rel"`
+	Old          string `json:"old"`
+	Head         string `json:"head"`
+	BufferDigest string `json:"buffer_digest"` // 後端 sha256(buffer)，hex
+}
+
+// BumpPreview is PreviewAnalysisBaseBump's result. NoBumpNeeded true means
+// no token was issued (Token stays the zero value) — old already equals
+// HEAD, or every path old..HEAD touched stays inside plan/**, so there is
+// nothing for a bump to move.
+type BumpPreview struct {
+	Token        BumpToken    `json:"token"`
+	Old          string       `json:"old"`
+	Head         string       `json:"head"`
+	Commits      []CommitInfo `json:"commits"`
+	TouchedFiles []string     `json:"touched_files"`
+	NoBumpNeeded bool         `json:"no_bump_needed"`
+}
+
+// fullOIDPattern rejects abbreviated/short OIDs — a bump must anchor to an
+// unambiguous, fully-qualified commit id, never a prefix that could resolve
+// to a different object as the repository grows.
+var fullOIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// bumpPlanDoc is a minimal decode target for extracting analysis_base_commit
+// out of a plan buffer — deliberately not plan.Parse's KnownFields(true)
+// schema: bump only needs this one field and must not reject on unrelated
+// schema drift elsewhere in an in-progress editor buffer (task-5-brief:
+// buffer 解析 analysis_base_commit，yaml 解析取值即可).
+type bumpPlanDoc struct {
+	AnalysisBaseCommit string `yaml:"analysis_base_commit"`
+}
+
+// parseAnalysisBaseCommit extracts buffer's analysis_base_commit and
+// validates it is a full 40-hex commit OID — a prerequisite for the
+// existence／ancestor checks PreviewAnalysisBaseBump performs next. Neither
+// check touches git; a malformed/empty value fails here without spawning a
+// process.
+func parseAnalysisBaseCommit(buffer string) (string, error) {
+	var doc bumpPlanDoc
+	if err := yaml.Unmarshal([]byte(buffer), &doc); err != nil {
+		return "", fmt.Errorf("plan: bump: parse buffer: %w", err)
+	}
+	old := doc.AnalysisBaseCommit
+	if !fullOIDPattern.MatchString(old) {
+		return "", fmt.Errorf("plan: bump: analysis_base_commit %q is not a full commit id — re-run PlannerAssist", old)
+	}
+	return old, nil
+}
+
+// bumpExitCoder matches *exec.ExitError's ExitCode() method structurally —
+// same trick as plan.VerifyLineage／gatepolicy.Gate2Policy.ReconcileBindings
+// — so an expected git exit code ("commit missing", "not an ancestor") can
+// be told apart from a fatal/unrecognized failure without importing os/exec.
+type bumpExitCoder interface{ ExitCode() int }
+
+// verifyCommitExists checks oid names a real commit object, via
+// `git rev-parse --verify --quiet <oid>^{commit}` — the same existence
+// check gatepolicy.Gate2Policy.ReconcileBindings uses for base_commit
+// (exit 1 = missing, anything else = fatal, fail closed).
+func verifyCommitExists(g plan.GitRunner, oid string) error {
+	if _, err := g.Git("rev-parse", "--verify", "--quiet", oid+"^{commit}"); err != nil {
+		var ec bumpExitCoder
+		if errors.As(err, &ec) && ec.ExitCode() == 1 {
+			return fmt.Errorf("plan: bump: analysis_base_commit %s not found in this repository — re-run PlannerAssist", oid)
+		}
+		return err
+	}
+	return nil
+}
+
+// verifyIsAncestor checks ancestor is a git ancestor of descendant, via
+// `git merge-base --is-ancestor` — same exit-code split as
+// plan.VerifyLineage, but deliberately not VerifyLineage itself: that
+// function also rejects any touched path outside an allow scope, the
+// opposite of what a bump needs (a bump exists precisely because something
+// outside plan/** changed).
+func verifyIsAncestor(g plan.GitRunner, ancestor, descendant string) error {
+	if _, err := g.Git("merge-base", "--is-ancestor", ancestor, descendant); err != nil {
+		var ec bumpExitCoder
+		if errors.As(err, &ec) && ec.ExitCode() == 1 {
+			return fmt.Errorf("plan: bump: analysis_base_commit %s is not an ancestor of HEAD — re-run PlannerAssist", ancestor)
+		}
+		return err
+	}
+	return nil
+}
+
+// splitBumpNULFields splits a `git diff --name-status -z` record stream on
+// NUL. Mirrors internal/plan/lineage.go's unexported splitNULFields
+// (duplicated rather than exported cross-package for this single caller,
+// to keep plan's I/O-free package boundary unchanged) — real output always
+// ends with a trailing NUL after the last field, which must be dropped.
+func splitBumpNULFields(out []byte) []string {
+	trimmed := bytes.TrimRight(out, "\x00")
+	if len(trimmed) == 0 {
+		return nil
+	}
+	return strings.Split(string(trimmed), "\x00")
+}
+
+// bumpTouchedFiles lists paths changed in old..head via
+// `git diff --name-status -z --find-renames` — same record shape
+// plan.VerifyLineage parses (NUL-delimited; an R/C rename/copy record
+// carries two paths, everything else carries one). paths is the flat list
+// for display (a rename contributes its new path only — what an operator
+// wants to see changed); allPlanOnly folds in BOTH sides of every
+// rename/copy record, because a path that moved from outside plan/** into
+// plan/** (or vice versa) is a real change to the non-plan tree even though
+// its post-rename path alone would satisfy spec.PlanScope.Match (review F2:
+// `git diff --name-only` alone only reports the new path and would
+// misclassify such a move as plan-only).
+func bumpTouchedFiles(g plan.GitRunner, old, head string) (paths []string, allPlanOnly bool, err error) {
+	out, err := g.Git("diff", "--name-status", "-z", "--find-renames", old+".."+head)
+	if err != nil {
+		return nil, false, err
+	}
+	fields := splitBumpNULFields(out)
+	allPlanOnly = true
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		if status == "" {
+			continue
+		}
+		switch status[0] {
+		case 'R', 'C':
+			if i+1 >= len(fields) {
+				return nil, false, fmt.Errorf("plan: bump: malformed diff entry: status %q missing paths", status)
+			}
+			oldPath, newPath := fields[i], fields[i+1]
+			i += 2
+			paths = append(paths, newPath)
+			if !spec.PlanScope.Match(oldPath) || !spec.PlanScope.Match(newPath) {
+				allPlanOnly = false
+			}
+		default:
+			if i >= len(fields) {
+				return nil, false, fmt.Errorf("plan: bump: malformed diff entry: status %q missing path", status)
+			}
+			p := fields[i]
+			i++
+			paths = append(paths, p)
+			if !spec.PlanScope.Match(p) {
+				allPlanOnly = false
+			}
+		}
+	}
+	return paths, allPlanOnly, nil
+}
+
+// PreviewAnalysisBaseBump（§3.2）reads buffer's analysis_base_commit (never
+// trusts a caller-supplied value) and validates it is a full, existing
+// commit OID that is an ancestor of the current HEAD — any failure rejects
+// with guidance to re-run PlannerAssist. old == HEAD, or every path
+// old..HEAD touched staying inside plan/**, both mean there is nothing to
+// bump (NoBumpNeeded: true, no token issued). Otherwise returns a BumpToken
+// (carrying a backend-computed sha256(buffer) digest, never a
+// caller-supplied one) plus the commit log and touched files for the
+// operator to review before confirming.
+func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, error) {
+	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.planGit
+		return BumpPreview{}, err
+	}
+	old, err := parseAnalysisBaseCommit(buffer)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	if err := verifyCommitExists(a.planGit, old); err != nil {
+		return BumpPreview{}, err
+	}
+	headOut, err := a.planGit.Git("rev-parse", "HEAD")
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	head := strings.TrimSpace(string(headOut))
+
+	if old == head {
+		return BumpPreview{Old: old, Head: head, NoBumpNeeded: true}, nil
+	}
+	if err := verifyIsAncestor(a.planGit, old, head); err != nil {
+		return BumpPreview{}, err
+	}
+
+	touched, allPlanOnly, err := bumpTouchedFiles(a.planGit, old, head)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+	if allPlanOnly {
+		return BumpPreview{Old: old, Head: head, TouchedFiles: touched, NoBumpNeeded: true}, nil
+	}
+
+	logOut, err := a.planGit.Git("log", "--format=%H%x00%s", "-n", "50", old+".."+head)
+	if err != nil {
+		return BumpPreview{}, err
+	}
+
+	tok := BumpToken{PlanRel: planRel, Old: old, Head: head, BufferDigest: spec.HashBytes([]byte(buffer))}
+	return BumpPreview{
+		Token:        tok,
+		Old:          old,
+		Head:         head,
+		Commits:      parseCommitCandidates(logOut),
+		TouchedFiles: touched,
+	}, nil
+}
+
+// analysisBaseCommitKey is the plan schema's analysis_base_commit key,
+// including its trailing colon — the string-anchor every step below keys
+// off of (isAnalysisBaseCommitLine's prefix check and
+// parseAnalysisBaseCommitLine's split point).
+const analysisBaseCommitKey = "analysis_base_commit:"
+
+// isAnalysisBaseCommitLine reports whether line's trimmed content begins
+// with the plan schema's analysis_base_commit key. This is only a
+// structural/textual filter — a multi-line block scalar's content line can
+// coincidentally satisfy it too (review F1); parseAnalysisBaseCommitLine's
+// extracted value must additionally equal the expected old value before a
+// line is trusted as the real key.
+func isAnalysisBaseCommitLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), analysisBaseCommitKey)
+}
+
+// parseAnalysisBaseCommitLine splits a line isAnalysisBaseCommitLine has
+// already confirmed into: prefix (indentation + key + colon + separating
+// whitespace, kept verbatim), quote (0 for a bare/plain scalar, or the
+// quote byte — a double or single quote character — the value is wrapped
+// in), value (the scalar's literal content — dequoted, so it is directly
+// comparable to a BumpToken's Old/Head, which are always bare Go strings
+// regardless of how the source YAML quoted them), and rest (everything
+// after the value: inline comment,
+// trailing whitespace, kept verbatim). ok is false for anything this
+// deliberately-not-a-YAML-parser line scan cannot safely handle — no value
+// at all, or an unterminated quote — so callers never index into a failed
+// parse (review F3: the previous regex-based version indexed a nil
+// submatch and panicked on exactly this shape).
+func parseAnalysisBaseCommitLine(line string) (prefix string, quote byte, value string, rest string, ok bool) {
+	idx := strings.Index(line, analysisBaseCommitKey)
+	if idx < 0 {
+		return "", 0, "", "", false
+	}
+	prefix = line[:idx+len(analysisBaseCommitKey)]
+	remainder := line[idx+len(analysisBaseCommitKey):]
+	sp := 0
+	for sp < len(remainder) && (remainder[sp] == ' ' || remainder[sp] == '\t') {
+		sp++
+	}
+	prefix += remainder[:sp]
+	remainder = remainder[sp:]
+	if remainder == "" {
+		return "", 0, "", "", false
+	}
+	if remainder[0] == '"' || remainder[0] == '\'' {
+		q := remainder[0]
+		end := strings.IndexByte(remainder[1:], q)
+		if end < 0 {
+			return "", 0, "", "", false
+		}
+		return prefix, q, remainder[1 : 1+end], remainder[1+end+1:], true
+	}
+	if end := strings.IndexAny(remainder, " \t"); end >= 0 {
+		return prefix, 0, remainder[:end], remainder[end:], true
+	}
+	return prefix, 0, remainder, "", true
+}
+
+// replaceAnalysisBaseCommitLine returns line with only its
+// analysis_base_commit value replaced by newVal, preserving the original
+// quote characters verbatim if the value was quoted (review F4: a bare
+// `(\S+)` replacement previously swallowed a `"..."` value's closing quote,
+// corrupting the YAML). ok is false when line does not parse as an
+// analysis_base_commit line at all (see parseAnalysisBaseCommitLine).
+func replaceAnalysisBaseCommitLine(line, newVal string) (string, bool) {
+	prefix, quote, _, rest, ok := parseAnalysisBaseCommitLine(line)
+	if !ok {
+		return "", false
+	}
+	if quote != 0 {
+		return prefix + string(quote) + newVal + string(quote) + rest, true
+	}
+	return prefix + newVal + rest, true
+}
+
+// ConfirmAnalysisBaseBump（§3.2）re-verifies every field of tok against the
+// caller's current state — planRel unchanged, currentBuffer's backend-
+// recomputed digest still matches (never trusts a caller-supplied digest),
+// HEAD unmoved since preview — then scans currentBuffer for
+// analysis_base_commit lines. Any such line whose extracted (dequoted)
+// value does not equal tok.Old rejects immediately and specifically: it
+// is either malformed (review F3) or, as it stands, most likely
+// unrelated text that coincidentally starts with the same key text — e.g.
+// inside a block scalar (review F1) — which the previous count-only "恰
+// 一處" check could not tell apart from the real key, permanently rejecting
+// (re-running preview never changes a buffer's own text, so that was a
+// dead-end retry loop, not a recoverable staleness error). Once every
+// matching line's value is confirmed consistent, exactly one such line must
+// remain (0 or ≥2 still rejects: string-position replacement is only
+// well-defined with exactly one). On success, replaces only that line's
+// value with tok.Head — preserving quotes if the value was quoted (review
+// F4) — and returns the full updatedBuffer; every other byte, including
+// comments and formatting, untouched. Does not write to disk or commit; the
+// caller decides when to land the result.
+func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer string) (string, error) {
+	if _, err := a.ensureGate(); err != nil {
+		return "", err
+	}
+	if planRel != tok.PlanRel {
+		return "", errors.New("plan: bump: plan path changed since preview — re-run preview")
+	}
+	if spec.HashBytes([]byte(currentBuffer)) != tok.BufferDigest {
+		return "", errors.New("plan: bump: buffer changed since preview — re-run preview")
+	}
+	headOut, err := a.planGit.Git("rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(headOut)) != tok.Head {
+		return "", errors.New("plan: bump: HEAD moved since preview — re-run preview")
+	}
+
+	lines := strings.Split(currentBuffer, "\n")
+	var matchIdx []int
+	for i, l := range lines {
+		if !isAnalysisBaseCommitLine(l) {
+			continue
+		}
+		_, _, value, _, ok := parseAnalysisBaseCommitLine(l)
+		if !ok {
+			return "", fmt.Errorf("plan: bump: line %d looks like an analysis_base_commit key but its value could not be parsed: %q — re-run preview", i+1, l)
+		}
+		if value != tok.Old {
+			return "", fmt.Errorf("plan: bump: line %d looks like an analysis_base_commit key but holds %q, not the expected old value %q — likely unrelated text coincidentally starting with the same key (e.g. inside a block scalar); edit the buffer to remove the ambiguity, then re-run preview", i+1, value, tok.Old)
+		}
+		matchIdx = append(matchIdx, i)
+	}
+	if len(matchIdx) != 1 {
+		return "", fmt.Errorf("plan: bump: buffer must contain exactly one analysis_base_commit line holding the expected old value %q, found %d — re-run preview", tok.Old, len(matchIdx))
+	}
+
+	newLine, ok := replaceAnalysisBaseCommitLine(lines[matchIdx[0]], tok.Head)
+	if !ok {
+		return "", fmt.Errorf("plan: bump: line %d could not be rewritten: %q", matchIdx[0]+1, lines[matchIdx[0]])
+	}
+	lines[matchIdx[0]] = newLine
+	return strings.Join(lines, "\n"), nil
+}
+
 // gate2Bindings assembles the five §3.3 required Gate 2 bindings.
 func gate2Bindings(specManifest, planManifest, baseCommit, riskPolicyDigest, permissionManifestDigest string) []gate.Binding {
 	return []gate.Binding{
@@ -1893,7 +2278,7 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 
 	if errs := plan.Validate(pl, pol, specScenarios); len(errs) > 0 {
 		verr := fmt.Errorf("plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: %w", errors.Join(errs...))
-		if hasRiskClassificationError(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
+		if isRiskUnclassifiable(errs) { // §3.8 (1)：risk 分類失敗（minimum 無法重算）
 			a.workflowMu.Lock()
 			_, cerr := a.escCreateSystemLocked("risk-unclassifiable:"+planID, "gate2:"+planID, true,
 				"plan "+planID+" 的 risk 分類驗證失敗（minimum 無法重算）", "plan:"+planID)
@@ -1938,16 +2323,13 @@ func (a *App) SubmitPlanForApproval(planID string) (string, error) {
 	return a.submitGateRequest(svc, "gate2", "plan:"+planID, bindings)
 }
 
-// hasRiskClassificationError：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk
-// 分類失敗（minimum 重算不符、tier 名稱未知）。plan.Validate 回傳未型別化的
-// inline errors，這裡以訊息片段比對——脆弱點已知（validate.go 措辭改動需同步），
-// 換 typed error 屬 internal/plan 的 API 擴張，非本 task scope。
-func hasRiskClassificationError(errs []error) bool {
+// isRiskUnclassifiable：plan.Validate 的錯誤中是否含 §3.8 (1) 的 risk 分類
+// 失敗（minimum 重算不符、planner 低於 minimum、tier 名稱未知）。改用
+// errors.Is 對 plan.ErrRiskUnclassifiable 判定（review 補強），取代先前以訊息
+// 片段比對的脆弱作法。
+func isRiskUnclassifiable(errs []error) bool {
 	for _, e := range errs {
-		msg := e.Error()
-		if strings.Contains(msg, "does not match recomputed") ||
-			strings.Contains(msg, "unknown minimum_risk_tier") ||
-			strings.Contains(msg, "unknown planner_risk_tier") {
+		if errors.Is(e, plan.ErrRiskUnclassifiable) {
 			return true
 		}
 	}
@@ -1981,11 +2363,24 @@ func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
 	return m.MutationID, nil
 }
 
+// ErrStaleGeneration：RunEvidence 的 CAS 換版失敗——呼叫端（TcaWorkspace）
+// 讀取 active Gate 2 approval 當下的 approval_id（expectedGate2ApprovalID）到
+// 這次呼叫實際取得 workflowMu 之間，那筆 approval 已被換版（gate2 supersede：
+// 新 SubmitPlanForApproval→GateDecide 核可）。錯誤訊息前端原文顯示（§3.3.2）。
+var ErrStaleGeneration = errors.New("evidence: gate2 approval changed since view was loaded")
+
 // RunEvidence 同步執行 planID/taskID 已核可（Gate 2 active）的 TestContract，
 // 對 testCommit 的 committed tree 產生一筆 EvidenceRun，回傳 evidence_id。
 // kind="negative_control" 時 mutationID 必填，其登記的 patch（RegisterMutation）
 // 會被套用；kind="expected_red" 時 mutationID 必須為空（evidence.Run 本身拒絕
 // 帶 mutation 的 expected_red，見 runner.go）。
+//
+// expectedGate2ApprovalID：呼叫端（TcaWorkspace）觀察到的 active Gate 2
+// approval_id 快照——RunEvidence 以它跟自己在 workflowMu 下重讀的權威值做 CAS
+// 比對（§3.3.2）：不符即代表使用者按下按鈕後、這次呼叫真正取得 workflowMu
+// 之前，該 plan 的 Gate 2 已換版，回 ErrStaleGeneration，且**零 side
+// effect**——不發 started event、不載入 mutation、不建 worktree（凍結順序見
+// 下方 Step 2 分段）。
 //
 // Lifecycle ownership（task-20-brief.md 凍結，不依賴 Task 24 的
 // workflowMu）：beginAppTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
@@ -2008,37 +2403,30 @@ func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
 // 一筆語意完整的 EvidenceRun（ctx 取消走的是 abortReason="context
 // canceled"，不是 Go error），也視為未完成、不 finalize——一個被 shutdown
 // 中止的 run 不能被當成有效證據收進 journal。
-func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (string, error) {
+//
+// M3a.1 T8（§3.3.2）凍結順序：beginAppTxn → workflowMu.Lock → 讀取並固定
+// 權威 active gate2 approval_id／plan_commit（GateList 挪到 beginAppTxn 之
+// 後、workflowMu 下讀——不再信任呼叫前的快照）→ CAS 比對 expected（不符→
+// Unlock→endAppTxn→ErrStaleGeneration）→ workflowMu.Unlock → Step 2b：
+// shutMu 下重查 shuttingDown（沿 pre-ulid 窗自我 cancel 先例——CAS 通過後到
+// started event 之間若 shutdown 已開始，零副作用返回，不指望 ulid callback
+// 那次複查還來得及，因為這個 run 這時甚至還沒發過 started event）→ started
+// event／mutation 載入／worktree 建立／run → finalize → endAppTxn。
+// runEvidenceCASHook（測試 seam，沿 decideBarrierHook 命名慣例）在
+// beginAppTxn 成功後、workflowMu.Lock 前觸發——特意早於 Lock，讓 hook 內部
+// 可呼叫 GateDecide 之類同樣取 workflowMu 的操作換版，而不會跟本呼叫自己的
+// Lock 死鎖。
+func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID string) (string, error) {
 	if kind != "expected_red" && kind != "negative_control" {
 		return "", fmt.Errorf("evidence: unknown kind %q", kind)
 	}
 	if a.evidenceJournal == nil {
 		return "", errors.New("evidence: not initialized")
 	}
-
-	entries, err := a.GateList()
-	if err != nil {
-		return "", err
-	}
-	planCommit, ok := activeGate2PlanCommit(entries, planID)
-	if !ok {
-		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
-	}
-
-	var mutationPatch []byte
 	if kind == "negative_control" {
 		if mutationID == "" {
 			return "", errors.New("evidence: negative_control requires a mutation_id")
 		}
-		m, merr := a.evidenceJournal.GetMutation(mutationID)
-		if merr != nil {
-			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
-		}
-		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
-		if oerr != nil {
-			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
-		}
-		mutationPatch = patch
 	} else if mutationID != "" {
 		return "", errors.New("evidence: expected_red must not carry a mutation_id")
 	}
@@ -2048,12 +2436,57 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 	}
 	defer a.endAppTxn()
 
+	if h := a.runEvidenceCASHook; h != nil { // 測試 seam：見上方函式 doc
+		h()
+	}
+
+	a.workflowMu.Lock()
+	entries, err := a.GateList()
+	if err != nil {
+		a.workflowMu.Unlock()
+		return "", err
+	}
+	approvalID, aok := activeGate2ApprovalID(entries, planID)
+	planCommit, pok := activeGate2PlanCommit(entries, planID)
+	if !aok || !pok {
+		a.workflowMu.Unlock()
+		return "", fmt.Errorf("evidence: no active Gate 2 approval for plan %q", planID)
+	}
+	if approvalID != expectedGate2ApprovalID { // CAS：不符即換版，零 side effect
+		a.workflowMu.Unlock()
+		return "", ErrStaleGeneration
+	}
+	a.workflowMu.Unlock()
+
+	// Step 2b（review M1 pre-ulid 窗自我 cancel 的同一先例）：CAS 通過後、
+	// started event 之前重查 shutdown——已進 shutdown 即零副作用返回，不發
+	// started、不載入 mutation、不建 worktree。
+	a.shutMu.Lock()
+	shuttingDown := a.shuttingDown
+	a.shutMu.Unlock()
+	if shuttingDown {
+		return "", errors.New("app shutting down")
+	}
+
+	var mutationPatch []byte
+	if kind == "negative_control" {
+		m, merr := a.evidenceJournal.GetMutation(mutationID)
+		if merr != nil {
+			return "", fmt.Errorf("evidence: load mutation %q: %w", mutationID, merr)
+		}
+		patch, oerr := evidence.OpenCAS(a.evidenceCASDir, m.Digest)
+		if oerr != nil {
+			return "", fmt.Errorf("evidence: open mutation patch: %w", oerr)
+		}
+		mutationPatch = patch
+	}
+
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
 
 	a.manager.EmitWorkspace(evidenceRunEventKind, nil, map[string]any{
 		"phase": "started", "plan_id": planID, "task_id": taskID,
-		"kind": kind, "test_commit": testCommit,
+		"kind": kind, "test_commit": testCommit, "gate2_approval_id": approvalID,
 	})
 
 	var evidenceID string
@@ -2136,7 +2569,7 @@ func (a *App) RunEvidence(planID, taskID, testCommit, kind, mutationID string) (
 
 	payload := map[string]any{
 		"phase": "finished", "evidence_id": evidenceID,
-		"plan_id": planID, "task_id": taskID, "kind": kind,
+		"plan_id": planID, "task_id": taskID, "kind": kind, "gate2_approval_id": approvalID,
 	}
 	if finalErr != nil {
 		payload["error"] = finalErr.Error()
@@ -2699,7 +3132,8 @@ func (a *App) reconcileLocked(svc *gate.Service) error {
 			continue
 		}
 		if _, cerr := a.escCreateSystemLocked("stale:"+gs, scopeForSubject(e.Record.Gate, e.Record.Subject), true,
-			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——需修正版重核",
+			"核可 "+e.ApprovalID+"（"+e.Record.Gate+" "+e.Record.Subject+"）的綁定已 stale——"+
+				"修正後必須建立修正版並重新送核；還原檔案內容不會讓舊核可恢復生效",
 			e.ApprovalID); cerr != nil {
 			return cerr
 		}
@@ -2790,16 +3224,38 @@ func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bin
 	return id, nil
 }
 
-// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement probe 失敗的
-// condition key。現況 PlanAssist 沒有 enforcement probe 結果 hook（唯讀
-// sandbox 由 provider 端 flags 強制、無失敗回報路徑）——觸發點待 probe 接線
-// 後補（task-24-report.md 列明），key 與建立函式先凍結在此，不假接。
-func plannerEnforcementKey(provider string) string { return "planner-enforcement:" + provider }
+// planner enforcement condition keys（§3.8 (9)；spec §3.4 erratum，owner
+// 2026-08-14 裁決 key 分離）：
+//   - preflight key：spawn 前靜態 preflight 驗不過 → 建立；同 provider 的
+//     preflight 重新通過（runner 啟動前，時點不變）→ 系統解除。
+//   - runtime key：runner 回 typed *assist.EnforcementViolation（Codex
+//     runtime 違規）→ 建立；**只有一次完整 PlanAssist 成功結束（runner.Run
+//     回 nil、全程無 violation）才系統解除**。一般錯誤／逾時／取消／
+//     escalation 寫入失敗皆不解除。
+//
+// 分離理由：共用 key 時「上次已實證 runtime 違規」的 workspace blocker 會在
+// 下次 PlanAssist 僅通過靜態 preflight、runner 尚未證明安全的窗口內被提前
+// 解除，Gate decision 可能於該窗口通過——靜態 preflight 證明不了 runtime
+// 行為已恢復。
+func plannerPreflightKey(provider string) string {
+	return "planner-enforcement-preflight:" + provider
+}
 
-// escPlannerEnforcementFailedLocked：(9) 的建立函式（呼叫端持 workflowMu）。
-func (a *App) escPlannerEnforcementFailedLocked(provider, detail string) (string, error) {
-	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", false,
-		"PlannerAssist enforcement 失敗（"+provider+"）："+detail, "provider:"+provider)
+func plannerRuntimeKey(provider string) string {
+	return "planner-enforcement-runtime:" + provider
+}
+
+// escPlannerPreflightFailedLocked／escPlannerRuntimeViolationLocked：(9) 的
+// 建立函式（呼叫端持 workflowMu）。皆 hard=true：安全不變量缺口僅系統可依
+// 各自修復條件解除，UI 不可手動 resolve。
+func (a *App) escPlannerPreflightFailedLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerPreflightKey(provider), "workspace", true,
+		"PlannerAssist preflight 失敗（"+provider+"）："+detail, "provider:"+provider)
+}
+
+func (a *App) escPlannerRuntimeViolationLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerRuntimeKey(provider), "workspace", true,
+		"PlannerAssist runtime enforcement 違規（"+provider+"）："+detail, "provider:"+provider)
 }
 
 // EscalationList 回傳收件匣 projection（Wails 綁定）。Project 失敗回錯——
@@ -3076,6 +3532,33 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		return "", errors.New("assist: workspace 有未提交的非 plan 變更——PlannerAssist 需在乾淨 code tree 上分析")
 	}
 
+	// provider capability preflight（M3a.1 Task 7：spec §3.4）：spawn 前驗 pin
+	// 版本＋argv 凍結基準。失敗 → fail closed：不啟動 runner、workflowMu 下建
+	// hard preflight 項並回明確錯誤；escalation 寫入失敗仍不啟動且錯誤含
+	// journal 失敗。重新通過 → 系統解除 preflight key（僅此 key——runtime
+	// blocker 的修復條件是一次完整成功 run，見 plannerRuntimeKey doc）。
+	pf, pferr := a.planPreflight(provider)
+	if pferr != nil || !pf.OK {
+		reason := pf.Reason
+		if pferr != nil {
+			reason = pferr.Error()
+		}
+		failErr := fmt.Errorf("%w：%s preflight 失敗：%s", assist.ErrEnforcementUnproven, provider, reason)
+		a.workflowMu.Lock()
+		_, cerr := a.escPlannerPreflightFailedLocked(provider, reason)
+		a.workflowMu.Unlock()
+		if cerr != nil {
+			return "", errors.Join(failErr, cerr)
+		}
+		return "", failErr
+	}
+	a.workflowMu.Lock()
+	rerr := a.escResolveByKeyLocked(plannerPreflightKey(provider), "preflight-pass:"+pf.BinaryDigest)
+	a.workflowMu.Unlock()
+	if rerr != nil { // 已重新通過但修復解除寫不進去：fail loud（不無聲留下已修復的 blocker）
+		return "", rerr
+	}
+
 	headOID, err := a.specRepo.HeadCommit()
 	if err != nil {
 		return "", fmt.Errorf("assist: resolve HEAD: %w", err)
@@ -3151,7 +3634,66 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		a.manager.EmitAssist(prov, gen.correlationID, purpose, assistEnvelopeToEvent(prov, env))
 	}
 	err = runner.Run(ctx, prompt, sink)
+	// 誤分類禁止（§3.4）：preflight 通過後的 runner 啟動失敗／逾時是一般錯誤，
+	// 不建 enforcement 項；只有 typed *EnforcementViolation（Codex 在
+	// readOnly+never 下仍送 escalation/approval request）才建 runtime hard 項。
+	var viol *assist.EnforcementViolation
+	switch {
+	case errors.As(err, &viol):
+		a.workflowMu.Lock()
+		_, cerr := a.escPlannerRuntimeViolationLocked(viol.Provider, viol.Detail)
+		a.workflowMu.Unlock()
+		if cerr != nil { // fail loud：違規發生但 journal 寫不進去，錯誤要帶出來
+			err = errors.Join(err, cerr)
+		}
+	case err == nil:
+		// runtime blocker 修復條件（spec §3.4 erratum 2026-08-14）：一次完整
+		// PlanAssist 成功結束、全程無 violation——此刻才系統解除。一般錯誤／
+		// 逾時／取消不會走到這裡（err != nil），blocker 續留。
+		a.workflowMu.Lock()
+		rerr := a.escResolveByKeyLocked(plannerRuntimeKey(provider), "clean-run:"+gen.correlationID)
+		a.workflowMu.Unlock()
+		if rerr != nil { // 已修復但解除寫不進去：fail loud（blocker 續留、錯誤帶出）
+			err = rerr
+		}
+	}
 	return gen.correlationID, err
+}
+
+// planPreflight（§3.4）：provider 的 PlanAssist spawn 前 capability preflight，
+// 帶 digest-keyed 快取（見 preflightCache 欄位 doc）。cache miss 時 hash 會在
+// Preflight* 內重算一次——只發生在 miss，維持單一實作比省一次 hash 值得。
+func (a *App) planPreflight(provider string) (assist.PreflightResult, error) {
+	bin := a.claudeCLIPath()
+	if provider == "codex" {
+		bin = a.codexCLIPath()
+	}
+	digest, err := assist.BinarySHA256(bin)
+	if err != nil {
+		return assist.PreflightResult{Provider: provider, BinaryPath: bin}, err
+	}
+	key := bin + "|" + digest
+	a.preflightMu.Lock()
+	cached, hit := a.preflightCache[key]
+	a.preflightMu.Unlock()
+	if hit {
+		return cached, nil
+	}
+	var res assist.PreflightResult
+	if provider == "claude" {
+		res, err = assist.PreflightClaude(bin, assist.ClaudePlannerArgs())
+	} else {
+		res, err = assist.PreflightCodex(bin)
+	}
+	if err == nil && res.OK { // 只快取 OK：失敗每次重驗（恢復即刻可見）
+		// key 用 res.BinaryDigest（Preflight* 驗證當下同一次 hash 的結果），
+		// 不用上面 lookup 用的 digest——兩次 hash 之間 binary 若被抽換，存入
+		// 的 key 仍與驗證結果自洽，抽換後的 binary 下次 lookup 必 miss 重驗。
+		a.preflightMu.Lock()
+		a.preflightCache[bin+"|"+res.BinaryDigest] = res
+		a.preflightMu.Unlock()
+	}
+	return res, err
 }
 
 // newPlanAssistRunner：production 造 provider 專屬唯讀 PlannerAssist Runner；

@@ -48,7 +48,8 @@ export interface Bindings {
 // Bindings 形狀。
 export interface EvidenceBindings {
   RegisterMutation(taskRef: string, patch: string): Promise<string>
-  RunEvidence(planID: string, taskID: string, testCommit: string, kind: string, mutationID: string): Promise<string>
+  RunEvidence(expectedGate2ApprovalID: string, planID: string, taskID: string,
+    testCommit: string, kind: string, mutationID: string): Promise<string>
   EvidenceGet(evidenceID: string): Promise<evidence.EvidenceRun>
   SubmitTestContract(planID: string, taskID: string, testCommit: string,
     expectedRedID: string, negativeControlID: string, mutationID: string): Promise<string>

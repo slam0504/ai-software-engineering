@@ -260,6 +260,36 @@ func TestReconcileSingleStaleUnderConcurrency(t *testing.T) {
 	}
 }
 
+// TestPrepareDecisionRejectsUnknownDecision guards against a decision value
+// outside {"approved","rejected"} silently falling through PrepareDecision's
+// switch (BuildDecision/CommitDecision downstream only ever branch on
+// "approved" vs. else-is-rejected) — the check must run before the pending
+// lookup, so an unknown decision is rejected on its own terms rather than as
+// ErrNotPending, and the error must name the value actually received.
+func TestPrepareDecisionRejectsUnknownDecision(t *testing.T) {
+	s, _ := newTestService(t)
+	_, err := s.PrepareDecision("x", "maybe", "", approver(), DecisionInput{})
+	if err == nil {
+		t.Fatal("PrepareDecision: want error for unknown decision value \"maybe\"")
+	}
+	if !strings.Contains(err.Error(), "maybe") {
+		t.Errorf("error = %v, want it to mention the received decision value %q", err, "maybe")
+	}
+}
+
+// TestDecideRejectsUnknownDecision guards the same path through Decide
+// (Prepare→Commit convenience wrapper), which app-level callers use.
+func TestDecideRejectsUnknownDecision(t *testing.T) {
+	s, _ := newTestService(t)
+	id, err := s.Submit("gate1", "workspace", gate1BWith("sha256:"+hex64()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(id, "maybe", "", approver(), DecisionInput{}); err == nil {
+		t.Fatal("Decide: want error for unknown decision value \"maybe\"")
+	}
+}
+
 func TestRejectNeedsReason(t *testing.T) {
 	s, _ := newTestService(t)
 	id, _ := s.Submit("gate1", "workspace", gate1BWith("sha256:"+hex64()))
@@ -341,6 +371,121 @@ func TestRejectedNeedsOnlyReason(t *testing.T) {
 	}
 	if err := s.Decide(id, "rejected", "不完整", approver(), DecisionInput{}); err != nil {
 		t.Fatalf("rejected must not require risk input: %v", err)
+	}
+}
+
+// ---- Lookup (used by the TCA gate2_approval resolver) --------------------
+
+func TestServiceLookupReturnsRecordAndActiveState(t *testing.T) {
+	s := newTestServiceWithGates(t)
+	id, err := s.Submit("gate1", "workspace", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(id, "approved", "", approver(), DecisionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	rec, state, err := s.Lookup(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != Active {
+		t.Fatalf("want Active, got %s", state)
+	}
+	if rec == nil || rec.ApprovalID != id {
+		t.Fatalf("want record for %s, got %+v", id, rec)
+	}
+}
+
+func TestServiceLookupPendingHasNilRecord(t *testing.T) {
+	s := newTestServiceWithGates(t)
+	id, err := s.Submit("gate1", "workspace", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, state, err := s.Lookup(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != Pending {
+		t.Fatalf("want Pending, got %s", state)
+	}
+	if rec != nil {
+		t.Fatalf("pending approval must have a nil record, got %+v", rec)
+	}
+}
+
+func TestServiceLookupUnknownIDErrors(t *testing.T) {
+	s := newTestServiceWithGates(t)
+	if _, _, err := s.Lookup("does-not-exist"); err == nil {
+		t.Fatal("Lookup on an unknown approval id must error")
+	}
+}
+
+// TestCommitDecisionSupersessionRecordAndTransitionShareOneGateOp is the raw
+// journal counterpart to TestSupersessionScopedByGateAndSubject: CommitDecision's
+// doc comment promises the new approval_record and every "superseded"
+// transition it triggers land in a single gate_op (service.go:131,
+// s.appendOp(recs...) called once with the whole recs slice) — not two
+// separate appends that a crash between them could split. This reads
+// s.opsForTest() (raw GateOp.Records) directly, since the projection alone
+// can't distinguish "two ops" from "one op" once both are Active/Superseded.
+func TestCommitDecisionSupersessionRecordAndTransitionShareOneGateOp(t *testing.T) {
+	s := newTestServiceWithGates(t)
+	id1, err := s.Submit("gate1", "workspace", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(id1, "approved", "", approver(), DecisionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	id2, err := s.Submit("gate1", "workspace", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(id2, "approved", "", approver(), DecisionInput{}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateOf(entries, id1) != Superseded {
+		t.Fatal("id1 must be superseded by id2's approval (same gate1|workspace supersession key)")
+	}
+	if stateOf(entries, id2) != Active {
+		t.Fatal("id2 must be active")
+	}
+
+	var opWithRecord, opWithTransition *GateOp
+	for i, op := range s.opsForTest() {
+		for _, raw := range op.Records {
+			var probe struct {
+				Type       string `json:"_type"`
+				ApprovalID string `json:"approval_id"`
+				To         string `json:"to"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil {
+				t.Fatalf("unmarshal record: %v", err)
+			}
+			if probe.Type == "approval_record" && probe.ApprovalID == id2 {
+				opWithRecord = &s.opsForTest()[i]
+			}
+			if probe.Type == "transition" && probe.ApprovalID == id1 && probe.To == "superseded" {
+				opWithTransition = &s.opsForTest()[i]
+			}
+		}
+	}
+	if opWithRecord == nil {
+		t.Fatal("no GateOp found containing id2's approval_record")
+	}
+	if opWithTransition == nil {
+		t.Fatal("no GateOp found containing id1's superseded transition")
+	}
+	if opWithRecord.OpID != opWithTransition.OpID {
+		t.Fatalf("id2's approval_record (op %s) and id1's superseded transition (op %s) must land in the SAME GateOp",
+			opWithRecord.OpID, opWithTransition.OpID)
 	}
 }
 

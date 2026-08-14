@@ -22,9 +22,10 @@ func setupTCAEvidence(t *testing.T, a *App, planID string) (planCommit, redID, n
 	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), "#!/bin/sh\necho 'FAIL: TestX'\nexit 1\n")
 	writeFile(t, filepath.Join(a.workspaceDir, "other.txt"), "unrelated content\n")
 	planCommit = setupApprovedEvidencePlan(t, a, planID)
+	approvalID := activeApprovalIDFor(t, a, planID)
 
 	var err error
-	redID, err = a.RunEvidence(planID, "T1", planCommit, "expected_red", "")
+	redID, err = a.RunEvidence(approvalID, planID, "T1", planCommit, "expected_red", "")
 	if err != nil {
 		t.Fatalf("RunEvidence expected_red: %v", err)
 	}
@@ -40,7 +41,7 @@ func setupTCAEvidence(t *testing.T, a *App, planID string) (planCommit, redID, n
 	if err != nil {
 		t.Fatalf("RegisterMutation: %v", err)
 	}
-	negID, err = a.RunEvidence(planID, "T1", planCommit, "negative_control", mutationID)
+	negID, err = a.RunEvidence(approvalID, planID, "T1", planCommit, "negative_control", mutationID)
 	if err != nil {
 		t.Fatalf("RunEvidence negative_control: %v", err)
 	}

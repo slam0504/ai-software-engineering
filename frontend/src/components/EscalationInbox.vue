@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { escalation } from '../../wailsjs/go/models'
+import { parseStaleTarget } from '../lib/staleNav'
 
 const { t } = useI18n()
 
@@ -25,6 +26,27 @@ const props = defineProps<{
   // 表單。新物件參照即觸發 watch（見下），同一按鈕連續點兩次也會重新套用。
   prefill?: { sourceRef: string; blockScope: string } | null
 }>()
+const emit = defineEmits<{ (e: 'go-resubmit', payload: { gate: string; subject: string }): void }>()
+
+// staleNavTarget／isStaleSystemItem（M3a.1 Task 11，spec §3.5.4 凍結規則）：
+// 手動項或 condition_key 不以 "stale:" 開頭 → 不是系統 stale 項，不顯示導航
+// （正常，跟這個功能無關）；source=system 且 "stale:" 開頭但 parseStaleTarget
+// 解析失敗（未知 gate／空 subject／格式錯誤）→ 顯示資料完整性錯誤、禁止導航
+// ——不得靜默隱藏，讀不出目標比裝作沒事更危險；可解析 → 顯示導航按鈕。二次
+// subject 形狀驗證（resolveResubmitTarget）留給 App.vue 的 onGoResubmit，這裡
+// 只做「condition_key 能不能切出 gate/subject」這一層。
+function isStaleSystemItem(e: escalation.Entry): boolean {
+  return e.Item.source === 'system' && e.Item.condition_key.startsWith('stale:')
+}
+function staleNavTarget(e: escalation.Entry): { gate: string; subject: string } | null {
+  if (!isStaleSystemItem(e)) return null
+  return parseStaleTarget(e.Item.condition_key)
+}
+function onGoResubmit(e: escalation.Entry) {
+  const target = staleNavTarget(e)
+  if (!target) return
+  emit('go-resubmit', target)
+}
 
 const openEntries = computed(() => props.entries.filter(e => e.State === 'open'))
 const ackEntries = computed(() => props.entries.filter(e => e.State === 'acknowledged'))
@@ -182,6 +204,14 @@ async function onCreate() {
             </span>
           </p>
 
+          <p v-if="isStaleSystemItem(e) && !staleNavTarget(e)" class="err" :data-test="'stale-nav-error-' + e.Item.escalation_id">
+            {{ t('escalation.staleNav.integrityError') }}
+          </p>
+          <button
+            v-else-if="staleNavTarget(e)" type="button" :data-test="'go-resubmit-' + e.Item.escalation_id"
+            @click="onGoResubmit(e)"
+          >{{ t('escalation.staleNav.goResubmit') }}</button>
+
           <div class="actions">
             <button type="button" :data-test="'ack-' + e.Item.escalation_id" @click="onAck(e.Item.escalation_id)">
               {{ t('escalation.action.ack') }}
@@ -231,6 +261,14 @@ async function onCreate() {
               {{ t('escalation.badge.occurrence', { n: e.Item.occurrence }) }}
             </span>
           </p>
+
+          <p v-if="isStaleSystemItem(e) && !staleNavTarget(e)" class="err" :data-test="'stale-nav-error-' + e.Item.escalation_id">
+            {{ t('escalation.staleNav.integrityError') }}
+          </p>
+          <button
+            v-else-if="staleNavTarget(e)" type="button" :data-test="'go-resubmit-' + e.Item.escalation_id"
+            @click="onGoResubmit(e)"
+          >{{ t('escalation.staleNav.goResubmit') }}</button>
 
           <div v-if="e.Item.hard" class="hard-notice" :data-test="'hard-notice-' + e.Item.escalation_id">
             {{ t('escalation.hardNotice') }}

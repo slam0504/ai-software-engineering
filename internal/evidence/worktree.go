@@ -33,11 +33,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/journal"
 )
+
+// evidenceIDPattern is the only shape NewWorktree accepts for evidenceID
+// before using it, unsanitized, to derive a filesystem path
+// (os.TempDir()+"wb-evidence-"+evidenceID): a bare ULID's alphabet plus '_'
+// and '-', capped at 64 bytes. Anything else — a path separator, "..",
+// whitespace, or an oversized/empty string — is rejected outright rather
+// than trusted, since a caller-controlled evidenceID landing unchecked in a
+// path is a path-traversal / directory-escape vector (review defense).
+var evidenceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // Worktree is a detached git worktree checked out at a specific commit,
 // tracked by evidence id in the durable registry described above.
@@ -64,6 +74,9 @@ type registryRecord struct {
 // expected to already be unique (a ULID minted by the caller); NewWorktree
 // does not mint one itself.
 func NewWorktree(repoRoot, commitOID, registryPath, evidenceID string) (*Worktree, error) {
+	if !evidenceIDPattern.MatchString(evidenceID) {
+		return nil, fmt.Errorf("evidence: new worktree: invalid evidence id %q", evidenceID)
+	}
 	dir := filepath.Join(os.TempDir(), "wb-evidence-"+evidenceID)
 
 	reg, err := journal.Open(registryPath)

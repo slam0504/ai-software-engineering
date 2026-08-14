@@ -21,6 +21,9 @@ export default {
       height: '拖曳調整高度',
     },
     startupError: '啟動：{error}',
+    goResubmit: {
+      integrityError: '資料完整性錯誤：無法解析重新送核目標——已取消導航',
+    },
   },
   settings: {
     action: {
@@ -111,6 +114,14 @@ export default {
       gate2Link: '對應 Gate 2：{id}',
       viewEvidence: '查看證據',
       mutationDigest: 'mutation digest',
+      evidenceIntegrityError: '資料完整性錯誤：evidence binding role 不完整，無法顯示證據',
+      evidenceIntegrityMissing: '缺漏：{roles}',
+      evidenceIntegrityDuplicate: '重複：{roles}',
+      evidenceIntegrityUnknown: '未知 role：{roles}',
+    },
+    stale: {
+      goResubmit: '前往重新送核',
+      navError: '資料完整性錯誤：無法判定重新送核目標',
     },
   },
   spec: {
@@ -177,6 +188,9 @@ export default {
     },
     mutationId: 'mutation 編號（mutation_id）：{id}',
     submittedApprovalId: '核可編號（approval_id）：{id}',
+    staleGeneration: {
+      hint: '狀態已更新，請重新確認後再執行',
+    },
   },
   evidence: {
     title: 'evidence：{id}',
@@ -342,5 +356,31 @@ export default {
       submit: '建立',
       buttonFrom: '建立升級項目',
     },
+    staleNav: {
+      goResubmit: '前往重新送核',
+      integrityError: '資料完整性錯誤：無法解析重新送核目標',
+    },
+  },
+  newFile: {
+    path: {
+      placeholder: '路徑（例如 spec/features/foo.feature 或 plan/my-plan.yaml）',
+    },
+    action: {
+      create: '建立檔案',
+    },
+    scopeHint: '路徑不在管理範圍內',
+    singlePlanBlocked: '已存在主要 plan 文件，一次僅允許一份主要 plan（單一 plan 限制）',
+  },
+  bump: {
+    banner: {
+      message: '分析基準（analysis_base_commit）落後目前 HEAD，建議更新',
+    },
+    noBumpNeeded: '不需要更新',
+    action: {
+      viewDiff: '檢視差異',
+      rerunAssist: '重新執行 PlannerAssist',
+      confirm: '確認更新',
+    },
+    warning: '更新代表你已檢視這段 code 變更，並確認現有計畫仍適用',
   },
 }

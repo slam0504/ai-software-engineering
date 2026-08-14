@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import type { GateEntry, GateDecisionTask, RiskSelection } from '../types'
 import type { evidence } from '../../wailsjs/go/models'
 import { resolveState, gateStateKeys, evidenceResultKeys, riskTierKeys } from '../i18n/stateKeys'
+import { resolveResubmitTarget } from '../lib/staleNav'
 
 const { t } = useI18n()
 
@@ -22,6 +23,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'open-evidence', evidenceId: string): void
   (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
+  (e: 'go-resubmit', payload: { gate: string; subject: string }): void
 }>()
 
 // scopeForEntry：review fix（spec §3.8 回填）——鏡射後端 app.go 的
@@ -41,6 +43,18 @@ function scopeForEntry(e: GateEntry): string {
 }
 function onEscalate(e: GateEntry) {
   emit('escalate', { sourceRef: 'approval:' + e.approval_id, blockScope: scopeForEntry(e) })
+}
+
+// resubmitTargetOf／onGoResubmit（M3a.1 Task 11，spec §3.5）：stale 卡片的
+// 「前往重新送核」——entry 已經有結構化 gate/subject（不像 EscalationInbox 只有
+// condition_key 字串），直接用 resolveResubmitTarget 二次解析 subject 形狀。
+// 解析失敗（gate/subject 缺失或形狀不符）一律顯示資料完整性錯誤、不渲染按鈕、
+// 不 emit——fail loud，不讓操作者點了才發現導航不了。
+function resubmitTargetOf(e: GateEntry) {
+  return resolveResubmitTarget(e.gate ?? '', e.subject ?? '')
+}
+function onGoResubmit(e: GateEntry) {
+  emit('go-resubmit', { gate: e.gate ?? '', subject: e.subject ?? '' })
 }
 
 const reasons = reactive<Record<string, string>>({}) // 理由欄：per approval_id 獨立輸入
@@ -118,6 +132,53 @@ async function ensureEvidence(evidenceId: string) {
   }
 }
 
+// evidenceIntegrityOf（spec §3.3.3，單一答案，凍結）：純函式判定 tca 卡片
+// evidence_run bindings 的完整性——必要 role（expected_red／negative_control）
+// 各恰一筆，且不得帶任何非必要 role 值。任一條件不成立即整體判不完整：卡片
+// 改顯示資料完整性錯誤、不呼叫 EvidenceGet、不渲染「查看證據」控制項（見
+// watch()／template），raw bindings 清單不受影響（GateConsole 既有渲染，
+// 獨立於這個函式之外）。
+//
+// 根因（M3a review「data-test 偶發 -undefined」，Task 10 追查，review 修正）：
+// 後端 validateTCABindings（internal/gatepolicy/tca.go）只鎖「必要 (kind,role)
+// 存在＋不重複」——遍歷 tcaBindingReqs 逐筆 findBinding 確認在，並用
+// map[(kind,role)]bool 擋重複——**沒有鎖白名單、不拒絕清單外的額外
+// binding**（M3a ledger 已記錄此 laxness）。一筆 role 為空字串的第三筆
+// evidence_run（kind/role 都不撞既有必要項的 key）可以直接通過 Submit 進
+// journal；`gate.Binding.Role` 帶 `json:"role,omitempty"`，空字串序列化時整個
+// key 被省略，前端 `Binding.role` 因此是 JS `undefined`——**這是正常請求路徑
+// 就能產生的資料形狀，不需要繞過驗證**。GateConsole 的 tca-section 模板
+// （data-test="'tca-evidence-' + b.role" 等）過去無條件信任每筆
+// evidence_run binding 都帶合法 role、直接把 b.role 接進 data-test／DOM，
+// 字串樣板把 undefined toString 成字面 "undefined"，且照樣渲染「查看證據」
+// 按鈕、照樣呼叫 EvidenceGet——沒有任何錯誤浮現。spec §3.3.3 的修正就是在後端
+// 目前只鎖必要項存在＋不重複、未鎖無額外項的前提下，前端自己補上這層防線：
+// 不管後端未來是否收緊白名單，UI 收到不完整（含「有額外未知 role」）的
+// evidence_run bindings 一律 fail loud，不再靜默組出 undefined。
+function evidenceIntegrityOf(e: GateEntry): { ok: boolean; missing: string[]; duplicate: string[]; unknown: string[] } {
+  const required = ['expected_red', 'negative_control']
+  const counts: Record<string, number> = {}
+  const unknown: string[] = []
+  for (const b of evidenceBindingsOf(e)) {
+    if (b.role && required.includes(b.role)) {
+      counts[b.role] = (counts[b.role] ?? 0) + 1
+    } else {
+      unknown.push(b.role ?? '(missing)')
+    }
+  }
+  const missing = required.filter(r => !counts[r])
+  const duplicate = required.filter(r => (counts[r] ?? 0) > 1)
+  return { ok: missing.length === 0 && duplicate.length === 0 && unknown.length === 0, missing, duplicate, unknown }
+}
+function evidenceIntegrityDetail(e: GateEntry): string {
+  const r = evidenceIntegrityOf(e)
+  const parts: string[] = []
+  if (r.missing.length) parts.push(t('gate.tca.evidenceIntegrityMissing', { roles: r.missing.join(', ') }))
+  if (r.duplicate.length) parts.push(t('gate.tca.evidenceIntegrityDuplicate', { roles: r.duplicate.join(', ') }))
+  if (r.unknown.length) parts.push(t('gate.tca.evidenceIntegrityUnknown', { roles: r.unknown.join(', ') }))
+  return parts.join('；')
+}
+
 // scrollToApproval：gate2_approval 連結點擊後捲到對應卡片（同 DagPane
 // select-task → highlightId 的「導航」語意，這裡改用 scrollIntoView 直接定位，
 // 不像 highlightId 需要跨元件狀態）。jsdom 測試環境不一定實作
@@ -136,7 +197,8 @@ function shortOID(oid: string): string {
 watch(() => props.entries, (entries) => {
   for (const e of entries) {
     if (isGate2Pending(e)) void ensureRiskContext(e.approval_id)
-    if (isTca(e)) for (const b of evidenceBindingsOf(e)) void ensureEvidence(b.ref)
+    // role 不完整（spec §3.3.3）→ 連 EvidenceGet 都不打，不只是不渲染控制項。
+    if (isTca(e) && evidenceIntegrityOf(e).ok) for (const b of evidenceBindingsOf(e)) void ensureEvidence(b.ref)
   }
 }, { immediate: true })
 
@@ -216,6 +278,14 @@ function shortDigest(d: string): string {
         <span :class="['badge', 'badge-' + e.state]" :data-test="'badge-' + e.approval_id">{{ resolveState(gateStateKeys, e.state, t) }}</span>
         <button type="button" :data-test="'escalate-' + e.approval_id" @click="onEscalate(e)">{{ t('escalation.create.buttonFrom') }}</button>
       </div>
+      <div v-if="e.state === 'stale'" class="stale-section" data-test="stale-section">
+        <p v-if="!resubmitTargetOf(e)" class="err" :data-test="'stale-nav-error-' + e.approval_id">
+          {{ t('gate.stale.navError') }}
+        </p>
+        <button v-else type="button" :data-test="'go-resubmit-' + e.approval_id" @click="onGoResubmit(e)">
+          {{ t('gate.stale.goResubmit') }}
+        </button>
+      </div>
       <ul v-if="e.bindings && e.bindings.length" class="bindings">
         <li v-for="b in e.bindings" :key="b.kind + (b.role ?? '') + b.ref" :title="b.digest">
           {{ b.kind }}<template v-if="b.role">（{{ b.role }}）</template>: {{ shortDigest(b.digest) }}
@@ -258,23 +328,28 @@ function shortDigest(d: string): string {
             {{ t('gate.tca.gate2Link', { id: gate2ApprovalIdOf(e) }) }}
           </button>
         </p>
-        <div v-for="b in evidenceBindingsOf(e)" :key="b.role + b.ref" class="tca-evidence" :data-test="'tca-evidence-' + b.role">
-          <span class="role">{{ b.role }}</span>
-          <span v-if="evidenceErrors[b.ref]" class="err" :data-test="'tca-evidence-error-' + b.role">{{ evidenceErrors[b.ref] }}</span>
-          <template v-else-if="evidenceCache[b.ref]">
-            <span
-              :class="['result', 'result-' + evidenceCache[b.ref].result]"
-              :data-test="'tca-evidence-result-' + b.role"
-            >{{ resolveState(evidenceResultKeys, evidenceCache[b.ref].result, t) }}</span>
-            <span class="test-commit" :title="evidenceCache[b.ref].test_commit">{{ shortOID(evidenceCache[b.ref].test_commit) }}</span>
-            <span v-if="evidenceCache[b.ref].result === 'error'" class="err" :data-test="'tca-evidence-observed-' + b.role">
-              {{ evidenceCache[b.ref].observed_failure }}
-            </span>
-            <button type="button" :data-test="'tca-evidence-open-' + b.role" @click="emit('open-evidence', b.ref)">
-              {{ t('gate.tca.viewEvidence') }}
-            </button>
-          </template>
-        </div>
+        <p v-if="!evidenceIntegrityOf(e).ok" class="err" data-test="tca-evidence-integrity-error">
+          {{ t('gate.tca.evidenceIntegrityError') }}<template v-if="evidenceIntegrityDetail(e)"> — {{ evidenceIntegrityDetail(e) }}</template>
+        </p>
+        <template v-else>
+          <div v-for="b in evidenceBindingsOf(e)" :key="b.role + b.ref" class="tca-evidence" :data-test="'tca-evidence-' + b.role">
+            <span class="role">{{ b.role }}</span>
+            <span v-if="evidenceErrors[b.ref]" class="err" :data-test="'tca-evidence-error-' + b.role">{{ evidenceErrors[b.ref] }}</span>
+            <template v-else-if="evidenceCache[b.ref]">
+              <span
+                :class="['result', 'result-' + evidenceCache[b.ref].result]"
+                :data-test="'tca-evidence-result-' + b.role"
+              >{{ resolveState(evidenceResultKeys, evidenceCache[b.ref].result, t) }}</span>
+              <span class="test-commit" :title="evidenceCache[b.ref].test_commit">{{ shortOID(evidenceCache[b.ref].test_commit) }}</span>
+              <span v-if="evidenceCache[b.ref].result === 'error'" class="err" :data-test="'tca-evidence-observed-' + b.role">
+                {{ evidenceCache[b.ref].observed_failure }}
+              </span>
+              <button type="button" :data-test="'tca-evidence-open-' + b.role" @click="emit('open-evidence', b.ref)">
+                {{ t('gate.tca.viewEvidence') }}
+              </button>
+            </template>
+          </div>
+        </template>
         <p v-if="mutationBindingOf(e)" class="tca-mutation" data-test="tca-mutation">
           {{ t('gate.tca.mutationDigest') }}: {{ shortDigest(mutationBindingOf(e)!.digest) }}
         </p>
@@ -313,6 +388,7 @@ function shortDigest(d: string): string {
 .badge-rejected { background: var(--rejected); color: #2a1708; }
 .bindings { list-style: none; margin: 4px 0 0; padding: 0; color: var(--text-muted); font-size: var(--fs-s); overflow-wrap: anywhere; word-break: break-all; }
 .bindings li { overflow-wrap: anywhere; word-break: break-all; }
+.stale-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; font-size: var(--fs-s); }
 .risk-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
 .risk-rows { display: flex; flex-direction: column; gap: 6px; }
 .risk-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--fs-s); }

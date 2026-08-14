@@ -1,6 +1,15 @@
 package plan
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrRiskUnclassifiable is the sentinel every risk-tier classification
+// failure Validate reports wraps (minimum recompute mismatch, planner tier
+// below minimum, unknown tier name) — §3.8 (1). Callers identify these via
+// errors.Is rather than matching on message text.
+var ErrRiskUnclassifiable = errors.New("plan: risk tier unclassifiable")
 
 // Validate performs deterministic, collection-style checks over a plan:
 // schema completeness (plan_id/task id/title non-empty), DAG acyclicity,
@@ -55,19 +64,19 @@ func Validate(p Plan, policy RiskPolicy, specScenarios map[string]bool) []error 
 
 		_, minKnown := tierOrder[t.MinimumRiskTier]
 		if !minKnown {
-			errs = append(errs, fmt.Errorf("task %q: unknown minimum_risk_tier %q", t.ID, t.MinimumRiskTier))
+			errs = append(errs, fmt.Errorf("task %q: unknown minimum_risk_tier %q: %w", t.ID, t.MinimumRiskTier, ErrRiskUnclassifiable))
 		}
 		_, plannerKnown := tierOrder[t.PlannerRiskTier]
 		if !plannerKnown {
-			errs = append(errs, fmt.Errorf("task %q: unknown planner_risk_tier %q", t.ID, t.PlannerRiskTier))
+			errs = append(errs, fmt.Errorf("task %q: unknown planner_risk_tier %q: %w", t.ID, t.PlannerRiskTier, ErrRiskUnclassifiable))
 		}
 
 		if want := policy.ComputeMinimum(t); want != t.MinimumRiskTier {
-			errs = append(errs, fmt.Errorf("task %q: minimum_risk_tier %q does not match recomputed %q", t.ID, t.MinimumRiskTier, want))
+			errs = append(errs, fmt.Errorf("task %q: minimum_risk_tier %q does not match recomputed %q: %w", t.ID, t.MinimumRiskTier, want, ErrRiskUnclassifiable))
 		}
 
 		if minKnown && plannerKnown && tierOrder[t.PlannerRiskTier] < tierOrder[t.MinimumRiskTier] {
-			errs = append(errs, fmt.Errorf("task %q: planner_risk_tier %q below minimum_risk_tier %q", t.ID, t.PlannerRiskTier, t.MinimumRiskTier))
+			errs = append(errs, fmt.Errorf("task %q: planner_risk_tier %q below minimum_risk_tier %q: %w", t.ID, t.PlannerRiskTier, t.MinimumRiskTier, ErrRiskUnclassifiable))
 		}
 	}
 

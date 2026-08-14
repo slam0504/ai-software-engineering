@@ -53,7 +53,7 @@ describe('TcaWorkspace', () => {
     await w.find('[data-test=test-commit-input-T1]').setValue('deadbeef00')
     await w.find('[data-test=run-expected_red-T1]').trigger('click')
     await flushPromises()
-    expect(props.runEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef00', 'expected_red', '')
+    expect(props.runEvidence).toHaveBeenCalledWith('G2-1', 'P1', 'T1', 'deadbeef00', 'expected_red', '')
     expect(w.find('[data-test=run-result-expected_red-T1]').text()).toContain('通過')
     expect(w.find('[data-test=submit-tca-T1]').attributes('disabled')).toBeDefined() // 只有一筆 passed，仍 disabled
 
@@ -69,7 +69,7 @@ describe('TcaWorkspace', () => {
 
     await w.find('[data-test=run-negative_control-T1]').trigger('click')
     await flushPromises()
-    expect(props.runEvidence).toHaveBeenCalledWith('P1', 'T1', 'deadbeef00', 'negative_control', 'mut-1')
+    expect(props.runEvidence).toHaveBeenCalledWith('G2-1', 'P1', 'T1', 'deadbeef00', 'negative_control', 'mut-1')
     expect(w.find('[data-test=submit-tca-T1]').attributes('disabled')).toBeUndefined() // 雙 passed，可送核
 
     await w.find('[data-test=submit-tca-T1]').trigger('click')
@@ -105,7 +105,7 @@ describe('TcaWorkspace', () => {
   // negative-control 已有 mutation_id，也不能被點擊觸發第二個並行呼叫。
   it('同一 task 任一 kind 執行中時，兩顆 run 按鈕都 disabled（per-task 互斥）', async () => {
     let resolveRed: (id: string) => void = () => {}
-    const runEvidence = vi.fn().mockImplementation((_p: string, _t: string, _c: string, kind: string) => {
+    const runEvidence = vi.fn().mockImplementation((_a: string, _p: string, _t: string, _c: string, kind: string) => {
       if (kind === 'expected_red') return new Promise<string>(r => { resolveRed = r })
       return Promise.resolve('ev-neg')
     })
@@ -167,5 +167,75 @@ describe('TcaWorkspace', () => {
     const w = mountWithI18n(TcaWorkspace, { props })
     await flushPromises()
     expect(w.find('[data-test=tca-load-error]').text()).toContain('gate: approval id "G2-1" not found')
+  })
+
+  // Task 9（§3.3.1-2 step 1(c)）：active gate2 approval_id 改變（換版，例如
+  // replan 後重新送核 Gate 2）——即使 task_id 沿用同一值，test_commit 輸入／
+  // 預檢結果／mutation ID／run 結果／送核結果都必須全清空，且 task context
+  // 與候選 commit 都要重載，不能殘留舊 generation 的痕跡。
+  it('active gate2 approval_id 改變→全清空並重載 task context／候選（換版）', async () => {
+    const loadDecisionContext = vi.fn()
+      .mockResolvedValueOnce(oneTask)
+      .mockResolvedValueOnce({ tasks: [{ task_id: 'T1', title: 'redone after replan', minimum_risk_tier: 'medium', planner_risk_tier: 'medium' }] })
+    const listCandidates = vi.fn().mockResolvedValue([{ oid: 'deadbeef00', subject: 'add oracle test' }])
+    const props = baseProps({ loadDecisionContext, listCandidates })
+    const w = mountWithI18n(TcaWorkspace, { props })
+    await flushPromises()
+
+    await w.find('[data-test=test-commit-input-T1]').setValue('deadbeef00')
+    await w.find('[data-test=run-expected_red-T1]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=run-result-expected_red-T1]').exists()).toBe(true)
+
+    await w.setProps({ entries: [{ approval_id: 'G2-2', state: 'active', gate: 'gate2', subject: 'plan:P1' }] })
+    await flushPromises()
+
+    expect(loadDecisionContext).toHaveBeenCalledWith('G2-2')
+    expect(listCandidates).toHaveBeenCalledTimes(2) // 重載候選，不只沿用初次結果
+    expect(w.find('[data-test=tca-row-T1]').text()).toContain('redone after replan')
+    expect((w.find('[data-test=test-commit-input-T1]').element as HTMLInputElement).value).toBe('') // test_commit 輸入清空
+    expect(w.find('[data-test=run-result-expected_red-T1]').exists()).toBe(false) // run 結果清空
+  })
+
+  // Task 9（§3.3.1-2 step 1(d)）：generation guard——呼叫當下記錄的 approval
+  // id 快照跟 resolve 時的目前值比對，換版後才 resolve 的舊 generation 回應
+  // 一律丟棄，不寫入任何格子，也不會繼續呼叫 EvidenceGet。
+  it('舊 generation 的 RunEvidence Promise 在換版後才 resolve→丟棄不寫入', async () => {
+    let resolveRun: (id: string) => void = () => {}
+    const runEvidence = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveRun = r }))
+    const getEvidence = vi.fn().mockResolvedValue({ result: 'passed' })
+    const props = baseProps({ runEvidence, getEvidence })
+    const w = mountWithI18n(TcaWorkspace, { props })
+    await flushPromises()
+
+    await w.find('[data-test=test-commit-input-T1]').setValue('deadbeef00')
+    void w.find('[data-test=run-expected_red-T1]').trigger('click')
+    await flushPromises()
+    expect(runEvidence).toHaveBeenCalledWith('G2-1', 'P1', 'T1', 'deadbeef00', 'expected_red', '')
+
+    await w.setProps({ entries: [{ approval_id: 'G2-2', state: 'active', gate: 'gate2', subject: 'plan:P1' }] })
+    await flushPromises()
+
+    resolveRun('ev-late') // 舊 generation 的呼叫這時才 resolve
+    await flushPromises()
+
+    expect(getEvidence).not.toHaveBeenCalled() // generation guard 攔在拿到 evidence_id 之後、查詳情之前
+    expect(w.find('[data-test=run-busy-expected_red-T1]').exists()).toBe(false)
+    expect(w.find('[data-test=run-result-expected_red-T1]').exists()).toBe(false)
+  })
+
+  // Task 9（§3.3.1-2 step 1(e)）：ErrStaleGeneration（後端 CAS 換版偵測，
+  // app.go）錯誤原文照樣顯示（不吞），另外加一句引導文案。
+  it('ErrStaleGeneration 顯示錯誤原文＋重新確認引導', async () => {
+    const runEvidence = vi.fn().mockRejectedValue(new Error('evidence: gate2 approval changed since view was loaded'))
+    const props = baseProps({ runEvidence })
+    const w = mountWithI18n(TcaWorkspace, { props })
+    await flushPromises()
+
+    await w.find('[data-test=run-expected_red-T1]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=run-error-expected_red-T1]').text()).toContain('evidence: gate2 approval changed since view was loaded')
+    expect(w.find('[data-test=run-stale-hint-expected_red-T1]').text()).toContain('狀態已更新，請重新確認後再執行')
   })
 })

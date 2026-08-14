@@ -219,6 +219,102 @@ describe('GateConsole', () => {
     expect(w.find('[data-test=tca-evidence-error-expected_red]').text()).toContain('evidence: not found: evidence_id ev-red')
   })
 
+  // Task 10（§3.3.3）：role 完整性 fail loud——根因是 GateConsole 過去無條件信任
+  // binding.role、直接把它接進 data-test／DOM；bindings[].role 缺漏／未知／重複時
+  // 一律不得靜默組出 "...-undefined"，改顯示資料完整性錯誤、零呼叫 EvidenceGet、
+  // 不渲染「查看證據」控制項，raw bindings 清單仍保留診斷。
+  const tcaBindingsMissingRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    // role 欄位完全缺漏（重現 M3a review 記錄的 data-test="...-undefined"：
+    // b.role 是 JS undefined，字串樣板把它 toString 成字面 "undefined"）。
+    { kind: 'evidence_run', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsMissingNegativeControl = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsUnknownRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'bogus_role', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  const tcaBindingsDuplicateRole = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red-2', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+  // review 修正：validateTCABindings（internal/gatepolicy/tca.go）只鎖必要
+  // (kind,role) 存在＋不重複，不拒絕清單外的額外 binding——兩個必要 role 齊全
+  // 之外再帶一筆 role 省略（omitempty 序列化後前端拿到 undefined）的第三筆
+  // evidence_run，是後端目前這道缺口在正常請求路徑下就能產生的真實資料形狀，
+  // 不是繞過驗證才會出現，integrity 檢查的 unknown 分支必須擋下它。
+  const tcaBindingsExtraUnknownRoleBinding = () => [
+    { kind: 'gate2_approval', ref: 'approval:G2-1', digest: 'sha256:' + 'a'.repeat(64) },
+    { kind: 'base_commit', ref: 'plan_commit', digest: 'git:sha1:' + 'b'.repeat(40) },
+    { kind: 'oracle_surface', ref: 'c'.repeat(40), digest: 'sha256:' + 'c'.repeat(64) },
+    { kind: 'evidence_run', role: 'expected_red', ref: 'ev-red', digest: 'sha256:' + 'd'.repeat(64) },
+    { kind: 'evidence_run', role: 'negative_control', ref: 'ev-neg', digest: 'sha256:' + 'e'.repeat(64) },
+    { kind: 'evidence_run', ref: 'ev-extra', digest: 'sha256:' + 'd'.repeat(64) }, // role 省略（後端 omitempty 序列化後的真實形狀）
+    { kind: 'mutation', ref: 'mut-1', digest: 'sha256:' + 'f'.repeat(64) },
+  ]
+
+  it.each([
+    ['role 完全缺漏（-undefined 根因重現）', tcaBindingsMissingRole],
+    ['缺 negative_control', tcaBindingsMissingNegativeControl],
+    ['未知 role', tcaBindingsUnknownRole],
+    ['雙份同 role', tcaBindingsDuplicateRole],
+    ['兩必要 role 齊全＋額外一筆 role 省略的第三筆 evidence_run（後端白名單缺口的真實資料形狀）', tcaBindingsExtraUnknownRoleBinding],
+  ])('tca 卡片：evidence bindings 不完整（%s）→ 資料完整性錯誤、零呼叫 EvidenceGet、不渲染查看證據', async (_label, bindingsFactory) => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'pending', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: bindingsFactory() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(getEvidence).not.toHaveBeenCalled() // EvidenceGet 零呼叫
+    expect(w.find('[data-test=tca-evidence-integrity-error]').exists()).toBe(true)
+    expect(w.find('[data-test=tca-evidence-integrity-error]').text()).not.toContain('undefined') // 不得靜默組出 "-undefined"
+    expect(w.find('button[data-test^="tca-evidence-open-"]').exists()).toBe(false) // 不渲染「查看證據」控制項
+    expect(w.html()).not.toContain('-undefined') // data-test 屬性本身也不得出現 undefined
+    // raw bindings 清單仍保留供診斷
+    expect(w.find('.bindings').exists()).toBe(true)
+    expect(w.find('.bindings').text()).toContain('evidence_run')
+  })
+
+  it('tca 卡片：evidence bindings 完整（雙 role 各恰一）→ 查看證據控制項正常渲染（回歸）', async () => {
+    const decide = vi.fn()
+    const getEvidence = vi.fn().mockResolvedValue(evidenceRunFixture())
+    const w = mountWithI18n(GateConsole, {
+      props: {
+        entries: [{ approval_id: 'TCA-1', state: 'pending', gate: 'test_contract_approval', subject: 'task:P1/T1', bindings: tcaBindings() }],
+        decide, getEvidence,
+      },
+    })
+    await flushPromises()
+
+    expect(w.find('[data-test=tca-evidence-integrity-error]').exists()).toBe(false)
+    expect(getEvidence).toHaveBeenCalledWith('ev-red')
+    expect(getEvidence).toHaveBeenCalledWith('ev-neg')
+    expect(w.find('[data-test=tca-evidence-open-expected_red]').exists()).toBe(true)
+  })
+
   it('gate2／gate1 卡片不渲染 tca-section（回歸）', async () => {
     const w = mountWithI18n(GateConsole, {
       props: { entries: [{ approval_id: 'A', state: 'active', gate: 'gate2', subject: 'plan:P1' }], decide: vi.fn() },
@@ -255,5 +351,48 @@ describe('GateConsole', () => {
     })
     await w.find('[data-test=escalate-A]').trigger('click')
     expect(w.emitted('escalate')).toEqual([[{ sourceRef: 'approval:A', blockScope: 'workspace' }]])
+  })
+
+  // M3a.1 Task 11（spec §3.5）：stale 卡片「前往重新送核」——三種 gate 各 emit
+  // 正確的 (gate, subject)；畸形 subject 顯示資料完整性錯誤、不渲染按鈕、不
+  // emit；導航純 view 操作，不呼叫任何寫入 binding（decide 全程零呼叫）。
+  it.each([
+    ['gate1', { gate: 'gate1', subject: 'workspace' }],
+    ['gate2', { gate: 'gate2', subject: 'plan:P1' }],
+    ['test_contract_approval', { gate: 'test_contract_approval', subject: 'task:P1/T1' }],
+  ])('stale 卡片（%s）點擊「前往重新送核」emit go-resubmit 帶正確 gate/subject，且不呼叫 decide', async (_label, entry) => {
+    const decide = vi.fn()
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale', ...entry }], decide },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(false)
+    await w.find('[data-test=go-resubmit-A]').trigger('click')
+    expect(w.emitted('go-resubmit')).toEqual([[entry]])
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stale 卡片：畸形 subject（gate2 缺 plan id）顯示資料完整性錯誤、不渲染導航按鈕、不 emit', async () => {
+    const decide = vi.fn()
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale', gate: 'gate2', subject: 'plan:' }], decide },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-A]').exists()).toBe(false)
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stale 卡片：缺 gate/subject（未知形狀）顯示資料完整性錯誤、不渲染導航按鈕', () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'stale' }], decide: vi.fn() },
+    })
+    expect(w.find('[data-test=stale-nav-error-A]').exists()).toBe(true)
+    expect(w.find('[data-test=go-resubmit-A]').exists()).toBe(false)
+  })
+
+  it('非 stale 卡片不渲染 stale-section（正常，無導航）', () => {
+    const w = mountWithI18n(GateConsole, {
+      props: { entries: [{ approval_id: 'A', state: 'pending', gate: 'gate1' }], decide: vi.fn() },
+    })
+    expect(w.find('[data-test=stale-section]').exists()).toBe(false)
   })
 })

@@ -21,6 +21,9 @@ export default {
       height: 'Drag to resize height',
     },
     startupError: 'startup: {error}',
+    goResubmit: {
+      integrityError: 'Data integrity error: the resubmit target could not be parsed — navigation cancelled',
+    },
   },
   settings: {
     action: {
@@ -111,6 +114,14 @@ export default {
       gate2Link: 'Gate 2: {id}',
       viewEvidence: 'View evidence',
       mutationDigest: 'mutation digest',
+      evidenceIntegrityError: 'Data integrity error: evidence binding roles are incomplete, evidence cannot be shown',
+      evidenceIntegrityMissing: 'missing: {roles}',
+      evidenceIntegrityDuplicate: 'duplicate: {roles}',
+      evidenceIntegrityUnknown: 'unknown role: {roles}',
+    },
+    stale: {
+      goResubmit: 'Go to resubmit',
+      navError: 'Data integrity error: the resubmit target could not be determined',
     },
   },
   spec: {
@@ -177,6 +188,9 @@ export default {
     },
     mutationId: 'mutation_id: {id}',
     submittedApprovalId: 'approval_id: {id}',
+    staleGeneration: {
+      hint: 'State has changed — please re-check before running again',
+    },
   },
   evidence: {
     title: 'evidence: {id}',
@@ -342,5 +356,31 @@ export default {
       submit: 'Create',
       buttonFrom: 'Create escalation item',
     },
+    staleNav: {
+      goResubmit: 'Go to resubmit',
+      integrityError: 'Data integrity error: the resubmit target could not be parsed',
+    },
+  },
+  newFile: {
+    path: {
+      placeholder: 'Path (e.g. spec/features/foo.feature or plan/my-plan.yaml)',
+    },
+    action: {
+      create: 'Create file',
+    },
+    scopeHint: 'Path is outside the managed scope',
+    singlePlanBlocked: 'A primary plan file already exists — only one primary plan is allowed at a time',
+  },
+  bump: {
+    banner: {
+      message: 'analysis_base_commit is behind the current HEAD — an update is recommended',
+    },
+    noBumpNeeded: 'No update needed',
+    action: {
+      viewDiff: 'View diff',
+      rerunAssist: 'Re-run PlannerAssist',
+      confirm: 'Confirm update',
+    },
+    warning: 'Confirming means you have reviewed this code change and confirm the current plan still applies',
   },
 }

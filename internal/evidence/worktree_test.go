@@ -3,6 +3,7 @@ package evidence
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,11 +62,15 @@ func writeFileT(t *testing.T, root, rel, content string) {
 
 // evID returns a unique-per-call evidence id derived from the test name, so
 // concurrent/previous test runs never collide on the same real
-// os.TempDir()-rooted worktree directory.
+// os.TempDir()-rooted worktree directory. The test name is folded into a
+// short hash rather than used verbatim — NewWorktree now rejects evidence
+// ids over 64 bytes (review defense), and t.Name() alone (subtests included)
+// can easily exceed that.
 func evID(t *testing.T, suffix string) string {
 	t.Helper()
-	safe := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
-	return fmt.Sprintf("%s-%s-%d", safe, suffix, time.Now().UnixNano())
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(t.Name()))
+	return fmt.Sprintf("t%x-%s-%d", h.Sum32(), suffix, time.Now().UnixNano())
 }
 
 // removeEvidenceDirLeftover is a final safety-net cleanup for the real
@@ -77,6 +82,45 @@ func removeEvidenceDirLeftover(t *testing.T, evidenceID string) {
 	dir := filepath.Join(os.TempDir(), "wb-evidence-"+evidenceID)
 	if err := os.RemoveAll(dir); err != nil {
 		t.Errorf("cleanup: RemoveAll(%q): %v", dir, err)
+	}
+}
+
+// ---- Step 1: NewWorktree sanitizes evidenceID (review defense) ----
+
+// TestNewWorktreeRejectsInvalidEvidenceID guards against evidenceID being
+// used unsanitized to derive a filesystem path (filepath.Join(os.TempDir(),
+// "wb-evidence-"+evidenceID)): a path-traversal or otherwise malformed id
+// must be rejected before any registry/filesystem mutation, while a
+// legitimate ULID-shaped id must still work end-to-end.
+func TestNewWorktreeRejectsInvalidEvidenceID(t *testing.T) {
+	root, _, commit2 := initRepoTwoCommits(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.jsonl")
+
+	cases := []string{
+		"../x",                  // path traversal
+		"a/b",                   // embedded path separator
+		"has space",             // whitespace
+		strings.Repeat("a", 65), // over 64 chars
+		"",                      // empty
+	}
+	for _, id := range cases {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			if _, err := NewWorktree(root, commit2, registryPath, id); err == nil {
+				t.Fatalf("NewWorktree(%q): want error for invalid evidence id", id)
+			}
+		})
+	}
+	assertNoZombieWorktrees(t, root)
+
+	// A legitimate ULID-shaped id (26 chars, Crockford base32) must still pass.
+	validID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	t.Cleanup(func() { removeEvidenceDirLeftover(t, validID) })
+	w, err := NewWorktree(root, commit2, registryPath, validID)
+	if err != nil {
+		t.Fatalf("NewWorktree(valid ULID): %v", err)
+	}
+	if err := w.Remove(root, registryPath); err != nil {
+		t.Fatalf("Remove: %v", err)
 	}
 }
 

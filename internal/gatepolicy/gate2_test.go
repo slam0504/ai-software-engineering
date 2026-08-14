@@ -228,6 +228,86 @@ func newBuildDecisionPolicy(pl plan.Plan) gate.GatePolicy {
 	return NewGate2Policy(loader, nopGit{}, failFn, failFn, failFn, failFn)
 }
 
+// newBuildDecisionPolicyWithPolicy is newBuildDecisionPolicy generalized to
+// an explicit RiskPolicy, for cases that need a non-default recomputation
+// (a matching rule, or a policy that bypasses plan.ParseRiskPolicy's
+// load-time tier validation — see the "unknown tier" case below).
+func newBuildDecisionPolicyWithPolicy(pl plan.Plan, pol plan.RiskPolicy) gate.GatePolicy {
+	loader := &fakeLoader{entries: map[string]loaderEntry{
+		"C1|P1": {plan: pl, pol: pol},
+	}}
+	return NewGate2Policy(loader, nopGit{}, failFn, failFn, failFn, failFn)
+}
+
+// TestGate2BuildDecisionRejectionPaths covers BuildDecision's three
+// task-level rejection checks (gate2.go:151-167), each independent of the
+// happy-path/malformed-input cases already covered by
+// TestGate2BuildDecisionApproved:
+//   - recomputed minimum_risk_tier (via a matching RiskPolicy rule) diverges
+//     from the committed plan's minimum_risk_tier
+//   - planner_risk_tier below the (matching) minimum_risk_tier
+//   - an unknown risk tier reaching BuildDecision's own tierOrder lookup
+//     (constructed directly rather than via plan.ParseRiskPolicy, which
+//     already rejects unknown tiers at load time — this exercises gate2's
+//     own defense-in-depth check)
+func TestGate2BuildDecisionRejectionPaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		pl      plan.Plan
+		pol     plan.RiskPolicy
+		sel     []gate.RiskSelection
+		wantErr string
+	}{
+		{
+			name: "rule recomputes high but committed plan says medium",
+			pl: func() plan.Plan {
+				task := riskTask("T1", "medium", "high")
+				task.Impact.Contexts = []string{"gate"}
+				return planWithTasks(task)
+			}(),
+			pol: func() plan.RiskPolicy {
+				pol, err := plan.ParseRiskPolicy([]byte(
+					"version: 1\ndefault_tier: medium\nrules:\n  - match:\n      contexts: [gate]\n    tier: high\n"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return pol
+			}(),
+			sel:     []gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "high"}},
+			wantErr: "recomputed minimum_risk_tier",
+		},
+		{
+			name: "planner_risk_tier below recomputed minimum",
+			pl:   planWithTasks(riskTask("T1", "medium", "low")),
+			pol:  plan.RiskPolicy{Version: 1, DefaultTier: "medium"}, // no rules -> recomputed "medium" matches committed
+			sel:  []gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "medium"}},
+			// planner "low" < recomputed minimum "medium"
+			wantErr: "planner_risk_tier",
+		},
+		{
+			name: "unknown risk tier",
+			pl:   planWithTasks(riskTask("T1", "critical", "critical")),
+			// constructed directly (not parsed) so an out-of-band tier can
+			// reach BuildDecision's tierOrder lookup: recomputed default
+			// "critical" matches the committed minimum "critical", so the
+			// mismatch check passes and BuildDecision itself must reject it.
+			pol:     plan.RiskPolicy{Version: 1, DefaultTier: "critical"},
+			sel:     []gate.RiskSelection{{TaskID: "T1", SelectedRiskTier: "critical"}},
+			wantErr: "unknown minimum_risk_tier",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := newBuildDecisionPolicyWithPolicy(c.pl, c.pol)
+			req := gate2Req()
+			if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{RiskSelections: c.sel}); err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", c.wantErr, err)
+			}
+		})
+	}
+}
+
 func gate2Req() gate.GateRequest {
 	return gate.GateRequest{Gate: "gate2", Subject: "plan:P1", Bindings: validGate2Bindings("C1")}
 }
