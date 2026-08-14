@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -58,8 +59,19 @@ func Open(path string) (*Store, error) {
 	b, err := os.ReadFile(path)
 	switch {
 	case err == nil:
+		// malformed 一律直接回錯，不像 restore.go:34-41 那樣「重建並回錯」：
+		// restore.go 重建只丟失可再生的 view 視窗（下次重放 audit 即可復
+		// 原），而這裡的 entries 是使用者所有 session 的權威記錄，重建等於
+		// 把它們全部抹掉、不可再生，所以刻意不沿用那個自動修復策略。
 		if jerr := json.Unmarshal(b, &s.file); jerr != nil {
 			return nil, fmt.Errorf("wsregistry: malformed %s: %w", path, jerr)
+		}
+		// 0 視為舊檔／缺欄位，維持現行接受行為；非 0 且不等於目前
+		// schemaVersion 一律拒絕。schema_version 是凍結常數，另一半語意
+		// 就是「非此版本」不可靜默接受——否則下一次任何寫入會把 version
+		// 蓋回目前值並落盤，造成未預期版本間的靜默資料遺失。
+		if s.file.SchemaVersion != 0 && s.file.SchemaVersion != schemaVersion {
+			return nil, fmt.Errorf("wsregistry: %s schema_version=%d, want %d（不支援的版本，拒絕載入）", path, s.file.SchemaVersion, schemaVersion)
 		}
 		if s.file.Entries == nil {
 			s.file.Entries = map[string]Entry{}
@@ -89,11 +101,18 @@ func (s *Store) persistLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// Put：新增或覆寫一筆 entry。persist 失敗回滾記憶體（第三輪 P1-4 慣例）。
+// Put：新增或覆寫一筆 entry。若該 WSID 已被 Remove tombstone，拒絕覆寫——
+// 否則呼叫端傳入未帶 RemovedAt 的 Entry（例如 replay index 從 audit 重建時
+// 對已知 WSID 呼叫 Put）就會靜默清掉 tombstone，讓已移除的 session 復活，
+// 正是 spec §3.6.1 tombstone 機制要防的情況。
+// persist 失敗回滾記憶體（第三輪 P1-4 慣例）。
 func (s *Store) Put(e Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, existed := s.file.Entries[e.WSID]
+	if existed && old.RemovedAt != "" {
+		return fmt.Errorf("wsregistry: wsid %q is tombstoned, refusing to revive via Put", e.WSID)
+	}
 	s.file.Entries[e.WSID] = e
 	if err := s.persistLocked(); err != nil {
 		if existed {
@@ -127,13 +146,21 @@ func (s *Store) Remove(wsid, reason string) error {
 }
 
 // DeleteUncommitted：建立交易失敗的回滾——整筆刪除、不留 tombstone，因為
-// 失敗的建立不該在 registry 永久留痕。冪等：wsid 不存在時視為已達目標狀態。
+// 失敗的建立不該在 registry 永久留痕。冪等：wsid 不存在時視為已達目標
+// 狀態（Put persist 失敗時已自行回滾記憶體，呼叫端的 abort 路徑常態性會
+// 遇到「entry 根本不在 registry」，no-op 避免退化成 check-then-act 競態）。
+// 若該 wsid 已是 tombstone（使用者已明確 Remove），拒絕刪除——這種情況下
+// 呼叫端傳入的 wsid 顯然不是「本次建立失敗」的那一筆，整筆刪除會抹掉
+// audit 需要的 tombstone 痕跡。
 func (s *Store) DeleteUncommitted(wsid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, existed := s.file.Entries[wsid]
 	if !existed {
 		return nil
+	}
+	if old.RemovedAt != "" {
+		return fmt.Errorf("wsregistry: wsid %q is tombstoned, refusing to delete", wsid)
 	}
 	delete(s.file.Entries, wsid)
 	if err := s.persistLocked(); err != nil {
@@ -151,7 +178,10 @@ func (s *Store) Get(wsid string) (Entry, bool) {
 	return e, ok
 }
 
-// Live：排除 tombstone（RemovedAt 非空）與已刪除的 entries。
+// Live：排除 tombstone（RemovedAt 非空）與已刪除的 entries。排序：CreatedAt
+// 遞增，同值以 WSID 為 tie-break——map 迭代順序不穩定，不排序的話每次呼叫
+// （含每次重啟）順序都可能不同，會讓 session 清單 UI 跳動、也讓依賴順序
+// 的呼叫端測試不穩定。
 func (s *Store) Live() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,15 +191,25 @@ func (s *Store) Live() []Entry {
 			out = append(out, e)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		return out[i].WSID < out[j].WSID
+	})
 	return out
 }
 
-// SetLayout：更新 pinned／focused 排列。persist 失敗回滾記憶體。
+// SetLayout：更新 pinned／focused 排列。Pins 進來時深拷貝——若直接存呼叫端
+// 傳入的 slice，呼叫端事後原地修改（例如 append 且 cap 有餘裕）會在鎖外
+// 污染 store 內部狀態；且 persist 失敗要回滾的 old.Pins 也會指向同一塊已
+// 被污染的 backing array，回滾等於回滾到錯的資料，直接否定「記憶體與磁碟
+// 不分裂」的不變量。persist 失敗回滾記憶體。
 func (s *Store) SetLayout(l Layout) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.file.Layout
-	s.file.Layout = l
+	s.file.Layout = Layout{Pins: append([]string(nil), l.Pins...), Focused: l.Focused}
 	if err := s.persistLocked(); err != nil {
 		s.file.Layout = old
 		return err
@@ -177,11 +217,12 @@ func (s *Store) SetLayout(l Layout) error {
 	return nil
 }
 
-// Layout：回傳目前的 pinned／focused 排列。
+// Layout：回傳目前的 pinned／focused 排列。Pins 為深拷貝，呼叫端修改回傳值
+// 不影響 store 內部狀態（理由同 SetLayout）。
 func (s *Store) Layout() Layout {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.file.Layout
+	return Layout{Pins: append([]string(nil), s.file.Layout.Pins...), Focused: s.file.Layout.Focused}
 }
 
 // Migrated：是否已完成舊格式的一次性遷移（Task 5 消費）。
@@ -192,17 +233,31 @@ func (s *Store) Migrated() bool {
 }
 
 // MarkMigrated：把遷移後的 entries 與 migrated marker 一次原子寫入——
-// Task 5 的冪等性靠這個原子性：中途 crash 不會出現「entries 已寫、marker
-// 未寫」的半完成狀態，重啟後會整批重跑遷移而不是誤判已完成。
+// Task 5 的冪等性靠這個原子性：中途 app crash 不會出現「entries 已寫、
+// marker 未寫」的半完成狀態，重啟後會整批重跑遷移而不是誤判已完成
+//（僅涵蓋 app crash；未做 fsync，斷電情境不在保證範圍內，同 restore.go
+// 既有慣例缺口）。
+//
+// entries 是整批取代既有 s.file.Entries，不是合併——呼叫端必須傳入遷移
+// 後完整的目標集合。允許空 slice（legacy 遷移來源本身就沒有 entries 時，
+// 例如兩個 provider 的 restore entry 都空，屬合法情況，不算清空）。拒絕
+// 空 WSID 與重複 WSID：兩者都代表呼叫端建構 entries 時已經有 bug，讓它
+// 靜默通過只會在 registry 裡留下無法定址或互相覆蓋的資料。
 func (s *Store) MarkMigrated(entries []Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	oldEntries := s.file.Entries
-	oldMigrated := s.file.Migrated
 	newEntries := make(map[string]Entry, len(entries))
 	for _, e := range entries {
+		if e.WSID == "" {
+			return fmt.Errorf("wsregistry: MarkMigrated: entry with empty WSID")
+		}
+		if _, dup := newEntries[e.WSID]; dup {
+			return fmt.Errorf("wsregistry: MarkMigrated: duplicate wsid %q", e.WSID)
+		}
 		newEntries[e.WSID] = e
 	}
+	oldEntries := s.file.Entries
+	oldMigrated := s.file.Migrated
 	s.file.Entries = newEntries
 	s.file.Migrated = true
 	if err := s.persistLocked(); err != nil {
