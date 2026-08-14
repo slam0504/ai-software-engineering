@@ -336,7 +336,7 @@ func TestUnknownProviderEntrySkipped(t *testing.T) {
 	if got := a.manager.SlotCount("gemini"); got != 0 {
 		t.Fatalf("未知 provider 不得佔名額：%d", got)
 	}
-	if !strings.Contains(a.startupErr, "wX") || !strings.Contains(a.startupErr, "1") {
+	if !strings.Contains(a.startupErr, "wX") || !strings.Contains(a.startupErr, "跳過 1 筆") {
 		t.Fatalf("啟動警告必須含被跳過的筆數與 WSID：%q", a.startupErr)
 	}
 	if !auditHas(t, dir, "session_registry_unknown_provider") {
@@ -378,10 +378,107 @@ func TestProviderOverLimitRestoresNothing(t *testing.T) {
 	if a.wsReg != nil {
 		t.Fatal("驗證失敗不得接線")
 	}
-	for _, want := range []string{"claude", "5", fmt.Sprint(appcore.MaxSessionsPerProvider)} {
+	for _, want := range []string{
+		fmt.Sprintf("有 %d 筆 live claude session", appcore.MaxSessionsPerProvider+1),
+		fmt.Sprintf("上限為 %d", appcore.MaxSessionsPerProvider),
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("錯誤訊息必須說明 provider／筆數／上限，缺 %q：%v", want, err)
 		}
+	}
+}
+
+// seedRegistryRaw：直接寫出 workspace-sessions.json（已遷移狀態）。
+// 手動編輯才可能出現的壞資料——WSID 欄位為空、兩個 map key 帶同一個 WSID——
+// 沒辦法經 MarkMigrated 造出來（它會擋掉），只能直接寫檔。
+func seedRegistryRaw(t *testing.T, stateDir string, entries map[string]map[string]any) {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"schema_version": 2, "migrated": true, "entries": entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "workspace-sessions.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInvalidEntriesSkippedWithoutPartialRestore（review #1）：手動編輯可造出
+// 兩種「Pass 1 放行、Pass 2 中途才爆」的 entry——WSID 欄位為空
+//（RestoreDormant 回 ErrSessionNotFound）與重複 WSID（回 ErrProviderMismatch）。
+// 兩者都必須在 Pass 1 就被跳過，否則前面幾筆已還原、之後才失敗，就留下
+// 「Manager 有 slot、wsReg 為 nil」的半還原狀態。
+func TestInvalidEntriesSkippedWithoutPartialRestore(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	seedRegistryRaw(t, dir, map[string]map[string]any{
+		"w1":  {"wsid": "w1", "provider": "claude", "created_at": "t1"}, // 正常，會先被還原
+		"bad": {"wsid": "", "provider": "claude", "created_at": "t2"},   // 空 WSID
+		"dup": {"wsid": "w1", "provider": "codex", "created_at": "t3"},  // 重複 WSID、provider 還不同
+	})
+
+	live, err := a.loadSessionRegistry()
+	if err != nil {
+		// 先驗「一筆都不還原」的不變量：邊驗邊還原會在這裡露餡（w1 已進 Manager）。
+		if c, x := a.manager.SlotCount("claude"), a.manager.SlotCount("codex"); c != 0 || x != 0 {
+			t.Fatalf("半還原：載入回錯卻留下 slot（claude=%d codex=%d）", c, x)
+		}
+		t.Fatalf("壞 entry 應跳過而非阻擋啟動：%v", err)
+	}
+	if len(live) != 1 || live[0].WSID != "w1" {
+		t.Fatalf("只有合法的那筆該被還原：%+v", live)
+	}
+	if got := a.manager.SlotCount("claude"); got != 1 {
+		t.Fatalf("合法 entry 仍須還原：%d", got)
+	}
+	if got := a.manager.SlotCount("codex"); got != 0 {
+		t.Fatalf("重複 WSID 的那筆不得佔名額：%d", got)
+	}
+	if !strings.Contains(a.startupErr, "跳過 2 筆") ||
+		!strings.Contains(a.startupErr, "empty wsid") ||
+		!strings.Contains(a.startupErr, "duplicate wsid") {
+		t.Fatalf("啟動警告必須含筆數與兩種原因：%q", a.startupErr)
+	}
+	if !auditHas(t, dir, "session_registry_invalid_entry") {
+		t.Fatal("必須留下 audit 診斷軌跡")
+	}
+	if _, ok := registryOnDisk(t, dir).Get("dup"); !ok {
+		t.Fatal("被跳過的 entry 不得從 registry 刪除")
+	}
+}
+
+// TestFatalErrorNotMaskedBySkipWarning（review #2）：noteStartupWarning 只填
+// 第一則。若「跳過 N 筆」的非致命警告在 Pass 1 就佔走名額，之後的致命失敗
+// 訊息會被丟棄——UI 只看得到一句聽起來沒事的警告，實際上 registry 載入整個
+// 失敗、CreateSession 全掛。audit 兩筆都要在（診斷軌跡的價值正是在失敗時）。
+func TestFatalErrorNotMaskedBySkipWarning(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	entries := map[string]map[string]any{
+		"wX": {"wsid": "wX", "provider": "gemini", "created_at": "t0"}, // 未知 provider
+	}
+	for i := 0; i <= appcore.MaxSessionsPerProvider; i++ { // 同時超限
+		k := fmt.Sprintf("w%d", i)
+		entries[k] = map[string]any{"wsid": k, "provider": "claude", "created_at": fmt.Sprintf("t%d", i+1)}
+	}
+	seedRegistryRaw(t, dir, entries)
+
+	_, err := a.loadSessionRegistry()
+	if err == nil {
+		t.Fatal("超限必須 fail loud")
+	}
+	if a.startupErr != "" {
+		t.Fatalf("載入失敗時非致命警告不得先佔用 UI 名額：%q", a.startupErr)
+	}
+	// startup() 的處置：致命訊息因此才拿得到唯一的名額。
+	a.noteStartupWarning("session registry load failed: " + err.Error())
+	if !strings.Contains(a.startupErr, "load failed") ||
+		!strings.Contains(a.startupErr, "上限為") {
+		t.Fatalf("UI 必須看到致命那則：%q", a.startupErr)
+	}
+	if !auditHas(t, dir, "session_registry_unknown_provider") {
+		t.Fatal("跳過的診斷軌跡仍必須留在 audit（即使載入失敗）")
 	}
 }
 

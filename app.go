@@ -388,6 +388,18 @@ var legacyProviders = []string{"claude", "codex"}
 // codex session 並吃掉一個名額。window 判定直接重用 replayViewWindow，因為
 // 「view window 裡有沒有事件」的定義就該和實際重放的視窗完全一致。
 //
+// 與 wsregistry.Migrate 判準的一格分歧（owner 2026-08-15 裁決：接受為已知
+// 行為，兩邊都不改）——「window 內有事件、但 ViewStartEventID 為空且無
+// resume／taskID」這一格：本函式判定該遷（window 非空），而 Migrate 的欄位
+// 檢查（三者皆空即跳過）會把它靜默丟掉，於是該 provider 不獲得 legacy
+// session。不改的理由是兩個 filter 各自擋的洞都是真的：這裡的 window 檢查擋
+// 「憑空多出一個使用者從沒用過的 codex session 並吃掉名額」；Migrate 的欄位
+// 檢查擋「ViewStartEventID 為空時 view window 等於該 provider 的**全部歷史**」，
+// 而 §3.2.5 明文禁止把全部歷史丟進 legacy session。放寬任一邊，就會重新打開
+// 它原本擋住的、更嚴重的那個洞。這一格的後果限於極窄族群（用過 codex 但從未
+// Accept、也沒按過 New Session）：升級後不獲得 legacy session、改為全新開始，
+// events.jsonl 稽核歷史完整——影響是 view 連續性，不是資料。
+//
 // restore store 尚未開啟（a.restore == nil）一律回錯，不當成空資料：遷移
 // marker 是單向的，以零 legacy entry 標記 migrated 會讓舊 session 永遠不可能
 // 再被遷出。這是載入順序 bug，必須 fail loud。
@@ -420,8 +432,14 @@ func (a *App) noteStartupWarning(msg string) {
 	}
 }
 
-// knownProvider：可還原的 provider 白名單（同 CreateSession 的 guard）。
-func knownProvider(p string) bool { return p == "claude" || p == "codex" }
+// knownProviders：可建立／可還原 session 的 provider 白名單（同 CreateSession
+// 的 guard）。與 legacyProviders 語意不同——後者是「legacy 遷移的來源」，只在
+// restore.json 轉接時走訪。per-provider 限額檢查一律走這份，未來加第三個
+// provider 時只改這裡即可；若讓兩份清單各自硬編，新 provider 的超限檢查會
+// 靜默漏掉、然後在 Pass 2 撞 ErrSessionLimit 造成半還原。
+var knownProviders = []string{"claude", "codex"}
+
+func knownProvider(p string) bool { return slices.Contains(knownProviders, p) }
 
 // loadSessionRegistry：§3.2.4 啟動修復序列的前半段——載入／遷移 registry →
 // 還原 Manager dormant slots。後半段（index 驗證／重建 → incomplete turn 修復
@@ -469,29 +487,46 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	}
 
 	// Pass 1：只分類與驗證，不動任何 Manager 狀態。
+	//
+	// 三類壞資料一律「跳過該筆、不刪除、不阻擋啟動」（決策 2 的精神）——
+	// workspace-sessions.json 是使用者可手動編輯的檔案，單筆無法還原的 entry
+	// 不該讓整個 app 開不起來，跳過也是非破壞性的（entry 仍在磁碟，修好或該
+	// provider 回歸即可還原）。三類都必須在這裡擋掉而不是留給 Pass 2，否則
+	// 「前面幾筆已還原、中途才失敗」就會留下 Manager 有 slot 而 wsReg 為 nil
+	// 的半還原狀態，正是兩段式要消滅的東西。
 	live := store.Live()
 	restorable := make([]wsregistry.Entry, 0, len(live))
 	perProvider := map[string]int{}
-	var skipped []string
+	seen := map[string]bool{}
+	var unknownProv, invalid []string
 	for _, e := range live {
-		// 未知 provider（手動編輯／未來版本降級）：跳過該筆，不刪除、不阻擋
-		// 啟動——單筆無法解析的 entry 不該讓整個 app 開不起來，且跳過是非
-		// 破壞性的（entry 仍在磁碟，該 provider 若回歸即可還原）。
-		if !knownProvider(e.Provider) {
-			skipped = append(skipped, fmt.Sprintf("%s(provider=%q)", e.WSID, e.Provider))
-			continue
+		switch {
+		// WSID 欄位為空：JSON map key 與 Entry.WSID 是兩回事，key 有值而欄位
+		// 空是合法 JSON，但 RestoreDormant 對空 WSID 回 ErrSessionNotFound。
+		case e.WSID == "":
+			invalid = append(invalid, fmt.Sprintf("(empty wsid, provider=%q)", e.Provider))
+		// 兩個 map key 帶同一個 WSID：provider 不同時 RestoreDormant 回
+		// ErrProviderMismatch；相同時兩筆會靜默共用一個 slot。都不放行。
+		case seen[e.WSID]:
+			invalid = append(invalid, fmt.Sprintf("%s(duplicate wsid)", e.WSID))
+		case !knownProvider(e.Provider):
+			unknownProv = append(unknownProv, fmt.Sprintf("%s(provider=%q)", e.WSID, e.Provider))
+		default:
+			seen[e.WSID] = true
+			perProvider[e.Provider]++
+			restorable = append(restorable, e)
 		}
-		perProvider[e.Provider]++
-		restorable = append(restorable, e)
 	}
-	if len(skipped) > 0 { // 診斷軌跡先發，之後就算驗證失敗也留得下來
+	// 診斷軌跡先發：之後就算限額驗證失敗直接回錯，audit 也留得下來。
+	if len(unknownProv) > 0 {
 		a.audit("session_registry_unknown_provider",
-			map[string]any{"count": len(skipped), "skipped": skipped, "path": path})
-		a.noteStartupWarning(fmt.Sprintf(
-			"session registry: 跳過 %d 筆 provider 無法解析的 entry（未刪除，仍在 %s）：%s",
-			len(skipped), path, strings.Join(skipped, ", ")))
+			map[string]any{"count": len(unknownProv), "skipped": unknownProv, "path": path})
 	}
-	for _, p := range legacyProviders { // 固定順序：錯誤訊息不得隨 map 迭代漂移
+	if len(invalid) > 0 {
+		a.audit("session_registry_invalid_entry",
+			map[string]any{"count": len(invalid), "skipped": invalid, "path": path})
+	}
+	for _, p := range knownProviders { // 固定順序：錯誤訊息不得隨 map 迭代漂移
 		if n := perProvider[p]; n > appcore.MaxSessionsPerProvider {
 			return nil, fmt.Errorf("session registry 有 %d 筆 live %s session，上限為 %d："+
 				"一筆都不還原（避免 Manager 與 registry 半還原不一致）。\n"+
@@ -504,6 +539,16 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 		if rerr := a.manager.RestoreDormant(appcore.WSID(e.WSID), contract.Provider(e.Provider)); rerr != nil {
 			return nil, fmt.Errorf("app: restore dormant wsid=%s provider=%s: %w", e.WSID, e.Provider, rerr)
 		}
+	}
+	// 跳過筆數的警告刻意留到最後才寫：noteStartupWarning 只填第一則，若在
+	// Pass 1 就寫入，之後任何致命失敗（限額、Pass 2）的訊息都會被丟棄，UI 只
+	// 看得到一句聽起來沒事的「跳過 N 筆」，實際上整個 registry 載入失敗、
+	// CreateSession 全掛。audit 不受此限（在前面就發），診斷軌跡的價值正是
+	// 在失敗時。
+	if n := len(unknownProv) + len(invalid); n > 0 {
+		a.noteStartupWarning(fmt.Sprintf(
+			"session registry: 跳過 %d 筆無法還原的 entry（未刪除，仍在 %s）：%s",
+			n, path, strings.Join(slices.Concat(unknownProv, invalid), ", ")))
 	}
 	a.wsReg = store
 	return restorable, nil
