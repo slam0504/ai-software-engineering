@@ -284,6 +284,54 @@ func TestPutAndDeleteUncommittedRefuseTombstonedEntry(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsUnsupportedSchemaVersionButAcceptsMissing（review round 3，
+// I-3 NOT ADDRESSED 修正）：非目前 schemaVersion 的檔案必須拒絕載入
+//（防的是靜默資料遺失——不擋的話下次任何寫入會把 version 蓋回目前值並
+// 落盤）；schema_version 缺欄位（值為 0）視為舊檔，必須維持既有接受行為，
+// 否則之後有人「順手」把 != 0 的判斷拿掉不會被任何測試發現。
+func TestOpenRejectsUnsupportedSchemaVersionButAcceptsMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ws.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":3,"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("非目前 schema_version 必須拒絕載入")
+	}
+
+	path2 := filepath.Join(t.TempDir(), "ws2.json")
+	if err := os.WriteFile(path2, []byte(`{"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path2)
+	if err != nil {
+		t.Fatalf("缺 schema_version（視為 0／舊檔）必須接受: %v", err)
+	}
+	if len(s.Live()) != 0 {
+		t.Fatalf("預期空 entries: %+v", s.Live())
+	}
+}
+
+// TestSetLayoutDeepCopiesCallerSlice（review round 3 補測）：呼叫端自己持有
+// 傳入 SetLayout 的 slice、事後修改，不得污染 store 內部狀態。與
+// TestLayoutRoundTripDoesNotAliasInternalState 互補——那條只證明 Layout()
+// 出口有拷貝，這條證明 SetLayout 入口也有拷貝（若把入口拷貝拿掉，出口
+// 拷貝仍會讓那條測試 PASS，測不出入口的問題）。
+func TestSetLayoutDeepCopiesCallerSlice(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := []string{"w1", "w2"}
+	if err := s.SetLayout(Layout{Pins: pins, Focused: "w1"}); err != nil {
+		t.Fatal(err)
+	}
+	pins[0] = "polluted" // 呼叫端在鎖外原地修改自己手上的 slice
+
+	if got := s.Layout().Pins[0]; got != "w1" {
+		t.Fatalf("SetLayout 必須深拷貝呼叫端傳入的 slice：got %q want w1", got)
+	}
+}
+
 // TestLiveIsSortedByCreatedAtThenWSID（裁決）：map 迭代順序不穩定，Live()
 // 必須自行排序（CreatedAt 遞增，WSID tie-break），避免 session 清單 UI
 // 跳動、避免呼叫端測試不穩定。
