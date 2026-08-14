@@ -40,6 +40,13 @@ export interface Bindings {
     taskLabel: string, approvalPolicy: string): Promise<void>
   SendMessage(provider: string, prompt: string): Promise<void>
 }
+// WorkspaceSessionBindings：M3b Task 4 純新增的 CreateSession——回傳新 session
+// 的 WSID。獨立於 Bindings（session store 用）之外，理由同 EvidenceBindings：
+// session store 目前只消費 StartSession／SendMessage，其 test mock 也只給這兩個
+// 欄位；WSID 化的 store 切換是 Task 26 的原子改動，這裡不提前擴大 Bindings。
+export interface WorkspaceSessionBindings {
+  CreateSession(provider: string, taskLabel: string): Promise<string>
+}
 // EvidenceBindings：Task 22 TCA workspace 六個多參數 Go 綁定——同 SendMessage
 // 的既定教訓（M1.5 review P1-1），每個 adapter 都逐參數轉發，順序鎖在
 // bindings.test.ts。獨立於 Bindings（session store 用）之外，makeBindings()

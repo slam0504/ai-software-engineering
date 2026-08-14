@@ -35,6 +35,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 type pendingApproval struct {
@@ -58,6 +59,23 @@ type App struct {
 	registry *claude.Registry
 	manager  *appcore.Manager
 	restore  *restoreStore
+
+	// M3b §3.1：workspace session 的 durable metadata store（Task 2 的
+	// wsregistry.Store；由 Task 6 的 registry 載入流程接上）。介面而非具體型別，
+	// 讓建立交易的補償路徑可以用 stub 注入 persist 失敗。
+	wsReg sessionRegistry
+
+	// createDegradedMu／createDegradedSet：per-provider create-degraded latch
+	// （§3.1）——CommitCreate 與 registry 回滾雙雙失敗時，Manager 與 registry
+	// 已無法證明一致，該 provider 自此拒絕新建，直到 app restart 由 registry
+	// 為權威還原。刻意沒有 in-process 解除路徑；既有 session 完全不受影響。
+	createDegradedMu  sync.Mutex
+	createDegradedSet map[contract.Provider]bool
+
+	// hookForceCommitCreateError：測試注入——讓 commitCreate 直接回這個錯誤，
+	// 用來驅動「CommitCreate 失敗」的兩條補償路徑（真實 CommitCreate 只在
+	// closed／stale token 時失敗，兩者都無法在不破壞 Manager 狀態下重現）。
+	hookForceCommitCreateError error
 
 	auditMu sync.Mutex
 	auditF  *os.File
@@ -238,6 +256,109 @@ func (a *App) beginAppTxn() error {
 }
 
 func (a *App) endAppTxn() { a.inflight.Done() }
+
+// ---- workspace session 建立交易（M3b §3.1）----
+
+// sessionRegistry：wsregistry.Store 的 App 側視角（*wsregistry.Store 直接滿足）。
+// 抽成介面只為一個目的——建立交易的補償路徑必須能被測試逐條驅動，而 persist
+// 失敗無法在真實 Store 上穩定重現。
+type sessionRegistry interface {
+	Put(e wsregistry.Entry) error
+	DeleteUncommitted(wsid string) error
+	Remove(wsid, reason string) error
+	Get(wsid string) (wsregistry.Entry, bool)
+	Live() []wsregistry.Entry
+	Sync() error
+}
+
+var _ sessionRegistry = (*wsregistry.Store)(nil)
+
+// errCreateDegraded：該 provider 的建立路徑已進入 degraded latch。刻意沒有
+// in-process 解除路徑——見 setCreateDegraded。
+var errCreateDegraded = errors.New("app: session create degraded（需重啟 app 復原）")
+
+// errNoSessionRegistry：registry 尚未載入就呼叫 CreateSession。理論上不會發生
+// （啟動流程先載入 registry 才開放 UI），但 nil 介面直接呼叫會 panic 在
+// ReserveSession 之後、名額已被佔走的位置——fail loud 早退比 panic 洩名額好。
+var errNoSessionRegistry = errors.New("app: session registry not loaded")
+
+// createDegraded：該 provider 是否已進入 create-degraded latch。
+func (a *App) createDegraded(p contract.Provider) bool {
+	a.createDegradedMu.Lock()
+	defer a.createDegradedMu.Unlock()
+	return a.createDegradedSet[p]
+}
+
+// setCreateDegraded：把 provider 標成 create-degraded（單向；只有 app restart
+// 能解除）。觸發點只有一個——CommitCreate 失敗且 registry 回滾也失敗：此時
+// Manager 側的 slot 是否該存在、registry 磁碟上那筆 entry 是否該留，兩邊都
+// 已無法互相證明。AbortCreate 會讓記憶體退回名額但磁碟仍有 entry（重啟即
+// 復活成 ghost session）；逕自當成建立成功則 Manager 側沒有可信狀態可據。
+// 保留名額 ＋ latch 是唯一能收斂的選擇：重啟後 registry 是權威，那筆 entry
+// 會被還原成 dormant，名額自然歸位。
+func (a *App) setCreateDegraded(p contract.Provider) {
+	a.createDegradedMu.Lock()
+	defer a.createDegradedMu.Unlock()
+	if a.createDegradedSet == nil {
+		a.createDegradedSet = map[contract.Provider]bool{}
+	}
+	a.createDegradedSet[p] = true
+}
+
+// commitCreate：manager.CommitCreate 的可注入包裝（見 hookForceCommitCreateError）。
+func (a *App) commitCreate(tok appcore.CreateToken) error {
+	if err := a.hookForceCommitCreateError; err != nil {
+		return err
+	}
+	return a.manager.CommitCreate(tok)
+}
+
+// CreateSession 建立一個新的 workspace session，回傳其 WSID（純新增 binding；
+// 既有 provider-keyed 的 StartSession／SendMessage／EndSession 不受影響）。
+//
+// 編排順序凍結（§3.1）：beginAppTxn → ReserveSession → wsReg.Put ＋ atomic
+// persist → CommitCreate → endAppTxn。registry 先於 CommitCreate 落盤，因為
+// 「磁碟有、記憶體無」可以在重啟時由 registry 權威還原成 dormant，反之
+// 「記憶體有、磁碟無」重啟即整個 session 消失。
+//
+// 三條失敗路徑：
+//  1. Put 失敗：AbortCreate 退回名額，errors.Join 回報。
+//  2. CommitCreate 失敗、DeleteUncommitted 成功：AbortCreate 退回名額。回滾用
+//     DeleteUncommitted 而非 Remove——建立失敗不該在 registry 留 tombstone，
+//     那是「使用者明確移除」的語意。
+//  3. CommitCreate 失敗、DeleteUncommitted 也失敗：**不** AbortCreate、保留
+//     名額、該 provider 進 create-degraded latch（見 setCreateDegraded）。
+func (a *App) CreateSession(provider, taskLabel string) (string, error) {
+	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
+		return "", err
+	}
+	defer a.endAppTxn()
+	p := contract.Provider(provider)
+	if a.createDegraded(p) {
+		return "", errCreateDegraded
+	}
+	if a.wsReg == nil { // 名額尚未被佔用，直接早退
+		return "", errNoSessionRegistry
+	}
+	w, tok, err := a.manager.ReserveSession(p)
+	if err != nil {
+		return "", err
+	}
+	if err := a.wsReg.Put(wsregistry.Entry{
+		WSID: string(w), Provider: provider, TaskLabel: taskLabel,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return "", errors.Join(err, a.manager.AbortCreate(tok))
+	}
+	if cerr := a.commitCreate(tok); cerr != nil {
+		if rerr := a.wsReg.DeleteUncommitted(string(w)); rerr != nil {
+			a.setCreateDegraded(p) // 雙失敗：保留名額、latch，等 app restart（§3.1）
+			return "", errors.Join(cerr, rerr, errCreateDegraded)
+		}
+		return "", errors.Join(cerr, a.manager.AbortCreate(tok))
+	}
+	return string(w), nil
+}
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
 func (a *App) emit(name string, data any) {

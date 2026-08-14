@@ -18,6 +18,8 @@ export function ConfirmPlanCommit(arg1:spec.CommitToken,arg2:string):Promise<voi
 
 export function ConfirmSpecCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
 
+export function CreateSession(arg1:string,arg2:string):Promise<string>;
+
 export function EndSession(arg1:string):Promise<void>;
 
 export function EscalationAck(arg1:string):Promise<void>;

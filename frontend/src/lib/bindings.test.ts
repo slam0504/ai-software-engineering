@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 const h = vi.hoisted(() => ({
   StartSession: vi.fn(async () => {}),
   SendMessage: vi.fn(async () => {}),
+  CreateSession: vi.fn(async () => 'wsid-1'),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
   RunEvidence: vi.fn(async () => 'evidence-id'),
   EvidenceGet: vi.fn(async () => ({})),
@@ -32,6 +33,13 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.StartSession('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
     expect(h.StartSession).toHaveBeenCalledWith('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
+  })
+
+  // M3b Task 4：CreateSession 是純新增的多參數綁定，同一教訓套用。
+  it('CreateSession 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.CreateSession('claude', 'my-task')
+    expect(h.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
   })
 
   // Task 22：TCA workspace 六個新綁定，逐一鎖參數順序與名稱——Go 測試驗不到

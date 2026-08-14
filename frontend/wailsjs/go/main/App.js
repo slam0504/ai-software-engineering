@@ -26,6 +26,10 @@ export function ConfirmSpecCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
 }
 
+export function CreateSession(arg1, arg2) {
+  return window['go']['main']['App']['CreateSession'](arg1, arg2);
+}
+
 export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }

@@ -1,21 +1,23 @@
 import {
-  StartSession, SendMessage,
+  StartSession, SendMessage, CreateSession,
   RegisterMutation, RunEvidence, EvidenceGet, SubmitTestContract, ValidateTestCommit, EvidenceCommitCandidates,
   EscalationList, EscalationCreate, EscalationAck, EscalationResolve,
 } from '../../wailsjs/go/main/App'
-import type { Bindings, EvidenceBindings, EscalationBindings } from '../types'
+import type { Bindings, WorkspaceSessionBindings, EvidenceBindings, EscalationBindings } from '../types'
 
 // production bindings adapter（M1.5 第三輪 review P1-1：SendMessage 必須
 // 逐參數轉發——單參數 adapter 會把 provider 名當成訊息內容送出）。Task 22 加入
 // TCA workspace 六個綁定、Task 25 加入 escalation 收件匣四個綁定，同一教訓
 // 套用：多參數呼叫每個都逐參數轉發、順序與 Go 簽章一致（見 bindings.test.ts）。
-// 回傳型別交集 Bindings & EvidenceBindings & EscalationBindings：session
-// store 只取用 Bindings 那兩個欄位，App.vue 把其餘綁定個別當 prop 傳給
-// TcaWorkspace／EscalationInbox 等元件。
-export function makeBindings(): Bindings & EvidenceBindings & EscalationBindings {
+// M3b Task 4 加入 CreateSession（純新增，多參數）——同一教訓再套一次。
+// 回傳型別交集 Bindings & WorkspaceSessionBindings & EvidenceBindings &
+// EscalationBindings：session store 只取用 Bindings 那兩個欄位，App.vue 把其餘
+// 綁定個別當 prop 傳給 TcaWorkspace／EscalationInbox 等元件。
+export function makeBindings(): Bindings & WorkspaceSessionBindings & EvidenceBindings & EscalationBindings {
   return {
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
     SendMessage: (p, t) => SendMessage(p, t),
+    CreateSession: (p, taskLabel) => CreateSession(p, taskLabel),
     RegisterMutation: (taskRef, patch) => RegisterMutation(taskRef, patch),
     RunEvidence: (expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID) =>
       RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID),
