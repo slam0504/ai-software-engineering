@@ -2,7 +2,7 @@
 //
 // 驗證前提：單一 codex app-server 能同時承載多個 thread 的並行 turn。
 // 判定範圍（凍結）：
-//   (a) 兩 thread 並行 turn 是否真並行（wire frame 時間上交錯，非串行化）
+//   (a) 兩 thread 並行 turn 是否真並行（turn 生命期重疊，非 A 全部完成才出現 B）
 //   (b) notification 與 approval request 是否帶足以歸屬的 thread／turn identity
 //   (c) 自然與強制（-force）兩種收尾是否 bounded 收斂且錄到最後一筆 frame
 //
@@ -10,6 +10,8 @@
 //
 // 全程走 production API（codex.StartAppServer / ThreadRunner / Conn），
 // 不另建 wire 路徑；wire log 即證據。
+//
+// 退出碼：0 = 全部通過；1 = probe 執行失敗（環境／API 錯誤）；2 = probe 跑完但判定 NO-GO。
 package main
 
 import (
@@ -29,6 +31,9 @@ import (
 var (
 	codexBin = flag.String("codex-bin", "", "bundled codex binary 路徑（必填）")
 	force    = flag.Bool("force", false, "強制收尾分支：turn 進行中直接 Terminate")
+	// 補充 run 專用旗標——不影響凍結參數的兩次主 run。
+	longOutput = flag.Bool("long-output", false,
+		"補充 run：以長輸出 prompt 取代 promptA/promptB，觀察輸出階段是否交錯（非凍結參數）")
 )
 
 // 凍結參數
@@ -40,6 +45,13 @@ const (
 	promptB        = "請只回覆字串 PROBE_B_DONE，不要使用任何工具。"
 	// 第三個 turn 刻意觸發核可——(b) 的 approval 歸屬必須有實際 frame 才能驗
 	promptApproval = "請在目前工作目錄建立檔案 probe-approval.txt，內容為 PROBE。"
+)
+
+// 補充 run 的 prompt（**非凍結參數**）：只在 -long-output 時取代 promptA／promptB，
+// 用來觀察兩 thread 的模型輸出階段（agentMessage delta）是否真的交錯。
+const (
+	promptALongOutput = "請從 1 數到 60，每個數字一行，不要使用任何工具。"
+	promptBLongOutput = "請從 101 數到 160，每個數字一行，不要使用任何工具。"
 )
 
 // frameRec 是 wire log 每筆 frame 的分析用摘要（raw frame 另存 jsonl）。
@@ -56,7 +68,8 @@ type frameRec struct {
 type turnEnd struct {
 	turnID   string
 	status   string
-	viaBcast bool // 無 threadId 可歸屬，只能廣播
+	errMsg   string // turn.error.message（server 端失敗，例如 usageLimitExceeded）
+	viaBcast bool   // 無 threadId 可歸屬，只能廣播
 }
 
 type turnResult struct {
@@ -80,6 +93,16 @@ type apprRec struct {
 	Raw      string
 }
 
+// analysis 是 report() 算出的自動指標，供 gate 強制判定使用。
+type analysis struct {
+	overlap          string // yes / no / inconclusive —— (a) turn 生命期重疊
+	overlapWhy       string
+	deltaInterleaved string // yes / no / inconclusive —— 輸出階段是否交錯（觀察用，不入 gate）
+	approvals        int
+	apprMissingID    int
+	broadcast        bool
+}
+
 type probe struct {
 	mu       sync.Mutex
 	seq      int
@@ -96,24 +119,76 @@ type probe struct {
 	wireLog *os.File
 }
 
+// ---- cleanup registry：任何退出路徑（含 NO-GO）都必須收掉子行程與暫存目錄 ----
+
+var (
+	cleanupMu   sync.Mutex
+	cleanups    []func()
+	cleanupDone bool
+)
+
+func addCleanup(f func()) {
+	cleanupMu.Lock()
+	cleanups = append(cleanups, f)
+	cleanupMu.Unlock()
+}
+
+// runCleanups 反序執行並且只執行一次（正常路徑與 fatal／nogo 路徑共用）。
+func runCleanups() {
+	cleanupMu.Lock()
+	if cleanupDone {
+		cleanupMu.Unlock()
+		return
+	}
+	cleanupDone = true
+	fs := cleanups
+	cleanupMu.Unlock()
+	for i := len(fs) - 1; i >= 0; i-- {
+		fs[i]()
+	}
+}
+
+// terminateAt 記錄**第一次** Terminate 的時刻——forced 模式的第一次 Terminate 發生在
+// 並行段中途，收尾段的第二次是 no-op，量它等於量錯指標（I4）。
+var (
+	termOnce sync.Once
+	termAt   time.Time
+)
+
+func terminate(srv *codex.Server) {
+	termOnce.Do(func() { termAt = time.Now() })
+	_ = srv.Terminate()
+}
+
 func main() {
 	flag.Parse()
 	if *codexBin == "" {
 		fatal("必須以 -codex-bin 指定 bundled binary")
 	}
 	mode := "natural"
+	if *longOutput {
+		mode = "natural-long"
+	}
 	if *force {
 		mode = "forced"
+		if *longOutput {
+			mode = "forced-long"
+		}
+	}
+	pA, pB := promptA, promptB
+	if *longOutput {
+		pA, pB = promptALongOutput, promptBLongOutput
 	}
 
 	tmp, err := os.MkdirTemp("", "probe-codex-*")
 	must(err)
-	defer os.RemoveAll(tmp)
+	addCleanup(func() { _ = os.RemoveAll(tmp) })
 
 	// wire log 落在 tmp 之外——tmp 於離開時整個刪除，證據必須留存。
 	wirePath := filepath.Join(os.TempDir(), "probe-codex-parallel-"+mode+".jsonl")
 	wireLog, err := os.Create(wirePath)
 	must(err)
+	addCleanup(func() { _ = wireLog.Close() })
 
 	p := &probe{waiters: map[string]chan turnEnd{}, wireLog: wireLog}
 
@@ -124,6 +199,28 @@ func main() {
 		Binary: *codexBin, CWD: tmp, TermGrace: 5 * time.Second,
 	})
 	must(err)
+
+	// 收尾（Terminate → Wait → StopRecording）只跑一次；正常路徑與 fatal／nogo 共用同一份實作，
+	// 因此任何退出路徑都不會留下孤兒 app-server。
+	var (
+		shutOnce           sync.Once
+		exitCode           int
+		stderrTail         string
+		doneAfterTerminate time.Duration
+		recErr             error
+		shutdownRan        bool
+	)
+	shutdown := func() {
+		shutOnce.Do(func() {
+			terminate(srv)
+			ex := srv.Wait() // Wait 回傳時 Done 已關閉（supervisor 收尾完成、Exit 已快取）
+			doneAfterTerminate = time.Since(termAt)
+			recErr = srv.StopRecording()
+			exitCode, stderrTail, shutdownRan = ex.Code, ex.StderrTail, true
+		})
+	}
+	addCleanup(shutdown)
+
 	must(srv.BeginRecording(p.sink)) // 全程錄流即證據
 
 	conn := srv.Conn()
@@ -137,23 +234,24 @@ func main() {
 	//     -force 會在 (a) 途中終止 server，故此項一律排在並行段之前。
 	apprRunner, err := mustStartThread(ctx, srv)
 	if err != nil {
-		fatal("NO-GO: approval thread 無法建立: %v", err)
+		nogoExit("approval thread 無法建立: %v", err)
 	}
 	appr := p.runTurnDenyingApprovals(ctx, srv, apprRunner, "APPROVAL", promptApproval)
 	if _, serr := os.Stat(filepath.Join(tmp, "probe-approval.txt")); serr == nil {
-		fatal("NO-GO: 核可被拒仍寫入檔案")
+		nogoExit("核可被拒仍寫入檔案 probe-approval.txt")
 	}
 
 	// (a) 兩 thread 並行送 turn
 	runnerA, errA := mustStartThread(ctx, srv)
 	runnerB, errB := mustStartThread(ctx, srv)
 	if errA != nil {
-		fatal("NO-GO: thread A 無法建立: %v", errA)
+		nogoExit("thread A 無法建立: %v", errA)
 	}
 	if errB != nil {
-		fatal("NO-GO: 第二個 thread 被拒（單 app-server 無法承載多 thread）: %v", errB)
+		nogoExit("第二個 thread 被拒（單 app-server 無法承載多 thread）: %v", errB)
 	}
 	thA, thB := runnerA.ThreadID(), runnerB.ThreadID()
+	fmt.Printf("MODE %s promptA=%q promptB=%q\n", mode, pA, pB)
 	fmt.Printf("threads approval=%s A=%s B=%s\n", apprRunner.ThreadID(), thA, thB)
 
 	var wg sync.WaitGroup
@@ -163,7 +261,7 @@ func main() {
 		runner *codex.ThreadRunner
 		prompt string
 	}
-	for i, pr := range []pair{{"A", runnerA, promptA}, {"B", runnerB, promptB}} {
+	for i, pr := range []pair{{"A", runnerA, pA}, {"B", runnerB, pB}} {
 		wg.Add(1)
 		go func(i int, pr pair) {
 			defer wg.Done()
@@ -172,30 +270,78 @@ func main() {
 	}
 	if *force { // 強制收尾：不等 turn 完成（只影響 (a) 與 (c)，approval 已驗完）
 		time.Sleep(2 * time.Second) // 讓兩個 turn 真的送上 wire，否則測不到「turn 進行中終止」
-		_ = srv.Terminate()
+		terminate(srv)
 	}
 	wg.Wait()
 
-	p.report(mode, res, appr, thA, thB, wirePath)
+	an := p.report(mode, res, appr, thA, thB, wirePath)
 
-	// (c) 收尾：Terminate → Wait → StopRecording → Close
-	termStart := time.Now()
-	_ = srv.Terminate()
-	exit := srv.Wait()
-	shutdown := time.Since(termStart)
-	recErr := srv.StopRecording()
+	// (c) 收尾：Terminate → Wait → StopRecording（doneAfterTerminate 自**第一次** Terminate 起算）
+	shutdown()
 	p.mu.Lock()
 	lastSeq, lastAt := p.seq, time.Time{}
 	if n := len(p.frames); n > 0 {
 		lastAt = p.frames[n-1].At
 	}
 	p.mu.Unlock()
-	must(wireLog.Close())
 
-	fmt.Printf("exit_code=%d stderr_tail=%q\n", exit.Code, tail(exit.StderrTail, 400))
-	fmt.Printf("SHUTDOWN mode=%s bounded=%v elapsed=%s record_err=%v last_frame_seq=%d last_frame_at=%s\n",
-		mode, shutdown < 10*time.Second, shutdown.Round(time.Millisecond), recErr, lastSeq, ts(lastAt))
+	fmt.Printf("exit_code=%d stderr_tail=%q\n", exitCode, tail(stderrTail, 400))
+	fmt.Printf("SHUTDOWN mode=%s ran=%v bounded=%v done_after_first_terminate=%s record_err=%v last_frame_seq=%d last_frame_at=%s\n",
+		mode, shutdownRan, doneAfterTerminate < 10*time.Second,
+		doneAfterTerminate.Round(time.Millisecond), recErr, lastSeq, ts(lastAt))
 	fmt.Printf("WIRE_LOG %s\n", wirePath)
+
+	// **先**分出「probe 執行失敗」與「判定 NO-GO」——這是兩件事，不可混為一談。
+	// server 端 turn 失敗（usageLimitExceeded、模型錯誤…）是環境問題，不是架構前提不成立，
+	// 不得報成 NO-GO，也不得報成 GO。
+	var execFail []string
+	for _, r := range append([]turnResult{appr}, res...) {
+		if r.status != "completed" {
+			if *force && (r.label == "A" || r.label == "B") {
+				continue // forced 模式刻意中斷並行 turn，其未完成是預期行為
+			}
+			execFail = append(execFail, fmt.Sprintf("turn %s status=%s err=%q", r.label, r.status, r.errText))
+		}
+	}
+	if len(execFail) > 0 {
+		fmt.Println("PROBE EXECUTION FAILED（環境／server 問題，非 GO/NO-GO 判定）")
+		for _, e := range execFail {
+			fmt.Println("  - " + e)
+		}
+		runCleanups()
+		os.Exit(1)
+	}
+
+	// GO 條件由 driver 強制（I2）：作為 gate 工具，最關鍵的 NO-GO 不靠人眼把關。
+	var reasons []string
+	if an.approvals == 0 {
+		reasons = append(reasons, "(b) 未觀察到任何 approval request")
+	}
+	if an.apprMissingID > 0 {
+		reasons = append(reasons, fmt.Sprintf("(b) %d 筆 approval request 缺 threadId／turnId", an.apprMissingID))
+	}
+	if an.broadcast {
+		reasons = append(reasons, "(b) turn/completed 缺 threadId，只能靠廣播歸屬")
+	}
+	if !*force && an.overlap != "yes" {
+		reasons = append(reasons, "(a) 兩 thread 的 turn 生命期未重疊："+an.overlapWhy)
+	}
+	if recErr != nil {
+		reasons = append(reasons, fmt.Sprintf("(c) 錄流回報錯誤: %v", recErr))
+	}
+	if !(doneAfterTerminate < 10*time.Second) {
+		reasons = append(reasons, "(c) 收尾未於 10s 內 bounded 收斂")
+	}
+	if len(reasons) > 0 {
+		fmt.Println("GATE NO-GO")
+		for _, r := range reasons {
+			fmt.Println("  - " + r)
+		}
+		runCleanups()
+		os.Exit(2)
+	}
+	fmt.Println("GATE GO")
+	runCleanups()
 }
 
 // ---- thread / turn helpers（依 internal/codex 真實 API 實作）----
@@ -242,7 +388,7 @@ func (p *probe) runTurn(ctx context.Context, srv *codex.Server,
 			if te.turnID != "" && turnID != "" && te.turnID != turnID {
 				continue // 同 thread 的舊 turn 收尾，不是這一輪
 			}
-			out.status, out.ended = te.status, time.Now()
+			out.status, out.ended, out.errText = te.status, time.Now(), te.errMsg
 			if te.viaBcast {
 				out.note = "turn/completed 無 threadId，只能靠廣播歸屬"
 			}
@@ -273,6 +419,8 @@ func (p *probe) unregister(threadID string) {
 
 // ---- wire 錄流與 handler ----
 
+// sink 在同一把鎖內配發 seq 並寫檔——read loop（s2c）與並行段兩個送 turn/start 的
+// goroutine（c2s）會同時進來，寫入必須與 seq 配發原子化，否則證據檔會交錯損毀（I5）。
 func (p *probe) sink(env []byte) error {
 	var e struct {
 		Dir   string          `json:"dir"`
@@ -286,6 +434,7 @@ func (p *probe) sink(env []byte) error {
 	rec.Dir, rec.At = e.Dir, now
 
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.seq++
 	rec.Seq = p.seq
 	p.frames = append(p.frames, rec)
@@ -301,11 +450,8 @@ func (p *probe) sink(env []byte) error {
 			p.notifIDs.missingBoth = append(p.notifIDs.missingBoth, rec.Method)
 		}
 	}
-	seq := rec.Seq
-	p.mu.Unlock()
-
 	_, err := fmt.Fprintf(p.wireLog, "{\"seq\":%d,\"ts\":%q,\"dir\":%q,\"frame\":%s}\n",
-		seq, now.UTC().Format(time.RFC3339Nano), e.Dir, e.Frame)
+		rec.Seq, now.UTC().Format(time.RFC3339Nano), e.Dir, e.Frame)
 	return err
 }
 
@@ -318,6 +464,9 @@ func (p *probe) onNotification(method string, params json.RawMessage) {
 		Turn     struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`
+			Error  struct {
+				Message string `json:"message"`
+			} `json:"error"`
 		} `json:"turn"`
 	}
 	_ = json.Unmarshal(params, &q)
@@ -325,7 +474,7 @@ func (p *probe) onNotification(method string, params json.RawMessage) {
 	if status == "" {
 		status = "completed"
 	}
-	te := turnEnd{turnID: q.Turn.ID, status: status}
+	te := turnEnd{turnID: q.Turn.ID, status: status, errMsg: q.Turn.Error.Message}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -422,7 +571,7 @@ func parseFrame(b []byte) frameRec {
 
 // ---- 判定輸出 ----
 
-func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB, wirePath string) {
+func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB, wirePath string) analysis {
 	p.mu.Lock()
 	frames := append([]frameRec(nil), p.frames...)
 	approvals := append([]apprRec(nil), p.appr...)
@@ -430,7 +579,7 @@ func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB,
 	noIdent := p.noIdent
 	p.mu.Unlock()
 
-	fmt.Printf("MODE %s wire=%s frames=%d\n", mode, wirePath, len(frames))
+	fmt.Printf("WIRE %s frames=%d\n", wirePath, len(frames))
 
 	for _, r := range append([]turnResult{appr}, res...) {
 		fmt.Printf("TURN label=%s thread=%s turn=%s status=%s dur=%s err=%q note=%q\n",
@@ -438,10 +587,15 @@ func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB,
 			r.ended.Sub(r.started).Round(time.Millisecond), r.errText, r.note)
 	}
 
-	// (a) 並行交錯：只看 thA / thB 的 s2c frame
+	an := analysis{approvals: len(approvals), broadcast: noIdent}
+
+	// (a) 判準：**turn 生命期重疊**——turn/started(A) < turn/completed(B) 且
+	//     turn/started(B) < turn/completed(A)。只取 turn-scoped frame（TurnID 非空），
+	//     排除 thread/started 等 thread 級 frame——它們必然依建立順序落在最前面，
+	//     用「index 區間相交」會恆真，無法區分並行與串行化。
 	var trace []frameRec
 	for _, f := range frames {
-		if f.Dir != "s2c" {
+		if f.Dir != "s2c" || f.TurnID == "" {
 			continue
 		}
 		if f.ThreadID == thA || f.ThreadID == thB {
@@ -449,27 +603,43 @@ func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB,
 		}
 	}
 	sort.SliceStable(trace, func(i, j int) bool { return trace[i].Seq < trace[j].Seq })
-	firstA, lastA, firstB, lastB := -1, -1, -1, -1
-	nA, nB := 0, 0
-	for i, f := range trace {
+
+	an.overlap, an.overlapWhy = overlapVerdict(trace, thA, thB)
+	fmt.Printf("VERDICT_A turn_lifetime_overlap=%s %s\n", an.overlap, an.overlapWhy)
+
+	// 輸出階段是否交錯（觀察指標，**不入 gate**）：兩 thread 的 agentMessage delta
+	// 的 seq 區間是否相交。用來區分「並行受理」與「並行產出」。
+	dA0, dA1, dB0, dB1, nDA, nDB := -1, -1, -1, -1, 0, 0
+	for _, f := range trace {
+		if f.Method != codex.MethodAgentMessageDelta {
+			continue
+		}
 		if f.ThreadID == thA {
-			nA++
-			if firstA < 0 {
-				firstA = i
+			nDA++
+			if dA0 < 0 {
+				dA0 = f.Seq
 			}
-			lastA = i
+			dA1 = f.Seq
 		} else {
-			nB++
-			if firstB < 0 {
-				firstB = i
+			nDB++
+			if dB0 < 0 {
+				dB0 = f.Seq
 			}
-			lastB = i
+			dB1 = f.Seq
 		}
 	}
-	interleaved := firstA >= 0 && firstB >= 0 && firstB < lastA && firstA < lastB
-	fmt.Printf("VERDICT_A interleaved=%v framesA=%d framesB=%d windowA=[%d,%d] windowB=[%d,%d]\n",
-		interleaved, nA, nB, firstA, lastA, firstB, lastB)
-	fmt.Println("--- interleave trace (s2c frames of thread A/B) ---")
+	switch {
+	case nDA == 0 || nDB == 0:
+		an.deltaInterleaved = "inconclusive"
+	case dB0 < dA1 && dA0 < dB1:
+		an.deltaInterleaved = "yes"
+	default:
+		an.deltaInterleaved = "no"
+	}
+	fmt.Printf("OBSERVE delta_interleaved=%s deltasA=%d[seq%d..%d] deltasB=%d[seq%d..%d]\n",
+		an.deltaInterleaved, nDA, dA0, dA1, nDB, dB0, dB1)
+
+	fmt.Println("--- turn-scoped s2c trace (thread A/B) ---")
 	for _, f := range trace {
 		lbl := "A"
 		if f.ThreadID == thB {
@@ -485,12 +655,61 @@ func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB,
 	if len(notif.missingBoth) > 0 {
 		fmt.Printf("  notif_missing_identity_methods=%v\n", dedup(notif.missingBoth))
 	}
-	fmt.Printf("VERDICT_B approvals=%d\n", len(approvals))
+	for _, a := range approvals {
+		if a.ThreadID == "" || a.TurnID == "" {
+			an.apprMissingID++
+		}
+	}
+	fmt.Printf("VERDICT_B approvals=%d missing_identity=%d\n", an.approvals, an.apprMissingID)
 	for _, a := range approvals {
 		fmt.Printf("  APPROVAL at=%s method=%s threadId=%q turnId=%q itemId=%q decision=%s\n",
 			ts(a.At), a.Method, a.ThreadID, a.TurnID, a.ItemID, a.Decision)
 		fmt.Printf("    raw=%s\n", a.Raw)
 	}
+	return an
+}
+
+// overlapVerdict 是 (a) 的自動判準：**turn 生命期重疊**——
+// turn/started(A) 早於 turn/completed(B) 且 turn/started(B) 早於 turn/completed(A)。
+//
+// trace 必須只含 turn-scoped s2c frame（TurnID 非空）並依 Seq 遞增。
+// 不可改回「A/B frame 的 index 區間相交」：thread 級 frame（thread/started 等）依建立
+// 順序必然落在最前面，串行化的 server 也會讓兩區間互相包含 → 該指標恆真。
+func overlapVerdict(trace []frameRec, thA, thB string) (verdict, why string) {
+	var startedA, startedB, endedA, endedB *frameRec
+	pick := func(dst **frameRec, f *frameRec) {
+		if *dst == nil {
+			*dst = f
+		}
+	}
+	for i := range trace {
+		f := &trace[i]
+		switch {
+		case f.Method == codex.MethodTurnStarted && f.ThreadID == thA:
+			pick(&startedA, f)
+		case f.Method == codex.MethodTurnStarted && f.ThreadID == thB:
+			pick(&startedB, f)
+		case f.Method == codex.MethodTurnCompleted && f.ThreadID == thA:
+			pick(&endedA, f)
+		case f.Method == codex.MethodTurnCompleted && f.ThreadID == thB:
+			pick(&endedB, f)
+		}
+	}
+	switch {
+	case startedA == nil || startedB == nil:
+		return "inconclusive", "缺少 turn/started（A 或 B 的 turn 未開始）"
+	case endedA == nil && endedB == nil:
+		return "inconclusive", "兩個 turn 都沒有 turn/completed（forced 收尾預期如此）"
+	case endedA == nil || endedB == nil:
+		return "inconclusive", "只有一個 turn 有 turn/completed，無法判定生命期是否重疊"
+	}
+	v := "no"
+	if startedA.Seq < endedB.Seq && startedB.Seq < endedA.Seq {
+		v = "yes"
+	}
+	return v, fmt.Sprintf("startedA=seq%d(%s) endedA=seq%d(%s) startedB=seq%d(%s) endedB=seq%d(%s)",
+		startedA.Seq, ts(startedA.At), endedA.Seq, ts(endedA.At),
+		startedB.Seq, ts(startedB.At), endedB.Seq, ts(endedB.At))
 }
 
 // ---- 小工具 ----
@@ -537,7 +756,17 @@ func must(err error) {
 	}
 }
 
+// fatal：probe 執行失敗（環境／API 錯誤），exit 1。先 cleanup 再退出。
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "PROBE FATAL: "+format+"\n", args...)
+	runCleanups()
 	os.Exit(1)
+}
+
+// nogoExit：probe 跑得起來但判定 NO-GO，exit 2。先 cleanup 再退出。
+func nogoExit(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "GATE NO-GO: "+format+"\n", args...)
+	fmt.Println("GATE NO-GO")
+	runCleanups()
+	os.Exit(2)
 }
