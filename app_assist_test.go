@@ -473,12 +473,12 @@ func TestPlanAssistPreflightFailureFailsClosedAndRecovers(t *testing.T) {
 	if !errors.Is(err, assist.ErrEnforcementUnproven) {
 		t.Fatalf("preflight failure must reject with ErrEnforcementUnproven, got: %v", err)
 	}
-	e := openItemByKey(t, a, "planner-enforcement:claude")
+	e := openItemByKey(t, a, "planner-enforcement-preflight:claude")
 	if e == nil {
-		t.Fatal("preflight failure must open a planner-enforcement escalation item")
+		t.Fatal("preflight failure must open a planner-enforcement-preflight escalation item")
 	}
 	if !e.Item.Hard {
-		t.Fatal("planner-enforcement item must be hard (system-resolve only)")
+		t.Fatal("planner-enforcement-preflight item must be hard (system-resolve only)")
 	}
 
 	// 恢復：bin 原地換回 pin 版（digest 變更 → cache miss 重驗）。
@@ -489,8 +489,8 @@ func TestPlanAssistPreflightFailureFailsClosedAndRecovers(t *testing.T) {
 	if _, err := a.PlanAssist("claude", "draft plan"); err != nil {
 		t.Fatalf("PlanAssist after pin-version recovery must succeed, got: %v", err)
 	}
-	if openItemByKey(t, a, "planner-enforcement:claude") != nil {
-		t.Fatal("a re-passing preflight must system-resolve the planner-enforcement item")
+	if openItemByKey(t, a, "planner-enforcement-preflight:claude") != nil {
+		t.Fatal("a re-passing preflight must system-resolve the planner-enforcement-preflight item")
 	}
 }
 
@@ -510,12 +510,15 @@ func TestPlanAssistRunnerFailureNotMisclassifiedAsEnforcement(t *testing.T) {
 	if errors.Is(err, assist.ErrEnforcementUnproven) {
 		t.Fatalf("post-preflight runner failure must not be classified as unproven enforcement: %v", err)
 	}
-	if openItemByKey(t, a, "planner-enforcement:claude") != nil {
-		t.Fatal("post-preflight runner failure must NOT open a planner-enforcement item (misclassification)")
+	for _, key := range []string{"planner-enforcement-preflight:claude", "planner-enforcement-runtime:claude"} {
+		if openItemByKey(t, a, key) != nil {
+			t.Fatalf("post-preflight runner failure must NOT open %s (misclassification)", key)
+		}
 	}
 }
 
-// Codex runtime violation（typed *EnforcementViolation）→ 同 condition key hard 項。
+// Codex runtime violation（typed *EnforcementViolation）→ runtime hard 項；
+// preflight key 不受影響（兩 key 條件隔離，spec §3.4 erratum）。
 func TestPlanAssistCodexRuntimeViolationOpensHardItem(t *testing.T) {
 	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
 		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
@@ -529,9 +532,12 @@ func TestPlanAssistCodexRuntimeViolationOpensHardItem(t *testing.T) {
 	if !errors.As(err, &viol) {
 		t.Fatalf("runtime violation must surface typed, got: %v", err)
 	}
-	e := openItemByKey(t, a, "planner-enforcement:codex")
+	e := openItemByKey(t, a, "planner-enforcement-runtime:codex")
 	if e == nil || !e.Item.Hard {
-		t.Fatalf("codex runtime violation must open a hard planner-enforcement item, got: %+v", e)
+		t.Fatalf("codex runtime violation must open a hard planner-enforcement-runtime item, got: %+v", e)
+	}
+	if openItemByKey(t, a, "planner-enforcement-preflight:codex") != nil {
+		t.Fatal("runtime violation must not touch the preflight condition key")
 	}
 }
 
@@ -586,5 +592,101 @@ func TestPlanAssistPreflightCachedUntilBinaryChanges(t *testing.T) {
 	}
 	if n := countLines(); n != 2 {
 		t.Fatalf("changed binary digest must force re-verification, got %d --version runs", n)
+	}
+}
+
+// (a) channel-barrier（spec §3.4 erratum，owner 2026-08-14）：runtime blocker
+// 存在時發起乾淨恢復 run——run 尚未結束（runner 卡在 hook）期間 blocker 必須
+// 仍有效（Gate decision 被擋）；run 成功結束才系統解除；之後 Gate decision
+// 通過。守住「僅過靜態 preflight 就提前解除」的誤放行窗口。
+func TestPlanAssistRuntimeBlockerHeldUntilCleanRunCompletes(t *testing.T) {
+	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
+	})
+	a, _ := newTestAppGitAssist(t, violating)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "codex", "codex-cli 0.146.1")
+	// 同 manifest 再送一枚 pending gate1 決議（Submit 不受 blocker 影響），
+	// 供 blocker 生效期間／解除後的 GateDecide 對照。
+	pendingID, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) violation run → runtime blocker 建立。
+	if _, err := a.PlanAssist("codex", "draft plan"); err == nil {
+		t.Fatal("violation run must fail")
+	}
+	if e := openItemByKey(t, a, "planner-enforcement-runtime:codex"); e == nil || !e.Item.Hard {
+		t.Fatalf("violation must open the hard runtime blocker, got: %+v", e)
+	}
+
+	// 2) 乾淨恢復 run 進行中（preflight 已過、runner 卡住）：blocker 仍有效。
+	started := make(chan struct{})
+	release := make(chan struct{})
+	a.assistRunnerFactory = func(string) (assist.Runner, error) {
+		return runnerFunc(func(ctx context.Context, _ string, _ func(contract.Envelope)) error {
+			close(started)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}), nil
+	}
+	runErr := make(chan error, 1)
+	go func() { _, err := a.PlanAssist("codex", "recovery run"); runErr <- err }()
+	<-started // barrier：靜態 preflight 已通過、runner 執行中、run 未結束
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+		t.Fatal("runtime blocker must NOT be released while the recovery run is still in flight")
+	}
+	if derr := a.GateDecide(pendingID, "approved", "ok", nil); derr == nil || !strings.Contains(derr.Error(), "blocked by") {
+		t.Fatalf("gate decision during the in-flight recovery run must stay vetoed, got: %v", derr)
+	}
+
+	// 3) run 成功結束 → 系統解除 → Gate decision 通過。
+	close(release)
+	if err := <-runErr; err != nil {
+		t.Fatalf("clean recovery run must succeed, got: %v", err)
+	}
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") != nil {
+		t.Fatal("a fully clean PlanAssist run must system-resolve the runtime blocker")
+	}
+	if err := a.GateDecide(pendingID, "approved", "resolved", nil); err != nil {
+		t.Fatalf("gate decision after the clean run must pass, got: %v", err)
+	}
+}
+
+// (b) 一般錯誤與逾時／取消的 run 結束後 runtime blocker 仍在——只有「成功結束
+// 且全程無 violation」的 run 才是修復條件。
+func TestPlanAssistRuntimeBlockerSurvivesGenericFailures(t *testing.T) {
+	violating := runnerFunc(func(context.Context, string, func(contract.Envelope)) error {
+		return &assist.EnforcementViolation{Provider: "codex", Detail: "item/commandExecution/requestApproval"}
+	})
+	a, _ := newTestAppGitAssist(t, violating)
+	approveGate1Spec(t, a)
+	plantPlannerBin(t, a, "codex", "codex-cli 0.146.1")
+	if _, err := a.PlanAssist("codex", "draft plan"); err == nil {
+		t.Fatal("violation run must fail")
+	}
+	if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+		t.Fatal("violation must open the runtime blocker")
+	}
+
+	for name, rerr := range map[string]error{
+		"generic error":  errors.New("assist: runner exploded (generic)"),
+		"timeout/cancel": context.DeadlineExceeded,
+	} {
+		failing := rerr
+		a.assistRunnerFactory = func(string) (assist.Runner, error) {
+			return runnerFunc(func(context.Context, string, func(contract.Envelope)) error { return failing }), nil
+		}
+		if _, err := a.PlanAssist("codex", "retry"); err == nil {
+			t.Fatalf("%s: run must fail", name)
+		}
+		if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
+			t.Fatalf("%s: a failed run must NOT release the runtime blocker", name)
+		}
 	}
 }

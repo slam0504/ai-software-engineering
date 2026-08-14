@@ -3224,19 +3224,38 @@ func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bin
 	return id, nil
 }
 
-// plannerEnforcementKey（§3.8 (9)）：PlannerAssist enforcement 失敗的
-// condition key。觸發點（M3a.1 Task 7 接線）：(a) PlanAssist spawn 前
-// preflight 驗不過（planPreflight）；(b) runner 回 typed
-// *assist.EnforcementViolation（Codex runtime 違規）。修復條件：同 provider
-// 的 preflight 重新通過 → 系統解除（escResolveByKeyLocked）。
-func plannerEnforcementKey(provider string) string { return "planner-enforcement:" + provider }
+// planner enforcement condition keys（§3.8 (9)；spec §3.4 erratum，owner
+// 2026-08-14 裁決 key 分離）：
+//   - preflight key：spawn 前靜態 preflight 驗不過 → 建立；同 provider 的
+//     preflight 重新通過（runner 啟動前，時點不變）→ 系統解除。
+//   - runtime key：runner 回 typed *assist.EnforcementViolation（Codex
+//     runtime 違規）→ 建立；**只有一次完整 PlanAssist 成功結束（runner.Run
+//     回 nil、全程無 violation）才系統解除**。一般錯誤／逾時／取消／
+//     escalation 寫入失敗皆不解除。
+//
+// 分離理由：共用 key 時「上次已實證 runtime 違規」的 workspace blocker 會在
+// 下次 PlanAssist 僅通過靜態 preflight、runner 尚未證明安全的窗口內被提前
+// 解除，Gate decision 可能於該窗口通過——靜態 preflight 證明不了 runtime
+// 行為已恢復。
+func plannerPreflightKey(provider string) string {
+	return "planner-enforcement-preflight:" + provider
+}
 
-// escPlannerEnforcementFailedLocked：(9) 的建立函式（呼叫端持 workflowMu）。
-// hard=true：enforcement 未證明是安全不變量缺口，僅系統（preflight 重新通過）
-// 可解除，UI 不可手動 resolve。
-func (a *App) escPlannerEnforcementFailedLocked(provider, detail string) (string, error) {
-	return a.escCreateSystemLocked(plannerEnforcementKey(provider), "workspace", true,
-		"PlannerAssist enforcement 失敗（"+provider+"）："+detail, "provider:"+provider)
+func plannerRuntimeKey(provider string) string {
+	return "planner-enforcement-runtime:" + provider
+}
+
+// escPlannerPreflightFailedLocked／escPlannerRuntimeViolationLocked：(9) 的
+// 建立函式（呼叫端持 workflowMu）。皆 hard=true：安全不變量缺口僅系統可依
+// 各自修復條件解除，UI 不可手動 resolve。
+func (a *App) escPlannerPreflightFailedLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerPreflightKey(provider), "workspace", true,
+		"PlannerAssist preflight 失敗（"+provider+"）："+detail, "provider:"+provider)
+}
+
+func (a *App) escPlannerRuntimeViolationLocked(provider, detail string) (string, error) {
+	return a.escCreateSystemLocked(plannerRuntimeKey(provider), "workspace", true,
+		"PlannerAssist runtime enforcement 違規（"+provider+"）："+detail, "provider:"+provider)
 }
 
 // EscalationList 回傳收件匣 projection（Wails 綁定）。Project 失敗回錯——
@@ -3515,8 +3534,9 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 
 	// provider capability preflight（M3a.1 Task 7：spec §3.4）：spawn 前驗 pin
 	// 版本＋argv 凍結基準。失敗 → fail closed：不啟動 runner、workflowMu 下建
-	// hard planner-enforcement 項並回明確錯誤；escalation 寫入失敗仍不啟動且
-	// 錯誤含 journal 失敗。重新通過 → 系統解除同 key（修復條件）。
+	// hard preflight 項並回明確錯誤；escalation 寫入失敗仍不啟動且錯誤含
+	// journal 失敗。重新通過 → 系統解除 preflight key（僅此 key——runtime
+	// blocker 的修復條件是一次完整成功 run，見 plannerRuntimeKey doc）。
 	pf, pferr := a.planPreflight(provider)
 	if pferr != nil || !pf.OK {
 		reason := pf.Reason
@@ -3525,7 +3545,7 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		}
 		failErr := fmt.Errorf("%w：%s preflight 失敗：%s", assist.ErrEnforcementUnproven, provider, reason)
 		a.workflowMu.Lock()
-		_, cerr := a.escPlannerEnforcementFailedLocked(provider, reason)
+		_, cerr := a.escPlannerPreflightFailedLocked(provider, reason)
 		a.workflowMu.Unlock()
 		if cerr != nil {
 			return "", errors.Join(failErr, cerr)
@@ -3533,7 +3553,7 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 		return "", failErr
 	}
 	a.workflowMu.Lock()
-	rerr := a.escResolveByKeyLocked(plannerEnforcementKey(provider), "preflight-pass:"+pf.BinaryDigest)
+	rerr := a.escResolveByKeyLocked(plannerPreflightKey(provider), "preflight-pass:"+pf.BinaryDigest)
 	a.workflowMu.Unlock()
 	if rerr != nil { // 已重新通過但修復解除寫不進去：fail loud（不無聲留下已修復的 blocker）
 		return "", rerr
@@ -3616,15 +3636,25 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 	err = runner.Run(ctx, prompt, sink)
 	// 誤分類禁止（§3.4）：preflight 通過後的 runner 啟動失敗／逾時是一般錯誤，
 	// 不建 enforcement 項；只有 typed *EnforcementViolation（Codex 在
-	// readOnly+never 下仍送 escalation/approval request）才接 hard 項（同
-	// condition key，修復同樣走 preflight 重新通過的系統解除）。
+	// readOnly+never 下仍送 escalation/approval request）才建 runtime hard 項。
 	var viol *assist.EnforcementViolation
-	if errors.As(err, &viol) {
+	switch {
+	case errors.As(err, &viol):
 		a.workflowMu.Lock()
-		_, cerr := a.escPlannerEnforcementFailedLocked(viol.Provider, viol.Detail)
+		_, cerr := a.escPlannerRuntimeViolationLocked(viol.Provider, viol.Detail)
 		a.workflowMu.Unlock()
 		if cerr != nil { // fail loud：違規發生但 journal 寫不進去，錯誤要帶出來
 			err = errors.Join(err, cerr)
+		}
+	case err == nil:
+		// runtime blocker 修復條件（spec §3.4 erratum 2026-08-14）：一次完整
+		// PlanAssist 成功結束、全程無 violation——此刻才系統解除。一般錯誤／
+		// 逾時／取消不會走到這裡（err != nil），blocker 續留。
+		a.workflowMu.Lock()
+		rerr := a.escResolveByKeyLocked(plannerRuntimeKey(provider), "clean-run:"+gen.correlationID)
+		a.workflowMu.Unlock()
+		if rerr != nil { // 已修復但解除寫不進去：fail loud（blocker 續留、錯誤帶出）
+			err = rerr
 		}
 	}
 	return gen.correlationID, err

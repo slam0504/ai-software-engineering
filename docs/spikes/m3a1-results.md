@@ -1,7 +1,8 @@
 # M3a.1 Task 12 實機走查結果
 
 - 執行依據：coordinator 指示（M3a.1 分支 `m3a1-closure` coding 完成後的 Task 12 實機走查）；比對對象為 `docs/spikes/m3a-results.md`（M3a Task 27 A1–A10）中已記錄的已知缺口，驗證 M3a.1 是否修復。
-- 基線：branch `m3a1-closure`（13 commits，新增：新檔建立 inline 列＋四種模板、analysis_base bump 引導面板、TCA generation 隔離、role 完整性錯誤、STALE 重核導航按鈕、provider capability preflight）。
+- 基線：branch `m3a1-closure`（merge 前共 19 commits，含 review／owner 裁決修正；新增：新檔建立 inline 列＋四種模板、analysis_base bump 引導面板、TCA generation 隔離、role 完整性錯誤、STALE 重核導航按鈕、provider capability preflight）。
+- 附記：`frontend/wailsjs/go/models.ts` 的尾端空白（tab-only 行，`git diff --check` 會報）為 `wails generate module` 必然產物——2026-08-14 重生比對 byte-identical，不手動清除（下次 generate 會覆寫）。
 - 狀態：**5 項走查全數 PASS**（實機 `wails dev` + Playwright 驅動 browser 前端執行，2026-08-13）。全程使用全新臨時 workspace `~/m3a1-accept`；不 commit repo、不改 repo 其他檔案。
 
 ## 環境準備
