@@ -333,6 +333,12 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 		return "", err
 	}
 	defer a.endAppTxn()
+	// provider 白名單（同 StartSession／SendMessage／EndSession 的既有 guard）：
+	// 未知 provider 若放行，會被 Put 寫進 durable registry，重啟後 RestoreDormant
+	// 拿到無人能接手的 provider，那筆 entry 永久卡住。
+	if provider != "claude" && provider != "codex" {
+		return "", fmt.Errorf("unknown provider %q", provider)
+	}
 	p := contract.Provider(provider)
 	if a.createDegraded(p) {
 		return "", errCreateDegraded
@@ -353,7 +359,10 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	if cerr := a.commitCreate(tok); cerr != nil {
 		if rerr := a.wsReg.DeleteUncommitted(string(w)); rerr != nil {
 			a.setCreateDegraded(p) // 雙失敗：保留名額、latch，等 app restart（§3.1）
-			return "", errors.Join(cerr, rerr, errCreateDegraded)
+			// WSID 一併帶進錯誤：這筆 reservation 被刻意保留、不 emit、不寫 audit，
+			// registry 那筆 entry 也還在磁碟上——錯誤字串是 post-mortem 對帳的唯一線索。
+			return "", errors.Join(cerr, rerr,
+				fmt.Errorf("app: create degraded, orphan reservation wsid=%s: %w", w, errCreateDegraded))
 		}
 		return "", errors.Join(cerr, a.manager.AbortCreate(tok))
 	}

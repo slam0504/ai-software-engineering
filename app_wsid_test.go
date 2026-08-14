@@ -41,6 +41,12 @@ func (s *stubRegistry) DeleteUncommitted(wsid string) error {
 	if s.deleteErr != nil {
 		return s.deleteErr
 	}
+	// 只在該 wsid 真的存在時才記旗標——真實 Store 的 DeleteUncommitted 對不存在
+	// 的 wsid 是冪等 no-op，無條件設旗標會讓「Put 寫錯 WSID」的實作照樣通過
+	// TestCommitFailureRollsBackRegistryWithoutTombstone。
+	if _, ok := s.entries[wsid]; !ok {
+		return nil
+	}
 	s.deletedUncommitted = true
 	delete(s.entries, wsid)
 	return nil
@@ -71,6 +77,61 @@ func (s *stubRegistry) Live() []wsregistry.Entry {
 }
 
 func (s *stubRegistry) Sync() error { return nil }
+
+// TestCreateSessionHappyPathWritesEntryAndHoldsSlot：stub 級的快樂路徑——
+// 鎖住 Put 的欄位對映（WSID／Provider／TaskLabel 不得對調或寫錯來源）與
+// 「commit 成功後名額確實被佔住」。end-to-end 版本要等 Task 6 接上真實 registry。
+func TestCreateSessionHappyPathWritesEntryAndHoldsSlot(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	wsid, err := a.CreateSession("claude", "my-task")
+	if err != nil {
+		t.Fatalf("快樂路徑不得回錯：%v", err)
+	}
+	if wsid == "" {
+		t.Fatal("成功建立必須回傳非空 WSID")
+	}
+	e, ok := reg.Get(wsid)
+	if !ok {
+		t.Fatalf("registry 必須以回傳的 WSID 為 key 存有該 entry：%q", wsid)
+	}
+	if e.WSID != wsid {
+		t.Fatalf("Entry.WSID 與回傳值不一致：%q vs %q", e.WSID, wsid)
+	}
+	if e.Provider != "claude" {
+		t.Fatalf("Entry.Provider 錯誤：%q", e.Provider)
+	}
+	if e.TaskLabel != "my-task" {
+		t.Fatalf("Entry.TaskLabel 錯誤：%q", e.TaskLabel)
+	}
+	if e.CreatedAt == "" {
+		t.Fatal("Entry.CreatedAt 必須寫入")
+	}
+	if got := a.manager.SlotCount("claude"); got != 1 {
+		t.Fatalf("commit 成功後應佔住一個名額：%d", got)
+	}
+	if reg.deletedUncommitted || reg.removedWithTombstone {
+		t.Fatal("快樂路徑不得觸發任何回滾")
+	}
+}
+
+// TestCreateSessionRejectsUnknownProvider：未知 provider 若放行會被寫進 durable
+// registry，重啟後 RestoreDormant 拿到無人能接手的 provider、該 entry 永久卡住。
+func TestCreateSessionRejectsUnknownProvider(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	if _, err := a.CreateSession("clade", "t"); err == nil {
+		t.Fatal("未知 provider 必須 fail loud")
+	}
+	if len(reg.Live()) != 0 {
+		t.Fatalf("未知 provider 不得寫進 registry：%+v", reg.Live())
+	}
+	if got := a.manager.SlotCount("clade"); got != 0 {
+		t.Fatalf("未知 provider 不得佔名額：%d", got)
+	}
+}
 
 func TestCreateSessionRollsBackOnPersistFailure(t *testing.T) {
 	a, _ := newTestApp(t)
