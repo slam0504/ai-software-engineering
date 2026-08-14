@@ -9,21 +9,22 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
 
-// last：memSink 最後一筆 envelope（memSink 本體定義於 manager_test.go，遷移期不得更動）。
-func (s *memSink) last() contract.Envelope {
+// all：memSink 目前收到的全部 envelope 快照（memSink 本體定義於 manager_test.go，
+// 遷移期不得更動）。刻意不提供 last()——一次 Emit 可能產生 message ＋ reducer 合成的
+// state_change 兩筆，只看最後一筆會斷言到非預期的那筆。
+func (s *memSink) all() []contract.Envelope {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.rows) == 0 {
-		return contract.Envelope{}
-	}
-	return s.rows[len(s.rows)-1]
+	out := make([]contract.Envelope, len(s.rows))
+	copy(out, s.rows)
+	return out
 }
 
 func TestReserveSessionLimitIsAtomic(t *testing.T) {
 	m := New(Config{Sink: &memSink{}})
 	var ok, limited int64
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -90,8 +91,25 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	if err := m.EmitWS(w, contract.Event{Kind: "message", Provider: "claude"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := sink.last().WorkspaceSessionID; got != string(w) {
+	// result 會讓 reducer 進 done，因而**合成**一筆 state_change——上面那筆 role-less
+	// message 對 reducer 是中性的，只發它就驗不到合成路徑有沒有填 WSID。
+	if err := m.EmitWS(w, contract.Event{Kind: contract.KindResult, Provider: "claude", Raw: []byte("{}")}); err != nil {
+		t.Fatal(err)
+	}
+	rows := sink.all()
+	// §3.1.5：這兩次 emit 產生的**每一筆** envelope（含 reducer 合成的 state_change）
+	// 都要帶 WSID，否則多 session 上線後前端無法歸戶到 session tab。
+	for _, e := range rows {
+		if e.WorkspaceSessionID != string(w) {
+			t.Fatalf("每筆 envelope 都要填 WSID：kind=%q wsid=%q", e.Kind, e.WorkspaceSessionID)
+		}
+	}
+	// 明確鎖定各自那筆，不依賴「最後一筆剛好是它」；同時確保合成路徑真的有被涵蓋。
+	if got := lastOfKind(t, rows, "message").WorkspaceSessionID; got != string(w) {
 		t.Fatalf("Emit 必須填 WSID：%q", got)
+	}
+	if got := lastOfKind(t, rows, string(contract.KindStateChange)).WorkspaceSessionID; got != string(w) {
+		t.Fatalf("合成的 state_change 也必須填 WSID：%q", got)
 	}
 	if err := m.EmitWS(w, contract.Event{Kind: "message", Provider: "codex"}); !errors.Is(err, ErrProviderMismatch) {
 		t.Fatalf("provider 不符必須 fail loud：%v", err)

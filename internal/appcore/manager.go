@@ -142,7 +142,14 @@ func New(cfg Config) *Manager {
 }
 
 // countLocked：該 provider 已佔用的名額（含尚未 commit 的 reservation）。
-// legacy slot 是遷移期產物，不佔使用者名額。
+//
+// legacy slot 是遷移期產物，不佔使用者名額——相容層必須保留「讀取時隱式建立」，
+// 而 Totals(p)／State(p)／SessionActive(p) 都是唯讀查詢卻會建 legacy slot；若把
+// legacy 計入，一次 UI 輪詢就永久吃掉一個使用者名額，等於把 §3.1.4 要廢除的洞
+// 從新入口搬到舊入口。
+//
+// 因此**遷移期每 provider 實際上限為 MaxSessionsPerProvider + 1 = 5**：m.legacy[p]
+// 是一對一 map，每個 provider 最多一個 legacy slot。相容層於 Task 9 刪除後回歸 4。
 func (m *Manager) countLocked(p contract.Provider) int {
 	n := 0
 	for _, sl := range m.slots {
@@ -214,7 +221,10 @@ func (m *Manager) AbortCreate(tok CreateToken) error {
 }
 
 // RestoreDormant：把 registry 既存的 dormant session 掛回 slot（已 committed，
-// 不經 reservation）。同 WSID 重複 restore 為 no-op；provider 不符 fail loud。
+// 不經 reservation）。同 WSID＋同 provider 重複 restore 為 no-op（啟動修復序列在
+// crash 後重跑必須冪等）；provider 不符、或該 WSID 正卡在一筆未完成的 reservation
+// 一律 fail loud——後者若放行，呼叫端會誤判 restore 成功，之後每個 ...WS 呼叫都是
+// ErrSessionNotFound。
 func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -227,6 +237,9 @@ func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error {
 	if sl, ok := m.slots[w]; ok {
 		if sl.provider != p {
 			return ErrProviderMismatch
+		}
+		if !sl.committed { // 撞上進行中的 reservation：不可當作 restore 成功
+			return ErrStaleCreate
 		}
 		return nil
 	}
@@ -250,6 +263,12 @@ func (m *Manager) SlotCount(p contract.Provider) int {
 func (m *Manager) ProviderOf(w WSID) (contract.Provider, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.providerOfLocked(w)
+}
+
+// providerOfLocked：唯讀查詢，不建立任何 slot。closed 路徑用它補齊 drop 通知的
+// provider（此時已不能走 committedSlotLocked）。
+func (m *Manager) providerOfLocked(w WSID) (contract.Provider, bool) {
 	sl, ok := m.slots[w]
 	if !ok {
 		return "", false
@@ -579,7 +598,7 @@ func (m *Manager) Emit(ev contract.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先——不 queue、不 Apply、不動 totals
-		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
+		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider), "") // legacy slot 無 WSID
 		return
 	}
 	m.queueOrEmitLocked(m.legacySlotLocked(ev.Provider), pendingEntry{ev: ev})
@@ -590,7 +609,7 @@ func (m *Manager) EmitWS(w WSID, ev contract.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先——與舊入口一致：單一 UI stream_error、不寫 sink
-		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
+		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider), w)
 		return ErrClosed
 	}
 	sl, err := m.committedSlotLocked(w)
@@ -752,7 +771,7 @@ func (m *Manager) EmitWorkspace(kind string, bindings []contract.Binding, payloa
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(kind, "")
+		m.emitClosedDroppedLocked(kind, "", "") // workspace lane 不計入 slot（§3.1.6）
 		return
 	}
 	raw, _ := json.Marshal(payload)
@@ -778,7 +797,7 @@ func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先——與其他出口一致（單一 UI stream_error、不寫 sink）
-		m.emitClosedDroppedLocked(string(contract.KindStreamError), string(provider))
+		m.emitClosedDroppedLocked(string(contract.KindStreamError), string(provider), "") // assist one-shot 無 slot
 		return
 	}
 	for _, ev := range evs {
@@ -807,7 +826,7 @@ func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, too
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(string(contract.KindApproval), string(provider))
+		m.emitClosedDroppedLocked(string(contract.KindApproval), string(provider), "")
 		return
 	}
 	sl := m.legacySlotLocked(provider)
@@ -817,13 +836,14 @@ func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, too
 func (m *Manager) EmitApprovalRequestWS(w WSID, sessionID, toolName string, raw []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed { // closed 最先——與全檔一致：drop 通知不因 WSID 是否存在而異
+		p, _ := m.providerOfLocked(w)
+		m.emitClosedDroppedLocked(string(contract.KindApproval), string(p), w)
+		return ErrClosed
+	}
 	sl, err := m.committedSlotLocked(w)
 	if err != nil {
 		return err
-	}
-	if m.closed {
-		m.emitClosedDroppedLocked(string(contract.KindApproval), string(sl.provider))
-		return ErrClosed
 	}
 	m.queueOrEmitLocked(sl, approvalRequestEvent(sl.provider, sessionID, toolName, raw))
 	return nil
@@ -833,7 +853,7 @@ func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, de
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(provider))
+		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(provider), "")
 		return
 	}
 	sl := m.legacySlotLocked(provider)
@@ -843,13 +863,14 @@ func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, de
 func (m *Manager) EmitApprovalDecisionWS(w WSID, sessionID, decision, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed { // closed 最先——與全檔一致：drop 通知不因 WSID 是否存在而異
+		p, _ := m.providerOfLocked(w)
+		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(p), w)
+		return ErrClosed
+	}
 	sl, err := m.committedSlotLocked(w)
 	if err != nil {
 		return err
-	}
-	if m.closed {
-		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(sl.provider))
-		return ErrClosed
 	}
 	m.queueOrEmitLocked(sl, approvalDecisionEvent(sl.provider, sessionID, decision, reason))
 	return nil
@@ -907,17 +928,21 @@ func (m *Manager) writeAndEmitLocked(env contract.Envelope) {
 		m.cfg.Emit(contract.Envelope{ // 只走 UI，不回寫 sink（防遞迴）
 			EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
 			Provider: env.Provider, Kind: string(contract.KindStreamError),
-			Error: "audit sink: " + sinkErr.Error(),
+			WorkspaceSessionID: env.WorkspaceSessionID, // §3.1.5：sink 失敗通知要能歸戶
+			Error:              "audit sink: " + sinkErr.Error(),
 		})
 	}
 }
 
 // emitClosedDroppedLocked：close 後的唯一輸出——單一 UI stream_error（不寫 sink）。
-func (m *Manager) emitClosedDroppedLocked(kind, provider string) {
+// wsid 帶上呼叫端已知的 workspace session（§3.1.5），讓前端能把 drop 通知歸戶到
+// 對應的 session tab；workspace／assist lane 無 slot，傳空值。
+func (m *Manager) emitClosedDroppedLocked(kind, provider string, wsid WSID) {
 	m.cfg.Emit(contract.Envelope{
 		EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
 		Provider: provider, Kind: string(contract.KindStreamError),
-		Error: "manager closed: event dropped (kind=" + kind + ")",
+		WorkspaceSessionID: string(wsid),
+		Error:              "manager closed: event dropped (kind=" + kind + ")",
 	})
 }
 
