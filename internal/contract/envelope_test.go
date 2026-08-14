@@ -119,3 +119,21 @@ func TestEnvelopeWorkspaceFieldsOmitemptyAndPopulated(t *testing.T) {
 		t.Fatalf("KindBindingStale constant mismatch: %q", KindBindingStale)
 	}
 }
+
+func TestEnvelopeCarriesWorkspaceSessionID(t *testing.T) {
+	b, err := json.Marshal(Envelope{EventID: "e1", Kind: "message", WorkspaceSessionID: "01JWSID"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"workspace_session_id":"01JWSID"`) {
+		t.Fatalf("欄位未序列化: %s", b)
+	}
+	var back Envelope
+	if err := json.Unmarshal(b, &back); err != nil || back.WorkspaceSessionID != "01JWSID" {
+		t.Fatalf("round-trip 失敗: %v %+v", err, back)
+	}
+	b2, _ := json.Marshal(Envelope{EventID: "e2", Kind: "message"})
+	if strings.Contains(string(b2), "workspace_session_id") {
+		t.Fatalf("空值不應序列化（舊 journal 相容）: %s", b2)
+	}
+}
