@@ -82,3 +82,24 @@ func EndSessionFlow(m *Manager, p contract.Provider, busyCheck func() bool, tear
 	finErr := m.FinishEndSession(p, tok)
 	return errors.Join(tearErr, finErr)
 }
+
+// EndSessionFlowWS：EndSessionFlow 的 WSID 定址版（M3b §3.3）——編排與語意逐字
+// 相同，只是 slot 由 WSID 解析而非 provider 相容層，讓同一 provider 的多個
+// session 各自獨立收尾。未知／未 commit 的 WSID 由 ...WS 入口回 ErrSessionNotFound
+// （fail loud，不當成「無 session」冪等吞掉）。
+func EndSessionFlowWS(m *Manager, w WSID, busyCheck func() bool, teardown func() error) error {
+	tok, err := m.BeginEndSessionWS(w)
+	if errors.Is(err, ErrNoSession) {
+		return nil // 冪等
+	}
+	if err != nil {
+		return err
+	}
+	if busyCheck != nil && busyCheck() {
+		cerr := m.CancelEndSessionWS(w, tok) // Cancel 錯誤保留、不吞
+		return errors.Join(ErrProviderBusy, cerr)
+	}
+	tearErr := teardown()
+	finErr := m.FinishEndSessionWS(w, tok)
+	return errors.Join(tearErr, finErr)
+}

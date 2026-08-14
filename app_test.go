@@ -271,7 +271,7 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 // P1 迴歸（第二輪 review）：start 交易 abort（如 shutdown 與 StartSession 交錯，
 // Accept 得 ErrClosed）時，reaper 不得等 process EOF——MultiTurn CLI 仍在等
 // 輸入，必須立即 teardown：process 界限內退出、lease finalized、
-// claudeSess／broker 全清除。
+// sessionHost（含 sess／broker）自 registry 移除。
 func TestClaudeAbortedStartIsReclaimed(t *testing.T) {
 	a, ui := newTestApp(t)
 	bin := a.claudeCLIPath()
@@ -290,10 +290,8 @@ func TestClaudeAbortedStartIsReclaimed(t *testing.T) {
 		t.Fatalf("aborted start must surface ErrClosed, got %v", err)
 	}
 	waitFor(t, "session:done after abort", func() bool { return len(ui.find("session:done")) > 0 })
-	waitFor(t, "state reclaimed", func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return a.claudeSess == nil && a.broker == nil
+	waitFor(t, "state reclaimed", func() bool { // host 自 registry 取出即代表 sess／broker 都已收乾
+		return a.hostFor(a.legacyWSIDFor(contract.ProviderClaude)) == nil
 	})
 	meta, err := os.ReadFile(filepath.Join(a.stateDir, "recordings", "claude-abort.meta.json"))
 	if err != nil {
@@ -318,10 +316,7 @@ func TestClaudeFastExitDoesNotLeaveDeadActiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.hookAfterProviderStart = func() { // deterministic：pump 收乾後才 Accept
-		a.mu.Lock()
-		done := a.claudePumpDone
-		a.mu.Unlock()
-		<-done
+		<-a.hostFor(a.legacyWSIDFor(contract.ProviderClaude)).pumpDone
 	}
 
 	if err := a.StartSession("claude", "hi", "", "", "task-x", ""); err != nil {
@@ -1203,10 +1198,11 @@ func TestRestoreViewsIsReadOnly(t *testing.T) {
 	if countLines() != before { // 不回寫 audit
 		t.Fatal("RestoreViews must not write to the audit stream")
 	}
+	hostsEmpty := len(a.snapshotHosts()) == 0
 	a.mu.Lock()
-	sessNil, runnerNil := a.claudeSess == nil, a.runner == nil
+	runnerNil := a.runner == nil
 	a.mu.Unlock()
-	if !sessNil || !runnerNil { // 零 provider starter 呼叫
+	if !hostsEmpty || !runnerNil { // 零 provider starter 呼叫
 		t.Fatal("RestoreViews must not spawn providers")
 	}
 }
@@ -1217,13 +1213,11 @@ func TestLateClaudeInitCannotOverwriteNewGeneration(t *testing.T) {
 	if err := a.StartSession("claude", "hi", "", "", "task-a", ""); err != nil {
 		t.Fatal(err)
 	}
-	a.mu.Lock()
-	oldSess := a.claudeSess
-	a.mu.Unlock()
+	oldHost := a.hostFor(a.legacyWSIDFor(contract.ProviderClaude))
 	if err := a.NewSession("claude"); err != nil { // 換代：舊 generation 結束
 		t.Fatal(err)
 	}
-	a.commitClaudeResume(oldSess, "stale-session-id") // 舊 pump 的 late init（同一 guard 函式）
+	a.commitClaudeResume(oldHost, "stale-session-id") // 舊 pump 的 late init（同一 guard 函式）
 	if got := a.restore.Get("claude"); got.ResumeSessionID == "stale-session-id" {
 		t.Fatalf("late init from old generation must not overwrite: %+v", got)
 	}

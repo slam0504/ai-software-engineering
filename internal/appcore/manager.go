@@ -300,6 +300,17 @@ func (m *Manager) legacyWSIDLocked(p contract.Provider) WSID {
 	return w
 }
 
+// LegacyWSID：相容層的 provider → legacy slot WSID。app 層 legacyWSIDFor 的最後
+// 順位需要一個「保證對 ...WS 入口可解析」的 WSID——legacy slot 是惰性建立的，
+// 光靠字面 key 猜不到、也可能還不存在，故沿用 legacyWSIDLocked 的「讀取時隱式
+// 建立」語意。legacy slot 的 sl.wsid 留空，envelope 的 workspace_session_id 因此
+// 與 M3a 完全一致。與整個相容層一起在 Task 26 刪除。
+func (m *Manager) LegacyWSID(p contract.Provider) WSID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.legacyWSIDLocked(p)
+}
+
 // legacySlotLocked：舊簽名的 slot 解析捷徑（legacyWSIDLocked → slot）。
 func (m *Manager) legacySlotLocked(p contract.Provider) *slot {
 	return m.slots[m.legacyWSIDLocked(p)]
