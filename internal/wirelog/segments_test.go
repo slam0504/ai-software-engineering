@@ -217,11 +217,14 @@ func TestAppendConcurrentSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// goroutines/perGoroutine 刻意壓小：journal.Append 每次都會 fsync，量大只是拉長
-	// 測試時間，這條測試要證明的是「有並行寫入同一個 journal」而非量大（40 次
-	// Append 已足夠讓 race detector／順序斷言有機會抓到鎖範圍縮小）。
-	const goroutines = 4
-	const perGoroutine = 10 // 偶數，一半進 "shared"、一半進各自獨立的 wsid
+	// goroutines/perGoroutine 大小是實測校準過的，不要為了加快單次執行縮小：把
+	// Append 拆成兩段鎖（journal.Append 移出鎖外，重現 Task 8 那個 bug 形狀）做
+	// mutation 測試時，8×50（400 次 Append）在 20 輪 -race 中 19 輪 FAIL（95% 偵測
+	// 率）；縮到 4×10（40 次）掉到 6-10/20（30-50%），三分之二左右機率是綠燈假象。
+	// 代價是單輪約 8.8s（journal.Append 每次都 fsync）而非 0.9s，CI 只跑一輪，一次
+	// 性多 8 秒換這條測試的保護力，值得。
+	const goroutines = 8
+	const perGoroutine = 50 // 偶數，一半進 "shared"、一半進各自獨立的 wsid
 	var wg sync.WaitGroup
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
