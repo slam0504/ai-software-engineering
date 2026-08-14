@@ -21,7 +21,26 @@ var (
 	ErrStaleSession    = errors.New("appcore: stale session token")
 	ErrStaleReset      = errors.New("appcore: stale reset token")
 	ErrClosed          = errors.New("appcore: manager closed")
+
+	// M3b §3.1：per-WSID slot registry ＋三段建立交易的 sentinel。
+	ErrSessionLimit     = errors.New("appcore: session slot limit reached")
+	ErrSessionNotFound  = errors.New("appcore: unknown workspace session")
+	ErrStaleCreate      = errors.New("appcore: stale create token")
+	ErrProviderMismatch = errors.New("appcore: event provider != slot provider")
 )
+
+// MaxSessionsPerProvider：凍結常數——不進 config、不讀環境變數（M3b §3.1.4）。
+const MaxSessionsPerProvider = 4
+
+// WSID：host-side 穩定 workspace session identity（contract.NewULID 產生）。
+type WSID string
+
+// CreateToken：ReserveSession → CommitCreate／AbortCreate 的一次性 ownership token。
+// 已 commit／已 abort 的 token 再次使用一律 ErrStaleCreate。
+type CreateToken struct {
+	wsid WSID
+	seq  uint64
+}
 
 // SubmissionID：coordinator 的唯一 ownership token（per slot）。
 type SubmissionID struct{ gen, seq uint64 }
@@ -54,13 +73,22 @@ const (
 	phaseResetting // M1.5：NewSession 的「teardown → restore reset」ownership 區段
 )
 
-// slot：單一 provider 的 session 狀態容器（M1.5 plan §5.3）。不對外暴露——
-// Manager 是唯一 aggregate root，所有操作帶 provider 進同一 mutex。
+// slot：單一 workspace session 的狀態容器（M1.5 plan §5.3；M3b §3.1 改為 per-WSID）。
+// 不對外暴露——Manager 是唯一 aggregate root，所有操作帶 WSID（或相容層的 provider）
+// 進同一 mutex。
 type slot struct {
 	reducer    *contract.Reducer
 	taskID     string
 	totalCost  float64
 	totalUsage contract.Usage
+
+	// M3b §3.1：slot identity。wsid 供 emit 路徑回填 Envelope.WorkspaceSessionID；
+	// legacy slot 的 wsid 留空，遷移期舊入口的 envelope 因此與 M3a 完全一致。
+	wsid      WSID
+	provider  contract.Provider
+	committed bool   // false = 只保留名額，尚未 CommitCreate；新入口一律拒絕
+	isLegacy  bool   // 相容層產物（Task 9 刪除）：不計入 countLocked
+	createSeq uint64 // CreateToken 比對用
 
 	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken／ResetToken 全部失效
 	seq            uint64
@@ -92,29 +120,172 @@ func newSlot() *slot { return &slot{reducer: contract.NewReducer()} }
 // resetting 期間 BeginSubmit／BeginNewSessionSubmit／BeginEndSession／第二個
 // BeginReset 一律 ErrResetInProgress。非法轉移一律 sentinel error；stale token
 // 一律 no-op error。跨 provider：一個 slot 的 pending submit 不阻塞另一個 slot。
+//
+// # Slot registry（M3b §3.1）
+//
+// slot 以 WSID 為 key（同一 provider 最多 MaxSessionsPerProvider 個）。建立走
+// ReserveSession → CommitCreate／AbortCreate 三段交易：reservation 當下即佔名額，
+// 未 commit 的 slot 對新入口不可見。新入口（`...WS` 後綴）只讀不建；舊 provider-keyed
+// 簽名走 legacyWSIDLocked 相容層（Task 9 連同相容層一併刪除）。
 type Manager struct {
-	mu       sync.Mutex
-	cfg      Config
-	slots    map[contract.Provider]*slot
-	auditErr error
-	closed   bool
+	mu         sync.Mutex
+	cfg        Config
+	slots      map[WSID]*slot
+	legacy     map[contract.Provider]WSID // 相容層：provider → legacy slot（Task 9 刪除）
+	reserveSeq uint64
+	auditErr   error
+	closed     bool
 }
 
 func New(cfg Config) *Manager {
-	return &Manager{cfg: cfg, slots: map[contract.Provider]*slot{}}
+	if cfg.Emit == nil { // 出口未接時退化為 no-op，避免 writeAndEmitLocked nil call
+		cfg.Emit = func(contract.Envelope) {}
+	}
+	return &Manager{cfg: cfg, slots: map[WSID]*slot{}, legacy: map[contract.Provider]WSID{}}
 }
 
-func (m *Manager) slotLocked(p contract.Provider) *slot {
-	sl, ok := m.slots[p]
-	if !ok {
-		sl = newSlot()
-		m.slots[p] = sl
+// countLocked：該 provider 已佔用的名額（含尚未 commit 的 reservation）。
+// legacy slot 是遷移期產物，不佔使用者名額。
+func (m *Manager) countLocked(p contract.Provider) int {
+	n := 0
+	for _, sl := range m.slots {
+		if sl.provider == p && !sl.isLegacy {
+			n++
+		}
 	}
-	return sl
+	return n
+}
+
+// ReserveSession：三段建立交易第一段——同一 mutex 內完成「檢查上限 → 產 WSID →
+// 放進 slots」，第 5 個併發建立不可穿透。
+func (m *Manager) ReserveSession(p contract.Provider) (WSID, CreateToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return "", CreateToken{}, ErrClosed
+	}
+	if m.countLocked(p) >= MaxSessionsPerProvider {
+		return "", CreateToken{}, ErrSessionLimit
+	}
+	w := WSID(contract.NewULID(time.Now()))
+	m.reserveSeq++
+	sl := newSlot()
+	sl.wsid, sl.provider, sl.createSeq = w, p, m.reserveSeq
+	m.slots[w] = sl // reservation 當下即佔名額
+	return w, CreateToken{wsid: w, seq: m.reserveSeq}, nil
+}
+
+// pendingCreateLocked：只認尚未 commit／abort 的 reservation；其餘一律 stale。
+func (m *Manager) pendingCreateLocked(tok CreateToken) (*slot, error) {
+	sl, ok := m.slots[tok.wsid]
+	if !ok || sl.committed || tok.seq == 0 || sl.createSeq != tok.seq {
+		return nil, ErrStaleCreate
+	}
+	return sl, nil
+}
+
+// CommitCreate：第二段——正式建立，slot 自此對新入口可見。
+func (m *Manager) CommitCreate(tok CreateToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	sl, err := m.pendingCreateLocked(tok)
+	if err != nil {
+		return err
+	}
+	sl.committed = true
+	return nil
+}
+
+// AbortCreate：第三段——建立失敗退回名額。純狀態清理，closed 後仍可執行（供
+// CommitCreate 失敗補償）。
+func (m *Manager) AbortCreate(tok CreateToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.pendingCreateLocked(tok); err != nil {
+		return err
+	}
+	delete(m.slots, tok.wsid)
+	return nil
+}
+
+// RestoreDormant：把 registry 既存的 dormant session 掛回 slot（已 committed，
+// 不經 reservation）。同 WSID 重複 restore 為 no-op；provider 不符 fail loud。
+func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	if w == "" {
+		return ErrSessionNotFound
+	}
+	if sl, ok := m.slots[w]; ok {
+		if sl.provider != p {
+			return ErrProviderMismatch
+		}
+		return nil
+	}
+	if m.countLocked(p) >= MaxSessionsPerProvider {
+		return ErrSessionLimit
+	}
+	sl := newSlot()
+	sl.wsid, sl.provider, sl.committed = w, p, true
+	m.slots[w] = sl
+	return nil
+}
+
+// SlotCount：該 provider 目前佔用的名額（reservation 亦計入；legacy slot 不計入）。
+func (m *Manager) SlotCount(p contract.Provider) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.countLocked(p)
+}
+
+// ProviderOf：WSID → provider 的登錄查詢（含尚未 commit 的 reservation）。
+func (m *Manager) ProviderOf(w WSID) (contract.Provider, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, ok := m.slots[w]
+	if !ok {
+		return "", false
+	}
+	return sl.provider, true
+}
+
+// committedSlotLocked：新入口唯一的 slot 解析路徑——只讀不建。未 commit 或不存在
+// 一律 ErrSessionNotFound（廢除舊 slotLocked 的「讀取時隱式建立」）。
+func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
+	sl, ok := m.slots[w]
+	if !ok || !sl.committed {
+		return nil, ErrSessionNotFound
+	}
+	return sl, nil
+}
+
+// legacyWSIDLocked：相容入口專用——沿用現行「讀取時隱式建立」行為，讓舊
+// provider-keyed 呼叫點完全不受影響。Task 9 連同全部舊簽名一併刪除。
+// legacy slot 不計入 countLocked。
+func (m *Manager) legacyWSIDLocked(p contract.Provider) WSID {
+	if w, ok := m.legacy[p]; ok {
+		return w
+	}
+	w := WSID("legacy-" + string(p))
+	sl := newSlot()
+	sl.provider, sl.committed, sl.isLegacy = p, true, true
+	m.slots[w], m.legacy[p] = sl, w
+	return w
+}
+
+// legacySlotLocked：舊簽名的 slot 解析捷徑（legacyWSIDLocked → slot）。
+func (m *Manager) legacySlotLocked(p contract.Provider) *slot {
+	return m.slots[m.legacyWSIDLocked(p)]
 }
 
 // newSessionLocked：flush 該 slot 殘留 queue（掛舊 task）→ 換代 → 重設。
-func (m *Manager) newSessionLocked(p contract.Provider, sl *slot, taskID string) {
+func (m *Manager) newSessionLocked(sl *slot, taskID string) {
 	m.flushLocked(sl)
 	sl.gen++
 	sl.submitting, sl.fromNewSession = nil, false
@@ -127,7 +298,18 @@ func (m *Manager) newSessionLocked(p contract.Provider, sl *slot, taskID string)
 func (m *Manager) NewSession(p contract.Provider, taskID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.newSessionLocked(p, m.slotLocked(p), taskID)
+	m.newSessionLocked(m.legacySlotLocked(p), taskID)
+}
+
+func (m *Manager) NewSessionWS(w WSID, taskID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	m.newSessionLocked(sl, taskID)
+	return nil
 }
 
 // BeginNewSessionSubmit：StartSession 的單一 ownership 交易（per slot）。
@@ -137,7 +319,23 @@ func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (Sub
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	return m.beginNewSessionSubmitLocked(m.legacySlotLocked(p), taskID)
+}
+
+func (m *Manager) BeginNewSessionSubmitWS(w WSID, taskID string) (SubmissionID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return SubmissionID{}, ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SubmissionID{}, err
+	}
+	return m.beginNewSessionSubmitLocked(sl, taskID)
+}
+
+func (m *Manager) beginNewSessionSubmitLocked(sl *slot, taskID string) (SubmissionID, error) {
 	switch sl.phase {
 	case phaseActive, phaseEnding:
 		return SubmissionID{}, ErrSessionActive
@@ -149,7 +347,7 @@ func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (Sub
 	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
 	}
-	m.newSessionLocked(p, sl, taskID)
+	m.newSessionLocked(sl, taskID)
 	sl.seq++
 	id := SubmissionID{gen: sl.gen, seq: sl.seq}
 	sl.submitting, sl.fromNewSession = &id, true
@@ -164,7 +362,23 @@ func (m *Manager) BeginEndSession(p contract.Provider) (SessionToken, error) {
 	if m.closed {
 		return SessionToken{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	return m.beginEndSessionLocked(m.legacySlotLocked(p))
+}
+
+func (m *Manager) BeginEndSessionWS(w WSID) (SessionToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return SessionToken{}, ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SessionToken{}, err
+	}
+	return m.beginEndSessionLocked(sl)
+}
+
+func (m *Manager) beginEndSessionLocked(sl *slot) (SessionToken, error) {
 	switch sl.phase {
 	case phaseIdle:
 		return SessionToken{}, ErrNoSession
@@ -185,13 +399,34 @@ func (m *Manager) BeginEndSession(p contract.Provider) (SessionToken, error) {
 	return tok, nil
 }
 
+// endingOwnerLocked：ending 階段的 token 比對（Cancel／Finish／IntoReset 共用）。
+func endingOwnerLocked(sl *slot, t SessionToken) error {
+	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
+		return ErrStaleSession
+	}
+	return nil
+}
+
 // CancelEndSession：ending → active 復原（teardown 前）；stale token no-op error。
 func (m *Manager) CancelEndSession(p contract.Provider, t SessionToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
-		return ErrStaleSession
+	return m.cancelEndSessionLocked(m.legacySlotLocked(p), t)
+}
+
+func (m *Manager) CancelEndSessionWS(w WSID, t SessionToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.cancelEndSessionLocked(sl, t)
+}
+
+func (m *Manager) cancelEndSessionLocked(sl *slot, t SessionToken) error {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return err
 	}
 	sl.phase = phaseActive
 	sl.endTok = nil
@@ -202,9 +437,22 @@ func (m *Manager) CancelEndSession(p contract.Provider, t SessionToken) error {
 func (m *Manager) FinishEndSession(p contract.Provider, t SessionToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
-		return ErrStaleSession
+	return m.finishEndSessionLocked(m.legacySlotLocked(p), t)
+}
+
+func (m *Manager) FinishEndSessionWS(w WSID, t SessionToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.finishEndSessionLocked(sl, t)
+}
+
+func (m *Manager) finishEndSessionLocked(sl *slot, t SessionToken) error {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return err
 	}
 	sl.phase = phaseIdle
 	sl.endTok = nil
@@ -218,7 +466,23 @@ func (m *Manager) BeginReset(p contract.Provider) (ResetToken, error) {
 	if m.closed {
 		return ResetToken{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	return m.beginResetLocked(m.legacySlotLocked(p))
+}
+
+func (m *Manager) BeginResetWS(w WSID) (ResetToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ResetToken{}, ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return ResetToken{}, err
+	}
+	return m.beginResetLocked(sl)
+}
+
+func (m *Manager) beginResetLocked(sl *slot) (ResetToken, error) {
 	switch sl.phase {
 	case phaseStarting:
 		return ResetToken{}, ErrStartInProgress
@@ -240,9 +504,22 @@ func (m *Manager) BeginReset(p contract.Provider) (ResetToken, error) {
 func (m *Manager) FinishEndSessionIntoReset(p contract.Provider, t SessionToken) (ResetToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
-		return ResetToken{}, ErrStaleSession
+	return m.finishEndSessionIntoResetLocked(m.legacySlotLocked(p), t)
+}
+
+func (m *Manager) FinishEndSessionIntoResetWS(w WSID, t SessionToken) (ResetToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return ResetToken{}, err
+	}
+	return m.finishEndSessionIntoResetLocked(sl, t)
+}
+
+func (m *Manager) finishEndSessionIntoResetLocked(sl *slot, t SessionToken) (ResetToken, error) {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return ResetToken{}, err
 	}
 	sl.endTok = nil
 	return m.enterResetLocked(sl), nil
@@ -260,7 +537,20 @@ func (m *Manager) enterResetLocked(sl *slot) ResetToken {
 func (m *Manager) FinishReset(p contract.Provider, t ResetToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	return m.finishResetLocked(m.legacySlotLocked(p), t)
+}
+
+func (m *Manager) FinishResetWS(w WSID, t ResetToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.finishResetLocked(sl, t)
+}
+
+func (m *Manager) finishResetLocked(sl *slot, t ResetToken) error {
 	if sl.phase != phaseResetting || sl.resetTok == nil || *sl.resetTok != t {
 		return ErrStaleReset
 	}
@@ -272,7 +562,15 @@ func (m *Manager) FinishReset(p contract.Provider, t ResetToken) error {
 func (m *Manager) SessionActive(p contract.Provider) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.slotLocked(p).phase == phaseActive
+	return m.legacySlotLocked(p).phase == phaseActive
+}
+
+// IsActiveWS：新入口的 SessionActive；未 commit／不存在的 WSID 一律 false。
+func (m *Manager) IsActiveWS(w WSID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	return err == nil && sl.phase == phaseActive
 }
 
 func (m *Manager) Emit(ev contract.Event) {
@@ -282,12 +580,41 @@ func (m *Manager) Emit(ev contract.Event) {
 		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
 		return
 	}
-	sl := m.slotLocked(ev.Provider)
-	if sl.submitting != nil { // 只 queue 該 slot（跨 provider 不互相阻塞）
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
+	m.queueOrEmitLocked(m.legacySlotLocked(ev.Provider), pendingEntry{ev: ev})
+}
+
+// EmitWS：新入口的 Emit——WSID 定址＋provider fail-loud 檢查。
+func (m *Manager) EmitWS(w WSID, ev contract.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先——與舊入口一致：單一 UI stream_error、不寫 sink
+		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	if ev.Provider != sl.provider {
+		return ErrProviderMismatch
+	}
+	m.queueOrEmitLocked(sl, pendingEntry{ev: ev})
+	return nil
+}
+
+// queueOrEmitLocked：submitting 中只 queue 該 slot（跨 slot 不互相阻塞），
+// 否則直接送出。所有 session-scope 事件出口（Emit／approval）共用這一段。
+func (m *Manager) queueOrEmitLocked(sl *slot, e pendingEntry) {
+	if sl.submitting != nil {
+		sl.pendingBuf = append(sl.pendingBuf, e)
 		return
 	}
-	m.emitLocked(sl, ev)
+	m.emitLocked(sl, e.ev)
+	if e.resolveApprove {
+		if st, changed := sl.reducer.ResolveApproval(); changed {
+			m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
+		}
+	}
 }
 
 // BeginSubmit：既有 session 的後續輪（僅該 slot phaseActive 允許）。
@@ -297,7 +624,23 @@ func (m *Manager) BeginSubmit(p contract.Provider) (SubmissionID, error) {
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	return m.beginSubmitLocked(m.legacySlotLocked(p))
+}
+
+func (m *Manager) BeginSubmitWS(w WSID) (SubmissionID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return SubmissionID{}, ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SubmissionID{}, err
+	}
+	return m.beginSubmitLocked(sl)
+}
+
+func (m *Manager) beginSubmitLocked(sl *slot) (SubmissionID, error) {
 	switch sl.phase {
 	case phaseIdle:
 		return SubmissionID{}, ErrNoSession
@@ -331,7 +674,20 @@ func (m *Manager) checkOwnerLocked(sl *slot, id SubmissionID) error {
 func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	return m.acceptSubmitLocked(m.legacySlotLocked(p), id, sessionID, text)
+}
+
+func (m *Manager) AcceptSubmitWS(w WSID, id SubmissionID, sessionID, text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.acceptSubmitLocked(sl, id, sessionID, text)
+}
+
+func (m *Manager) acceptSubmitLocked(sl *slot, id SubmissionID, sessionID, text string) error {
 	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
@@ -340,7 +696,7 @@ func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, 
 		sl.sessionGen = id.gen
 	}
 	sl.submitting, sl.fromNewSession = nil, false
-	m.emitLocked(sl, contract.Event{Provider: p, Kind: contract.KindMessage,
+	m.emitLocked(sl, contract.Event{Provider: sl.provider, Kind: contract.KindMessage,
 		Role: "user", SessionID: sessionID, Text: text,
 		Raw: []byte(`{"source":"workbench_user_input"}`)})
 	m.flushLocked(sl)
@@ -350,7 +706,20 @@ func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, 
 func (m *Manager) RejectSubmit(p contract.Provider, id SubmissionID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	return m.rejectSubmitLocked(m.legacySlotLocked(p), id)
+}
+
+func (m *Manager) RejectSubmitWS(w WSID, id SubmissionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.rejectSubmitLocked(sl, id)
+}
+
+func (m *Manager) rejectSubmitLocked(sl *slot, id SubmissionID) error {
 	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
@@ -420,6 +789,18 @@ func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose 
 	}
 }
 
+// approvalRequestEvent／approvalDecisionEvent：新舊入口共用的事件組裝。
+func approvalRequestEvent(p contract.Provider, sessionID, toolName string, raw []byte) pendingEntry {
+	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApproval,
+		SessionID: sessionID, Text: toolName, Raw: raw}}
+}
+
+func approvalDecisionEvent(p contract.Provider, sessionID, decision, reason string) pendingEntry {
+	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApprovalDecision,
+		SessionID: sessionID, Text: decision, Thinking: reason,
+		Raw: []byte(`{"decision":"` + decision + `"}`)}, resolveApprove: true}
+}
+
 func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, toolName string, raw []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -427,14 +808,23 @@ func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, too
 		m.emitClosedDroppedLocked(string(contract.KindApproval), string(provider))
 		return
 	}
-	sl := m.slotLocked(provider)
-	ev := contract.Event{Provider: provider, Kind: contract.KindApproval,
-		SessionID: sessionID, Text: toolName, Raw: raw}
-	if sl.submitting != nil { // approval 同樣入該 slot queue
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
-		return
+	sl := m.legacySlotLocked(provider)
+	m.queueOrEmitLocked(sl, approvalRequestEvent(provider, sessionID, toolName, raw))
+}
+
+func (m *Manager) EmitApprovalRequestWS(w WSID, sessionID, toolName string, raw []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
 	}
-	m.emitLocked(sl, ev)
+	if m.closed {
+		m.emitClosedDroppedLocked(string(contract.KindApproval), string(sl.provider))
+		return ErrClosed
+	}
+	m.queueOrEmitLocked(sl, approvalRequestEvent(sl.provider, sessionID, toolName, raw))
+	return nil
 }
 
 func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, decision, reason string) {
@@ -444,18 +834,23 @@ func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, de
 		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(provider))
 		return
 	}
-	sl := m.slotLocked(provider)
-	ev := contract.Event{Provider: provider, Kind: contract.KindApprovalDecision,
-		SessionID: sessionID, Text: decision, Thinking: reason,
-		Raw: []byte(`{"decision":"` + decision + `"}`)}
-	if sl.submitting != nil {
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev, resolveApprove: true})
-		return
+	sl := m.legacySlotLocked(provider)
+	m.queueOrEmitLocked(sl, approvalDecisionEvent(provider, sessionID, decision, reason))
+}
+
+func (m *Manager) EmitApprovalDecisionWS(w WSID, sessionID, decision, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
 	}
-	m.emitLocked(sl, ev)
-	if st, changed := sl.reducer.ResolveApproval(); changed {
-		m.emitStateLocked(sl, provider, sessionID, st)
+	if m.closed {
+		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(sl.provider))
+		return ErrClosed
 	}
+	m.queueOrEmitLocked(sl, approvalDecisionEvent(sl.provider, sessionID, decision, reason))
+	return nil
 }
 
 func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
@@ -479,6 +874,7 @@ func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
 		}
 	}
 	env := contract.Wrap(ev, sl.taskID)
+	env.WorkspaceSessionID = string(sl.wsid) // legacy slot 為空值：遷移期輸出不變
 	if ev.Kind == contract.KindUsage || ev.Kind == contract.KindResult {
 		snap := sl.totalUsage
 		env.Usage = &snap // 輸出一律該 slot 的累計 snapshot
@@ -494,6 +890,7 @@ func (m *Manager) emitStateLocked(sl *slot, provider contract.Provider, sessionI
 	env := contract.Wrap(contract.Event{Provider: provider, Kind: contract.KindStateChange,
 		SessionID: sessionID, Raw: []byte(`{"state":"` + string(st) + `"}`)}, sl.taskID)
 	env.State = string(st)
+	env.WorkspaceSessionID = string(sl.wsid)
 	m.writeAndEmitLocked(env)
 }
 
@@ -525,14 +922,34 @@ func (m *Manager) emitClosedDroppedLocked(kind, provider string) {
 func (m *Manager) Totals(p contract.Provider) (float64, contract.Usage) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	sl := m.legacySlotLocked(p)
 	return sl.totalCost, sl.totalUsage
+}
+
+func (m *Manager) TotalsWS(w WSID) (float64, contract.Usage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return 0, contract.Usage{}, err
+	}
+	return sl.totalCost, sl.totalUsage, nil
 }
 
 func (m *Manager) State(p contract.Provider) contract.SessionState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.slotLocked(p).reducer.Current()
+	return m.legacySlotLocked(p).reducer.Current()
+}
+
+func (m *Manager) StateWS(w WSID) (contract.SessionState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return "", err
+	}
+	return sl.reducer.Current(), nil
 }
 
 func (m *Manager) AuditErr() error {
@@ -556,7 +973,7 @@ func (m *Manager) Close() error {
 	if m.closed {
 		return nil
 	}
-	for p, sl := range m.slots {
+	for _, sl := range m.slots {
 		if sl.submitting != nil || len(sl.pendingBuf) > 0 {
 			n := len(sl.pendingBuf)
 			sl.submitting, sl.fromNewSession = nil, false
@@ -566,8 +983,9 @@ func (m *Manager) Close() error {
 			m.flushLocked(sl) // sink 尚未關：queue 事件全數落 audit + UI
 			m.cfg.Emit(contract.Envelope{
 				EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
-				Provider: string(p), Kind: string(contract.KindStreamError),
-				Error: fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
+				Provider: string(sl.provider), Kind: string(contract.KindStreamError),
+				WorkspaceSessionID: string(sl.wsid),
+				Error:              fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
 			})
 		}
 	}
