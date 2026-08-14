@@ -19,6 +19,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 )
 
 // ---- production 接線測試基盤 ----
@@ -466,10 +467,13 @@ func TestDualSessionsConcurrently(t *testing.T) {
 	if err := a.EndSession("codex"); err != nil {
 		t.Fatalf("end codex: %v", err)
 	}
-	for _, name := range []string{"claude-dual.meta.json", "codex-dual.meta.json"} { // 錄流各自收尾
-		if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", name)); err != nil {
-			t.Fatalf("recording meta %s: %v", name, err)
-		}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-dual.meta.json")); err != nil {
+		t.Fatalf("claude 錄流必須收尾：%v", err)
+	}
+	// codex 側自 §3.4.4 起沒有 session-scoped 錄流（recordCase 只剩 label，證據
+	// 在 connection-wide wire log），因此不得再有 recordings/codex-dual.*
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-dual.meta.json")); !os.IsNotExist(err) {
+		t.Fatalf("codex recordCase 應只是 label，不得產生 session 錄流：%v", err)
 	}
 }
 
@@ -547,10 +551,8 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	if !wire.sawMethod(codex.MethodTurnInterrupt) { // busy turn 先被 interrupt
 		t.Fatal("forced shutdown must interrupt the active codex turn")
 	}
-	for _, name := range []string{"claude-fsd.meta.json", "codex-fsd.meta.json"} { // 兩邊 lease 都 finalize
-		if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", name)); err != nil {
-			t.Fatalf("lease not finalized (%s): %v", name, err)
-		}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-fsd.meta.json")); err != nil {
+		t.Fatalf("claude lease not finalized: %v", err) // codex 側無 session 錄流（§3.4.4）
 	}
 	if len(ui.find("session:done")) < 2 { // 兩邊 session:done 都發出
 		t.Fatalf("session:done count = %d, want >= 2", len(ui.find("session:done")))
@@ -621,28 +623,31 @@ func TestShutdownForcedBenignWhenNaturalEndRaces(t *testing.T) {
 	}
 }
 
+// M3b §3.4.4 之後 codex 已無 session-scoped 錄流，錄流寫入失敗只可能發生在
+// claude 側——角色對調（claude 帶 recordCase、codex 不帶），驗的不變量相同：
+// 一邊的收尾錯誤必須 errors.Join 浮出，且不得跳過另一邊的收尾。
 func TestShutdownJoinsErrors(t *testing.T) {
 	a, ui := newTestApp(t)
 	writeMultiTurnClaude(t, a)
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
-	if err := a.StartSession("claude", "hi", "", "", "task-c", ""); err != nil { // claude 無錄流
+	if err := a.StartSession("claude", "hi", "", "claude-joinerr", "task-c", ""); err != nil {
 		t.Fatal(err)
 	}
-	startCodexForTest(t, a, wire, conn, "codex-joinerr", "task-x")
-	// 弄壞 codex meta 寫入（claude 無錄流不受影響）
+	startCodexForTest(t, a, wire, conn, "", "task-x") // codex 無 session 錄流
+	// 弄壞 claude meta 寫入
 	if err := os.Chmod(filepath.Join(a.stateDir, "recordings"), 0o500); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(a.stateDir, "recordings"), 0o755) })
 
 	err := a.forcedShutdown()
-	if err == nil { // codex meta 寫失敗必須以 errors.Join 浮出
-		t.Fatal("codex lease error must surface")
+	if err == nil { // claude meta 寫失敗必須以 errors.Join 浮出
+		t.Fatal("claude lease error must surface")
 	}
-	waitFor(t, "claude session:done despite codex error", func() bool {
+	waitFor(t, "codex session:done despite claude error", func() bool {
 		for _, e := range ui.find("session:done") {
-			if d, ok := e.data.(map[string]any); ok && d["provider"] == "claude" {
+			if d, ok := e.data.(map[string]any); ok && d["provider"] == "codex" {
 				return true
 			}
 		}
@@ -1412,8 +1417,9 @@ func TestCodexAcceptFailureReclaimsResources(t *testing.T) { // P1-5
 	if _, ok := a.codexWSIDFor("t1", ""); ok { // 路由一併撤掉
 		t.Fatal("codex thread routing must be removed on teardown")
 	}
-	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-acceptfail.meta.json")); err != nil {
-		t.Fatalf("lease must be finalized (meta written): %v", err)
+	// §3.4.4：codex 已無 session-scoped 錄流可 finalize，recordCase 只是 label
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-acceptfail.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("recordCase 不得再 attach session recorder：%v", err)
 	}
 	if len(ui.find("session:done")) == 0 {
 		t.Fatal("teardown must emit session:done")
@@ -1561,12 +1567,24 @@ func TestCodexApprovalReasonReachesEnvelope(t *testing.T) {
 	}
 }
 
-// W6 佐證迴歸：codex 錄流須涵蓋 thread/resume（BeginRecording 先於 EnsureThread）——
-// 否則 resume request 在錄流開始前發出、無法以 JSON-RPC 錄流佐證。
+// W6 佐證迴歸：codex 錄流須涵蓋 thread/resume——否則 resume request 在錄流開始前
+// 發出、無法以 JSON-RPC 錄流佐證。
+//
+// M3b §3.4.4 之後承載者換成 connection-wide wire log：錄流由
+// codex.NewGenerationOwner 在 handshake **之前**掛上（always-on，不再由
+// recordCase 控制 attach），涵蓋面比舊的 session-scoped 錄流更大。
 func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 	a, _ := newTestApp(t)
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
+	gen, err := wirelog.NewGeneration(a.wireLogDir(), "codex-resume-rec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newFakeServerOn(conn)
+	if _, err := codex.NewGenerationOwner(srv, gen); err != nil { // production attach（早於 handshake）
+		t.Fatalf("always-on 錄流必須在 handshake 之前掛上：%v", err)
+	}
 	var sawResume atomic.Bool
 	var turnSeq atomic.Int32
 	wire.setOnReq(func(f codex.Frame) {
@@ -1590,7 +1608,7 @@ func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderCodex), "task-x")
-	threadID, _, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), fakeCodexHost{conn}, "hi", "t-resumed", "codex-resume-rec", "untrusted")
+	threadID, _, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), srv, "hi", "t-resumed", "codex-resume-rec", "untrusted")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1601,11 +1619,14 @@ func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 	if err := a.EndSession("codex"); err != nil { // 收尾 flush 錄流
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(a.stateDir, "recordings", "codex-resume-rec.jsonl"))
+	b, err := os.ReadFile(filepath.Join(a.wireLogDir(), "codex-resume-rec.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `"thread/resume"`) { // 錄流涵蓋 thread/resume
-		t.Fatalf("recording must capture thread/resume, got:\n%s", b)
+	if !strings.Contains(string(b), `"thread/resume"`) { // wire log 涵蓋 thread/resume
+		t.Fatalf("wire log must capture thread/resume, got:\n%s", b)
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-resume-rec.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("recordCase 只是 label，不得再產生 session-scoped 錄流：%v", err)
 	}
 }

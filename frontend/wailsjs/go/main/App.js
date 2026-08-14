@@ -118,6 +118,10 @@ export function ReadWorkspaceFile(arg1) {
   return window['go']['main']['App']['ReadWorkspaceFile'](arg1);
 }
 
+export function RecoverCodexRecording() {
+  return window['go']['main']['App']['RecoverCodexRecording']();
+}
+
 export function RegisterMutation(arg1, arg2) {
   return window['go']['main']['App']['RegisterMutation'](arg1, arg2);
 }

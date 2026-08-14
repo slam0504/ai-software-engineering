@@ -47,6 +47,13 @@ export interface Bindings {
 export interface WorkspaceSessionBindings {
   CreateSession(provider: string, taskLabel: string): Promise<string>
 }
+// CodexRecordingBindings：M3b Task 13 純新增的 RecoverCodexRecording——§3.4.6
+// recorder error latch 的 in-process 復原入口（latch 期間新 Codex session 被拒，
+// 這是唯一的解除路徑）。獨立成一個介面，理由同 WorkspaceSessionBindings：
+// session store 不消費它，UI 接線是後續 task 的事，這裡不提前擴大 Bindings。
+export interface CodexRecordingBindings {
+  RecoverCodexRecording(): Promise<void>
+}
 // EvidenceBindings：Task 22 TCA workspace 六個多參數 Go 綁定——同 SendMessage
 // 的既定教訓（M1.5 review P1-1），每個 adapter 都逐參數轉發，順序鎖在
 // bindings.test.ts。獨立於 Bindings（session store 用）之外，makeBindings()

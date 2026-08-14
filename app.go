@@ -5356,10 +5356,12 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 }
 
 // codexHost：startCodexHost 對長駐 server 的最小依賴（fake wire 測試注入點）。
+//
+// Task 13 之後只剩 Conn()：Argv()／StderrSnapshot() 原本只服務 session-scoped
+// 錄流的 meta，而 §3.4.4 已把 codex 的錄流證據整個移到 connection-wide wire log
+// （那份 meta 由 GenerationOwner.FinalizeWith 從 ProbeTarget 取得）。
 type codexHost interface {
 	Conn() *codex.Conn
-	Argv() []string
-	StderrSnapshot() string
 }
 
 func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
@@ -5394,41 +5396,25 @@ func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPol
 //     查不到」的空隙。
 //
 // host 填滿才 publish、publish 後不可變（見 sessionHost 併發規約）：runner／
-// threadID／lease 都在 publishCodexHost 之前寫定。StartTurn 失敗即 takeHost
-// rollback ＋ finalize 錄流，registry 不留半成品。
+// threadID 都在 publishCodexHost 之前寫定。StartTurn 失敗即 takeHost rollback，
+// registry 不留半成品。
+//
+// **錄流（§3.4.4，Task 13 凍結）**：這裡**不再** attach 任何 session-scoped
+// recorder。一條 codex.Conn 只容許一個 sink，而該 sink 已經是 §3.4.1 的
+// connection-wide always-on wire log（由 GenerationOwner 在 handshake 之前掛上、
+// 錄到 server 生命終點）；session 若再 attach 一次只會拿到「recording already in
+// progress」，整個 session 起不來。recordCase 因此降為 **label**：進 audit 與
+// sessionHost.recordLabel 供觀測，不控制 recorder attach。W6 的「codex resume 以
+// JSON-RPC 錄流佐證」由 wire log 承載（覆蓋面更大：不再只有帶 recordCase 的
+// session 才錄）；session 級的 []WireSegmentRef 聚合是後續 task 的工作。
 func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
 	conn := host.Conn()
 	if approvalPolicy == "" { // M0 驗證定位沿用：commandExecution 一律 requestApproval
 		approvalPolicy = "untrusted"
 	}
 	runner := codex.NewThreadRunner(conn)
-
-	// 錄流先於 EnsureThread 開啟——thread/start｜resume 屬 session wire 的一部分，
-	// 必須進錄流（W6：codex resume 以 JSON-RPC 錄流佐證）。
-	var lease *appcore.RecordingLease
-	var rec *recorder.Recorder
-	if recordCase != "" {
-		var rerr error
-		rec, rerr = recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
-		if rerr != nil { // 可見的 session 失敗，不無聲降級
-			return "", false, rerr
-		}
-		if berr := conn.BeginRecording(rec.Line); berr != nil {
-			cerr := rec.CloseWith(recorder.Meta{Provider: "codex", RecordedAt: time.Now().UTC().Format(time.RFC3339)})
-			return "", false, errors.Join(berr, cerr)
-		}
-		lease = appcore.NewRecordingLease(rec, conn.StopRecording,
-			func(ports.Exit) recorder.Meta { // 長駐 server 不隨 session 退出：live snapshot、ExitCode nil
-				return recorder.Meta{Provider: "codex", CLIVersion: a.cliVersion("codex"),
-					Argv: host.Argv(), CWD: a.workspaceDir,
-					RecordedAt:          time.Now().UTC().Format(time.RFC3339),
-					ProcessStillRunning: true, StderrTail: host.StderrSnapshot()}
-			})
-	}
-	finalizeLease := func() {
-		if lease != nil {
-			_ = lease.Finalize(ports.Exit{Exited: false})
-		}
+	if recordCase != "" { // label-only：留下可觀測軌跡，不影響任何錄流行為
+		a.audit("codex_record_label", map[string]any{"wsid": string(w), "label": recordCase})
 	}
 
 	// pending start 窗口：登記 → 送 thread/start｜resume → response 抵達 → host
@@ -5454,12 +5440,11 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 
 	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
 	if err != nil {
-		finalizeLease() // 錄流已開：EnsureThread 失敗須收尾
 		return "", false, err
 	}
 
 	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1,
-		runner: runner, threadID: threadID, lease: lease}
+		runner: runner, threadID: threadID, recordLabel: recordCase}
 	a.publishCodexHost(h) // 發布：首輪事件的 handler ownership（host ＋ threadId 路由）
 	endPending()          // host 已可經 threadId 命中：pending 窗口到此為止
 
@@ -5467,7 +5452,6 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 	if err != nil {
 		a.takeHost(h) // rollback：registry 不留半成品
 		a.forgetCodexHostRouting(h)
-		finalizeLease()
 		return "", false, err
 	}
 
@@ -5477,12 +5461,10 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 		Provider: contract.ProviderCodex, Kind: contract.KindInit,
 		SessionID: threadID, Raw: fmt.Appendf(nil, `{"threadId":%q}`, threadID)}))
 
-	if lease != nil { // fatal：wire EOF（server 死亡）時仍收尾錄流（冪等由 lease 保證）
-		go func() {
-			<-conn.Done()
-			_ = lease.Finalize(ports.Exit{Exited: false})
-		}()
-	}
+	// 舊版在這裡起一條 goroutine 等 conn.Done() 收尾 session 錄流；§3.4.4 之後
+	// codex 已無 session-scoped 錄流，而 wire EOF（server 死亡）的收尾由
+	// GenerationOwner 的 WatchGeneration reaper 負責（§3.4.2），不需要 per-session
+	// 的第二個 watcher。
 	return threadID, alreadyEnded, nil
 }
 

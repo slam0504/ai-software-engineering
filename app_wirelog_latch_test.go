@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/codex"
@@ -66,6 +67,14 @@ func (s *fakeCodexServer) die() {
 		s.closeWire()
 		close(s.done)
 	})
+}
+
+// newFakeServerOn 把一條**既有**的 fake conn 包成 ProbeTarget，供需要真的 wire
+// 回應器的測試（如 W6 錄流佐證）用 production 的 codex.NewGenerationOwner 掛上
+// always-on 錄流。Terminate 只關 Done，不動 pipe——那條 conn 由建立者收尾。
+func newFakeServerOn(conn *codex.Conn) *fakeCodexServer {
+	return &fakeCodexServer{conn: conn, closeWire: func() {},
+		steps: func(string) {}, done: make(chan struct{})}
 }
 
 // fakeWireControl 是 codexServerFactory 的測試控制器：步驟序列、每一代 server
@@ -441,5 +450,44 @@ func TestLatchBlocksProviderStart(t *testing.T) {
 	_, _, err := a.startCodex(w, "hi", "", "", "untrusted")
 	if !errors.Is(err, errWireLogDegraded) {
 		t.Fatalf("latch 必須擋住 provider 啟動：%v", err)
+	}
+}
+
+// §3.4.4（coordinator 2026-08-15 裁決）：recordCase 降為 label——一條 Conn 只有
+// 一個 sink，connection-wide always-on 錄流掛上之後，session 再 attach 一次就會
+// 拿到「recording already in progress」讓整個 session 起不來。本測試以「錄流已
+// 掛在 conn 上」的 production 形狀驗三件事：session 照樣起得來、label 進 audit
+// 與 host、以及既有 sink 不被 session 摘掉或覆蓋。
+func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
+	a, _, _ := newTestAppWithFakeWire(t)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	var frames atomic.Int32
+	if err := conn.BeginRecording(func([]byte) error { frames.Add(1); return nil }); err != nil {
+		t.Fatalf("precondition: connection-wide 錄流必須掛得上：%v", err)
+	}
+
+	w := mustCreate(t, a, "codex")
+	startCodexForTest(t, a, wire, conn, "codex-label", "task-x") // 帶 recordCase 仍須成功
+
+	if frames.Load() == 0 {
+		t.Fatal("connection-wide sink 必須持續收到 frame（session 不得覆蓋它）")
+	}
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-label.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("不得再產生 session-scoped 錄流：%v", err)
+	}
+	if !auditHas(t, a.stateDir, "codex_record_label") {
+		t.Fatal("label 必須留在 audit（可觀察性）")
+	}
+	h := a.hostFor(w)
+	if h == nil || h.recordLabel != "codex-label" {
+		t.Fatalf("label 必須留在 host：%+v", h)
+	}
+	// 收尾同樣不得摘掉 connection-wide sink（舊版 lease.Finalize 會 StopRecording）
+	if err := a.EndSession("codex"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.BeginRecording(func([]byte) error { return nil }); err == nil {
+		t.Fatal("session 收尾不得 detach connection-wide 錄流")
 	}
 }

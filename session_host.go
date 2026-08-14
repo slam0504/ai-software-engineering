@@ -73,6 +73,11 @@ type sessionHost struct {
 	threadID string
 	track    appcore.TurnTrack
 
+	// recordLabel：使用者輸入的 recordCase。M3b §3.4.4 之後它**只是 label**——
+	// codex 的錄流證據一律由 connection-wide wire log 承載，這個欄位不控制任何
+	// recorder attach，只供觀測／後續 []WireSegmentRef view 標記用。
+	recordLabel string
+
 	sessionID string
 }
 

@@ -4,6 +4,7 @@ const h = vi.hoisted(() => ({
   StartSession: vi.fn(async () => {}),
   SendMessage: vi.fn(async () => {}),
   CreateSession: vi.fn(async () => 'wsid-1'),
+  RecoverCodexRecording: vi.fn(async () => {}),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
   RunEvidence: vi.fn(async () => 'evidence-id'),
   EvidenceGet: vi.fn(async () => ({})),
@@ -40,6 +41,14 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.CreateSession('claude', 'my-task')
     expect(h.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
+  })
+
+  // M3b Task 13：RecoverCodexRecording 無參數，仍要鎖「adapter 真的打到 Go 綁定」
+  // ——§3.4.6 的 latch 只有這條路徑能解除，adapter 接錯就是永久 degraded。
+  it('RecoverCodexRecording 轉發至 Go 綁定', async () => {
+    const b = makeBindings()
+    await b.RecoverCodexRecording()
+    expect(h.RecoverCodexRecording).toHaveBeenCalledWith()
   })
 
   // Task 22：TCA workspace 六個新綁定，逐一鎖參數順序與名稱——Go 測試驗不到
