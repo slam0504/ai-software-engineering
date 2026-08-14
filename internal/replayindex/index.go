@@ -3,10 +3,13 @@
 // 第 N 個完整 turn 佔了哪段 audit byte range，讓重啟／UI 只需讀最近 N 個
 // 完整 turn，不必全掃 events.jsonl。
 //
-// 本檔（Task 15）只做 turn boundary 狀態機＋目錄形狀＋checkpoint 持久化。
-// degraded latch／防遞迴通知（Task 16）、crash consistency 三態修復
-// （Task 17）、損壞分級（Task 18）、runtime 重建交接（Task 19）、App 接線
-// （Task 20）皆為後續 task，本檔不涉及。
+// 本檔（Task 15）打底 turn boundary 狀態機＋目錄形狀＋checkpoint 持久化；
+// Task 16 疊上 degraded latch＋防遞迴通知（§3.5.4）：index 只是快取，它壞
+// 掉絕不能讓 provider turn 失敗，所以寫入失敗一律 latch degraded、不回錯給
+// Observe 呼叫端。crash consistency 三態修復（Task 17）、損壞分級
+// （Task 18）、runtime 重建交接（Task 19）、App 接線（Task 20）仍是後續
+// task，本檔不涉及——Task 16 只提供 latch 狀態與 ClearDegraded 解除入口，
+// 實際重建邏輯由那幾個 task 補上。
 package replayindex
 
 import (
@@ -31,9 +34,12 @@ type TurnRecord struct {
 	LastEventID  string `json:"last_event_id"`
 }
 
-// Config：replayindex 的可選設定。Notify 是 degraded latch 的復原／異常通知
-// 出口，由 Task 16 接上防遞迴的 latch-then-notify 邏輯；本 task 僅宣告並保
-// 存這個欄位，目前沒有任何程式路徑呼叫它。
+// Config：replayindex 的可選設定。Notify 是 degraded latch 的異常通知出口
+// （§3.5.4）：index 寫入失敗時，Observe 先把狀態 latch 成 degraded、再（於
+// 釋放 idx.mu 之後）呼叫 Notify——順序不能反過來，否則 Notify 送進的通知事
+// 件會在 latch 生效前回灌 Observe、再次寫入失敗、無限遞迴。同一個 degraded
+// generation（由開始 latch 到 ClearDegraded 解除為止）只呼叫一次。可以是
+// nil，此時 Observe 只 latch、不通知。
 type Config struct {
 	Notify func(string)
 }
@@ -58,6 +64,19 @@ type Index struct {
 	checkpointOffset      int64
 	checkpointLastEventID string
 	turns                 map[string]*turnState // wsid -> 目前是否有 open turn
+
+	// degraded latch（§3.5.4）：index 寫入失敗時 latch，不回錯給 Observe 呼叫
+	// 端。degradedErr 是觸發 latch 的原因，僅供通知文字與未來狀態查詢使用。
+	// degradedNotified 是「每個 degraded generation 只通知一次」的守衛，
+	// ClearDegraded 解除 latch 時一併重置，開啟下一個 generation。
+	degraded         bool
+	degradedErr      error
+	degradedNotified bool
+
+	// forceWriteErr 是測試專用的故障注入鉤子，唯一設值入口是 degraded_test.go
+	// 的 ForceWriteErrForTest；production 路徑永遠不會設它。同慣例見
+	// internal/wirelog/wirelog.go 的 forceErr。
+	forceWriteErr error
 }
 
 // checkpointFile：checkpoint.json 的完整內容（§3.5.5）。OpenTurns 保存每個
@@ -122,9 +141,22 @@ func (idx *Index) loadCheckpoint() error {
 }
 
 // Observe：把一筆已落盤的稽核事件（env＋其 AppendReceipt）餵給 turn boundary
-// 狀態機。持鎖涵蓋狀態轉移與所有實際檔案 I/O。持久化失敗一律回錯（fail
-// loud）——這個 task 沒有 degraded latch，呼叫端必須自行處理錯誤；latch 化
-// 是 Task 16 的範圍。
+// 狀態機。持鎖涵蓋狀態轉移與所有實際檔案 I/O。
+//
+// degraded latch（§3.5.4，Task 16，凍結取捨）：index 只是快取，它壞掉絕不
+// 能讓 provider turn 失敗，所以持久化失敗**不回錯**給呼叫端——這是本套件
+// 對 fail-loud 慣例唯一的例外，取捨已在 spec 凍結。失敗時改為：
+//  1. latch degraded（checkpoint 前移的部分回滾到失敗前的值，見下）；
+//  2. 釋放 idx.mu 之後才呼叫 Config.Notify（先 latch、後通知，順序不可反
+//     過來——Notify 送進的通知事件本身會再次呼叫 Observe，此時 latch 已生
+//     效，Observe 一開頭就直接 return nil，不會再嘗試寫入、不會再次觸發
+//     Notify，因此不會遞迴）；
+//  3. 同一個 degraded generation 只通知一次（degradedNotified），直到
+//     ClearDegraded 解除 latch、開啟下一個 generation。
+//
+// latch 之後每一次 Observe 呼叫都是空操作：不跑 turn 狀態機、不動記憶體
+// checkpoint、直接 return nil，直到 ClearDegraded 被呼叫（重建成功的入口，
+// Task 17-19 範圍，本 task 只提供這個入口）。
 //
 // checkpoint.json 只在 turn boundary（開 turn／收 turn）才落盤，不是每個事件
 // 都寫：Task 20 接線後 Observe 會在 Manager 的全域 mutex 內被呼叫，一次回覆
@@ -142,18 +174,81 @@ func (idx *Index) loadCheckpoint() error {
 // 閉會踩到的缺口（不該依賴 crash 修復機制解決）：見 Flush。
 func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) error {
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
 
-	boundary, err := idx.applyTurnState(env, receipt)
-	if err != nil {
-		return err
-	}
-	idx.checkpointOffset = receipt.EndOffset
-	idx.checkpointLastEventID = receipt.EventID
-	if !boundary {
+	if idx.degraded {
+		idx.mu.Unlock()
 		return nil
 	}
-	return idx.writeCheckpointFile()
+
+	// 失敗時要把 checkpoint 前移的部分回滾到失敗前的值（degraded 期間
+	// checkpoint 不得前移——這是對記憶體值的保證；磁碟值本就只在 boundary
+	// 才落盤，寫入失敗代表磁碟本來就沒動過，不需要另外回滾）。
+	prevOffset := idx.checkpointOffset
+	prevEventID := idx.checkpointLastEventID
+
+	boundary, err := idx.applyTurnState(env, receipt)
+	if err == nil {
+		idx.checkpointOffset = receipt.EndOffset
+		idx.checkpointLastEventID = receipt.EventID
+		if boundary {
+			if werr := idx.writeCheckpointFile(); werr != nil {
+				idx.checkpointOffset = prevOffset
+				idx.checkpointLastEventID = prevEventID
+				err = werr
+			}
+		}
+	}
+
+	if err == nil {
+		idx.mu.Unlock()
+		return nil
+	}
+
+	idx.latchDegraded(err)
+	notify := idx.cfg.Notify
+	shouldNotify := notify != nil && !idx.degradedNotified
+	if shouldNotify {
+		idx.degradedNotified = true
+	}
+	wsid := env.WorkspaceSessionID
+	idx.mu.Unlock() // 必須先解鎖才能呼叫 Notify——callback 可能再呼叫 Observe（見上）
+
+	if shouldNotify {
+		notify(fmt.Sprintf("replayindex degraded (wsid=%s): %v", wsid, err))
+	}
+	return nil
+}
+
+// Degraded：index 目前是否處於 degraded latch（§3.5.4）。true 時 Observe 是
+// 空操作、checkpoint 不再前移，需靠重建（Task 17-19）成功後呼叫
+// ClearDegraded 解除。
+func (idx *Index) Degraded() bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.degraded
+}
+
+// ClearDegraded：以成功重建為準解除 degraded latch（§3.5.4：「解除以成功重
+// 建為準」）。本 task 不做重建本身，只提供這個入口給 Task 17-19 的 runtime
+// 重建路徑呼叫。解除的同時開啟下一個 degraded generation——degradedNotified
+// 一併重置，所以下一次寫入失敗仍會各自發一次通知，不會因為用過一次就永久
+// 啞掉。
+func (idx *Index) ClearDegraded() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.degraded = false
+	idx.degradedErr = nil
+	idx.degradedNotified = false
+}
+
+// latchDegraded：呼叫端須持有 idx.mu。把 index 標成 degraded；err 是觸發原
+// 因，保存供未來狀態查詢／診斷用（目前只有 Observe 的通知文字會用到，即呼
+// 叫端自行帶出 err 組訊息，不經由這裡）。只設狀態、不做 I/O、不呼叫
+// Notify——Notify 的呼叫時機由 Observe 在釋放鎖之後才觸發，這裡不能提前呼
+// 叫，否則會在 lock 仍持有時遞迴呼叫 Observe 而自我死鎖。
+func (idx *Index) latchDegraded(err error) {
+	idx.degraded = true
+	idx.degradedErr = err
 }
 
 // applyTurnState：turn boundary 狀態機本體（§3.5.9，凍結）。
@@ -327,8 +422,12 @@ func (idx *Index) turnFilePath(wsid string) string {
 
 // writeCheckpointFile：temp file + atomic rename、0600（沿用
 // internal/wsregistry/store.go 的慣例）。呼叫端須持有 idx.mu，或於建構期間
-// （尚無並行存取）單執行緒呼叫。
+// （尚無並行存取）單執行緒呼叫。forceWriteErr 非 nil 時故障注入優先於實際
+// 寫入（測試專用，見 forceWriteErr 欄位說明）。
 func (idx *Index) writeCheckpointFile() error {
+	if idx.forceWriteErr != nil {
+		return idx.forceWriteErr
+	}
 	cf := checkpointFile{
 		Offset:      idx.checkpointOffset,
 		LastEventID: idx.checkpointLastEventID,
@@ -356,7 +455,12 @@ func (idx *Index) writeCheckpointFile() error {
 
 // appendTurnRecord：<dir>/<wsid>.turns.jsonl 只在 terminal state_change 抵達
 // 時 append 一筆——不是每個事件都寫。單筆小量寫入，不維持常駐檔案 handle。
+// forceWriteErr 非 nil 時故障注入優先於實際寫入（測試專用，見 forceWriteErr
+// 欄位說明）。
 func (idx *Index) appendTurnRecord(wsid string, rec TurnRecord) error {
+	if idx.forceWriteErr != nil {
+		return idx.forceWriteErr
+	}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
