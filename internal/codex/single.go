@@ -10,7 +10,8 @@ type Alive interface{ Done() <-chan struct{} }
 // epoch 是單調遞增的發布序號（M3b §3.4.2）：每次成功發布（Ensure 建立、
 // WithExclusive／WithExclusiveEpoch 回 keep=true）遞增一次，用來辨識「現在持有的
 // 還是不是當時那一個 instance」。刻意不用值比較——T 沒有 comparable 約束（加上去
-// 會牽動既有的 Single[*Server]／Single[*stubAlive] 實例化），泛型值不能直接用 ==。
+// 會牽動既有的 Single[*GenerationOwner]／Single[*stubAlive] 實例化），泛型值不能
+// 直接用 ==。
 type Single[T Alive] struct {
 	mu    sync.Mutex
 	cur   T
@@ -23,8 +24,9 @@ type Single[T Alive] struct {
 //
 // 注意（M3b §3.4.2）：Ensure 會遞增 epoch 但**不回傳**，所以經它建立的 instance
 // 拿不到 epoch、無法掛 WatchGeneration 死亡 reaper。持有 GenerationOwner 的呼叫端
-// 若走 Ensure 建立 server，那條路徑上的錄流不會在 server 意外死亡時自動 finalize；
-// 需要 reaper 就得走 RunOwnedHandshake（或另補會回傳 epoch 的 Ensure 變體）。
+// 若走 Ensure 建立 server，那條路徑上的錄流不會在 server 意外死亡時自動 finalize。
+// App 因此已全面改走 Current()＋RunOwnedHandshake（Task 13）：「存活就沿用」由
+// 呼叫端在自己的鎖內 check-then-act，發布一律經會回傳 epoch 的那條路徑。
 func (s *Single[T]) Ensure(start func() (T, error)) (T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,6 +86,22 @@ func (s *Single[T]) WithExclusiveEpoch(fn func(cur T, ok bool) (T, bool, error))
 	}
 	s.cur, s.ok, s.epoch = t, true, s.epoch+1
 	return s.epoch, err
+}
+
+// Current 回傳目前持有者（不取出、不影響 epoch、不重建）；無持有者回 ok=false。
+//
+// 與 Ensure 的差別是它**不會**在持有者已死時重建，也不會清空 ownership——死亡的
+// 收尾一律由該 instance 自己的 watcher（WatchGeneration）負責，Current 只是讀取。
+// 呼叫端拿到的值可能在返回後立刻死亡（與 Ensure 同樣的固有競態）；需要「建立或
+// 沿用」語意的路徑要自己序列化 check-then-act（App 的 codexServerMu）。
+func (s *Single[T]) Current() (T, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ok {
+		var zero T
+		return zero, false
+	}
+	return s.cur, true
 }
 
 // Epoch 回傳目前持有者的 epoch；無持有者回 0。

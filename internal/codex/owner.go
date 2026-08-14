@@ -8,9 +8,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 )
+
+// ProbeTarget 是一個 app-server generation 對外的最小介面（*Server 以薄委派滿足；
+// 測試用 stub）。GenerationOwner 只持有它、不直接持有 *Server，呼叫端（App 的
+// 受控 restart／錄流復原路徑）因此可以注入 fake server 走同一段 production 編排。
+//
+// 匯出的理由：`RunOwnedHandshake` 的 start 參數型別是 `func() (ProbeTarget, error)`，
+// package 外的呼叫端必須能寫出這個 closure 型別（Go 沒有 function 型別的協變）。
+type ProbeTarget interface {
+	Alive
+	// Conn 是 GenerationOwner 的呼叫端（interrupt／fake-wire 路徑）取得底層連線的
+	// 入口——owner 只持有 ProbeTarget，不再直接持有 *Server。
+	Conn() *Conn
+	BeginRecording(sink func([]byte) error) error
+	StopRecording() error
+	Handshake(ctx context.Context, ci ClientInfo) error
+	Terminate() error
+	Wait() proc.Exit
+	StderrSnapshot() string
+	Argv() []string
+}
 
 // errServerDied 是死亡 reaper 收尾 generation 時記錄的 stage 原因（§3.4.2）。
 var errServerDied = errors.New("codex: app-server exited")
@@ -43,7 +64,7 @@ var hookAfterPublishBeforeWatch func()
 // **靜默**跳過 detach（不回錯、不計數）——generation 關檔後仍掛著的 sink 會把後續
 // frame 寫進已關閉的檔案，錯誤只 latch 進 writeErr，而 meta 早就寫完了。
 type GenerationOwner struct {
-	Server     probeTarget
+	Server     ProbeTarget
 	Generation *wirelog.Generation
 
 	mu       sync.Mutex
@@ -58,7 +79,7 @@ type GenerationOwner struct {
 // 回傳的 owner **一律非 nil**，即使 attach 失敗也要拿它收尾（Terminate → Wait →
 // finalize）；attach 失敗時 attached 維持 false，收尾不會 detach 別人的 sink——
 // BeginRecording 可能正是因為「已有別人在錄流」而失敗的。
-func NewGenerationOwner(srv probeTarget, gen *wirelog.Generation) (*GenerationOwner, error) {
+func NewGenerationOwner(srv ProbeTarget, gen *wirelog.Generation) (*GenerationOwner, error) {
 	o := &GenerationOwner{Server: srv, Generation: gen}
 	if err := srv.BeginRecording(generationSink(gen)); err != nil {
 		return o, err
@@ -114,7 +135,7 @@ func (o *GenerationOwner) Done() <-chan struct{} {
 // 的結果，不重複 Terminate／Wait／寫 meta。
 //
 // Server 為 nil（start 階段就失敗、還沒有 server）時跳過 terminate／wait／drain／
-// stop，meta 不帶 exit_code——比照 RunHandshakeProbe 的 start 失敗分支。
+// stop，meta 不帶 exit_code——沒有子行程就沒有 exit 證據，不得捏造。
 func (o *GenerationOwner) FinalizeWith(stage error) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -207,9 +228,11 @@ func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint
 	}()
 }
 
-// RunOwnedHandshake 是 owner 版的 app-server 建立／替換編排（§3.4.2／§3.4.7）。
-// 與 RunHandshakeProbe 的差別是 handoff 語意內建：成功後**不** StopRecording、
-// 不 finalize generation——錄流持續掛在發布出去的 server 上，直到它死亡或被替換。
+// RunOwnedHandshake 是 app-server 建立／替換的唯一編排（§3.4.2／§3.4.7）：B1 受控
+// restart、錄流受控復原與 ensureAppServer 三條路徑共用它。handoff 語意內建：成功後
+// **不** StopRecording、不 finalize generation——錄流持續掛在發布出去的 server 上，
+// 直到它死亡或被替換（M3b 之前的 probe-scoped 入口 RunHandshakeProbe 在成功發布前
+// 會 Stop＋Close 錄流，與 §3.4.1 的 always-on wire log 不相容，已於 Task 13 刪除）。
 //
 // 全段在 single.WithExclusiveEpoch 的單一互斥交易內完成：鎖內先收尾舊 owner
 // （terminate → wait → finalize_old）→ 建新 generation（wire_log_id 在掛 recorder
@@ -228,7 +251,7 @@ func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint
 // **只有經本函式發布的 owner 才有死亡 reaper**；`Single.Ensure` 不回傳 epoch，
 // 經它建立的 instance 沒有 watcher（見 Single.Ensure 的註解）。
 func RunOwnedHandshake(ctx context.Context, single *Single[*GenerationOwner],
-	newGen func() (*wirelog.Generation, error), start func() (probeTarget, error),
+	newGen func() (*wirelog.Generation, error), start func() (ProbeTarget, error),
 	ci ClientInfo, onFinalized func(err error, wasActive bool)) error {
 
 	var published *GenerationOwner

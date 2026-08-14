@@ -40,7 +40,7 @@ func (s *Server) PGID() int            { return s.p.PGID() }
 func (s *Server) StderrSnapshot() string { return s.p.StderrSnapshot() } // v1.6：長駐 server live 證據
 func (s *Server) Done() <-chan struct{} { return s.p.Done() }            // v1.7：非阻塞死亡判定
 
-// probeTarget 薄委派（Task 8 Step 5b）
+// ProbeTarget 薄委派（Task 8 Step 5b）
 func (s *Server) BeginRecording(sink func([]byte) error) error { return s.conn.BeginRecording(sink) }
 func (s *Server) StopRecording() error                         { return s.conn.StopRecording() }
 func (s *Server) Handshake(ctx context.Context, ci ClientInfo) error {

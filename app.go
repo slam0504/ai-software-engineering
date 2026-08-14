@@ -35,6 +35,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
+	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
@@ -87,9 +88,45 @@ type App struct {
 	// mu：sessionHosts registry ＋ codex dispatcher 索引的互斥。
 	mu sync.Mutex
 
-	codexSingle  codex.Single[*codex.Server]
+	// codexSingle 持有的是 generation ownership 單位（Task 12／13，§3.4.2）：
+	// 「app-server instance ＋ 該 generation 的 always-on 錄流」綁在一起，死亡
+	// reaper／受控 replacement／shutdown 三條路徑才都拿得到那份 wire log 去
+	// finalize。所有發布一律經 codex.RunOwnedHandshake（唯一會回傳 epoch、因此
+	// 唯一掛得上 WatchGeneration 的入口），不再用 Single.Ensure。
+	codexSingle  codex.Single[*codex.GenerationOwner]
 	codexConn    *codex.Conn // wireCodexConn 記錄；interrupt 用（fake wire 測試同路徑）
 	codexLoginID string
+
+	// codexServerMu 序列化「建立或替換 codex app-server generation」的三條路徑
+	// （ensureAppServer／RestartCodexServerRecorded／RecoverCodexRecording）。
+	// Single.mu 本身只保護單次 replacement 交易，擋不住 ensureAppServer 的
+	// check-then-act（兩個併發呼叫都看到「沒有 server」就會各起一個 process，
+	// 其中一個隨即被另一個的 RunOwnedHandshake 收掉，白白多一次 spawn 與一份
+	// 空 generation）。鎖序凍結為 codexServerMu → Single.mu，反向一律禁止；
+	// onCodexGenerationFinalized（watcher callback）因此不得取這把鎖。
+	codexServerMu sync.Mutex
+
+	// codexServerFactory：測試注入的 app-server 工廠（nil = production 的
+	// codex.StartAppServer）。fake wire 因此能走完整的 RunOwnedHandshake 編排
+	// （finalize 舊 generation → 新 wire_log_id → start → attach → handshake →
+	// 發布），不必真的 spawn codex CLI。
+	codexServerFactory func() (codex.ProbeTarget, error)
+
+	// ---- Codex connection-wide wire log（§3.4.6-7；Task 13）----
+	//
+	// wireMu 保護以下三個欄位。wireGen 是目前 generation 的錄流 handle（供
+	// checkWireRecorder 輪詢 latch 住的寫入錯誤）；wireErr 是 App 層的 recorder
+	// error latch——非 nil 即拒絕新 Codex session，只有「新 generation 的
+	// recorder 掛載、handshake 與發布全部成功」才清除（§3.4.6），不因時間或重試
+	// 次數自動解除。wireSeq 讓同一秒內的多次 replacement 也能拿到唯一 wire_log_id。
+	wireMu  sync.Mutex
+	wireGen *wirelog.Generation
+	wireErr error
+	wireSeq int
+
+	// hookWireStep：測試注入——受控復原／replacement 的步驟順序探針（§3.4.7 的
+	// 順序是凍結契約）。production 恆為 nil。
+	hookWireStep func(step string)
 
 	// sessionHosts（M3b Phase 2，§3.3）：per-WSID 的單例 ownership registry。
 	// Task 8 遷入 Claude 側（broker／sess／sessionID／pumpDone／lease／teardownFn），
@@ -373,6 +410,11 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	p := contract.Provider(provider)
 	if a.createDegraded(p) {
 		return "", errCreateDegraded
+	}
+	if p == contract.ProviderCodex { // §3.4.6：錄流 latch 期間拒絕新 Codex session
+		if err := a.codexWireGate(); err != nil {
+			return "", err
+		}
 	}
 	if a.wsReg == nil { // 名額尚未被佔用，直接早退
 		return "", errNoSessionRegistry
@@ -1147,9 +1189,11 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.manager != nil {
 		_ = a.manager.Close() // 全部 finalize 之後才關 sink（pending queue abort+flush 兜底）
 	}
-	if srv, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
-		_ = srv.Terminate()
-		srv.Wait()
+	if o, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
+		// §3.4.2 的收尾總序（terminate → wait → stdout 汲取完成 → detach →
+		// finalize wire log）全在 FinalizeWith 內，與死亡 reaper／受控
+		// replacement 共用同一份實作；冪等，watcher 已收過就直接回原結果。
+		_ = o.FinalizeWith(nil)
 	}
 	// 殘留 host 的 broker：teardown 成功的 host 已把自己從 registry 取出並關掉
 	// broker，留在這裡的是 teardown 失敗／從未進入收尾的那些。**這是 best effort、
@@ -4685,39 +4729,291 @@ func (a *App) claudeTeardown(host *sessionHost) func() error {
 
 // ---- Codex 線 ----
 
-func (a *App) ensureAppServer() (*codex.Server, error) {
-	// server-create 交易：check 與 Ensure 對 shutdown 原子（TOCTOU 關閉）——
+// errCodexNotRunning：沒有已發布的長駐 server（不重建的讀取路徑用）。
+var errCodexNotRunning = errors.New("codex app-server not running")
+
+// ensureAppServer：取得長駐 app-server；沒有存活的就建一個新 generation。
+//
+// M3b §3.4：不再用 Single.Ensure——它不回傳 epoch，經它建立的 instance 掛不上
+// WatchGeneration 死亡 reaper，那條路徑上的 wire log 在 server 意外死亡時永遠
+// 不會 finalize（而且完全靜默）。改為「codexServerMu 內 check-then-act ＋
+// RunOwnedHandshake 發布」：Ensure 的「存活就沿用」語意由這裡的 Current＋Done
+// 檢查提供，序列化由 codexServerMu 提供（Ensure 原本是靠 Single.mu 提供的）。
+//
+// 鎖序：codexServerMu → Single.mu（RunOwnedHandshake 內部自持），呼叫端不得
+// 再包一層 codexSingle 的鎖。
+func (a *App) ensureAppServer() (codex.ProbeTarget, error) {
+	// server-create 交易：check 與建立對 shutdown 原子（TOCTOU 關閉）——
 	// AuthStatus／StartLogin／Logout 等所有經此入口的路徑一體適用
 	if err := a.beginAppTxn(); err != nil {
 		return nil, err
 	}
 	defer a.endAppTxn()
-	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、Ensure 未開始
+	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、建立未開始
 		h()
 	}
-	return a.codexSingle.Ensure(func() (*codex.Server, error) {
+	a.codexServerMu.Lock()
+	defer a.codexServerMu.Unlock()
+	if o, ok := a.codexSingle.Current(); ok && o.Server != nil {
+		select {
+		case <-o.Done(): // 已死：它自己的 watcher 負責收尾，這裡直接建新 generation
+		default:
+			return o.Server, nil
+		}
+	}
+	if err := a.replaceCodexGeneration(); err != nil {
+		return nil, err
+	}
+	o, ok := a.codexSingle.Current()
+	if !ok {
+		return nil, errCodexNotRunning
+	}
+	return o.Server, nil
+}
+
+// currentAppServer 取得既有長駐 server（不重建、不清空 ownership）。
+func (a *App) currentAppServer() (codex.ProbeTarget, error) {
+	o, ok := a.codexSingle.Current()
+	if !ok || o.Server == nil {
+		return nil, errCodexNotRunning
+	}
+	return o.Server, nil
+}
+
+// ---- Codex connection-wide wire log：generation 生命週期＋recorder error latch ----
+//
+// §3.4.1／§3.4.6-7。每個 app-server generation 一份 always-on 錄流（wire_log_id
+// 在掛 recorder 之前配置），錄到該 server 的生命終點才 finalize；寫入失敗即
+// latch、發 workspace 通知並拒絕新 Codex session，只有受控復原能解除。
+
+// errWireLogDegraded：latch 生效時新 Codex session 的拒絕原因。
+var errWireLogDegraded = errors.New("codex wire log degraded: 已停止建立新 Codex session，請先執行錄流復原")
+
+// wireLogDir：connection-wide wire log 的落點——每個 generation 一份
+// <wire_log_id>.jsonl ＋ <wire_log_id>.meta.json（沿用 recorder 的檔案形狀）。
+// 與 session 級錄流（recordings/）分開放：兩者的生命週期單位不同，一個是
+// app-server generation、一個是 session。
+func (a *App) wireLogDir() string { return filepath.Join(a.stateDir, "wire-logs") }
+
+// wireStep：受控復原／replacement 的步驟探針（測試注入，見 hookWireStep）。
+func (a *App) wireStep(step string) {
+	if h := a.hookWireStep; h != nil {
+		h(step)
+	}
+}
+
+// newWireGeneration 配置新的 wire_log_id 並開檔。序號讓同一秒內的多次
+// replacement 也不會撞 id（wirelog.NewGeneration 與 recorder.New 同慣例，同名
+// 會直接覆寫舊檔，不做去重保護）。
+func (a *App) newWireGeneration() (*wirelog.Generation, error) {
+	a.wireMu.Lock()
+	a.wireSeq++
+	id := fmt.Sprintf("codex-wire-%s-%03d", time.Now().UTC().Format("20060102T150405"), a.wireSeq)
+	a.wireMu.Unlock()
+	return wirelog.NewGeneration(a.wireLogDir(), id)
+}
+
+// wireLatched 回報 recorder error latch 是否生效。
+func (a *App) wireLatched() bool {
+	a.wireMu.Lock()
+	defer a.wireMu.Unlock()
+	return a.wireErr != nil
+}
+
+// latchWireRecorder：錄流寫入失敗的唯一入口（§3.4.6）——latch 首個錯誤、立刻發
+// workspace 通知，自此拒絕新 Codex session（既有 session 仍可 bounded 收尾）。
+//
+// 「每個 degraded generation 只發一次通知」由 nil → non-nil 的狀態轉移保證：
+// latch 只在新 generation 全部成功時清除（clearWireLatch），所以同一個
+// generation 內至多發生一次轉移。刻意不另外放一個 per-generation sync.Once
+// ——那是同一件事的第二份狀態，兩者一旦不同步就會多發或漏發。
+func (a *App) latchWireRecorder(err error) {
+	if err == nil {
+		return
+	}
+	a.wireMu.Lock()
+	first := a.wireErr == nil
+	if first {
+		a.wireErr = err
+	}
+	id := ""
+	if a.wireGen != nil {
+		id = a.wireGen.ID()
+	}
+	a.wireMu.Unlock()
+	if !first { // 同一 generation 的後續錯誤：latch 已保留首因，不重複通知
+		return
+	}
+	a.audit("codex_wire_log_degraded", map[string]any{"wireLogId": id, "error": err.Error()})
+	a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+		"component": "codex_wire_log", "wireLogId": id, "error": err.Error()})
+}
+
+// clearWireLatch 在新 generation 的 recorder 掛載、handshake 與發布全部成功之後
+// 解除 latch——這是 §3.4.6 凍結的**唯一**解除條件（不因時間或重試次數自動解除）。
+func (a *App) clearWireLatch(gen *wirelog.Generation) {
+	a.wireMu.Lock()
+	was := a.wireErr
+	a.wireErr, a.wireGen = nil, gen
+	a.wireMu.Unlock()
+	if was == nil {
+		return
+	}
+	id := ""
+	if gen != nil {
+		id = gen.ID()
+	}
+	a.audit("codex_wire_log_recovered", map[string]any{"wireLogId": id, "previousError": was.Error()})
+	a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+		"component": "codex_wire_log", "wireLogId": id, "event": "recovered"})
+}
+
+// checkWireRecorder 把目前 generation latch 住的寫入錯誤升級成 App 層 latch。
+//
+// 為什麼要輪詢：錄流 sink 掛在 codex.Conn 內部，寫入錯誤只 latch 進
+// wirelog.Generation.writeErr（Conn.record 看到 sink 回錯只記進 recErr，不通知
+// 任何人），沒有推播管道。故 App 在兩個決策點取用：每一筆入站 frame 之後
+// （wireCodexConn 的 handler）與新 Codex session 的建立閘門。c2s 寫入失敗因此
+// 最遲在下一筆入站 frame 或下一次建立 session 時被看見。
+func (a *App) checkWireRecorder() {
+	a.wireMu.Lock()
+	gen := a.wireGen
+	a.wireMu.Unlock()
+	if gen == nil {
+		return
+	}
+	a.latchWireRecorder(gen.Err())
+}
+
+// codexWireGate：latch 生效時拒絕新 Codex session（§3.4.6）。既有 session 的
+// 收尾與**受控復原**（RecoverCodexRecording）刻意不經此閘門——復原正是唯一的
+// 解除路徑，擋掉它 latch 就永遠解不開。
+func (a *App) codexWireGate() error {
+	a.checkWireRecorder()
+	a.wireMu.Lock()
+	defer a.wireMu.Unlock()
+	if a.wireErr != nil {
+		return fmt.Errorf("%w：%v", errWireLogDegraded, a.wireErr)
+	}
+	return nil
+}
+
+// onCodexGenerationFinalized 是 WatchGeneration 的回呼。
+//
+// **wasActive == false 不是異常**：每次受控 replacement 之後都會補發一次——舊
+// owner 的 watcher 仍掛在舊 process 上，該 process 退出時就會以 false 回報。把
+// 它當意外死亡處理（發事件、re-latch、觸發重啟）會在每次正常 restart 後誤觸，
+// 故這裡只記 audit、不進任何反應路徑。
+func (a *App) onCodexGenerationFinalized(err error, wasActive bool) {
+	payload := map[string]any{"wasActive": wasActive}
+	if err != nil {
+		payload["error"] = err.Error()
+	}
+	if !wasActive {
+		a.audit("codex_generation_finalized", payload)
+		return
+	}
+	a.audit("codex_server_died", payload) // 現役 server 意外死亡：唯一該 fail loud 的分支
+	a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+		"component": "codex_app_server", "error": "codex app-server exited unexpectedly"})
+}
+
+// replaceCodexGeneration 是「建立或替換一個 codex app-server generation」的唯一
+// 實作，三個呼叫端共用（ensureAppServer／RestartCodexServerRecorded／
+// RecoverCodexRecording）。順序凍結於 codex.RunOwnedHandshake 內部：
+// 收尾舊 owner（terminate → wait → drain → detach → finalize 舊 generation）→
+// 配置新 wire_log_id → start → 掛 recorder → handshake → 發布（§3.4.2／§3.4.7）。
+//
+// **全段由 RunOwnedHandshake 自己的 WithExclusiveEpoch 單層互斥交易保護，這裡
+// 不得再包一層 codexSingle 的鎖**——同一把 mutex，巢狀即死鎖。呼叫端必須先持有
+// a.codexServerMu（見該欄位 doc）。
+//
+// 發布判定看 Single 本身、不看 err：RunOwnedHandshake 的契約是「err != nil 不
+// 代表沒有發布」（新 server handshake 成功但舊 owner 收尾失敗時 ownership 已經
+// 換手）。反過來失敗時 Single 必為空（keep=false 會清空 ownership），所以
+// Current() 非空即代表本次已發布。
+func (a *App) replaceCodexGeneration() error {
+	_, hadOld := a.codexSingle.Current()
+	newGen := func() (*wirelog.Generation, error) {
+		if hadOld { // RunOwnedHandshake 在建新 generation 之前已收完舊 owner
+			a.wireStep("finalize_old")
+		}
+		a.wireStep("new_wire_log_id")
+		return a.newWireGeneration()
+	}
+	start := func() (codex.ProbeTarget, error) {
+		a.wireStep("start")
+		if a.codexServerFactory != nil { // 測試注入：fake wire 走同一段 production 編排
+			return a.codexServerFactory()
+		}
 		srv, err := codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
 			CWD: a.workspaceDir, Env: a.childEnv()})
 		if err != nil {
-			return nil, err
+			return nil, err // 具體型別的 nil 不可直接回傳（會變成非 nil 介面值）
 		}
-		hctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
-		defer cancel()
-		if err := srv.Handshake(hctx, clientInfo()); err != nil { // start 失敗不保留 instance（Ensure 契約）
-			_ = srv.Terminate()
-			srv.Wait()
-			return nil, err
-		}
-		a.wireCodexConn(srv.Conn())
 		return srv, nil
-	})
+	}
+	hctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	err := codex.RunOwnedHandshake(hctx, &a.codexSingle, newGen, start, clientInfo(),
+		a.onCodexGenerationFinalized)
+	o, published := a.codexSingle.Current()
+	if published {
+		a.wireCodexConn(o.Server.Conn()) // 發布成功即接上 handlers
+	}
+	if err != nil {
+		return err // §3.4.6：任一步失敗即 dispose 新 server 並保留 latch
+	}
+	a.clearWireLatch(o.Generation)
+	return nil
 }
 
-// currentAppServer 取得既有長駐 server（不重建）。
-func (a *App) currentAppServer() (*codex.Server, error) {
-	return a.codexSingle.Ensure(func() (*codex.Server, error) {
-		return nil, errors.New("codex app-server not running")
-	})
+// refuseIfCodexLive：受控 replacement／復原的拒絕條件（§3.4.7）——存在 live
+// Codex host 或 in-flight turn 一律拒絕，只有 dormant session 不阻擋。
+// in-flight turn 先判：它是兩者中較嚴重、訊息也較精確的那一個。
+func (a *App) refuseIfCodexLive() error {
+	hosts := a.hostsOf(contract.ProviderCodex)
+	for _, h := range hosts {
+		if h.runner != nil && h.runner.ActiveTurnID() != "" {
+			return fmt.Errorf("codex 受控 replacement 被拒：session %s 仍有 in-flight turn（§3.4.7）", h.wsid)
+		}
+	}
+	if len(hosts) > 0 {
+		return fmt.Errorf("codex 受控 replacement 被拒：仍有 %d 個 live host（§3.4.7）", len(hosts))
+	}
+	return nil
+}
+
+// RecoverCodexRecording 是 §3.4.6 recorder error latch 的 in-process 復原入口，
+// 同時是 §3.4.7 受控 app-server replacement 的最小方案。
+//
+// 為什麼它不能被 latch 擋住：latch 的唯一解除條件是「新 generation 的 recorder
+// 掛載、handshake 與發布全部成功」，而新 generation 的觸發（新 session、
+// ensureAppServer）都在被 latch 擋掉的那些路徑上——復原入口自己再被擋一次，
+// latch 就永遠解不開。
+//
+// 順序：收乾 live host（此處為「確認沒有 live host／in-flight turn」，有就拒絕）
+// → terminate → wait → finalize 舊 generation → 配置新 wire_log_id → 起新
+// server → 掛 recorder → handshake → 發布；中段由 replaceCodexGeneration 委派
+// 給 RunOwnedHandshake。拒絕不改變 latch 狀態。
+func (a *App) RecoverCodexRecording() error {
+	if err := a.beginAppTxn(); err != nil { // 與 ensureAppServer／B1 probe 同一 shutdown 閘門
+		return err
+	}
+	defer a.endAppTxn()
+	a.codexServerMu.Lock()
+	defer a.codexServerMu.Unlock()
+	if err := a.refuseIfCodexLive(); err != nil {
+		a.audit("codex_wire_recovery_refused", map[string]any{"error": err.Error()})
+		return err
+	}
+	a.wireStep("drain")
+	if err := a.replaceCodexGeneration(); err != nil {
+		a.audit("codex_wire_recovery_failed", map[string]any{"error": err.Error()})
+		return err
+	}
+	a.audit("codex_wire_recovery_ok", map[string]any{})
+	return nil
 }
 
 // ---- Codex dispatcher（M3b §3.3；Task 9）----
@@ -4984,11 +5280,13 @@ func (a *App) wireCodexConn(conn *codex.Conn) {
 		if err := a.dispatchCodexNotification(method, params); err != nil {
 			a.failLoudCodexDispatch(err.Error())
 		}
+		a.checkWireRecorder() // 每筆入站 frame 後取用錄流 latch（見 checkWireRecorder）
 	})
 	conn.OnUnknown(func(raw []byte) {
 		if err := a.dispatchCodexUnknown(raw); err != nil {
 			a.failLoudCodexDispatch(err.Error())
 		}
+		a.checkWireRecorder()
 	})
 	conn.OnServerRequest(func(method string, params json.RawMessage) (any, error) {
 		switch method {
@@ -5065,6 +5363,12 @@ type codexHost interface {
 }
 
 func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
+	// §3.4.6：latch 期間不得再開新的 provider session——那等於在明知錄流已壞的
+	// 情況下累積不可稽核的活動。既有 session 的收尾（EndSession／turn 完成）不
+	// 經此路徑，受控復原也不經（見 RecoverCodexRecording）。
+	if err := a.codexWireGate(); err != nil {
+		return "", false, err
+	}
 	if a.codexHostOverride != nil { // 測試 seam：fake wire 走同一 production 分支
 		return a.startCodexHost(w, a.codexHostOverride, prompt, resume, recordCase, approvalPolicy)
 	}
@@ -5228,30 +5532,29 @@ func (a *App) emitCodexSessionDone(recorderErr string) {
 		"processStillRunning": true, "stderrTail": stderr, "recorderError": recorderErr})
 }
 
-// RestartCodexServerRecorded：B1 受控重啟 probe（薄封裝 codex.RunHandshakeProbe，
-// 生命週期 Begin → Handshake → Stop → CloseWith 與四階段失敗處置在 M0 Task 8 以測試固定）。
+// RestartCodexServerRecorded：B1 受控重啟 probe。
+//
+// M3b §3.4 之後它與 RecoverCodexRecording 是同一件事的兩個入口，共用
+// replaceCodexGeneration：錄流不再是 probe-scoped（原本成功前會 StopRecording ＋
+// CloseWith），而是交棒給 connection-level 的 always-on wire log，錄到該 server
+// 終止為止。recordCase 因此**只剩 label**（進 audit），不再控制 recorder attach
+// （§3.4.4）；拒絕條件與復原入口相同（§3.4.7：live host／in-flight turn 一律拒絕）。
 func (a *App) RestartCodexServerRecorded(recordCase string) error {
 	if err := a.beginAppTxn(); err != nil { // probe 直接操作 codexSingle：同樣入 gate
 		return err
 	}
 	defer a.endAppTxn()
-	newRec := func() (*recorder.Recorder, error) {
-		return recorder.New(filepath.Join(a.stateDir, "recordings"), recordCase, ".jsonl")
+	a.codexServerMu.Lock()
+	defer a.codexServerMu.Unlock()
+	if err := a.refuseIfCodexLive(); err != nil {
+		a.audit("codex_probe_refused", map[string]any{"case": recordCase, "error": err.Error()})
+		return err
 	}
-	start := func() (*codex.Server, error) {
-		return codex.StartAppServer(a.ctx, codex.Config{Binary: a.codexCLIPath(),
-			CWD: a.workspaceDir, Env: a.childEnv()})
-	}
-	err := codex.RunHandshakeProbe(a.ctx, &a.codexSingle, newRec, start, clientInfo())
-	if err != nil {
+	a.wireStep("drain")
+	if err := a.replaceCodexGeneration(); err != nil {
 		a.audit("codex_probe_failed", map[string]any{"case": recordCase, "error": err.Error()})
 		return err
 	}
-	srv, serr := a.currentAppServer() // probe 成功必有長駐 server；接上 handlers
-	if serr != nil {
-		return serr
-	}
-	a.wireCodexConn(srv.Conn())
 	a.audit("codex_probe_ok", map[string]any{"case": recordCase})
 	return nil
 }

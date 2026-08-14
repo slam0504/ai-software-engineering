@@ -31,7 +31,7 @@ func TestServerDeathAutoFinalizesGeneration(t *testing.T) {
 	finalized := make(chan bool, 1) // wasActive
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{},
+		func() (ProbeTarget, error) { return stub, nil }, ClientInfo{},
 		func(_ error, wasActive bool) { finalized <- wasActive }); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestReplacementFinalizesOldGenerationBeforePublishingNew(t *testing.T) {
 	oldGen := newTestGeneration(t)
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return oldGen, nil },
-		func() (probeTarget, error) { return old, nil }, ClientInfo{}, nil); err != nil {
+		func() (ProbeTarget, error) { return old, nil }, ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +79,7 @@ func TestReplacementFinalizesOldGenerationBeforePublishingNew(t *testing.T) {
 			order = append(order, "new_gen_created")
 			return newGen, nil
 		},
-		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
+		func() (ProbeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(order, []string{"old_finalized", "new_gen_created"}) {
@@ -101,7 +101,7 @@ func TestStaleReaperDoesNotClearNewGeneration(t *testing.T) {
 	staleDone := make(chan bool, 1) // wasActive
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return oldGen, nil },
-		func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{},
+		func() (ProbeTarget, error) { return oldSrv, nil }, ClientInfo{},
 		func(_ error, wasActive bool) { staleDone <- wasActive }); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestStaleReaperDoesNotClearNewGeneration(t *testing.T) {
 	newSrv, newGen := newStubServer(), newTestGeneration(t)
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return newGen, nil },
-		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
+		func() (ProbeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,7 +156,7 @@ func TestWatcherEpochCapturedUnderLock(t *testing.T) {
 	go func() {
 		firstDone <- RunOwnedHandshake(context.Background(), &single,
 			func() (*wirelog.Generation, error) { return oldGen, nil },
-			func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{},
+			func() (ProbeTarget, error) { return oldSrv, nil }, ClientInfo{},
 			func(_ error, wasActive bool) { staleDone <- wasActive })
 	}()
 	<-firstAtBarrier
@@ -165,7 +165,7 @@ func TestWatcherEpochCapturedUnderLock(t *testing.T) {
 	newSrv, newGen := newStubServer(), newTestGeneration(t)
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return newGen, nil },
-		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
+		func() (ProbeTarget, error) { return newSrv, nil }, ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	close(releaseFirst)
@@ -200,7 +200,7 @@ func TestReaperFinalizesEvenWhenOwnershipAlreadyTaken(t *testing.T) {
 	done := make(chan bool, 1)
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{},
+		func() (ProbeTarget, error) { return stub, nil }, ClientInfo{},
 		func(_ error, wasActive bool) { done <- wasActive }); err != nil {
 		t.Fatal(err)
 	}
@@ -218,21 +218,6 @@ func TestReaperFinalizesEvenWhenOwnershipAlreadyTaken(t *testing.T) {
 	}
 	if !gen.Finalized() {
 		t.Fatal("stale 分支仍須 finalize 自己那份 generation")
-	}
-}
-
-func TestOldProbeEntryPointUnchanged(t *testing.T) {
-	// 舊 probe-scoped 入口在 Task 13 之前必須維持原簽名與原行為，
-	// 否則 App.codexSingle（Single[*codex.Server]）與 B1 呼叫點會編譯失敗
-	stub := newStubServer()
-	var single Single[*stubServer]
-	newRec, _ := probeRecFactory(t)
-	if err := RunHandshakeProbe(context.Background(), &single, newRec,
-		func() (*stubServer, error) { return stub, nil }, ClientInfo{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, stops, _, _ := stub.callCounts(); stops != 1 {
-		t.Fatalf("舊入口必須維持 probe-scoped（成功時 StopRecording）：%d", stops)
 	}
 }
 
@@ -254,7 +239,7 @@ func TestThreeStageFailuresDisposeAndKeepEvidence(t *testing.T) {
 			gen := newTestGeneration(t)
 			err := RunOwnedHandshake(context.Background(), &single,
 				func() (*wirelog.Generation, error) { return gen, nil },
-				func() (probeTarget, error) {
+				func() (ProbeTarget, error) {
 					if c.name == "start" {
 						return nil, startErr
 					}
@@ -303,7 +288,7 @@ func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 	gen := newTestGeneration(t)
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { order = append(order, "gen_id"); return gen, nil },
-		func() (probeTarget, error) { order = append(order, "start"); return stub, nil },
+		func() (ProbeTarget, error) { order = append(order, "start"); return stub, nil },
 		ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +461,7 @@ func TestFinalizeWithoutOwnAttachDoesNotStopOthersRecording(t *testing.T) {
 	var single Single[*GenerationOwner]
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return newTestGeneration(t), nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, nil); err == nil {
+		func() (ProbeTarget, error) { return stub, nil }, ClientInfo{}, nil); err == nil {
 		t.Fatal("attach 失敗必須回錯")
 	}
 	if _, stops, terms, _ := stub.callCounts(); stops != 0 || terms != 1 {
@@ -499,7 +484,7 @@ func TestGenerationSinkRecordsConnEnvelope(t *testing.T) { // stub 的 sink 走�
 	var single Single[*GenerationOwner]
 	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, nil); err != nil {
+		func() (ProbeTarget, error) { return stub, nil }, ClientInfo{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := gen.Err(); err != nil {
