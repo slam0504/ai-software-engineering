@@ -20,7 +20,7 @@
 - **不得有向後依賴**：任何 task 的測試與實作只能使用**已完成 task** 提供的符號。撰寫 task 時逐一核對 Interfaces 的 Consumes 欄。
 - **Wails 綁定的兩條規則**：
   1. **純新增的 binding**（`CreateSession`／`RemoveSession`／`LoadTurnsBefore`）在**新增它的那個 task 內**完成四件事：重生 `frontend/wailsjs` → 更新 `frontend/src/lib/bindings.ts` 逐參數轉發 → 更新 `frontend/src/types.ts` → 補 `bindings.test.ts` 轉發斷言。
-  2. **改簽名的 binding**（`StartSession`／`SendMessage`／`EndSession`／`NewSession` 由 provider 改 WSID）**不得中途切換**——後端在 Task 9 之後保留一層 provider-keyed exported 包裝（內部解析到 legacy WSID），前端維持原呼叫；直到 Task 25 才**原子地**同時切換後端 exported 簽名、`wailsjs`、adapter、`types.ts` 與 session store，並刪除包裝層。
+  2. **改簽名的 binding**（`StartSession`／`SendMessage`／`EndSession`／`NewSession` 由 provider 改 WSID）**不得中途切換**——後端在 Task 9 之後保留一層 provider-keyed exported 包裝（內部解析到 legacy WSID），前端維持原呼叫；直到 Task 26 才**原子地**同時切換後端 exported 簽名、`wailsjs`、adapter、`types.ts` 與 session store，並刪除包裝層。
   （`bindings.ts:9-12` 記載 M1.5 P1-1 的真 bug：單參數 adapter 把 provider 名當訊息送出，元件 mock 抓不到。）
 - **凍結常數不可設定**：`MaxSessionsPerProvider = 4`（§1.1）；`MaxCatchUpBytes`／`MaxCatchUpRecords`／`MaxCatchUpAttempts`（Task 19）皆為具名 Go 常數，**不進 config、不讀環境變數**。
 - **事件權威唯一**：`events.jsonl` append-only、完整不裁切；registry 與 replay index 都是快取／metadata（§3.2.7、§3.5.10）。
@@ -112,6 +112,14 @@ func main() {
 	}))
 	must(srv.Handshake(ctx, codex.ClientInfo{Name: "probe-codex-parallel"}))
 
+	// (b) 受控 approval turn **先跑**——server 必須仍活著才能開 thread。
+	//     -force 會在 (a) 途中終止 server，故此項一律排在並行段之前。
+	appr := runTurnDenyingApprovals(ctx, srv, mustStartThread(ctx, srv),
+		promptApproval, turnTimeout, approvalPolicy)
+	if _, err := os.Stat(filepath.Join(tmp, "probe-approval.txt")); err == nil {
+		fatal("NO-GO: 核可被拒仍寫入檔案")
+	}
+
 	// (a) 兩 thread 並行送 turn
 	thA, thB := mustStartThread(ctx, srv), mustStartThread(ctx, srv)
 	var wg sync.WaitGroup
@@ -123,14 +131,10 @@ func main() {
 			res[i] = runTurn(ctx, srv, th, p, turnTimeout, approvalPolicy)
 		}(i, pair.th, pair.prompt)
 	}
-	if *force { // 強制收尾：不等 turn 完成
+	if *force { // 強制收尾：不等 turn 完成（只影響 (a) 與 (c)，approval 已驗完）
 		srv.Terminate()
 	}
 	wg.Wait()
-
-	// (b) 受控 approval turn：一律拒絕，只為取得 approval request frame
-	appr := runTurnDenyingApprovals(ctx, srv, mustStartThread(ctx, srv),
-		promptApproval, turnTimeout, approvalPolicy)
 
 	report(res, appr, wireLog.Name())
 
@@ -140,11 +144,10 @@ func main() {
 	_ = srv.StopRecording()
 	must(wireLog.Close())
 	fmt.Printf("exit_code=%d stderr_tail=%q\n", exit.Code, exit.StderrTail)
-	if _, err := os.Stat(filepath.Join(tmp, "probe-approval.txt")); err == nil {
-		fatal("NO-GO: 核可被拒仍寫入檔案")
-	}
 }
 ```
+
+**兩次執行的判定聚合（凍結）**：`-force` 那次仍會跑 approval turn（它排在終止之前），但若因終止時序導致該項無結論，**以 natural run 的 (b) 結果為準**；(a) 以 natural run 為準、(c) 需**兩次都通過**。最終 GO 是兩次結果的聚合，spike 文件必須分別記錄。
 
 - [ ] **Step 3: 執行兩種收尾並蒐證**
 
@@ -815,7 +818,7 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 
 ## Phase 2 — App ownership additive migration
 
-> **遷移紀律**：Task 7 只**加** `sessionHosts`；Task 8 遷完 Claude 才刪 Claude 單例；Task 9 遷完 Codex 才刪其餘單例與 Manager 相容入口。**exported Wails binding 的簽名在本 phase 完全不變**（Task 9 保留 provider-keyed 包裝層，Task 25 才原子切換）。
+> **遷移紀律**：Task 7 只**加** `sessionHosts`；Task 8 遷完 Claude 才刪 Claude 單例；Task 9 遷完 Codex 才刪其餘單例與 Manager 相容入口。**exported Wails binding 的簽名在本 phase 完全不變**（Task 9 保留 provider-keyed 包裝層，Task 26 才原子切換）。
 
 ### Task 7: `sessionHosts` registry（additive）
 
@@ -872,7 +875,7 @@ func TestSnapshotHostsIsRaceFree(t *testing.T) {
 - Consumes: Task 7 `sessionHost`、Task 3 `...WS` 方法。
 - Produces: `func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (func(accepted bool), error)`；`pumpApprovals(h *sessionHost)`；socket `approval-<wsid>.sock`、mcp `mcp-<wsid>.json`。
 - **刪除**：`App.broker`／`claudeSess`／`claudeSessionID`／`claudePumpDone`／`claudeLease`／`claudeTeardownFn`。
-- **不變**：exported `StartSession(provider, …)`／`SendMessage(provider, …)`／`EndSession(provider)` 簽名——內部透過 `a.legacyWSIDFor(provider)` 解析（Task 25 刪除）。
+- **不變**：exported `StartSession(provider, …)`／`SendMessage(provider, …)`／`EndSession(provider)` 簽名——內部透過 `a.legacyWSIDFor(provider)` 解析（Task 26 刪除）。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -923,7 +926,9 @@ func TestNoClaudeSingletonFieldsRemain(t *testing.T) {
 }
 
 func TestExportedBindingSignatureUnchanged(t *testing.T) {
-	// exported binding 在 Task 25 之前不得改簽名，否則前端會在中途壞掉
+	// exported binding 在 Task 26 的原子切換之前不得改簽名，否則前端會中途壞掉
+	a := newTestApp(t)
+	mustStartClaude(t, a, mustCreate(t, a, "claude"))
 	m, _ := reflect.TypeOf(&App{}).MethodByName("SendMessage")
 	if got := m.Type.In(1).Kind(); got != reflect.String {
 		t.Fatalf("SendMessage 第一參數型別不得改變：%v", got)
@@ -961,7 +966,7 @@ func appcore.EndSessionFlow(m *Manager, w WSID, busyCheck func() bool, teardown 
   3. `appcore.EndSessionFlow` 的 `p contract.Provider` 參數（`pump.go:69`）
   4. `app.go` 內約 24 處 provider-keyed Manager 呼叫（`Emit`×7、`RejectSubmit`×6、`AcceptSubmit`×4、`FinishReset`／`FinishEndSession`／`CancelEndSession`／`BeginSubmit`／`BeginReset`／`BeginNewSessionSubmit`／`BeginEndSession` 各 1）
   5. `internal/appcore/manager_test.go`（1254 行）與 `manager_workspace_test.go` 的全部呼叫點——**語意不得減少**，只改取得 WSID 的方式（`Reserve`＋`Commit`）
-- **保留到 Task 25**：`a.legacyWSIDFor(provider)` 與 provider-keyed exported binding 包裝層。
+- **保留到 Task 26**：`a.legacyWSIDFor(provider)` 與 provider-keyed exported binding 包裝層。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1151,9 +1156,11 @@ func TestForReturnsCopy(t *testing.T) {
 
 - [ ] **Step 5: Commit** — `git commit -m "feat(wirelog): []SegmentRef 跨 generation 有序歸屬（§3.4.4）"`
 
-### Task 12: `GenerationOwner`＋死亡自動 finalize（production 路徑）
+### Task 12: `GenerationOwner`＋死亡自動 finalize（新增入口，不動舊 probe）
 
-**Files:** Create `internal/codex/owner.go`；Modify `internal/codex/single.go`／`probe.go:24-71`；Test `internal/codex/owner_test.go`
+**Files:** Create `internal/codex/owner.go`；Modify `internal/codex/single.go`（**只加方法**）；Test `internal/codex/owner_test.go`
+
+> **additive 紀律**：現行 `RunHandshakeProbe`（probe-scoped）與 `App.codexSingle codex.Single[*codex.Server]`（`app.go:78`）**本 task 完全不動**——否則 `RestartCodexServerRecorded` 會編譯失敗。本 task 只新增 owner 版入口與 `Single` 的兩個方法；App 的 ownership 型別遷移與舊入口刪除在 **Task 13**。
 
 **Interfaces:**
 - Produces:
@@ -1166,17 +1173,23 @@ func (o *GenerationOwner) Done() <-chan struct{} { return o.Server.Done() } // �
 func (o *GenerationOwner) FinalizeWith(stage error) error                   // 冪等
 func (o *GenerationOwner) Finalized() bool
 
-// Single 新增：只有目前持有者仍是 want 時才取出——防止 stale reaper 清掉
-// 已被 replacement 取代的新 generation。
-func (s *Single[T]) CompareAndTake(want T) bool
+// Single 新增（additive；不改 `T Alive` 約束——泛型值不可直接用 == 比較，
+// 故以單調 epoch 辨識持有者，避免加上 comparable 約束而牽動既有實例化）：
+func (s *Single[T]) Epoch() uint64                    // 目前持有者的 epoch（無持有者=0）
+func (s *Single[T]) CompareAndTakeEpoch(e uint64) (T, bool) // 僅當 epoch 相符才取出
 
-// production 死亡收尾：發布 owner 後立即啟動；Done() 關閉即 CompareAndTake →
-// FinalizeWith。呼叫端不需手動收尾。
-func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, onFinalized func(error))
+// production 死亡收尾：發布 owner 後立即啟動。Done() 關閉 → CompareAndTakeEpoch
+// → FinalizeWith。**無論是否仍為 active 持有者都會 finalize 自己的 generation，
+// 且一律呼叫 onFinalized**（wasActive 標示是否仍是當時的持有者）——測試才能在
+// stale 分支等到 callback 而不卡住。
+func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint64,
+	onFinalized func(err error, wasActive bool))
 
-func RunHandshakeProbe(ctx context.Context, single *Single[*GenerationOwner],
+// owner 版入口（新增；handoff 語意內建）。舊的 RunHandshakeProbe 維持原簽名
+// 與 probe-scoped 行為，Task 13 遷完 App 後才刪。
+func RunOwnedHandshake(ctx context.Context, single *Single[*GenerationOwner],
 	newGen func() (*wirelog.Generation, error), start func() (probeTarget, error),
-	ci ClientInfo, handoff bool) error
+	ci ClientInfo, onFinalized func(err error, wasActive bool)) error
 ```
 
 - [ ] **Step 1: 失敗測試——production 路徑，測試不得手動 finalize**
@@ -1186,16 +1199,19 @@ func TestServerDeathAutoFinalizesGeneration(t *testing.T) {
 	stub := newStubServer()
 	var single Single[*GenerationOwner]
 	gen := newTestGeneration(t)
-	finalized := make(chan error, 1)
-	if err := RunHandshakeProbeWithWatch(context.Background(), &single,
+	finalized := make(chan bool, 1) // wasActive
+	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, true,
-		func(err error) { finalized <- err }); err != nil {
+		func() (probeTarget, error) { return stub, nil }, ClientInfo{},
+		func(_ error, wasActive bool) { finalized <- wasActive }); err != nil {
 		t.Fatal(err)
 	}
 	stub.die() // 只做這件事——不得由測試呼叫 FinalizeWith
 	select {
-	case <-finalized:
+	case wasActive := <-finalized:
+		if !wasActive {
+			t.Fatal("死亡時仍是 active 持有者，wasActive 應為 true")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Done() 關閉後必須由 production reaper 自動 finalize（§3.4.2）")
 	}
@@ -1211,18 +1227,18 @@ func TestReplacementWaitsForOldGenerationFinalize(t *testing.T) {
 	old := newStubServer()
 	var single Single[*GenerationOwner]
 	oldGen := newTestGeneration(t)
-	_ = RunHandshakeProbe(context.Background(), &single,
+	_ = RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return oldGen, nil },
-		func() (probeTarget, error) { return old, nil }, ClientInfo{}, true)
+		func() (probeTarget, error) { return old, nil }, ClientInfo{}, func(error, bool) {})
 
 	var order []string
 	newGen := newTestGeneration(t)
 	newGen.OnCreateForTest(func() { order = append(order, "new_gen_created") })
 	oldGen.OnFinalizeForTest(func() { order = append(order, "old_finalized") })
 
-	_ = RunHandshakeProbe(context.Background(), &single,
+	_ = RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return newGen, nil },
-		func() (probeTarget, error) { return newStubServer(), nil }, ClientInfo{}, true)
+		func() (probeTarget, error) { return newStubServer(), nil }, ClientInfo{}, func(error, bool) {})
 
 	if len(order) < 2 || order[0] != "old_finalized" {
 		t.Fatalf("replacement 必須等舊 generation finalize 完才發布：%v", order)
@@ -1233,27 +1249,49 @@ func TestStaleReaperDoesNotClearNewGeneration(t *testing.T) {
 	oldSrv := newStubServer()
 	var single Single[*GenerationOwner]
 	oldGen := newTestGeneration(t)
-	oldReaperReleased := make(chan struct{})
-	_ = RunHandshakeProbeWithWatch(context.Background(), &single,
+	staleDone := make(chan bool, 1) // wasActive
+	_ = RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return oldGen, nil },
-		func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{}, true,
-		func(error) { close(oldReaperReleased) })
+		func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{},
+		func(_ error, wasActive bool) { staleDone <- wasActive })
 
-	// 先以 replacement 換掉 owner，之後才讓舊 server 死亡
+	// 先以 replacement 換掉 owner（epoch 遞增），之後才讓舊 server 死亡
 	newSrv, newGen := newStubServer(), newTestGeneration(t)
-	_ = RunHandshakeProbe(context.Background(), &single,
+	_ = RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return newGen, nil },
-		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, true)
+		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, func(error, bool) {})
 
 	oldSrv.die()
-	<-oldReaperReleased
+	select { // stale 分支同樣會呼叫 onFinalized，測試不會卡住
+	case wasActive := <-staleDone:
+		if wasActive {
+			t.Fatal("已被 replacement 取代，wasActive 應為 false")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale reaper 也必須呼叫 onFinalized")
+	}
 
 	o, ok := single.Take()
 	if !ok || o.Generation != newGen {
-		t.Fatal("stale reaper 不得清掉新 generation（CompareAndTake 必須回 false）")
+		t.Fatal("stale reaper 不得清掉新 generation（CompareAndTakeEpoch 必須回 false）")
 	}
 	if newGen.Finalized() {
 		t.Fatal("新 generation 不得被舊 reaper finalize")
+	}
+}
+
+func TestOldProbeEntryPointUnchanged(t *testing.T) {
+	// 舊 probe-scoped 入口在 Task 13 之前必須維持原簽名與原行為，
+	// 否則 App.codexSingle（Single[*codex.Server]）與 B1 呼叫點會編譯失敗
+	stub := newStubServer()
+	var single Single[*stubServer]
+	if err := RunHandshakeProbe(context.Background(), &single,
+		func() (*recorder.Recorder, error) { return newTestRecorder(t), nil },
+		func() (*stubServer, error) { return stub, nil }, ClientInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	if stub.stopRecordingCalls != 1 {
+		t.Fatalf("舊入口必須維持 probe-scoped（成功時 StopRecording）：%d", stub.stopRecordingCalls)
 	}
 }
 
@@ -1272,14 +1310,14 @@ func TestThreeStageFailuresDisposeAndKeepEvidence(t *testing.T) {
 			c.setup(stub)
 			var single Single[*GenerationOwner]
 			gen := newTestGeneration(t)
-			err := RunHandshakeProbe(context.Background(), &single,
+			err := RunOwnedHandshake(context.Background(), &single,
 				func() (*wirelog.Generation, error) { return gen, nil },
 				func() (probeTarget, error) {
 					if stub.startErr != nil {
 						return nil, stub.startErr
 					}
 					return stub, nil
-				}, ClientInfo{}, true)
+				}, ClientInfo{}, func(error, bool) {})
 			if err == nil {
 				t.Fatal("失敗階段必須回錯")
 			}
@@ -1305,10 +1343,10 @@ func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 	stub.onBeginRecording = func() { order = append(order, "attach") }
 	var single Single[*GenerationOwner]
 	gen := newTestGeneration(t)
-	if err := RunHandshakeProbe(context.Background(), &single,
+	if err := RunOwnedHandshake(context.Background(), &single,
 		func() (*wirelog.Generation, error) { order = append(order, "gen_id"); return gen, nil },
 		func() (probeTarget, error) { order = append(order, "start"); return stub, nil },
-		ClientInfo{}, true); err != nil {
+		ClientInfo{}, func(error, bool) {}); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(order, []string{"gen_id", "start", "attach"}) {
@@ -1324,17 +1362,37 @@ func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 
 - [ ] **Step 3: 實作**
 
-`Single.CompareAndTake(want T) bool`：鎖內比對 `s.cur == want`（指標相等）才取出。`WatchGeneration` 起一個 goroutine：`<-o.Done()` → `if s.CompareAndTake(o) { err := o.FinalizeWith(errServerDied); onFinalized(err) }`；若 `CompareAndTake` 回 false（已被 replacement 取代），**仍要 finalize 自己的 generation**但不動 Single。`RunHandshakeProbe` 在 `WithExclusive` 內先 `cur.FinalizeWith(nil)` 收舊 owner，再建新 generation → start → attach → handshake → 發布，並在發布後啟動 `WatchGeneration`。
+`Single` 新增 `epoch uint64`，每次成功發布（`WithExclusive` 回 `keep=true` 或 `Ensure` 建立）時遞增；`CompareAndTakeEpoch(e)` 在鎖內比對 `s.epoch == e && s.ok` 才取出。**不改 `T Alive` 約束**——泛型值不能直接 `==`，加 `comparable` 會牽動既有 `Single[*Server]`／`Single[*stubAlive]` 實例化。
 
-- [ ] **Step 4: 全綠＋競態穩定** — `go test ./internal/codex/ -race -count=30` → PASS
+```go
+func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint64,
+	onFinalized func(err error, wasActive bool)) {
+	go func() {
+		<-o.Done()
+		_, wasActive := s.CompareAndTakeEpoch(epoch) // false＝已被 replacement 取代
+		err := o.FinalizeWith(errServerDied)         // 兩種情況都要 finalize 自己的 generation
+		if onFinalized != nil {
+			onFinalized(err, wasActive) // 一律呼叫——stale 分支也要，否則呼叫端會等不到
+		}
+	}()
+}
+```
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(codex): GenerationOwner＋死亡自動 finalize reaper＋CompareAndTake 防 stale（§3.4.2／§3.4.7）"`
+`RunOwnedHandshake` 在 `WithExclusive` 內：先 `cur.FinalizeWith(nil)` 收舊 owner → 建新 generation（`wire_log_id` 前置配置）→ start → attach → handshake → 發布，取得新 epoch 後啟動 `WatchGeneration`。**舊 `RunHandshakeProbe` 一行不動。**
+
+- [ ] **Step 4: 全綠＋競態穩定** — `go vet ./... && go test -race ./... -count=1` 並 `go test ./internal/codex/ -race -count=30` → PASS
+
+- [ ] **Step 5: Commit** — `git commit -m "feat(codex): GenerationOwner＋死亡自動 finalize reaper＋epoch CompareAndTake 防 stale（additive，§3.4.2／§3.4.7）"`
 
 ### Task 13: recorder error latch＋in-process 受控復原
 
-**Files:** Modify `app.go:4456-4505`；Test `app_wirelog_latch_test.go`
+**Files:** Modify `app.go:78`（`codexSingle` 型別）、`app.go:4456-4505`（`RestartCodexServerRecorded`）、`internal/codex/probe.go`（刪舊入口）；Test `app_wirelog_latch_test.go`
 
-**Interfaces:** Consumes Task 12。Produces `wireLatched`／`latchWireRecorder`／`RecoverCodexRecording`。
+**Interfaces:**
+- Consumes: Task 12 `GenerationOwner`／`RunOwnedHandshake`／`WatchGeneration`。
+- Produces: `wireLatched`／`latchWireRecorder`／`RecoverCodexRecording`。
+- **ownership 型別遷移（本 task 完成）**：`App.codexSingle` 由 `codex.Single[*codex.Server]` 改為 `codex.Single[*codex.GenerationOwner]`；`RestartCodexServerRecorded` 改走 `RunOwnedHandshake`；**遷完才刪** `codex.RunHandshakeProbe` 舊入口與其 probe-scoped 測試（語意由 owner 版測試接手）。
+- `a.codexConn` 的取得改為 `owner.Server`；既有 interrupt／fake-wire 路徑同步。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1411,11 +1469,18 @@ func TestLatchNotifiesOncePerGeneration(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestLatch|TestRecovery' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 與 `RestartCodexServerRecorded` 共用同一段編排（`handoff=true`），全段在 `codexSingle.WithExclusive` 內；latch 以 per-generation `sync.Once` 單次通知；全部成功才解除。
+- [ ] **Step 3: 遷移 ownership 型別** — `App.codexSingle` 改 `codex.Single[*codex.GenerationOwner]`；`RestartCodexServerRecorded` 與 `RecoverCodexRecording` 共用 `RunOwnedHandshake`，全段在 `codexSingle.WithExclusive` 內；latch 以 per-generation `sync.Once` 單次通知；全部成功才解除。
 
-- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
+- [ ] **Step 4: 刪除舊入口並確認無殘留**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(app): recorder error latch＋in-process 受控復原（§3.4.6-7）"`
+```bash
+grep -rn "RunHandshakeProbe\b" --include='*.go' . && echo "舊入口殘留" || echo OK
+grep -rn "Single\[\*codex.Server\]\|Single\[\*Server\]" --include='*.go' . && echo "舊 ownership 型別殘留" || echo OK
+```
+
+- [ ] **Step 5: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
+
+- [ ] **Step 6: Commit** — `git commit -m "feat(app): recorder error latch＋in-process 受控復原＋codexSingle 遷移為 GenerationOwner（§3.4.6-7）"`
 
 ---
 
@@ -2136,11 +2201,15 @@ func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
 // After 是可注入的等待來源；production 傳 RealAfter，測試傳受控 timer。
 type After func(d time.Duration) <-chan time.Time
 func RealAfter(d time.Duration) <-chan time.Time { return time.After(d) }
+
+// **純 additive**：只在參數尾端加 after；回傳型別、ports.Exit、finalize 的
+// error 回傳與 errors.Join 傳播全部維持 pump.go:41-60 現行契約，一字不改。
 func WaitQuiesce(done <-chan struct{}, timeout time.Duration, after After) error
 func CloseSequence(closeFn func() error, done <-chan struct{},
 	quiesceTimeout, killTimeout time.Duration,
-	terminate func() error, wait func() proc.Exit, finalize func(proc.Exit),
-	after After) (proc.Exit, error)
+	terminate func() error, wait func() ports.Exit,
+	finalize func(ports.Exit) error,
+	after After) (ports.Exit, error)
 ```
 
 > 先做這個 task，Task 24 的 bounded-window barrier 才有東西可注入（`pump.go:27` 現在直接用 `time.After`）。
@@ -2181,7 +2250,8 @@ func TestCloseSequenceEscalatesWithInjectedAfter(t *testing.T) {
 	go func() {
 		_, err := CloseSequence(func() error { return nil }, done, time.Second, time.Second,
 			func() error { terminated = true; return nil },
-			func() proc.Exit { return proc.Exit{} }, func(proc.Exit) {}, after)
+			func() ports.Exit { return ports.Exit{} },
+			func(ports.Exit) error { return nil }, after)
 		errC <- err
 	}()
 	quiesce <- time.Time{} // 第一次逾時 → 升級 Terminate
@@ -2194,11 +2264,38 @@ func TestCloseSequenceEscalatesWithInjectedAfter(t *testing.T) {
 		t.Fatalf("必須恰有兩段 bounded window：%d", calls)
 	}
 }
+
+// 錯誤契約回歸：finalize 的 error 必須仍進 errors.Join（pump.go:59-60）
+func TestCloseSequenceStillPropagatesFinalizeError(t *testing.T) {
+	done := make(chan struct{})
+	close(done) // 直接 quiesce 成功，走 wait → finalize 路徑
+	finErr := errors.New("finalize failed")
+	_, err := CloseSequence(func() error { return nil }, done, time.Second, time.Second,
+		func() error { return nil },
+		func() ports.Exit { return ports.Exit{Exited: true, Code: 0} },
+		func(ports.Exit) error { return finErr }, RealAfter)
+	if !errors.Is(err, finErr) {
+		t.Fatalf("finalize error 必須仍回傳並 Join：%v", err)
+	}
+}
+
+// 回傳型別回歸：仍是 ports.Exit，且 wait() 的 cached Exit 原樣回傳
+func TestCloseSequenceReturnsPortsExit(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	want := ports.Exit{Exited: true, Code: 7, StderrTail: "tail"}
+	got, err := CloseSequence(func() error { return nil }, done, time.Second, time.Second,
+		func() error { return nil }, func() ports.Exit { return want },
+		func(ports.Exit) error { return nil }, RealAfter)
+	if err != nil || got != want {
+		t.Fatalf("回傳契約不得改變：%+v %v", got, err)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/appcore/ -run 'TestWaitQuiesceUses|TestCloseSequenceEscalates' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 加參數；`app.go:4176` 傳 `appcore.RealAfter`，並新增 `App.afterFn`（測試可覆寫）。既有 `pump_test.go` 呼叫點同步更新。
+- [ ] **Step 3: 實作** — **只在參數尾端加 `after After`**，`ports.Exit`／`finalize func(ports.Exit) error`／`errors.Join` 傳播順序全部照 `pump.go:41-60` 原樣保留。`app.go:4176` 傳 `appcore.RealAfter`，並新增 `App.afterFn`（測試可覆寫）。既有 `pump_test.go` 呼叫點同步加參數，**斷言一字不改**。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
@@ -2438,13 +2535,47 @@ func TestShutdownFollowsFrozenOrder(t *testing.T) {
 	}
 }
 
-// 8 個卡死 session 必須共用單一 bounded window：
-// 全部 quiesce timer 同時 outstanding → 一次觸發 → 全部升級 → kill timer 同理。
-func TestStuckHostsShareSingleBoundedWindow(t *testing.T) {
+// (1) 8 個 host 的 teardown 必須同時進場——Claude 與 Codex 都算，
+//     但只用 hookTeardownEntered barrier，不假設每個 host 都有 CloseSequence timer。
+func TestAllTeardownsRunConcurrently(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	seedSessions(t, a, 4, 4)
-	for _, h := range a.snapshotHosts() {
-		a.makeHostStuck(h.wsid) // 全部卡死，只能靠 timeout 收斂
+	const n = 8
+	entered := make(chan appcore.WSID, n)
+	release := make(chan struct{})
+	a.hookTeardownEntered = func(w appcore.WSID) { entered <- w; <-release }
+
+	done := make(chan struct{})
+	go func() { a.shutdown(context.Background()); close(done) }()
+	seen := map[appcore.WSID]bool{}
+	for k := 0; k < n; k++ {
+		select {
+		case w := <-entered:
+			seen[w] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("只有 %d 個 teardown 進場——未並行（§3.6.5）", k)
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("應有 8 個相異 host 進場：%d", len(seen))
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown 未收斂")
+	}
+}
+
+// (2) bounded window 只適用「卡死的 Claude」——每個 Claude session 有自己的
+//     子行程與 CloseSequence；Codex 四個 session 共用一個 app-server，
+//     不會、也不該產生 per-host 的 CloseSequence timer（spec §3.6.5 凍結的
+//     情境即「4 個 Claude 卡死時最壞仍為單一 bounded window」）。
+func TestStuckClaudeSessionsShareSingleBoundedWindow(t *testing.T) {
+	a := newTestAppWithFakeWire(t)
+	seedSessions(t, a, 4, 4)
+	for _, h := range a.hostsOf("claude") {
+		a.makeHostStuck(h.wsid)
 	}
 	timers := newFakeAfter() // 記錄每次 After 呼叫並回傳受控 channel
 	a.afterFn = timers.After
@@ -2452,9 +2583,9 @@ func TestStuckHostsShareSingleBoundedWindow(t *testing.T) {
 	done := make(chan struct{})
 	go func() { a.shutdown(context.Background()); close(done) }()
 
-	timers.WaitForOutstanding(t, 8) // 8 個 quiesce timer 同時存在＝teardown 並行
-	timers.FireAll()                // 單一 window
-	timers.WaitForOutstanding(t, 8) // 8 個 kill timer 同時存在
+	timers.WaitForOutstanding(t, 4) // 4 個 quiesce timer 同時存在＝並行且僅 Claude
+	timers.FireAll()
+	timers.WaitForOutstanding(t, 4) // 4 個 kill timer 同時存在
 	timers.FireAll()
 
 	select {
@@ -2463,10 +2594,34 @@ func TestStuckHostsShareSingleBoundedWindow(t *testing.T) {
 		t.Fatal("shutdown 未收斂")
 	}
 	if got := timers.Rounds(); got != 2 {
-		t.Fatalf("卡死者應共用兩段 bounded window（quiesce＋kill），實測 %d 輪＝串行", got)
+		t.Fatalf("應為兩段 bounded window（quiesce＋kill），實測 %d 輪＝串行", got)
+	}
+	if got := timers.TotalCreated(); got != 8 {
+		t.Fatalf("只有 4 個卡死 Claude 各兩段 timer＝8；Codex 不應有 per-host timer：%d", got)
 	}
 	if !a.allHostsTornDown() {
 		t.Fatal("卡死者也必須收斂")
+	}
+}
+
+// (3) Codex：全部 session host 收乾之後，才 terminate／wait 共用 app-server
+func TestCodexSharedServerTerminatedAfterAllHostsDrained(t *testing.T) {
+	a := newTestAppWithFakeWire(t)
+	seedSessions(t, a, 0, 4)
+	var order []string
+	a.hookTeardownDone = func(w appcore.WSID) { order = append(order, "host_done:"+string(w)) }
+	a.hookShutdownStep = func(s string) {
+		if s == "server_terminate_wait" || s == "wirelog_finalize" {
+			order = append(order, s)
+		}
+	}
+	a.shutdown(context.Background())
+	idx := indexOf(order, "server_terminate_wait")
+	if idx < 4 {
+		t.Fatalf("共用 app-server 必須在 4 個 host 全部收乾後才 terminate：%v", order)
+	}
+	if indexOf(order, "wirelog_finalize") < idx {
+		t.Fatalf("wire log 必須在 terminate／wait 之後 finalize（§3.4.2）：%v", order)
 	}
 }
 
@@ -2485,7 +2640,7 @@ func TestIndexAcceptsEventsUntilManagerClose(t *testing.T) {
 
 - [ ] **Step 3: 實作** — 依 §3.6.5 逐行；per-session teardown 用 goroutine＋`WaitGroup`，全部把 `a.afterFn` 傳進 `CloseSequence`。
 
-- [ ] **Step 4: 全綠＋競態穩定** — `go test . -run TestStuckHosts -race -count=30` → PASS（**不得出現真實 5s／10s 等待**）
+- [ ] **Step 4: 全綠＋競態穩定** — `go test . -run 'TestAllTeardowns|TestStuckClaude|TestCodexSharedServer' -race -count=30` → PASS（**不得出現真實 5s／10s 等待**）
 
 - [ ] **Step 5: Commit** — `git commit -m "feat(app): shutdown 總序凍結＋並行 teardown 與單一 bounded window barrier（§3.6.5）"`
 
@@ -2921,7 +3076,18 @@ npm --prefix frontend run test && npm --prefix frontend run build && wails build
 
 ---
 
-## Self-Review 記錄（v3）
+## Self-Review 記錄（v4）
+
+**v3 → v4 修正（四項 P1＋兩項小修）**
+
+| # | 問題 | 修正 |
+|---|---|---|
+| P1-1 | Task 0 的 `-force` 分支會在終止 server 後才跑 approval turn | approval turn 移到並行段**之前**（server 必活著），`-force` 只影響 (a)(c)；新增「兩次執行的判定聚合」凍結段落：(b) 以 natural run 為準、(c) 兩次都須通過 |
+| P1-2 | Task 12 改動 `RunHandshakeProbe` 會讓 App（`Single[*codex.Server]`）編譯失敗；`s.cur == want` 泛型不可比較；stale 分支未呼叫 `onFinalized` 導致測試卡住；`RunHandshakeProbeWithWatch` 未列入契約 | Task 12 改為**純新增** `RunOwnedHandshake`＋`WatchGeneration`，舊 `RunHandshakeProbe` 一行不動並加 `TestOldProbeEntryPointUnchanged` 守門；`CompareAndTake` 改為 **epoch 版**（`Epoch()`／`CompareAndTakeEpoch`），不動 `T Alive` 約束；`onFinalized(err, wasActive)` **兩種分支都呼叫**，stale 測試改等 callback 並斷言 `wasActive==false`；App ownership 型別遷移與舊入口刪除移到 **Task 13**（含 grep 守門） |
+| P1-3 | Task 21 誤把 `ports.Exit` 改成 `proc.Exit`、`finalize` 不再回錯 | 簽名改為**純 additive**（只在尾端加 `after After`），`ports.Exit`／`finalize func(ports.Exit) error`／`errors.Join` 傳播照 `pump.go:41-60` 原樣；新增 `TestCloseSequenceStillPropagatesFinalizeError` 與 `TestCloseSequenceReturnsPortsExit` 兩條契約回歸 |
+| P1-4 | Task 24 把 4 個 Codex session 當成 4 個獨立 `CloseSequence`（共用一個 app-server） | 拆成三條：`TestAllTeardownsRunConcurrently`（8 host 用 `hookTeardownEntered` barrier，不假設 timer）、`TestStuckClaudeSessionsShareSingleBoundedWindow`（只 4 個卡死 Claude → 4 quiesce＋4 kill、`TotalCreated()==8` 斷言 Codex 無 per-host timer）、`TestCodexSharedServerTerminatedAfterAllHostsDrained`（全部 host 收乾才 terminate／wait，wire log 最後 finalize） |
+| 小修 1 | `TestExportedBindingSignatureUnchanged` 用了未宣告的 `a` | 補 `a := newTestApp(t)`＋`mustStartClaude` 前置 |
+| 小修 2 | 多處寫「Task 25 原子切換」，實際是 Task 26 | 全域約束與 Task 8／9 共四處統一為 Task 26 |
 
 **v2 → v3 修正（六項 P1＋兩項 P2）**
 
