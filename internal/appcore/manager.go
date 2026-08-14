@@ -138,9 +138,6 @@ type Manager struct {
 }
 
 func New(cfg Config) *Manager {
-	if cfg.Emit == nil { // 出口未接時退化為 no-op，避免 writeAndEmitLocked nil call
-		cfg.Emit = func(contract.Envelope) {}
-	}
 	return &Manager{cfg: cfg, slots: map[WSID]*slot{}, legacy: map[contract.Provider]WSID{}}
 }
 
@@ -199,8 +196,13 @@ func (m *Manager) CommitCreate(tok CreateToken) error {
 	return nil
 }
 
-// AbortCreate：第三段——建立失敗退回名額。純狀態清理，closed 後仍可執行（供
-// CommitCreate 失敗補償）。
+// AbortCreate：第三段——建立失敗退回名額。
+//
+// 與 CommitCreate 不同，**刻意不檢查 m.closed**：shutdown 期間仍必須能退回
+// reservation，否則「CommitCreate 失敗 → 補償 AbortCreate」這條路徑一旦與 Close
+// 競態，該名額就永久洩漏（slot 留在 map 裡且永遠不會被 commit）。本方法只刪
+// map entry，不 emit、不寫 sink，closed 後執行沒有副作用。Task 4 的建立交易
+// 補償直接依賴這個語意。
 func (m *Manager) AbortCreate(tok CreateToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

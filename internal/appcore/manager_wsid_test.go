@@ -80,7 +80,9 @@ func TestWSIDIsULID(t *testing.T) {
 
 func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	sink := &memSink{}
-	m := New(Config{Sink: sink})
+	// UI 出口不是本測試關心的對象——用 sink 觀察即可；Config.Emit 是必填欄位，
+	// New 不做 nil 退化（避免「忘記接 UI 出口」變成靜默降級），故此處明確接 no-op。
+	m := New(Config{Sink: sink, Emit: func(contract.Envelope) {}})
 	w, tok, _ := m.ReserveSession("claude")
 	if err := m.CommitCreate(tok); err != nil {
 		t.Fatal(err)
