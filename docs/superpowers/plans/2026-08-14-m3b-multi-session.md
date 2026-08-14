@@ -8,7 +8,7 @@
 
 **Tech Stack:** 既有全套（Go 1.26／Wails v2／Vue 3＋Pinia＋vue-i18n／vitest）。無新依賴。
 
-**Spec:** `docs/superpowers/specs/2026-08-14-m3b-multi-session-design.md`（rev4，closure APPROVED 2026-08-14，`b63f168`）。全文 §號皆指該檔。
+**Spec:** `docs/superpowers/specs/2026-08-14-m3b-multi-session-design.md`（rev4，closure review **APPROVED** 2026-08-14，`b63f168`）。全文 §號皆指該檔。
 
 **執行約束**：Subagent-Driven、單一 writer、每 task 主代理 review。**Task 0（Codex 並行 live probe）是實作 gate——判定 NO-GO 即停止實作、退回 spec gate 由 owner 重裁；不得自行改成 provider-wide 串行或多 app-server 等替代架構（§7.2）**。
 
@@ -16,38 +16,32 @@
 
 ## Global Constraints
 
-- **每個 commit 都必須是可執行基線**：`go build ./... && go vet ./... && go test -race ./... -count=1` 在**每個 task 結束時**全綠。改簽名一律用 additive 相容入口（新舊並存）→ 遷呼叫點 → 最後才刪舊入口，**不得留下中間的編譯失敗狀態**。
-- **凍結常數不可設定**：`MaxSessionsPerProvider = 4`（§1.1、§3.1）；replay index 的 `MaxCatchUpBytes`／`MaxCatchUpRecords`／`MaxCatchUpAttempts`（Task 19）皆為具名 Go 常數，**不進 config、不讀環境變數**。
+- **每個 commit 都必須是可執行基線**：`go build ./... && go vet ./... && go test -race ./... -count=1` 在**每個 task 結束時**全綠，且 app 在該 commit 下行為不退化。改簽名一律 additive（新舊並存）→ 遷呼叫點 → 最後才刪舊入口。
+- **不得有向後依賴**：任何 task 的測試與實作只能使用**已完成 task** 提供的符號。撰寫 task 時逐一核對 Interfaces 的 Consumes 欄。
+- **Wails 綁定的兩條規則**：
+  1. **純新增的 binding**（`CreateSession`／`RemoveSession`／`LoadTurnsBefore`）在**新增它的那個 task 內**完成四件事：重生 `frontend/wailsjs` → 更新 `frontend/src/lib/bindings.ts` 逐參數轉發 → 更新 `frontend/src/types.ts` → 補 `bindings.test.ts` 轉發斷言。
+  2. **改簽名的 binding**（`StartSession`／`SendMessage`／`EndSession`／`NewSession` 由 provider 改 WSID）**不得中途切換**——後端在 Task 9 之後保留一層 provider-keyed exported 包裝（內部解析到 legacy WSID），前端維持原呼叫；直到 Task 25 才**原子地**同時切換後端 exported 簽名、`wailsjs`、adapter、`types.ts` 與 session store，並刪除包裝層。
+  （`bindings.ts:9-12` 記載 M1.5 P1-1 的真 bug：單參數 adapter 把 provider 名當訊息送出，元件 mock 抓不到。）
+- **凍結常數不可設定**：`MaxSessionsPerProvider = 4`（§1.1）；`MaxCatchUpBytes`／`MaxCatchUpRecords`／`MaxCatchUpAttempts`（Task 19）皆為具名 Go 常數，**不進 config、不讀環境變數**。
 - **事件權威唯一**：`events.jsonl` append-only、完整不裁切；registry 與 replay index 都是快取／metadata（§3.2.7、§3.5.10）。
 - **event_id 檔案級嚴格遞增**：所有新路徑一律經 `Manager.writeAndEmitLocked` 的單一 mutex（§2）。
-- **Fail loud**：slot 超限、未知 WSID、provider 不符、registry persist 失敗、recorder 寫入失敗、migration persist 失敗一律回錯並顯示；**不靜默降級、不自動刪 session**。
+- **Fail loud**：slot 超限、未知 WSID、provider 不符、registry persist 失敗、recorder 寫入失敗、migration persist 失敗一律回錯並顯示。
 - **無閒置回收**：只有使用者明確「關閉／移除」才釋放名額（§1 Slot 語意）。
-- **Barrier 測試不得依賴 `time.Sleep`**：一律用 `hook*` 注入點或 channel barrier（沿 `app.go:96-107` 慣例）；併發測試一律 `-race`，關鍵競態測試另跑 `-count=30`。
-- **Wails binding 契約**：任何新增／改簽名的 binding 都必須同 task 完成「重生 `frontend/wailsjs` → 更新 `frontend/src/lib/bindings.ts` 逐參數轉發 → 更新 `frontend/src/types.ts` → 補 `bindings.test.ts` 轉發斷言」四件事（`bindings.ts:9-12` 記載 M1.5 P1-1 單參數轉發造成的真 bug，元件 mock 抓不到）。
-- **i18n**：新 UI 字串進 `zh-TW`＋`en` 雙 locale、key parity 測試綠、台灣慣用語；契約值（provider 名、WSID、event kind）維持原文。
+- **Barrier 測試不得依賴 `time.Sleep` 或真實 timeout**：一律用 `hook*` 注入點、channel barrier 或可注入的 `After`；併發測試 `-race`，關鍵競態另跑 `-count=30`。
+- **i18n**：新 UI 字串進 `zh-TW`＋`en` 雙 locale、key parity 測試綠；契約值（provider 名、WSID、event kind）維持原文。
 - **收尾 gate**：`go vet ./...`／`go test -race ./... -count=1`／`npm --prefix frontend run test`／`npm --prefix frontend run build`／`wails build`。
 
 ---
 
 ## File Structure
 
-**新增 Go 套件：**
-- `internal/wsregistry/` — `workspace-sessions.json` 的唯一 ownership：durable metadata 白名單、schema v2、legacy 遷移 marker、tombstone。
-- `internal/replayindex/` — per-WSID turn index、checkpoint、degraded latch、損壞分級、runtime 重建收斂。
-- `internal/wirelog/` — Codex connection-wide wire log：generation、frame index、`SegmentRef`。
-- `cmd/probe-codex-parallel/` — Task 0 的可重現 live probe driver。
+**新增 Go：** `internal/wsregistry/`（durable metadata store＋legacy 遷移）、`internal/replayindex/`（turn index／degraded／損壞分級／runtime 重建）、`internal/wirelog/`（generation／frame index／`SegmentRef`）、`cmd/probe-codex-parallel/`（Task 0 driver）、`session_host.go`、`rebuild_orchestrator.go`。
 
-**修改 Go：**
-- `internal/appcore/manager.go` — per-WSID slot registry、三段建立交易、legacy 相容入口（Task 9 刪除）。
-- `internal/appcore/sink.go` — `AuditSink.Write` 回傳 `AppendReceipt`。
-- `internal/contract/envelope.go` — 新增 `WorkspaceSessionID`。
-- `internal/codex/single.go`／`probe.go`／`session.go` — `codexGenerationOwner` ownership 型別、recorder 交棒。
-- `app.go` — `sessionHosts` registry、per-WSID socket／mcp、Codex dispatcher、approval WSID 路由、shutdown 總序、啟動修復序列、rebuild 編排。
-- `restore.go` — legacy 遷移來源（唯讀）。
+**修改 Go：** `internal/appcore/manager.go`（per-WSID registry＋相容入口）、`internal/appcore/sink.go`（`AppendReceipt`）、`internal/appcore/pump.go`（`EndSessionFlow` WSID 化、`WaitQuiesce`／`CloseSequence` 可注入 `After`）、`internal/contract/envelope.go`、`internal/codex/{single,probe,session,owner}.go`、`app.go`、`restore.go`。
 
-**前端：** 新增 `SessionList.vue`／`PaneView.vue`／`DualPane.vue`＋測試；修改 `stores/session.ts`、`lib/bindings.ts`、`types.ts`、`App.vue`、`SettingsBar.vue`、`StatusBar.vue`、`ApprovalDialog.vue`、雙 locale。
+**前端：** 新增 `SessionList.vue`／`PaneView.vue`／`DualPane.vue`＋測試；修改 `stores/session.ts`、`lib/bindings.ts`、`types.ts`、`App.vue`、`SettingsBar.vue`、`StatusBar.vue`、雙 locale。
 
-**文件：** `docs/spikes/m3b-codex-parallel.md`（Task 0）、`docs/spikes/m3b-results.md`（Task 31）。
+**文件：** `docs/spikes/m3b-codex-parallel.md`（Task 0）、`docs/spikes/m3b-results.md`（Task 30）。
 
 ---
 
@@ -56,55 +50,69 @@
 ### Task 0: Codex 單 app-server 多 thread 並行 live probe（NO-GO gate）
 
 **Files:**
-- Create: `cmd/probe-codex-parallel/main.go`
-- Create: `docs/spikes/m3b-codex-parallel.md`
+- Create: `cmd/probe-codex-parallel/main.go`、`docs/spikes/m3b-codex-parallel.md`
 
 **Interfaces:**
-- Produces: 可重現的 probe driver＋GO/NO-GO 判定。**GO** → Phase 1 起可執行；**NO-GO** → 停止實作、退回 spec gate（§7.2）。
-- **判定範圍（凍結）**：只判 (a) 兩 thread 並行 turn 是否真並行、(b) notification／approval 是否帶足以歸屬 thread 的欄位、(c) 關閉語意是否可控。**`completed-before-response` 不列入 live probe 判定**——它是 host 對惡意／異常順序的容錯，真 server 不一定自然產生；該保證改由 Task 9 的 fake-wire malicious-order 測試鎖住。
+- Consumes: 既有 `codex.StartAppServer(ctx, codex.Config{Binary, CWD, Env, TermGrace})`（`internal/codex/session.go:26`）、`Server.BeginRecording`／`Handshake`／`Terminate`／`Wait`／`StopRecording`。
+- Produces: 可重現的 probe driver＋GO/NO-GO 判定。
+- **判定範圍（凍結）**：(a) 兩 thread 並行 turn 是否**真並行**、(b) notification **與 approval request** 是否帶足以歸屬的 thread／turn identity、(c) 自然與強制兩種收尾是否 bounded 收斂且錄到最後一筆 frame。**`completed-before-response` 不列入**——它是 host 對惡意／異常順序的容錯，真 server 不一定自然產生；改由 Task 9 的 fake-wire 測試鎖住。
 
 - [ ] **Step 1: 驗 bundled binary 與 pin 版本**
 
 ```bash
-./scripts/check-cli.sh          # 驗 tools/codex-cli 的 pin 版本＋輸出 sha256
+./scripts/check-cli.sh          # 驗 tools/codex-cli pin 版本並輸出 sha256
 CODEX_BIN="$(git rev-parse --show-toplevel)/tools/codex-cli/node_modules/.bin/codex"
 test -x "$CODEX_BIN" || { echo "NO-GO: bundled codex binary 不存在或不可執行"; exit 1; }
 ```
 
-輸出的版本與 sha256 逐字記進 spike 文件。**不得用 grep 猜版本**。
+版本與 sha256 逐字記進 spike 文件。**不得用 grep 猜版本**。
 
 - [ ] **Step 2: 寫 probe driver**
 
-`cmd/probe-codex-parallel/main.go`——用 `internal/codex` 的 production 型別（`Server`／`Conn`／`ThreadRunner`），凍結下列參數：
+`cmd/probe-codex-parallel/main.go`——binary 路徑由旗標傳入，全部走 production API：
 
 ```go
+var (
+	codexBin = flag.String("codex-bin", "", "bundled codex binary 路徑（必填）")
+	force    = flag.Bool("force", false, "強制收尾分支：turn 進行中直接 Terminate")
+)
+
+// 凍結參數
 const (
-	probeTimeout   = 90 * time.Second // 整體上限
-	turnTimeout    = 60 * time.Second // 單一 turn 上限
-	approvalPolicy = "untrusted"      // 凍結：與 production 預設一致
-	promptA        = "請只回覆字串 PROBE_A_DONE，不要使用任何工具。"
-	promptB        = "請只回覆字串 PROBE_B_DONE，不要使用任何工具。"
+	probeTimeout    = 90 * time.Second
+	turnTimeout     = 60 * time.Second
+	approvalPolicy  = "untrusted" // 凍結：與 production 預設一致，確保會觸發核可
+	promptA         = "請只回覆字串 PROBE_A_DONE，不要使用任何工具。"
+	promptB         = "請只回覆字串 PROBE_B_DONE，不要使用任何工具。"
+	// 第三個 turn 刻意觸發核可——(b) 的 approval 歸屬必須有實際 frame 才能驗
+	promptApproval  = "請在目前工作目錄建立檔案 probe-approval.txt，內容為 PROBE。"
 )
 
 func main() {
-	tmp, err := os.MkdirTemp("", "probe-codex-*")   // 隔離工作目錄
+	flag.Parse()
+	if *codexBin == "" {
+		fatal("必須以 -codex-bin 指定 bundled binary")
+	}
+	tmp, err := os.MkdirTemp("", "probe-codex-*")
 	must(err)
-	defer os.RemoveAll(tmp)                          // 清理
+	defer os.RemoveAll(tmp)
 
 	wireLog, err := os.Create(filepath.Join(tmp, "wire.jsonl"))
 	must(err)
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
-	srv, err := codex.Start(ctx, codexBin, tmp)      // production 啟動路徑
+	srv, err := codex.StartAppServer(ctx, codex.Config{
+		Binary: *codexBin, CWD: tmp, TermGrace: 5 * time.Second,
+	})
 	must(err)
-	must(srv.BeginRecording(func(b []byte) error {   // 全程錄流＝證據
+	must(srv.BeginRecording(func(b []byte) error { // 全程錄流即證據
 		_, werr := fmt.Fprintf(wireLog, "%s\n", b)
 		return werr
 	}))
 	must(srv.Handshake(ctx, codex.ClientInfo{Name: "probe-codex-parallel"}))
 
-	// 兩 thread 並行送 turn
+	// (a) 兩 thread 並行送 turn
 	thA, thB := mustStartThread(ctx, srv), mustStartThread(ctx, srv)
 	var wg sync.WaitGroup
 	res := make([]turnResult, 2)
@@ -115,35 +123,45 @@ func main() {
 			res[i] = runTurn(ctx, srv, th, p, turnTimeout, approvalPolicy)
 		}(i, pair.th, pair.prompt)
 	}
+	if *force { // 強制收尾：不等 turn 完成
+		srv.Terminate()
+	}
 	wg.Wait()
 
-	report(res, wireLog.Name())                      // 逐項 (a)(b)(c) 判定
-	// 自然收尾：先 Terminate → Wait → StopRecording → Close
+	// (b) 受控 approval turn：一律拒絕，只為取得 approval request frame
+	appr := runTurnDenyingApprovals(ctx, srv, mustStartThread(ctx, srv),
+		promptApproval, turnTimeout, approvalPolicy)
+
+	report(res, appr, wireLog.Name())
+
+	// (c) 收尾：Terminate → Wait → StopRecording → Close
 	_ = srv.Terminate()
 	exit := srv.Wait()
 	_ = srv.StopRecording()
 	must(wireLog.Close())
 	fmt.Printf("exit_code=%d stderr_tail=%q\n", exit.Code, exit.StderrTail)
+	if _, err := os.Stat(filepath.Join(tmp, "probe-approval.txt")); err == nil {
+		fatal("NO-GO: 核可被拒仍寫入檔案")
+	}
 }
 ```
-
-**強制收尾分支**：driver 支援 `-force` 旗標——在兩 turn 進行中直接 `Terminate` 不等 turn 完成，用來觀察關閉期間的最後 frame 是否仍被錄到（§3.4.2 的前提）。
 
 - [ ] **Step 3: 執行兩種收尾並蒐證**
 
 ```bash
-go run ./cmd/probe-codex-parallel            2>&1 | tee /tmp/probe-natural.log
-go run ./cmd/probe-codex-parallel -force     2>&1 | tee /tmp/probe-forced.log
+CODEX_BIN="$(git rev-parse --show-toplevel)/tools/codex-cli/node_modules/.bin/codex"
+go run ./cmd/probe-codex-parallel -codex-bin "$CODEX_BIN"        2>&1 | tee /tmp/probe-natural.log
+go run ./cmd/probe-codex-parallel -codex-bin "$CODEX_BIN" -force 2>&1 | tee /tmp/probe-forced.log
 ```
 
-逐項記錄：
-- **(a) 真並行**：兩 turn 的 wire frame 是否時間上交錯（非 A 全部完成才出現 B 的 frame）。若被 server 串行化或第二 thread 被拒 → **NO-GO**。
-- **(b) 可歸屬**：每筆 notification／approval 是否帶 `threadID` 或 `turnID`，不靠抵達順序即可歸屬。任一類事件無法歸屬 → **NO-GO**。
-- **(c) 關閉語意**：natural 與 forced 兩種收尾下，`Terminate → Wait` 是否 bounded 收斂、wire log 是否錄到最後一筆 frame。不收斂 → **NO-GO**。
+**GO 條件（全部成立才 GO）：**
+- **(a)** 兩 turn 的 wire frame 時間上交錯（非 A 全部完成才出現 B）。被串行化或第二 thread 被拒 → **NO-GO**。
+- **(b)** notification **與 approval request** 都帶 `threadID` 或 `turnID`，不靠抵達順序即可歸屬。**未觀察到任何 approval request，或 request 缺 thread/turn identity → NO-GO**（不得因「兩個 prompt 都不用工具」而略過此項——第三個 turn 就是為此設計）。
+- **(c)** natural 與 forced 兩種收尾都 bounded 收斂，wire log 錄到最後一筆 frame。
 
 - [ ] **Step 4: 寫 spike 記錄**
 
-`docs/spikes/m3b-codex-parallel.md`：CLI 版本＋sha256、完整凍結參數、兩次執行的 wire 節錄（交錯證據）、(a)(b)(c) 逐項判定與理由、GO/NO-GO。**如實記錄失敗**。
+`docs/spikes/m3b-codex-parallel.md`：CLI 版本＋sha256、完整凍結參數、兩次執行的 wire 節錄（交錯證據、approval request 原文）、(a)(b)(c) 逐項判定與理由、GO/NO-GO。**如實記錄失敗**。
 
 - [ ] **Step 5: Commit**
 
@@ -159,12 +177,9 @@ git commit -m "docs(spike): M3b Codex 多 thread 並行 live probe driver＋GO/N
 
 ### Task 1: `contract.Envelope` 新增 `workspace_session_id`
 
-**Files:**
-- Modify: `internal/contract/envelope.go:71-96`
-- Test: `internal/contract/envelope_test.go`
+**Files:** Modify `internal/contract/envelope.go:71-96`；Test `internal/contract/envelope_test.go`
 
-**Interfaces:**
-- Produces: `Envelope.WorkspaceSessionID string \`json:"workspace_session_id,omitempty"\``。
+**Interfaces:** Produces `Envelope.WorkspaceSessionID string \`json:"workspace_session_id,omitempty"\``。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -188,7 +203,7 @@ func TestEnvelopeCarriesWorkspaceSessionID(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/contract/ -run TestEnvelopeCarriesWorkspaceSessionID -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/contract/ -run TestEnvelopeCarries -v` → FAIL
 
 - [ ] **Step 3: 加欄位**
 
@@ -201,41 +216,26 @@ func TestEnvelopeCarriesWorkspaceSessionID(t *testing.T) {
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/contract/
-git commit -m "feat(contract): Envelope 新增 workspace_session_id（additive，§3.1.5）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(contract): Envelope 新增 workspace_session_id（additive，§3.1.5）"`
 
 ### Task 2: `internal/wsregistry` durable metadata store
 
-**Files:**
-- Create: `internal/wsregistry/store.go`、`internal/wsregistry/store_test.go`
+**Files:** Create `internal/wsregistry/store.go`＋`store_test.go`
 
 **Interfaces:**
 - Produces:
 ```go
 type Entry struct {
-	WSID             string `json:"wsid"`
-	Provider         string `json:"provider"`
-	ResumeSessionID  string `json:"resume_session_id,omitempty"`
-	TaskLabel        string `json:"task_label,omitempty"`
-	ViewStartEventID string `json:"view_start_event_id,omitempty"`
-	CreatedAt        string `json:"created_at"`
-	RemovedAt        string `json:"removed_at,omitempty"`
-	RemoveReason     string `json:"remove_reason,omitempty"`
+	WSID, Provider, ResumeSessionID, TaskLabel, ViewStartEventID string
+	CreatedAt, RemovedAt, RemoveReason                           string
 }
-type Layout struct {
-	Pins    []string `json:"pins"`
-	Focused string   `json:"focused"`
-}
+type Layout struct{ Pins []string; Focused string }
 type Store struct{ /* mu、path、file */ }
 
 func Open(path string) (*Store, error)
 func (s *Store) Put(e Entry) error
-func (s *Store) Remove(wsid, reason string) error        // 使用者移除：留 tombstone
-func (s *Store) DeleteUncommitted(wsid string) error     // 建立失敗回滾：整筆刪除、不留 tombstone
+func (s *Store) Remove(wsid, reason string) error    // 使用者移除：留 tombstone
+func (s *Store) DeleteUncommitted(wsid string) error // 建立失敗回滾：整筆刪除
 func (s *Store) Get(wsid string) (Entry, bool)
 func (s *Store) Live() []Entry
 func (s *Store) SetLayout(l Layout) error
@@ -272,20 +272,17 @@ func TestRemoveKeepsTombstoneButDeleteUncommittedDoesNot(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "ws.json"))
 	_ = s.Put(Entry{WSID: "w1", Provider: "codex", CreatedAt: "t"})
 	_ = s.Put(Entry{WSID: "w2", Provider: "codex", CreatedAt: "t"})
-
 	if err := s.Remove("w1", "user_removed"); err != nil {
 		t.Fatal(err)
 	}
 	if e, ok := s.Get("w1"); !ok || e.RemovedAt == "" || e.RemoveReason != "user_removed" {
 		t.Fatalf("使用者移除必須留 tombstone：%+v ok=%v", e, ok)
 	}
-
-	// 建立失敗回滾不得留 tombstone——否則失敗的建立會在 registry 永久留痕
 	if err := s.DeleteUncommitted("w2"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := s.Get("w2"); ok {
-		t.Fatal("DeleteUncommitted 必須整筆刪除")
+		t.Fatal("DeleteUncommitted 必須整筆刪除（建立失敗不得永久留痕）")
 	}
 	if len(s.Live()) != 0 {
 		t.Fatalf("tombstone 與已刪除都不得出現在 Live()：%+v", s.Live())
@@ -311,53 +308,38 @@ func TestPersistFailureRollsBackMemory(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/wsregistry/ -v` → FAIL
 
-- [ ] **Step 3: 實作** — 沿 `restore.go:68-78` 的 temp file + atomic rename + 0600 慣例；persist 失敗回滾記憶體（同 `restore.go:99-103`）。白名單靠型別強制：`Entry` 不含任何 runtime state 欄位。
+- [ ] **Step 3: 實作** — 沿 `restore.go:68-78` 的 temp file＋atomic rename＋0600；persist 失敗回滾記憶體（同 `restore.go:99-103`）。白名單靠型別強制：`Entry` 不含任何 runtime state 欄位。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/wsregistry/
-git commit -m "feat(wsregistry): durable metadata store＋tombstone／DeleteUncommitted 分離（§3.2.1／§3.6.1）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(wsregistry): durable metadata store＋tombstone／DeleteUncommitted 分離（§3.2.1／§3.6.1）"`
 
 ### Task 3: Manager per-WSID slot registry（additive，保留舊入口）
 
-**Files:**
-- Modify: `internal/appcore/manager.go:95-360`
-- Test: `internal/appcore/manager_wsid_test.go`
+**Files:** Modify `internal/appcore/manager.go:95-360`；Test `internal/appcore/manager_wsid_test.go`
 
 **Interfaces:**
-- Produces（**新入口與舊入口並存**）：
+- Consumes: `contract.NewULID(t time.Time)`（`internal/contract/envelope.go:19`——**appcore 沒有 `newULID`，一律用這支**）。
+- Produces（**新舊入口並存**）：
 ```go
 type WSID string
 type CreateToken struct{ wsid WSID; seq uint64 }
-
-const MaxSessionsPerProvider = 4 // 凍結常數（§1.1）
-
+const MaxSessionsPerProvider = 4
 var (
 	ErrSessionLimit     = errors.New("appcore: session slot limit reached")
 	ErrSessionNotFound  = errors.New("appcore: unknown workspace session")
 	ErrStaleCreate      = errors.New("appcore: stale create token")
 	ErrProviderMismatch = errors.New("appcore: event provider != slot provider")
 )
-
-// 新入口（WS 後綴）——Task 9 遷完全部呼叫點後改名為無後綴並刪除舊入口。
 func (m *Manager) ReserveSession(p contract.Provider) (WSID, CreateToken, error)
 func (m *Manager) CommitCreate(tok CreateToken) error
 func (m *Manager) AbortCreate(tok CreateToken) error
 func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error
 func (m *Manager) SlotCount(p contract.Provider) int
 func (m *Manager) ProviderOf(w WSID) (contract.Provider, bool)
-func (m *Manager) BeginNewSessionSubmitWS(w WSID, taskID string) (SubmissionID, error)
-func (m *Manager) BeginSubmitWS(w WSID) (SubmissionID, error)
-func (m *Manager) BeginEndSessionWS(w WSID) (SessionToken, error)
-func (m *Manager) EmitWS(w WSID, ev contract.Event) error
-// …既有每個 provider-keyed 方法都有對應的 WS 版本
-
-// 相容入口（Task 9 刪除）：舊 provider-keyed 簽名維持不變，內部解析到該
-// provider 的 legacy slot（沿用現行隱式建立行為，讓既有測試與 app.go 不受影響）。
+func (m *Manager) IsActiveWS(w WSID) bool
+// 既有每個 provider-keyed 方法都新增對應的 `...WS(w WSID, …)` 版本
+// 相容入口（Task 9 刪除）：舊 provider-keyed 簽名不變，內部解析 legacy slot
 func (m *Manager) legacyWSIDLocked(p contract.Provider) WSID
 ```
 
@@ -384,7 +366,7 @@ func TestReserveSessionLimitIsAtomic(t *testing.T) {
 		t.Fatalf("要恰 4 個 reservation：ok=%d limited=%d", ok, limited)
 	}
 	if got := m.SlotCount("claude"); got != 4 {
-		t.Fatalf("reservation 當下即應計入名額，got=%d", got)
+		t.Fatalf("reservation 當下即應計入名額：%d", got)
 	}
 }
 
@@ -415,6 +397,14 @@ func TestUnknownWSIDNeverCreatesSlot(t *testing.T) {
 	}
 }
 
+func TestWSIDIsULID(t *testing.T) {
+	m := New(Config{Sink: &memSink{}})
+	w, _, _ := m.ReserveSession("claude")
+	if len(string(w)) != 26 { // contract.NewULID 產生 26 字元 ULID
+		t.Fatalf("WSID 必須是 contract.NewULID 產生的 ULID：%q", w)
+	}
+}
+
 func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	sink := &memSink{}
 	m := New(Config{Sink: sink})
@@ -433,20 +423,22 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	}
 }
 
-// 相容入口：舊 provider-keyed 路徑在遷移期間必須完全不變
 func TestLegacyProviderEntryStillWorks(t *testing.T) {
 	m := New(Config{Sink: &memSink{}})
 	if _, err := m.BeginNewSessionSubmit("claude", "t"); err != nil {
 		t.Fatalf("舊入口在遷移期間必須可用：%v", err)
 	}
+	if got := m.SlotCount("claude"); got != 0 {
+		t.Fatalf("legacy slot 不得佔使用者名額：%d", got)
+	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/appcore/ -run 'TestReserveSession|TestAbortCreate|TestUnknownWSID|TestEmitFills|TestLegacyProvider' -race -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/appcore/ -race -v` → FAIL
 
 - [ ] **Step 3: 實作**
 
-`Manager.slots` 改 `map[WSID]*slot`；`slot` 增 `provider contract.Provider`＋`committed bool`；新增 `legacy map[contract.Provider]WSID`＋`reserveSeq uint64`。
+`slots map[WSID]*slot`；`slot` 增 `provider`＋`committed`；新增 `legacy map[contract.Provider]WSID`、`reserveSeq uint64`。
 
 ```go
 func (m *Manager) ReserveSession(p contract.Provider) (WSID, CreateToken, error) {
@@ -458,15 +450,14 @@ func (m *Manager) ReserveSession(p contract.Provider) (WSID, CreateToken, error)
 	if m.countLocked(p) >= MaxSessionsPerProvider {
 		return "", CreateToken{}, ErrSessionLimit
 	}
-	w := WSID(newULID())
+	w := WSID(contract.NewULID(time.Now())) // appcore 無 newULID，一律用 contract
 	sl := newSlot()
 	sl.provider = p
-	m.slots[w] = sl // reservation 當下即佔名額：第 5 個併發不可穿透
+	m.slots[w] = sl // reservation 當下即佔名額
 	m.reserveSeq++
 	return w, CreateToken{wsid: w, seq: m.reserveSeq}, nil
 }
 
-// committedSlotLocked：新入口一律走這裡——只讀不建（§3.1.4）。
 func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
 	sl, ok := m.slots[w]
 	if !ok || !sl.committed {
@@ -475,39 +466,27 @@ func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
 	return sl, nil
 }
 
-// legacyWSIDLocked：相容入口專用——沿用現行「讀取時隱式建立」行為，讓舊
-// provider-keyed 呼叫點在遷移期間完全不受影響。Task 9 連同全部舊簽名刪除。
+// legacyWSIDLocked：相容入口專用——沿用現行「讀取時隱式建立」行為。
+// Task 9 連同全部舊簽名一併刪除。legacy slot 不計入 countLocked。
 func (m *Manager) legacyWSIDLocked(p contract.Provider) WSID {
 	if w, ok := m.legacy[p]; ok {
 		return w
 	}
 	w := WSID("legacy-" + string(p))
 	sl := newSlot()
-	sl.provider, sl.committed = p, true
+	sl.provider, sl.committed, sl.isLegacy = p, true, true
 	m.slots[w], m.legacy[p] = sl, w
 	return w
 }
 ```
 
-舊方法（`BeginNewSessionSubmit(p, ...)` 等）改為：取鎖 → `w := m.legacyWSIDLocked(p)` → 呼叫共用的 `...Locked(w, ...)` 內部函式。新 `...WS` 方法走 `committedSlotLocked`。**`countLocked` 不計入 legacy slot**（legacy 是遷移期產物，不佔使用者名額）。
+- [ ] **Step 4: 全綠（既有 Manager 測試一字不改也要綠）** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 4: 全綠（既有 Manager 測試一字不改也要綠）**
+- [ ] **Step 5: Commit** — `git commit -m "feat(appcore): per-WSID slot registry＋三段建立交易（additive，舊入口暫留，§3.1）"`
 
-Run: `go vet ./... && go test -race ./... -count=1`
-Expected: PASS
+### Task 4: App 建立交易＋create-degraded＋`CreateSession` binding
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/appcore/
-git commit -m "feat(appcore): per-WSID slot registry＋三段建立交易（additive，舊入口暫留，§3.1）"
-```
-
-### Task 4: App 建立交易編排＋CommitCreate 雙失敗降級
-
-**Files:**
-- Modify: `app.go:47-107`（App struct 加欄位）、`app.go:230-240`
-- Test: `app_wsid_test.go`
+**Files:** Modify `app.go:47-107`／`230-240`；Test `app_wsid_test.go`、`frontend/src/lib/bindings.test.ts`
 
 **Interfaces:**
 - Consumes: Task 2 `wsregistry.Store`、Task 3 `ReserveSession`／`CommitCreate`／`AbortCreate`。
@@ -521,11 +500,11 @@ type sessionRegistry interface {
 	Live() []wsregistry.Entry
 	Sync() error
 }
-func (a *App) CreateSession(provider, taskLabel string) (string, error) // Wails binding（Task 25 接前端）
+func (a *App) CreateSession(provider, taskLabel string) (string, error) // 純新增 binding
 func (a *App) createDegraded(p contract.Provider) bool
 ```
 
-- [ ] **Step 1: 失敗測試三條**
+- [ ] **Step 1: 失敗測試（Go）**
 
 ```go
 func TestCreateSessionRollsBackOnPersistFailure(t *testing.T) {
@@ -561,13 +540,10 @@ func TestCommitFailureRollsBackRegistryWithoutTombstone(t *testing.T) {
 	}
 }
 
-// §3.1 雙失敗：不 AbortCreate、名額保留、進 create-degraded、既有 session 不受影響
 func TestCommitAndRollbackBothFailEnterDegraded(t *testing.T) {
 	a := newTestApp(t)
-	existing := mustCreateLegacySession(t, a, "claude") // 先有一個可用 session
 	a.hookForceCommitCreateError = errors.New("injected commit failure")
 	a.wsReg = &stubRegistry{deleteErr: errors.New("rollback persist failed")}
-
 	before := a.manager.SlotCount("claude")
 	if _, err := a.CreateSession("claude", "t"); err == nil {
 		t.Fatal("必須 fail loud")
@@ -581,24 +557,35 @@ func TestCommitAndRollbackBothFailEnterDegraded(t *testing.T) {
 	if _, err := a.CreateSession("claude", "t2"); !errors.Is(err, errCreateDegraded) {
 		t.Fatalf("degraded 期間必須拒絕新建：%v", err)
 	}
-	if err := a.SendMessageWS(existing, "still works"); err != nil {
-		t.Fatalf("degraded 不得影響既有 session：%v", err)
-	}
 	if a.createDegraded("codex") {
-		t.Fatal("degraded 應 per-provider，不得波及另一 provider")
+		t.Fatal("degraded 應 per-provider")
+	}
+	// 既有 session 不受影響：走 legacy 入口的既有路徑仍可送訊息
+	if err := a.SendMessage("claude", "still works"); err != nil {
+		t.Fatalf("degraded 不得影響既有 session：%v", err)
 	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestCreateSession|TestCommitFailure|TestCommitAndRollback' -race -v` → FAIL
+- [ ] **Step 2: 失敗測試（binding 轉發）**
 
-- [ ] **Step 3: 實作**
+```ts
+it('CreateSession 逐參數轉發', () => {
+  const b = makeBindings()
+  b.CreateSession('claude', 'my-task')
+  expect(App.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
+})
+```
+
+- [ ] **Step 3: 跑測試確認失敗** — `go test . -run 'TestCreateSession|TestCommit' -race -v && npm --prefix frontend run test -- bindings` → FAIL
+
+- [ ] **Step 4: 實作**
 
 ```go
 var errCreateDegraded = errors.New("app: session create degraded（需重啟 app 復原）")
 
 func (a *App) CreateSession(provider, taskLabel string) (string, error) {
-	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄（§3.1）
+	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
 		return "", err
 	}
 	defer a.endAppTxn()
@@ -618,46 +605,26 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	}
 	if cerr := a.commitCreate(tok); cerr != nil {
 		if rerr := a.wsReg.DeleteUncommitted(string(w)); rerr != nil {
-			// 雙失敗：不 Abort、保留名額、進 degraded；等 app restart 由 registry
-			// 權威還原成 dormant（§3.2.2）
-			a.setCreateDegraded(p)
+			a.setCreateDegraded(p) // 雙失敗：保留名額、latch，等 app restart（§3.1）
 			return "", errors.Join(cerr, rerr, errCreateDegraded)
 		}
 		return "", errors.Join(cerr, a.manager.AbortCreate(tok))
 	}
 	return string(w), nil
 }
-
-func (a *App) commitCreate(tok appcore.CreateToken) error {
-	if a.hookForceCommitCreateError != nil {
-		return a.hookForceCommitCreateError
-	}
-	return a.manager.CommitCreate(tok)
-}
 ```
 
-`createDegraded`／`setCreateDegraded` 以 `a.mu` 保護的 `map[contract.Provider]bool`；**無 in-process 解除路徑**（僅 app restart）。
+同 task 完成 binding 四件事：`wails generate module` → `bindings.ts` → `types.ts` → 測試。
 
-- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
+- [ ] **Step 5: 全綠** — `go vet ./... && go test -race ./... -count=1 && npm --prefix frontend run test && npm --prefix frontend run build` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go app_wsid_test.go
-git commit -m "feat(app): 建立交易編排＋CommitCreate×rollback 雙失敗降級為 create-degraded（§3.1）"
-```
+- [ ] **Step 6: Commit** — `git commit -m "feat(app): 建立交易＋create-degraded 降級＋CreateSession binding（§3.1）"`
 
 ### Task 5: legacy `restore.json` 遷移（一次性、冪等）
 
-**Files:**
-- Create: `internal/wsregistry/migrate.go`、`internal/wsregistry/migrate_test.go`
+**Files:** Create `internal/wsregistry/migrate.go`＋`migrate_test.go`
 
-**Interfaces:**
-- Produces:
-```go
-type LegacyEntry struct{ ViewStartEventID, ResumeSessionID, TaskID string }
-func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]Entry, error)
-```
+**Interfaces:** Produces `type LegacyEntry struct{ ViewStartEventID, ResumeSessionID, TaskID string }`；`func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]Entry, error)`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -682,12 +649,8 @@ func TestMigrateIsIdempotentAcrossRestart(t *testing.T) {
 	if got1[0].ViewStartEventID != "e100" || got1[0].ResumeSessionID != "sess-a" || got1[0].TaskLabel != "task-a" {
 		t.Fatalf("view window／resume／task 必須沿用：%+v", got1[0])
 	}
-
 	s2, _ := Open(p) // 模擬重啟
-	got2, err := Migrate(s2, legacy, gen)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got2, _ := Migrate(s2, legacy, gen)
 	if len(got2) != 0 {
 		t.Fatalf("已遷移不得再建第二枚 WSID：%+v", got2)
 	}
@@ -708,7 +671,7 @@ func TestMigratePersistFailureFailsLoud(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	if _, err := Migrate(s, map[string]LegacyEntry{"claude": {TaskID: "t"}},
 		func() string { return "w1" }); err == nil {
-		t.Fatal("migration persist 失敗必須 fail loud（呼叫端據此不啟動 provider）")
+		t.Fatal("migration persist 失敗必須 fail loud")
 	}
 	if s.Migrated() {
 		t.Fatal("失敗不得標記 migrated")
@@ -721,10 +684,8 @@ func TestRemovedLegacyIsNotRemigrated(t *testing.T) {
 	s, _ := Open(p)
 	out, _ := Migrate(s, legacy, func() string { return "w1" })
 	_ = s.Remove(out[0].WSID, "user_removed")
-
 	s2, _ := Open(p)
-	again, _ := Migrate(s2, legacy, func() string { return "w2" })
-	if len(again) != 0 {
+	if again, _ := Migrate(s2, legacy, func() string { return "w2" }); len(again) != 0 {
 		t.Fatalf("legacy 移除後不得再次遷入（§3.6.1）：%+v", again)
 	}
 }
@@ -732,176 +693,136 @@ func TestRemovedLegacyIsNotRemigrated(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/wsregistry/ -run 'TestMigrate|TestRemovedLegacy' -v` → FAIL
 
-- [ ] **Step 3: 實作**
-
-```go
-func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]Entry, error) {
-	if s.Migrated() {
-		return nil, nil // §3.2.6：不得再由舊 entry 建出第二枚 WSID
-	}
-	var out []Entry
-	for _, p := range []string{"claude", "codex"} { // 決定性順序
-		le, ok := legacy[p]
-		if !ok || (le.ResumeSessionID == "" && le.TaskID == "" && le.ViewStartEventID == "") {
-			continue // 空 entry 不建立、不佔名額（§3.2.5）
-		}
-		out = append(out, Entry{
-			WSID: newWSID(), Provider: p,
-			ResumeSessionID: le.ResumeSessionID, TaskLabel: le.TaskID,
-			ViewStartEventID: le.ViewStartEventID,
-			CreatedAt:        time.Now().UTC().Format(time.RFC3339),
-		})
-	}
-	return out, s.MarkMigrated(out) // entries＋marker 原子一次寫
-}
-```
+- [ ] **Step 3: 實作** — 決定性順序走訪 `claude`／`codex`；空 entry 跳過；`MarkMigrated(out)` 一次原子寫 entries＋marker。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(wsregistry): legacy restore.json 一次性遷移＋migration marker（§3.2.5-6）"`
 
-```bash
-git add internal/wsregistry/
-git commit -m "feat(wsregistry): legacy restore.json 一次性遷移＋migration marker（§3.2.5-6）"
-```
+### Task 6: registry 載入／遷移＋dormant 還原
 
-### Task 6: 啟動修復序列（冪等）
+> **範圍界定**：本 task **只做** registry 載入／遷移／`RestoreDormant`。§3.2.4 完整序列的後半（replay index 驗證、incomplete-turn 修復、開放 UI／provider）依賴 `replayindex` 與 `sessionHosts`，移到 **Task 20**（index 接線完成後）。
 
-**Files:**
-- Modify: `app.go:259-325`
-- Test: `app_startup_repair_test.go`
+**Files:** Modify `app.go:259-325`；Test `app_restore_dormant_test.go`
 
 **Interfaces:**
-- Produces:
-```go
-func (a *App) restoreSessions() ([]wsregistry.Entry, error) // §3.2.4 凍結順序
-func (a *App) repairIncompleteTurns(entries []wsregistry.Entry) error
-```
+- Consumes: Task 2 `Store`、Task 5 `Migrate`、Task 3 `RestoreDormant`／`IsActiveWS`／`SlotCount`。
+- Produces: `func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error)`。
 
 - [ ] **Step 1: 失敗測試**
 
 ```go
-func TestStartupRepairEmitsStreamErrorThenFailed(t *testing.T) {
-	dir := t.TempDir()
-	writeEvents(t, dir, []contract.Envelope{
-		{EventID: "e1", Kind: "message", Role: "user", Provider: "claude", WorkspaceSessionID: "w1"},
-		{EventID: "e2", Kind: "delta", Provider: "claude", WorkspaceSessionID: "w1"},
-	})
-	seedRegistry(t, dir, wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"})
-
-	a1 := newTestAppAt(t, dir)
-	if _, err := a1.restoreSessions(); err != nil {
-		t.Fatal(err)
-	}
-	ev := readEvents(t, dir)
-	// stream_error 先寫，reducer 追發的 state_change=failed 在其後——檢查末二筆
-	if n := len(ev); n < 2 ||
-		ev[n-2].Kind != "stream_error" || ev[n-2].WorkspaceSessionID != "w1" ||
-		ev[n-1].Kind != "state_change" || ev[n-1].State != "failed" ||
-		ev[n-1].WorkspaceSessionID != "w1" {
-		t.Fatalf("末二筆應為 stream_error → state_change=failed：%+v", tail(ev, 3))
-	}
-}
-
-func TestStartupRepairIsIdempotent(t *testing.T) {
-	dir := seedInterruptedTurn(t)
-	a1 := newTestAppAt(t, dir)
-	if _, err := a1.restoreSessions(); err != nil {
-		t.Fatal(err)
-	}
-	first := readEvents(t, dir)
-
-	a2 := newTestAppAt(t, dir) // 模擬 crash 後重跑同序列
-	if _, err := a2.restoreSessions(); err != nil {
-		t.Fatal(err)
-	}
-	if second := readEvents(t, dir); len(second) != len(first) {
-		t.Fatalf("重跑必須冪等，事件數 %d → %d", len(first), len(second))
-	}
-}
-
-func TestRestoreAllDormantNoRuntimeState(t *testing.T) {
-	a := newTestAppWithRegistry(t, wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"})
-	entries, err := a.restoreSessions()
+func TestLoadRegistryRestoresAllDormant(t *testing.T) {
+	a := newTestAppWithRegistry(t,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"},
+		wsregistry.Entry{WSID: "w2", Provider: "codex", CreatedAt: "t"})
+	entries, err := a.loadSessionRegistry()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("應還原 1 個 dormant session：%d", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("應還原 2 個 dormant session：%d", len(entries))
 	}
-	if a.hostFor("w1") != nil {
-		t.Fatal("dormant 還原不得建立 host")
+	for _, e := range entries {
+		if a.manager.IsActiveWS(appcore.WSID(e.WSID)) {
+			t.Fatalf("必須以 dormant 還原，不得為 active：%s", e.WSID)
+		}
 	}
 	if len(a.apprPending) != 0 {
 		t.Fatal("dormant 還原不得有 pending approval")
 	}
-	if got := a.manager.SlotCount("claude"); got != 1 {
-		t.Fatalf("dormant 仍佔名額：%d", got)
+	if a.manager.SlotCount("claude") != 1 || a.manager.SlotCount("codex") != 1 {
+		t.Fatal("dormant 仍佔名額")
 	}
 }
 
-func TestStartupOrderIsFrozen(t *testing.T) {
-	a := newTestAppAt(t, seedInterruptedTurn(t))
-	var order []string
-	a.hookStartupStep = func(s string) { order = append(order, s) }
-	if _, err := a.restoreSessions(); err != nil {
+func TestLoadRegistryTriggersMigrationOnce(t *testing.T) {
+	dir := seedLegacyRestoreJSON(t) // 只有舊 restore.json，無 workspace-sessions.json
+	a1 := newTestAppAt(t, dir)
+	e1, err := a1.loadSessionRegistry()
+	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"registry_load", "migrate", "restore_dormant", "index_verify", "detect_incomplete", "emit_stream_error"}
-	if !reflect.DeepEqual(order, want) {
-		t.Fatalf("啟動修復順序不符 §3.2.4：\n got=%v\nwant=%v", order, want)
+	if len(e1) != 1 {
+		t.Fatalf("legacy 應遷出 1 個 session：%+v", e1)
+	}
+	a2 := newTestAppAt(t, dir)
+	e2, _ := a2.loadSessionRegistry()
+	if len(e2) != 1 || e2[0].WSID != e1[0].WSID {
+		t.Fatalf("重啟不得產生第二枚 WSID：%+v vs %+v", e2, e1)
+	}
+}
+
+func TestMigrationPersistFailureBlocksProviderStart(t *testing.T) {
+	dir := seedLegacyRestoreJSON(t)
+	a := newTestAppAt(t, dir)
+	a.hookForceMigratePersistError = errors.New("disk full")
+	if _, err := a.loadSessionRegistry(); err == nil {
+		t.Fatal("migration persist 失敗必須 fail loud（§3.2.6），呼叫端據此不啟動 provider")
+	}
+	if a.providersStarted() {
+		t.Fatal("migration 失敗後不得啟動 provider")
+	}
+}
+
+func TestRemovedTombstoneNotRestored(t *testing.T) {
+	a := newTestAppWithRegistry(t,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t", RemovedAt: "t2", RemoveReason: "user_removed"})
+	entries, _ := a.loadSessionRegistry()
+	if len(entries) != 0 {
+		t.Fatalf("tombstone 不得還原：%+v", entries)
+	}
+	if a.manager.SlotCount("claude") != 0 {
+		t.Fatal("removed 不計 slot")
 	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestStartup|TestRestoreAllDormant' -race -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestLoadRegistry|TestMigrationPersist|TestRemovedTombstoneNot' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 依 §3.2.4 凍結順序；`repairIncompleteTurns` 的冪等判定：該 WSID 末筆已是 app-restart `stream_error` 或其導出的 `state_change=failed` 即跳過。`Manager.RestoreDormant` 在 mutex 內直接建 committed slot（registry 是權威），超限仍回 `ErrSessionLimit` 並 fail loud。
+- [ ] **Step 3: 實作**
+
+```go
+// loadSessionRegistry：§3.2.4 的前半段——載入／遷移 registry → 還原 dormant slots。
+// 後半段（index 驗證／重建 → incomplete turn 修復 → 開放 UI 與 provider）見 Task 20。
+func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
+	store, err := wsregistry.Open(filepath.Join(a.stateDir, "workspace-sessions.json"))
+	if err != nil {
+		return nil, err
+	}
+	a.wsReg = store
+	if !store.Migrated() {
+		if _, err := wsregistry.Migrate(store, a.legacyEntries(),
+			func() string { return contract.NewULID(time.Now()) }); err != nil {
+			return nil, err // fail loud，不啟動 provider（§3.2.6）
+		}
+	}
+	live := store.Live()
+	for _, e := range live {
+		if err := a.manager.RestoreDormant(appcore.WSID(e.WSID), contract.Provider(e.Provider)); err != nil {
+			return nil, err
+		}
+	}
+	return live, nil
+}
+```
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go app_startup_repair_test.go
-git commit -m "feat(app): 啟動修復凍結序列＋stuck busy 冪等解除（§3.2.2-4）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): registry 載入／遷移＋dormant 還原（§3.2.2／§3.2.5-6）"`
 
 ---
 
 ## Phase 2 — App ownership additive migration
 
-> **本 phase 的遷移紀律**：Task 7 只**加** `sessionHosts`，舊單例欄位原封不動；Task 8 把 Claude 全部路徑遷到 host 後，**才**刪 Claude 單例欄位；Task 9 把 Codex 遷完後，**才**刪其餘單例欄位與 Task 3 的 Manager 相容入口。每個 task 結束時全套測試都是綠的。
+> **遷移紀律**：Task 7 只**加** `sessionHosts`；Task 8 遷完 Claude 才刪 Claude 單例；Task 9 遷完 Codex 才刪其餘單例與 Manager 相容入口。**exported Wails binding 的簽名在本 phase 完全不變**（Task 9 保留 provider-keyed 包裝層，Task 25 才原子切換）。
 
 ### Task 7: `sessionHosts` registry（additive）
 
-**Files:**
-- Create: `session_host.go`、`session_host_test.go`
-- Modify: `app.go:47-107`（**只加欄位，不刪**）
+**Files:** Create `session_host.go`＋`session_host_test.go`；Modify `app.go:47-107`（**只加欄位**）
 
 **Interfaces:**
-- Produces:
-```go
-type sessionHost struct {
-	wsid     appcore.WSID
-	provider contract.Provider
-	sess       *claude.Session
-	sockPath   string
-	mcpPath    string
-	broker     *approval.Broker
-	pumpDone   <-chan struct{}
-	teardownFn func() error // sync.OnceValue
-	lease      *appcore.RecordingLease
-	threadID   string
-	track      appcore.TurnTrack
-	sessionID  string
-}
-func (a *App) hostFor(w appcore.WSID) *sessionHost
-func (a *App) putHost(h *sessionHost)
-func (a *App) dropHost(w appcore.WSID)
-func (a *App) snapshotHosts() []*sessionHost
-func (a *App) hostsOf(p contract.Provider) []*sessionHost
-```
+- Produces: `type sessionHost struct{ wsid; provider; sess; sockPath; mcpPath; broker; pumpDone; teardownFn; lease; threadID; track; sessionID }`；`hostFor`／`putHost`／`dropHost`／`snapshotHosts`／`hostsOf`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -937,33 +858,21 @@ func TestSnapshotHostsIsRaceFree(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run TestSessionHosts -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — `App` **新增** `sessionHosts map[appcore.WSID]*sessionHost`（`a.mu` 保護）。既有 `broker`／`claudeSess`／`runner`／`track`／`codexLease` 等欄位**全部保留不動**。
+- [ ] **Step 3: 實作** — `App` **新增** `sessionHosts map[appcore.WSID]*sessionHost`（`a.mu` 保護）；既有單例欄位全部保留不動。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go session_host.go session_host_test.go
-git commit -m "feat(app): 新增 sessionHosts registry（additive，單例欄位暫留，§3.3）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): 新增 sessionHosts registry（additive，§3.3）"`
 
 ### Task 8: Claude 遷入 host＋per-WSID socket／MCP＋刪 Claude 單例
 
-**Files:**
-- Modify: `app.go:3998-4285`（`startClaude`）、`app.go:4011`、`app.go:4050`、`app.go:3758-3809`
-- Test: `app_claude_multi_test.go`
+**Files:** Modify `app.go:3998-4285`／`4011`／`4050`／`3758-3809`；Test `app_claude_multi_test.go`
 
 **Interfaces:**
-- Consumes: Task 7 `sessionHost`、Task 3 `EmitWS`。
-- Produces:
-```go
-func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (func(accepted bool), error)
-func (a *App) pumpApprovals(h *sessionHost)
-// socket：filepath.Join(a.stateDir, "approval-"+string(w)+".sock")
-// mcp   ：filepath.Join(a.stateDir, "mcp-"+string(w)+".json")
-```
+- Consumes: Task 7 `sessionHost`、Task 3 `...WS` 方法。
+- Produces: `func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (func(accepted bool), error)`；`pumpApprovals(h *sessionHost)`；socket `approval-<wsid>.sock`、mcp `mcp-<wsid>.json`。
 - **刪除**：`App.broker`／`claudeSess`／`claudeSessionID`／`claudePumpDone`／`claudeLease`／`claudeTeardownFn`。
+- **不變**：exported `StartSession(provider, …)`／`SendMessage(provider, …)`／`EndSession(provider)` 簽名——內部透過 `a.legacyWSIDFor(provider)` 解析（Task 25 刪除）。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1004,7 +913,6 @@ func TestClaudeApprovalCarriesWSID(t *testing.T) {
 }
 
 func TestNoClaudeSingletonFieldsRemain(t *testing.T) {
-	// 反射守門：Claude 單例欄位必須已刪除，避免遷移半途留下兩套 ownership
 	tp := reflect.TypeOf(App{})
 	for _, name := range []string{"broker", "claudeSess", "claudeSessionID",
 		"claudePumpDone", "claudeLease", "claudeTeardownFn"} {
@@ -1013,39 +921,47 @@ func TestNoClaudeSingletonFieldsRemain(t *testing.T) {
 		}
 	}
 }
+
+func TestExportedBindingSignatureUnchanged(t *testing.T) {
+	// exported binding 在 Task 25 之前不得改簽名，否則前端會在中途壞掉
+	m, _ := reflect.TypeOf(&App{}).MethodByName("SendMessage")
+	if got := m.Type.In(1).Kind(); got != reflect.String {
+		t.Fatalf("SendMessage 第一參數型別不得改變：%v", got)
+	}
+	if err := a.SendMessage("claude", "hi"); err != nil {
+		t.Fatalf("provider-keyed exported binding 必須仍可用：%v", err)
+	}
+}
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestTwoClaudeSessions|TestClaudeApprovalCarries|TestNoClaudeSingleton' -race -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestTwoClaudeSessions|TestClaudeApproval|TestNoClaudeSingleton|TestExportedBinding' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 路徑組裝帶 WSID；broker／pump／lease／teardown（`sync.OnceValue`）建到 host；`registerApproval` 記錄 WSID；`EndSession`／`NewSession`／`SendMessage` 的 Claude 分支改走 `hostFor(w)`＋`EmitWS`。刪除六個單例欄位並修正全部引用。
-
-**檔案清理不在本 task**——per-WSID socket／mcp 的移除清理屬 remove 生命週期，測試放 Task 22。
+- [ ] **Step 3: 實作** — 路徑帶 WSID；broker／pump／lease／teardown（`sync.OnceValue`）建到 host；`registerApproval` 記 WSID；Claude 分支改走 `hostFor(w)`＋`...WS`；刪六個單例欄位並修正引用。per-WSID 檔案的**移除清理**屬 remove 生命週期，測試在 Task 23。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): Claude 遷入 sessionHost＋per-WSID socket／MCP，刪除 Claude 單例（§3.3）"`
 
-```bash
-git add app.go app_claude_multi_test.go
-git commit -m "feat(app): Claude 遷入 sessionHost＋per-WSID socket／MCP，刪除 Claude 單例（§3.3）"
-```
+### Task 9: Codex dispatcher＋刪除 Manager 相容入口
 
-### Task 9: Codex dispatcher＋`startCodexHost(wsid, …)`＋刪除相容 shim
-
-**Files:**
-- Modify: `app.go:4240-4455`、`internal/appcore/manager.go`（刪 `legacyWSIDLocked` 與舊簽名）
-- Test: `app_codex_dispatch_test.go`
+**Files:** Modify `app.go:4240-4455`、`internal/appcore/pump.go:69-84`（`EndSessionFlow`）、`internal/appcore/manager.go`、`internal/appcore/manager_test.go`、`manager_workspace_test.go`；Test `app_codex_dispatch_test.go`
 
 **Interfaces:**
 - Produces:
 ```go
-// WSID 進入 production start 路徑——pending start 在 response 抵達前即知歸屬。
 func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPolicy string) (string, bool, error)
 func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, recordCase, approvalPolicy string) (string, bool, error)
 func (a *App) hostByThread(threadID string) *sessionHost
 func (a *App) hostByTurn(turnID string) *sessionHost
+func appcore.EndSessionFlow(m *Manager, w WSID, busyCheck func() bool, teardown func() error) error // 改 WSID
 ```
-- **刪除**：`App.runner`／`track`／`codexLease`／`currentRunner()`；`Manager` 的 `legacyWSIDLocked` 與全部 provider-keyed 舊簽名（`...WS` 方法同時改名為無後綴）。
+- **刪除清單（必須逐項清乾淨）**：
+  1. `App.runner`／`App.track`／`App.codexLease`／`App.currentRunner()`
+  2. `Manager.legacyWSIDLocked` 與全部 provider-keyed 方法（`...WS` 同步改名為無後綴）
+  3. `appcore.EndSessionFlow` 的 `p contract.Provider` 參數（`pump.go:69`）
+  4. `app.go` 內約 24 處 provider-keyed Manager 呼叫（`Emit`×7、`RejectSubmit`×6、`AcceptSubmit`×4、`FinishReset`／`FinishEndSession`／`CancelEndSession`／`BeginSubmit`／`BeginReset`／`BeginNewSessionSubmit`／`BeginEndSession` 各 1）
+  5. `internal/appcore/manager_test.go`（1254 行）與 `manager_workspace_test.go` 的全部呼叫點——**語意不得減少**，只改取得 WSID 的方式（`Reserve`＋`Commit`）
+- **保留到 Task 25**：`a.legacyWSIDFor(provider)` 與 provider-keyed exported binding 包裝層。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1053,12 +969,9 @@ func (a *App) hostByTurn(turnID string) *sessionHost
 func TestCodexTwoThreadsDoNotCrossWire(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	w1, w2 := mustCreate(t, a, "codex"), mustCreate(t, a, "codex")
-	th1 := mustStartCodex(t, a, w1)
-	th2 := mustStartCodex(t, a, w2)
-
+	th1, th2 := mustStartCodex(t, a, w1), mustStartCodex(t, a, w2)
 	a.fakeWire.PushNotification(th2, `{"type":"delta","text":"for-w2"}`)
 	a.fakeWire.PushApproval(th1, "appr-1")
-
 	if !containsText(eventsFor(t, a, w2), "for-w2") {
 		t.Fatal("notification 未歸屬 w2")
 	}
@@ -1071,14 +984,11 @@ func TestCodexTwoThreadsDoNotCrossWire(t *testing.T) {
 }
 
 // completed-before-response：走 production start 路徑的惡意順序容錯
-// （Task 0 的 live probe 不判定此項——真 server 不一定自然產生此順序）
+// （Task 0 的 live probe 不判定此項）
 func TestCompletedBeforeResponseOnProductionPath(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	w := mustCreate(t, a, "codex")
-	a.hookInServerTxn = func() {
-		// start request 尚未回 response，就先推該 turn 的 completed
-		a.fakeWire.PushCompletedForPendingStart()
-	}
+	a.hookInServerTxn = func() { a.fakeWire.PushCompletedForPendingStart() }
 	if _, _, err := a.startCodexHost(w, a.codexHostOverride, "p", "", "", "untrusted"); err != nil {
 		t.Fatal(err)
 	}
@@ -1093,13 +1003,12 @@ func TestCompletedBeforeResponseOnProductionPath(t *testing.T) {
 func TestUnattributableFrameFailsLoud(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	mustStartCodex(t, a, mustCreate(t, a, "codex"))
-	err := a.dispatchNotification("unknown-thread", []byte(`{"type":"delta"}`))
-	if err == nil {
+	if err := a.dispatchNotification("unknown-thread", []byte(`{"type":"delta"}`)); err == nil {
 		t.Fatal("無法歸屬必須 fail loud，不得落到『當前』session")
 	}
 }
 
-func TestNoLegacyShimRemains(t *testing.T) {
+func TestNoSingletonsAndNoShimRemain(t *testing.T) {
 	tp := reflect.TypeOf(App{})
 	for _, name := range []string{"runner", "track", "codexLease"} {
 		if _, ok := tp.FieldByName(name); ok {
@@ -1109,27 +1018,22 @@ func TestNoLegacyShimRemains(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestCodexTwoThreads|TestCompletedBeforeResponse|TestUnattributable|TestNoLegacyShim' -race -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test . ./internal/appcore/ -run 'TestCodexTwoThreads|TestCompletedBefore|TestUnattributable|TestNoSingletons' -race -v` → FAIL
 
-- [ ] **Step 3: 實作**
+- [ ] **Step 3: 實作 dispatcher** — `a.mu` 下維護 `threadToWSID`／`turnToWSID`／`pendingStartToWSID`（key 為 request id）。`startCodexHost` 送 `thread/start` 前先登記 pending，response 抵達補 `threadToWSID`。查找順序 `turnToWSID` → `threadToWSID` → `pendingStartToWSID`，查不到即 fail loud。
 
-`a.mu` 下維護 `threadToWSID`／`turnToWSID`／`pendingStartToWSID map[string]appcore.WSID`（key 為 request id）。`startCodexHost` 收 WSID → 送 `thread/start` 前先登記 `pendingStartToWSID[reqID] = w` → response 抵達時補 `threadToWSID[threadID] = w`。所有 notification／approval／timeout／decision 依序查 `turnToWSID` → `threadToWSID` → `pendingStartToWSID`，查不到即 fail loud。
-
-- [ ] **Step 4: 刪除相容層並確認無殘留**
+- [ ] **Step 4: 逐項遷移刪除清單並確認無殘留**
 
 ```bash
-grep -rn "currentRunner\|legacyWSIDLocked\|SubmitWS\|EmitWS" --include='*.go' . \
-  && echo "仍有殘留——必須清乾淨或完成改名" || echo OK
+grep -rn "currentRunner\|legacyWSIDLocked" --include='*.go' . && echo "殘留" || echo OK
+grep -rn "EndSessionFlow(.*contract.Provider" --include='*.go' . && echo "殘留" || echo OK
+grep -rn "\.\(BeginSubmit\|BeginEndSession\|AcceptSubmit\|RejectSubmit\|Emit\)WS(" --include='*.go' . \
+  && echo "WS 後綴未改名" || echo OK
 ```
 
 - [ ] **Step 5: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add app.go internal/appcore/ app_codex_dispatch_test.go
-git commit -m "feat(app): Codex WSID dispatcher＋startCodexHost(wsid,…)，刪除 currentRunner 與 Manager 相容入口（§3.3）"
-```
+- [ ] **Step 6: Commit** — `git commit -m "feat(app): Codex WSID dispatcher＋刪除 currentRunner／Manager 相容入口／EndSessionFlow WSID 化（§3.3）"`
 
 ---
 
@@ -1137,34 +1041,9 @@ git commit -m "feat(app): Codex WSID dispatcher＋startCodexHost(wsid,…)，刪
 
 ### Task 10: `internal/wirelog` generation＋frame index
 
-**Files:**
-- Create: `internal/wirelog/wirelog.go`、`frameindex.go`＋測試
+**Files:** Create `internal/wirelog/wirelog.go`／`frameindex.go`＋測試
 
-**Interfaces:**
-- Produces:
-```go
-type Direction string
-const (DirClientToServer Direction = "c2s"; DirServerToClient Direction = "s2c")
-
-type SegmentRef struct {
-	WireLogID  string `json:"wire_log_id"`
-	FirstFrame int64  `json:"first_frame"`
-	LastFrame  int64  `json:"last_frame"`
-}
-type FrameKey struct{ WireLogID string; Direction Direction; RequestID string }
-
-type Generation struct{ /* id、file、frameSeq、mu、latched error、finalMeta */ }
-func NewGeneration(dir, id string) (*Generation, error) // handshake 前呼叫
-func (g *Generation) ID() string
-func (g *Generation) Line(dir Direction, b []byte) error
-func (g *Generation) Attribute(frame int64, wsid string)
-func (g *Generation) Finalize(m recorder.Meta) error
-func (g *Generation) Finalized() bool
-func (g *Generation) FinalMeta() recorder.Meta
-func (g *Generation) Err() error
-func (g *Generation) FrameIndex() *FrameIndex
-func RebuildFrameIndex(path string) (*FrameIndex, error)
-```
+**Interfaces:** Produces `Direction`／`SegmentRef`／`FrameKey`／`Generation`（`NewGeneration`／`ID`／`Line`／`Attribute`／`Finalize`／`Finalized`／`FinalMeta`／`Err`／`FrameIndex`）／`RebuildFrameIndex`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1222,25 +1101,17 @@ func TestFrameIndexIsRebuildable(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/wirelog/ -v` → FAIL
 
-- [ ] **Step 3: 實作** — frame 以單調 `frameSeq` 編號；wire log 為 JSONL，每行含 `{frame, dir, wsid, raw}`。
+- [ ] **Step 3: 實作** — JSONL，每行 `{frame, dir, wsid, raw}`；frame 單調編號。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/wirelog/
-git commit -m "feat(wirelog): connection-wide wire log generation＋可重建 frame index（§3.4.1-5）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(wirelog): connection-wide wire log generation＋可重建 frame index（§3.4.1-5）"`
 
 ### Task 11: `[]SegmentRef` 跨 generation 歸屬
 
-**Files:**
-- Modify: `internal/wirelog/wirelog.go`
-- Test: `internal/wirelog/segments_test.go`
+**Files:** Modify `internal/wirelog/wirelog.go`；Test `segments_test.go`
 
-**Interfaces:**
-- Produces: `type SegmentSet struct{…}`；`NewSegmentSet()`；`(*SegmentSet) Append(wsid string, ref SegmentRef)`；`(*SegmentSet) For(wsid string) []SegmentRef`。
+**Interfaces:** Produces `SegmentSet`／`NewSegmentSet`／`Append`／`For`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1249,8 +1120,7 @@ func TestSegmentsSpanTwoGenerations(t *testing.T) {
 	set := NewSegmentSet()
 	set.Append("w1", SegmentRef{WireLogID: "g1", FirstFrame: 1, LastFrame: 10})
 	set.Append("w2", SegmentRef{WireLogID: "g1", FirstFrame: 11, LastFrame: 20})
-	set.Append("w1", SegmentRef{WireLogID: "g2", FirstFrame: 1, LastFrame: 5}) // restart 後延續
-
+	set.Append("w1", SegmentRef{WireLogID: "g2", FirstFrame: 1, LastFrame: 5})
 	got := set.For("w1")
 	if len(got) != 2 || got[0].WireLogID != "g1" || got[1].WireLogID != "g2" {
 		t.Fatalf("同 WSID 必須跨 generation 有序延續：%+v", got)
@@ -1268,109 +1138,134 @@ func TestForReturnsCopy(t *testing.T) {
 	got := set.For("w1")
 	got[0].LastFrame = 999
 	if set.For("w1")[0].LastFrame != 2 {
-		t.Fatal("For 必須回傳副本，呼叫端不得改寫內部狀態")
+		t.Fatal("For 必須回傳副本")
 	}
 }
 ```
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/wirelog/ -run TestSegments -v` → FAIL
 
-- [ ] **Step 3: 實作** — `map[string][]SegmentRef`＋mutex；append 順序即時間序。
+- [ ] **Step 3: 實作** — `map[string][]SegmentRef`＋mutex。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(wirelog): []SegmentRef 跨 generation 有序歸屬（§3.4.4）"`
 
-```bash
-git add internal/wirelog/
-git commit -m "feat(wirelog): []SegmentRef 跨 generation 有序歸屬（§3.4.4）"
-```
+### Task 12: `GenerationOwner`＋死亡自動 finalize（production 路徑）
 
-### Task 12: `codexGenerationOwner`——connection-level recorder ownership
-
-**Files:**
-- Create: `internal/codex/owner.go`
-- Modify: `internal/codex/probe.go:24-71`
-- Test: `internal/codex/owner_test.go`、`probe_test.go`
+**Files:** Create `internal/codex/owner.go`；Modify `internal/codex/single.go`／`probe.go:24-71`；Test `internal/codex/owner_test.go`
 
 **Interfaces:**
 - Produces:
 ```go
-// codexGenerationOwner 是 Single 持有的 ownership 單位——server 與其 generation
-// 綁在一起，故死亡／restart／shutdown 任一路徑都拿得到 generation 去 finalize。
 type GenerationOwner struct {
 	Server     probeTarget
 	Generation *wirelog.Generation
 }
 func (o *GenerationOwner) Done() <-chan struct{} { return o.Server.Done() } // 滿足 Alive
-// FinalizeWith：Terminate → Wait → Generation.Finalize（以 Exit 填 meta）。冪等。
-func (o *GenerationOwner) FinalizeWith(stage error) error
+func (o *GenerationOwner) FinalizeWith(stage error) error                   // 冪等
+func (o *GenerationOwner) Finalized() bool
 
-// handoff=true（production／受控復原）：成功後不 Stop、不 Close，ownership 隨
-// GenerationOwner 交給 Single，直到 server 終止才 finalize（§3.4.7）。
+// Single 新增：只有目前持有者仍是 want 時才取出——防止 stale reaper 清掉
+// 已被 replacement 取代的新 generation。
+func (s *Single[T]) CompareAndTake(want T) bool
+
+// production 死亡收尾：發布 owner 後立即啟動；Done() 關閉即 CompareAndTake →
+// FinalizeWith。呼叫端不需手動收尾。
+func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, onFinalized func(error))
+
 func RunHandshakeProbe(ctx context.Context, single *Single[*GenerationOwner],
 	newGen func() (*wirelog.Generation, error), start func() (probeTarget, error),
 	ci ClientInfo, handoff bool) error
 ```
 
-- [ ] **Step 1: 失敗測試——三階段失敗＋意外 Done**
+- [ ] **Step 1: 失敗測試——production 路徑，測試不得手動 finalize**
 
 ```go
-func currentOwner(t *testing.T, s *Single[*GenerationOwner]) *GenerationOwner {
-	t.Helper()
-	o, ok := s.Take() // Single 無 Current()；用既有 Take 取出後視需要回填
-	if !ok {
-		return nil
-	}
-	_ = s.Ensure(func() (*GenerationOwner, error) { return o, nil })
-	return o
-}
-
-func TestHandoffKeepsRecorderOpen(t *testing.T) {
+func TestServerDeathAutoFinalizesGeneration(t *testing.T) {
 	stub := newStubServer()
 	var single Single[*GenerationOwner]
 	gen := newTestGeneration(t)
-	if err := RunHandshakeProbe(context.Background(), &single,
+	finalized := make(chan error, 1)
+	if err := RunHandshakeProbeWithWatch(context.Background(), &single,
 		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, true); err != nil {
+		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, true,
+		func(err error) { finalized <- err }); err != nil {
 		t.Fatal(err)
 	}
-	if stub.stopRecordingCalls != 0 {
-		t.Fatal("handoff 模式不得 StopRecording（§3.4.7）")
+	stub.die() // 只做這件事——不得由測試呼叫 FinalizeWith
+	select {
+	case <-finalized:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done() 關閉後必須由 production reaper 自動 finalize（§3.4.2）")
 	}
-	if gen.Finalized() {
-		t.Fatal("handoff 模式不得在發布時 finalize")
+	if !gen.Finalized() {
+		t.Fatal("generation 未 finalize，錄流 meta 會漏")
 	}
-	o := currentOwner(t, &single)
-	if o == nil || o.Generation != gen {
-		t.Fatal("Single 必須持有 generation ownership")
+	if _, ok := single.Take(); ok {
+		t.Fatal("死亡的 owner 必須已從 Single 移除")
 	}
 }
 
-func TestGenerationIDAllocatedBeforeAttach(t *testing.T) {
-	stub := newStubServer()
-	var order []string
-	stub.onBeginRecording = func() { order = append(order, "attach") }
+func TestReplacementWaitsForOldGenerationFinalize(t *testing.T) {
+	old := newStubServer()
 	var single Single[*GenerationOwner]
+	oldGen := newTestGeneration(t)
 	_ = RunHandshakeProbe(context.Background(), &single,
-		func() (*wirelog.Generation, error) { order = append(order, "gen_id"); return newTestGeneration(t), nil },
-		func() (probeTarget, error) { order = append(order, "start"); return stub, nil },
-		ClientInfo{}, true)
-	if !reflect.DeepEqual(order, []string{"gen_id", "start", "attach"}) {
-		t.Fatalf("wire_log_id 必須在掛 recorder 前配置：%v", order)
+		func() (*wirelog.Generation, error) { return oldGen, nil },
+		func() (probeTarget, error) { return old, nil }, ClientInfo{}, true)
+
+	var order []string
+	newGen := newTestGeneration(t)
+	newGen.OnCreateForTest(func() { order = append(order, "new_gen_created") })
+	oldGen.OnFinalizeForTest(func() { order = append(order, "old_finalized") })
+
+	_ = RunHandshakeProbe(context.Background(), &single,
+		func() (*wirelog.Generation, error) { return newGen, nil },
+		func() (probeTarget, error) { return newStubServer(), nil }, ClientInfo{}, true)
+
+	if len(order) < 2 || order[0] != "old_finalized" {
+		t.Fatalf("replacement 必須等舊 generation finalize 完才發布：%v", order)
+	}
+}
+
+func TestStaleReaperDoesNotClearNewGeneration(t *testing.T) {
+	oldSrv := newStubServer()
+	var single Single[*GenerationOwner]
+	oldGen := newTestGeneration(t)
+	oldReaperReleased := make(chan struct{})
+	_ = RunHandshakeProbeWithWatch(context.Background(), &single,
+		func() (*wirelog.Generation, error) { return oldGen, nil },
+		func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{}, true,
+		func(error) { close(oldReaperReleased) })
+
+	// 先以 replacement 換掉 owner，之後才讓舊 server 死亡
+	newSrv, newGen := newStubServer(), newTestGeneration(t)
+	_ = RunHandshakeProbe(context.Background(), &single,
+		func() (*wirelog.Generation, error) { return newGen, nil },
+		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{}, true)
+
+	oldSrv.die()
+	<-oldReaperReleased
+
+	o, ok := single.Take()
+	if !ok || o.Generation != newGen {
+		t.Fatal("stale reaper 不得清掉新 generation（CompareAndTake 必須回 false）")
+	}
+	if newGen.Finalized() {
+		t.Fatal("新 generation 不得被舊 reaper finalize")
 	}
 }
 
 func TestThreeStageFailuresDisposeAndKeepEvidence(t *testing.T) {
-	cases := []struct {
+	for _, c := range []struct {
 		name  string
 		setup func(*stubServer)
 	}{
 		{"start", func(s *stubServer) { s.startErr = errors.New("spawn failed") }},
 		{"attach", func(s *stubServer) { s.beginRecordingErr = errors.New("attach failed") }},
 		{"handshake", func(s *stubServer) { s.handshakeErr = errors.New("handshake refused") }},
-	}
-	for _, c := range cases {
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			stub := newStubServer()
 			stub.exit = proc.Exit{Code: 3, StderrTail: "boom"}
@@ -1388,76 +1283,58 @@ func TestThreeStageFailuresDisposeAndKeepEvidence(t *testing.T) {
 			if err == nil {
 				t.Fatal("失敗階段必須回錯")
 			}
-			if gen.ID() == "" {
-				t.Fatal("失敗的 generation 仍須保留 wire_log_id")
+			if gen.ID() == "" || !gen.Finalized() {
+				t.Fatal("失敗的 generation 仍須保留 wire_log_id 並 finalize")
 			}
-			if !gen.Finalized() {
-				t.Fatal("失敗的 generation 必須 finalize（留收尾證據）")
-			}
-			if c.name != "start" { // start 失敗時沒有 server，無 exit code
+			if c.name != "start" {
 				m := gen.FinalMeta()
 				if m.ExitCode == nil || *m.ExitCode != 3 || !strings.Contains(m.StderrTail, "boom") {
 					t.Fatalf("必須保留收尾證據：%+v", m)
 				}
 			}
-			if o, ok := single.Take(); ok && o != nil {
+			if _, ok := single.Take(); ok {
 				t.Fatal("不得留下未發布 server")
 			}
 		})
 	}
 }
 
-func TestUnexpectedServerDeathFinalizesGeneration(t *testing.T) {
+func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 	stub := newStubServer()
+	var order []string
+	stub.onBeginRecording = func() { order = append(order, "attach") }
 	var single Single[*GenerationOwner]
 	gen := newTestGeneration(t)
-	_ = RunHandshakeProbe(context.Background(), &single,
-		func() (*wirelog.Generation, error) { return gen, nil },
-		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, true)
-
-	stub.die() // 意外死亡：Conn.Done 關閉
-	o := currentOwner(t, &single)
-	if err := o.FinalizeWith(errors.New("server died")); err != nil {
+	if err := RunHandshakeProbe(context.Background(), &single,
+		func() (*wirelog.Generation, error) { order = append(order, "gen_id"); return gen, nil },
+		func() (probeTarget, error) { order = append(order, "start"); return stub, nil },
+		ClientInfo{}, true); err != nil {
 		t.Fatal(err)
 	}
-	if !gen.Finalized() {
-		t.Fatal("server 意外死亡也必須在 Done 後 finalize（§3.4.2）")
+	if !reflect.DeepEqual(order, []string{"gen_id", "start", "attach"}) {
+		t.Fatalf("wire_log_id 必須在掛 recorder 前配置：%v", order)
 	}
-	if err := o.FinalizeWith(nil); err != nil {
-		t.Fatalf("FinalizeWith 必須冪等：%v", err)
+	if stub.stopRecordingCalls != 0 || gen.Finalized() {
+		t.Fatal("handoff 模式不得 Stop／Finalize（§3.4.7）")
 	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/codex/ -run 'TestHandoff|TestGenerationID|TestThreeStage|TestUnexpectedServerDeath' -race -v` → FAIL
+- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/codex/ -race -v` → FAIL
 
 - [ ] **Step 3: 實作**
 
-`newGen` 在 `start()` **之前**呼叫（wire_log_id 前置配置）；成功且 `handoff` 為真時 `return &GenerationOwner{Server: srv, Generation: gen}, true, nil`——不 `StopRecording`、不 `Finalize`。失敗一律 `owner.FinalizeWith(stageErr)`（Terminate → Wait → Finalize with Exit）後 `keep=false`。`handoff=false` 維持原 probe-scoped 行為，供既有 B1 錄流測試沿用。
+`Single.CompareAndTake(want T) bool`：鎖內比對 `s.cur == want`（指標相等）才取出。`WatchGeneration` 起一個 goroutine：`<-o.Done()` → `if s.CompareAndTake(o) { err := o.FinalizeWith(errServerDied); onFinalized(err) }`；若 `CompareAndTake` 回 false（已被 replacement 取代），**仍要 finalize 自己的 generation**但不動 Single。`RunHandshakeProbe` 在 `WithExclusive` 內先 `cur.FinalizeWith(nil)` 收舊 owner，再建新 generation → start → attach → handshake → 發布，並在發布後啟動 `WatchGeneration`。
 
-- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
+- [ ] **Step 4: 全綠＋競態穩定** — `go test ./internal/codex/ -race -count=30` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/codex/
-git commit -m "feat(codex): GenerationOwner 承載 connection-level recorder ownership＋三階段失敗 dispose（§3.4.7）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(codex): GenerationOwner＋死亡自動 finalize reaper＋CompareAndTake 防 stale（§3.4.2／§3.4.7）"`
 
 ### Task 13: recorder error latch＋in-process 受控復原
 
-**Files:**
-- Modify: `app.go:4456-4505`（`RestartCodexServerRecorded`）
-- Test: `app_wirelog_latch_test.go`
+**Files:** Modify `app.go:4456-4505`；Test `app_wirelog_latch_test.go`
 
-**Interfaces:**
-- Consumes: Task 12 `GenerationOwner`。
-- Produces:
-```go
-func (a *App) wireLatched() bool
-func (a *App) latchWireRecorder(err error)  // latch → 每 generation 一次 workspace 通知
-func (a *App) RecoverCodexRecording() error // latch 下的 in-process 復原入口（§3.4.7）
-```
+**Interfaces:** Consumes Task 12。Produces `wireLatched`／`latchWireRecorder`／`RecoverCodexRecording`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1485,14 +1362,13 @@ func TestRecoveryOrderAndFailureKeepsLatch(t *testing.T) {
 	a.hookWireStep = func(s string) { order = append(order, s) }
 	a.latchWireRecorder(errors.New("disk full"))
 	a.fakeWire.FailHandshake = true
-
 	if err := a.RecoverCodexRecording(); err == nil {
 		t.Fatal("handshake 失敗必須回錯")
 	}
 	if !a.wireLatched() {
 		t.Fatal("失敗必須保留 latch")
 	}
-	if o, ok := a.codexSingle.Take(); ok && o != nil {
+	if _, ok := a.codexSingle.Take(); ok {
 		t.Fatal("不得留下未發布 server")
 	}
 	want := []string{"drain", "terminate", "wait", "finalize_old", "new_wire_log_id", "start", "attach", "handshake"}
@@ -1527,7 +1403,6 @@ func TestLatchNotifiesOncePerGeneration(t *testing.T) {
 	a.hookWorkspaceNotice = func(string) { n++ }
 	a.latchWireRecorder(errors.New("e1"))
 	a.latchWireRecorder(errors.New("e2"))
-	a.latchWireRecorder(errors.New("e3"))
 	if n != 1 {
 		t.Fatalf("每 generation 只發一次通知：%d", n)
 	}
@@ -1536,16 +1411,11 @@ func TestLatchNotifiesOncePerGeneration(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestLatch|TestRecovery' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — `RecoverCodexRecording` 與 `RestartCodexServerRecorded` 共用同一段編排（`handoff=true`），全段在 `codexSingle.WithExclusive` 內；latch 以 per-generation `sync.Once` 保證單次通知；**全部成功才**解除 latch。
+- [ ] **Step 3: 實作** — 與 `RestartCodexServerRecorded` 共用同一段編排（`handoff=true`），全段在 `codexSingle.WithExclusive` 內；latch 以 per-generation `sync.Once` 單次通知；全部成功才解除。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go app_wirelog_latch_test.go
-git commit -m "feat(app): recorder error latch＋in-process 受控復原（§3.4.6-7）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): recorder error latch＋in-process 受控復原（§3.4.6-7）"`
 
 ---
 
@@ -1553,23 +1423,9 @@ git commit -m "feat(app): recorder error latch＋in-process 受控復原（§3.4
 
 ### Task 14: `AuditSink.Write` 回傳 `AppendReceipt`
 
-**Files:**
-- Modify: `internal/appcore/sink.go:14-40`、`manager.go:500-510`、`app.go:282-287`、`app.go:351-354`
-- Test: `internal/appcore/sink_test.go`
+**Files:** Modify `internal/appcore/sink.go:14-40`／`manager.go:500-510`／`app.go:282-287`／`351-354`；Test `sink_test.go`
 
-**Interfaces:**
-- Produces:
-```go
-type AppendReceipt struct {
-	StartOffset int64  `json:"start_offset"`
-	EndOffset   int64  `json:"end_offset"`
-	EventID     string `json:"event_id"`
-}
-type AuditSink interface {
-	Write(env contract.Envelope) (AppendReceipt, error)
-	Close() error
-}
-```
+**Interfaces:** Produces `AppendReceipt{StartOffset, EndOffset int64; EventID string}`；`AuditSink.Write(env) (AppendReceipt, error)`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1586,7 +1442,6 @@ func TestJSONLSinkReceiptMatchesFileOffsets(t *testing.T) {
 	}
 	r2, _ := s.Write(contract.Envelope{EventID: "e2", Kind: "message"})
 	_ = s.Close()
-
 	b, _ := os.ReadFile(p)
 	if r1.StartOffset != 0 || r2.StartOffset != r1.EndOffset {
 		t.Fatalf("offset 必須連續：%+v %+v", r1, r2)
@@ -1597,9 +1452,6 @@ func TestJSONLSinkReceiptMatchesFileOffsets(t *testing.T) {
 	if !strings.Contains(string(b[r1.StartOffset:r1.EndOffset]), `"e1"`) {
 		t.Fatal("receipt 範圍未涵蓋該筆")
 	}
-	if r1.EventID != "e1" {
-		t.Fatalf("receipt EventID 錯：%s", r1.EventID)
-	}
 }
 
 func TestSinkReopenContinuesOffsets(t *testing.T) {
@@ -1607,7 +1459,7 @@ func TestSinkReopenContinuesOffsets(t *testing.T) {
 	s1, _ := NewJSONLSink(p)
 	r1, _ := s1.Write(contract.Envelope{EventID: "e1", Kind: "message"})
 	_ = s1.Close()
-	s2, _ := NewJSONLSink(p) // 重開：O_APPEND，offset 必須接續
+	s2, _ := NewJSONLSink(p)
 	r2, _ := s2.Write(contract.Envelope{EventID: "e2", Kind: "message"})
 	if r2.StartOffset != r1.EndOffset {
 		t.Fatalf("重開後 offset 未接續：%+v %+v", r1, r2)
@@ -1617,42 +1469,17 @@ func TestSinkReopenContinuesOffsets(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/appcore/ -run TestJSONLSink -v` → FAIL
 
-- [ ] **Step 3: 實作** — `JSONLSink` 開檔時以 `f.Seek(0, io.SeekEnd)` 取得初始 offset；`failedSink.Write` 回 `AppendReceipt{}, s.reason`。
+- [ ] **Step 3: 實作** — 開檔時 `f.Seek(0, io.SeekEnd)` 取初始 offset；`failedSink.Write` 回 `AppendReceipt{}, s.reason`。
 
-- [ ] **Step 4: 全綠（既有 audit 測試不得減少）** — `go vet ./... && go test -race ./... -count=1` → PASS
+- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(appcore): AuditSink.Write 回傳 AppendReceipt（§3.5.2）"`
 
-```bash
-git add internal/appcore/ app.go
-git commit -m "feat(appcore): AuditSink.Write 回傳 AppendReceipt（§3.5.2）"
-```
+### Task 15: turn index＋turn boundary
 
-### Task 15: `internal/replayindex` 目錄形狀＋turn boundary
+**Files:** Create `internal/replayindex/index.go`＋測試
 
-**Files:**
-- Create: `internal/replayindex/index.go`＋測試
-
-**Interfaces:**
-- Produces:
-```go
-type TurnRecord struct {
-	StartOffset, EndOffset  int64
-	FirstEventID, LastEventID string
-}
-type Config struct {
-	Notify func(msg string) // 每個 degraded generation 只呼叫一次（Task 16）
-}
-type Index struct{ /* dir、checkpoint、mu、degraded、rebuildCursor */ }
-
-func Open(dir string) (*Index, error)
-func OpenWith(dir string, cfg Config) (*Index, error)
-func (i *Index) Observe(env contract.Envelope, r appcore.AppendReceipt) error
-func (i *Index) RecentTurns(wsid string, n int) ([]TurnRecord, error)
-func (i *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, error)
-func (i *Index) OpenTurnStart(wsid string) (int64, bool)
-func (i *Index) Checkpoint() (offset int64, lastEventID string)
-```
+**Interfaces:** Produces `TurnRecord`／`Config{Notify}`／`Index`（`Open`／`OpenWith`／`Observe`／`RecentTurns`／`TurnsBefore`／`OpenTurnStart`／`Checkpoint`）。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1664,21 +1491,18 @@ func TestTurnBoundaryDefinition(t *testing.T) {
 			WorkspaceSessionID: "w1"},
 			appcore.AppendReceipt{StartOffset: off, EndOffset: off + 10, EventID: id})
 	}
-	obs("init", "system", "", "e1", 0)          // 無 canonical user message → 不成 turn
-	obs("message", "user", "", "e2", 10)        // turn 起
+	obs("init", "system", "", "e1", 0)              // 無 canonical user message → 不成 turn
+	obs("message", "user", "", "e2", 10)            // turn 起
 	obs("delta", "assistant", "", "e3", 20)
 	obs("result", "system", "", "e4", 30)
 	obs("state_change", "system", "done", "e5", 40) // terminal：turn 止
-
 	turns, _ := i.RecentTurns("w1", 10)
 	if len(turns) != 1 {
-		t.Fatalf("init 不得被猜成一個 turn，應恰 1 個完整 turn：%d", len(turns))
+		t.Fatalf("init 不得被猜成一個 turn：%d", len(turns))
 	}
-	if turns[0].StartOffset != 10 || turns[0].EndOffset != 50 {
-		t.Fatalf("turn 範圍錯：%+v", turns[0])
-	}
-	if turns[0].FirstEventID != "e2" || turns[0].LastEventID != "e5" {
-		t.Fatalf("首末 event ID 錯：%+v", turns[0])
+	if turns[0].StartOffset != 10 || turns[0].EndOffset != 50 ||
+		turns[0].FirstEventID != "e2" || turns[0].LastEventID != "e5" {
+		t.Fatalf("turn 範圍／首末 event ID 錯：%+v", turns[0])
 	}
 }
 
@@ -1719,7 +1543,7 @@ func TestPerWSIDFilesAreSeparate(t *testing.T) {
 	feedCompleteTurn(t, i, "w2", 100)
 	for _, w := range []string{"w1", "w2"} {
 		if _, err := os.Stat(filepath.Join(dir, w+".turns.jsonl")); err != nil {
-			t.Fatalf("每 WSID 一個 index 檔（§3.5 目錄形狀）：%v", err)
+			t.Fatalf("每 WSID 一個 index 檔：%v", err)
 		}
 	}
 }
@@ -1727,27 +1551,17 @@ func TestPerWSIDFilesAreSeparate(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/replayindex/ -v` → FAIL
 
-- [ ] **Step 3: 實作** — `<dir>/checkpoint.json`（含每 WSID 的 `open_turn_start_offset`）＋`<dir>/<wsid>.turns.jsonl`；checkpoint 一律 atomic rename。
+- [ ] **Step 3: 實作** — `<dir>/checkpoint.json`（含每 WSID 的 `open_turn_start_offset`）＋`<dir>/<wsid>.turns.jsonl`；checkpoint atomic rename。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/replayindex/
-git commit -m "feat(replayindex): per-WSID turn index＋凍結 turn boundary 定義（§3.5.1／§3.5.9）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(replayindex): per-WSID turn index＋凍結 turn boundary（§3.5.1／§3.5.9）"`
 
 ### Task 16: degraded latch＋防遞迴通知
 
-**Files:**
-- Modify: `internal/replayindex/index.go`
-- Test: `internal/replayindex/degraded_test.go`
+**Files:** Modify `internal/replayindex/index.go`；Test `degraded_test.go`
 
-**Interfaces:**
-- Produces: `func (i *Index) Degraded() bool`；`func (i *Index) latchDegraded(err error)`；`Config.Notify` 生效。
-
-> 本 task 排在損壞分級（Task 18）**之前**，因為 quarantine 的復原通知要用 `Config.Notify`。
+**Interfaces:** Produces `Degraded()`／`latchDegraded(err)`；`Config.Notify` 生效。（排在損壞分級之前，因為 quarantine 的復原通知要用它。）
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1756,7 +1570,6 @@ func TestIndexFailureDoesNotBreakAuditAndNotifiesOnce(t *testing.T) {
 	var notices int
 	i, _ := OpenWith(t.TempDir(), Config{Notify: func(string) { notices++ }})
 	i.ForceWriteErrForTest(errors.New("index disk full"))
-
 	for k := 0; k < 5; k++ {
 		if err := i.Observe(userMsg("w1", k), receipt(k)); err != nil {
 			t.Fatalf("index 失敗不得讓 provider turn 失敗：%v", err)
@@ -1778,8 +1591,7 @@ func TestNotificationEventDoesNotRecurse(t *testing.T) {
 	var i *Index
 	i, _ = OpenWith(t.TempDir(), Config{Notify: func(string) {
 		notices++
-		// 通知事件本身照常進 audit → 再回灌 index
-		_ = i.Observe(workspaceNotice("w1"), receipt(99))
+		_ = i.Observe(workspaceNotice("w1"), receipt(99)) // 通知本身也進 audit
 	}})
 	i.ForceWriteErrForTest(errors.New("boom"))
 	_ = i.Observe(userMsg("w1", 0), receipt(0))
@@ -1795,31 +1607,24 @@ func TestLatchBeforeNotify(t *testing.T) {
 	i.ForceWriteErrForTest(errors.New("boom"))
 	_ = i.Observe(userMsg("w1", 0), receipt(0))
 	if !degradedAtNotify {
-		t.Fatal("必須先 latch、後通知（§3.5.4），否則通知會再觸發 index 失敗")
+		t.Fatal("必須先 latch、後通知（§3.5.4）")
 	}
 }
 ```
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/replayindex/ -run 'TestIndexFailure|TestNotification|TestLatchBefore' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 先 latch（writer 停止寫入）、後通知；`Observe` 在 degraded 時直接回 nil。
+- [ ] **Step 3: 實作** — 先 latch（writer 停寫）、後通知；`Observe` 在 degraded 時直接回 nil。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/replayindex/
-git commit -m "feat(replayindex): degraded latch＋每 generation 單次通知防遞迴（§3.5.4）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(replayindex): degraded latch＋每 generation 單次通知防遞迴（§3.5.4）"`
 
 ### Task 17: crash consistency 三態修復（啟動期）
 
-**Files:**
-- Create: `internal/replayindex/rebuild.go`＋測試
+**Files:** Create `internal/replayindex/rebuild.go`＋測試
 
-**Interfaces:**
-- Produces: `func (i *Index) VerifyOrRebuild(auditPath string) error`（啟動期用，無並行 append）。
+**Interfaces:** Produces `func (i *Index) VerifyOrRebuild(auditPath string) error`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1844,11 +1649,8 @@ func TestIndexAheadIsRepaired(t *testing.T) {
 		t.Fatal(err)
 	}
 	off, last := i.Checkpoint()
-	if off > auditSize(t, audit) {
-		t.Fatalf("超前的 checkpoint 未修復：%d", off)
-	}
-	if last == "e-nonexistent" {
-		t.Fatal("不可信 checkpoint 必須捨棄")
+	if off > auditSize(t, audit) || last == "e-nonexistent" {
+		t.Fatalf("超前的不可信 checkpoint 未修復：%d %s", off, last)
 	}
 }
 
@@ -1870,25 +1672,17 @@ func TestCheckpointPastOpenTurnRebuilds(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/replayindex/ -run 'TestIndexBehind|TestIndexAhead|TestCheckpointPast' -v` → FAIL
 
-- [ ] **Step 3: 實作** — 落後掃 suffix 補；超前／超界／event ID 不符 → 交 Task 18 的分級處置。
+- [ ] **Step 3: 實作** — 落後掃 suffix 補；超前／超界／event ID 不符交 Task 18 分級處置。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/replayindex/
-git commit -m "feat(replayindex): crash consistency 三態修復（§3.5.3／§3.5.5）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(replayindex): crash consistency 三態修復（§3.5.3／§3.5.5）"`
 
 ### Task 18: 損壞處置分級
 
-**Files:**
-- Create: `internal/replayindex/corrupt.go`＋測試
+**Files:** Create `internal/replayindex/corrupt.go`＋測試
 
-**Interfaces:**
-- Consumes: Task 16 的 `Config.Notify`。
-- Produces: `func (i *Index) inspect(wsid string) (lastValid int64, midCorrupt bool, err error)`；`func (i *Index) quarantine(wsid string) (movedTo string, err error)`。
+**Interfaces:** Consumes Task 16 `Config.Notify`。Produces `inspect`／`quarantine`。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -1902,13 +1696,10 @@ func TestTailCorruptionTruncatesAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
-		t.Fatalf("尾端 corruption 應 truncate 至最後 valid 續用：%d", len(turns))
+		t.Fatalf("尾端 corruption 應 truncate 續用：%d", len(turns))
 	}
-	if quarantineExists(t, dir) {
-		t.Fatal("尾端 corruption 不該 quarantine")
-	}
-	if notices != 0 {
-		t.Fatalf("尾端 truncate 不需復原通知：%d", notices)
+	if quarantineExists(t, dir) || notices != 0 {
+		t.Fatal("尾端 corruption 不該 quarantine、不需通知")
 	}
 }
 
@@ -1934,45 +1725,31 @@ func TestMidCorruptionQuarantinesAndRebuilds(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/replayindex/ -run 'TestTailCorruption|TestMidCorruption' -v` → FAIL
 
-- [ ] **Step 3: 實作** — 逐行解析，第一個壞行之後**仍有 valid 行**即判定中段。
+- [ ] **Step 3: 實作** — 第一個壞行之後**仍有 valid 行**即判定中段。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/replayindex/
-git commit -m "feat(replayindex): 損壞分級——尾端 truncate、中段 quarantine＋復原通知（§3.5.6）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(replayindex): 損壞分級——尾端 truncate、中段 quarantine＋復原通知（§3.5.6）"`
 
 ### Task 19: runtime 重建交接——收斂上限與原子接回
 
-**Files:**
-- Modify: `internal/replayindex/rebuild.go`
-- Test: `internal/replayindex/runtime_rebuild_test.go`
+**Files:** Modify `internal/replayindex/rebuild.go`；Test `runtime_rebuild_test.go`
 
 **Interfaces:**
 - Produces:
 ```go
-// 凍結常數（§3.5.7）——不得改為設定
 const (
 	MaxCatchUpBytes    = 1 << 20
 	MaxCatchUpRecords  = 512
 	MaxCatchUpAttempts = 8
 )
-
-// auditEnd 為可注入的「目前 audit 檔尾」來源：production 傳實際檔案大小；
-// 測試以此模擬「取鎖期間 audit 持續增長」，不需在鎖內直接 append（production
-// 中 append 也必須持有同一把 emit mutex，鎖內 append 是不可能發生的情境）。
 type auditEndFunc func() (int64, error)
-
-// RuntimeRebuild：app 運行中的重建；emitMu 為 Manager 的 emit／index 互斥。
 func (i *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd auditEndFunc) error
 var ErrRebuildNotConverged = errors.New("replayindex: catch-up 未收斂，保留 degraded latch")
 ```
-- **rebuild cursor 獨立於 checkpoint**：degraded 期間 checkpoint 依 §3.5.4 不前移，故 catch-up 的續掃位置改用 `Index.rebuildCursor`（in-memory，只在成功接回時才寫進 checkpoint）。
+- **rebuild cursor 獨立於 checkpoint**：degraded 期間 checkpoint 依 §3.5.4 不前移，catch-up 續掃位置改用 in-memory `rebuildCursor`，只在成功接回時才寫進 checkpoint。
 
-- [ ] **Step 1: 失敗測試——三條 barrier**
+- [ ] **Step 1: 失敗測試——四條**
 
 ```go
 // (1) TOCTOU：事件恰落在「鎖外補掃完成、mutex 尚未取得」的窗口
@@ -2000,7 +1777,8 @@ func TestRebuildCoversPreLockWindow(t *testing.T) {
 	}
 }
 
-// (2) sustained-append (a)：鎖外 catch-up 始終無法達標——hook 掛在殘量檢查「之前」
+// (2) sustained-append (a)：鎖外 catch-up 始終無法達標
+//     hook 掛在殘量檢查「之前」，並斷言從未進入取鎖階段
 func TestRebuildNeverConvergesKeepsLatch(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 1)
 	i, _ := Open(dir)
@@ -2008,7 +1786,6 @@ func TestRebuildNeverConvergesKeepsLatch(t *testing.T) {
 	var emitMu sync.Mutex
 	var lockAcquired int
 	i.hookAfterResidualOKBeforeLock = func() { lockAcquired++ }
-	// 每輪鎖外 catch-up 結束時都灌入超過上限的殘量 → 殘量檢查永遠不通過
 	i.hookAfterUnlockedCatchUp = func() { appendBytes(t, audit, MaxCatchUpBytes*2) }
 
 	err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit))
@@ -2029,9 +1806,9 @@ func TestRebuildNeverConvergesKeepsLatch(t *testing.T) {
 	}
 }
 
-// (3) sustained-append (b)：達標後取鎖時再次超限
-// 以 auditEnd 注入模擬「等待 emitMu 期間其他 goroutine 持續 append」——
-// 這正是 production 中取鎖阻塞窗口會發生的事。
+// (3) sustained-append (b)：達標後取鎖時再次超限。
+//     用 auditEnd 注入模擬「等待 emitMu 期間其他 goroutine 持續 append」——
+//     production 中 append 必須持有同一把 emit mutex，鎖內 append 不可能發生。
 func TestRebuildOverLimitUnderLockUnlocksAndRetries(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 1)
 	i, _ := Open(dir)
@@ -2044,7 +1821,7 @@ func TestRebuildOverLimitUnderLockUnlocksAndRetries(t *testing.T) {
 		if err != nil {
 			return 0, err
 		}
-		if i.HoldingLockForTest() && burst > 0 { // 只在鎖內讀時放大
+		if i.HoldingLockForTest() && burst > 0 {
 			burst--
 			return end + MaxCatchUpBytes*2, nil
 		}
@@ -2064,6 +1841,7 @@ func TestRebuildOverLimitUnderLockUnlocksAndRetries(t *testing.T) {
 	}
 }
 
+// (4) rebuild cursor 與 checkpoint 分離
 func TestRebuildCursorIndependentOfCheckpoint(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 3)
 	i, _ := Open(dir)
@@ -2109,7 +1887,7 @@ func (i *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd au
 			return err
 		}
 		if !ok {
-			continue // 殘量仍超限：不取鎖，直接下一輪
+			continue // 殘量仍超限：不取鎖
 		}
 		if i.hookAfterResidualOKBeforeLock != nil {
 			i.hookAfterResidualOKBeforeLock()
@@ -2131,39 +1909,101 @@ func (i *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd au
 		emitMu.Unlock()
 		return err
 	}
-	return ErrRebuildNotConverged // 保留 degraded latch，由 Task 20 的編排 backoff 重試
+	return ErrRebuildNotConverged
 }
 ```
 
-`catchUpUnlocked` 從 **`i.rebuildCursor`**（非 checkpoint）續掃；去重靠 `TurnRecord` 的 `(StartOffset, LastEventID)` 唯一鍵。
+`catchUpUnlocked` 從 `i.rebuildCursor` 續掃；去重靠 `(StartOffset, LastEventID)` 唯一鍵。
 
 - [ ] **Step 4: 全綠＋競態穩定** — `go test ./internal/replayindex/ -race -count=30` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(replayindex): runtime 重建收斂上限＋原子接回＋兩種不收斂分支（§3.5.7）"`
 
-```bash
-git add internal/replayindex/
-git commit -m "feat(replayindex): runtime 重建收斂上限＋原子接回＋兩種不收斂分支（§3.5.7）"
-```
+### Task 20: index 接線＋rebuild 編排＋**啟動序列完整化**
 
-### Task 20: index 接線＋rebuild 編排（單一 active／取消／backoff）
-
-**Files:**
-- Modify: `internal/appcore/manager.go:500-510`、`app.go:275-325`
-- Create: `rebuild_orchestrator.go`
-- Test: `app_replayindex_test.go`
+**Files:** Modify `internal/appcore/manager.go:500-510`、`app.go:259-325`；Create `rebuild_orchestrator.go`；Test `app_replayindex_test.go`、`app_startup_repair_test.go`
 
 **Interfaces:**
+- Consumes: Task 6 `loadSessionRegistry`、Task 7 `sessionHosts`、Task 14 `AppendReceipt`、Task 15-19 `Index`。
 - Produces:
 ```go
-// scheduleRebuild：degraded 時觸發。同一時刻至多一個 active rebuild；
-// ErrRebuildNotConverged 以指數 backoff 重試；shutdown 時取消並不阻擋收尾。
+func (a *App) restoreSessions() ([]wsregistry.Entry, error) // §3.2.4 完整凍結序列
+func (a *App) repairIncompleteTurns(entries []wsregistry.Entry) error
 func (a *App) scheduleRebuild(reason string)
 func (a *App) rebuildInFlight() bool
-func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error)
+func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error) // 純新增 binding
 ```
 
-- [ ] **Step 1: 失敗測試**
+- [ ] **Step 1: 失敗測試（啟動序列）**
+
+```go
+func TestStartupOrderIsFrozen(t *testing.T) {
+	a := newTestAppAt(t, seedInterruptedTurn(t))
+	var order []string
+	a.hookStartupStep = func(s string) { order = append(order, s) }
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"registry_load", "migrate", "restore_dormant",
+		"index_verify", "detect_incomplete", "emit_stream_error", "open_ui"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("啟動修復順序不符 §3.2.4：\n got=%v\nwant=%v", order, want)
+	}
+}
+
+func TestStartupRepairEmitsStreamErrorThenFailed(t *testing.T) {
+	dir := seedInterruptedTurn(t) // w1 有 user message＋delta，無 terminal state_change
+	a := newTestAppAt(t, dir)
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	ev := readEvents(t, dir)
+	if n := len(ev); n < 2 ||
+		ev[n-2].Kind != "stream_error" || ev[n-2].WorkspaceSessionID != "w1" ||
+		ev[n-1].Kind != "state_change" || ev[n-1].State != "failed" ||
+		ev[n-1].WorkspaceSessionID != "w1" {
+		t.Fatalf("末二筆應為 stream_error → state_change=failed：%+v", tail(ev, 3))
+	}
+}
+
+func TestStartupRepairIsIdempotent(t *testing.T) {
+	dir := seedInterruptedTurn(t)
+	a1 := newTestAppAt(t, dir)
+	if _, err := a1.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	first := readEvents(t, dir)
+	a2 := newTestAppAt(t, dir) // 模擬 crash 後重跑
+	if _, err := a2.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if second := readEvents(t, dir); len(second) != len(first) {
+		t.Fatalf("重跑必須冪等，事件數 %d → %d", len(first), len(second))
+	}
+}
+
+func TestUIOpensOnlyAfterRepair(t *testing.T) {
+	a := newTestAppAt(t, seedInterruptedTurn(t))
+	var uiOpenedAt int
+	var repairedAt int
+	a.hookStartupStep = func(s string) {
+		switch s {
+		case "emit_stream_error":
+			repairedAt = len(readEvents(t, a.stateDir))
+		case "open_ui":
+			uiOpenedAt = len(readEvents(t, a.stateDir))
+		}
+	}
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if uiOpenedAt < repairedAt {
+		t.Fatal("必須修復完才開放 UI 與 provider 啟動（§3.2.4）")
+	}
+}
+```
+
+- [ ] **Step 2: 失敗測試（rebuild 編排與視窗）**
 
 ```go
 func TestOnlyOneActiveRebuild(t *testing.T) {
@@ -2225,11 +2065,8 @@ func TestRestoreLoadsLast20TurnsPlusOpenTurn(t *testing.T) {
 	if countCompleteTurns(got.Envelopes) != 20 {
 		t.Fatalf("釘選 pane 應載最近 20 個完整 turn：%d", countCompleteTurns(got.Envelopes))
 	}
-	if !hasOpenTurn(got.Envelopes) {
-		t.Fatal("未結束的目前 turn 必須一併載入（§3.8）")
-	}
-	if truncatedMidTurn(got.Envelopes) {
-		t.Fatal("不得從 turn 中間截斷")
+	if !hasOpenTurn(got.Envelopes) || truncatedMidTurn(got.Envelopes) {
+		t.Fatal("未結束 turn 必須一併載入且不得從中間截斷（§3.8）")
 	}
 }
 
@@ -2240,40 +2077,138 @@ func TestPagingUsesBeforeEventIDCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if countCompleteTurns(page) != 20 {
-		t.Fatalf("每頁 20 turn：%d", countCompleteTurns(page))
-	}
-	if overlaps(first, page) {
-		t.Fatal("分頁不得重疊（event_id 去重）")
+	if countCompleteTurns(page) != 20 || overlaps(first, page) {
+		t.Fatalf("每頁 20 turn 且不得重疊：%d", countCompleteTurns(page))
 	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestOnlyOneActive|TestNotConverged|TestShutdownCancels|TestRestoreLoads|TestPaging' -race -v` → FAIL
+- [ ] **Step 3: 失敗測試（binding 轉發）**
 
-- [ ] **Step 3: 實作** — `writeAndEmitLocked` 取得 receipt 後在**同一 mutex 內**呼叫 `index.Observe`（滿足 §3.5.7 的 emit／index 同鎖前提）；編排以 `context.Context` 承載 shutdown 取消、`atomic.Bool` 保證單一 active。
-
-- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/appcore/manager.go app.go rebuild_orchestrator.go app_replayindex_test.go
-git commit -m "feat(app): replay index 接線＋單一 active rebuild／backoff／shutdown 取消（§3.5）"
+```ts
+it('LoadTurnsBefore 逐參數轉發', () => {
+  const b = makeBindings()
+  b.LoadTurnsBefore('w1', 'e100', 20)
+  expect(App.LoadTurnsBefore).toHaveBeenCalledWith('w1', 'e100', 20)
+})
 ```
+
+- [ ] **Step 4: 跑測試確認失敗** — `go test . -race -v && npm --prefix frontend run test -- bindings` → FAIL
+
+- [ ] **Step 5: 實作**
+
+`writeAndEmitLocked` 取得 receipt 後在**同一 mutex 內**呼叫 `index.Observe`（滿足 §3.5.7 的 emit／index 同鎖前提）。`restoreSessions` 完整化：
+
+```go
+func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
+	live, err := a.loadSessionRegistry() // Task 6：registry_load → migrate → restore_dormant
+	if err != nil {
+		return nil, err
+	}
+	if err := a.replayIndex.VerifyOrRebuild(a.eventsPath()); err != nil { // index_verify
+		return nil, err
+	}
+	if err := a.repairIncompleteTurns(live); err != nil { // detect_incomplete → emit_stream_error
+		return nil, err
+	}
+	a.openUIAndProviders() // open_ui：修復完才開放
+	return live, nil
+}
+```
+
+`repairIncompleteTurns` 冪等判定：該 WSID 末筆已是 app-restart `stream_error` 或其導出的 `failed` 即跳過。rebuild 編排以 `context.Context` 承載 shutdown 取消、`atomic.Bool` 保證單一 active。同 task 完成 `LoadTurnsBefore` 的 binding 四件事。
+
+- [ ] **Step 6: 全綠** — `go vet ./... && go test -race ./... -count=1 && npm --prefix frontend run test && npm --prefix frontend run build` → PASS
+
+- [ ] **Step 7: Commit** — `git commit -m "feat(app): replay index 接線＋啟動序列完整化＋單一 active rebuild／backoff／shutdown 取消（§3.2.4／§3.5）"`
 
 ---
 
 ## Phase 5 — 移除、approval 與 shutdown
 
-### Task 21: 移除＝tombstone＋名額釋放時點（含序列化 barrier）
+### Task 21: 可注入的 `After`——`WaitQuiesce`／`CloseSequence`
 
-**Files:**
-- Modify: `app.go`
-- Test: `app_remove_test.go`
+**Files:** Modify `internal/appcore/pump.go:23-31`／`33-67`、`app.go:4176`；Test `internal/appcore/pump_test.go`
 
 **Interfaces:**
-- Produces: `func (a *App) RemoveSession(wsid string) error`（Wails binding，Task 25 接前端）。
+- Produces:
+```go
+// After 是可注入的等待來源；production 傳 RealAfter，測試傳受控 timer。
+type After func(d time.Duration) <-chan time.Time
+func RealAfter(d time.Duration) <-chan time.Time { return time.After(d) }
+func WaitQuiesce(done <-chan struct{}, timeout time.Duration, after After) error
+func CloseSequence(closeFn func() error, done <-chan struct{},
+	quiesceTimeout, killTimeout time.Duration,
+	terminate func() error, wait func() proc.Exit, finalize func(proc.Exit),
+	after After) (proc.Exit, error)
+```
+
+> 先做這個 task，Task 24 的 bounded-window barrier 才有東西可注入（`pump.go:27` 現在直接用 `time.After`）。
+
+- [ ] **Step 1: 失敗測試**
+
+```go
+func TestWaitQuiesceUsesInjectedAfter(t *testing.T) {
+	fired := make(chan time.Time, 1)
+	var gotTimeout time.Duration
+	after := func(d time.Duration) <-chan time.Time { gotTimeout = d; return fired }
+	done := make(chan struct{})
+	errC := make(chan error, 1)
+	go func() { errC <- WaitQuiesce(done, 7*time.Second, after) }()
+	fired <- time.Time{} // 受控觸發，不真的等 7 秒
+	if err := <-errC; err == nil {
+		t.Fatal("逾時必須回 error")
+	}
+	if gotTimeout != 7*time.Second {
+		t.Fatalf("timeout 未傳入注入的 after：%v", gotTimeout)
+	}
+}
+
+func TestCloseSequenceEscalatesWithInjectedAfter(t *testing.T) {
+	quiesce := make(chan time.Time, 1)
+	kill := make(chan time.Time, 1)
+	calls := 0
+	after := func(d time.Duration) <-chan time.Time {
+		calls++
+		if calls == 1 {
+			return quiesce
+		}
+		return kill
+	}
+	var terminated bool
+	done := make(chan struct{})
+	errC := make(chan error, 1)
+	go func() {
+		_, err := CloseSequence(func() error { return nil }, done, time.Second, time.Second,
+			func() error { terminated = true; return nil },
+			func() proc.Exit { return proc.Exit{} }, func(proc.Exit) {}, after)
+		errC <- err
+	}()
+	quiesce <- time.Time{} // 第一次逾時 → 升級 Terminate
+	kill <- time.Time{}    // 第二次逾時 → 盡力 finalize
+	<-errC
+	if !terminated {
+		t.Fatal("quiesce 逾時必須升級 Terminate")
+	}
+	if calls != 2 {
+		t.Fatalf("必須恰有兩段 bounded window：%d", calls)
+	}
+}
+```
+
+- [ ] **Step 2: 跑測試確認失敗** — `go test ./internal/appcore/ -run 'TestWaitQuiesceUses|TestCloseSequenceEscalates' -race -v` → FAIL
+
+- [ ] **Step 3: 實作** — 加參數；`app.go:4176` 傳 `appcore.RealAfter`，並新增 `App.afterFn`（測試可覆寫）。既有 `pump_test.go` 呼叫點同步更新。
+
+- [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
+
+- [ ] **Step 5: Commit** — `git commit -m "refactor(appcore): WaitQuiesce／CloseSequence 可注入 After（為 shutdown bounded-window barrier 鋪路）"`
+
+### Task 22: 移除＝tombstone＋名額釋放時點（含序列化 barrier）
+
+**Files:** Modify `app.go`；Test `app_remove_test.go`、`frontend/src/lib/bindings.test.ts`
+
+**Interfaces:** Produces `func (a *App) RemoveSession(wsid string) error`（純新增 binding，本 task 完成四件事）。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2300,7 +2235,8 @@ func TestRemoveOrderIsFrozen(t *testing.T) {
 	if err := a.RemoveSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"deny_approvals", "teardown", "lease_finalize", "cleanup_files", "tombstone_persist", "decrement_count"}
+	want := []string{"deny_approvals", "teardown", "lease_finalize",
+		"cleanup_files", "tombstone_persist", "decrement_count"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("釋放名額必須是最後一步（§3.6.2）：\n got=%v\nwant=%v", order, want)
 	}
@@ -2310,7 +2246,7 @@ func TestRemovedTombstoneSurvivesRestartAndRebuild(t *testing.T) {
 	dir := t.TempDir()
 	a1 := newTestAppAt(t, dir)
 	w := mustCreate(t, a1, "codex")
-	mustEmitTurn(t, a1, w) // audit 中留有該 WSID 的事件
+	mustEmitTurn(t, a1, w)
 	if err := a1.RemoveSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
@@ -2329,74 +2265,84 @@ func TestRemovedTombstoneSurvivesRestartAndRebuild(t *testing.T) {
 	}
 }
 
-// Remove × New 序列化 barrier：不是只看最終 count，而是證明兩者不重疊。
-func TestRemoveXNewSerializedByOwnershipToken(t *testing.T) {
+// Remove × New 共用 ownership token：deterministic barrier。
+// 刻意留一個空 slot，讓 Create 在無競態時「必定成功」——如此 Create 若立即
+// 失敗或未取得 token，就是實作沒有共用 token，而不是被名額擋掉。
+func TestRemoveXNewShareOwnershipToken(t *testing.T) {
 	a := newTestApp(t)
-	for k := 0; k < appcore.MaxSessionsPerProvider; k++ {
-		mustStartClaude(t, a, mustCreate(t, a, "claude")) // 佔滿 4 slot
+	var hosts []appcore.WSID
+	for k := 0; k < appcore.MaxSessionsPerProvider-1; k++ { // 佔 3/4，留一個空位
+		w := mustCreate(t, a, "claude")
+		mustStartClaude(t, a, w)
+		hosts = append(hosts, w)
 	}
-	victim := a.hostsOf("claude")[0].wsid
+	victim := hosts[0]
 
-	inRemove := make(chan struct{})
+	removeHoldingToken := make(chan struct{})
 	releaseRemove := make(chan struct{})
-	var overlapped atomic.Bool
-	a.hookRemoveHoldingToken = func() { // Remove 已取得 ownership token
-		close(inRemove)
-		<-releaseRemove
-	}
-	a.hookCreateHoldingToken = func() { // New 取得 token 時 Remove 若仍持有＝未序列化
+	createWaitingForToken := make(chan struct{})
+	var createTookTokenWhileRemoveHeld atomic.Bool
+
+	a.hookRemoveHoldingToken = func() { close(removeHoldingToken); <-releaseRemove }
+	a.hookCreateWaitingForToken = func() { close(createWaitingForToken) }
+	a.hookCreateAcquiredToken = func() {
 		if a.removeTokenHeldForTest() {
-			overlapped.Store(true)
+			createTookTokenWhileRemoveHeld.Store(true)
 		}
 	}
 
-	errC := make(chan error, 2)
-	go func() { errC <- a.RemoveSession(string(victim)) }()
-	<-inRemove
-	newDone := make(chan error, 1)
-	go func() { _, err := a.CreateSession("claude", "new"); newDone <- err }()
+	removeErr := make(chan error, 1)
+	go func() { removeErr <- a.RemoveSession(string(victim)) }()
+	<-removeHoldingToken
 
-	select { // Remove 尚未放行前，New 必須因滿額被擋或阻塞——不得穿透
-	case err := <-newDone:
-		if err == nil {
-			t.Fatal("Remove 未完成前名額尚未釋放，New 不得成功")
-		}
-	case <-time.After(200 * time.Millisecond): // 阻塞也是合格行為
+	createErr := make(chan error, 1)
+	go func() { _, err := a.CreateSession("claude", "new"); createErr <- err }()
+
+	select { // Create 必須「在等 token」，而不是直接失敗或直接成功
+	case <-createWaitingForToken:
+	case err := <-createErr:
+		t.Fatalf("Create 未等待共用 token 就返回（err=%v）——未序列化", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Create 未進場")
 	}
+
 	close(releaseRemove)
-	if err := <-errC; err != nil {
+	if err := <-removeErr; err != nil {
 		t.Fatal(err)
 	}
-	<-newDone
-	if overlapped.Load() {
-		t.Fatal("Remove 與 New 的 ownership token 區段重疊＝未序列化")
+	if err := <-createErr; err != nil { // 只讀一次
+		t.Fatalf("Remove 放行後 Create 應成功（有空 slot）：%v", err)
 	}
-	if got := a.manager.SlotCount("claude"); got > appcore.MaxSessionsPerProvider {
-		t.Fatalf("名額穿透：%d", got)
+	if createTookTokenWhileRemoveHeld.Load() {
+		t.Fatal("Create 在 Remove 仍持有 token 時取得 token＝未序列化")
+	}
+	if got := a.manager.SlotCount("claude"); got != appcore.MaxSessionsPerProvider-1 {
+		t.Fatalf("移除一個＋新增一個，名額應維持 3：%d", got)
 	}
 }
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `go test . -run TestRemove -race -v` → FAIL
+- [ ] **Step 2: 失敗測試（binding）**
 
-- [ ] **Step 3: 實作** — 依 §3.6.2 凍結順序；Remove 與 Create 共用同一 provider-scoped ownership token。
-
-- [ ] **Step 4: 全綠＋競態穩定** — `go test . -run TestRemoveXNew -race -count=30` → PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go app_remove_test.go
-git commit -m "feat(app): 移除＝durable tombstone＋名額釋放時點＋Remove×New 序列化（§3.6.1-2）"
+```ts
+it('RemoveSession 逐參數轉發', () => {
+  const b = makeBindings()
+  b.RemoveSession('w1')
+  expect(App.RemoveSession).toHaveBeenCalledWith('w1')
+})
 ```
 
-### Task 22: 待核可時移除（fail-closed deny）＋per-WSID 檔案清理
+- [ ] **Step 3: 跑測試確認失敗** — `go test . -run TestRemove -race -v && npm --prefix frontend run test -- bindings` → FAIL
 
-**Files:**
-- Modify: `app.go`
-- Test: `app_remove_approval_test.go`
+- [ ] **Step 4: 實作** — 依 §3.6.2 凍結順序；Remove 與 Create 共用同一 provider-scoped ownership token（`hookCreateWaitingForToken` 在嘗試取得 token 前呼叫、`hookCreateAcquiredToken` 在取得後呼叫）。同 task 完成 binding 四件事。
 
-**Interfaces:** Consumes Task 21 `RemoveSession`、Task 8 的 per-WSID socket／mcp 路徑。
+- [ ] **Step 5: 全綠＋競態穩定** — `go test . -run TestRemoveXNew -race -count=30` → PASS
+
+- [ ] **Step 6: Commit** — `git commit -m "feat(app): 移除＝durable tombstone＋名額釋放時點＋Remove×New 共用 token（§3.6.1-2）"`
+
+### Task 23: 待核可時移除＋per-WSID 檔案清理
+
+**Files:** Modify `app.go`；Test `app_remove_approval_test.go`
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2406,14 +2352,12 @@ func TestRemoveDeniesAllPendingApprovalsAndCleansFiles(t *testing.T) {
 	w := mustCreate(t, a, "claude")
 	mustStartClaude(t, a, w)
 	sock, mcp := a.hostFor(w).sockPath, a.hostFor(w).mcpPath
-	ids := seedPendingApprovals(t, a, w, 3) // 1 顯示中＋2 排隊
-
+	ids := seedPendingApprovals(t, a, w, 3)
 	if err := a.RemoveSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range ids {
-		d := recordedDecision(t, a, id)
-		if d.allow || d.reason != "session_removed" {
+		if d := recordedDecision(t, a, id); d.allow || d.reason != "session_removed" {
 			t.Fatalf("必須 fail-closed deny 且帶 reason：%+v", d)
 		}
 	}
@@ -2429,21 +2373,18 @@ func TestPartialDenyFailureKeepsDormantSlot(t *testing.T) {
 	w := mustCreate(t, a, "claude")
 	mustStartClaude(t, a, w)
 	ids := seedPendingApprovals(t, a, w, 3)
-	a.failDenyForIndex(1) // 第二筆 deny 失敗
-
+	a.failDenyForIndex(1)
 	err := a.RemoveSession(string(w))
 	if err == nil {
 		t.Fatal("deny 部分失敗不得靜默移除")
 	}
-	// 每一筆都必須被嘗試過——不得在第一個錯誤就中斷
-	for _, id := range ids {
+	for _, id := range ids { // 每一筆都必須被嘗試——不得在第一個錯誤就中斷
 		if !a.denyAttempted(id) {
 			t.Fatalf("approval %s 未被嘗試 deny", id)
 		}
 	}
-	// 錯誤必須完整 Join，不得只留最後一個
 	if !strings.Contains(err.Error(), "deny failed") {
-		t.Fatalf("錯誤未 Join：%v", err)
+		t.Fatalf("錯誤未完整 Join：%v", err)
 	}
 	if !a.providerTerminated(w) {
 		t.Fatal("deny 部分失敗時仍須 terminate provider（§3.6.3）")
@@ -2457,32 +2398,25 @@ func TestPartialDenyFailureKeepsDormantSlot(t *testing.T) {
 	if got := a.manager.SlotCount("claude"); got != 1 {
 		t.Fatalf("必須保留 dormant slot 供重試移除：%d", got)
 	}
-	if _, ok := a.wsReg.Get(string(w)); !ok {
-		t.Fatal("未成功移除時 registry entry 必須保留（非 tombstone）")
+	if e, ok := a.wsReg.Get(string(w)); !ok || e.RemovedAt != "" {
+		t.Fatal("未成功移除時 registry entry 必須保留且不得標 tombstone")
 	}
 }
 ```
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestRemoveDenies|TestPartialDeny' -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — best-effort deny 全部（逐筆 recover，不中斷）→ `errors.Join` 收集 → bounded teardown → lease finalize → 檔案清理；失敗仍 terminate、保留 dormant slot 與 registry entry。
+- [ ] **Step 3: 實作** — best-effort deny 全部（逐筆 recover 不中斷）→ `errors.Join` → bounded teardown → lease finalize → 檔案清理。
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): 待核可時移除全部 fail-closed deny＋部分失敗保留 dormant slot＋檔案清理（§3.6.3）"`
 
-```bash
-git add app.go app_remove_approval_test.go
-git commit -m "feat(app): 待核可時移除——全部 fail-closed deny＋部分失敗保留 dormant slot＋檔案清理（§3.6.3）"
-```
+### Task 24: shutdown 總序＋並行與 bounded-window barrier
 
-### Task 23: shutdown 總序＋並行 teardown barrier
+**Files:** Modify `app.go:694-800`；Test `app_shutdown_multi_test.go`
 
-**Files:**
-- Modify: `app.go:694-800`
-- Test: `app_shutdown_multi_test.go`
-
-**Interfaces:** Consumes Task 7 `snapshotHosts`、Task 12/13 wire log、Task 20 index。
+**Interfaces:** Consumes Task 7 `snapshotHosts`、Task 12/13 wire log、Task 20 index、**Task 21 可注入 `After`**。
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2504,47 +2438,32 @@ func TestShutdownFollowsFrozenOrder(t *testing.T) {
 	}
 }
 
-// 並行 barrier：8 個 teardown 必須「同時進場」才放行——若實作是串行，
-// 第二個 teardown 永遠等不到 barrier，測試以 timeout 失敗。
-func TestTeardownsRunConcurrently(t *testing.T) {
+// 8 個卡死 session 必須共用單一 bounded window：
+// 全部 quiesce timer 同時 outstanding → 一次觸發 → 全部升級 → kill timer 同理。
+func TestStuckHostsShareSingleBoundedWindow(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	seedSessions(t, a, 4, 4)
-	const n = 8
-	entered := make(chan struct{}, n)
-	release := make(chan struct{})
-	a.hookTeardownEntered = func(appcore.WSID) {
-		entered <- struct{}{}
-		<-release // 全部到齊前不放行
+	for _, h := range a.snapshotHosts() {
+		a.makeHostStuck(h.wsid) // 全部卡死，只能靠 timeout 收斂
 	}
+	timers := newFakeAfter() // 記錄每次 After 呼叫並回傳受控 channel
+	a.afterFn = timers.After
+
 	done := make(chan struct{})
 	go func() { a.shutdown(context.Background()); close(done) }()
 
-	for k := 0; k < n; k++ {
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("只有 %d 個 teardown 進場——teardown 未並行（§3.6.5）", k)
-		}
-	}
-	close(release)
+	timers.WaitForOutstanding(t, 8) // 8 個 quiesce timer 同時存在＝teardown 並行
+	timers.FireAll()                // 單一 window
+	timers.WaitForOutstanding(t, 8) // 8 個 kill timer 同時存在
+	timers.FireAll()
+
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown 未收斂")
 	}
-}
-
-// 卡死者必須被 bounded window 收斂，且不把總時間乘以 session 數
-func TestStuckHostConvergesWithinSingleBoundedWindow(t *testing.T) {
-	a := newTestAppWithFakeWire(t)
-	seedSessions(t, a, 4, 4)
-	a.makeHostStuck(a.snapshotHosts()[0].wsid) // 一個 Claude 卡死，只靠 kill timeout 收斂
-	start := a.fakeClock.Now()
-	a.shutdown(context.Background())
-	elapsed := a.fakeClock.Since(start)
-	if elapsed > 2*a.closeSequenceTimeout() {
-		t.Fatalf("shutdown 時間應為單一 bounded window，實測 %v（timeout=%v）",
-			elapsed, a.closeSequenceTimeout())
+	if got := timers.Rounds(); got != 2 {
+		t.Fatalf("卡死者應共用兩段 bounded window（quiesce＋kill），實測 %d 輪＝串行", got)
 	}
 	if !a.allHostsTornDown() {
 		t.Fatal("卡死者也必須收斂")
@@ -2564,24 +2483,15 @@ func TestIndexAcceptsEventsUntilManagerClose(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run TestShutdown -race -v` → FAIL
 
-- [ ] **Step 3: 實作** — 依 §3.6.5 逐行；per-session teardown 用 goroutine＋`WaitGroup`；卡死收斂靠既有 `CloseSequence` 的 quiesce/kill timeout（用 fake clock 驗證，不用 `time.Sleep`）。
+- [ ] **Step 3: 實作** — 依 §3.6.5 逐行；per-session teardown 用 goroutine＋`WaitGroup`，全部把 `a.afterFn` 傳進 `CloseSequence`。
 
-- [ ] **Step 4: 全綠＋競態穩定** — `go test . -run 'TestTeardownsRunConcurrently|TestStuckHost' -race -count=30` → PASS
+- [ ] **Step 4: 全綠＋競態穩定** — `go test . -run TestStuckHosts -race -count=30` → PASS（**不得出現真實 5s／10s 等待**）
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): shutdown 總序凍結＋並行 teardown 與單一 bounded window barrier（§3.6.5）"`
 
-```bash
-git add app.go app_shutdown_multi_test.go
-git commit -m "feat(app): shutdown 總序凍結＋per-session 並行 teardown barrier（§3.6.5）"
-```
+### Task 25: approval WSID 路由（後端）
 
-### Task 24: approval WSID 路由（後端）
-
-**Files:**
-- Modify: `app.go:3758-3809`
-- Test: `app_approval_route_test.go`
-
-**Interfaces:** Produces：approval 事件攜帶 `workspace_session_id`；`func (a *App) promotionOrder() []string`。
+**Files:** Modify `app.go:3758-3809`；Test `app_approval_route_test.go`
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2592,15 +2502,13 @@ func TestApprovalCarriesWSIDAndFIFOPromotion(t *testing.T) {
 	mustStartClaude(t, a, w1)
 	mustStartClaude(t, a, w2)
 	id1, id2, id3 := seedApproval(t, a, w1), seedApproval(t, a, w2), seedApproval(t, a, w1)
-
 	if got := a.pendingByID(id1).wsid; got != w1 {
 		t.Fatalf("approval 必須依 WSID 路由：%v", got)
 	}
 	if got := a.promotionOrder(); !reflect.DeepEqual(got, []string{id1, id2, id3}) {
-		t.Fatalf("多筆待核可 FIFO promotion（按 approval ID／WSID）：%v", got)
+		t.Fatalf("多筆待核可 FIFO promotion：%v", got)
 	}
-	ev := approvalEventFor(t, a, id1)
-	if ev.WorkspaceSessionID != string(w1) {
+	if ev := approvalEventFor(t, a, id1); ev.WorkspaceSessionID != string(w1) {
 		t.Fatalf("approval 事件必須帶 WSID：%+v", ev)
 	}
 }
@@ -2612,57 +2520,40 @@ func TestApprovalCarriesWSIDAndFIFOPromotion(t *testing.T) {
 
 - [ ] **Step 4: 全綠** — `go vet ./... && go test -race ./... -count=1` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add app.go app_approval_route_test.go
-git commit -m "feat(app): approval 依 WSID 路由＋FIFO promotion（§3.6.4）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(app): approval 依 WSID 路由＋FIFO promotion（§3.6.4）"`
 
 ---
 
-## Phase 6 — Wails bindings 與前端
+## Phase 6 — 前端
 
-### Task 25: Wails bindings 重生＋adapter 逐參數轉發
+### Task 26: exported binding WSID 化＋session store per-WSID lane（**原子切換**）
 
-**Files:**
-- Modify: `frontend/wailsjs/go/main/App.d.ts`／`App.js`（重生）、`frontend/src/lib/bindings.ts`、`frontend/src/types.ts`
-- Test: `frontend/src/lib/bindings.test.ts`
+> 本 task 是 Global Constraints 第 2 條的原子切換點：後端 exported 簽名、`wailsjs`、adapter、`types.ts`、session store **必須同一個 commit 一起改**，否則前端會在中途壞掉。
+
+**Files:** Modify `app.go`（刪 `legacyWSIDFor` 包裝層）、`frontend/wailsjs`（重生）、`frontend/src/lib/bindings.ts`、`types.ts`、`stores/session.ts`；Test `bindings.test.ts`、`session.test.ts`
 
 **Interfaces:**
-- Consumes: Task 4 `CreateSession`、Task 21 `RemoveSession`、Task 20 `LoadTurnsBefore`、Task 9 改為 WSID 的 `SendMessage`／`EndSession`／`NewSession`／`StartSession`。
-- Produces: `Bindings` 介面新增／改簽名的 TypeScript 契約。
+- Produces（後端）：`StartSession(wsid, prompt, resume, recordCase, taskLabel, approvalPolicy)`／`SendMessage(wsid, text)`／`EndSession(wsid)`／`NewSession(wsid)`。
+- Produces（前端）：
+```ts
+export interface SessionMeta {
+  wsid: string; provider: ProviderKey; taskLabel: string
+  state: string; unread: number; busy: boolean; awaitingApproval: boolean; removed: boolean
+}
+interface State {
+  sessions: Record<string, SessionMeta>
+  views: Record<string, SessionView>   // 只有釘選／曾切入的才有 transcript
+  persistentPins: [string | null, string | null]
+  pins: [string | null, string | null]
+  focused: 0 | 1
+  scrollAnchors: Record<string, string>
+}
+```
+- **契約凍結**：`busy`／`unread`／`awaitingApproval`／`state` 一律讀寫 `sessions[wsid]`；`views` 只承載 transcript（`chat`／`timeline`／`totals`）。
 
-> **本 task 必做四件事**（`bindings.ts:9-12` 記載的 M1.5 P1-1 真 bug：單參數 adapter 把 provider 名當訊息送出，元件 mock 抓不到）。
-
-- [ ] **Step 1: 失敗測試——逐參數轉發**
+- [ ] **Step 1: 失敗測試（binding 轉發＋WSID 回歸）**
 
 ```ts
-import { makeBindings } from './bindings'
-import * as App from '../../wailsjs/go/main/App'
-vi.mock('../../wailsjs/go/main/App')
-
-it('每個 binding 都逐參數轉發，順序與 Go 簽章一致', () => {
-  const b = makeBindings()
-  b.CreateSession('claude', 'my-task')
-  expect(App.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
-
-  b.StartSession('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
-  expect(App.StartSession).toHaveBeenCalledWith('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
-
-  b.SendMessage('w1', 'hello')
-  expect(App.SendMessage).toHaveBeenCalledWith('w1', 'hello')
-
-  b.EndSession('w1')
-  expect(App.EndSession).toHaveBeenCalledWith('w1')
-
-  b.RemoveSession('w1')
-  expect(App.RemoveSession).toHaveBeenCalledWith('w1')
-
-  b.LoadTurnsBefore('w1', 'e100', 20)
-  expect(App.LoadTurnsBefore).toHaveBeenCalledWith('w1', 'e100', 20)
-})
-
 it('WSID 取代 provider 作為第一參數——不得誤傳 provider', () => {
   const b = makeBindings()
   b.SendMessage('01JWSIDABC', 'text')
@@ -2670,53 +2561,17 @@ it('WSID 取代 provider 作為第一參數——不得誤傳 provider', () => {
   expect(first).toBe('01JWSIDABC')
   expect(['claude', 'codex']).not.toContain(first)
 })
+
+it('StartSession／EndSession 逐參數轉發且第一參數為 WSID', () => {
+  const b = makeBindings()
+  b.StartSession('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+  expect(App.StartSession).toHaveBeenCalledWith('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+  b.EndSession('w1')
+  expect(App.EndSession).toHaveBeenCalledWith('w1')
+})
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `npm --prefix frontend run test -- bindings` → FAIL
-
-- [ ] **Step 3: 重生 bindings 並更新 adapter 與型別**
-
-```bash
-wails generate module     # 重生 frontend/wailsjs
-```
-
-`bindings.ts` 逐參數轉發新增／改簽名的六個 binding；`types.ts` 的 `Bindings` 介面同步（`StartSession`／`SendMessage`／`EndSession` 第一參數由 `provider` 改 `wsid: string`）。
-
-- [ ] **Step 4: 全綠** — `npm --prefix frontend run test && npm --prefix frontend run build` → PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/
-git commit -m "feat(frontend): Wails bindings 重生＋adapter 逐參數轉發（CreateSession／RemoveSession／LoadTurnsBefore／WSID 化）"
-```
-
-### Task 26: session store 泛化為 per-WSID lane
-
-**Files:**
-- Modify: `frontend/src/stores/session.ts:40-253`
-- Test: `frontend/src/stores/session.test.ts`
-
-**Interfaces:**
-- Produces:
-```ts
-export interface SessionMeta {
-  wsid: string; provider: ProviderKey; taskLabel: string
-  state: string; unread: number; busy: boolean; awaitingApproval: boolean
-  removed: boolean
-}
-interface State {
-  sessions: Record<string, SessionMeta>
-  views: Record<string, SessionView>          // 只有釘選／曾切入的才有 transcript
-  persistentPins: [string | null, string | null]
-  pins: [string | null, string | null]        // 顯示用（transient 會暫時改寫）
-  focused: 0 | 1
-  scrollAnchors: Record<string, string>
-}
-```
-- **契約凍結**：`busy`／`unread`／`awaitingApproval` 一律讀寫 `sessions[wsid]`（**不在 `views` 上**）——`views` 只承載 transcript（`chat`／`timeline`／`totals`）。
-
-- [ ] **Step 1: 失敗測試**
+- [ ] **Step 2: 失敗測試（store）**
 
 ```ts
 it('apply 依 workspace_session_id 路由，不再依 provider', () => {
@@ -2758,15 +2613,6 @@ it('解除釘選釋放 transcript，保留 metadata、已讀與捲動錨點', ()
   expect(s.scrollAnchors['w1']).toBe('e1')
 })
 
-it('focused pane 唯一，切換不重設捲動', () => {
-  const s = useSession()
-  s.pin(0, 'w1'); s.pin(1, 'w2')
-  s.setScrollAnchor('w1', 'e9')
-  s.setFocus(1)
-  expect(s.focused).toBe(1)
-  expect(s.scrollAnchors['w1']).toBe('e9')
-})
-
 it('未釘選來源以 transient 顯示，六種觸發都恢復原釘選', () => {
   const s = useSession()
   s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
@@ -2787,26 +2633,17 @@ it('來源在另一 pane 時自動切 focus', () => {
 })
 ```
 
-- [ ] **Step 2: 跑測試確認失敗** — `npm --prefix frontend run test -- session` → FAIL
+- [ ] **Step 3: 跑測試確認失敗** — `npm --prefix frontend run test` → FAIL
 
-- [ ] **Step 3: 實作** — `providerOf` 改 `wsidOf(env)`；`submit`／`reset`／`pushError`／`applyDone` 全部作用於 focused pane 的 WSID。
+- [ ] **Step 4: 原子切換** — 後端改 exported 簽名並刪 `legacyWSIDFor` → `wails generate module` → `bindings.ts` → `types.ts` → `session.ts`。
 
-- [ ] **Step 4: 全綠** — `npm --prefix frontend run test` → PASS
+- [ ] **Step 5: 全綠** — `go vet ./... && go test -race ./... -count=1 && npm --prefix frontend run test && npm --prefix frontend run build` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/src/stores/
-git commit -m "feat(frontend): session store 泛化為 per-WSID lane＋pin／focus／transient 路由（§3.6.4／§3.7-8）"
-```
+- [ ] **Step 6: Commit** — `git commit -m "feat: exported binding WSID 化＋session store per-WSID lane（原子切換，§3.6.4／§3.7-8）"`
 
 ### Task 27: `SessionList.vue`
 
-**Files:**
-- Create: `frontend/src/components/SessionList.vue`＋`SessionList.test.ts`
-- Modify: 雙 locale
-
-**Interfaces:** Consumes Task 26 store；emit `pin`／`create`／`remove`。
+**Files:** Create `SessionList.vue`＋測試；Modify 雙 locale
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2838,7 +2675,7 @@ it('達上限時建立按鈕停用', async () => {
   expect(w.find('[data-test=create-claude]').attributes('disabled')).toBeUndefined()
 })
 
-it('卡片顯示 provider／狀態／unread／busy／待核可標記', async () => {
+it('卡片顯示 unread 與待核可標記', async () => {
   const s = useSession()
   s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
   s.sessions['w1'].unread = 3
@@ -2861,24 +2698,15 @@ it('移除需確認並說明稽核保留', async () => {
 
 - [ ] **Step 2: 跑測試確認失敗** — `npm --prefix frontend run test -- SessionList` → FAIL
 
-- [ ] **Step 3: 實作元件＋雙 locale 字串（key parity 測試須綠）**
+- [ ] **Step 3: 實作元件＋雙 locale（key parity 綠）**
 
 - [ ] **Step 4: 全綠** — `npm --prefix frontend run test` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/src
-git commit -m "feat(frontend): SessionList——既有 session 清單＋n/4 計數＋移除確認（§4）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(frontend): SessionList——既有 session 清單＋n/4 計數＋移除確認（§4）"`
 
 ### Task 28: `DualPane.vue`＋`PaneView.vue`
 
-**Files:**
-- Create: `DualPane.vue`／`PaneView.vue`＋測試
-- Modify: `App.vue`、`SettingsBar.vue`、`StatusBar.vue`
-
-**Interfaces:** Consumes Task 26 store、既有 `ChatPanel`／`Timeline`。
+**Files:** Create `DualPane.vue`／`PaneView.vue`＋測試；Modify `App.vue`、`SettingsBar.vue`、`StatusBar.vue`
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2894,7 +2722,7 @@ it('兩 pane 皆 live，背景 pane 持續更新', async () => {
   expect(w.find('[data-test=pane-1]').text()).toContain('bg')
 })
 
-it('只有 focused pane 有 composer 與 SettingsBar 操作', async () => {
+it('只有 focused pane 有 composer', async () => {
   const s = useSession()
   s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
   const w = mount(DualPane, { global: { plugins: [pinia, i18n] } })
@@ -2911,7 +2739,7 @@ it('點另一 pane 切焦點但不卸載', async () => {
   const before = w.find('[data-test=pane-1]').element
   await w.find('[data-test=pane-1]').trigger('click')
   expect(s.focused).toBe(1)
-  expect(w.find('[data-test=pane-1]').element).toBe(before) // 同一 DOM 節點＝未卸載
+  expect(w.find('[data-test=pane-1]').element).toBe(before)
 })
 
 it('A 執行中仍可切 B 送出', async () => {
@@ -2923,7 +2751,7 @@ it('A 執行中仍可切 B 送出', async () => {
   expect(s.bindings.SendMessage).toHaveBeenCalledWith('w2', 'hello')
 })
 
-it('SettingsBar 的 End／Terminate／New 只作用於 focused pane', async () => {
+it('SettingsBar 的 End 只作用於 focused pane', async () => {
   const s = useSession()
   s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(1)
   const w = mount(DualPane, { global: { plugins: [pinia, i18n] } })
@@ -2939,20 +2767,11 @@ it('SettingsBar 的 End／Terminate／New 只作用於 focused pane', async () =
 
 - [ ] **Step 4: 全綠** — `npm --prefix frontend run test && npm --prefix frontend run build` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/src
-git commit -m "feat(frontend): 雙 pane 並看＋單一 focused pane 操作語意（§3.7／§4）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(frontend): 雙 pane 並看＋單一 focused pane 操作語意（§3.7／§4）"`
 
 ### Task 29: lazy load 與向上分頁
 
-**Files:**
-- Modify: `PaneView.vue`、`stores/session.ts`
-- Test: `PaneView.test.ts`
-
-**Interfaces:** Consumes Task 25 的 `LoadTurnsBefore` binding。
+**Files:** Modify `PaneView.vue`、`stores/session.ts`；Test `PaneView.test.ts`
 
 - [ ] **Step 1: 失敗測試**
 
@@ -2995,12 +2814,7 @@ it('分頁不重設捲動錨點', async () => {
 
 - [ ] **Step 4: 全綠** — `npm --prefix frontend run test` → PASS
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/src
-git commit -m "feat(frontend): 釘選 lazy load＋向上 20 turn 分頁去重（§3.8）"
-```
+- [ ] **Step 5: Commit** — `git commit -m "feat(frontend): 釘選 lazy load＋向上 20 turn 分頁去重（§3.8）"`
 
 ---
 
@@ -3008,7 +2822,7 @@ git commit -m "feat(frontend): 釘選 lazy load＋向上 20 turn 分頁去重（
 
 ### Task 30: 跨切面不變量測試
 
-**Files:** Test: `app_invariants_test.go`
+**Files:** Test `app_invariants_test.go`
 
 - [ ] **Step 1: 失敗測試**
 
@@ -3031,7 +2845,7 @@ func TestEventIDMonotonicAcross8ParallelSessions(t *testing.T) {
 }
 
 func TestLegacyJournalWithoutWSIDAttributes(t *testing.T) {
-	dir := seedLegacyJournalFixture(t) // M3a 時代 events.jsonl，無 workspace_session_id
+	dir := seedLegacyJournalFixture(t)
 	a := newTestAppAt(t, dir)
 	live, err := a.restoreSessions()
 	if err != nil {
@@ -3040,8 +2854,7 @@ func TestLegacyJournalWithoutWSIDAttributes(t *testing.T) {
 	if len(live) != 1 || live[0].Provider != "claude" {
 		t.Fatalf("legacy 事件應歸屬遷移後的 legacy session：%+v", live)
 	}
-	view := a.RestoreViews()[live[0].WSID]
-	if len(view.Envelopes) == 0 {
+	if len(a.RestoreViews()[live[0].WSID].Envelopes) == 0 {
 		t.Fatal("legacy view window 內的事件應可重放")
 	}
 }
@@ -3060,7 +2873,7 @@ func TestSecondInFlightTurnRejected(t *testing.T) {
 
 func TestWorkspaceLaneHasNoWSID(t *testing.T) {
 	a := newTestApp(t)
-	mustSubmitGate(t, a) // Gate 事件走 workspace lane
+	mustSubmitGate(t, a)
 	for _, ev := range readEvents(t, a.stateDir) {
 		if ev.Scope == "workspace" && ev.WorkspaceSessionID != "" {
 			t.Fatalf("workspace lane 不得帶 WSID（§3.1.6）：%+v", ev)
@@ -3074,18 +2887,11 @@ func TestWorkspaceLaneHasNoWSID(t *testing.T) {
 
 - [ ] **Step 2: 跑測試、修正到全綠** — `go test . -race -count=1 -v`
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add app_invariants_test.go
-git commit -m "test: M3b 跨切面不變量——event_id 單調／legacy 歸屬／單一 in-flight turn／workspace lane 隔離（§5.7）"
-```
+- [ ] **Step 3: Commit** — `git commit -m "test: M3b 跨切面不變量（§5.7）"`
 
 ### Task 31: E2E 驗收矩陣＋最終 gate
 
-**Files:**
-- Create: `docs/spikes/m3b-results.md`
-- Modify: `README.md`
+**Files:** Create `docs/spikes/m3b-results.md`；Modify `README.md`
 
 - [ ] **Step 1: 實機驗收逐項執行並記錄（§6）**
 
@@ -3099,7 +2905,7 @@ git commit -m "test: M3b 跨切面不變量——event_id 單調／legacy 歸屬
 | A6 | index 落後補掃／注入損壞 → 重建＋通知 | |
 | A7 | 未完成 turn 重啟 → failed 解除 busy | |
 | A8 | 舊 workspace 升級：legacy 歸屬、resume 可用、重啟不產生第二枚 WSID | |
-| A9 | M2／M3a／M3a.1 迴歸抽驗（Gate 流程、TCA、收件匣、assists） | |
+| A9 | M2／M3a／M3a.1 迴歸抽驗 | |
 | A10 | Claude 4 session 常駐的 RAM／CPU 實測（§7.1） | |
 
 - [ ] **Step 2: 收尾 gate 全綠**
@@ -3111,35 +2917,29 @@ npm --prefix frontend run test && npm --prefix frontend run build && wails build
 
 - [ ] **Step 3: 寫結果文件** — A1-A10 逐項證據、缺口清單、PR 揭露事項。**未通過項如實記錄，不得標綠**。
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add docs/spikes/m3b-results.md README.md
-git commit -m "docs: M3b E2E 驗收矩陣結果＋README 章節"
-```
+- [ ] **Step 4: Commit** — `git commit -m "docs: M3b E2E 驗收矩陣結果＋README 章節"`
 
 ---
 
-## Self-Review 記錄（v2）
+## Self-Review 記錄（v3）
 
-**v1 → v2 修正（closure review 六項 P1＋四項 P2）**
+**v2 → v3 修正（六項 P1＋兩項 P2）**
 
 | # | 問題 | 修正 |
 |---|---|---|
-| P1-1 | Task graph 無法維持每個 commit 可執行（Manager 改簽名未同步呼叫點、Task 3 用未建立的 registry、`go test -run` 仍編譯整個 package、Task 8 用 Task 21 的 API） | 改 additive migration：Task 3 保留 provider-keyed 相容入口、Task 9 才刪；`wsregistry` 前移至 Task 2；Phase 2 遷移紀律段落明訂三段順序；每個 task 的 Step 4 一律是全套 `go vet ./... && go test -race ./... -count=1`；per-WSID 檔案清理測試移到 Task 22 |
-| P1-2 | Task 0 不可重現 | 落成 `cmd/probe-codex-parallel`；用 `scripts/check-cli.sh` 驗 bundled binary＋sha256；凍結 prompts／approval policy／兩段 timeout；自然與強制兩種收尾；wire log 即證據＋`defer os.RemoveAll` 清理；**`completed-before-response` 移出 live probe 判定**，改由 Task 9 fake-wire 測試 |
-| P1-3 | Codex dispatcher 未把 WSID 傳入 production start | 凍結 `startCodex(w, …)`／`startCodexHost(w, …)`；新增 `pendingStartToWSID`；malicious-order 測試走 production path |
-| P1-4 | recorder ownership 無可交棒型別、測試用不存在的 `Single.Current()` | 新增 `codex.GenerationOwner{Server, Generation}`＋`FinalizeWith`，由 `Single[*GenerationOwner]` 持有；測試改用既有 `Take()`（附 `currentOwner` helper）；補 start／attach／handshake 三階段失敗與意外 `Done` 測試 |
-| P1-5 | runtime rebuild 測試與游標語意不成立 | 「始終無法達標」的 hook 改掛 `hookAfterUnlockedCatchUp`（殘量檢查之前）並斷言 `lockAcquired == 0`；鎖內增量改用 `auditEndFunc` 注入（不在鎖內 append）；新增獨立 `rebuildCursor` 與 `TestRebuildCursorIndependentOfCheckpoint`；Task 20 補單一 active／backoff／shutdown 取消編排與測試 |
-| P1-6 | Wails bindings 缺席 | 新增 Task 25：重生 `wailsjs`、更新 `bindings.ts`＋`types.ts`、逐參數轉發測試（含「第一參數必須是 WSID 而非 provider」的回歸斷言） |
-| P1-7 | Remove×New／shutdown 不是 barrier | Remove×New 改 channel barrier＋token 重疊偵測＋`-count=30`；shutdown 改「8 個 teardown 同時進場才放行」的 barrier，另加卡死者 bounded window（fake clock）與 `TestShutdownFollowsFrozenOrder` |
-| P2-1 | Task 6 斷言末筆 | 改檢查末二筆（`stream_error` → `state_change=failed`） |
-| P2-2 | 回滾重用會留 tombstone 的 Remove | 新增 `DeleteUncommitted`，與 `Remove` 分離並各自測試 |
-| P2-3 | `busy` 型別契約不一致 | Task 26 凍結「狀態在 `SessionMeta`、transcript 在 `SessionView`」，並加專測；Task 28 改讀 `s.sessions['w1'].busy` |
-| P2-4 | Task 22 斷言不足 | 補「每筆 deny 都被嘗試」「錯誤完整 Join」「host 已收尾」「lease 已 finalize」「slot 保留 dormant」「registry entry 保留非 tombstone」 |
+| P1-1 | Task 6 向後依賴 `hostFor()`（Task 7）與 `replayindex`（Task 15-18） | Task 6 縮小為 `loadSessionRegistry`（只做 registry 載入／遷移／`RestoreDormant`），測試改用 `IsActiveWS`／`SlotCount` 斷言 dormant；§3.2.4 後半（index 驗證 → incomplete 修復 → 開放 UI）併入 **Task 20**，含 `TestStartupOrderIsFrozen`／`TestUIOpensOnlyAfterRepair` |
+| P1-2 | Task 0 driver 用不存在的 `codex.Start`、binary 未傳入、approval 歸屬無實際 frame | 改 `codex.StartAppServer(ctx, codex.Config{Binary: *codexBin, CWD: tmp, TermGrace: …})`；新增 `-codex-bin` 旗標；新增第三個**受控 approval turn**（要求建檔 → probe 拒絕）；GO 條件明訂「未觀察到 approval request 或缺 thread/turn identity → NO-GO」，並驗證被拒後檔案不存在 |
+| P1-3 | `GenerationOwner` 只證明手動收尾；`Single.Ensure` 遇死亡會直接覆寫、漏 finalize | 新增 `Single.CompareAndTake`＋production `WatchGeneration` reaper；測試改為只呼叫 `stub.die()`，斷言自動 finalize、replacement 等舊 generation finalize 完才發布、stale reaper 不清新 generation |
+| P1-4 | Task 9 刪 shim 的清單不完整；binding 延後違反契約 | Task 9 列出五項刪除清單（含 `pump.go:69` `EndSessionFlow`、`app.go` 24 處呼叫、`manager_test.go` 1254 行）並加 `grep` 守門；binding 分兩類——純新增在各自 task（4／20／22）完成四件事，改簽名的保留 provider-keyed 包裝層到 **Task 26 原子切換**，Task 8 加 `TestExportedBindingSignatureUnchanged` 守門 |
+| P1-5 | Remove×New 測試會死鎖且允許 Create 立即失敗 | 改留一個空 slot（Create 無競態時必成功）；新增 `hookCreateWaitingForToken`／`hookCreateAcquiredToken`；用 `select` 區分「在等 token」與「直接返回」，直接返回即判失敗；結果 channel **各只讀一次** |
+| P1-6 | fake clock 未接到 production timeout（`pump.go:27` 用 `time.After`） | 新增 **Task 21**：`WaitQuiesce`／`CloseSequence` 加可注入 `After`（`RealAfter` 為 production 預設）；Task 24 改用 `timers.WaitForOutstanding(8)` → `FireAll()` 兩輪，證明並行＋單一 bounded window，且不產生真實等待 |
+| P2-1 | `newULID()` 在 appcore 不存在 | 一律用 `contract.NewULID(time.Now())`（`envelope.go:19`），並加 `TestWSIDIsULID` |
+| P2-2 | spec 狀態列與 plan 不一致 | spec 狀態列同步為「rev4，closure review APPROVED（2026-08-14，`b63f168`）」 |
 
-**Spec 覆蓋**：§1／§2／§3.1-3.8／§4／§5／§6／§7.2 逐條對應 Task 0-31（對照表同 v1，Task 編號依新順序調整：wsregistry=Task 2、App 交易=Task 4、degraded latch=Task 16、損壞分級=Task 18）。
+**任務數**：32（Task 0-31）。Phase 5 因新增可注入 `After` 而多一個 task，Phase 6 因 binding 原子切換與 store 合併而少一個。
 
-**型別一致性**：`appcore.WSID`、`AppendReceipt{StartOffset,EndOffset,EventID}`、`wsregistry.Entry`、`wirelog.SegmentRef`、`codex.GenerationOwner`、前端 `SessionMeta`／`SessionView`／`persistentPins`／`pins`／`focused` 全程一致。
+**Spec 覆蓋**：§1／§2／§3.1-3.8／§4／§5／§6／§7.2 逐條對應。啟動序列 §3.2.4 拆在 Task 6（前半）與 Task 20（後半），兩處都有凍結順序測試。
 
-**遺留的執行前提**：Task 3 的相容入口是**暫時**產物，Task 9 的 Step 4 有 `grep` 守門確保清乾淨；若 Task 9 之前中止，需在收尾前補刪。
+**型別一致性**：`appcore.WSID`、`appcore.After`／`RealAfter`、`AppendReceipt`、`wsregistry.Entry`、`wirelog.SegmentRef`、`codex.GenerationOwner`、前端 `SessionMeta`／`SessionView`／`persistentPins`／`pins`／`focused` 全程一致。
+
+**遺留執行前提**：Task 3 的 Manager 相容入口與 Task 8-25 的 provider-keyed exported binding 包裝層都是**暫時**產物，分別由 Task 9 與 Task 26 的 `grep` 守門與測試確保清乾淨。

@@ -1,7 +1,7 @@
 # M3b — 多 session 工作區設計
 
 - 日期：2026-08-14
-- 狀態：rev4，待 closure review（rev1 六項設計 P1、rev2 六項生命週期 P1、rev3 四項 P1＋兩項 P2 已整合；rev4 修五項 P1：CommitCreate × rollback 雙失敗收斂為 create-degraded latch、recorder error latch 的 in-process 復原入口、Codex 受控復原的錄流 ownership 交棒（`wire_log_id` 前置配置、非 probe-scoped）、runtime replay index 重建與並行 append 的交接、鎖外收斂至凍結上限後才取鎖——同時消除 TOCTOU 與無界鎖內掃描）
+- 狀態：rev4，**closure review APPROVED（2026-08-14，`b63f168`）**（rev1 六項設計 P1、rev2 六項生命週期 P1、rev3 四項 P1＋兩項 P2 已整合；rev4 修五項 P1：CommitCreate × rollback 雙失敗收斂為 create-degraded latch、recorder error latch 的 in-process 復原入口、Codex 受控復原的錄流 ownership 交棒（`wire_log_id` 前置配置、非 probe-scoped）、runtime replay index 重建與並行 append 的交接、鎖外收斂至凍結上限後才取鎖——同時消除 TOCTOU 與無界鎖內掃描）
 - 上游依據：app plan §7（M3 列「多 session 並看」延後項）；M3a 範圍切分時的 M3b 定義（同 provider 多 session、資源上限、事件重放視窗化、session 導覽與生命週期契約）
 - 前置：M3a ✅（`cfa5a20`）＋M3a.1 ✅（`4ac2d78`）
 - 明確不含：閒置回收、pane 比例拖曳／N-pane、task 綁定（M4）、removed session 的 reopen、M3a.1 九張後續票（獨立 triage）、ACP（候選里程碑 §7.1）
