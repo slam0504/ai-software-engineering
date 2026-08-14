@@ -369,6 +369,89 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	return string(w), nil
 }
 
+// ---- 啟動：session registry 載入／遷移／dormant 還原（M3b §3.2.2／§3.2.4-6）----
+
+// legacyProviders：legacy 遷移的來源 provider（restore.json 的兩個固定 key，
+// 同 restore.go:52 的補齊清單）。
+var legacyProviders = []string{"claude", "codex"}
+
+// legacyEntries：把 M3a provider-keyed restore.json 轉成 wsregistry.Migrate 的
+// 輸入。轉換是呼叫端的責任（wsregistry 不碰檔案）；資料來源是 App 已持有的
+// restoreStore，不重讀檔案——restore.json 的 ownership 只有一份。
+//
+// 「空 entry 不建立、不佔 slot」（§3.2.5）的判準刻意用 spec 的字面語意——
+// resume identity／taskID 皆空**且 view window 內沒有事件**——而不是「
+// ViewStartEventID 是否為空」：restore.json 不存在或 malformed 時
+// openRestoreStore 會用 audit high-watermark 幫**兩個** provider 都補齊 entry
+//（restore.go:42-56），那種 entry 的 ViewStartEventID 非空但 window 內必然
+// 零事件。只看欄位非空的話，只用過 claude 的使用者升級後會憑空多出一個
+// codex session 並吃掉一個名額。window 判定直接重用 replayViewWindow，因為
+// 「view window 裡有沒有事件」的定義就該和實際重放的視窗完全一致。
+//
+// restore store 尚未開啟（a.restore == nil）一律回錯，不當成空資料：遷移
+// marker 是單向的，以零 legacy entry 標記 migrated 會讓舊 session 永遠不可能
+// 再被遷出。這是載入順序 bug，必須 fail loud。
+func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
+	if a.restore == nil {
+		return nil, errors.New("app: restore store not opened before session registry migration")
+	}
+	out := make(map[string]wsregistry.LegacyEntry, len(legacyProviders))
+	for _, p := range legacyProviders {
+		e := a.restore.Get(p)
+		if e.ResumeSessionID == "" && e.TaskID == "" &&
+			len(replayViewWindow(a.eventsPath(), p, e.ViewStartEventID)) == 0 {
+			continue
+		}
+		out[p] = wsregistry.LegacyEntry{
+			ViewStartEventID: e.ViewStartEventID,
+			ResumeSessionID:  e.ResumeSessionID,
+			TaskID:           e.TaskID,
+		}
+	}
+	return out, nil
+}
+
+// loadSessionRegistry：§3.2.4 啟動修復序列的前半段——載入／遷移 registry →
+// 還原 Manager dormant slots。後半段（index 驗證／重建 → incomplete turn 修復
+// → 才開放 UI 與 provider 啟動）見 Task 20。
+//
+// a.wsReg 只在整段序列成功後才接線，這是「Migrate 先於任何 Put」的第一道
+// 防線：CreateSession 唯一的 registry 入口是 a.wsReg，nil 即早退
+//（errNoSessionRegistry）。若在 Open 之後就接線，遷移失敗的那次啟動仍可
+// Put，那筆 entry 會在下次啟動被 MarkMigrated 的整批取代語意無聲蒸發（或撞上
+// Migrate 的第二道 guard，讓 app 從此無法完成遷移）。wsregistry.Migrate 內的
+// entryCount guard 是最後防線，不是第一道。
+//
+// 任一步失敗一律回錯、不降級：wsregistry.Open 對 malformed 檔案是 fail loud
+// 而非重建（見 wsregistry.Open 的說明——重建等於抹掉使用者所有 session），
+// migration 落盤失敗同樣 fail loud、不啟動 provider（§3.2.6）。
+func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
+	store, err := wsregistry.Open(filepath.Join(a.stateDir, "workspace-sessions.json"))
+	if err != nil {
+		return nil, err
+	}
+	// Migrated() 在 Migrate 內也會再檢查一次（冪等由那裡保證）；這裡先擋一層
+	// 只為省掉 legacyEntries 對 events.jsonl 的掃描——正常啟動每次都會走到。
+	if !store.Migrated() {
+		legacy, lerr := a.legacyEntries()
+		if lerr != nil {
+			return nil, lerr
+		}
+		if _, merr := wsregistry.Migrate(store, legacy,
+			func() string { return contract.NewULID(time.Now()) }); merr != nil {
+			return nil, merr
+		}
+	}
+	live := store.Live()
+	for _, e := range live {
+		if rerr := a.manager.RestoreDormant(appcore.WSID(e.WSID), contract.Provider(e.Provider)); rerr != nil {
+			return nil, fmt.Errorf("app: restore dormant wsid=%s provider=%s: %w", e.WSID, e.Provider, rerr)
+		}
+	}
+	a.wsReg = store
+	return live, nil
+}
+
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
 func (a *App) emit(name string, data any) {
 	if a.emitUI != nil {
@@ -423,6 +506,16 @@ func (a *App) startup(ctx context.Context) {
 	a.restore = rs
 	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
 		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
+	}
+	// M3b §3.2.4 前半段：載入／遷移 workspace-sessions.json → 還原 dormant slots。
+	// 必須在 restore store 開啟之後（legacy 遷移的來源）與 manager 建立之後。
+	// 失敗一律 fail loud：a.wsReg 維持 nil，CreateSession 早退，不以猜測的狀態
+	// 繼續（§3.2.6）。
+	if _, lerr := a.loadSessionRegistry(); lerr != nil {
+		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
+		if a.startupErr == "" {
+			a.startupErr = "session registry load failed: " + lerr.Error()
+		}
 	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
