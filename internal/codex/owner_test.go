@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -269,12 +270,15 @@ func TestThreeStageFailuresDisposeAndKeepEvidence(t *testing.T) {
 				if m.ExitCode != nil {
 					t.Fatalf("尚無 server 時不得捏造 exit_code：%+v", m)
 				}
-				if !strings.Contains(m.StderrTail, "spawn failed") {
+				if !strings.Contains(m.FinalizeCause, "spawn failed") {
 					t.Fatalf("必須保留失敗原因：%+v", m)
 				}
 			} else {
-				if m.ExitCode == nil || *m.ExitCode != 3 || !strings.Contains(m.StderrTail, "boom") {
+				if m.ExitCode == nil || *m.ExitCode != 3 || m.StderrTail != "boom" {
 					t.Fatalf("必須保留收尾證據：%+v", m)
+				}
+				if !strings.Contains(m.FinalizeCause, "failed") && !strings.Contains(m.FinalizeCause, "refused") {
+					t.Fatalf("收尾原因必須寫進 finalize_cause：%+v", m)
 				}
 				if _, _, terms, waits := stub.callCounts(); terms != 1 || waits != 1 {
 					t.Fatalf("失敗階段必須 terminate＋wait：term=%d wait=%d", terms, waits)
@@ -312,7 +316,7 @@ func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 
 func TestFinalizeWithIsIdempotent(t *testing.T) { // 死亡 reaper／受控 restart／shutdown 多路徑
 	stub := newStubServer()
-	o := &GenerationOwner{Server: stub, Generation: newTestGeneration(t)}
+	o := &GenerationOwner{Server: stub, Generation: newTestGeneration(t), attached: true}
 	first := o.FinalizeWith(errServerDied)
 	if !o.Finalized() {
 		t.Fatal("FinalizeWith 後 Finalized 必須為 true")
@@ -322,6 +326,116 @@ func TestFinalizeWithIsIdempotent(t *testing.T) { // 死亡 reaper／受控 rest
 	}
 	if _, stops, terms, waits := stub.callCounts(); stops != 1 || terms != 1 || waits != 1 {
 		t.Fatalf("重複呼叫不得重跑收尾：stop=%d term=%d wait=%d", stops, terms, waits)
+	}
+}
+
+// §3.4.2 順序：terminate → wait →（stdout 汲取完成）→ stop → finalize。
+// detach 一旦排在 terminate 之前，關閉期間的 frame 會被 Conn.record 靜默丟棄
+// （sink == nil 直接 return，無錯誤、無計數），錄流檔尾就此被截。
+func TestFinalizeWithDetachesOnlyAfterServerExit(t *testing.T) {
+	stub := newStubServer()
+	gen := newTestGeneration(t)
+	var finalizedAtStop bool
+	stub.onStop = func() { finalizedAtStop = gen.Finalized() }
+	o := &GenerationOwner{Server: stub, Generation: gen, attached: true}
+	if err := o.FinalizeWith(errServerDied); err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.callOrder(); !reflect.DeepEqual(got, []string{"terminate", "wait", "stop"}) {
+		t.Fatalf("收尾順序必須是 terminate → wait → stop（§3.4.2）：%v", got)
+	}
+	if finalizedAtStop {
+		t.Fatal("StopRecording 必須早於 Generation.Finalize，否則收尾期間的寫入會撞上已關檔")
+	}
+	if !gen.Finalized() {
+		t.Fatal("收尾必須以 Finalize 結束")
+	}
+}
+
+// stdout 汲取完成的訊號是 Conn.Done（readLoop 讀到 EOF），不是 proc 的 Done
+// （後者在 cmd.Wait／stderr 收完就關，與 stdout 汲取無順序依賴）。
+func TestFinalizeWithWaitsForStdoutDrainBeforeDetach(t *testing.T) {
+	pr, pw := io.Pipe()
+	stub := newStubServer()
+	stub.conn = NewConn(io.Discard, pr)
+	o := &GenerationOwner{Server: stub, Generation: newTestGeneration(t), attached: true}
+
+	done := make(chan error, 1)
+	go func() { done <- o.FinalizeWith(errServerDied) }()
+
+	select { // stdout 還沒 EOF：不得 detach
+	case <-done:
+		t.Fatal("stdout 尚未汲取完成就收尾，關閉期間的 frame 會漏錄")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, stops, _, _ := stub.callCounts(); stops != 0 {
+		t.Fatal("EOF 之前不得 StopRecording")
+	}
+
+	_ = pw.Close() // readLoop 讀到 EOF → Conn.Done 關閉
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EOF 之後收尾必須完成")
+	}
+	if got := stub.callOrder(); !reflect.DeepEqual(got, []string{"terminate", "wait", "stop"}) {
+		t.Fatalf("順序錯誤：%v", got)
+	}
+}
+
+// 孫程序 setsid 脫離 process group 時 EOF 可能永遠不來——收尾必須有界，
+// 且逾時要 fail loud（回錯＋寫進 finalize_cause），不得假裝錄流完整。
+func TestFinalizeWithBoundedDrainTimeout(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	prev := wireDrainTimeout
+	wireDrainTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { wireDrainTimeout = prev })
+
+	stub := newStubServer()
+	stub.conn = NewConn(io.Discard, pr)
+	gen := newTestGeneration(t)
+	o := &GenerationOwner{Server: stub, Generation: gen, attached: true}
+
+	done := make(chan error, 1)
+	go func() { done <- o.FinalizeWith(errServerDied) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errWireDrainTimeout) {
+			t.Fatalf("逾時必須 fail loud：%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain 必須有界，不得無限期等 EOF")
+	}
+	if m := gen.FinalMeta(); !strings.Contains(m.FinalizeCause, "drain") {
+		t.Fatalf("逾時證據必須留在 meta：%+v", m)
+	}
+}
+
+// BeginRecording 失敗可能是因為「已有別人在錄流」——此時收尾不得 detach 別人的 sink。
+func TestFinalizeWithoutOwnAttachDoesNotStopOthersRecording(t *testing.T) {
+	stub := newStubServer()
+	stub.beginErr = errors.New("recording already in progress")
+	var single Single[*GenerationOwner]
+	if err := RunOwnedHandshake(context.Background(), &single,
+		func() (*wirelog.Generation, error) { return newTestGeneration(t), nil },
+		func() (probeTarget, error) { return stub, nil }, ClientInfo{}, nil); err == nil {
+		t.Fatal("attach 失敗必須回錯")
+	}
+	if _, stops, terms, _ := stub.callCounts(); stops != 0 || terms != 1 {
+		t.Fatalf("未成功 attach 就不得 StopRecording：stop=%d term=%d", stops, terms)
+	}
+}
+
+func TestOwnerWithoutServerDoneIsClosed(t *testing.T) { // start 失敗的暫時 owner
+	o := &GenerationOwner{Generation: newTestGeneration(t)}
+	select {
+	case <-o.Done():
+	case <-time.After(time.Second):
+		t.Fatal("無 server 的 owner，Done 必須視為已結束（且不得 panic）")
 	}
 }
 

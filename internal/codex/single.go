@@ -20,6 +20,11 @@ type Single[T Alive] struct {
 
 // Ensure：既有 instance 存在且未死（Done 未關閉）→ 直接回傳；否則呼叫 start 重建。
 // start 失敗 → 不保留任何 instance；start 內部必須自行清理其失敗的中間產物。
+//
+// 注意（M3b §3.4.2）：Ensure 會遞增 epoch 但**不回傳**，所以經它建立的 instance
+// 拿不到 epoch、無法掛 WatchGeneration 死亡 reaper。持有 GenerationOwner 的呼叫端
+// 若走 Ensure 建立 server，那條路徑上的錄流不會在 server 意外死亡時自動 finalize；
+// 需要 reaper 就得走 RunOwnedHandshake（或另補會回傳 epoch 的 Ensure 變體）。
 func (s *Single[T]) Ensure(start func() (T, error)) (T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

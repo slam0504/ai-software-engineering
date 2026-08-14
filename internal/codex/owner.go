@@ -15,6 +15,17 @@ import (
 // errServerDied 是死亡 reaper 收尾 generation 時記錄的 stage 原因（§3.4.2）。
 var errServerDied = errors.New("codex: app-server exited")
 
+// errWireDrainTimeout：等 stdout 汲取完成逾時。孫程序若以 setsid 脫離 process
+// group，stdout 的寫入端可能永遠不關閉、EOF 不會來，收尾不能因此無限期卡住；
+// 逾時代表錄流檔尾可能不完整，故 fail loud（回錯＋寫進 meta 的 finalize_cause）。
+var errWireDrainTimeout = errors.New("codex: wire log drain timed out before stdout EOF")
+
+// wireDrainTimeout 是上述等待的上界（測試可覆寫）。
+var wireDrainTimeout = 5 * time.Second
+
+// closedCh 供無 Server 的暫時 owner 當作「已結束」的 Done()。
+var closedCh = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
 // hookAfterPublishBeforeWatch 是「owner 已發布、watcher 尚未註冊」之間的測試
 // barrier；production 恆為 nil（唯一設值入口是 owner_test.go）。
 var hookAfterPublishBeforeWatch func()
@@ -30,27 +41,49 @@ type GenerationOwner struct {
 	Server     probeTarget
 	Generation *wirelog.Generation
 
-	mu   sync.Mutex
-	done bool
-	err  error
+	mu       sync.Mutex
+	attached bool // 本 owner 自己成功掛上錄流 sink，收尾時才有資格 detach
+	done     bool
+	err      error
 }
 
 // Done 讓 GenerationOwner 滿足 Alive（Single 的型別約束）。
-// 只有發布成功的 owner 才會被 WatchGeneration 監看，故此時 Server 必非 nil；
-// start 失敗時建立的暫時 owner（Server == nil）只會走 FinalizeWith，不會被監看。
-func (o *GenerationOwner) Done() <-chan struct{} { return o.Server.Done() }
+// Server 為 nil（start 階段就失敗的暫時 owner）時回傳已關閉的 channel——「沒有
+// server」等同「已結束」，不 panic 也不讓呼叫端永久阻塞。
+func (o *GenerationOwner) Done() <-chan struct{} {
+	if o.Server == nil {
+		return closedCh
+	}
+	return o.Server.Done()
+}
 
-// FinalizeWith 收尾本 owner：detach 錄流 sink（StopRecording 會等 in-flight
-// callback 完成，避免寫入已 finalize 的 generation）→ Terminate → Wait →
-// 以 Exit 證據 finalize generation。stage 是觸發收尾的原因（死亡＝errServerDied、
-// 受控 replacement＝nil、三階段失敗＝該階段的錯誤），會併入 meta 的 stderr_tail
-// 一併保留——失敗的 generation 同樣要留下 wire_log_id 與收尾證據，不因未發布而丟棄。
+// FinalizeWith 收尾本 owner，順序凍結為
+// **Terminate → Wait → stdout 汲取完成 → StopRecording → Generation.Finalize**
+// （§3.4.2；與 cmd/probe-codex-parallel/main.go:220-223 的收尾同序）。
+//
+// 為什麼 detach 必須排在 server 死透之後：`Conn.record` 看到 sink == nil 會直接
+// return——無錯誤、無計數——所以任何提前 detach 都是**靜默漏錄**。提前 detach 會吃
+// 掉三段 frame：(a) SIGTERM 到真正退出之間的 in-flight response／shutdown
+// notification／error frame；(b) 已進 OS pipe 但 readLoop 的 scanner 還沒掃到的
+// 行；(c) 死亡 reaper 場景最嚴重——`Server.Done()` 是 proc 的 doneCh（cmd.Wait ＋
+// stderr 收完就關），與 stdout 汲取「完成」沒有順序依賴，reaper 醒來時 stdout 幾乎
+// 必然還有殘餘。`Conn.Done()`（readLoop 讀到 EOF 才關，rpc.go:315）才是汲取完成的
+// 真正訊號，故等它、不等 proc 的 Done。
+//
+// 為什麼 detach 仍必須排在 Finalize 之前：`Generation.Line` 沒有 finalized
+// short-circuit，Finalize 之後才拿到鎖的 Line 會寫進已 Close 的 file，錯誤只會
+// latch 進 writeErr，而 meta 早就寫完——那個錯誤永遠進不了 meta。StopRecording 會
+// 等 in-flight callback 跑完，正好關掉這個窗口。
+//
+// stage 是觸發收尾的原因（死亡＝errServerDied、受控 replacement＝nil、三階段失敗
+// ＝該階段的錯誤），寫進 meta.FinalizeCause；stderr_tail 維持只放子程序 stderr 原文。
+// 失敗的 generation 同樣保留 wire_log_id 與收尾證據，不因未發布而丟棄。
 //
 // 冪等：死亡 reaper、受控 restart 與 shutdown 總序都會呼叫，重複呼叫只回傳第一次
 // 的結果，不重複 Terminate／Wait／寫 meta。
 //
-// Server 為 nil（start 階段就失敗、還沒有 server）時跳過 stop／terminate／wait，
-// meta 不帶 exit_code——比照 RunHandshakeProbe 的 start 失敗分支。
+// Server 為 nil（start 階段就失敗、還沒有 server）時跳過 terminate／wait／drain／
+// stop，meta 不帶 exit_code——比照 RunHandshakeProbe 的 start 失敗分支。
 func (o *GenerationOwner) FinalizeWith(stage error) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -60,25 +93,48 @@ func (o *GenerationOwner) FinalizeWith(stage error) error {
 	o.done = true
 
 	meta := recorder.Meta{Provider: "codex", RecordedAt: time.Now().UTC().Format(time.RFC3339)}
-	var stopErr error
+	if stage != nil {
+		meta.FinalizeCause = stage.Error()
+	}
+	var stopErr, drainErr error
 	if o.Server != nil {
-		stopErr = o.Server.StopRecording()
 		_ = o.Server.Terminate()
 		ex := o.Server.Wait()
+		drainErr = o.drainStdout()
+		if o.attached { // 只 detach 自己掛上的 sink，不摘別人的
+			stopErr = o.Server.StopRecording()
+		}
 		meta.Argv = o.Server.Argv()
 		meta.ExitCode = &ex.Code
 		meta.StderrTail = ex.StderrTail
 	}
-	if stage != nil {
-		meta.StderrTail = appendCause(meta.StderrTail, stage)
+	if drainErr != nil {
+		meta.FinalizeCause = appendCause(meta.FinalizeCause, drainErr)
 	}
 
 	var finErr error
 	if o.Generation != nil {
 		finErr = o.Generation.Finalize(meta)
 	}
-	o.err = errors.Join(stopErr, finErr)
+	o.err = errors.Join(drainErr, stopErr, finErr)
 	return o.err
+}
+
+// drainStdout 等 readLoop 讀到 EOF（stdout 汲取完成），上界 wireDrainTimeout。
+// Conn 為 nil（測試 stub／尚未建立連線）時無事可等。
+func (o *GenerationOwner) drainStdout() error {
+	c := o.Server.Conn()
+	if c == nil {
+		return nil
+	}
+	t := time.NewTimer(wireDrainTimeout)
+	defer t.Stop()
+	select {
+	case <-c.Done():
+		return nil
+	case <-t.C:
+		return errWireDrainTimeout
+	}
 }
 
 // Finalized 回報本 owner 是否已收尾過一次。
@@ -88,15 +144,12 @@ func (o *GenerationOwner) Finalized() bool {
 	return o.done
 }
 
-// appendCause 把收尾原因併進 stderr_tail。recorder.Meta 沒有獨立的「收尾原因」欄
-// 位，而 recorder_error 由 wirelog.Finalize 保留給 latch 住的寫入錯誤（會被覆寫），
-// 不能借用——否則兩種不同的失敗會互相蓋掉。
-func appendCause(tail string, cause error) string {
-	line := "wire log finalize cause: " + cause.Error()
-	if tail == "" {
-		return line
+// appendCause 併接多個收尾原因（stage ＋ drain 逾時）到 finalize_cause。
+func appendCause(cause string, extra error) string {
+	if cause == "" {
+		return extra.Error()
 	}
-	return tail + "\n" + line
+	return cause + "; " + extra.Error()
 }
 
 // WatchGeneration 是 production 的死亡收尾 reaper（§3.4.2）：owner 發布後立即啟動，
@@ -105,6 +158,12 @@ func appendCause(tail string, cause error) string {
 // epoch 不符（已被 replacement 取代）時**不動 Single**，但仍 finalize 自己的
 // generation——否則舊那份錄流的 meta 會漏；且兩種分支都會呼叫 onFinalized
 // （wasActive 標示死亡當下是否仍是持有者），呼叫端才不會在 stale 分支空等。
+//
+// **onFinalized 的契約（呼叫端務必看）**：`wasActive == false` **不代表異常**——每
+// 一次受控 replacement 之後都會補發一次：舊 owner 的 watcher 仍掛在舊 process 上，
+// 該 process 退出時就會以 wasActive=false 回報。所以只有 `wasActive == true` 才是
+// 「現役 server 意外死亡」；把 false 也當死亡處理（發事件、re-latch、觸發重啟）會在
+// 每次正常 restart 後誤觸。
 func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint64,
 	onFinalized func(err error, wasActive bool)) {
 	go func() {
@@ -129,6 +188,14 @@ func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint
 // 死亡時錯誤取走新 generation。
 //
 // 呼叫端不得在外層再包一次 single.WithExclusive（同一把 mutex，巢狀必死鎖）。
+//
+// **回傳值契約**：`err != nil` **不代表沒有發布新 server**——新 server handshake 成功
+// 但舊 owner 收尾失敗時，ownership 已換成新的，錯誤照樣往上回（沿用
+// WithExclusive 的 `keep=true && err != nil` 語意）。呼叫端不得從 err 推論
+// 「Single 是空的」，要判斷請看 Single 本身。
+//
+// **只有經本函式發布的 owner 才有死亡 reaper**；`Single.Ensure` 不回傳 epoch，
+// 經它建立的 instance 沒有 watcher（見 Single.Ensure 的註解）。
 func RunOwnedHandshake(ctx context.Context, single *Single[*GenerationOwner],
 	newGen func() (*wirelog.Generation, error), start func() (probeTarget, error),
 	ci ClientInfo, onFinalized func(err error, wasActive bool)) error {
@@ -150,8 +217,11 @@ func RunOwnedHandshake(ctx context.Context, single *Single[*GenerationOwner],
 		}
 		o := &GenerationOwner{Server: srv, Generation: gen}
 		if err := srv.BeginRecording(generationSink(gen)); err != nil { // 4. 不留未 handshake 的 server
+			// attached 仍為 false：BeginRecording 可能是因「已有別人在錄流」而失
+			// 敗，此時收尾若 StopRecording 會摘掉別人的 sink。
 			return nil, false, errors.Join(err, o.FinalizeWith(err), oldErr)
 		}
+		o.attached = true
 		if err := srv.Handshake(ctx, ci); err != nil { // 5. 同上
 			return nil, false, errors.Join(err, o.FinalizeWith(err), oldErr)
 		}

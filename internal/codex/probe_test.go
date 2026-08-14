@@ -23,12 +23,15 @@ type stubServer struct {
 	hsGate   chan struct{} // 非 nil：Handshake 阻塞至關閉
 	exit     proc.Exit     // Wait 回傳值（預設 9／stub-stderr）
 	onBegin  func()        // 非 nil：BeginRecording 進入時呼叫（順序斷言用）
+	onStop   func()        // 非 nil：StopRecording 進入時呼叫（順序斷言用）
+	conn     *Conn         // 非 nil：收尾時必須等它的 Done（stdout 汲取完成）
 
 	mu         sync.Mutex
 	begins     int
 	stops      int
 	terminates int
 	waits      int
+	calls      []string // 收尾相關呼叫的實際順序
 	dieOnce    sync.Once
 }
 
@@ -41,11 +44,9 @@ func newStubServer() *stubServer {
 func (s *stubServer) die() { s.dieOnce.Do(func() { close(s.done) }) }
 
 func (s *stubServer) Done() <-chan struct{} { return s.done }
-func (s *stubServer) Conn() *Conn           { return nil } // owner 路徑不觸碰 Conn
+func (s *stubServer) Conn() *Conn           { return s.conn } // 預設 nil：無 stdout 可等
 func (s *stubServer) BeginRecording(sink func([]byte) error) error {
-	s.mu.Lock()
-	s.begins++
-	s.mu.Unlock()
+	s.note("begin")
 	if s.onBegin != nil {
 		s.onBegin()
 	}
@@ -56,9 +57,10 @@ func (s *stubServer) BeginRecording(sink func([]byte) error) error {
 	return nil
 }
 func (s *stubServer) StopRecording() error {
-	s.mu.Lock()
-	s.stops++
-	s.mu.Unlock()
+	s.note("stop")
+	if s.onStop != nil {
+		s.onStop()
+	}
 	return s.stopErr
 }
 func (s *stubServer) Handshake(ctx context.Context, ci ClientInfo) error {
@@ -68,16 +70,37 @@ func (s *stubServer) Handshake(ctx context.Context, ci ClientInfo) error {
 	return s.hsErr
 }
 func (s *stubServer) Terminate() error {
-	s.mu.Lock()
-	s.terminates++
-	s.mu.Unlock()
+	s.note("terminate")
 	return nil
 }
 func (s *stubServer) Wait() proc.Exit {
+	s.note("wait")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.waits++
 	return s.exit
+}
+
+// note 記錄收尾相關呼叫的實際順序（§3.4.2 的順序斷言靠它）。
+func (s *stubServer) note(call string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, call)
+	switch call {
+	case "begin":
+		s.begins++
+	case "stop":
+		s.stops++
+	case "terminate":
+		s.terminates++
+	case "wait":
+		s.waits++
+	}
+}
+
+func (s *stubServer) callOrder() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
 }
 func (s *stubServer) StderrSnapshot() string { return "live-stderr" }
 func (s *stubServer) Argv() []string         { return []string{"codex", "app-server"} }
