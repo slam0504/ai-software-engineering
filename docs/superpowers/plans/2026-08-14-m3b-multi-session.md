@@ -1292,9 +1292,14 @@ func TestWatcherEpochCapturedUnderLock(t *testing.T) {
 	var single Single[*GenerationOwner]
 	firstAtBarrier := make(chan struct{})
 	releaseFirst := make(chan struct{})
-	var once sync.Once
+	// 不可用 sync.Once：Once.Do 在第一次 callback 未返回前會**阻塞**第二次呼叫，
+	// 於是第二個 replacement 也卡住，而 releaseFirst 又要等它返回才關 → 死鎖。
+	var calls atomic.Int32
 	hookAfterPublishBeforeWatch = func() { // 套件層測試 hook
-		once.Do(func() { close(firstAtBarrier); <-releaseFirst })
+		if calls.Add(1) == 1 { // 只有第一次停在 barrier，後續呼叫直接通過
+			close(firstAtBarrier)
+			<-releaseFirst
+		}
 	}
 	t.Cleanup(func() { hookAfterPublishBeforeWatch = nil })
 
@@ -3159,7 +3164,13 @@ npm --prefix frontend run test && npm --prefix frontend run build && wails build
 
 ---
 
-## Self-Review 記錄（v5）
+## Self-Review 記錄（v6）
+
+**v5 → v6 修正（一項 P1）**
+
+| # | 問題 | 修正 |
+|---|---|---|
+| P1-1 | `TestWatcherEpochCapturedUnderLock` 用 `sync.Once` 當 barrier 會確定性死鎖——`Once.Do` 在第一次 callback 返回前會阻塞第二次呼叫，於是第二個 replacement 也卡住，而 `releaseFirst` 又要等 replacement 返回才關閉 | 改用 `atomic.Int32` 計數：`if calls.Add(1) == 1` 才停在 barrier，後續呼叫直接通過；並在測試內加註為何不能用 `sync.Once` |
 
 **v4 → v5 修正（兩項 P1＋一項補述）**
 
