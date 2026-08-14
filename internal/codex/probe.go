@@ -12,6 +12,9 @@ import (
 // probeTarget 是 B1 handshake probe 的最小介面（*Server 以薄委派滿足；測試用 stub）。
 type probeTarget interface {
 	Alive
+	// Conn 是 GenerationOwner 的呼叫端（interrupt／fake-wire 路徑）取得底層連線的
+	// 入口——owner 只持有 probeTarget，不再直接持有 *Server。
+	Conn() *Conn
 	BeginRecording(sink func([]byte) error) error
 	StopRecording() error
 	Handshake(ctx context.Context, ci ClientInfo) error

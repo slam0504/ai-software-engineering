@@ -21,21 +21,34 @@ type stubServer struct {
 	hsErr    error
 	stopErr  error
 	hsGate   chan struct{} // 非 nil：Handshake 阻塞至關閉
+	exit     proc.Exit     // Wait 回傳值（預設 9／stub-stderr）
+	onBegin  func()        // 非 nil：BeginRecording 進入時呼叫（順序斷言用）
 
 	mu         sync.Mutex
 	begins     int
 	stops      int
 	terminates int
 	waits      int
+	dieOnce    sync.Once
 }
 
-func newStubServer() *stubServer { return &stubServer{done: make(chan struct{})} }
+func newStubServer() *stubServer {
+	return &stubServer{done: make(chan struct{}), exit: proc.Exit{Code: 9, StderrTail: "stub-stderr"}}
+}
+
+// die 模擬 server 意外死亡（只關 Done，不做其他事）——死亡收尾必須由 production
+// reaper 負責，測試不得代勞。
+func (s *stubServer) die() { s.dieOnce.Do(func() { close(s.done) }) }
 
 func (s *stubServer) Done() <-chan struct{} { return s.done }
+func (s *stubServer) Conn() *Conn           { return nil } // owner 路徑不觸碰 Conn
 func (s *stubServer) BeginRecording(sink func([]byte) error) error {
 	s.mu.Lock()
 	s.begins++
 	s.mu.Unlock()
+	if s.onBegin != nil {
+		s.onBegin()
+	}
 	if s.beginErr != nil {
 		return s.beginErr
 	}
@@ -62,9 +75,9 @@ func (s *stubServer) Terminate() error {
 }
 func (s *stubServer) Wait() proc.Exit {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.waits++
-	s.mu.Unlock()
-	return proc.Exit{Code: 9, StderrTail: "stub-stderr"}
+	return s.exit
 }
 func (s *stubServer) StderrSnapshot() string { return "live-stderr" }
 func (s *stubServer) Argv() []string         { return []string{"codex", "app-server"} }
