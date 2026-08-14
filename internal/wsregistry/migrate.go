@@ -31,10 +31,17 @@ var providerMigrationOrder = []string{"claude", "codex"}
 // 第二層防禦：上一段的「理論上」不是唯一防線
 // ——workspace-sessions.json 是使用者可手動編輯的檔案，若有人手動把
 // migrated 改回 false（或載入順序被破壞、在 Migrate 之前先呼叫了
-// Put），s.file.Entries 就會在 Migrated()==false 時已經有真實 session。
+// Put／Remove），s.file.Entries 就會在 Migrated()==false 時已經有內容。
 // 這種情況下 MarkMigrated 的整批取代語意會把既有 entries 無聲蒸發、且回傳
 // nil error，呼叫端會誤判成功。所以在建立任何新 entry 之前，先檢查
-// s.Live() 是否非空；非空就直接拒絕整個遷移，不呼叫 MarkMigrated。
+// entryCount() 是否非零——刻意用「registry 有任何已持久化的 entry」而非
+// 「有 live entry」：只看 Live() 會漏掉「只剩 tombstone、沒有 live
+// entry」的情況（例如手動編輯前使用者已經移除過某個 session），此時
+// Live() 回空、guard 不會觸發，遷移照跑，tombstone 就被整批取代抹掉——而
+// tombstone 存在正是為了讓 replay index 重建時不要把已移除的 session
+// 復活（store.go Remove 的說明），丟掉它等於把 §3.6.1 要防的洞打開。
+// marker 未設代表這個 registry「應該」是全新的，那它就該是空的（entry
+// 數為零，不分 live／tombstone）；任何內容都是異常，一律拒絕。
 //
 // 只遷移有內容的 entry：ResumeSessionID／TaskID／ViewStartEventID 三者皆空
 // 的 provider 不建立、不佔名額。沿用舊 entry 的 ViewStartEventID，只遷 view
@@ -46,8 +53,8 @@ func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]
 	if s.Migrated() {
 		return nil, nil
 	}
-	if live := s.Live(); len(live) > 0 {
-		return nil, fmt.Errorf("wsregistry: refusing to migrate: registry has %d live entries but migration marker is unset (manual edit or load-order bug)", len(live))
+	if n := s.entryCount(); n > 0 {
+		return nil, fmt.Errorf("wsregistry: refusing to migrate: registry has %d persisted entries but migration marker is unset (manual edit or load-order bug)", n)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)

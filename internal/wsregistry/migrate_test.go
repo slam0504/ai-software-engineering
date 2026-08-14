@@ -106,6 +106,43 @@ func TestMigrateRefusesWhenLiveEntriesExistWithoutMarker(t *testing.T) {
 	}
 }
 
+// TestMigrateRefusesWhenOnlyTombstonesExistWithoutMarker：guard 用
+// entryCount()（含 tombstone）而非 Live()（排除 tombstone）的原因
+//（coordinator 追加裁決）。registry 只剩 tombstone、沒有 live entry 時，
+// Live() 回空——若 guard 只看 Live()，這個狀態會被誤判成「registry 是空
+// 的」而放行遷移，MarkMigrated 的整批取代就會把 tombstone 無聲丟棄，等於
+// 打開 §3.6.1 tombstone 機制要防的「已移除 session 復活」的洞。
+func TestMigrateRefusesWhenOnlyTombstonesExistWithoutMarker(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ws.json")
+	s, _ := Open(p)
+	if err := s.Put(Entry{WSID: "removed-1", Provider: "claude", CreatedAt: "2026-08-14T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("removed-1", "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if live := s.Live(); len(live) != 0 {
+		t.Fatalf("前提不成立：Live() 應為空，實際 %+v", live)
+	}
+
+	legacy := map[string]LegacyEntry{"claude": {TaskID: "t"}}
+	out, err := Migrate(s, legacy, func() string { return "w1" })
+	if err == nil {
+		t.Fatalf("registry 只剩 tombstone 但 marker 未設時必須拒絕遷移，卻回傳 out=%+v", out)
+	}
+	if out != nil {
+		t.Fatalf("拒絕路徑不得回傳任何 entries：%+v", out)
+	}
+
+	e, ok := s.Get("removed-1")
+	if !ok || e.RemovedAt == "" {
+		t.Fatalf("tombstone 不得被清空：%+v (ok=%v)", e, ok)
+	}
+	if s.Migrated() {
+		t.Fatal("拒絕路徑不得標記 migrated")
+	}
+}
+
 // TestMigrateDeterministicOrderAcrossProviders：兩個 provider 都非空時，
 // 走訪順序與 WSID 指派必須是決定性的（claude 先於 codex），不能依賴 map
 // 迭代順序。brief 的三個測試都只有一個 provider 非空，沒有覆蓋到這個情境。

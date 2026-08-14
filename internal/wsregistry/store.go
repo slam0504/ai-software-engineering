@@ -178,6 +178,16 @@ func (s *Store) Get(wsid string) (Entry, bool) {
 	return e, ok
 }
 
+// entryCount：registry 目前持久化的 entry 總數，含 tombstone（未 export，
+// package 內部用；目前只給 migrate.go 的第二層防禦判斷「registry 是否應
+// 視為全新」——tombstone 也算數，因為丟掉它就等於把 §3.6.1 tombstone 要防
+// 的「已移除 session 復活」的洞打開）。
+func (s *Store) entryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.file.Entries)
+}
+
 // Live：排除 tombstone（RemovedAt 非空）與已刪除的 entries。排序：CreatedAt
 // 遞增，同值以 WSID 為 tie-break——map 迭代順序不穩定，不排序的話每次呼叫
 // （含每次重啟）順序都可能不同，會讓 session 清單 UI 跳動、也讓依賴順序
