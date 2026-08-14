@@ -194,3 +194,48 @@ func TestFinalizeIsIdempotent(t *testing.T) {
 		t.Fatalf("meta.json must reflect only the first Finalize call: %s", b)
 	}
 }
+
+// TestRebuildFrameIndexTailTruncationIsTolerated 對應 coordinator review 的
+// Important：app-server 意外死亡最典型的後果就是最後一行 JSONL 沒寫完，這正是
+// RebuildFrameIndex 存在的動機（reaper／受控 restart／啟動修復）。比照 §3.5.6
+// replay index 的損壞分級——檔尾（僅最後一行）不完整必須容忍，回傳有效前綴，
+// 不得整份放棄。
+func TestRebuildFrameIndexTailTruncationIsTolerated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "g1.jsonl")
+	// 第二行故意不完整（缺結尾、無結尾換行）模擬 crash 當下寫一半的 frame。
+	content := `{"frame":0,"dir":"c2s","wsid":"","raw":{"id":1}}` + "\n" +
+		`{"frame":1,"dir":"s2c","wsid":"","raw":{"id":2}` // 截斷，無結尾 } 也無換行
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := RebuildFrameIndex(path)
+	if err != nil {
+		t.Fatalf("檔尾截斷必須容忍、回傳有效前綴，不應整份失敗：%v", err)
+	}
+	got := idx.Lookup(FrameKey{WireLogID: "g1", Direction: DirClientToServer, RequestID: "1"})
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("有效前綴（frame 0）必須被保留：%v", got)
+	}
+	if idx.TruncatedTailBytes() == 0 {
+		t.Fatal("必須回報丟棄了多少位元組（檔尾截斷）")
+	}
+}
+
+// TestRebuildFrameIndexMidFileCorruptionFailsLoud：壞行之後還有有效行＝中段損
+// 壞，不是 crash 的典型後果，必須 fail loud，不得靜默跳過或整份放棄部分結果。
+func TestRebuildFrameIndexMidFileCorruptionFailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "g1.jsonl")
+	content := `{"frame":0,"dir":"c2s","wsid":"","raw":{"id":1}}` + "\n" +
+		`not-json-garbage` + "\n" +
+		`{"frame":2,"dir":"c2s","wsid":"","raw":{"id":3}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RebuildFrameIndex(path); err == nil {
+		t.Fatal("中段損壞（後面還有有效行）必須 fail loud，不得跳過或整份丟棄")
+	}
+}

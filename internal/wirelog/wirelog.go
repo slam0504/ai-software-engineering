@@ -101,6 +101,13 @@ func (g *Generation) ID() string { return g.id }
 //
 // 無法歸屬（尚未知道 WSID）的 frame 仍照樣寫入、不得丟棄（§3.4.5）；WSID 的歸
 // 屬透過 Attribute 事後標記，寫入當下一律留空。
+//
+// latch 後的行為（§3.4.6）：Line 進入時**不會**檢查 g.writeErr 做 short-circuit，
+// 每次呼叫都照樣嘗試真實寫入。若底層問題是暫時性的（例如磁碟空間恢復），後續
+// Line 呼叫仍可能成功並回傳 nil——但 Err() 會繼續回報第一次的失敗，不因此清除。
+// latch 保證的是「首次失敗的原因不被覆寫」，不保證「之後所有呼叫必然失敗或被
+// 擋」。是否要在 latch 後直接拒絕新寫入（例如只允許既有 session bounded 收尾、
+// 擋新 session 建立）是呼叫端（Task 12/13 的 App 層）的政策決定，不在本套件內。
 func (g *Generation) Line(dir Direction, raw []byte) error {
 	if dir != DirClientToServer && dir != DirServerToClient {
 		return fmt.Errorf("wirelog: invalid direction %q", dir)
@@ -145,6 +152,12 @@ func (g *Generation) Line(dir Direction, raw []byte) error {
 // 已知限制：RebuildFrameIndex 只讀 wire log 本身，故不會還原 Attribute 標記的
 // 結果；崩潰後重建的 FrameIndex 是「未歸屬」狀態。是否需要 crash-safe 的歸屬持
 // 久化留給接線 Task（12/13）依實際需求評估。
+//
+// 分工（coordinator 裁決）：本欄位僅 best-effort 記憶體註記，**不是** durable
+// 的 session 級錄流證據——錄流 sink 掛在 codex.Conn 內，寫入當下未必解析得出
+// WSID（pending start 窗口內尤其如此，thread 綁定還沒回來）。durable 權威是
+// §3.4.4 的 []SegmentRef（見 SegmentRef 的 doc）；若讓 frame line 的 wsid 欄位
+// 與 SegmentSet 都宣稱是歸屬權威，就是雙來源。
 func (g *Generation) Attribute(key FrameKey, wsid string) {
 	g.idx.attribute(key, wsid)
 }
