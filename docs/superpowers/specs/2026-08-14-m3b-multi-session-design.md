@@ -1,7 +1,7 @@
 # M3b — 多 session 工作區設計
 
 - 日期：2026-08-14
-- 狀態：rev4，待 closure review（rev1 六項設計 P1、rev2 六項生命週期 P1、rev3 四項 P1＋兩項 P2 已整合；rev4 修五項 P1：CommitCreate × rollback 雙失敗收斂為 create-degraded latch、recorder error latch 的 in-process 復原入口、Codex 受控復原的錄流 ownership 交棒（`wire_log_id` 前置配置、非 probe-scoped）、runtime replay index 重建與並行 append 的交接、鎖內最後補掃消除 TOCTOU）
+- 狀態：rev4，待 closure review（rev1 六項設計 P1、rev2 六項生命週期 P1、rev3 四項 P1＋兩項 P2 已整合；rev4 修五項 P1：CommitCreate × rollback 雙失敗收斂為 create-degraded latch、recorder error latch 的 in-process 復原入口、Codex 受控復原的錄流 ownership 交棒（`wire_log_id` 前置配置、非 probe-scoped）、runtime replay index 重建與並行 append 的交接、鎖外收斂至凍結上限後才取鎖——同時消除 TOCTOU 與無界鎖內掃描）
 - 上游依據：app plan §7（M3 列「多 session 並看」延後項）；M3a 範圍切分時的 M3b 定義（同 provider 多 session、資源上限、事件重放視窗化、session 導覽與生命週期契約）
 - 前置：M3a ✅（`cfa5a20`）＋M3a.1 ✅（`4ac2d78`）
 - 明確不含：閒置回收、pane 比例拖曳／N-pane、task 綁定（M4）、removed session 的 reopen、M3a.1 九張後續票（獨立 triage）、ACP（候選里程碑 §7.1）
@@ -116,7 +116,15 @@ type sessionHost struct {
 4. **Index 失敗不得影響 audit**：不回滾 audit、不讓 provider turn 失敗；改 latch `replay-index degraded` 狀態、checkpoint 不前移，待重建。**防遞迴（凍結）**：先 latch、後通知，**每個 degraded generation 只發一次** workspace 通知；通知事件照常進 audit，但 latch 期間 index writer 已停止寫入（含該通知本身），故通知不會再觸發 index 失敗——解除 latch 以成功重建為準（重建與並行 append 的交接見第 7 條）。
 5. checkpoint 以 **atomic rename** 寫入、clean shutdown 時 Sync；啟動時以 audit offset＋末筆 event ID 驗證。checkpoint 保存**每個 WSID 的 `open_turn_start_offset`**——否則 checkpoint 越過未完成 turn 後，result 到達時無法重建該 turn 起點。
 6. **損壞處置分級（凍結）**：index 檔**尾端** corruption → truncate 至最後一筆 valid record 續用；**中段** corruption、offset 超界或 event ID 不符 → quarantine＋全量重建＋復原通知。不可遺失或猜測事件。
-7. **Runtime 重建交接（凍結）**：第 4 條的 degraded latch 與第 6 條的中段 quarantine，其重建都發生在 **app 運行中**——provider turn 仍持續 append audit，故不得「邊掃邊解除 latch」（掃描高水位之後、writer 接回之前的事件會留下缺口）。序列凍結為：**bulk 重建（不持鎖，掃至當下 audit end 高水位）→ 取得 emit／index mutex → 在鎖內重讀最新 audit end 並完成最後一段 suffix 補掃 → 前移 checkpoint、接回 writer、解除 latch → unlock**。**最後一段補掃與接回必須在同一把鎖內**——若在鎖外補掃完才去搶鎖，補掃結束到取得鎖之間仍可 append，會留下缺口（TOCTOU）。鎖內只處理 bulk 之後的殘量，窗口為 bounded；**不得在鎖內做全量掃描**（會把 emit 停在不受控的時長）。落在重建窗口內的事件必須**恰好索引一次**（以 `AppendReceipt` 的 event ID／offset 去重，不得產生重複 record），barrier 為必測項（§5.5）。啟動期重建走 §3.2.4 序列（開 UI 前完成），無並行 append，不適用本條。
+7. **Runtime 重建交接（凍結）**：第 4 條的 degraded latch 與第 6 條的中段 quarantine，其重建都發生在 **app 運行中**——provider turn 仍持續 append audit，故不得「邊掃邊解除 latch」（掃描高水位之後、writer 接回之前的事件會留下缺口）。序列凍結為：
+
+   1. **bulk 重建**至初始高水位（不持鎖）。
+   2. **鎖外反覆 catch-up** 至最新 audit end，直到**殘量**（最新 audit end − 已索引 offset）低於**收斂上限**——byte 與 record 雙上限、凍結常數（不可設定）。bulk 期間 audit 仍在增長，故一次補掃不保證收斂，必須迭代。**迭代本身有固定嘗試次數／時間界限（凍結常數）**：界限內仍未達標即**中止本輪重建**（見下方收斂分支），不得無限迭代或 busy-loop。
+   3. 殘量達標**才**取得 emit／index mutex。
+   4. 鎖內重讀 final audit end：**殘量若又超限，立即 unlock 回到第 2 步重試**——**不得在鎖內硬掃**。
+   5. 殘量符合上限 → 鎖內完成最後一段補掃 → 前移 checkpoint → 接回 writer → 解除 latch → unlock。
+
+   **最後一段補掃與接回必須在同一把鎖內**——若在鎖外補掃完才去搶鎖，補掃結束到取得鎖之間仍可 append，會留下缺口（TOCTOU）。**持續高速 append 下的兩種不收斂分支，一律以「保留 degraded latch ＋ 中止本輪 ＋ backoff 稍後重試」收束**：(a) 鎖外 catch-up 在嘗試界限內**始終未達標**（本條第 2 步，從未進入取鎖階段）；(b) 達標取鎖後**殘量又超限**、反覆 unlock 重試至嘗試界限（本條第 4 步）。重試從已索引位置續掃，不重跑 bulk。此收束安全的前提是 **index 是快取、audit 不受影響**（第 4 條）；**不得為求收斂在鎖內做無上限掃描，也不得在鎖外 busy-loop**。落在重建窗口內的事件必須**恰好索引一次**（以 `AppendReceipt` 的 event ID／offset 去重，不得產生重複 record），barrier 為必測項（§5.5）。啟動期重建走 §3.2.4 序列（開 UI 前完成），無並行 append，不適用本條。
 8. Current incomplete turn 從 `open_turn_start_offset` 之後的 audit suffix 直接取得（不入 index）。
 9. **Turn boundary 定義（凍結）**：turn 自 **canonical user message** 起；以該 result 導出的 **terminal `state_change=done|failed`** 止（含 failed turn）；`stream_error` 同樣導出 failed 並結束 incomplete turn；`session:done` 不單獨構成 turn；**沒有 canonical user message 的 init／unknown 事件屬 session metadata，不得猜成一個 turn**。未完成 turn 獨立載入、不得從 turn 中間截斷。
 10. 稽核匯出、contract replay 等仍讀完整 events.jsonl，不受 UI 視窗限制。index 是快取，不是第二份事件格式。
@@ -163,10 +171,10 @@ shuttingDown=true（拒新 app txn）
 ## 5. 測試（production-path barrier 必備清單）
 
 1. 同 provider **5 個並行 ReserveSession，恰 4 個**取得 reservation（`-race`）；Reserve → registry persist failure → AbortCreate 退回名額；**注入式 CommitCreate 失敗 → registry 回滾＋AbortCreate、重啟無 durable ghost**；**CommitCreate 失敗 × rollback persist 失敗 → 不 AbortCreate、名額保留、`session-create-degraded` latch 拒絕新建（既有 session 不受影響），重啟後由 registry 還原為 dormant 且名額歸位**；Reserve × shutdown barrier（拒新 app txn）。
-2. Codex 兩 thread 的 notification／approval／completed-before-response／錄流 frame 歸屬**不串線**；wire recorder error latch → 拒新 Codex session、**但不擋受控 restart**；**latch 下的完整復原路徑：收乾 live host → finalize 舊 generation → 新 server 掛 recorder＋handshake＋發布全成功才解除 latch；掛 recorder 或 handshake 失敗 → dispose 新 server＋latch 保留＋不留未發布 server**；**發布成功後 recorder 未被 Stop／Close，wire log 持續錄到 server 終止才 finalize（非 probe-scoped）**；**失敗的 generation 仍保留 `wire_log_id` 與收尾證據**；app-server generation restart 開新 wire_log_id；**同一 WSID 橫跨兩個 generation 的 `[]WireSegmentRef` 完整且不混入他 session frame**；B1 在 live host／in-flight turn 時拒絕。
+2. Codex 兩 thread 的 notification／approval／completed-before-response／錄流 frame 歸屬**不串線**；wire recorder error latch → 拒新 Codex session、**但不擋受控 restart**；**latch 下的完整復原路徑：收乾 live host → terminate → wait（`Conn.Done`）→ finalize 舊 generation（§3.4.2 順序）→ 配置新 `wire_log_id` → 新 server 掛 recorder＋handshake＋發布全成功才解除 latch；掛 recorder 或 handshake 失敗 → dispose 新 server＋latch 保留＋不留未發布 server**；**發布成功後 recorder 未被 Stop／Close，wire log 持續錄到 server 終止才 finalize（非 probe-scoped）**；**失敗的 generation 仍保留 `wire_log_id` 與收尾證據**；app-server generation restart 開新 wire_log_id；**同一 WSID 橫跨兩個 generation 的 `[]WireSegmentRef` 完整且不混入他 session frame**；B1 在 live host／in-flight turn 時拒絕。
 3. Legacy migration 的 crash／restart 得到**相同 WSID**（原子持久化＋migration marker）；incomplete turn restart → `stream_error`＋failed，不殘留 busy／pending approval；**啟動修復序列 crash 後重跑冪等**（不重複 append stream_error、收斂到相同狀態）。
 4. Remove × New 同 token 競態；removed tombstone 重啟與 index rebuild **不復活**；shutdown × Start barrier；8 session 含一個卡死 Claude → shutdown 總時間仍為單一 bounded window。
-5. Replay index 三種 crash：落後（補掃）、超前（不可信快取修復）、checkpoint 越過 open turn（`open_turn_start_offset` 重建）；index 尾端 truncate 續用 vs 中段 quarantine 重建；**degraded latch 每 generation 只通知一次、通知事件不觸發遞迴**；**runtime 重建 × 並行 append barrier：事件固定插在「bulk 補掃已完成、emit／index mutex 尚未取得」的窗口 → 由鎖內最後一段補掃涵蓋，恰好索引一次、無缺口亦無重複 record**。
+5. Replay index 三種 crash：落後（補掃）、超前（不可信快取修復）、checkpoint 越過 open turn（`open_turn_start_offset` 重建）；index 尾端 truncate 續用 vs 中段 quarantine 重建；**degraded latch 每 generation 只通知一次、通知事件不觸發遞迴**；**runtime 重建 × 並行 append barrier：事件固定插在「bulk 補掃已完成、emit／index mutex 尚未取得」的窗口 → 由鎖內最後一段補掃涵蓋，恰好索引一次、無缺口亦無重複 record**；**sustained-append barrier 兩條**：(a) **鎖外 catch-up 始終無法達標** → 嘗試界限內中止本輪、保留 degraded latch、backoff 重試；(b) **達標後取鎖時再次超限** → 立即解鎖重試、鎖內處理量不超過凍結收斂上限。兩條均須驗證**不 busy-loop、不做無界掃描**，且後續成功重建時事件**無缺漏無重複**。
 6. 雙 pane 已滿時未釘選 session approval 的 transient routing（顯示 → allow/deny/timeout/dismiss/remove/shutdown 各觸發恢復原 pin）。
 7. 另：event_id 檔案級單調在 8 session 並行 turn 下不變量測試；舊 journal（無 WSID）legacy 歸屬 fixture；每 session 單一 in-flight turn 拒絕第二筆。
 
