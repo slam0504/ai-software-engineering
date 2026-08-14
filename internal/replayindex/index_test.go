@@ -169,6 +169,59 @@ func TestTurnsBeforePagination(t *testing.T) {
 	}
 }
 
+// TestCheckpointOnlyPersistsAtTurnBoundary：mutation 驗證——非終止事件
+// （delta 等）不得觸發 checkpoint.json 落盤（內容與 mtime 皆不變），只有
+// turn boundary（開 turn／收 turn）才落盤。記憶體中的 Checkpoint() 不受此
+// 節流影響，逐事件即時更新。
+func TestCheckpointOnlyPersistsAtTurnBoundary(t *testing.T) {
+	dir := t.TempDir()
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "checkpoint.json")
+
+	feedUserMsg(t, i, "w1", 0) // 開 turn：boundary，必落盤
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for k := 0; k < 5; k++ {
+		feed(t, i, "w1", string(contract.KindDelta), "", int64(10+k*10))
+	}
+	afterDeltas, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterDeltasInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterDeltas) != string(before) {
+		t.Fatalf("非終止事件不得改動 checkpoint 檔內容：\nbefore=%s\nafter=%s", before, afterDeltas)
+	}
+	if !afterDeltasInfo.ModTime().Equal(beforeInfo.ModTime()) {
+		t.Fatalf("非終止事件不得改動 checkpoint 檔 mtime：before=%v after=%v", beforeInfo.ModTime(), afterDeltasInfo.ModTime())
+	}
+	if off, _ := i.Checkpoint(); off != 60 {
+		t.Fatalf("記憶體 checkpoint 應逐事件即時更新、不受落盤節流影響：%d", off)
+	}
+
+	feed(t, i, "w1", string(contract.KindStateChange), string(contract.StateDone), 60) // 收 turn：boundary，必落盤
+	afterClose, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterClose) == string(before) {
+		t.Fatal("turn 收尾必須落盤 checkpoint")
+	}
+}
+
 func TestOpenTurnStartSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	i1, err := Open(dir)

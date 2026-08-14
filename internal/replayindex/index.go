@@ -125,15 +125,28 @@ func (idx *Index) loadCheckpoint() error {
 // 狀態機。持鎖涵蓋狀態轉移與所有實際檔案 I/O。持久化失敗一律回錯（fail
 // loud）——這個 task 沒有 degraded latch，呼叫端必須自行處理錯誤；latch 化
 // 是 Task 16 的範圍。
+//
+// checkpoint.json 只在 turn boundary（開 turn／收 turn）才落盤，不是每個事件
+// 都寫：Task 20 接線後 Observe 會在 Manager 的全域 mutex 內被呼叫，一次回覆
+// 可能有幾十到幾百個 delta，若每個 delta 都同步 marshal＋WriteFile＋Rename，
+// 等於把磁碟 I/O 放大到整條事件管線的關鍵路徑上。節流到 turn boundary 不影
+// 響正確性——§3.5.3 本就把「checkpoint 落後於實際 audit 進度」列為 crash 後
+// 的預期情形，修復機制是「掃 audit suffix 補索引」，不要求 checkpoint 逐事
+// 件同步。記憶體中的 checkpointOffset／checkpointLastEventID 仍逐事件更新
+// （Checkpoint() 讀的是這份即時值），只有實際落盤動作被節流。
 func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if err := idx.applyTurnState(env, receipt); err != nil {
+	boundary, err := idx.applyTurnState(env, receipt)
+	if err != nil {
 		return err
 	}
 	idx.checkpointOffset = receipt.EndOffset
 	idx.checkpointLastEventID = receipt.EventID
+	if !boundary {
+		return nil
+	}
 	return idx.writeCheckpointFile()
 }
 
@@ -154,10 +167,13 @@ func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) 
 //     terminal state_change，不需要對 stream_error 額外開特例；若上游未
 //     衍生對應的 state_change，turn 就維持未結束（§3.5.8 未完成 turn 不入
 //     index，交由重啟修復處理，非本 task 範圍）。
-func (idx *Index) applyTurnState(env contract.Envelope, receipt appcore.AppendReceipt) error {
+//
+// 回傳值 boundary：這筆事件是否觸發了開 turn 或收 turn（Observe 靠它決定要
+// 不要落盤 checkpoint——見 Observe 的節流說明）。
+func (idx *Index) applyTurnState(env contract.Envelope, receipt appcore.AppendReceipt) (bool, error) {
 	wsid := env.WorkspaceSessionID
 	if wsid == "" {
-		return nil
+		return false, nil
 	}
 	st, ok := idx.turns[wsid]
 	if !ok {
@@ -169,6 +185,7 @@ func (idx *Index) applyTurnState(env contract.Envelope, receipt appcore.AppendRe
 		st.open = true
 		st.startOffset = receipt.StartOffset
 		st.firstEventID = receipt.EventID
+		return true, nil
 	case st.open && isTerminalStateChange(env):
 		rec := TurnRecord{
 			StartOffset:  st.startOffset,
@@ -177,13 +194,14 @@ func (idx *Index) applyTurnState(env contract.Envelope, receipt appcore.AppendRe
 			LastEventID:  receipt.EventID,
 		}
 		if err := idx.appendTurnRecord(wsid, rec); err != nil {
-			return err
+			return false, err
 		}
 		st.open = false
 		st.startOffset = 0
 		st.firstEventID = ""
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 func isCanonicalUserMessage(env contract.Envelope) bool {
@@ -199,6 +217,14 @@ func isTerminalStateChange(env contract.Envelope) bool {
 
 // RecentTurns：wsid 最近（檔尾）至多 n 筆完整 turn，時間遞增排列。未完成
 // turn 不含在內（§3.5.8）；wsid 尚無完整 turn 時回傳空 slice、非錯誤。
+//
+// 目前實作是 O(該 WSID 全部 turn 數)——readTurnFileLocked 整份 <wsid>.turns.jsonl
+// 讀完解析、才在記憶體中取尾，不是從檔尾反向讀。這是刻意取捨，不是疏漏：
+// turns.jsonl 每筆約 100 bytes，即使單一 WSID 累積一萬個 turn 也才 ~1MB，
+// 比它取代的 events.jsonl（動輒上百 MB）小兩到三個數量級，現在寫反向讀取
+// 器是為了還沒發生的問題增加複雜度。觸發改寫的條件：若實測某 WSID 的
+// turns.jsonl 成長到單次全讀有感（例如同一 WSID 累積數萬筆以上、或量到
+// I/O 延遲影響 UI 捲動），才值得換成真正的 tail read。
 func (idx *Index) RecentTurns(wsid string, n int) ([]TurnRecord, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -214,6 +240,9 @@ func (idx *Index) RecentTurns(wsid string, n int) ([]TurnRecord, error) {
 // beforeEventID 為空字串時等同 RecentTurns（首次載入無 cursor）。cursor 找
 // 不到對應 turn 時回傳空 slice、非錯誤——避免把「cursor 已經是最舊」與
 // 「cursor 不存在」混為一種呼叫端無法分辨的錯誤。
+//
+// 與 RecentTurns 共用 readTurnFileLocked，同樣是 O(該 WSID 全部 turn 數) 的
+// 全讀取捨，理由與改寫條件見 RecentTurns 的 doc。
 func (idx *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
