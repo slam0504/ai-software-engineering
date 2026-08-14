@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -30,6 +32,13 @@ func newTestAppAt(t *testing.T, stateDir string) *App {
 	}
 	a.manager = appcore.New(appcore.Config{Sink: sink})
 	t.Cleanup(func() { _ = a.manager.Close() })
+	af, err := os.OpenFile(filepath.Join(stateDir, "audit.jsonl"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.auditF = af
+	t.Cleanup(func() { _ = af.Close() })
 	rs, err := openRestoreStore(filepath.Join(stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
 	if err != nil {
 		t.Fatal(err)
@@ -288,6 +297,126 @@ func TestStartupWiresSessionRegistry(t *testing.T) {
 	}
 	if _, err := a.CreateSession("claude", "post-startup"); err != nil {
 		t.Fatalf("startup 之後 CreateSession 必須可用：%v", err)
+	}
+}
+
+// auditHas：audit.jsonl 是否出現指定 kind 的紀錄。
+func auditHas(t *testing.T, stateDir, kind string) bool {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Contains(string(b), `"kind":"`+kind+`"`)
+}
+
+// TestUnknownProviderEntrySkipped（owner 2026-08-14 決策 2）：單筆無法解析
+// provider 的 entry 不該讓整個 app 開不起來。跳過該筆、不刪除、不阻擋啟動，
+// 但必須留下診斷軌跡（audit ＋ 啟動警告，含被跳過的筆數與 WSID）。
+func TestUnknownProviderEntrySkipped(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1"},
+		wsregistry.Entry{WSID: "wX", Provider: "gemini", CreatedAt: "t2"})
+
+	live, err := a.loadSessionRegistry()
+	if err != nil {
+		t.Fatalf("單筆未知 provider 不得阻擋啟動：%v", err)
+	}
+	if len(live) != 1 || live[0].WSID != "w1" {
+		t.Fatalf("回傳值不得包含被跳過的 entry：%+v", live)
+	}
+	if a.wsReg == nil {
+		t.Fatal("啟動仍應完成接線")
+	}
+	if got := a.manager.SlotCount("claude"); got != 1 {
+		t.Fatalf("已知 provider 仍須還原：%d", got)
+	}
+	if got := a.manager.SlotCount("gemini"); got != 0 {
+		t.Fatalf("未知 provider 不得佔名額：%d", got)
+	}
+	if !strings.Contains(a.startupErr, "wX") || !strings.Contains(a.startupErr, "1") {
+		t.Fatalf("啟動警告必須含被跳過的筆數與 WSID：%q", a.startupErr)
+	}
+	if !auditHas(t, dir, "session_registry_unknown_provider") {
+		t.Fatal("必須留下 audit 診斷軌跡")
+	}
+	// 非破壞性：被跳過的 entry 仍在磁碟上（該 provider 若回歸即可還原）。
+	if _, ok := registryOnDisk(t, dir).Get("wX"); !ok {
+		t.Fatal("被跳過的 entry 不得從 registry 刪除")
+	}
+}
+
+// TestProviderOverLimitRestoresNothing（owner 2026-08-14 決策 3）：Manager 沒有
+// 移除 committed slot 的 API（Task 22 才有），半還原無法回滾——所以先全量驗證、
+// 再全量還原。某 provider 超限時必須「一筆都沒還原」，兩個 provider 的
+// SlotCount 都要是 0（若是邊驗邊還原，claude 會先被還原 4 筆才失敗）。
+func TestProviderOverLimitRestoresNothing(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	entries := []wsregistry.Entry{}
+	for i := 0; i < appcore.MaxSessionsPerProvider+1; i++ {
+		entries = append(entries, wsregistry.Entry{
+			WSID: fmt.Sprintf("w%d", i), Provider: "claude", CreatedAt: fmt.Sprintf("t%d", i)})
+	}
+	entries = append(entries, wsregistry.Entry{WSID: "wc", Provider: "codex", CreatedAt: "t9"})
+	seedRegistry(t, dir, entries...)
+
+	_, err := a.loadSessionRegistry()
+	if err == nil {
+		t.Fatal("超限必須 fail loud，不得靜默丟棄多餘 entry")
+	}
+	// 先斷言「一筆都不還原」——這是兩段式的核心，邊驗邊還原會在這裡露餡
+	//（claude 先被還原到上限才失敗）。
+	if got := a.manager.SlotCount("claude"); got != 0 {
+		t.Fatalf("驗證不過必須一筆都不還原（claude）：%d", got)
+	}
+	if got := a.manager.SlotCount("codex"); got != 0 {
+		t.Fatalf("驗證不過必須一筆都不還原（codex）：%d", got)
+	}
+	if a.wsReg != nil {
+		t.Fatal("驗證失敗不得接線")
+	}
+	for _, want := range []string{"claude", "5", fmt.Sprint(appcore.MaxSessionsPerProvider)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("錯誤訊息必須說明 provider／筆數／上限，缺 %q：%v", want, err)
+		}
+	}
+}
+
+// TestMalformedRegistryErrorIsActionable（owner 2026-08-14 決策 1）：維持 fail
+// loud、零自動修復，但錯誤訊息要可操作——完整路徑、備份後移除的指引、以及
+// 「稽核歷史不受影響」的說明。壞檔必須原封不動（不改名、不重建）。
+func TestMalformedRegistryErrorIsActionable(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	path := filepath.Join(dir, "workspace-sessions.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.loadSessionRegistry()
+	if err == nil {
+		t.Fatal("malformed registry 必須 fail loud")
+	}
+	for _, want := range []string{path, "備份", "events.jsonl"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("錯誤訊息缺可操作資訊 %q：%v", want, err)
+		}
+	}
+	if a.wsReg != nil {
+		t.Fatal("載入失敗不得接線")
+	}
+	b, rerr := os.ReadFile(path)
+	if rerr != nil || string(b) != "{not json" {
+		t.Fatalf("壞檔必須原封不動（不改名、不重建）：%q err=%v", string(b), rerr)
+	}
+	if ents, derr := os.ReadDir(dir); derr == nil {
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), "workspace-sessions.json.") {
+				t.Fatalf("不得自動改名／留下衍生檔：%s", e.Name())
+			}
+		}
 	}
 }
 

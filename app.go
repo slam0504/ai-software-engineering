@@ -411,6 +411,18 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 	return out, nil
 }
 
+// noteStartupWarning：把非致命的啟動警告接到既有 startupErr 通道（UI 經
+// CLIInfo().startupError 讀得到）。沿用 startup() 既有慣例——只填第一則，
+// 不覆寫更早的訊息。
+func (a *App) noteStartupWarning(msg string) {
+	if a.startupErr == "" {
+		a.startupErr = msg
+	}
+}
+
+// knownProvider：可還原的 provider 白名單（同 CreateSession 的 guard）。
+func knownProvider(p string) bool { return p == "claude" || p == "codex" }
+
 // loadSessionRegistry：§3.2.4 啟動修復序列的前半段——載入／遷移 registry →
 // 還原 Manager dormant slots。後半段（index 驗證／重建 → incomplete turn 修復
 // → 才開放 UI 與 provider 啟動）見 Task 20。
@@ -422,13 +434,26 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 // Migrate 的第二道 guard，讓 app 從此無法完成遷移）。wsregistry.Migrate 內的
 // entryCount guard 是最後防線，不是第一道。
 //
-// 任一步失敗一律回錯、不降級：wsregistry.Open 對 malformed 檔案是 fail loud
-// 而非重建（見 wsregistry.Open 的說明——重建等於抹掉使用者所有 session），
-// migration 落盤失敗同樣 fail loud、不啟動 provider（§3.2.6）。
+// 失敗處置一律 fail loud、不自動修復（owner 2026-08-14 裁決）：
+//   - registry 檔 malformed：wsregistry.Open 本身就不重建（重建等於抹掉使用者
+//     所有 session），這裡只把錯誤升級成可操作指引——檔案完整路徑、「備份後
+//     移除該檔即可以空清單啟動」、以及 events.jsonl 稽核歷史不受影響。刻意
+//     **不**自動把壞檔改名：若 corruption 其實是暫時性／環境性的讀取錯誤，
+//     改名會讓一份沒壞的檔案靜默消失，比不修復更危險。
+//   - migration 落盤失敗：回錯、不標記 migrated、不啟動 provider（§3.2.6）。
+//
+// 還原分兩段（先全量驗證、再全量還原）：Manager 目前沒有移除 committed slot
+// 的 API（Task 22 才有），「還原到一半失敗再回滾」根本做不到，所以用驗證取代
+// 回滾——驗證不過就一筆都不還原，不留 Manager 與 registry 不一致的半還原狀態。
 func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
-	store, err := wsregistry.Open(filepath.Join(a.stateDir, "workspace-sessions.json"))
+	path := filepath.Join(a.stateDir, "workspace-sessions.json")
+	store, err := wsregistry.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("session registry 載入失敗：%w\n"+
+			"檔案：%s\n"+
+			"此檔是所有 workspace session 的權威記錄，刻意不自動重建或改名——重建等於抹掉全部 session。\n"+
+			"請先備份該檔；確認無法修復後移除它，即可以空 session 清單重新啟動。\n"+
+			"events.jsonl 的稽核歷史完整未受影響，不會因此遺失", err, path)
 	}
 	// Migrated() 在 Migrate 內也會再檢查一次（冪等由那裡保證）；這裡先擋一層
 	// 只為省掉 legacyEntries 對 events.jsonl 的掃描——正常啟動每次都會走到。
@@ -442,14 +467,46 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 			return nil, merr
 		}
 	}
+
+	// Pass 1：只分類與驗證，不動任何 Manager 狀態。
 	live := store.Live()
+	restorable := make([]wsregistry.Entry, 0, len(live))
+	perProvider := map[string]int{}
+	var skipped []string
 	for _, e := range live {
+		// 未知 provider（手動編輯／未來版本降級）：跳過該筆，不刪除、不阻擋
+		// 啟動——單筆無法解析的 entry 不該讓整個 app 開不起來，且跳過是非
+		// 破壞性的（entry 仍在磁碟，該 provider 若回歸即可還原）。
+		if !knownProvider(e.Provider) {
+			skipped = append(skipped, fmt.Sprintf("%s(provider=%q)", e.WSID, e.Provider))
+			continue
+		}
+		perProvider[e.Provider]++
+		restorable = append(restorable, e)
+	}
+	if len(skipped) > 0 { // 診斷軌跡先發，之後就算驗證失敗也留得下來
+		a.audit("session_registry_unknown_provider",
+			map[string]any{"count": len(skipped), "skipped": skipped, "path": path})
+		a.noteStartupWarning(fmt.Sprintf(
+			"session registry: 跳過 %d 筆 provider 無法解析的 entry（未刪除，仍在 %s）：%s",
+			len(skipped), path, strings.Join(skipped, ", ")))
+	}
+	for _, p := range legacyProviders { // 固定順序：錯誤訊息不得隨 map 迭代漂移
+		if n := perProvider[p]; n > appcore.MaxSessionsPerProvider {
+			return nil, fmt.Errorf("session registry 有 %d 筆 live %s session，上限為 %d："+
+				"一筆都不還原（避免 Manager 與 registry 半還原不一致）。\n"+
+				"檔案：%s——請備份後手動移除多餘 entry", n, p, appcore.MaxSessionsPerProvider, path)
+		}
+	}
+
+	// Pass 2：驗證通過才真的還原。
+	for _, e := range restorable {
 		if rerr := a.manager.RestoreDormant(appcore.WSID(e.WSID), contract.Provider(e.Provider)); rerr != nil {
 			return nil, fmt.Errorf("app: restore dormant wsid=%s provider=%s: %w", e.WSID, e.Provider, rerr)
 		}
 	}
 	a.wsReg = store
-	return live, nil
+	return restorable, nil
 }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
@@ -513,9 +570,7 @@ func (a *App) startup(ctx context.Context) {
 	// 繼續（§3.2.6）。
 	if _, lerr := a.loadSessionRegistry(); lerr != nil {
 		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
-		if a.startupErr == "" {
-			a.startupErr = "session registry load failed: " + lerr.Error()
-		}
+		a.noteStartupWarning("session registry load failed: " + lerr.Error())
 	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
