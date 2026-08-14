@@ -23,10 +23,14 @@ import (
 // 填好才登記，putHost 的 a.mu 釋放即為 happens-before 邊界，之後的讀者（hostFor／
 // snapshotHosts／hostsOf 拿到的指標）可以在鎖外安全讀取。
 //
-// 這條規約由「不把 host 指標交給任何在 publish 之前就啟動的 goroutine」來維持
-// （review Important #2）：startClaude 的兩條 pump goroutine 只拿到窄值（wsid／
-// provider／broker）與兩個在 a.mu 下操作的 closure，拿不到 host 本身，因此不可能
-// 讀到尚未寫入的 sess／pumpDone／lease／teardownFn。
+// 這條規約由「不把 host 交給 goroutine 直接使用」來維持（review Important #2）：
+// startClaude 的兩條 pump goroutine 在 publish 之前就啟動，因此只拿到窄值（wsid／
+// provider／broker）與兩個 closure；它們接觸得到的 host 狀態只有 sessionID（經
+// hostSessionID／setHostSessionID，在 a.mu 下）與建構時就寫定的 wsid。goroutine
+// 作用域內沒有 host 識別字可寫，所以不會、也無法讀到 publish 前才填入的 sess／
+// pumpDone／lease／teardownFn——closure 仍然捕獲 host 指標，安全性來自「它們只走
+// a.mu 下的存取器」，不是來自「拿不到指標」。日後在這兩條 goroutine 內新增對 host
+// 其他欄位的存取，必須重新檢查這條規約。
 //
 // sessionID 是唯一 publish 後仍會變動的欄位（claude init 抵達時回填），一律經
 // hostSessionID／setHostSessionID 在 a.mu 下存取。
@@ -42,6 +46,10 @@ type sessionHost struct {
 	// 而**不是** WSID：unix sockaddr 的 sun_path 只有 ~104 bytes，26 字元的 ULID
 	// 會讓 production 的 `<cwd>/.workbench` 直接 bind 失敗（review Critical）。
 	// socket 是 ephemeral runtime 資源、不是 identity——identity 在 registry。
+	//
+	// 已知預算：approval-0.sock（15 bytes）比 M3b 之前的 approval.sock（13 bytes）
+	// 長 2 bytes，因此 stateDir 的可用長度約 88 bytes。這個修正把檔名從 40 bytes
+	// 壓回 15，但沒有徹底消除這個維度——極深的 workspace 路徑仍可能撐破上限。
 	sockPath   string
 	sockIndex  int    // reserveSockIndex 配到的槽位（-1 = 未配置）
 	mcpPath    string // per-WSID MCP config（普通檔案，不受 sun_path 限制）
