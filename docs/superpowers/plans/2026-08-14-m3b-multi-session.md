@@ -1178,6 +1178,12 @@ func (o *GenerationOwner) Finalized() bool
 func (s *Single[T]) Epoch() uint64                    // 目前持有者的 epoch（無持有者=0）
 func (s *Single[T]) CompareAndTakeEpoch(e uint64) (T, bool) // 僅當 epoch 相符才取出
 
+// WithExclusiveEpoch：與 WithExclusive 同語意，但**在同一把鎖內**回傳本次發布
+// 取得的 epoch。必須用它取 epoch——解鎖後才呼叫 Epoch() 有 TOCTOU：期間若已有
+// 第二次 replacement 發布，第一個 watcher 會拿到第二個 owner 的 epoch，
+// 之後在舊 server 死亡時錯誤取走新 generation。keep=false 時回 epoch=0。
+func (s *Single[T]) WithExclusiveEpoch(fn func(cur T, ok bool) (T, bool, error)) (uint64, error)
+
 // production 死亡收尾：發布 owner 後立即啟動。Done() 關閉 → CompareAndTakeEpoch
 // → FinalizeWith。**無論是否仍為 active 持有者都會 finalize 自己的 generation，
 // 且一律呼叫 onFinalized**（wasActive 標示是否仍是當時的持有者）——測試才能在
@@ -1280,6 +1286,56 @@ func TestStaleReaperDoesNotClearNewGeneration(t *testing.T) {
 	}
 }
 
+// epoch 必須在鎖內取得：第一個 owner 發布後、watcher 註冊前停住，
+// 讓第二次 replacement 完成，再放行第一個 watcher。
+func TestWatcherEpochCapturedUnderLock(t *testing.T) {
+	var single Single[*GenerationOwner]
+	firstAtBarrier := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var once sync.Once
+	hookAfterPublishBeforeWatch = func() { // 套件層測試 hook
+		once.Do(func() { close(firstAtBarrier); <-releaseFirst })
+	}
+	t.Cleanup(func() { hookAfterPublishBeforeWatch = nil })
+
+	oldSrv, oldGen := newStubServer(), newTestGeneration(t)
+	staleDone := make(chan bool, 1)
+	go func() {
+		_ = RunOwnedHandshake(context.Background(), &single,
+			func() (*wirelog.Generation, error) { return oldGen, nil },
+			func() (probeTarget, error) { return oldSrv, nil }, ClientInfo{},
+			func(_ error, wasActive bool) { staleDone <- wasActive })
+	}()
+	<-firstAtBarrier
+
+	// 第二次 replacement 在第一個 watcher 註冊前就完成發布
+	newSrv, newGen := newStubServer(), newTestGeneration(t)
+	if err := RunOwnedHandshake(context.Background(), &single,
+		func() (*wirelog.Generation, error) { return newGen, nil },
+		func() (probeTarget, error) { return newSrv, nil }, ClientInfo{},
+		func(error, bool) {}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseFirst)
+
+	oldSrv.die()
+	select {
+	case wasActive := <-staleDone:
+		if wasActive {
+			t.Fatal("第一個 watcher 必須帶自己那次發布的 epoch，wasActive 應為 false")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale watcher 未回報")
+	}
+	o, ok := single.Take()
+	if !ok || o.Generation != newGen {
+		t.Fatal("舊 watcher 不得取走新 owner（epoch 必須在鎖內取得）")
+	}
+	if newGen.Finalized() {
+		t.Fatal("新 generation 不得被舊 watcher finalize")
+	}
+}
+
 func TestOldProbeEntryPointUnchanged(t *testing.T) {
 	// 舊 probe-scoped 入口在 Task 13 之前必須維持原簽名與原行為，
 	// 否則 App.codexSingle（Single[*codex.Server]）與 B1 呼叫點會編譯失敗
@@ -1378,7 +1434,7 @@ func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint
 }
 ```
 
-`RunOwnedHandshake` 在 `WithExclusive` 內：先 `cur.FinalizeWith(nil)` 收舊 owner → 建新 generation（`wire_log_id` 前置配置）→ start → attach → handshake → 發布，取得新 epoch 後啟動 `WatchGeneration`。**舊 `RunHandshakeProbe` 一行不動。**
+`RunOwnedHandshake` 用 **`WithExclusiveEpoch`**：鎖內先 `cur.FinalizeWith(nil)` 收舊 owner → 建新 generation（`wire_log_id` 前置配置）→ start → attach → handshake → 發布，**由該呼叫直接回傳本次 epoch**，再以此 epoch 啟動 `WatchGeneration`（`hookAfterPublishBeforeWatch` 為兩者之間的測試 barrier）。**絕不可解鎖後再呼叫 `Epoch()`**——那會拿到後續 replacement 的 epoch。**舊 `RunHandshakeProbe` 一行不動。**
 
 - [ ] **Step 4: 全綠＋競態穩定** — `go vet ./... && go test -race ./... -count=1` 並 `go test ./internal/codex/ -race -count=30` → PASS
 
@@ -1392,6 +1448,7 @@ func WatchGeneration(s *Single[*GenerationOwner], o *GenerationOwner, epoch uint
 - Consumes: Task 12 `GenerationOwner`／`RunOwnedHandshake`／`WatchGeneration`。
 - Produces: `wireLatched`／`latchWireRecorder`／`RecoverCodexRecording`。
 - **ownership 型別遷移（本 task 完成）**：`App.codexSingle` 由 `codex.Single[*codex.Server]` 改為 `codex.Single[*codex.GenerationOwner]`；`RestartCodexServerRecorded` 改走 `RunOwnedHandshake`；**遷完才刪** `codex.RunHandshakeProbe` 舊入口與其 probe-scoped 測試（語意由 owner 版測試接手）。
+- **鎖層次（凍結）**：`RunOwnedHandshake` **內部自己持有 `WithExclusiveEpoch`**，App 呼叫端**不得**再包一層 `a.codexSingle.WithExclusive(...)`——巢狀會直接死鎖（`single.go:54-56` 同一把 mutex）。§3.4.7「全段在單一互斥交易內完成」指的就是 `RunOwnedHandshake` 這一層，不是要呼叫端另外加鎖。
 - `a.codexConn` 的取得改為 `owner.Server`；既有 interrupt／fake-wire 路徑同步。
 
 - [ ] **Step 1: 失敗測試**
@@ -2604,23 +2661,49 @@ func TestStuckClaudeSessionsShareSingleBoundedWindow(t *testing.T) {
 	}
 }
 
-// (3) Codex：全部 session host 收乾之後，才 terminate／wait 共用 app-server
+// (3) Codex：全部 session host 收乾之後，才 terminate／wait 共用 app-server。
+//     hookTeardownDone 由 4 個並行 teardown goroutine 呼叫，hookShutdownStep 由
+//     shutdown 主 goroutine 呼叫——順序紀錄必須加鎖，否則 -race 必報 data race。
 func TestCodexSharedServerTerminatedAfterAllHostsDrained(t *testing.T) {
 	a := newTestAppWithFakeWire(t)
 	seedSessions(t, a, 0, 4)
+	var mu sync.Mutex
 	var order []string
-	a.hookTeardownDone = func(w appcore.WSID) { order = append(order, "host_done:"+string(w)) }
+	record := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+
+	hosts := make(chan appcore.WSID, 4)
+	a.hookTeardownDone = func(w appcore.WSID) {
+		hosts <- w
+		record("host_done:" + string(w))
+	}
 	a.hookShutdownStep = func(s string) {
 		if s == "server_terminate_wait" || s == "wirelog_finalize" {
-			order = append(order, s)
+			record(s)
 		}
 	}
 	a.shutdown(context.Background())
-	idx := indexOf(order, "server_terminate_wait")
-	if idx < 4 {
+
+	close(hosts)
+	seen := map[appcore.WSID]bool{}
+	for w := range hosts {
+		seen[w] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("4 個 Codex host 都必須收乾：%d", len(seen))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	termIdx := indexOf(order, "server_terminate_wait")
+	if termIdx < 4 {
 		t.Fatalf("共用 app-server 必須在 4 個 host 全部收乾後才 terminate：%v", order)
 	}
-	if indexOf(order, "wirelog_finalize") < idx {
+	for k := 0; k < termIdx; k++ {
+		if !strings.HasPrefix(order[k], "host_done:") {
+			t.Fatalf("terminate 之前只該有 host_done：%v", order)
+		}
+	}
+	if wireIdx := indexOf(order, "wirelog_finalize"); wireIdx < termIdx {
 		t.Fatalf("wire log 必須在 terminate／wait 之後 finalize（§3.4.2）：%v", order)
 	}
 }
@@ -3076,7 +3159,15 @@ npm --prefix frontend run test && npm --prefix frontend run build && wails build
 
 ---
 
-## Self-Review 記錄（v4）
+## Self-Review 記錄（v5）
+
+**v4 → v5 修正（兩項 P1＋一項補述）**
+
+| # | 問題 | 修正 |
+|---|---|---|
+| P1-1 | epoch 在解鎖後才取得，有 TOCTOU——期間若已有第二次 replacement，第一個 watcher 會拿到第二個 owner 的 epoch，之後錯誤取走新 generation | 新增純 additive 的 `Single.WithExclusiveEpoch(fn) (uint64, error)`，**在同一把鎖內發布並回傳該次 epoch**；`RunOwnedHandshake` 改用它，並明寫「絕不可解鎖後再呼叫 `Epoch()`」；新增 `TestWatcherEpochCapturedUnderLock` barrier（第一個 owner 發布後、watcher 註冊前停住 → 第二次 replacement 完成 → 放行，斷言舊 watcher 不得清掉新 owner、新 generation 未被 finalize） |
+| P1-2 | `TestCodexSharedServerTerminatedAfterAllHostsDrained` 的 `order` 被 4 個並行 teardown goroutine 與 shutdown 主 goroutine 同時 append，`-race -count=30` 必報 data race | 順序紀錄改為 mutex 保護的 `record()`；host 完成另以 buffered channel 收集並斷言 4 個相異 WSID；保留「terminate 之前只該有 host_done」與「wirelog_finalize 在 terminate 之後」兩條斷言 |
+| 補述 | 實作者可能誤讀「全段在單一互斥交易內」而在 App 端再包一層 `WithExclusive` | Task 13 新增「鎖層次（凍結）」：`RunOwnedHandshake` 內部自持 `WithExclusiveEpoch`，呼叫端不得再加鎖（`single.go:54-56` 同一把 mutex，巢狀即死鎖） |
 
 **v3 → v4 修正（四項 P1＋兩項小修）**
 
