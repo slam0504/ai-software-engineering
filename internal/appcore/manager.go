@@ -809,7 +809,9 @@ func (m *Manager) emitStateLocked(sl *slot, provider contract.Provider, sessionI
 
 func (m *Manager) writeAndEmitLocked(env contract.Envelope) {
 	// closed 已在所有公開入口最先攔截；emitLocked 不可能於 closed 後執行。
-	sinkErr := m.cfg.Sink.Write(env)
+	// receipt 本 task（Task 14）先接住、暫不使用——replay index 接線見 Task 20。
+	receipt, sinkErr := m.cfg.Sink.Write(env)
+	_ = receipt
 	m.cfg.Emit(env) // 原 envelope 先出（ID 較小），合成事件後出——輸出序嚴格遞增
 	if sinkErr != nil {
 		if m.auditErr == nil {

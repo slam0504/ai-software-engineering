@@ -249,8 +249,10 @@ func (c *captureEnvs) add(env contract.Envelope) { c.envs = append(c.envs, env) 
 
 type nullSink struct{}
 
-func (nullSink) Write(contract.Envelope) error { return nil }
-func (nullSink) Close() error                  { return nil }
+func (nullSink) Write(contract.Envelope) (appcore.AppendReceipt, error) {
+	return appcore.AppendReceipt{}, nil
+}
+func (nullSink) Close() error { return nil }
 
 // ---- PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot）測試 ----
 

@@ -840,8 +840,10 @@ func (a *App) startupEvidence() {
 // Manager 會 latch 並以 stream_error fail loud（不無聲丟稽核）。
 type failedSink struct{ reason error }
 
-func (s failedSink) Write(contract.Envelope) error { return s.reason }
-func (s failedSink) Close() error                  { return nil }
+func (s failedSink) Write(contract.Envelope) (appcore.AppendReceipt, error) {
+	return appcore.AppendReceipt{}, s.reason
+}
+func (s failedSink) Close() error { return nil }
 
 // ReadDiagram 回傳目前圖檔內容（Mermaid pane 初始載入）。
 func (a *App) ReadDiagram() (string, error) {

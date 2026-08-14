@@ -18,14 +18,14 @@ type memSink struct {
 	fail error
 }
 
-func (s *memSink) Write(e contract.Envelope) error {
+func (s *memSink) Write(e contract.Envelope) (AppendReceipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
-		return s.fail
+		return AppendReceipt{}, s.fail
 	}
 	s.rows = append(s.rows, e)
-	return nil
+	return AppendReceipt{EventID: e.EventID}, nil
 }
 func (s *memSink) Close() error { return nil }
 
