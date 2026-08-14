@@ -56,6 +56,11 @@ func TestMigratePersistFailureFailsLoud(t *testing.T) {
 	}
 }
 
+// TestRemovedLegacyIsNotRemigrated 名稱講的是「防重遷」，但實際機制純粹靠
+// Migrated() marker——Remove 完全不碰 s.file.Migrated，也沒有獨立的
+// 「檢查該 provider 是否已被 tombstone」分支。這個測試真正守的是「Remove
+// 不會意外重置 marker」；marker 在第一次 Migrate 成功時已經寫入，第二次
+// Migrate 靠它 early return，與 tombstone 本身無關。
 func TestRemovedLegacyIsNotRemigrated(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "ws.json")
 	legacy := map[string]LegacyEntry{"claude": {TaskID: "t"}}
@@ -65,5 +70,67 @@ func TestRemovedLegacyIsNotRemigrated(t *testing.T) {
 	s2, _ := Open(p)
 	if again, _ := Migrate(s2, legacy, func() string { return "w2" }); len(again) != 0 {
 		t.Fatalf("legacy 移除後不得再次遷入（§3.6.1）：%+v", again)
+	}
+}
+
+// TestMigrateRefusesWhenLiveEntriesExistWithoutMarker：第二層防禦
+// （coordinator #1 裁決）。理論上 Migrated()==false 時 s.file.Entries 必為
+// 空，但 workspace-sessions.json 可被手動編輯、或載入順序被破壞而先塞入
+// entries；此時若仍放行 MarkMigrated，整批取代語意會把既有 entries 無聲
+// 蒸發且回傳 nil error。Migrate 必須偵測到這個狀態並直接拒絕。
+func TestMigrateRefusesWhenLiveEntriesExistWithoutMarker(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ws.json")
+	s, _ := Open(p)
+	if err := s.Put(Entry{WSID: "existing-1", Provider: "claude", CreatedAt: "2026-08-14T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(Entry{WSID: "existing-2", Provider: "codex", CreatedAt: "2026-08-14T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := map[string]LegacyEntry{"claude": {TaskID: "t"}}
+	out, err := Migrate(s, legacy, func() string { return "w1" })
+	if err == nil {
+		t.Fatalf("registry 已有 live entries 但 marker 未設時必須拒絕遷移，卻回傳 out=%+v", out)
+	}
+	if out != nil {
+		t.Fatalf("拒絕路徑不得回傳任何 entries：%+v", out)
+	}
+
+	live := s.Live()
+	if len(live) != 2 {
+		t.Fatalf("既有 entries 不得被清空：%+v", live)
+	}
+	if s.Migrated() {
+		t.Fatal("拒絕路徑不得標記 migrated")
+	}
+}
+
+// TestMigrateDeterministicOrderAcrossProviders：兩個 provider 都非空時，
+// 走訪順序與 WSID 指派必須是決定性的（claude 先於 codex），不能依賴 map
+// 迭代順序。brief 的三個測試都只有一個 provider 非空，沒有覆蓋到這個情境。
+func TestMigrateDeterministicOrderAcrossProviders(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ws.json")
+	legacy := map[string]LegacyEntry{
+		"claude": {TaskID: "task-claude"},
+		"codex":  {TaskID: "task-codex"},
+	}
+	ids := []string{"w-a", "w-b"}
+	i := 0
+	gen := func() string { id := ids[i]; i++; return id }
+
+	s, _ := Open(p)
+	out, err := Migrate(s, legacy, gen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("兩個 provider 皆非空，應各建一筆：%+v", out)
+	}
+	if out[0].Provider != "claude" || out[0].WSID != "w-a" {
+		t.Fatalf("第一筆必須是 claude／w-a（決定性順序）：%+v", out[0])
+	}
+	if out[1].Provider != "codex" || out[1].WSID != "w-b" {
+		t.Fatalf("第二筆必須是 codex／w-b（決定性順序）：%+v", out[1])
 	}
 }

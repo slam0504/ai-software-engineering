@@ -1,6 +1,9 @@
 package wsregistry
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // LegacyEntry：M3a 時代 restore.json 的 per-provider 一筆記錄，轉換後餵給
 // Migrate。轉換（讀 restore.json → map[string]LegacyEntry）由呼叫端負責
@@ -22,9 +25,16 @@ var providerMigrationOrder = []string{"claude", "codex"}
 // 枚 WSID——這也是「不存在『registry 已有 entries 卻呼叫 MarkMigrated』路
 // 徑」的保證所在：MarkMigrated 只會在本函式唯一一處呼叫點被呼叫到，而該
 // 呼叫點前面就是這個 !s.Migrated() early return，所以只要 s 尚未標記
-// migrated，s.file.Entries 必然還是「舊格式遷移前」的狀態（Open 剛讀完、
-// 或全新檔案），不會有其他呼叫端已經塞入 entries 卻還沒標記 migrated 的
-// 中間狀態；MarkMigrated 整批取代也就不會清掉任何既有資料。
+// migrated，s.file.Entries 理論上必然還是「舊格式遷移前」的狀態（Open 剛
+// 讀完、或全新檔案）。
+//
+// 第二層防禦：上一段的「理論上」不是唯一防線
+// ——workspace-sessions.json 是使用者可手動編輯的檔案，若有人手動把
+// migrated 改回 false（或載入順序被破壞、在 Migrate 之前先呼叫了
+// Put），s.file.Entries 就會在 Migrated()==false 時已經有真實 session。
+// 這種情況下 MarkMigrated 的整批取代語意會把既有 entries 無聲蒸發、且回傳
+// nil error，呼叫端會誤判成功。所以在建立任何新 entry 之前，先檢查
+// s.Live() 是否非空；非空就直接拒絕整個遷移，不呼叫 MarkMigrated。
 //
 // 只遷移有內容的 entry：ResumeSessionID／TaskID／ViewStartEventID 三者皆空
 // 的 provider 不建立、不佔名額。沿用舊 entry 的 ViewStartEventID，只遷 view
@@ -35,6 +45,9 @@ var providerMigrationOrder = []string{"claude", "codex"}
 func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]Entry, error) {
 	if s.Migrated() {
 		return nil, nil
+	}
+	if live := s.Live(); len(live) > 0 {
+		return nil, fmt.Errorf("wsregistry: refusing to migrate: registry has %d live entries but migration marker is unset (manual edit or load-order bug)", len(live))
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
