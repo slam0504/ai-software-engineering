@@ -31,6 +31,7 @@ type fakeCodexServer struct {
 	closeWire func()
 	steps     func(string)
 	hsErr     error
+	stopErr   error // 非 nil：StopRecording 回這個錯（舊 owner 收尾失敗）
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -42,7 +43,12 @@ func (s *fakeCodexServer) BeginRecording(sink func([]byte) error) error {
 	s.steps("attach")
 	return s.conn.BeginRecording(sink)
 }
-func (s *fakeCodexServer) StopRecording() error { return s.conn.StopRecording() }
+func (s *fakeCodexServer) StopRecording() error {
+	if err := s.conn.StopRecording(); err != nil {
+		return err
+	}
+	return s.stopErr
+}
 func (s *fakeCodexServer) Handshake(context.Context, codex.ClientInfo) error {
 	s.steps("handshake")
 	return s.hsErr
@@ -479,9 +485,8 @@ func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
 	if !auditHas(t, a.stateDir, "codex_record_label") {
 		t.Fatal("label 必須留在 audit（可觀察性）")
 	}
-	h := a.hostFor(w)
-	if h == nil || h.recordLabel != "codex-label" {
-		t.Fatalf("label 必須留在 host：%+v", h)
+	if a.hostFor(w) == nil {
+		t.Fatal("session 必須已發布")
 	}
 	// 收尾同樣不得摘掉 connection-wide sink（舊版 lease.Finalize 會 StopRecording）
 	if err := a.EndSession("codex"); err != nil {
@@ -489,5 +494,66 @@ func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
 	}
 	if err := conn.BeginRecording(func([]byte) error { return nil }); err == nil {
 		t.Fatal("session 收尾不得 detach connection-wide 錄流")
+	}
+}
+
+// Critical（Task 13 review）：新 server 在「發布」與 replaceCodexGeneration 讀
+// Single.Current() 之間就死亡時，它自己的 watcher 會搶先 CompareAndTakeEpoch 取
+// 走 owner，於是 RunOwnedHandshake 回 nil 但 Current() 回 ok=false。少了守衛就會
+// 對 nil owner 取 o.Generation → panic，整個 Wails 行程掛掉。
+func TestPublishedOwnerDyingBeforeReadFailsLoudly(t *testing.T) {
+	a, _, _ := newTestAppWithFakeWire(t)
+	a.latchWireRecorder(errors.New("disk full"))
+	// barrier：模擬 watcher 在這個窗口內取走已死的 owner（CompareAndTakeEpoch 與
+	// Take 對 Single 的效果相同——都是清空 ownership）
+	a.hookAfterCodexPublish = func() {
+		if o, ok := a.codexSingle.Take(); ok {
+			_ = o.FinalizeWith(errors.New("app-server exited"))
+		}
+	}
+	err := a.RecoverCodexRecording() // 不得 panic
+	if !errors.Is(err, errCodexNotRunning) {
+		t.Fatalf("發布後立即死亡必須 fail loud：%v", err)
+	}
+	if !a.wireLatched() {
+		t.Fatal("沒有活著的 generation，latch 必須保留")
+	}
+	if _, ok := a.codexSingle.Current(); ok {
+		t.Fatal("不得留下 owner")
+	}
+}
+
+// Important-2（Task 13 review）：RunOwnedHandshake 的契約是「err != nil 不代表
+// 沒有發布」——新 server handshake 成功、舊 owner 收尾失敗就是這個組合。此時
+// 監控對象必須換成新 generation，否則 checkWireRecorder 從此輪詢一個已 Finalize
+// 的 handle，新 generation 的寫入失敗永遠不會 latch（靜默降級）。
+func TestPublishedWithOldOwnerFailureStillRetargetsWireGen(t *testing.T) {
+	a, _, ctl := newTestAppWithFakeWire(t)
+	if _, err := a.ensureAppServer(); err != nil {
+		t.Fatal(err)
+	}
+	oldOwner, _ := a.codexSingle.Current()
+	a.latchWireRecorder(errors.New("disk full"))
+	ctl.last().stopErr = errors.New("detach failed") // 舊 owner 收尾失敗
+
+	err := a.RecoverCodexRecording()
+	if err == nil || !strings.Contains(err.Error(), "detach failed") {
+		t.Fatalf("舊 owner 收尾失敗必須往上回：%v", err)
+	}
+	o, ok := a.codexSingle.Current()
+	if !ok {
+		t.Fatal("precondition: 新 server 必須已發布（handshake 成功）")
+	}
+	a.wireMu.Lock()
+	gen := a.wireGen
+	a.wireMu.Unlock()
+	if gen == oldOwner.Generation {
+		t.Fatal("監控對象仍指著已 finalize 的舊 generation：新 generation 的寫入失敗將永遠不會 latch")
+	}
+	if gen != o.Generation {
+		t.Fatalf("監控對象必須是已發布的新 generation：%v", gen)
+	}
+	if !a.wireLatched() {
+		t.Fatal("err != nil：latch 必須保留（不是「全部成功」）")
 	}
 }

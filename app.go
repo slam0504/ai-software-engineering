@@ -128,6 +128,13 @@ type App struct {
 	// 順序是凍結契約）。production 恆為 nil。
 	hookWireStep func(step string)
 
+	// hookAfterCodexPublish：測試注入——RunOwnedHandshake 已返回、
+	// replaceCodexGeneration 讀 Single.Current() 之前的 barrier。用來確定性地
+	// 重現「新 server 在發布之後、被讀取之前就死亡」——那個窗口內 owner 自己的
+	// watcher 會以 CompareAndTakeEpoch 搶先取走它，Current() 因此回 ok=false 而
+	// RunOwnedHandshake 卻回 nil。production 恆為 nil。
+	hookAfterCodexPublish func()
+
 	// sessionHosts（M3b Phase 2，§3.3）：per-WSID 的單例 ownership registry。
 	// Task 8 遷入 Claude 側（broker／sess／sessionID／pumpDone／lease／teardownFn），
 	// Task 9 遷入 Codex 側（runner／track／lease／threadID）——App 上已無任何
@@ -4849,19 +4856,35 @@ func (a *App) latchWireRecorder(err error) {
 		"component": "codex_wire_log", "wireLogId": id, "error": err.Error()})
 }
 
+// noteWireGeneration 把錄流監控對象換成新 generation。
+//
+// **只要 owner 有發布就必須更新，與 RunOwnedHandshake 是否回錯無關**：它的契約
+// 明寫「err != nil 不代表沒有發布」——新 server handshake 成功、舊 owner 收尾失敗
+// （drain 逾時、detach 或 meta 寫入失敗）就是這個組合。那時新 server 已經在服務，
+// 若 wireGen 還指著舊的、已 Finalize 的 handle，checkWireRecorder 會永遠輪詢一個
+// 死掉的 generation ⇒ 新 generation 的寫入失敗永遠不會 latch、不會通知，正是本
+// task 要防的靜默降級。清 latch（clearWireLatch）才是「全部成功」才做的事，兩者
+// 刻意分開。
+func (a *App) noteWireGeneration(gen *wirelog.Generation) {
+	a.wireMu.Lock()
+	a.wireGen = gen
+	a.wireMu.Unlock()
+}
+
 // clearWireLatch 在新 generation 的 recorder 掛載、handshake 與發布全部成功之後
 // 解除 latch——這是 §3.4.6 凍結的**唯一**解除條件（不因時間或重試次數自動解除）。
-func (a *App) clearWireLatch(gen *wirelog.Generation) {
+// 監控對象的切換由 noteWireGeneration 負責（見其 doc：兩者的條件不同）。
+func (a *App) clearWireLatch() {
 	a.wireMu.Lock()
 	was := a.wireErr
-	a.wireErr, a.wireGen = nil, gen
+	a.wireErr = nil
+	id := ""
+	if a.wireGen != nil {
+		id = a.wireGen.ID()
+	}
 	a.wireMu.Unlock()
 	if was == nil {
 		return
-	}
-	id := ""
-	if gen != nil {
-		id = gen.ID()
 	}
 	a.audit("codex_wire_log_recovered", map[string]any{"wireLogId": id, "previousError": was.Error()})
 	a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
@@ -4872,9 +4895,14 @@ func (a *App) clearWireLatch(gen *wirelog.Generation) {
 //
 // 為什麼要輪詢：錄流 sink 掛在 codex.Conn 內部，寫入錯誤只 latch 進
 // wirelog.Generation.writeErr（Conn.record 看到 sink 回錯只記進 recErr，不通知
-// 任何人），沒有推播管道。故 App 在兩個決策點取用：每一筆入站 frame 之後
-// （wireCodexConn 的 handler）與新 Codex session 的建立閘門。c2s 寫入失敗因此
-// 最遲在下一筆入站 frame 或下一次建立 session 時被看見。
+// 任何人），沒有推播管道。
+//
+// **取用點（精確覆蓋面）**：只有 wireCodexConn 安裝的 OnNotification 與
+// OnUnknown 兩條 handler，以及新 Codex session 的建立閘門（codexWireGate）。
+// **不含** client Call 的 response frame（readLoop 直接送進 pending map）、
+// 也不含 OnServerRequest 的 approval 請求——那兩條路徑同樣會經 Conn.record 寫
+// 錄流，但錯誤要等下一筆 notification／unknown frame 或下一次建立 session 才會
+// 被看見。c2s 寫入失敗同理。這是有界的延遲，不是遺漏：latch 本身不會被清掉。
 func (a *App) checkWireRecorder() {
 	a.wireMu.Lock()
 	gen := a.wireGen
@@ -4957,20 +4985,43 @@ func (a *App) replaceCodexGeneration() error {
 	defer cancel()
 	err := codex.RunOwnedHandshake(hctx, &a.codexSingle, newGen, start, clientInfo(),
 		a.onCodexGenerationFinalized)
+	if h := a.hookAfterCodexPublish; h != nil { // 測試 barrier：見該欄位 doc
+		h()
+	}
 	o, published := a.codexSingle.Current()
 	if published {
 		a.wireCodexConn(o.Server.Conn()) // 發布成功即接上 handlers
+		a.noteWireGeneration(o.Generation)
 	}
 	if err != nil {
 		return err // §3.4.6：任一步失敗即 dispose 新 server 並保留 latch
 	}
-	a.clearWireLatch(o.Generation)
+	if !published {
+		// err == nil 但 Single 已空：新 server 在「發布」與這裡的 Current() 之間
+		// 就死了，它自己的 watcher（RunOwnedHandshake 返回後立即啟動）以
+		// CompareAndTakeEpoch 搶先取走並 finalize 了那份 generation。此時既沒有
+		// 可用的 server 也沒有活著的錄流，**不得清 latch**（清了等於宣告錄流已
+		// 復原，但下一次 ensureAppServer 才會重建）；fail loud 讓呼叫端知道這輪
+		// 沒有成功。不加這個守衛就會對 nil owner 取 o.Generation → panic。
+		return errCodexNotRunning
+	}
+	a.clearWireLatch()
 	return nil
 }
 
 // refuseIfCodexLive：受控 replacement／復原的拒絕條件（§3.4.7）——存在 live
 // Codex host 或 in-flight turn 一律拒絕，只有 dormant session 不阻擋。
 // in-flight turn 先判：它是兩者中較嚴重、訊息也較精確的那一個。
+//
+// **已知 TOCTOU 窗口（Task 13 review Important-3，帶進 Phase 5）**：本檢查讀的是
+// hostsOf（a.mu 下的快照），但 startCodex 只在 ensureAppServer 期間持
+// codexServerMu，`startCodexHost`（EnsureThread → publishCodexHost）整段跑在鎖外。
+// 因此「正在建立中、尚未 publish 的 codex host」看不到：replacement 可能在該窗口
+// 內放行並 terminate 舊 server，讓那筆 EnsureThread 對已死連線失敗。失敗是**可見
+// 的**（session 起不來、回錯），不是靜默漏錄；且 latch 情境下新 session 已被
+// codexWireGate 擋住，故 RecoverCodexRecording 大致不受影響，暴露面是 B1 的
+// RestartCodexServerRecorded。相對於改動前（完全沒有拒絕條件、直接換掉 server）
+// 仍是淨改善。收法留給 Phase 5：把 host 建立一併納入 codexServerMu。
 func (a *App) refuseIfCodexLive() error {
 	hosts := a.hostsOf(contract.ProviderCodex)
 	for _, h := range hosts {
@@ -5403,10 +5454,13 @@ func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPol
 // recorder。一條 codex.Conn 只容許一個 sink，而該 sink 已經是 §3.4.1 的
 // connection-wide always-on wire log（由 GenerationOwner 在 handshake 之前掛上、
 // 錄到 server 生命終點）；session 若再 attach 一次只會拿到「recording already in
-// progress」，整個 session 起不來。recordCase 因此降為 **label**：進 audit 與
-// sessionHost.recordLabel 供觀測，不控制 recorder attach。W6 的「codex resume 以
-// JSON-RPC 錄流佐證」由 wire log 承載（覆蓋面更大：不再只有帶 recordCase 的
-// session 才錄）；session 級的 []WireSegmentRef 聚合是後續 task 的工作。
+// progress」，整個 session 起不來。recordCase 因此降為 **label**：只進 audit 供
+// 觀測，不控制 recorder attach（刻意不存進 sessionHost——production 沒有讀者，
+// 等 []WireSegmentRef 接線時再加，不預留用不到的欄位）。W6 的「codex resume 以
+// JSON-RPC 錄流佐證」改由 wire log 承載——**錨點也換了人守**：舊版是這裡的
+// attach 鎖住「送 resume 之前就開錄」，新版由 RunOwnedHandshake 的
+// gen_id → start → attach → handshake 順序負責（見 owner_test.go 與
+// app_wirelog_latch_test.go 的順序測試）。
 func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
 	conn := host.Conn()
 	if approvalPolicy == "" { // M0 驗證定位沿用：commandExecution 一律 requestApproval
@@ -5444,7 +5498,7 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 	}
 
 	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1,
-		runner: runner, threadID: threadID, recordLabel: recordCase}
+		runner: runner, threadID: threadID}
 	a.publishCodexHost(h) // 發布：首輪事件的 handler ownership（host ＋ threadId 路由）
 	endPending()          // host 已可經 threadId 命中：pending 窗口到此為止
 
@@ -5490,17 +5544,12 @@ func (a *App) codexTeardown(h *sessionHost) error {
 	}
 	a.takeHost(h)
 	a.forgetCodexHostRouting(h)
-	var err error
-	if h.lease != nil {
-		err = h.lease.Finalize(ports.Exit{Exited: false}) // 冪等：重複 teardown 不會重複收尾
-	}
 	h.track.NoteEnded()
-	var recErrText string
-	if err != nil {
-		recErrText = err.Error()
-	}
-	a.emitCodexSessionDone(recErrText)
-	return err
+	// §3.4.4 之後 codex 已無 session-scoped 錄流可 finalize（lease 只由
+	// startClaude 寫入），這裡因此沒有 recorder 錯誤可回報。簽名保留 error 是
+	// EndSessionFlow 的 teardown 契約要求。
+	a.emitCodexSessionDone("")
+	return nil
 }
 
 // emitCodexSessionDone：codex 收尾的 UI 事件（長駐 server 不隨 session 退出，

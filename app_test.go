@@ -552,7 +552,11 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 		t.Fatal("forced shutdown must interrupt the active codex turn")
 	}
 	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "claude-fsd.meta.json")); err != nil {
-		t.Fatalf("claude lease not finalized: %v", err) // codex 側無 session 錄流（§3.4.4）
+		t.Fatalf("claude lease not finalized: %v", err)
+	}
+	// codex 側自 §3.4.4 起沒有 session-scoped 錄流（recordCase 只剩 label）
+	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-fsd.meta.json")); !os.IsNotExist(err) {
+		t.Fatalf("codex recordCase 應只是 label，不得產生 session 錄流：%v", err)
 	}
 	if len(ui.find("session:done")) < 2 { // 兩邊 session:done 都發出
 		t.Fatalf("session:done count = %d, want >= 2", len(ui.find("session:done")))
