@@ -14,9 +14,10 @@
 
 **結論：GO**（(a)(b)(c) 三項在 natural／forced 兩次真實執行中全部成立，driver 自動判定亦回 `GATE GO`）。
 
-> **本文件為 rev2**：Task review 指出 rev1 的 (a) 自動指標是恆真式（無法區分並行與串行化）等
-> 5 項品質問題，driver 已修正並**重跑全部 live run**；以下數據皆為修正後重跑的結果。
-> rev1 的判定結論未被推翻。修正細節見文末「rev1 → rev2 修正」。
+> **本文件為 rev3**：rev2 修掉 Task review 的 5 項品質問題（(a) 自動指標恆真等）並重跑全部
+> live run；rev3 為 re-review 的機械性收尾（wire log 檔名帶 run id、修正一句過度宣稱、
+> 移除 unused 參數），**不含 live run、不改判定**。
+> 修正細節見文末「rev1 → rev2 修正」與「rev2 → rev3 修正」。
 
 ---
 
@@ -85,7 +86,8 @@ Driver：`cmd/probe-codex-parallel/main.go`。全程走 production API——
 - wire log 寫在 `os.TempDir()`（不在 probe cwd 的 `tmp` 內）——`tmp` 於離開時整個刪除，證據必須留存。
   每行 `{"seq":N,"ts":"<RFC3339Nano>","dir":"c2s|s2c","frame":<原始 frame 逐字>}`；`seq` 配發與
   寫檔在同一把鎖內（read loop 與並行段的 c2s goroutine 會同時寫入同一個證據檔）。
-  檔名依 mode 命名，**同 mode 重跑會覆蓋**。
+  檔名為 `probe-codex-parallel-<mode>-<run id>.jsonl`（run id = 啟動時刻 UTC），
+  **同 mode 重跑不會覆蓋前一次的證據**；實際路徑於啟動時印在 `RUN` 那一行。
 - `-force` 分支在送出兩個 `turn/start` 後 **`time.Sleep(2s)` 再 `Terminate()`**——否則 SIGTERM 可能
   早於 turn 真正上 wire，測不到「turn 進行中強制終止」。
 - 任何退出路徑（成功／執行失敗／NO-GO）都走同一份 cleanup：`Terminate → Wait → StopRecording`
@@ -102,6 +104,12 @@ go run ./cmd/probe-codex-parallel -codex-bin "$CODEX_BIN" -long-output  # 補充
 ---
 
 ## Step 3：Run 1 — natural 收尾（凍結主 run，14:39:45）
+
+> **證據狀態（必讀）**：本次 natural 主 run 的**原始 wire log 已被後續一次 usage-limit
+> 重跑覆蓋、不可復原**（當時檔名固定為 `probe-codex-parallel-natural.jsonl`，未帶 run id；
+> 該缺陷已修，見文末 rev2→rev3）。本節判定依據為**當次執行輸出的文件節錄**，
+> 加上 re-reviewer 以下列 seq 值代入最終判準 `overlapVerdict` 的**獨立重算**（結果同為 `yes`）。
+> (b)(c) 的完整原始 log 保存在 forced 與 natural-long 兩份未被覆蓋的檔案中。
 
 ```
 MODE natural promptA="請只回覆字串 PROBE_A_DONE，不要使用任何工具。" promptB="請只回覆字串 PROBE_B_DONE，不要使用任何工具。"
@@ -367,7 +375,7 @@ thread／turn identity，host 可據以做 per-session 路由；兩種收尾都 
 
 | # | 問題 | 修正 |
 |---|---|---|
-| C1 | (a) 的自動指標 `firstB < lastA && firstA < lastB` 是**恆真式**：`trace` 含 `thread/started` 等 thread 級 frame，A/B 依建立順序必佔最前面，串行化的 server 也會讓兩區間互相包含 | 改為 **turn 生命期重疊**（`turn/started(A) < turn/completed(B)` 且反向亦然），且 trace **只取 `turnId` 非空的 turn-scoped frame**。抽成純函式 `overlapVerdict` 並加上 `TestOverlapVerdict`——其中 `serialized` case 就是舊指標的反例 |
+| C1 | (a) 的自動指標 `firstB < lastA && firstA < lastB` 是**恆真式**：`trace` 含 `thread/started` 等 thread 級 frame，A/B 依建立順序必佔最前面，串行化的 server 也會讓兩區間互相包含 | 改為 **turn 生命期重疊**（`turn/started(A) < turn/completed(B)` 且反向亦然），且 trace **只取 `turnId` 非空的 turn-scoped frame**。抽成純函式 `overlapVerdict` 並加上 `TestOverlapVerdict`：`serialized` 與 `forced-no-completion` 鎖住新判準在串行化／無收尾時分別回 `no`／`inconclusive`；另有 `serialized-with-thread-frames`（trace 含 `TurnID` 空的 thread 級 frame）才是舊恆真式的反例——該 case 舊式回 `true`、新判準回 `no` |
 | I2 | GO 條件沒有被 driver 強制，`approvals=0` 或 identity 全空一樣 exit 0 | 新增 gate：`approvals==0`、approval 缺 `threadId`／`turnId`、`broadcast_fallback=true`、(a) 生命期未重疊（非 force 模式）、錄流錯誤、收尾未 bounded → 印 `GATE NO-GO` 並 **exit 2**；全數通過才印 `GATE GO` |
 | I3 | `fatal()` 用 `os.Exit(1)` 跳過 defer，NO-GO 路徑洩漏孤兒 app-server（獨立 process group）與暫存目錄 | 導入 cleanup registry：所有退出路徑共用 `Terminate → Wait → StopRecording` → 關 wire log → 刪 tmp。**實測**（`-codex-bin /bin/cat` 觸發 handshake 失敗的 fatal）：exit 1、無殘留 tmp、無孤兒行程 |
 | I4 | forced run 的 `SHUTDOWN elapsed=0s` 量的是**第二次** Terminate（no-op），論證鏈接錯指標 | 改量 **自第一次 `Terminate()` 到 `Done` 關閉**（`done_after_first_terminate`）。forced=17ms、natural=18ms；文件論證同步改寫 |
@@ -385,14 +393,28 @@ PROBE EXECUTION FAILED（環境／server 問題，非 GO/NO-GO 判定）
 exit status 1
 ```
 
+## rev2 → rev3 修正（re-review 機械性收尾，無 live run）
+
+| # | 問題 | 修正 |
+|---|---|---|
+| 1 | wire log 檔名只含 mode，**同 mode 重跑直接覆蓋**——natural 主 run 的原始 log 就是這樣被一次 usage-limit 重跑蓋掉、不可復原 | 檔名改為 `probe-codex-parallel-<mode>-<run id>.jsonl`（run id = 啟動時刻 UTC），啟動時印 `RUN mode=… run_id=… wire_log=…`。實測連跑兩次產生兩個不同檔案，未覆蓋。Step 3 已加註證據狀態 |
+| 2 | 「`serialized` case 正是舊恆真式的反例」**不成立**——該 case 每筆都有 `TurnID`，舊式在它上面同樣回 `false` | 改寫 `main_test.go` 註解、報告 §1 的 C1 列與上表 rev1→rev2 的 C1 列為準確說法（「鎖住新判準對串行化情境回 `no`」）；另補 `serialized-with-thread-frames` case（含 `TurnID` 空的 thread 級 frame，A=[0,4]／B=[1,6] 互相包含），舊式回 `true`、新判準回 `no`——這才是真正的反例 |
+| 3 | `report()` 的 `mode` 參數未使用（`unusedparams`） | 加回 `WIRE` 輸出行：`WIRE mode=%s %s frames=%d` |
+
+**未變更**：GO 裁決、(a)(b)(c) 判定、殘留風險清單、凍結參數。本輪不含任何 live run
+（Codex 帳號 usage limit 至 2026-08-20；「driver 進 CI gate 前必須補跑一次 natural」
+已由 coordinator 記為外部待辦）。
+
 ## 驗證紀錄
 
 ```
 ./scripts/check-cli.sh             # codex 0.146.1 sha256=134063e1…f59f1477，OK
 go build ./...                     # OK
 go vet ./...                       # OK
-go test -race ./... -count=1       # 19 個 package 全 ok（含新增的 cmd/probe-codex-parallel）
+go test -race ./... -count=1       # 19 個 package 全 ok（含 cmd/probe-codex-parallel）
+go run … -codex-bin /bin/cat       # cleanup 驗證：exit 1、無殘留 tmp、無孤兒行程、產生獨立 run id 檔名
 ```
 
-Live run（未進 git，本機留存於 `$TMPDIR/probe-codex-parallel-<mode>.jsonl`；同 mode 重跑會覆蓋）：
-natural 142 frames、forced 100 frames、natural-long 最多 380 frames。
+Live run 產物（未進 git，本機留存於 `$TMPDIR/probe-codex-parallel-<mode>[-<run id>].jsonl`）：
+forced 100 frames、natural-long 最多 407 frames 皆完整保存；
+**natural 主 run 142 frames 的原始檔已被覆蓋**（見 Step 3 證據狀態註記）。

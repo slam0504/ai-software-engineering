@@ -185,10 +185,15 @@ func main() {
 	addCleanup(func() { _ = os.RemoveAll(tmp) })
 
 	// wire log 落在 tmp 之外——tmp 於離開時整個刪除，證據必須留存。
-	wirePath := filepath.Join(os.TempDir(), "probe-codex-parallel-"+mode+".jsonl")
+	// 檔名帶 run id（啟動時刻）：同 mode 重跑不得覆蓋前一次的證據——曾因固定檔名
+	// 讓一次失敗重跑蓋掉已引用的主 run log，事後不可復原。
+	runID := time.Now().UTC().Format("20060102T150405Z")
+	wirePath := filepath.Join(os.TempDir(),
+		fmt.Sprintf("probe-codex-parallel-%s-%s.jsonl", mode, runID))
 	wireLog, err := os.Create(wirePath)
 	must(err)
 	addCleanup(func() { _ = wireLog.Close() })
+	fmt.Printf("RUN mode=%s run_id=%s wire_log=%s\n", mode, runID, wirePath)
 
 	p := &probe{waiters: map[string]chan turnEnd{}, wireLog: wireLog}
 
@@ -579,7 +584,7 @@ func (p *probe) report(mode string, res []turnResult, appr turnResult, thA, thB,
 	noIdent := p.noIdent
 	p.mu.Unlock()
 
-	fmt.Printf("WIRE %s frames=%d\n", wirePath, len(frames))
+	fmt.Printf("WIRE mode=%s %s frames=%d\n", mode, wirePath, len(frames))
 
 	for _, r := range append([]turnResult{appr}, res...) {
 		fmt.Printf("TURN label=%s thread=%s turn=%s status=%s dur=%s err=%q note=%q\n",
