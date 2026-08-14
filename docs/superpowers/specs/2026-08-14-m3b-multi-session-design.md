@@ -1,7 +1,7 @@
 # M3b — 多 session 工作區設計
 
 - 日期：2026-08-14
-- 狀態：rev2，待 closure review（rev1 六項設計 P1 已整合；rev2 補齊六項生命週期 P1：CreateSession 三段交易、registry 不持久化 runtime state、Codex wire log lifecycle、replay crash consistency、turn boundary／remove tombstone、shutdown 總序＋P2 四項）
+- 狀態：rev3，待 closure review（rev1 六項設計 P1、rev2 六項生命週期 P1 已整合；rev3 修四項 P1：wire log finalize 順序＋latch 解除、`[]WireSegmentRef` 跨 generation、CommitCreate 失敗補償、Codex spike 失敗裁決；兩項 P2：啟動修復順序、degraded 通知防遞迴）
 - 上游依據：app plan §7（M3 列「多 session 並看」延後項）；M3a 範圍切分時的 M3b 定義（同 provider 多 session、資源上限、事件重放視窗化、session 導覽與生命週期契約）
 - 前置：M3a ✅（`cfa5a20`）＋M3a.1 ✅（`4ac2d78`）
 - 明確不含：閒置回收、pane 比例拖曳／N-pane、task 綁定（M4）、removed session 的 reopen、M3a.1 九張後續票（獨立 triage）、ACP（候選里程碑 §7.1）
@@ -44,6 +44,8 @@ AbortCreate(tok CreateToken) error    // 退回 reservation、釋放名額
 
 App 編排凍結為：`beginAppTxn → Manager.ReserveSession → sessionRegistry.Put ＋ atomic persist → Manager.CommitCreate → endAppTxn`；registry persist 失敗則 `AbortCreate`（slot 退回，fail loud）。shutdown 以 `beginAppTxn` 為柵欄：shutdown 開始後拒絕新 app txn，故不會插入 reservation 與 persist 之間。
 
+**CommitCreate 失敗補償（凍結）**：對有效且未過期的 reservation，`CommitCreate` 為單一 mutex 內的純 in-memory 狀態轉移，**在此窗口不得失敗**（app txn 柵欄已排除 shutdown 插入）。防禦性地，若仍回 error，App 必須**回滾 registry**（移除該 entry＋atomic persist）＋`AbortCreate`，以 `errors.Join` 合併回報——不得留下「registry 已持久化、Manager 無正式 slot、重啟卻復活」的 durable ghost。注入式 Commit 失敗為必測項（§5.1）。
+
 2. **已成功建立（committed）的 workspace session，後續 provider 首次啟動失敗時保留為 dormant**，允許重試或移除；不得自動刪除。
 3. slot 的 `provider` 建立後 **immutable**。
 4. 後續 API（BeginNewSessionSubmit／BeginSubmit／EndSession…）**只收 WSID**，provider 從 slot 取得；未知 WSID 回 `ErrSessionNotFound`——**廢除現行 `slotLocked()` 讀取時隱式建立 slot 的行為**（隱式建立＋上限＝查詢未知 WSID 吃名額，不可保留）。
@@ -57,10 +59,11 @@ App 編排凍結為：`beginAppTxn → Manager.ReserveSession → sessionRegistr
 
 1. **Registry 只保存 durable metadata（凍結白名單）**：`schema_version`（=2）、WSID、provider、resume identity、task label、view boundary、created／removed（tombstone，見 §3.6）、pane pins／focused pane。**starting／active／ending／busy／approval pending 等 runtime state 一律不持久化**——app crash 後這些狀態已失去真實 owner，不可原樣恢復。
 2. **啟動還原**：所有非 removed session 一律以 **dormant** 還原——無 host、無 pending approval。
-3. **Stuck busy 解除**：replay 發現某 WSID 最後一個 turn 未完成時，append 一筆帶 WSID 的 `stream_error`（app restart interrupted turn）＋`state_change=failed` 結束該 turn；下一次送訊息走 resume start。
-4. **Legacy 遷移**（自現行 provider-keyed `restore.json`）：只遷移既有 `viewStartEventID` 之後的 view window（不得把該 provider 全部歷史丟入 legacy session）；沿用該 entry 最新 `resumeSessionID` 與 `taskID`；**只有存在 resume identity、taskID 或 view window 事件時才建立** legacy session，空 entry 不建立、不佔 slot。
-5. Legacy WSID **只產生一次並原子持久化**；registry 帶 `schema_version: 2` 與 **migration marker**——遷移完成後不得再由舊 restore entry 建出第二枚 WSID；重啟不得換新 WSID。migration 持久化失敗時 **fail loud，不啟動 provider**。
-6. Registry 是 **UI／恢復 metadata，不是第二份事件歷史**；事件權威永遠是 events.jsonl。
+3. **Stuck busy 解除**：replay 發現某 WSID 最後一個 turn 未完成時，append 一筆帶 WSID 的 `stream_error`（app restart interrupted turn），由 reducer 追發 `state_change=failed` 結束該 turn；下一次送訊息走 resume start。**修復必須冪等**：該 WSID 末筆已是 app-restart `stream_error`／failed 時不得重複 append（crash 於修復中途、重啟重跑不得疊加）。
+4. **啟動修復順序（凍結）**：載入／遷移 registry → 還原 Manager dormant slots → 驗證或重建 replay index → 偵測 incomplete turns → 經 Manager emit `stream_error`（reducer 追發 failed state）→ **才開放 UI 與 provider 啟動**。crash 後重跑此序列須收斂到相同狀態（§5.3 必測）。
+5. **Legacy 遷移**（自現行 provider-keyed `restore.json`）：只遷移既有 `viewStartEventID` 之後的 view window（不得把該 provider 全部歷史丟入 legacy session）；沿用該 entry 最新 `resumeSessionID` 與 `taskID`；**只有存在 resume identity、taskID 或 view window 事件時才建立** legacy session，空 entry 不建立、不佔 slot。
+6. Legacy WSID **只產生一次並原子持久化**；registry 帶 `schema_version: 2` 與 **migration marker**——遷移完成後不得再由舊 restore entry 建出第二枚 WSID；重啟不得換新 WSID。migration 持久化失敗時 **fail loud，不啟動 provider**。
+7. Registry 是 **UI／恢復 metadata，不是第二份事件歷史**；事件權威永遠是 events.jsonl。
 
 ### 3.3 App ownership registry 化
 
@@ -83,13 +86,14 @@ type sessionHost struct {
 
 現行 `codex.Conn` 僅容許單一 recorder sink（第二次 BeginRecording 回 recording already in progress）——「單 app-server＋多 thread＋每 session lease」不可直接成立。**凍結為 connection-wide 錄流**，lifecycle 全凍結：
 
-1. **每個 production app-server generation 一份 always-on wire log**（transport 層完整原文）：handshake 前即開始、server 死亡或 shutdown 時 finalize；**每次 app-server restart 開新 `wire_log_id`（新 generation）**。不採 recordCase reference count 啟停。
-2. 另建**可重建的 frame index**，key 至少含 **`wire_log_id`＋`direction`＋`requestID`**（direction 不可省——client request 與 server request 的 ID 可能相撞）＋threadID／turnID→WSID 歸屬。
-3. Session 級錄流證據以 **`wire_log_id`＋WSID＋frame range** 的 evidence ref 表達（讀 wire log＋index 投影）；既有 recordCase 轉為該 view 的 **label**，不控制 recorder attach。
-4. **無法歸屬的 frame 仍寫入 wire log、WSID 留空**——不得丟棄。
-5. **Recorder 寫入失敗即時 fail loud**：error latch 後立刻發 workspace 通知並**拒絕新 Codex session**；既有 session 允許 bounded 收尾。
-6. **B1 handshake probe 採最小方案（凍結）**：存在 live Codex host 或 in-flight turn 時**拒絕執行**；只有 dormant session 不阻擋。執行 B1 前 finalize 現有 wire log，probe 後重啟 app-server 開新 generation。不提供臨時 server 選項。
-7. 不採「每 WSID 實體錄流檔」：需重做 Conn 為多 sink＋frame attribution，工程量與風險更大。Claude 維持每 session 實體錄流（每 session 本就獨立子行程）。
+1. **每個 production app-server generation 一份 always-on wire log**（transport 層完整原文）：handshake 前即開始；**每次 app-server restart 開新 `wire_log_id`（新 generation）**。不採 recordCase reference count 啟停。
+2. **Finalize 順序（凍結）**：wire log 錄到 server 生命終點——一律 **terminate → wait／`Conn.Done` → finalize**，關閉期間最後的 frame 不得漏錄；server 意外死亡同樣在 `Conn.Done` 後 finalize。shutdown 總序（§3.6.5）與 B1 同此順序。
+3. 另建**可重建的 frame index**，key 至少含 **`wire_log_id`＋`direction`＋`requestID`**（direction 不可省——client request 與 server request 的 ID 可能相撞）＋threadID／turnID→WSID 歸屬。
+4. Session 級錄流證據為**有序的 `[]WireSegmentRef`**（每段 `{wire_log_id, frame range}`）——同一 WSID 可在 B1、server restart 或 app restart 後跨 generation 延續，單一 wire_log_id 不足以涵蓋（跨兩 generation 且不混入他 session frame 為必測項，§5.2）；既有 recordCase 轉為該 view 的 **label**，不控制 recorder attach。
+5. **無法歸屬的 frame 仍寫入 wire log、WSID 留空**——不得丟棄。
+6. **Recorder 寫入失敗即時 fail loud**：error latch 後立刻發 workspace 通知並**拒絕新 Codex session**；既有 session 允許 bounded 收尾。**latch 只在新 generation 的錄流成功啟動後解除**——不因時間或重試次數自動解除。
+7. **B1 handshake probe 採最小方案（凍結）**：存在 live Codex host 或 in-flight turn 時**拒絕執行**；只有 dormant session 不阻擋。執行 B1 前先 terminate → wait 現有 app-server 再 finalize wire log；probe 後重啟 app-server 開新 generation。不提供臨時 server 選項。
+8. 不採「每 WSID 實體錄流檔」：需重做 Conn 為多 sink＋frame attribution，工程量與風險更大。Claude 維持每 session 實體錄流（每 session 本就獨立子行程）。
 
 ### 3.5 Replay index
 
@@ -105,7 +109,7 @@ type sessionHost struct {
 1. 每 WSID 的 index 只記**完整 turn** 的 audit byte range 與首末 event ID；從檔尾反向讀最近 20 筆；分頁 cursor 用該 index 的 byte offset。
 2. **Offset 來源（凍結）**：audit sink 的 append 回傳 `AppendReceipt{startOffset, endOffset, eventID}`，index 一律以 receipt 為準，不得自行推算 offset。
 3. **Crash consistency（凍結）**：正常路徑先 audit write、再更新 index；audit sink 不為快取強迫逐事件 fsync，故 **crash 後 index 可能落後也可能超前——兩者一律視為不可信快取並修復**（落後：掃 audit suffix 補索引；超前／offset 超界／event ID 不符：依第 6 條處置）。
-4. **Index 失敗不得影響 audit**：不回滾 audit、不讓 provider turn 失敗；改 latch `replay-index degraded` workspace 通知、checkpoint 不前移，待重建。
+4. **Index 失敗不得影響 audit**：不回滾 audit、不讓 provider turn 失敗；改 latch `replay-index degraded` 狀態、checkpoint 不前移，待重建。**防遞迴（凍結）**：先 latch、後通知，**每個 degraded generation 只發一次** workspace 通知；通知事件照常進 audit，但 latch 期間 index writer 已停止寫入（含該通知本身），故通知不會再觸發 index 失敗——解除 latch 以成功重建為準。
 5. checkpoint 以 **atomic rename** 寫入、clean shutdown 時 Sync；啟動時以 audit offset＋末筆 event ID 驗證。checkpoint 保存**每個 WSID 的 `open_turn_start_offset`**——否則 checkpoint 越過未完成 turn 後，result 到達時無法重建該 turn 起點。
 6. **損壞處置分級（凍結）**：index 檔**尾端** corruption → truncate 至最後一筆 valid record 續用；**中段** corruption、offset 超界或 event ID 不符 → quarantine＋全量重建＋復原通知。不可遺失或猜測事件。
 7. Current incomplete turn 從 `open_turn_start_offset` 之後的 audit suffix 直接取得（不入 index）。
@@ -128,8 +132,8 @@ shuttingDown=true（拒新 app txn）
 → 全部 session 先 interrupt／terminate
 → per-session teardown 並行（goroutine＋WaitGroup 收斂；不得逐 session 串行）
 → 全部 Codex session host 收完
-→ finalize Codex wire log
-→ terminate／wait 共用 app-server
+→ terminate／wait 共用 app-server（`Conn.Done`）
+→ finalize Codex wire log（§3.4.2：錄到 server 生命終點，關閉期間最後 frame 不漏）
 → Manager.Close（含 pending audit flush）
 → replay index flush／checkpoint／Close
 → session registry Sync
@@ -153,11 +157,11 @@ shuttingDown=true（拒新 app txn）
 
 ## 5. 測試（production-path barrier 必備清單）
 
-1. 同 provider **5 個並行 ReserveSession，恰 4 個**取得 reservation（`-race`）；Reserve → registry persist failure → AbortCreate 退回名額；Reserve × shutdown barrier（拒新 app txn）。
-2. Codex 兩 thread 的 notification／approval／completed-before-response／錄流 frame 歸屬**不串線**；wire recorder error latch → 拒新 Codex session；app-server generation restart 開新 wire_log_id；B1 在 live host／in-flight turn 時拒絕。
-3. Legacy migration 的 crash／restart 得到**相同 WSID**（原子持久化＋migration marker）；incomplete turn restart → `stream_error`＋failed，不殘留 busy／pending approval。
+1. 同 provider **5 個並行 ReserveSession，恰 4 個**取得 reservation（`-race`）；Reserve → registry persist failure → AbortCreate 退回名額；**注入式 CommitCreate 失敗 → registry 回滾＋AbortCreate、重啟無 durable ghost**；Reserve × shutdown barrier（拒新 app txn）。
+2. Codex 兩 thread 的 notification／approval／completed-before-response／錄流 frame 歸屬**不串線**；wire recorder error latch → 拒新 Codex session、**新 generation 錄流成功啟動才解除**；app-server generation restart 開新 wire_log_id；**同一 WSID 橫跨兩個 generation 的 `[]WireSegmentRef` 完整且不混入他 session frame**；B1 在 live host／in-flight turn 時拒絕。
+3. Legacy migration 的 crash／restart 得到**相同 WSID**（原子持久化＋migration marker）；incomplete turn restart → `stream_error`＋failed，不殘留 busy／pending approval；**啟動修復序列 crash 後重跑冪等**（不重複 append stream_error、收斂到相同狀態）。
 4. Remove × New 同 token 競態；removed tombstone 重啟與 index rebuild **不復活**；shutdown × Start barrier；8 session 含一個卡死 Claude → shutdown 總時間仍為單一 bounded window。
-5. Replay index 三種 crash：落後（補掃）、超前（不可信快取修復）、checkpoint 越過 open turn（`open_turn_start_offset` 重建）；index 尾端 truncate 續用 vs 中段 quarantine 重建。
+5. Replay index 三種 crash：落後（補掃）、超前（不可信快取修復）、checkpoint 越過 open turn（`open_turn_start_offset` 重建）；index 尾端 truncate 續用 vs 中段 quarantine 重建；**degraded latch 每 generation 只通知一次、通知事件不觸發遞迴**。
 6. 雙 pane 已滿時未釘選 session approval 的 transient routing（顯示 → allow/deny/timeout/dismiss/remove/shutdown 各觸發恢復原 pin）。
 7. 另：event_id 檔案級單調在 8 session 並行 turn 下不變量測試；舊 journal（無 WSID）legacy 歸屬 fixture；每 session 單一 in-flight turn 拒絕第二筆。
 
@@ -173,7 +177,7 @@ shuttingDown=true（拒新 app txn）
 ## 7. 風險與待驗證假設
 
 1. Claude 多常駐子行程的實際資源占用（4 個 session 的 RAM/CPU）——驗收時實測記錄，供未來 idle parking 評估。
-2. Codex 單一 app-server 對多 thread 並行 turn 的實際行為（pin 0.146.1 wire 層併發語意）——早期 spike 驗證（implementation plan 列前置 task）。
+2. Codex 單一 app-server 對多 thread 並行 turn 的實際行為（pin 0.146.1 wire 層併發語意）——早期 spike 驗證（implementation plan 列前置 task）。**失敗裁決（凍結）**：此為 M3b 並行能力的架構前提——probe 失敗即 **implementation NO-GO、退回 spec gate 由 owner 重裁**；實作端**不得**自行改成 provider-wide 串行或多 app-server 等替代架構。
 3. Claude per-WSID socket／MCP config 的檔案數與清理（session remove 時一併清）。
 4. 既有 M1.5 恢復測試基線大改（restore v2）——舊測試語意遷移不減。
 5. Audit sink append 介面改為回傳 `AppendReceipt` 屬 M1 核心路徑小幅改動——以既有 audit 測試全綠＋event_id 單調不變量測試護欄。
