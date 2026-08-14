@@ -13,6 +13,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // ---- M3b Task 8：Claude 遷入 sessionHost＋per-WSID socket／MCP ----
@@ -222,18 +223,18 @@ func TestExportedBindingSignatureUnchanged(t *testing.T) {
 	}
 }
 
-// legacyWSIDFor 的三段解析順序（coordinator 2026-08-15 凍結）。
+// legacyWSIDFor 的四段解析順序（coordinator 2026-08-15 凍結；第 3 順位由 Task 9 補入）。
 func TestLegacyWSIDForResolutionOrder(t *testing.T) {
 	a, _ := newTestApp(t)
 	pv := contract.ProviderClaude
 
-	// 3) 無 host、無 CreateSession → legacy slot WSID（且對 ...WS 入口可解析）
+	// 4) 無 host、無 CreateSession、registry 空 → legacy slot WSID（且可解析）
 	legacy := a.legacyWSIDFor(pv)
 	if legacy == "" {
 		t.Fatal("legacy slot WSID 不得為空")
 	}
-	if _, err := a.manager.BeginNewSessionSubmitWS(legacy, "task"); err != nil {
-		t.Fatalf("legacy WSID 必須對 ...WS 入口可解析：%v", err)
+	if _, err := a.manager.BeginNewSessionSubmit(legacy, "task"); err != nil {
+		t.Fatalf("legacy WSID 必須對 WSID 入口可解析：%v", err)
 	}
 
 	// 2) 有 CreateSession 紀錄、尚無 host → 最近一次建立的 WSID
@@ -250,5 +251,62 @@ func TestLegacyWSIDForResolutionOrder(t *testing.T) {
 	}
 	if other == w {
 		t.Fatal("CreateSession 必須產生相異 WSID")
+	}
+}
+
+// 第 3 順位（Task 9）：Task 5／6 把使用者既有的 session 遷進 registry 並還原成
+// dormant，但在這一層加入之前，使用者實際上仍工作在 legacy slot 上——那筆遷移
+// 出來的 entry 從此不反映現實。本測試守住「遷移真的生效」。
+func TestLegacyWSIDForPrefersSoleRestoredRegistryEntry(t *testing.T) {
+	a, _ := newTestApp(t)
+	pv := contract.ProviderCodex
+	reg := &stubRegistry{}
+	a.wsReg = reg
+
+	// registry 有一筆 live entry，且已被啟動修復序列還原成 committed slot
+	restored := appcore.WSID("01RESTOREDWSID000000000001")
+	if err := reg.Put(wsregistry.Entry{WSID: string(restored), Provider: "codex",
+		TaskLabel: "migrated", CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.manager.RestoreDormant(restored, pv); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.legacyWSIDFor(pv); got != restored {
+		t.Fatalf("第 3 順位應回 registry 中唯一的 live entry：want %s got %s", restored, got)
+	}
+
+	// 未被還原成 committed slot 的 entry 不可回傳——否則之後每個 lifecycle 呼叫
+	// 都會拿到 ErrSessionNotFound，比落到 legacy slot 更糟。
+	a2, _ := newTestApp(t)
+	reg2 := &stubRegistry{}
+	a2.wsReg = reg2
+	if err := reg2.Put(wsregistry.Entry{WSID: "01NOTRESTORED0000000000001", Provider: "codex",
+		CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	got := a2.legacyWSIDFor(pv)
+	if got == "01NOTRESTORED0000000000001" {
+		t.Fatal("未還原成 committed slot 的 entry 不得被解析出來")
+	}
+	if _, err := a2.manager.BeginNewSessionSubmit(got, "t"); err != nil {
+		t.Fatalf("fallback 必須是可解析的 WSID：%v", err)
+	}
+
+	// 兩筆以上 live entry → 無從判斷，落到下一順位（legacy slot）
+	a3, _ := newTestApp(t)
+	reg3 := &stubRegistry{}
+	a3.wsReg = reg3
+	for _, id := range []string{"01TWOA0000000000000000001", "01TWOB0000000000000000001"} {
+		if err := reg3.Put(wsregistry.Entry{WSID: id, Provider: "codex",
+			CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a3.manager.RestoreDormant(appcore.WSID(id), pv); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := a3.legacyWSIDFor(pv); got != a3.manager.LegacyWSID(pv) {
+		t.Fatalf("多筆 live entry 時應落到 legacy slot，got %s", got)
 	}
 }

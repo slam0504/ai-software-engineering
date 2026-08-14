@@ -63,7 +63,7 @@ func TestAbortCreateReleasesSlot(t *testing.T) {
 
 func TestUnknownWSIDNeverCreatesSlot(t *testing.T) {
 	m := New(Config{Sink: &memSink{}})
-	if _, err := m.BeginNewSessionSubmitWS("no-such", "t"); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := m.BeginNewSessionSubmit("no-such", "t"); !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("未知 WSID 應 ErrSessionNotFound（廢除隱式建立）：%v", err)
 	}
 	if got := m.SlotCount("claude") + m.SlotCount("codex"); got != 0 {
@@ -88,12 +88,12 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	if err := m.CommitCreate(tok); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.EmitWS(w, contract.Event{Kind: "message", Provider: "claude"}); err != nil {
+	if err := m.Emit(w, contract.Event{Kind: "message", Provider: "claude"}); err != nil {
 		t.Fatal(err)
 	}
 	// result 會讓 reducer 進 done，因而**合成**一筆 state_change——上面那筆 role-less
 	// message 對 reducer 是中性的，只發它就驗不到合成路徑有沒有填 WSID。
-	if err := m.EmitWS(w, contract.Event{Kind: contract.KindResult, Provider: "claude", Raw: []byte("{}")}); err != nil {
+	if err := m.Emit(w, contract.Event{Kind: contract.KindResult, Provider: "claude", Raw: []byte("{}")}); err != nil {
 		t.Fatal(err)
 	}
 	rows := sink.all()
@@ -111,15 +111,24 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	if got := lastOfKind(t, rows, string(contract.KindStateChange)).WorkspaceSessionID; got != string(w) {
 		t.Fatalf("合成的 state_change 也必須填 WSID：%q", got)
 	}
-	if err := m.EmitWS(w, contract.Event{Kind: "message", Provider: "codex"}); !errors.Is(err, ErrProviderMismatch) {
+	if err := m.Emit(w, contract.Event{Kind: "message", Provider: "codex"}); !errors.Is(err, ErrProviderMismatch) {
 		t.Fatalf("provider 不符必須 fail loud：%v", err)
 	}
 }
 
-func TestLegacyProviderEntryStillWorks(t *testing.T) {
+// LegacyWSID 是 Task 9 之後唯一殘留的相容入口（app 層 legacyWSIDFor 的最後順位）：
+// 必須「讀取時隱式建立」出一個對 WSID 入口可解析的 slot，且不吃使用者名額。
+func TestLegacyWSIDResolvesAndCostsNoQuota(t *testing.T) {
 	m := New(Config{Sink: &memSink{}})
-	if _, err := m.BeginNewSessionSubmit("claude", "t"); err != nil {
-		t.Fatalf("舊入口在遷移期間必須可用：%v", err)
+	w := m.LegacyWSID("claude")
+	if w == "" {
+		t.Fatal("legacy slot WSID 不得為空")
+	}
+	if _, err := m.BeginNewSessionSubmit(w, "t"); err != nil {
+		t.Fatalf("legacy WSID 必須對 WSID 入口可解析：%v", err)
+	}
+	if got := m.LegacyWSID("claude"); got != w { // 同 provider 恆為同一個 slot
+		t.Fatalf("LegacyWSID 必須冪等：%s vs %s", got, w)
 	}
 	if got := m.SlotCount("claude"); got != 0 {
 		t.Fatalf("legacy slot 不得佔使用者名額：%d", got)

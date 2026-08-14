@@ -200,8 +200,10 @@ func (h fakeCodexHost) Argv() []string         { return []string{"fake-codex"} }
 func (h fakeCodexHost) StderrSnapshot() string { return "" }
 
 // P1 迴歸：首輪 turn/completed 先於 turn/start response 抵達時，notification
-// handler 必須能透過已發布的 a.runner 命中 earlyEnded latch——不殘留 busy、
-// 第二輪可送；同一空窗中的 approval 也必須帶 thread ID。
+// handler 必須能透過已發布的 sessionHost.runner 命中 earlyEnded latch——不殘留
+// busy、第二輪可送；同一空窗中的 approval 也必須歸屬到該 thread。
+// 走 startCodexHost 直呼；production StartSession 路徑的同一形態見
+// app_codex_dispatch_test.go 的 TestCodexCompletedBeforeResponseOnProductionPath。
 func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 	a, ui := newTestApp(t)
 	conn, wire := newFakeCodexConn(t)
@@ -218,8 +220,10 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 			n := turnSeq.Add(1)
 			turnID := fmt.Sprintf("turn-%d", n)
 			if n == 1 { // 惡意順序：approval 請求與 completed 都先於 response
+				// approval 帶 threadId／turnId（pinned schema 的 required；Task 0
+				// live frame 佐證）——Task 9 之後 approval 一律 identity 路由。
 				wire.send(map[string]any{"id": 990, "method": codex.MethodCmdExecRequestApproval,
-					"params": map[string]any{"itemId": "item-1"}})
+					"params": map[string]any{"threadId": "t1", "turnId": turnID, "itemId": "item-1"}})
 				wire.send(map[string]any{"method": codex.MethodTurnCompleted,
 					"params": map[string]any{"threadId": "t1", "turn": map[string]any{"id": turnID, "status": "completed"}}})
 			}
@@ -234,17 +238,18 @@ func TestCodexFirstTurnCompletedBeforeResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	threadID, alreadyEnded, err := a.startCodexHost(fakeCodexHost{conn}, "hi", "", "", "untrusted")
+	threadID, alreadyEnded, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), fakeCodexHost{conn}, "hi", "", "", "untrusted")
 	if err != nil || threadID != "t1" {
 		t.Fatalf("start: %q %v", threadID, err)
 	}
 	if !alreadyEnded {
 		t.Fatal("completed-before-response must reconcile as alreadyEnded via published runner")
 	}
-	r := a.currentRunner()
-	if r == nil || r.ActiveTurnID() != "" {
-		t.Fatalf("runner must be published and not busy, got %v", r)
+	h := a.hostFor(a.legacyWSIDFor(contract.ProviderCodex))
+	if h == nil || h.runner == nil || h.runner.ActiveTurnID() != "" {
+		t.Fatalf("host／runner must be published and not busy, got %v", h)
 	}
+	r := h.runner
 	if _, _, err := r.StartTurn(context.Background(), "round two"); err != nil { // 第二輪可送
 		t.Fatalf("second turn must start: %v", err)
 	}
@@ -324,14 +329,14 @@ func TestClaudeFastExitDoesNotLeaveDeadActiveSession(t *testing.T) {
 	}
 	waitFor(t, "session:done", func() bool { return len(ui.find("session:done")) > 0 })
 	waitFor(t, "manager idle", func() bool {
-		_, err := a.manager.BeginSubmit(contract.ProviderClaude)
+		_, err := a.manager.BeginSubmit(a.legacyWSIDFor(contract.ProviderClaude))
 		return errors.Is(err, appcore.ErrNoSession)
 	})
-	id, err := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-y") // 下一個 session 可建立
+	id, err := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "task-y") // 下一個 session 可建立
 	if err != nil {
 		t.Fatalf("next session must be startable: %v", err)
 	}
-	_ = a.manager.RejectSubmit(contract.ProviderClaude, id)
+	_ = a.manager.RejectSubmit(a.legacyWSIDFor(contract.ProviderClaude), id)
 }
 
 func TestWorkspaceReadSecurity(t *testing.T) {
@@ -425,7 +430,7 @@ func TestDualSessionsConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	startCodexForTest(t, a, wire, conn, "codex-dual", "task-x")
-	if !a.manager.SessionActive(contract.ProviderClaude) || !a.manager.SessionActive(contract.ProviderCodex) {
+	if !a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) || !a.manager.IsActive(a.legacyWSIDFor(contract.ProviderCodex)) {
 		t.Fatal("both sessions must be active concurrently")
 	}
 
@@ -480,10 +485,10 @@ func TestEndOneProviderLeavesOtherActive(t *testing.T) {
 	if err := a.EndSession("claude"); err != nil {
 		t.Fatal(err)
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) {
 		t.Fatal("claude must be ended")
 	}
-	if !a.manager.SessionActive(contract.ProviderCodex) { // 另一 provider 不受影響
+	if !a.manager.IsActive(a.legacyWSIDFor(contract.ProviderCodex)) { // 另一 provider 不受影響
 		t.Fatal("codex must stay active")
 	}
 	if err := a.EndSession("codex"); err != nil {
@@ -520,8 +525,12 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	if err := a.SendMessage("codex", "long task"); err != nil {
 		t.Fatal(err)
 	}
-	a.track.NoteStarted([]byte(`{"threadId":"t1","turn":{"id":"turn-busy"}}`))
-	if a.currentRunner().ActiveTurnID() == "" {
+	codexHost := a.hostFor(a.legacyWSIDFor(contract.ProviderCodex))
+	if codexHost == nil {
+		t.Fatal("precondition: codex session host must be published")
+	}
+	codexHost.track.NoteStarted([]byte(`{"threadId":"t1","turn":{"id":"turn-busy"}}`))
+	if codexHost.runner.ActiveTurnID() == "" {
 		t.Fatal("precondition: codex turn must be active")
 	}
 
@@ -546,7 +555,7 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	if len(ui.find("session:done")) < 2 { // 兩邊 session:done 都發出
 		t.Fatalf("session:done count = %d, want >= 2", len(ui.find("session:done")))
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) || a.manager.IsActive(a.legacyWSIDFor(contract.ProviderCodex)) {
 		t.Fatal("both sessions must be ended")
 	}
 }
@@ -607,7 +616,7 @@ func TestShutdownForcedBenignWhenNaturalEndRaces(t *testing.T) {
 	if claudeDone != 1 { // shared OnceValue 保證 CloseSequence 只真正跑一次
 		t.Fatalf("claude session:done count = %d, want exactly 1 (no double teardown)", claudeDone)
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) {
 		t.Fatal("claude session must be ended")
 	}
 }
@@ -639,7 +648,7 @@ func TestShutdownJoinsErrors(t *testing.T) {
 		}
 		return false
 	})
-	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) || a.manager.IsActive(a.legacyWSIDFor(contract.ProviderCodex)) {
 		t.Fatal("one side's error must not skip the other side's teardown")
 	}
 }
@@ -663,14 +672,15 @@ func TestShutdownHungProviderIsBounded(t *testing.T) {
 	if err := a.SendMessage("codex", "long task"); err != nil {
 		t.Fatal(err)
 	}
-	a.track.NoteStarted([]byte(`{"threadId":"t1","turn":{"id":"turn-hang"}}`))
+	a.hostFor(a.legacyWSIDFor(contract.ProviderCodex)).track.NoteStarted(
+		[]byte(`{"threadId":"t1","turn":{"id":"turn-hang"}}`))
 
 	start := time.Now()
 	_ = a.forcedShutdown() // interrupt timeout 屬 best-effort，不影響收尾
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("forced shutdown must be bounded, took %v", elapsed)
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) || a.manager.SessionActive(contract.ProviderCodex) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) || a.manager.IsActive(a.legacyWSIDFor(contract.ProviderCodex)) {
 		t.Fatal("hung interrupt must not block either teardown")
 	}
 }
@@ -730,7 +740,7 @@ func TestEndSessionInFlightShutdownNoDoubleTeardown(t *testing.T) {
 	if !a.manager.Closed() {
 		t.Fatal("manager must be closed after shutdown returns")
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) {
 		t.Fatal("claude session must be ended")
 	}
 	claudeDone := 0
@@ -796,7 +806,7 @@ func TestNewSessionInFlightShutdownNoDoubleTeardown(t *testing.T) {
 	if !a.manager.Closed() {
 		t.Fatal("manager must be closed after shutdown returns")
 	}
-	if a.manager.SessionActive(contract.ProviderClaude) {
+	if a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) {
 		t.Fatal("claude session must not be active")
 	}
 	claudeDone := 0
@@ -819,19 +829,19 @@ func TestRestoreViewWindowReplay(t *testing.T) {
 	a, _ := newTestApp(t)
 	m := a.manager
 	// claude 第一個 session：首輪 user envelope 的 session_id 為空（production 形狀）
-	id, _ := m.BeginNewSessionSubmit(contract.ProviderClaude, "task-a")
-	_ = m.AcceptSubmit(contract.ProviderClaude, id, "", "hello one")
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindSystemOther, Raw: []byte("{}")}) // 無 ID 雜訊
-	m.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "x-interleave"})
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindInit, SessionID: "sA", Raw: []byte("{}")})
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
+	id, _ := m.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "task-a")
+	_ = m.AcceptSubmit(a.legacyWSIDFor(contract.ProviderClaude), id, "", "hello one")
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindSystemOther, Raw: []byte("{}")}) // 無 ID 雜訊
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderCodex), contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "x-interleave"})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindInit, SessionID: "sA", Raw: []byte("{}")})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
 	// End 後第二次 Start：同 view 兩個 session
-	if err := appcore.EndSessionFlow(m, contract.ProviderClaude, nil, func() error { return nil }); err != nil {
+	if err := appcore.EndSessionFlow(m, a.legacyWSIDFor(contract.ProviderClaude), nil, func() error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	id2, _ := m.BeginNewSessionSubmit(contract.ProviderClaude, "task-a")
-	_ = m.AcceptSubmit(contract.ProviderClaude, id2, "sB", "hello two")
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
+	id2, _ := m.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "task-a")
+	_ = m.AcceptSubmit(a.legacyWSIDFor(contract.ProviderClaude), id2, "sB", "hello two")
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
 
 	views := a.RestoreViews()
 	cl := views["claude"].Envelopes
@@ -916,7 +926,7 @@ func TestNewSessionRestoreWriteFailureKeepsEntry(t *testing.T) {
 		t.Fatalf("entry must be unchanged on failure: %+v", got)
 	}
 	_ = os.Chmod(filepath.Dir(a.restore.path), 0o755)
-	if _, err := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "t"); err != nil {
+	if _, err := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "t"); err != nil {
 		t.Fatalf("slot must be back to idle after failed reset: %v", err)
 	}
 }
@@ -967,12 +977,12 @@ func TestEnsureThreadThenStartTurnFailure(t *testing.T) {
 	if err := conn.Handshake(hctx, clientInfo()); err != nil {
 		t.Fatal(err)
 	}
-	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, "task-x")
-	_, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi", "", "", "untrusted")
+	id, _ := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderCodex), "task-x")
+	_, _, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), fakeCodexHost{conn}, "hi", "", "", "untrusted")
 	if err == nil {
 		t.Fatal("StartTurn failure must surface")
 	}
-	_ = a.manager.RejectSubmit(contract.ProviderCodex, id)
+	_ = a.manager.RejectSubmit(a.legacyWSIDFor(contract.ProviderCodex), id)
 	if got := a.restore.Get("codex"); got.ResumeSessionID != "" { // 候選丟棄
 		t.Fatalf("candidate must be discarded: %+v", got)
 	}
@@ -981,8 +991,8 @@ func TestEnsureThreadThenStartTurnFailure(t *testing.T) {
 func TestFreshRestoreInitializesHighWatermark(t *testing.T) {
 	a, _ := newTestApp(t)
 	m := a.manager
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "old history"})
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "old history"})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
 	// 模擬升級：既有 events.jsonl、restore.json 不存在
 	if err := os.Remove(a.restore.path); err != nil {
 		t.Fatal(err)
@@ -1028,7 +1038,7 @@ func TestRestoreStoreConcurrentWrites(t *testing.T) { // barrier：兩筆 entry 
 func TestRestoreToleratesMalformedTail(t *testing.T) {
 	a, _ := newTestApp(t)
 	m := a.manager
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "good"})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}"), Text: "good"})
 	// events.jsonl 加壞行：重放跳過該行、不中斷
 	f, err := os.OpenFile(a.eventsPath(), os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -1060,7 +1070,7 @@ func TestRestoreExcludesAssistEventsFromProviderView(t *testing.T) {
 	a, _ := newTestApp(t)
 	m := a.manager
 	// 正常 provider session 訊息（走 Wrap → scope 空、purpose 空）——應被重放。
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindMessage,
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindMessage,
 		Raw: []byte("{}"), Text: "hello-from-provider"})
 	// 隔離 SpecAssist 事件（帶文字＋usage）——絕不可進 provider view window。
 	m.EmitAssist(contract.ProviderClaude, "corr-assist-1", "spec_assist",
@@ -1146,13 +1156,13 @@ func TestRestoredResumeReachesProvider(t *testing.T) {
 	if err := conn.Handshake(hctx, clientInfo()); err != nil {
 		t.Fatal(err)
 	}
-	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, "task-x")
+	id, _ := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderCodex), "task-x")
 	rx := a.RestoreViews()["codex"].ResumeSessionID
-	threadID, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi", rx, "", "untrusted")
+	threadID, _, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), fakeCodexHost{conn}, "hi", rx, "", "untrusted")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = a.manager.AcceptSubmit(contract.ProviderCodex, id, threadID, "hi")
+	_ = a.manager.AcceptSubmit(a.legacyWSIDFor(contract.ProviderCodex), id, threadID, "hi")
 	if !sawResume.Load() {
 		t.Fatal("thread/resume with restored id must reach the wire")
 	}
@@ -1188,7 +1198,7 @@ func TestNewStartBarrier(t *testing.T) { // teardown 完成與 restore reset 之
 func TestRestoreViewsIsReadOnly(t *testing.T) {
 	a, _ := newTestApp(t)
 	m := a.manager
-	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}")})
+	_ = m.Emit(a.legacyWSIDFor(contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}")})
 	countLines := func() int {
 		b, _ := os.ReadFile(a.eventsPath())
 		return strings.Count(string(b), "\n")
@@ -1198,11 +1208,7 @@ func TestRestoreViewsIsReadOnly(t *testing.T) {
 	if countLines() != before { // 不回寫 audit
 		t.Fatal("RestoreViews must not write to the audit stream")
 	}
-	hostsEmpty := len(a.snapshotHosts()) == 0
-	a.mu.Lock()
-	runnerNil := a.runner == nil
-	a.mu.Unlock()
-	if !hostsEmpty || !runnerNil { // 零 provider starter 呼叫
+	if len(a.snapshotHosts()) != 0 { // 零 provider starter 呼叫（兩個 provider 的 ownership 都收在 sessionHosts）
 		t.Fatal("RestoreViews must not spawn providers")
 	}
 }
@@ -1228,8 +1234,8 @@ func TestLateClaudeInitCannotOverwriteNewGeneration(t *testing.T) {
 func TestNewSessionTeardownFailureKeepsRestore(t *testing.T) { // P1-2
 	a, _ := newTestApp(t)
 	// manager-only session（無 process）：claudeTeardown 必回錯——teardown 失敗形狀
-	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-a")
-	_ = a.manager.AcceptSubmit(contract.ProviderClaude, id, "sA", "hi")
+	id, _ := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "task-a")
+	_ = a.manager.AcceptSubmit(a.legacyWSIDFor(contract.ProviderClaude), id, "sA", "hi")
 	if err := a.restore.CommitResume("claude", "sA", "task-a"); err != nil {
 		t.Fatal(err)
 	}
@@ -1241,7 +1247,7 @@ func TestNewSessionTeardownFailureKeepsRestore(t *testing.T) { // P1-2
 		t.Fatalf("restore must be kept on teardown failure: %+v", got)
 	}
 	// lifecycle 已收束回 idle：可再開 session（不卡 ending/resetting）
-	if _, err := a.manager.BeginNewSessionSubmit(contract.ProviderClaude, "task-b"); err != nil {
+	if _, err := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderClaude), "task-b"); err != nil {
 		t.Fatalf("slot must be idle after failed New: %v", err)
 	}
 }
@@ -1333,7 +1339,7 @@ func TestRestoreCommitFailureKeepsSessionActive(t *testing.T) { // P1-4（plan D
 	if err := a.StartSession("claude", "hi", "", "", "task-a", ""); err != nil {
 		t.Fatalf("StartSession must succeed despite restore failure: %v", err)
 	}
-	if !a.manager.SessionActive(contract.ProviderClaude) { // session 保持 active
+	if !a.manager.IsActive(a.legacyWSIDFor(contract.ProviderClaude)) { // session 保持 active
 		t.Fatal("session must stay active")
 	}
 	waitFor(t, "restore failure stream_error", func() bool {
@@ -1394,16 +1400,17 @@ func TestCodexAcceptFailureReclaimsResources(t *testing.T) { // P1-5
 		t.Fatal(err)
 	}
 	a.codexHostOverride = fakeCodexHost{conn}
-	a.hookAfterProviderStart = func() { _ = a.manager.Close() } // runner/lease 已發布 → Accept 失敗
+	w := a.legacyWSIDFor(contract.ProviderCodex)
+	a.hookAfterProviderStart = func() { _ = a.manager.Close() } // host（runner/lease）已發布 → Accept 失敗
 	err := a.StartSession("codex", "hi", "", "codex-acceptfail", "task-x", "untrusted")
 	if !errors.Is(err, appcore.ErrClosed) {
 		t.Fatalf("accept must fail with ErrClosed, got %v", err)
 	}
-	a.mu.Lock()
-	runnerNil, leaseNil := a.runner == nil, a.codexLease == nil
-	a.mu.Unlock()
-	if !runnerNil || !leaseNil { // 已發布資源全部回收
-		t.Fatalf("runner/lease must be reclaimed: runner-nil=%v lease-nil=%v", runnerNil, leaseNil)
+	if h := a.hostFor(w); h != nil { // 已發布資源全部回收（host 自 registry 取出）
+		t.Fatalf("codex host must be reclaimed: %+v", h)
+	}
+	if _, ok := a.codexWSIDFor("t1", ""); ok { // 路由一併撤掉
+		t.Fatal("codex thread routing must be removed on teardown")
 	}
 	if _, err := os.Stat(filepath.Join(a.stateDir, "recordings", "codex-acceptfail.meta.json")); err != nil {
 		t.Fatalf("lease must be finalized (meta written): %v", err)
@@ -1448,7 +1455,7 @@ func TestShutdownGateBlocksLateCodexStart(t *testing.T) {
 		t.Fatal("shutdown must wait for the in-flight start transaction")
 	case <-time.After(150 * time.Millisecond):
 	}
-	if _, err := a.manager.BeginSubmit(contract.ProviderCodex); errors.Is(err, appcore.ErrClosed) {
+	if _, err := a.manager.BeginSubmit(a.legacyWSIDFor(contract.ProviderCodex)); errors.Is(err, appcore.ErrClosed) {
 		t.Fatal("manager must not be closed while a start transaction is in flight")
 	}
 	close(release) // 交易離場：ensureAppServer 被 gate 拒
@@ -1519,9 +1526,15 @@ func TestShutdownGateBlocksLateEnsure(t *testing.T) {
 // approval_decision envelope（原 codex resolve callback 丟棄 reason）。
 func TestCodexApprovalReasonReachesEnvelope(t *testing.T) {
 	a, ui := newTestApp(t)
+	// Task 9：approval 一律經 threadId 歸屬到某個 WSID，因此先掛一個 codex host
+	// 與它的 thread 路由（等價於 startCodexHost 的 publishCodexHost 那一步）。
+	w := a.legacyWSIDFor(contract.ProviderCodex)
+	a.publishCodexHost(&sessionHost{wsid: w, provider: contract.ProviderCodex,
+		sockIndex: -1, threadID: "t1"})
 	done := make(chan map[string]string, 1)
 	go func() {
-		done <- a.codexApproval("item/commandExecution/requestApproval", []byte(`{"command":"touch x"}`))
+		done <- a.codexApproval("item/commandExecution/requestApproval",
+			[]byte(`{"threadId":"t1","turnId":"turn-1","command":"touch x"}`))
 	}()
 	var id string
 	waitFor(t, "approval:request", func() bool {
@@ -1576,12 +1589,12 @@ func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 	if err := conn.Handshake(hctx, clientInfo()); err != nil {
 		t.Fatal(err)
 	}
-	id, _ := a.manager.BeginNewSessionSubmit(contract.ProviderCodex, "task-x")
-	threadID, _, err := a.startCodexHost(fakeCodexHost{conn}, "hi", "t-resumed", "codex-resume-rec", "untrusted")
+	id, _ := a.manager.BeginNewSessionSubmit(a.legacyWSIDFor(contract.ProviderCodex), "task-x")
+	threadID, _, err := a.startCodexHost(a.legacyWSIDFor(contract.ProviderCodex), fakeCodexHost{conn}, "hi", "t-resumed", "codex-resume-rec", "untrusted")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = a.manager.AcceptSubmit(contract.ProviderCodex, id, threadID, "hi")
+	_ = a.manager.AcceptSubmit(a.legacyWSIDFor(contract.ProviderCodex), id, threadID, "hi")
 	if !sawResume.Load() {
 		t.Fatal("precondition: thread/resume must reach the wire")
 	}

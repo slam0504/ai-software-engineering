@@ -110,7 +110,7 @@ func TestLoadRegistryRestoresAllDormant(t *testing.T) {
 		t.Fatalf("應還原 2 個 dormant session：%d", len(entries))
 	}
 	for _, e := range entries {
-		if a.manager.IsActiveWS(appcore.WSID(e.WSID)) {
+		if a.manager.IsActive(appcore.WSID(e.WSID)) {
 			t.Fatalf("必須以 dormant 還原，不得為 active：%s", e.WSID)
 		}
 	}

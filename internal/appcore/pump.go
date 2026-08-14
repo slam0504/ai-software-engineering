@@ -62,12 +62,16 @@ func CloseSequence(closeFn func() error, done <-chan struct{},
 
 var ErrProviderBusy = errors.New("appcore: provider busy; cannot end session now")
 
-// EndSessionFlow：EndSession 的單一編排（per provider）。busyCheck 為 teardown
-// 前置檢查（nil = 無）；true → CancelEndSession + ErrProviderBusy（phase 復原、
-// Cancel 錯誤保留）。teardown 一旦開始，無論成敗都 FinishEndSession；回傳
+// EndSessionFlow：EndSession 的單一編排（per workspace session）。busyCheck 為
+// teardown 前置檢查（nil = 無）；true → CancelEndSession + ErrProviderBusy（phase
+// 復原、Cancel 錯誤保留）。teardown 一旦開始，無論成敗都 FinishEndSession；回傳
 // errors.Join(teardownErr, finishErr)。無 active session 冪等回 nil。
-func EndSessionFlow(m *Manager, p contract.Provider, busyCheck func() bool, teardown func() error) error {
-	tok, err := m.BeginEndSession(p)
+//
+// M3b §3.3：slot 一律由 WSID 解析（原 provider-keyed 相容層已於 Task 9 刪除），
+// 同一 provider 的多個 session 因此各自獨立收尾。未知／未 commit 的 WSID 回
+// ErrSessionNotFound（fail loud，不當成「無 session」冪等吞掉）。
+func EndSessionFlow(m *Manager, w WSID, busyCheck func() bool, teardown func() error) error {
+	tok, err := m.BeginEndSession(w)
 	if errors.Is(err, ErrNoSession) {
 		return nil // 冪等
 	}
@@ -75,31 +79,10 @@ func EndSessionFlow(m *Manager, p contract.Provider, busyCheck func() bool, tear
 		return err
 	}
 	if busyCheck != nil && busyCheck() {
-		cerr := m.CancelEndSession(p, tok) // Cancel 錯誤保留、不吞
+		cerr := m.CancelEndSession(w, tok) // Cancel 錯誤保留、不吞
 		return errors.Join(ErrProviderBusy, cerr)
 	}
 	tearErr := teardown()
-	finErr := m.FinishEndSession(p, tok)
-	return errors.Join(tearErr, finErr)
-}
-
-// EndSessionFlowWS：EndSessionFlow 的 WSID 定址版（M3b §3.3）——編排與語意逐字
-// 相同，只是 slot 由 WSID 解析而非 provider 相容層，讓同一 provider 的多個
-// session 各自獨立收尾。未知／未 commit 的 WSID 由 ...WS 入口回 ErrSessionNotFound
-// （fail loud，不當成「無 session」冪等吞掉）。
-func EndSessionFlowWS(m *Manager, w WSID, busyCheck func() bool, teardown func() error) error {
-	tok, err := m.BeginEndSessionWS(w)
-	if errors.Is(err, ErrNoSession) {
-		return nil // 冪等
-	}
-	if err != nil {
-		return err
-	}
-	if busyCheck != nil && busyCheck() {
-		cerr := m.CancelEndSessionWS(w, tok) // Cancel 錯誤保留、不吞
-		return errors.Join(ErrProviderBusy, cerr)
-	}
-	tearErr := teardown()
-	finErr := m.FinishEndSessionWS(w, tok)
+	finErr := m.FinishEndSession(w, tok)
 	return errors.Join(tearErr, finErr)
 }

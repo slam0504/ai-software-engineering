@@ -84,23 +84,41 @@ type App struct {
 	auditMu sync.Mutex
 	auditF  *os.File
 
-	// mu：sessionHosts registry ＋ 下方 codex 單例欄位的互斥（Claude 的六個單例
-	// 欄位已於 Task 8 遷入 sessionHost 並刪除）。
+	// mu：sessionHosts registry ＋ codex dispatcher 索引的互斥。
 	mu sync.Mutex
 
 	codexSingle  codex.Single[*codex.Server]
 	codexConn    *codex.Conn // wireCodexConn 記錄；interrupt 用（fake wire 測試同路徑）
-	runner       *codex.ThreadRunner
-	track        appcore.TurnTrack
-	codexLease   *appcore.RecordingLease
 	codexLoginID string
 
 	// sessionHosts（M3b Phase 2，§3.3）：per-WSID 的單例 ownership registry。
-	// Task 8 已把 Claude 側（broker／sess／sessionID／pumpDone／lease／teardownFn）
-	// 全部遷入並刪除對應 App 欄位；上方 runner／track／codexLease 是 Codex 的
-	// 殘留單例，Task 9 才搬。存取一律經 session_host.go 的 hostFor／putHost／
+	// Task 8 遷入 Claude 側（broker／sess／sessionID／pumpDone／lease／teardownFn），
+	// Task 9 遷入 Codex 側（runner／track／lease／threadID）——App 上已無任何
+	// per-session 單例欄位。存取一律經 session_host.go 的 hostFor／putHost／
 	// dropHost／takeHost／snapshotHosts／hostsOf，在 a.mu 下操作。
 	sessionHosts map[appcore.WSID]*sessionHost
+
+	// ---- Codex dispatcher（M3b §3.3；Task 9）----
+	//
+	// Codex 與 Claude 的根本差異：所有 session **共用同一條 codex.Conn**，因此
+	// 隔離不是靠獨立行程，而是靠「共用連線上的每個 frame 都要被歸屬到正確的
+	// WSID」。原本的 currentRunner()（路由到「當前那個」）在多 session 下必然
+	// 串線，已刪除。三個索引都在 a.mu 下讀寫，查找順序見 codexWSIDFor。
+	codexTurnWSID   map[string]appcore.WSID // turnId → WSID（turn/started 綁、turn/completed 解）
+	codexThreadWSID map[string]appcore.WSID // threadId → WSID（EnsureThread 成功即綁、teardown 解）
+
+	// codexPendingStarts：thread/start｜resume 送出到 response 抵達之間的登記。
+	// 這段窗口內 server 可能先送 thread/started 之類帶著「client 還不知道的
+	// threadId」的通知，光靠 codexThreadWSID 無法歸屬（見 codexWSIDFor）。
+	codexPendingStarts map[uint64]appcore.WSID
+	codexPendingSeq    uint64
+
+	// codexStartMu：序列化 EnsureThread 那一段 RPC，使同一時間至多一筆 pending
+	// start。理由見 codexWSIDFor——pending 窗口內的通知只帶 threadId，沒有任何
+	// 欄位能把它對應回某一筆 in-flight 的 thread/start，兩筆並行 pending start 就
+	// 是「原理上無法歸屬」。與其在正常併發下 fail loud，寧可讓第二個 start 等前
+	// 一個的 response（EnsureThread 自帶 30s ctx，等待有界）。
+	codexStartMu sync.Mutex
 
 	// sockIndexOwner：approval socket 槽位的 free-list（index → 佔用它的 host）。
 	// 在 a.mu 下讀寫，存取一律經 reserveSockIndex／releaseSockIndex。與
@@ -349,7 +367,7 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	// provider 白名單（同 StartSession／SendMessage／EndSession 的既有 guard）：
 	// 未知 provider 若放行，會被 Put 寫進 durable registry，重啟後 RestoreDormant
 	// 拿到無人能接手的 provider，那筆 entry 永久卡住。
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
 	p := contract.Provider(provider)
@@ -393,16 +411,29 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 // 器。這些 binding 的簽名要維持到 Task 26 才與前端原子切換，但內部的 Claude
 // ownership 與 lifecycle 已全面 WSID 定址，中間需要這一層。
 //
-// 解析順序凍結（coordinator 2026-08-15）：
+// 解析順序凍結（coordinator 2026-08-15，Task 9 補入第 3 順位）：
 //  1. 該 provider 恰有一個 live sessionHost → 回它的 WSID；
 //  2. 否則 → 回該 provider 最近一次 CreateSession 的 WSID；
-//  3. 都沒有 → 回 Manager 的 legacy slot WSID（讀取時隱式建立，其 slot.wsid
+//  3. 否則 → registry 中該 provider 恰有一個 live（非 tombstone）entry，且它已被
+//     還原成 Manager 的 committed slot → 回它的 WSID；
+//  4. 都沒有 → 回 Manager 的 legacy slot WSID（讀取時隱式建立，其 slot.wsid
 //     留空，envelope 輸出與 M3a 完全一致）。
 //
 // 理由：exported binding 在遷移窗口（Task 8-25）內必須維持「操作使用者當前那個
 // session」的既有可觀察行為。窗口內前端仍是單 session／provider，第 1 條恆成立。
 // 同一個 session 的整段生命週期必須解析到同一個 WSID，否則 start 交易與收尾會
 // 落在不同 slot——這也是所有 exported binding 一律經本函式（而非各自猜）的原因。
+//
+// 第 3 順位（registry tier）的必要性：Task 5／6 把使用者既有的 session 遷進
+// registry 並在啟動時還原成 dormant slot，但使用者實際上仍工作在第 4 順位的
+// legacy slot 上——那筆遷移出來的 entry 從此不反映現實，到 Task 26 前端 WSID 化
+// 時會多出一筆過時的 session。加這一層，遷移出來的 entry 才真的被接手。
+// 「恰一個」是刻意的：多筆時無從判斷使用者指的是哪個，落到第 4 順位反而是安全的
+// 已知行為（多 session 本來就要等 Task 26 前端帶 WSID 才有意義）。
+//
+// 「已被還原成 committed slot」的檢查不可省：registry 是磁碟權威，Manager 才是
+// lifecycle 入口能解析的對象。若回一個沒被 RestoreDormant 掛回去的 WSID，之後每個
+// 呼叫都會拿到 ErrSessionNotFound——比落到第 4 順位糟。
 // Task 26 前端切換後整層刪除。
 func (a *App) legacyWSIDFor(p contract.Provider) appcore.WSID {
 	if hs := a.hostsOf(p); len(hs) == 1 {
@@ -414,7 +445,35 @@ func (a *App) legacyWSIDFor(p contract.Provider) appcore.WSID {
 	if ok {
 		return w
 	}
+	if rw, ok := a.soleRegistryWSID(p); ok {
+		return rw
+	}
 	return a.manager.LegacyWSID(p)
+}
+
+// soleRegistryWSID：registry 中該 provider 唯一的 live entry（見 legacyWSIDFor
+// 第 3 順位）。唯讀——不建立 slot、不寫 registry。
+func (a *App) soleRegistryWSID(p contract.Provider) (appcore.WSID, bool) {
+	if a.wsReg == nil {
+		return "", false
+	}
+	var found appcore.WSID
+	for _, e := range a.wsReg.Live() {
+		if contract.Provider(e.Provider) != p {
+			continue
+		}
+		if found != "" { // 兩筆以上：無從判斷，交給下一順位
+			return "", false
+		}
+		found = appcore.WSID(e.WSID)
+	}
+	if found == "" {
+		return "", false
+	}
+	if _, err := a.manager.State(found); err != nil { // 未還原成 committed slot
+		return "", false
+	}
+	return found, true
 }
 
 // noteWSEmitError：...WS 出口的錯誤處置（Emit／approval 共用）。舊的 provider-keyed
@@ -1127,12 +1186,10 @@ func (a *App) shutdown(ctx context.Context) {
 // errors.Join 保留。
 func (a *App) forcedShutdown() error {
 	claudeHosts := a.hostsOf(contract.ProviderClaude)
-	a.mu.Lock()
-	runner, klease := a.runner, a.codexLease
-	a.mu.Unlock()
+	codexHosts := a.hostsOf(contract.ProviderCodex)
 
 	var wg sync.WaitGroup
-	errs := make([]error, len(claudeHosts)+1)
+	errs := make([]error, len(claudeHosts)+len(codexHosts))
 	for i, ch := range claudeHosts {
 		if ch.sess == nil || ch.teardownFn == nil { // 未完成 publish 的 host 不可能存在（見 sessionHost doc）
 			continue
@@ -1144,7 +1201,7 @@ func (a *App) forcedShutdown() error {
 			if h := a.hookForcedShutdownClaudeBeforeFlow; h != nil { // 測試 barrier：見 App 欄位 doc
 				h()
 			}
-			err := appcore.EndSessionFlowWS(a.manager, ch.wsid, nil, ch.teardownFn)
+			err := appcore.EndSessionFlow(a.manager, ch.wsid, nil, ch.teardownFn)
 			switch {
 			case err == nil:
 				// forced shutdown 自己贏得 BeginEndSession、teardown 已完成。
@@ -1161,25 +1218,28 @@ func (a *App) forcedShutdown() error {
 			}
 		}()
 	}
-	if runner != nil || klease != nil {
+	// codex 側同構（Task 9）：所有 session 共用同一條 conn 與長駐 server，因此
+	// 這裡不 Terminate server（shutdown() 在全部 finalize 之後才 Take＋Terminate），
+	// 只逐 session interrupt 自己的 turn 再走同一套收尾。一個失敗不跳過其他。
+	for i, ch := range codexHosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if runner != nil && runner.ActiveTurnID() != "" { // interrupt active turn（best effort）
+			if ch.runner != nil && ch.runner.ActiveTurnID() != "" { // interrupt active turn（best effort）
 				a.mu.Lock()
 				conn := a.codexConn
 				a.mu.Unlock()
-				if params, perr := a.track.InterruptParams(); perr == nil && conn != nil {
+				if params, perr := ch.track.InterruptParams(); perr == nil && conn != nil {
 					ictx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					_, _ = conn.Call(ictx, codex.MethodTurnInterrupt, params)
 					cancel()
 				}
 			}
-			if err := appcore.EndSessionFlow(a.manager, contract.ProviderCodex, nil, func() error {
-				return a.codexTeardown(klease)
+			if err := appcore.EndSessionFlow(a.manager, ch.wsid, nil, func() error {
+				return a.codexTeardown(ch)
 			}); err != nil {
-				terr := a.codexTeardown(klease) // lifecycle 擋住：直接收（冪等）
-				errs[len(claudeHosts)] = errors.Join(err, terr)
+				terr := a.codexTeardown(ch) // lifecycle 擋住：直接收（lease.Finalize 冪等）
+				errs[len(claudeHosts)+i] = errors.Join(err, terr)
 			}
 		}()
 	}
@@ -3726,7 +3786,7 @@ func (a *App) EscalationResolve(id, resolution, reason string) error {
 //   - 交易閘：beginAppTxn 於啟動（shutdown 後拒新），endAppTxn 於收尾一次。
 //   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endAppTxn）
 //     後才 Manager.Close（reclaimAssists＋inflight.Wait）。
-//   - ownership 隔離：不碰 sessionHosts／a.runner／a.codexConn（runner 為獨立 process）；
+//   - ownership 隔離：不碰 sessionHosts／a.codexConn（assist runner 為獨立 process）；
 //     晚到舊 generation 事件（correlation 不符）丟棄並發 stream_error（fail loud）。
 //   - once/token 收尾：result／abort／timeout／shutdown 任一先觸發即收一次。
 //
@@ -4196,11 +4256,11 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 			}
 			err := br.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
 			a.noteWSEmitError("approval_decision", w,
-				a.manager.EmitApprovalDecisionWS(w, sessionID(), decision, reason))
+				a.manager.EmitApprovalDecision(w, sessionID(), decision, reason))
 			return err
 		})
 		a.noteWSEmitError("approval_request", w,
-			a.manager.EmitApprovalRequestWS(w, sessionID(), req.ToolName, req.Input))
+			a.manager.EmitApprovalRequest(w, sessionID(), req.ToolName, req.Input))
 		a.emit("approval:request", map[string]any{
 			"id": id, "provider": string(provider), "toolName": req.ToolName,
 			"inputJson": string(req.Input),
@@ -4213,7 +4273,7 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 // StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
 // process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
 func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
 	prov := contract.Provider(provider)
@@ -4224,19 +4284,10 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		return err
 	}
 	defer a.endAppTxn()
-	// claude 已遷入 sessionHost（§3.3）：整段 start 交易 WSID 定址（...WS 入口），
-	// WSID 由 legacyWSIDFor 解析；codex 仍走 provider 相容層（Task 9 才遷）。
-	var (
-		w   appcore.WSID
-		id  appcore.SubmissionID
-		err error
-	)
-	if prov == contract.ProviderClaude {
-		w = a.legacyWSIDFor(prov)
-		id, err = a.manager.BeginNewSessionSubmitWS(w, taskLabel)
-	} else {
-		id, err = a.manager.BeginNewSessionSubmit(prov, taskLabel)
-	}
+	// 兩個 provider 都已遷入 sessionHost（§3.3）：整段 start 交易一律 WSID 定址，
+	// WSID 由 legacyWSIDFor 解析（Task 26 前端改為直接帶 WSID 後刪除該層）。
+	w := a.legacyWSIDFor(prov)
+	id, err := a.manager.BeginNewSessionSubmit(w, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
 	}
@@ -4247,7 +4298,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 	case contract.ProviderClaude:
 		commit, serr := a.startClaude(w, prompt, resume, recordCase)
 		if serr != nil {
-			_ = a.manager.RejectSubmitWS(w, id)
+			_ = a.manager.RejectSubmit(w, id)
 			return serr
 		}
 		// host 指標先抓：commit() 之後 reaper 可能已把它自 registry 取走
@@ -4258,7 +4309,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		if h := a.hookAfterProviderStart; h != nil {
 			h()
 		}
-		aerr := a.manager.AcceptSubmitWS(w, id, "", prompt)
+		aerr := a.manager.AcceptSubmit(w, id, "", prompt)
 		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
 		if aerr == nil {    // Accept 成功才 commit（staged candidate；D6）
 			if cerr := a.restore.CommitResume("claude", a.hostSessionID(host), taskLabel); cerr != nil {
@@ -4267,22 +4318,19 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 		}
 		return aerr
 	default: // codex
-		threadID, alreadyEnded, serr := a.startCodex(prompt, resume, recordCase, approvalPolicy)
+		threadID, alreadyEnded, serr := a.startCodex(w, prompt, resume, recordCase, approvalPolicy)
 		if serr != nil {
-			_ = a.manager.RejectSubmit(prov, id)
+			_ = a.manager.RejectSubmit(w, id)
 			return serr
 		}
 		if h := a.hookAfterProviderStart; h != nil {
 			h()
 		}
-		if err := a.manager.AcceptSubmit(prov, id, threadID, prompt); err != nil {
-			// 第三輪 P1-5：runner／lease 已發布——Accept 失敗必須回收，
-			// 否則 shutdown snapshot 之後才發布的資源會漏收（破壞
+		if err := a.manager.AcceptSubmit(w, id, threadID, prompt); err != nil {
+			// 第三輪 P1-5：host（runner／lease／路由）已發布——Accept 失敗必須
+			// 回收，否則 shutdown snapshot 之後才發布的資源會漏收（破壞
 			// 「全部 finalize 後才 Manager.Close」保證）
-			a.mu.Lock()
-			klease := a.codexLease
-			a.mu.Unlock()
-			terr := a.codexTeardown(klease) // 冪等：清 runner/lease/track＋session:done
+			terr := a.codexTeardown(a.hostFor(w)) // 冪等：撤路由＋finalize＋session:done
 			return errors.Join(err, terr)
 		}
 		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
@@ -4296,45 +4344,42 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 // SendMessage：指定 provider 既有 session 的後續輪（僅該 slot phaseActive 允許；
 // 錯誤原樣回 UI）。雙 session 並存：一個 provider busy 不影響另一個。
 func (a *App) SendMessage(provider, prompt string) error {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
 	pv := contract.Provider(provider)
-	if pv == contract.ProviderClaude { // 已遷入 sessionHost（§3.3）：WSID 定址
-		w := a.legacyWSIDFor(pv)
-		h := a.hostFor(w)
-		id, err := a.manager.BeginSubmitWS(w)
+	w := a.legacyWSIDFor(pv) // 兩個 provider 都已遷入 sessionHost（§3.3）：WSID 定址
+	h := a.hostFor(w)
+	if pv == contract.ProviderClaude {
+		id, err := a.manager.BeginSubmit(w)
 		if err != nil {
 			return err
 		}
 		if h == nil || h.sess == nil {
-			_ = a.manager.RejectSubmitWS(w, id)
+			_ = a.manager.RejectSubmit(w, id)
 			return errors.New("no active claude session")
 		}
 		if err := h.sess.Send(prompt); err != nil {
-			_ = a.manager.RejectSubmitWS(w, id)
+			_ = a.manager.RejectSubmit(w, id)
 			return err
 		}
-		return a.manager.AcceptSubmitWS(w, id, a.hostSessionID(h), prompt)
+		return a.manager.AcceptSubmit(w, id, a.hostSessionID(h), prompt)
 	}
-	a.mu.Lock() // codex：仍是 App 級單例（Task 9）
-	runner := a.runner
-	a.mu.Unlock()
-	id, err := a.manager.BeginSubmit(pv)
+	id, err := a.manager.BeginSubmit(w)
 	if err != nil {
 		return err
 	}
-	if runner == nil {
-		_ = a.manager.RejectSubmit(pv, id)
+	if h == nil || h.runner == nil {
+		_ = a.manager.RejectSubmit(w, id)
 		return errors.New("no active codex thread")
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	defer cancel()
-	if _, _, err := runner.StartTurn(ctx, prompt); err != nil {
-		_ = a.manager.RejectSubmit(pv, id)
+	if _, _, err := h.runner.StartTurn(ctx, prompt); err != nil {
+		_ = a.manager.RejectSubmit(w, id)
 		return err
 	}
-	return a.manager.AcceptSubmit(pv, id, runner.ThreadID(), prompt)
+	return a.manager.AcceptSubmit(w, id, h.runner.ThreadID(), prompt)
 }
 
 // EndSession：指定 provider 的收尾編排（appcore.EndSessionFlow）。冪等；
@@ -4364,52 +4409,51 @@ func (a *App) SendMessage(provider, prompt string) error {
 // 的既有情境，見 fix/shutdown-end-in-progress report concern 3）因此維持原行為
 // 未變動，殘留面已知、非本輪修復範圍。
 func (a *App) EndSession(provider string) error {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
 	if err := a.beginAppTxn(); err != nil { // shutdown gate：見上方 doc
 		return err
 	}
 	defer a.endAppTxn()
-	if provider == "claude" { // 已遷入 sessionHost（§3.3）：WSID 定址
-		w := a.legacyWSIDFor(contract.ProviderClaude)
-		return appcore.EndSessionFlowWS(a.manager, w, nil, a.claudeTeardown(a.hostFor(w)))
+	w := a.legacyWSIDFor(contract.Provider(provider)) // 兩個 provider 都 WSID 定址（§3.3）
+	h := a.hostFor(w)
+	if provider == "claude" {
+		return appcore.EndSessionFlow(a.manager, w, nil, a.claudeTeardown(h))
 	}
-	a.mu.Lock()
-	runner, klease := a.runner, a.codexLease
-	a.mu.Unlock()
-	busy := func() bool { return runner != nil && runner.ActiveTurnID() != "" }
-	return appcore.EndSessionFlow(a.manager, contract.ProviderCodex, busy, func() error {
-		return a.codexTeardown(klease)
-	})
+	busy := func() bool { return h != nil && h.runner != nil && h.runner.ActiveTurnID() != "" }
+	return appcore.EndSessionFlow(a.manager, w, busy, func() error { return a.codexTeardown(h) })
 }
 
 func (a *App) TerminateSession(provider string) error {
-	switch provider {
-	case "claude":
-		h := a.hostFor(a.legacyWSIDFor(contract.ProviderClaude))
+	if !knownProvider(provider) {
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+	h := a.hostFor(a.legacyWSIDFor(contract.Provider(provider)))
+	if provider == "claude" {
 		if h == nil || h.sess == nil {
 			return errors.New("no active claude session")
 		}
 		return h.sess.Terminate()
-	case "codex": // 長駐 server 不關，只中斷 turn
-		params, err := a.track.InterruptParams()
-		if err != nil {
-			return err
-		}
-		a.mu.Lock()
-		conn := a.codexConn
-		a.mu.Unlock()
-		if conn == nil {
-			return errors.New("codex app-server not running")
-		}
-		ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
-		defer cancel()
-		_, err = conn.Call(ctx, codex.MethodTurnInterrupt, params)
-		return err
-	default:
-		return fmt.Errorf("unknown provider %q", provider)
 	}
+	// codex：長駐 server 不關（其他 session 共用它），只中斷這個 session 的 turn
+	if h == nil {
+		return errors.New("no active codex session")
+	}
+	params, err := h.track.InterruptParams()
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	conn := a.codexConn
+	a.mu.Unlock()
+	if conn == nil {
+		return errors.New("codex app-server not running")
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+	_, err = conn.Call(ctx, codex.MethodTurnInterrupt, params)
+	return err
 }
 
 // ---- Claude 線 ----
@@ -4485,7 +4529,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		delete(a.apprPending, id)
 		a.apprMu.Unlock()
 		a.noteWSEmitError("approval_decision", w,
-			a.manager.EmitApprovalDecisionWS(w, sessionID(), "timeout", ""))
+			a.manager.EmitApprovalDecision(w, sessionID(), "timeout", ""))
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	})
 	go a.pumpApprovals(w, contract.ProviderClaude, br, sessionID)
@@ -4537,11 +4581,11 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			})
 	}
 
-	// pump：錄流 tap ＋ init 綁定 registry → 一律經 Manager.EmitWS（該 WSID slot）
+	// pump：錄流 tap ＋ init 綁定 registry → 一律經 Manager.Emit（該 WSID slot）
 	done := appcore.Pump(sess.Events(), func(ev contract.Event) {
 		if rec != nil {
 			if lerr := rec.Line(ev.Raw); lerr != nil {
-				a.noteWSEmitError("emit", w, a.manager.EmitWS(w, contract.Event{
+				a.noteWSEmitError("emit", w, a.manager.Emit(w, contract.Event{
 					Provider: contract.ProviderClaude,
 					Kind:     contract.KindStreamError, Raw: []byte(lerr.Error()), Err: lerr}))
 			}
@@ -4550,7 +4594,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			_ = a.registry.Bind(info.SessionID, cwd)
 			noteSessionID(info.SessionID)
 		}
-		a.noteWSEmitError("emit", w, a.manager.EmitWS(w, ev))
+		a.noteWSEmitError("emit", w, a.manager.Emit(w, ev))
 	})
 
 	// teardownFn：shared sync.OnceValue（review P2）——這個 goroutine 下方的
@@ -4581,7 +4625,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		if h := a.hookClaudeReaperBeforeEndFlow; h != nil { // 測試 barrier：見 App 欄位 doc
 			h()
 		}
-		if err := appcore.EndSessionFlowWS(a.manager, w, nil, teardownFn); err != nil {
+		if err := appcore.EndSessionFlow(a.manager, w, nil, teardownFn); err != nil {
 			a.audit("claude_natural_end_error", map[string]any{"error": err.Error()})
 		}
 	}()
@@ -4676,10 +4720,254 @@ func (a *App) currentAppServer() (*codex.Server, error) {
 	})
 }
 
-func (a *App) currentRunner() *codex.ThreadRunner {
+// ---- Codex dispatcher（M3b §3.3；Task 9）----
+//
+// 共用 codex.Conn 上的每個 s2c frame 都必須被歸屬到唯一的 WSID，否則多 session
+// 之間會串線。分流表：
+//
+//	帳號層廣播  account/login/completed｜account/updated
+//	            → 既有語意（auth:status ＋ audit），不進 WSID 路由、不 fail loud
+//	server 級廣播 codexBroadcastNotifications（見其 doc）
+//	            → workspace lane，不進 WSID 路由、不 fail loud
+//	thread-scoped 其餘 ServerNotifications ＋兩種 requestApproval
+//	            → codexWSIDFor 歸屬；歸屬不到一律 fail loud
+//	未知 method（OnUnknown）
+//	            → 帶 identity 則同上；完全不帶 identity 視為 server 級廣播
+//
+// 「歸屬不到就 fail loud」與「廣播不 fail loud」的界線是刻意的（coordinator
+// 2026-08-15 凍結，依 Task 0 live probe 實據）：account/rateLimits/updated 與
+// remoteControl/status/changed 在真實 server 上**本來就不帶 threadId**，把它們
+// 當成歸屬缺口會讓 app 在正常運作下持續報錯；反過來，本應帶 identity 的 frame
+// 一旦歸屬不到，靜默丟棄或猜一個 session 都是資料正確性問題，必須吵。
+
+// codexBroadcastNotifications：server／帳號層的廣播通知——不屬於任何 thread，
+// 依定義沒有 threadId。account/rateLimits/updated 與 remoteControl/status/changed
+// 由 Task 0 的 live probe 實測確認（`notif_missing_identity_methods`）；後者不在
+// codex.ServerNotifications 白名單內，會走 OnUnknown，因此兩條路徑都要查這張表。
+var codexBroadcastNotifications = map[string]bool{
+	codex.MethodAccountRateLimitsUpdated: true,
+	"remoteControl/status/changed":       true,
+}
+
+// codexBroadcastEventKind：廣播事件落 workspace lane 用的 kind（不綁任何 slot）。
+const codexBroadcastEventKind = "codex_broadcast"
+
+// codexFrameIdentity：s2c frame 的 identity 欄位。turnId 有兩種 wire 形狀——
+// turn/started｜turn/completed 是巢狀的 turn.id，requestApproval 是扁平的 turnId
+// （pinned schema 覆核），兩者都要認。
+func codexFrameIdentity(params []byte) (threadID, turnID string) {
+	var p struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+		Turn     struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	_ = json.Unmarshal(params, &p)
+	turnID = p.TurnID
+	if turnID == "" {
+		turnID = p.Turn.ID
+	}
+	return p.ThreadID, turnID
+}
+
+// codexWSIDFor：identity → WSID，查找順序 turnId → threadId → pending start。
+//
+// 第三順位的語意：thread/start｜resume 送出到 response 抵達之間，server 可能先
+// 送帶著「client 尚不知道的 threadId」的通知（thread/started 即是），此時前兩個
+// 索引必然落空。這個窗口由 codexStartMu 保證至多一筆 pending start，因此「恰好
+// 一筆」即可唯一歸屬；出現兩筆以上代表 codexStartMu 的不變量被破壞，寧可回
+// false 讓上層 fail loud，也不猜。
+//
+// 已知殘留窗口：pending start 進行中時，一筆來自「剛被 teardown、路由已撤掉的
+// 舊 thread」的晚到 frame 會被歸到這筆 pending start。兩者在 wire 上無法區分
+// （晚到 frame 帶的就是一個查不到的 threadId），而另一個選項——fail loud——會把
+// 正常的 pending start 通知也一起吵掉。窗口只有一次 thread/start 往返、且只影響
+// 一筆已結束 session 的殘留事件，取捨後選擇歸屬。
+func (a *App) codexWSIDFor(threadID, turnID string) (appcore.WSID, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.runner
+	if turnID != "" {
+		if w, ok := a.codexTurnWSID[turnID]; ok {
+			return w, true
+		}
+	}
+	if threadID != "" {
+		if w, ok := a.codexThreadWSID[threadID]; ok {
+			return w, true
+		}
+	}
+	if len(a.codexPendingStarts) == 1 {
+		for _, w := range a.codexPendingStarts {
+			return w, true
+		}
+	}
+	return "", false
+}
+
+// beginCodexPendingStart／endCodexPendingStart：pending start 登記（見 codexWSIDFor）。
+func (a *App) beginCodexPendingStart(w appcore.WSID) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.codexPendingStarts == nil {
+		a.codexPendingStarts = map[uint64]appcore.WSID{}
+	}
+	a.codexPendingSeq++
+	a.codexPendingStarts[a.codexPendingSeq] = w
+	return a.codexPendingSeq
+}
+
+func (a *App) endCodexPendingStart(seq uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.codexPendingStarts, seq)
+}
+
+// publishCodexHost：把 host 登記進 registry 並同時綁定 threadId → WSID。兩者必須
+// 在同一個臨界區完成：分兩次鎖的話，中間抵達的通知會歸屬到 WSID 卻查不到 host
+// （turn/completed 因此漏掉 NoteTurnEnded，busy 永久殘留）。
+func (a *App) publishCodexHost(h *sessionHost) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sessionHosts == nil {
+		a.sessionHosts = make(map[appcore.WSID]*sessionHost)
+	}
+	if a.codexThreadWSID == nil {
+		a.codexThreadWSID = map[string]appcore.WSID{}
+	}
+	a.sessionHosts[h.wsid] = h
+	if h.threadID != "" {
+		a.codexThreadWSID[h.threadID] = h.wsid
+	}
+}
+
+// bindCodexTurn／unbindCodexTurn：turnId → WSID 的次級索引。thread-scoped frame
+// 幾乎都帶 threadId（Task 0 live probe：107 筆通知中 102 筆帶、5 筆是廣播），
+// 這層是給「只帶 turnId」的形狀用的，同時讓 turn 收尾能精確定位。
+func (a *App) bindCodexTurn(turnID string, w appcore.WSID) {
+	if turnID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.codexTurnWSID == nil {
+		a.codexTurnWSID = map[string]appcore.WSID{}
+	}
+	a.codexTurnWSID[turnID] = w
+}
+
+func (a *App) unbindCodexTurn(turnID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.codexTurnWSID, turnID)
+}
+
+// forgetCodexHostRouting：teardown 時撤掉該 host 的全部路由（thread 與它名下的
+// turn）。identity check 與 takeHost 同理：同一個 threadId 若已被下一輪 resume
+// 綁到別的 WSID，不得誤刪。
+func (a *App) forgetCodexHostRouting(h *sessionHost) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if h.threadID != "" && a.codexThreadWSID[h.threadID] == h.wsid {
+		delete(a.codexThreadWSID, h.threadID)
+	}
+	for turnID, w := range a.codexTurnWSID {
+		if w == h.wsid {
+			delete(a.codexTurnWSID, turnID)
+		}
+	}
+}
+
+// failLoudCodexDispatch：歸屬失敗的唯一出口（audit ＋ workspace lane stream_error）。
+// 走 workspace lane 而非某個 session slot：這筆 frame 的 session 正是查不到的那個，
+// 隨便挑一個 slot 發就是它要防的那種串線。
+func (a *App) failLoudCodexDispatch(msg string) {
+	a.audit("codex_dispatch_error", map[string]any{"error": msg})
+	if a.manager != nil {
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
+	}
+}
+
+// emitCodexBroadcast：server／帳號層廣播的出口——workspace lane，不碰任何 slot。
+func (a *App) emitCodexBroadcast(method string, params json.RawMessage) {
+	a.manager.EmitWorkspace(codexBroadcastEventKind, nil, map[string]any{
+		"provider": "codex", "method": method, "params": json.RawMessage(params)})
+}
+
+// emitCodexUnknownBroadcast：OnUnknown 的廣播出口——payload 帶**完整 raw frame**。
+// 這條路徑上的 frame 連 method／params 都可能解不出來（JSON 壞掉、或既無 id 也無
+// method），遷移前的 KindUnknown 事件是保留 raw 的，換到 workspace lane 之後同樣
+// 不能把它丟掉，否則故障排查時證據會憑空消失。
+func (a *App) emitCodexUnknownBroadcast(raw []byte) {
+	a.manager.EmitWorkspace(codexBroadcastEventKind, nil, map[string]any{
+		"provider": "codex", "raw": string(raw)})
+}
+
+// dispatchCodexNotification：thread-scoped 通知的分流入口。回傳非 nil 代表本 frame
+// 無法歸屬且**本應帶 identity**（呼叫端 fail loud）；廣播類一律回 nil。
+func (a *App) dispatchCodexNotification(method string, params json.RawMessage) error {
+	switch {
+	case method == codex.MethodAccountLoginCompleted || method == codex.MethodAccountUpdated:
+		a.emit("auth:status", map[string]any{"provider": "codex",
+			"event": method, "payload": string(params)})
+		a.audit("codex_auth", map[string]any{"method": method, "params": json.RawMessage(params)})
+		return nil
+	case codexBroadcastNotifications[method]:
+		a.emitCodexBroadcast(method, params)
+		return nil
+	}
+	threadID, turnID := codexFrameIdentity(params)
+	w, ok := a.codexWSIDFor(threadID, turnID)
+	if !ok {
+		return fmt.Errorf("codex: 無法歸屬的 notification %s（threadId=%q turnId=%q）", method, threadID, turnID)
+	}
+	switch method {
+	case codex.MethodTurnStarted:
+		a.bindCodexTurn(turnID, w)
+		if h := a.hostFor(w); h != nil {
+			h.track.NoteStarted(params) // TerminateSession 需要 turnId
+		}
+	case codex.MethodTurnCompleted:
+		if h := a.hostFor(w); h != nil {
+			h.track.NoteEnded()
+			if h.runner != nil {
+				h.runner.NoteTurnEnded(turnID) // 解 busy；不動 recorder（session-scoped 錄流）
+			}
+		}
+		a.unbindCodexTurn(turnID)
+	}
+	a.noteWSEmitError("emit", w, a.manager.Emit(w, codex.MapEvent(method, params)))
+	return nil
+}
+
+// dispatchCodexUnknown：OnUnknown 的分流（未列入 codex.ServerNotifications 的通知、
+// 或解不開的 frame）。帶 identity 就照 thread-scoped 規則走（歸屬不到 fail loud）；
+// 完全不帶 identity 則歸為 server 級廣播——這類 frame 連 method 白名單都不在，host
+// 無從判斷它「本應」帶不帶 identity，把它一律當成缺口會製造大量假警報
+// （remoteControl/status/changed 正是這個形狀）。
+func (a *App) dispatchCodexUnknown(raw []byte) error {
+	var f struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	_ = json.Unmarshal(raw, &f)
+	if codexBroadcastNotifications[f.Method] {
+		a.emitCodexBroadcast(f.Method, f.Params)
+		return nil
+	}
+	threadID, turnID := codexFrameIdentity(f.Params)
+	if threadID == "" && turnID == "" {
+		a.emitCodexUnknownBroadcast(raw)
+		return nil
+	}
+	w, ok := a.codexWSIDFor(threadID, turnID)
+	if !ok {
+		return fmt.Errorf("codex: 無法歸屬的 unknown frame（method=%q threadId=%q turnId=%q）",
+			f.Method, threadID, turnID)
+	}
+	a.noteWSEmitError("emit", w, a.manager.Emit(w, contract.Event{Provider: contract.ProviderCodex,
+		Kind: contract.KindUnknown, Raw: append([]byte(nil), raw...)}))
+	return nil
 }
 
 func (a *App) wireCodexConn(conn *codex.Conn) {
@@ -4687,28 +4975,14 @@ func (a *App) wireCodexConn(conn *codex.Conn) {
 	a.codexConn = conn
 	a.mu.Unlock()
 	conn.OnNotification(func(method string, params json.RawMessage) {
-		switch method {
-		case codex.MethodAccountLoginCompleted, codex.MethodAccountUpdated:
-			a.emit("auth:status", map[string]any{"provider": "codex",
-				"event": method, "payload": string(params)})
-			a.audit("codex_auth", map[string]any{"method": method, "params": json.RawMessage(params)})
-		case codex.MethodTurnStarted:
-			a.track.NoteStarted(params) // TerminateSession 需要 turnId
-			a.manager.Emit(codex.MapEvent(method, params))
-		case codex.MethodTurnCompleted:
-			a.track.NoteEnded()
-			_, turnID := appcore.ParseTurnStarted(params) // 同 schema：turn.id
-			if r := a.currentRunner(); r != nil {
-				r.NoteTurnEnded(turnID) // 解 busy；不動 recorder（session-scoped 錄流）
-			}
-			a.manager.Emit(codex.MapEvent(method, params))
-		default:
-			a.manager.Emit(codex.MapEvent(method, params))
+		if err := a.dispatchCodexNotification(method, params); err != nil {
+			a.failLoudCodexDispatch(err.Error())
 		}
 	})
 	conn.OnUnknown(func(raw []byte) {
-		a.manager.Emit(contract.Event{Provider: contract.ProviderCodex,
-			Kind: contract.KindUnknown, Raw: append([]byte(nil), raw...)})
+		if err := a.dispatchCodexUnknown(raw); err != nil {
+			a.failLoudCodexDispatch(err.Error())
+		}
 	})
 	conn.OnServerRequest(func(method string, params json.RawMessage) (any, error) {
 		switch method {
@@ -4721,26 +4995,37 @@ func (a *App) wireCodexConn(conn *codex.Conn) {
 }
 
 // codexApproval：核可請求 → 同一 ApprovalDialog → allow=accept / deny=decline；逾時 decline（fail closed）。
+//
+// M3b §3.3：identity 路由。approval request 的 params 帶 threadId／turnId／itemId
+// （pinned schema 兩種 requestApproval 的 required 皆含前二者；fileChange 形態另有
+// Task 0 的 live frame 佐證），因此 approval 一律歸屬到提出請求的那個 WSID——原本
+// 靠 currentRunner() 取「當前那個」的做法在多 session 下會把核可對話框送到錯的
+// session，是 P1 級正確性問題。歸屬不到即 fail loud ＋ fail closed（decline），
+// 不猜一個 session。
 func (a *App) codexApproval(method string, params json.RawMessage) map[string]string {
 	id := fmt.Sprintf("codex-%d", time.Now().UnixNano())
-	threadID := ""
-	if r := a.currentRunner(); r != nil {
-		threadID = r.ThreadID()
+	threadID, turnID := codexFrameIdentity(params)
+	w, ok := a.codexWSIDFor(threadID, turnID)
+	if !ok {
+		a.failLoudCodexDispatch(fmt.Sprintf(
+			"codex: 無法歸屬的 approval 請求 %s（threadId=%q turnId=%q）→ decline", method, threadID, turnID))
+		a.audit("codex_approval_unattributable",
+			map[string]any{"id": id, "method": method, "raw_params": json.RawMessage(params)})
+		return map[string]string{"decision": "decline"}
 	}
 	type codexDecision struct {
 		allow  bool
 		reason string
 	}
 	ch := make(chan codexDecision, 1)
-	// codex 尚未遷入 sessionHost（Task 9）：approval 仍走 provider 相容層，wsid
-	// 因此標成該 provider 的 legacy slot——與下方 EmitApprovalRequest 落地的 slot
-	// 完全一致，不猜一個對不上的 WSID。
-	a.registerApproval(id, a.manager.LegacyWSID(contract.ProviderCodex), "codex", func(allow bool, reason string) error {
+	a.registerApproval(id, w, "codex", func(allow bool, reason string) error {
 		ch <- codexDecision{allow, reason} // reason（如 Esc 的 "esc"）保留進 envelope
 		return nil
 	})
-	a.audit("codex_approval_request", map[string]any{"id": id, "method": method, "raw_params": json.RawMessage(params)})
-	a.manager.EmitApprovalRequest(contract.ProviderCodex, threadID, method, params)
+	a.audit("codex_approval_request", map[string]any{"id": id, "method": method,
+		"wsid": string(w), "raw_params": json.RawMessage(params)})
+	a.noteWSEmitError("approval_request", w,
+		a.manager.EmitApprovalRequest(w, threadID, method, params))
 	a.emit("approval:request", map[string]any{
 		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
@@ -4760,7 +5045,8 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
-	a.manager.EmitApprovalDecision(contract.ProviderCodex, threadID, uiDecision, reason)
+	a.noteWSEmitError("approval_decision", w,
+		a.manager.EmitApprovalDecision(w, threadID, uiDecision, reason))
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}
 }
@@ -4772,25 +5058,35 @@ type codexHost interface {
 	StderrSnapshot() string
 }
 
-func (a *App) startCodex(prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
+func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
 	if a.codexHostOverride != nil { // 測試 seam：fake wire 走同一 production 分支
-		return a.startCodexHost(a.codexHostOverride, prompt, resume, recordCase, approvalPolicy)
+		return a.startCodexHost(w, a.codexHostOverride, prompt, resume, recordCase, approvalPolicy)
 	}
 	srv, err := a.ensureAppServer()
 	if err != nil {
 		return "", false, err
 	}
-	return a.startCodexHost(srv, prompt, resume, recordCase, approvalPolicy)
+	return a.startCodexHost(w, srv, prompt, resume, recordCase, approvalPolicy)
 }
 
 // startCodexHost：EnsureThread＋StartTurn bounded synchronous（ctx 30s；turn/start
 // response 立即回）。回傳 threadID 供 AcceptSubmit。
 //
-// runner 於 EnsureThread 成功後、StartTurn 前發布至 a.runner——notification
-// handler（turn/completed→NoteTurnEnded、approval→ThreadID）在首輪 response
-// 尚未消化時就找得到 runner；completed-before-response 由 earlyEnded latch 對消。
-// 後續任何失敗原子 rollback（a.runner 清回 nil）。
-func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
+// M3b §3.3 的發布順序（凍結）：
+//
+//  1. beginCodexPendingStart：**送出 thread/start 之前**登記。這段窗口內 server 會
+//     送帶著 client 尚不知道的 threadId 的通知，pending 登記是它們唯一的歸屬依據。
+//     整段 EnsureThread 由 codexStartMu 序列化，保證至多一筆 pending（見 codexWSIDFor）。
+//  2. publishCodexHost（EnsureThread 成功後、StartTurn 前）：host 與 threadId → WSID
+//     在同一臨界區內生效，首輪事件因此找得到 runner／track——completed-before-response
+//     由 ThreadRunner 的 earlyEnded latch 對消，前提正是 handler 這時已能命中 runner。
+//  3. pending 登記直到 host publish 完成才解除（defer 順序）：中間沒有「兩個索引都
+//     查不到」的空隙。
+//
+// host 填滿才 publish、publish 後不可變（見 sessionHost 併發規約）：runner／
+// threadID／lease 都在 publishCodexHost 之前寫定。StartTurn 失敗即 takeHost
+// rollback ＋ finalize 錄流，registry 不留半成品。
+func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, recordCase, approvalPolicy string) (string, bool, error) {
 	conn := host.Conn()
 	if approvalPolicy == "" { // M0 驗證定位沿用：commandExecution 一律 requestApproval
 		approvalPolicy = "untrusted"
@@ -4827,38 +5123,45 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 		}
 	}
 
+	// pending start 窗口：登記 → 送 thread/start｜resume → response 抵達 → host
+	// publish 完成才解除（見函式 doc 的發布順序）。codexStartMu 讓同一時間至多
+	// 一筆 pending，pending 歸屬因此唯一。
+	a.codexStartMu.Lock()
+	pendingSeq := a.beginCodexPendingStart(w)
+	pendingDone := false
+	endPending := func() {
+		if !pendingDone {
+			pendingDone = true
+			a.endCodexPendingStart(pendingSeq)
+			a.codexStartMu.Unlock()
+		}
+	}
+	defer endPending()
+
 	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
 	if err != nil {
 		finalizeLease() // 錄流已開：EnsureThread 失敗須收尾
 		return "", false, err
 	}
 
-	a.mu.Lock()
-	a.runner = runner // 發布：首輪事件的 handler ownership
-	a.mu.Unlock()
-	rollback := func() {
-		finalizeLease()
-		a.mu.Lock()
-		if a.runner == runner {
-			a.runner = nil
-		}
-		a.mu.Unlock()
-	}
+	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1,
+		runner: runner, threadID: threadID, lease: lease}
+	a.publishCodexHost(h) // 發布：首輪事件的 handler ownership（host ＋ threadId 路由）
+	endPending()          // host 已可經 threadId 命中：pending 窗口到此為止
 
 	_, alreadyEnded, err := runner.StartTurn(ctx, prompt)
 	if err != nil {
-		rollback() // 含 finalizeLease
+		a.takeHost(h) // rollback：registry 不留半成品
+		a.forgetCodexHostRouting(h)
+		finalizeLease()
 		return "", false, err
 	}
 
-	a.mu.Lock()
-	a.codexLease = lease
-	a.mu.Unlock()
-
 	// init envelope（M0 行為保留）：UI 的 sessionId／taskId 來源。此刻 submit
 	// 仍 pending → 進 queue，Accept 後依序 flush（user → waiting → init）。
-	a.manager.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindInit,
-		SessionID: threadID, Raw: fmt.Appendf(nil, `{"threadId":%q}`, threadID)})
+	a.noteWSEmitError("emit", w, a.manager.Emit(w, contract.Event{
+		Provider: contract.ProviderCodex, Kind: contract.KindInit,
+		SessionID: threadID, Raw: fmt.Appendf(nil, `{"threadId":%q}`, threadID)}))
 
 	if lease != nil { // fatal：wire EOF（server 死亡）時仍收尾錄流（冪等由 lease 保證）
 		go func() {
@@ -4869,17 +5172,29 @@ func (a *App) startCodexHost(host codexHost, prompt, resume, recordCase, approva
 	return threadID, alreadyEnded, nil
 }
 
-// codexTeardown：長駐 server 不關；lease.Finalize(Exited=false) 收錄流，
-// 清 runner／track 並發 session:done。
-func (a *App) codexTeardown(lease *appcore.RecordingLease) error {
-	var err error
-	if lease != nil {
-		err = lease.Finalize(ports.Exit{Exited: false})
+// codexTeardown：長駐 server 不關（其他 session 還在用同一條 conn）；
+// lease.Finalize(Exited=false) 收錄流、撤掉該 host 的路由與 registry 登記，
+// 再發 session:done。
+//
+// take-then-dispose（見 dropHost doc）：先 takeHost 取出——此後沒有新讀者能拿到
+// 這個 host——才撤路由與 finalize；順序反過來的話，dispatcher 可能剛好把一個
+// frame 路由到一個 lease 已經 finalize 的 host。
+//
+// host 為 nil（該 WSID 沒有 live codex session）回 nil no-op：codex 的 teardown
+// 唯一的處置對象就是 host 自己，沒有 host 就沒有東西要收，也不該發 session:done
+// 讓 UI 以為剛結束了一個 session（Claude 那邊回 error 是因為 NewSession 的失敗
+// 路徑依賴它，codex 沒有對應依賴）。
+func (a *App) codexTeardown(h *sessionHost) error {
+	if h == nil {
+		return nil
 	}
-	a.mu.Lock()
-	a.runner, a.codexLease = nil, nil
-	a.mu.Unlock()
-	a.track.NoteEnded()
+	a.takeHost(h)
+	a.forgetCodexHostRouting(h)
+	var err error
+	if h.lease != nil {
+		err = h.lease.Finalize(ports.Exit{Exited: false}) // 冪等：重複 teardown 不會重複收尾
+	}
+	h.track.NoteEnded()
 	stderr := ""
 	if srv, serr := a.currentAppServer(); serr == nil {
 		stderr = srv.StderrSnapshot()
@@ -5077,7 +5392,7 @@ func (a *App) failLoudRestore(p contract.Provider, err error) {
 //
 //	由 StartSession Accept 成功後補 commit）。
 func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
-	if host == nil || a.hostFor(host.wsid) != host || !a.manager.IsActiveWS(host.wsid) {
+	if host == nil || a.hostFor(host.wsid) != host || !a.manager.IsActive(host.wsid) {
 		return
 	}
 	if err := a.restore.CommitSessionID("claude", sessionID); err != nil {
@@ -5108,7 +5423,7 @@ func (a *App) RestoreViews() map[string]RestoredView {
 // NewSession 也是「BeginEndSession 成功才會呼叫 teardown、失敗就直接回錯」，
 // 沒有 fallback 兜底重跑，故同樣不需要共用 host.teardownFn）。
 func (a *App) NewSession(provider string) error {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
 	if err := a.beginAppTxn(); err != nil { // shutdown gate：見 EndSession doc
@@ -5116,63 +5431,39 @@ func (a *App) NewSession(provider string) error {
 	}
 	defer a.endAppTxn()
 	pv := contract.Provider(provider)
-	a.mu.Lock()
-	runner, klease := a.runner, a.codexLease
-	a.mu.Unlock()
 
-	// lifecycle 入口選擇：claude 已遷入 sessionHost（§3.3），整段走該 WSID 的
-	// ...WS 入口——同一個 session 的 start／teardown 必須落在同一個 slot，
-	// StartSession 既然已 WSID 定址，這裡混用 provider 相容層就會操作到別的
-	// slot。codex 仍是 App 級單例，維持 provider 入口（Task 9）。
-	// 兩組簽名不同（WSID vs Provider），故以 closure 收斂成單一編排；
-	// Task 26 前端切換後只留 ...WS 版。
-	var claudeHost *sessionHost
-	beginEnd := func() (appcore.SessionToken, error) { return a.manager.BeginEndSession(pv) }
-	cancelEnd := func(t appcore.SessionToken) error { return a.manager.CancelEndSession(pv, t) }
-	finishEnd := func(t appcore.SessionToken) error { return a.manager.FinishEndSession(pv, t) }
-	intoReset := func(t appcore.SessionToken) (appcore.ResetToken, error) {
-		return a.manager.FinishEndSessionIntoReset(pv, t)
-	}
-	beginReset := func() (appcore.ResetToken, error) { return a.manager.BeginReset(pv) }
-	finishReset := func(t appcore.ResetToken) error { return a.manager.FinishReset(pv, t) }
-	if pv == contract.ProviderClaude {
-		w := a.legacyWSIDFor(pv)
-		claudeHost = a.hostFor(w)
-		beginEnd = func() (appcore.SessionToken, error) { return a.manager.BeginEndSessionWS(w) }
-		cancelEnd = func(t appcore.SessionToken) error { return a.manager.CancelEndSessionWS(w, t) }
-		finishEnd = func(t appcore.SessionToken) error { return a.manager.FinishEndSessionWS(w, t) }
-		intoReset = func(t appcore.SessionToken) (appcore.ResetToken, error) {
-			return a.manager.FinishEndSessionIntoResetWS(w, t)
-		}
-		beginReset = func() (appcore.ResetToken, error) { return a.manager.BeginResetWS(w) }
-		finishReset = func(t appcore.ResetToken) error { return a.manager.FinishResetWS(w, t) }
-	}
+	// 兩個 provider 都已遷入 sessionHost（§3.3）：整段 lifecycle 走同一個 WSID 的
+	// 入口。同一個 session 的 start／teardown 必須落在同一個 slot，StartSession
+	// 既然由 legacyWSIDFor 解析，這裡也必須用同一個解析結果。
+	w := a.legacyWSIDFor(pv)
+	host := a.hostFor(w)
 
 	var rtok appcore.ResetToken
-	tok, err := beginEnd()
+	tok, err := a.manager.BeginEndSession(w)
 	switch {
 	case err == nil: // active session：teardown 後原子轉入 resetting
-		if pv == contract.ProviderCodex && runner != nil && runner.ActiveTurnID() != "" {
-			cerr := cancelEnd(tok)
+		if pv == contract.ProviderCodex && host != nil && host.runner != nil &&
+			host.runner.ActiveTurnID() != "" {
+			cerr := a.manager.CancelEndSession(w, tok)
 			return errors.Join(appcore.ErrProviderBusy, cerr)
 		}
 		var tearErr error
 		if pv == contract.ProviderClaude {
-			tearErr = a.claudeTeardown(claudeHost)()
+			tearErr = a.claudeTeardown(host)()
 		} else {
-			tearErr = a.codexTeardown(klease)
+			tearErr = a.codexTeardown(host)
 		}
 		if tearErr != nil { // 第三輪 P1-2：收尾失敗立即返回——lifecycle 以
 			// FinishEndSession 收束回 idle、restore entry 保留、UI 不重設
-			finErr := finishEnd(tok)
+			finErr := a.manager.FinishEndSession(w, tok)
 			return errors.Join(tearErr, finErr)
 		}
-		rtok, err = intoReset(tok)
+		rtok, err = a.manager.FinishEndSessionIntoReset(w, tok)
 		if err != nil {
 			return err
 		}
 	case errors.Is(err, appcore.ErrNoSession): // 無 active session：直接進 resetting
-		rtok, err = beginReset()
+		rtok, err = a.manager.BeginReset(w)
 		if err != nil {
 			return err
 		}
@@ -5184,7 +5475,7 @@ func (a *App) NewSession(provider string) error {
 		h()
 	}
 	rerr := a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
-	finErr := finishReset(rtok) // restore 失敗仍 FinishReset 回 idle
+	finErr := a.manager.FinishReset(w, rtok) // restore 失敗仍 FinishReset 回 idle
 	if rerr != nil {
 		return errors.Join(rerr, finErr) // 失敗回錯：UI 不重設
 	}

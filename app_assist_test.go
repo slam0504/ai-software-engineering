@@ -201,11 +201,14 @@ func TestCodexAssistCannotEscalateOrMutateSessionView(t *testing.T) {
 
 	// 稽核仍完整：assist 事件經 Manager.EmitAssist 出口，帶 purpose=spec_assist、
 	// scope=session、correlation_id，但不進 provider slot（totals 不受污染）。
-	if cost, usage := a.manager.Totals(contract.ProviderCodex); cost != 0 || usage.OutputTokens != 0 {
-		t.Fatalf("assist must not pollute provider totals: cost=%v usage=%+v", cost, usage)
+	w := a.legacyWSIDFor(contract.ProviderCodex)
+	cost, usage, terr := a.manager.Totals(w)
+	if terr != nil || cost != 0 || usage.OutputTokens != 0 {
+		t.Fatalf("assist must not pollute provider totals: cost=%v usage=%+v err=%v", cost, usage, terr)
 	}
-	if st := a.manager.State(contract.ProviderCodex); st != "" && st != contract.StateIdle {
-		t.Fatalf("assist must not drive provider reducer, got state=%q", st)
+	st, serr := a.manager.State(w)
+	if serr != nil || (st != "" && st != contract.StateIdle) {
+		t.Fatalf("assist must not drive provider reducer, got state=%q err=%v", st, serr)
 	}
 }
 

@@ -8,13 +8,19 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
+	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
 
 // sessionHost：per-WSID 版本的「單例 ownership」（M3b Phase 2，§3.3）——把原本
 // 掛在 App 上的 broker／claudeSess／claudeLease／runner／track 等欄位，逐 provider
-// 搬進以 WSID 為 key 的 registry。Task 8 已把 Claude 側全部遷入（六個單例欄位隨之
-// 刪除）；Codex 的 runner／track／codexLease 仍在 App 上，Task 9 才搬。
+// 搬進以 WSID 為 key 的 registry。Task 8 遷入 Claude 側、Task 9 遷入 Codex 側，
+// App 上對應的九個單例欄位隨之全部刪除。
+//
+// Claude 與 Codex 的 host 形狀刻意不同，因為兩者的隔離維度不同：Claude 每個
+// session 是獨立子行程（sess／broker／socket／MCP config 全部 per-host），Codex
+// 所有 session 共用同一條 codex.Conn，per-host 的是 runner／threadID／track／
+// lease，隔離改由 App 的 codex dispatcher 依 threadId／turnId 分流達成。
 //
 // # 欄位併發規約（Task 8 凍結）
 //
@@ -57,9 +63,17 @@ type sessionHost struct {
 	pumpDone   <-chan struct{}
 	teardownFn func() error
 	lease      *appcore.RecordingLease
-	threadID   string
-	track      appcore.TurnTrack
-	sessionID  string
+
+	// ---- Codex 側（Task 9）----
+	//
+	// runner／threadID 在 publishCodexHost 之前就寫定、之後不可變（同上方規約）。
+	// track 是個帶自己 mutex 的值型別，publish 後由 dispatcher 與 TerminateSession
+	// 併發存取——一律以 &h.track 操作，不得複製 sessionHost。
+	runner   *codex.ThreadRunner
+	threadID string
+	track    appcore.TurnTrack
+
+	sessionID string
 }
 
 // maxApprovalSockets：同時存在的 approval socket 上限——2 provider ×
