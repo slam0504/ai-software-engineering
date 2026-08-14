@@ -1531,7 +1531,7 @@ func TestLatchNotifiesOncePerGeneration(t *testing.T) {
 
 - [ ] **Step 2: 跑測試確認失敗** — `go test . -run 'TestLatch|TestRecovery' -race -v` → FAIL
 
-- [ ] **Step 3: 遷移 ownership 型別** — `App.codexSingle` 改 `codex.Single[*codex.GenerationOwner]`；`RestartCodexServerRecorded` 與 `RecoverCodexRecording` 共用 `RunOwnedHandshake`，全段在 `codexSingle.WithExclusive` 內；latch 以 per-generation `sync.Once` 單次通知；全部成功才解除。
+- [ ] **Step 3: 遷移 ownership 型別** — `App.codexSingle` 改 `codex.Single[*codex.GenerationOwner]`；`RestartCodexServerRecorded` 與 `RecoverCodexRecording` 共用 `RunOwnedHandshake`——**全段由 `RunOwnedHandshake` 內部的 `WithExclusiveEpoch` 單層互斥交易保護，App 呼叫端不得另行包鎖**（見上方「鎖層次（凍結）」）；latch 以 per-generation `sync.Once` 單次通知；全部成功才解除。
 
 - [ ] **Step 4: 刪除舊入口並確認無殘留**
 
