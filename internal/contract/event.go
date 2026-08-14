@@ -30,6 +30,10 @@ const (
 	// M2 新增（additive；Stage A §3.4c）：workspace scope 事件，不進 provider slot。
 	KindGateRequest  Kind = "gate_request"  // gate 待決：Manager.EmitWorkspace 出口
 	KindBindingStale Kind = "binding_stale" // binding digest 過期通知
+
+	// M3b 新增（additive；§3.3）：codex 共用連線上的 server／帳號層廣播——不屬於
+	// 任何 thread，因此不進任何 workspace session slot，走 EmitWorkspace 出口。
+	KindCodexBroadcast Kind = "codex_broadcast"
 )
 
 type Event struct {

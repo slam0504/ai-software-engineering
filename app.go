@@ -3794,7 +3794,7 @@ func (a *App) EscalationResolve(id, resolution, reason string) error {
 // purpose="spec_assist"）——保留稽核＋檔案級 event_id，但**不進 provider slot**
 // （前端依 purpose 二次分流，不污染 reducer／Chat／totals）。
 func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
 	// Pin the assist purpose at the emit boundary (defense in depth): this is the
@@ -3962,7 +3962,7 @@ func activeGate1SpecManifestDigest(entries []GateEntryDTO) (digest string, ok bo
 // analysis_base_commit 欄位須等於此處注入的值（§9 契約，Task 12 的
 // VerifyLineage 以此為 lineage 起點）。
 func (a *App) PlanAssist(provider, prompt string) (string, error) {
-	if provider != "claude" && provider != "codex" {
+	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
 
@@ -4745,30 +4745,27 @@ func (a *App) currentAppServer() (*codex.Server, error) {
 // 由 Task 0 的 live probe 實測確認（`notif_missing_identity_methods`）；後者不在
 // codex.ServerNotifications 白名單內，會走 OnUnknown，因此兩條路徑都要查這張表。
 var codexBroadcastNotifications = map[string]bool{
-	codex.MethodAccountRateLimitsUpdated: true,
-	"remoteControl/status/changed":       true,
+	codex.MethodAccountRateLimitsUpdated:   true,
+	codex.MethodRemoteControlStatusChanged: true,
 }
-
-// codexBroadcastEventKind：廣播事件落 workspace lane 用的 kind（不綁任何 slot）。
-const codexBroadcastEventKind = "codex_broadcast"
 
 // codexFrameIdentity：s2c frame 的 identity 欄位。turnId 有兩種 wire 形狀——
 // turn/started｜turn/completed 是巢狀的 turn.id，requestApproval 是扁平的 turnId
 // （pinned schema 覆核），兩者都要認。
+//
+// 巢狀形狀刻意委派給 appcore.ParseTurnStarted（TurnTrack.NoteStarted 用的同一份）：
+// 兩處解析同一個 wire shape，各寫一份在 shape 變動時必然漂移。
 func codexFrameIdentity(params []byte) (threadID, turnID string) {
+	threadID, nested := appcore.ParseTurnStarted(params) // threadId ＋ 巢狀 turn.id
 	var p struct {
-		ThreadID string `json:"threadId"`
-		TurnID   string `json:"turnId"`
-		Turn     struct {
-			ID string `json:"id"`
-		} `json:"turn"`
+		TurnID string `json:"turnId"`
 	}
 	_ = json.Unmarshal(params, &p)
 	turnID = p.TurnID
 	if turnID == "" {
-		turnID = p.Turn.ID
+		turnID = nested
 	}
-	return p.ThreadID, turnID
+	return threadID, turnID
 }
 
 // codexWSIDFor：identity → WSID，查找順序 turnId → threadId → pending start。
@@ -4778,6 +4775,13 @@ func codexFrameIdentity(params []byte) (threadID, turnID string) {
 // 索引必然落空。這個窗口由 codexStartMu 保證至多一筆 pending start，因此「恰好
 // 一筆」即可唯一歸屬；出現兩筆以上代表 codexStartMu 的不變量被破壞，寧可回
 // false 讓上層 fail loud，也不猜。
+//
+// **第三順位要求 identity 非空**（review Important）：pending tier 的存在理由是
+// 「frame 帶著 client 還不知道的 threadId」——它從來不是為「完全沒有 identity 的
+// frame」準備的。少了這個條件，一筆本應帶 identity 卻缺漏的白名單通知（server bug）
+// 只要剛好落在 pending 窗口內，就會被靜默塞進「正在啟動的那個 session」，正是凍結
+// (1) 後半要 fail loud 的案例；approval 走同一條路徑，後果是核可對話框掛到錯的
+// session——本 task 的核心動機形狀。
 //
 // 已知殘留窗口：pending start 進行中時，一筆來自「剛被 teardown、路由已撤掉的
 // 舊 thread」的晚到 frame 會被歸到這筆 pending start。兩者在 wire 上無法區分
@@ -4797,7 +4801,7 @@ func (a *App) codexWSIDFor(threadID, turnID string) (appcore.WSID, bool) {
 			return w, true
 		}
 	}
-	if len(a.codexPendingStarts) == 1 {
+	if (threadID != "" || turnID != "") && len(a.codexPendingStarts) == 1 {
 		for _, w := range a.codexPendingStarts {
 			return w, true
 		}
@@ -4881,16 +4885,18 @@ func (a *App) forgetCodexHostRouting(h *sessionHost) {
 // failLoudCodexDispatch：歸屬失敗的唯一出口（audit ＋ workspace lane stream_error）。
 // 走 workspace lane 而非某個 session slot：這筆 frame 的 session 正是查不到的那個，
 // 隨便挑一個 slot 發就是它要防的那種串線。
+// a.manager 在這條路徑上必定非 nil：dispatch 只在 wireCodexConn 之後可達，而
+// wireCodexConn 只在 startup 建好 manager 之後才被呼叫。刻意不加 nil guard——
+// 同一條路徑上的 emitCodexBroadcast／Manager.Emit 也都沒有，只在其中一處加會讓
+// 「哪些地方可能 nil」變成一個沒人說得清的問題。
 func (a *App) failLoudCodexDispatch(msg string) {
 	a.audit("codex_dispatch_error", map[string]any{"error": msg})
-	if a.manager != nil {
-		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
-	}
+	a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{"error": msg})
 }
 
 // emitCodexBroadcast：server／帳號層廣播的出口——workspace lane，不碰任何 slot。
 func (a *App) emitCodexBroadcast(method string, params json.RawMessage) {
-	a.manager.EmitWorkspace(codexBroadcastEventKind, nil, map[string]any{
+	a.manager.EmitWorkspace(string(contract.KindCodexBroadcast), nil, map[string]any{
 		"provider": "codex", "method": method, "params": json.RawMessage(params)})
 }
 
@@ -4899,7 +4905,7 @@ func (a *App) emitCodexBroadcast(method string, params json.RawMessage) {
 // method），遷移前的 KindUnknown 事件是保留 raw 的，換到 workspace lane 之後同樣
 // 不能把它丟掉，否則故障排查時證據會憑空消失。
 func (a *App) emitCodexUnknownBroadcast(raw []byte) {
-	a.manager.EmitWorkspace(codexBroadcastEventKind, nil, map[string]any{
+	a.manager.EmitWorkspace(string(contract.KindCodexBroadcast), nil, map[string]any{
 		"provider": "codex", "raw": string(raw)})
 }
 
@@ -5092,8 +5098,6 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 		approvalPolicy = "untrusted"
 	}
 	runner := codex.NewThreadRunner(conn)
-	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
-	defer cancel()
 
 	// 錄流先於 EnsureThread 開啟——thread/start｜resume 屬 session wire 的一部分，
 	// 必須進錄流（W6：codex resume 以 JSON-RPC 錄流佐證）。
@@ -5138,6 +5142,12 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 	}
 	defer endPending()
 
+	// 30s 預算在**取得鎖之後**才起算（review Minor）：建在 Lock 之前的話，第二筆
+	// start 在鎖上等前一筆 EnsureThread 的時間會全數從自己的預算扣掉，可能連
+	// thread/start 都還沒送出就 context deadline exceeded——有界但訊息誤導。
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+
 	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
 	if err != nil {
 		finalizeLease() // 錄流已開：EnsureThread 失敗須收尾
@@ -5180,12 +5190,16 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 // 這個 host——才撤路由與 finalize；順序反過來的話，dispatcher 可能剛好把一個
 // frame 路由到一個 lease 已經 finalize 的 host。
 //
-// host 為 nil（該 WSID 沒有 live codex session）回 nil no-op：codex 的 teardown
-// 唯一的處置對象就是 host 自己，沒有 host 就沒有東西要收，也不該發 session:done
-// 讓 UI 以為剛結束了一個 session（Claude 那邊回 error 是因為 NewSession 的失敗
-// 路徑依賴它，codex 沒有對應依賴）。
+// host 為 nil：**仍發 session:done**（與 Task 9 之前的 codexTeardown(nil lease)
+// 逐字一致）。review 指出這是 UI 可見行為、不在凍結清單內，裁決要求二選一，這裡
+// 選「恢復發送」——這條路徑的唯一可達形狀是「Manager slot 仍 phaseActive、但 host
+// 已不在 registry」（EndSessionFlow 只在 BeginEndSession 成功時才呼叫 teardown）。
+// 那正是 UI 最需要 session:done 的時刻：不發的話，收尾流程會把 slot 收回 idle，
+// 而前端那個 session 永遠停在「執行中」。沒有 host 就沒有 lease／track 可收，
+// 因此只發事件、回 nil。
 func (a *App) codexTeardown(h *sessionHost) error {
 	if h == nil {
+		a.emitCodexSessionDone("")
 		return nil
 	}
 	a.takeHost(h)
@@ -5195,17 +5209,23 @@ func (a *App) codexTeardown(h *sessionHost) error {
 		err = h.lease.Finalize(ports.Exit{Exited: false}) // 冪等：重複 teardown 不會重複收尾
 	}
 	h.track.NoteEnded()
-	stderr := ""
-	if srv, serr := a.currentAppServer(); serr == nil {
-		stderr = srv.StderrSnapshot()
-	}
 	var recErrText string
 	if err != nil {
 		recErrText = err.Error()
 	}
-	a.emit("session:done", map[string]any{"provider": "codex",
-		"processStillRunning": true, "stderrTail": stderr, "recorderError": recErrText})
+	a.emitCodexSessionDone(recErrText)
 	return err
+}
+
+// emitCodexSessionDone：codex 收尾的 UI 事件（長駐 server 不隨 session 退出，
+// 因此 processStillRunning 恆為 true、stderr 取 live snapshot）。
+func (a *App) emitCodexSessionDone(recorderErr string) {
+	stderr := ""
+	if srv, serr := a.currentAppServer(); serr == nil {
+		stderr = srv.StderrSnapshot()
+	}
+	a.emit("session:done", map[string]any{"provider": "codex",
+		"processStillRunning": true, "stderrTail": stderr, "recorderError": recorderErr})
 }
 
 // RestartCodexServerRecorded：B1 受控重啟 probe（薄封裝 codex.RunHandshakeProbe，

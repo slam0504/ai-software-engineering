@@ -39,6 +39,12 @@ const (
 	MethodAccountRateLimitsUpdated = "account/rateLimits/updated"
 	MethodMCPServerStartupStatus   = "mcpServer/startupStatus/updated"
 	MethodThreadGoalCleared        = "thread/goal/cleared"
+
+	// MethodRemoteControlStatusChanged：Task 0 live probe 實測到的 server 級廣播
+	// （不帶 threadId）。**刻意不列入 ServerNotifications**——它不在 pinned schema
+	// 的 ServerNotification 列表內，維持走 OnUnknown 的既有路由；這個常數只是讓
+	// method 名稱在 repo 內只有一份（app 層的廣播白名單引用它）。
+	MethodRemoteControlStatusChanged = "remoteControl/status/changed"
 )
 
 // ClientMethods 是 M0 會送出的 c2s 方法集（replay 的 c2s 驗證依據）。

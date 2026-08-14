@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -345,7 +346,7 @@ func TestCodexServerBroadcastsDoNotFailLoud(t *testing.T) {
 	broadcasts := 0
 	ui.mu.Lock()
 	for _, e := range ui.envs {
-		if e.Scope == "workspace" && e.Kind == codexBroadcastEventKind {
+		if e.Scope == "workspace" && e.Kind == string(contract.KindCodexBroadcast) {
 			broadcasts++
 		}
 	}
@@ -362,13 +363,245 @@ func TestCodexServerBroadcastsDoNotFailLoud(t *testing.T) {
 	sawRaw := false
 	ui.mu.Lock()
 	for _, e := range ui.envs {
-		if e.Kind == codexBroadcastEventKind && strings.Contains(string(e.Payload), "garbage") {
+		if e.Kind == string(contract.KindCodexBroadcast) && strings.Contains(string(e.Payload), "garbage") {
 			sawRaw = true
 		}
 	}
 	ui.mu.Unlock()
 	if !sawRaw {
 		t.Fatal("解不開的 frame 必須以 raw 形式保留在 workspace lane")
+	}
+}
+
+// review Important 迴歸（notification 形態）：pending start **窗口內**，缺 identity
+// 的 frame 一樣必須 fail loud。pending tier 的存在理由是「frame 帶著 client 還不知道
+// 的 threadId」，從來不是為「完全沒有 identity 的 frame」準備的；少了 identity 非空
+// 的條件，一筆 server bug 造成缺 threadId 的白名單通知只要剛好落在窗口內，就會被靜默
+// 塞進「正在啟動的那個 session」。
+//
+// 既有的 TestCodexUnattributableFrameFailsLoud 測不到這個形狀：它的缺 identity 斷言
+// 跑在 start 完成之後，pending 早已清空。
+func TestCodexMissingIdentityNotificationInPendingWindowFailsLoud(t *testing.T) {
+	a, ui := newTestApp(t)
+	probe := newPendingWindowProbe(t, a)
+
+	var windowOpenErr, noIdentityErr error
+	probe.script.beforeStartResponse = func(threadID string) {
+		// 自我校驗：這一刻 pending 窗口確實開著（否則本測試什麼都守不住）。
+		probe.noteWindowOpen(threadID)
+		windowOpenErr = a.dispatchCodexNotification(codex.MethodThreadStarted,
+			fmt.Appendf(nil, `{"threadId":%q}`, threadID))
+		// 白名單內、但缺 identity 的 thread-scoped 通知
+		noIdentityErr = a.dispatchCodexNotification(codex.MethodThreadStatusChanged,
+			[]byte(`{"status":"idle"}`))
+	}
+	probe.start(t)
+	probe.assertWindowWasOpen(t, windowOpenErr)
+
+	if noIdentityErr == nil {
+		t.Fatal("pending 窗口內缺 identity 的白名單通知必須 fail loud")
+	}
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	for _, e := range ui.envs {
+		if e.Scope == "workspace" { // fail-loud 通知本來就走 workspace lane
+			continue
+		}
+		if strings.Contains(string(e.Raw), codex.MethodThreadStatusChanged) {
+			t.Fatalf("缺 identity 的通知落進 session slot：%+v", e)
+		}
+	}
+}
+
+// review Important 迴歸（approval 形態）：後果比 notification 更重——核可對話框會掛到
+// 「正在啟動的那個 session」而不是 fail loud ＋ fail-closed decline。這正是本 task 的
+// 核心動機形狀。
+func TestCodexMissingIdentityApprovalInPendingWindowFailsClosed(t *testing.T) {
+	a, ui := newTestApp(t)
+	probe := newPendingWindowProbe(t, a)
+
+	var (
+		decision     string
+		decided      bool
+		dialogRaised bool
+	)
+	probe.script.beforeStartResponse = func(threadID string) {
+		probe.noteWindowOpen(threadID)
+		// 觀察必須完整發生在 pending 窗口**之內**：hook 一返回，wire 就會送出
+		// thread/start response、窗口隨即關閉，之後才跑的 approval 測不到本測試
+		// 要守的東西。
+		//
+		// codexApproval 本身開 goroutine 跑：歸屬成功的 approval 會阻塞等使用者
+		// 裁決，在 hook 裡同步呼叫會連帶卡住 response，把「掛到錯的 session」這個
+		// 症狀掩蓋成 EnsureThread 逾時。這裡改為在窗口內輪詢兩個確定性觀察點——
+		// 「立即回 decline」（正確）或「掛出核可對話框」（錯誤）。
+		dialogsBefore := len(ui.find("approval:request"))
+		done := make(chan string, 1)
+		go func() {
+			done <- a.codexApproval(codex.MethodCmdExecRequestApproval,
+				[]byte(`{"itemId":"exec-1","command":"rm -rf /"}`))["decision"]
+		}()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case d := <-done:
+				decision, decided = d, true
+				return
+			default:
+			}
+			if len(ui.find("approval:request")) != dialogsBefore {
+				dialogRaised = true
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	probe.start(t)
+	probe.assertWindowWasOpen(t, nil)
+
+	if dialogRaised {
+		t.Fatal("缺 identity 的 approval 不得掛出核可對話框（會掛到正在啟動的那個 session）")
+	}
+	if !decided {
+		t.Fatal("pending 窗口內缺 identity 的 approval 必須立即 fail closed，不得掛起等待裁決")
+	}
+	if decision != "decline" {
+		t.Fatalf("pending 窗口內缺 identity 的 approval 必須 fail closed：%q", decision)
+	}
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	for _, e := range ui.envs {
+		if e.Scope != "workspace" && e.Kind == string(contract.KindApproval) {
+			t.Fatalf("缺 identity 的 approval 落進 session slot：%+v", e)
+		}
+	}
+}
+
+// pendingWindowProbe：上面兩個測試共用的骨架——一個 codex WSID、一份 fake wire
+// script，並在 thread/start 的 pending 窗口內提供注入點。noteWindowOpen ＋
+// assertWindowWasOpen 是**測試自身的有效性檢查**：確認注入點真的跑了、而且那一刻
+// pending tier 真的能歸屬（否則「缺 identity 會 fail loud」會因為窗口根本沒開而恆真）。
+type pendingWindowProbe struct {
+	app     *App
+	script  *codexScript
+	wsid    appcore.WSID
+	hookRan bool
+	gotWSID appcore.WSID
+	gotOK   bool
+}
+
+func newPendingWindowProbe(t *testing.T, a *App) *pendingWindowProbe {
+	t.Helper()
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	p := &pendingWindowProbe{app: a, script: newCodexScript(t, wire, "th-pending")}
+	handshakeFake(t, conn)
+	p.wsid = mustCreate(t, a, "codex")
+	p.script.beforeTurnResponse = func(threadID, turnID string) { // 收掉 turn，末尾才 End 得掉
+		p.script.completeTurn(threadID, turnID)
+	}
+	a.codexHostOverride = fakeCodexHost{conn}
+	return p
+}
+
+func (p *pendingWindowProbe) noteWindowOpen(threadID string) {
+	p.hookRan = true
+	p.gotWSID, p.gotOK = p.app.codexWSIDFor(threadID, "")
+}
+
+func (p *pendingWindowProbe) start(t *testing.T) {
+	t.Helper()
+	a := p.app
+	if err := a.StartSession("codex", "hi", "", "", "task-pending", "untrusted"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession("codex") })
+}
+
+func (p *pendingWindowProbe) assertWindowWasOpen(t *testing.T, windowOpenErr error) {
+	t.Helper()
+	if !p.hookRan {
+		t.Fatal("pending 窗口的注入點未被執行，測試無效")
+	}
+	if !p.gotOK || p.gotWSID != p.wsid {
+		t.Fatalf("自我校驗失敗：窗口內帶 identity 的 frame 必須歸屬到 %s，got %s ok=%v",
+			p.wsid, p.gotWSID, p.gotOK)
+	}
+	if windowOpenErr != nil {
+		t.Fatalf("自我校驗失敗：窗口內帶 identity 的通知不得 fail loud：%v", windowOpenErr)
+	}
+}
+
+// 「同一時間至多一筆 pending start」是 codexWSIDFor 第三順位成立的前提，而它由
+// codexStartMu 保證。三個多 session 測試都是依序啟動，從未併發驅動過這條不變量
+// ——Task 26 前端能同時開兩個 codex session 之後，這裡是最先爆的地方。
+func TestCodexConcurrentStartsKeepPendingInvariant(t *testing.T) {
+	a, ui := newTestApp(t)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	script := newCodexScript(t, wire, "th-c1", "th-c2")
+	handshakeFake(t, conn)
+	w1, w2 := mustCreate(t, a, "codex"), mustCreate(t, a, "codex")
+
+	// 每次 thread/start 都在窗口內斷言 pending 只有一筆，並送一筆 thread/started
+	// ——歸屬錯了就會在下方的交叉檢查裡現形。
+	var maxPending atomic.Int64
+	script.beforeStartResponse = func(threadID string) {
+		a.mu.Lock()
+		n := int64(len(a.codexPendingStarts))
+		a.mu.Unlock()
+		for {
+			cur := maxPending.Load()
+			if n <= cur || maxPending.CompareAndSwap(cur, n) {
+				break
+			}
+		}
+		script.notify(codex.MethodThreadStarted, map[string]any{"threadId": threadID})
+	}
+
+	type res struct {
+		w      appcore.WSID
+		thread string
+		err    error
+	}
+	out := make(chan res, 2)
+	begin := make(chan struct{})
+	for _, w := range []appcore.WSID{w1, w2} {
+		go func() {
+			<-begin
+			th, _, err := a.startCodexHost(w, fakeCodexHost{conn}, "hi", "", "", "untrusted")
+			out <- res{w, th, err}
+		}()
+	}
+	close(begin)
+	r1, r2 := <-out, <-out
+	for _, r := range []res{r1, r2} {
+		if r.err != nil {
+			t.Fatalf("併發 start 不得失敗（%s）：%v", r.w, r.err)
+		}
+	}
+	if r1.thread == r2.thread {
+		t.Fatalf("兩個併發 session 必須拿到相異 thread：%s / %s", r1.thread, r2.thread)
+	}
+	if got := maxPending.Load(); got != 1 {
+		t.Fatalf("codexStartMu 必須保證同時至多一筆 pending start，實測峰值 %d", got)
+	}
+
+	// 每個 thread 各送一筆可辨識的 delta，確認事件不互串。
+	script.notify(codex.MethodAgentMessageDelta,
+		map[string]any{"threadId": r1.thread, "delta": "only-" + string(r1.w)})
+	script.notify(codex.MethodAgentMessageDelta,
+		map[string]any{"threadId": r2.thread, "delta": "only-" + string(r2.w)})
+	waitFor(t, "兩個 WSID 各自收到自己的 delta", func() bool {
+		return containsText(envsForWSID(ui, r1.w), "only-"+string(r1.w)) &&
+			containsText(envsForWSID(ui, r2.w), "only-"+string(r2.w))
+	})
+	if containsText(envsForWSID(ui, r1.w), "only-"+string(r2.w)) ||
+		containsText(envsForWSID(ui, r2.w), "only-"+string(r1.w)) {
+		t.Fatal("併發 start 之後事件互串")
+	}
+	if errs := dispatchErrors(ui); len(errs) != 0 {
+		t.Fatalf("併發 start 全程不得 fail loud：%+v", errs)
 	}
 }
 
