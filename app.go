@@ -100,6 +100,14 @@ type App struct {
 	codexLease   *appcore.RecordingLease
 	codexLoginID string
 
+	// sessionHosts（M3b Phase 2 Task 7，§3.3）：per-WSID 版本的單例 ownership，
+	// 逐步取代上方 broker／claudeSess／…／codexLease 等 App 級單例欄位。本欄位
+	// 目前是 additive 中間狀態——尚未有任何寫入端／讀取端，既有單例欄位仍是
+	// production 路徑唯一真實來源；Task 8（Claude）／Task 9（Codex）才會分別把
+	// 對應欄位遷過來並刪掉舊欄位。存取一律經 session_host.go 的
+	// hostFor／putHost／dropHost／snapshotHosts／hostsOf，在 a.mu 下操作。
+	sessionHosts map[appcore.WSID]*sessionHost
+
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
 
