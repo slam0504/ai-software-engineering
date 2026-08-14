@@ -134,6 +134,12 @@ func (idx *Index) loadCheckpoint() error {
 // 的預期情形，修復機制是「掃 audit suffix 補索引」，不要求 checkpoint 逐事
 // 件同步。記憶體中的 checkpointOffset／checkpointLastEventID 仍逐事件更新
 // （Checkpoint() 讀的是這份即時值），只有實際落盤動作被節流。
+//
+// 落後量精確描述：checkpointOffset／checkpointLastEventID 是單一全域欄位，
+// 不是 per-WSID，所以落後量**不是**「最多一個 turn」——M3b 常態是多個 WSID
+// 同時各自有 open turn 並行推進 delta，此時落後量是「所有目前開著的 turn
+// 自各自上次 boundary 以來累積的事件量之和」。這個節流也打開了一個正常關
+// 閉會踩到的缺口（不該依賴 crash 修復機制解決）：見 Flush。
 func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -283,6 +289,22 @@ func (idx *Index) Checkpoint() (int64, string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	return idx.checkpointOffset, idx.checkpointLastEventID
+}
+
+// Flush：強制把記憶體中目前的 checkpoint 狀態（含所有 WSID 的
+// open_turn_start_offset）落盤，冪等。
+//
+// Observe 把 checkpoint 落盤節流到 turn boundary（見 Observe 的說明）之後，
+// 正常關閉也會踩到一個原本不存在的缺口：若 app 在某個 WSID 的 turn 仍開著
+// 時被正常關閉，checkpoint 會停在上一個 boundary，效果跟 crash 沒有兩
+// 樣，得靠啟動期「掃 audit suffix 補索引」的修復機制補回來。正常關閉不該
+// 依賴 crash 修復機制——這個缺口是節流造成的，補救也該在本套件裡：呼叫端
+// （Task 20 起，Manager 的收尾／shutdown 路徑）應在關閉序列裡呼叫 Flush，
+// 確保 checkpoint 反映關閉當下記憶體中的即時 offset。
+func (idx *Index) Flush() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.writeCheckpointFile()
 }
 
 func capTail(recs []TurnRecord, n int) []TurnRecord {

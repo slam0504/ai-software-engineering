@@ -1,6 +1,7 @@
 package replayindex
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,21 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
+
+// readCheckpointOffset：直接解析 checkpoint.json 的 offset 欄位（package 內
+// 測試可直接用 checkpointFile，不必另建 exported 讀取路徑）。
+func readCheckpointOffset(t *testing.T, path string) int64 {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cf checkpointFile
+	if err := json.Unmarshal(b, &cf); err != nil {
+		t.Fatal(err)
+	}
+	return cf.Offset
+}
 
 // feedUserMsg：canonical user message（turn 起點）。
 func feedUserMsg(t *testing.T, i *Index, wsid string, off int64) {
@@ -219,6 +235,55 @@ func TestCheckpointOnlyPersistsAtTurnBoundary(t *testing.T) {
 	}
 	if string(afterClose) == string(before) {
 		t.Fatal("turn 收尾必須落盤 checkpoint")
+	}
+}
+
+// TestFlushPersistsCurrentOffset：mutation 驗證——正常關閉不該依賴 crash
+// 修復機制補 checkpoint。開一個 turn（此時磁碟落盤），餵幾個 delta（節流下
+// 磁碟停在原地、記憶體已領先），呼叫 Flush()，斷言磁碟已追上記憶體的即時
+// offset；並驗證 Flush 冪等（無新事件時重複呼叫，內容不再變動）。
+func TestFlushPersistsCurrentOffset(t *testing.T) {
+	dir := t.TempDir()
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "checkpoint.json")
+
+	feedUserMsg(t, i, "w1", 0) // boundary：磁碟落盤 offset=10
+	staleOnDisk := readCheckpointOffset(t, path)
+
+	for k := 0; k < 3; k++ {
+		feed(t, i, "w1", string(contract.KindDelta), "", int64(10+k*10))
+	}
+	if got := readCheckpointOffset(t, path); got != staleOnDisk {
+		t.Fatalf("前置條件錯：非終止事件不應改動磁碟，got=%d want=%d", got, staleOnDisk)
+	}
+	memOff, _ := i.Checkpoint()
+	if memOff == staleOnDisk {
+		t.Fatal("前置條件錯：記憶體 offset 應已領先磁碟，否則本測試無法區分 Flush 有沒有生效")
+	}
+
+	if err := i.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := readCheckpointOffset(t, path); got != memOff {
+		t.Fatalf("Flush 後磁碟必須反映即時 offset：got=%d want=%d", got, memOff)
+	}
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Flush(); err != nil {
+		t.Fatalf("Flush 必須冪等（無新事件時重複呼叫不得報錯）：%v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("無新事件時重複 Flush 內容應不變：before=%s after=%s", before, after)
 	}
 }
 
