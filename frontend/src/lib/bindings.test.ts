@@ -5,6 +5,7 @@ const h = vi.hoisted(() => ({
   SendMessage: vi.fn(async () => {}),
   CreateSession: vi.fn(async () => 'wsid-1'),
   RecoverCodexRecording: vi.fn(async () => {}),
+  LoadTurnsBefore: vi.fn(async () => []),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
   RunEvidence: vi.fn(async () => 'evidence-id'),
   EvidenceGet: vi.fn(async () => ({})),
@@ -49,6 +50,17 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.RecoverCodexRecording()
     expect(h.RecoverCodexRecording).toHaveBeenCalledWith()
+  })
+
+  // M3b Task 20：LoadTurnsBefore 是 §3.8 的視窗化載入／向上分頁，三個參數且
+  // 順序（wsid, beforeEventID, n）不能互換——把 cursor 與 wsid 對調會安靜地
+  // 回一個空頁，UI 只會看起來「沒有更舊的訊息」。
+  it('LoadTurnsBefore 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.LoadTurnsBefore('w1', 'e100', 20)
+    expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w1', 'e100', 20)
+    await b.LoadTurnsBefore('w2', '', 20)
+    expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w2', '', 20)
   })
 
   // Task 22：TCA workspace 六個新綁定，逐一鎖參數順序與名稱——Go 測試驗不到

@@ -1,10 +1,11 @@
 import {
-  StartSession, SendMessage, CreateSession, RecoverCodexRecording,
+  StartSession, SendMessage, CreateSession, RecoverCodexRecording, LoadTurnsBefore,
   RegisterMutation, RunEvidence, EvidenceGet, SubmitTestContract, ValidateTestCommit, EvidenceCommitCandidates,
   EscalationList, EscalationCreate, EscalationAck, EscalationResolve,
 } from '../../wailsjs/go/main/App'
 import type {
-  Bindings, WorkspaceSessionBindings, CodexRecordingBindings, EvidenceBindings, EscalationBindings,
+  Bindings, WorkspaceSessionBindings, CodexRecordingBindings, TurnWindowBindings,
+  EvidenceBindings, EscalationBindings,
 } from '../types'
 
 // production bindings adapter（M1.5 第三輪 review P1-1：SendMessage 必須
@@ -12,17 +13,19 @@ import type {
 // TCA workspace 六個綁定、Task 25 加入 escalation 收件匣四個綁定，同一教訓
 // 套用：多參數呼叫每個都逐參數轉發、順序與 Go 簽章一致（見 bindings.test.ts）。
 // M3b Task 4 加入 CreateSession（純新增，多參數）——同一教訓再套一次；
-// Task 13 加入無參數的 RecoverCodexRecording（§3.4.6 錄流 latch 的復原入口）。
+// Task 13 加入無參數的 RecoverCodexRecording（§3.4.6 錄流 latch 的復原入口）；
+// Task 20 加入 LoadTurnsBefore（§3.8 視窗化載入／向上分頁，三個參數）。
 // 回傳型別交集 Bindings & WorkspaceSessionBindings & EvidenceBindings &
 // EscalationBindings：session store 只取用 Bindings 那兩個欄位，App.vue 把其餘
 // 綁定個別當 prop 傳給 TcaWorkspace／EscalationInbox 等元件。
 export function makeBindings(): Bindings & WorkspaceSessionBindings & CodexRecordingBindings
-  & EvidenceBindings & EscalationBindings {
+  & TurnWindowBindings & EvidenceBindings & EscalationBindings {
   return {
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
     SendMessage: (p, t) => SendMessage(p, t),
     CreateSession: (p, taskLabel) => CreateSession(p, taskLabel),
     RecoverCodexRecording: () => RecoverCodexRecording(),
+    LoadTurnsBefore: (wsid, beforeEventID, n) => LoadTurnsBefore(wsid, beforeEventID, n),
     RegisterMutation: (taskRef, patch) => RegisterMutation(taskRef, patch),
     RunEvidence: (expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID) =>
       RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID),

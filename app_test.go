@@ -19,6 +19,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/replayindex"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 )
 
@@ -117,7 +118,16 @@ func newTestApp(t *testing.T) (*App, *uiCapture) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.manager = appcore.New(appcore.Config{Sink: sink, Emit: ui.emitEnv})
+	a.eventSink = sink
+	// Task 20：replay index 接進 production 路徑（Manager 的同一個 mutex 內
+	// Observe）。所有既有測試因此也走 index 接線，不必各自另外組裝。
+	idx, err := replayindex.OpenWith(filepath.Join(a.stateDir, "replay-index"),
+		replayindex.Config{Notify: a.onIndexDegraded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.replayIndex = idx
+	a.manager = appcore.New(appcore.Config{Sink: sink, Emit: ui.emitEnv, Index: indexOrNil(idx)})
 	rs, err := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
 	if err != nil {
 		t.Fatal(err)

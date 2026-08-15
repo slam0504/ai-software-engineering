@@ -54,6 +54,13 @@ export interface WorkspaceSessionBindings {
 export interface CodexRecordingBindings {
   RecoverCodexRecording(): Promise<void>
 }
+// TurnWindowBindings：M3b Task 20 純新增的 LoadTurnsBefore——§3.8 的視窗化載入
+// 與向上分頁。beforeEventID 為空＝尾端視窗（最近 n 個完整 turn ＋未結束的目前
+// turn）；帶 cursor＝該 turn 之前的 n 個完整 turn。回傳 Envelope[]，但 pane 的
+// lazy load 接線是 Task 29 的事，這裡同樣不提前擴大 Bindings。
+export interface TurnWindowBindings {
+  LoadTurnsBefore(wsid: string, beforeEventID: string, n: number): Promise<Envelope[]>
+}
 // EvidenceBindings：Task 22 TCA workspace 六個多參數 Go 綁定——同 SendMessage
 // 的既定教訓（M1.5 review P1-1），每個 adapter 都逐參數轉發，順序鎖在
 // bindings.test.ts。獨立於 Bindings（session store 用）之外，makeBindings()

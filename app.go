@@ -34,6 +34,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/plan"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
+	"github.com/slam0504/sdlc-workbench/internal/replayindex"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
@@ -64,6 +65,19 @@ type App struct {
 	registry *claude.Registry
 	manager  *appcore.Manager
 	restore  *restoreStore
+
+	// M3b §3.5：per-WSID turn 索引（Task 15-19 的 replayindex.Index）。nil 代
+	// 表這次啟動沒有可用的 index——index 只是快取，缺它不影響 audit 權威性，
+	// 但 §3.8 的視窗化載入與 §3.2.3 的 incomplete turn 偵測會一併停用（兩者
+	// 都以 index 為唯一來源，不另做一份掃描實作）。
+	replayIndex *replayindex.Index
+
+	// eventSink：events.jsonl 的具體 sink。Manager 只需要 appcore.AuditSink，
+	// 這裡另外留一份具體型別**只為了 End()**——replayindex 的 auditEndFunc 契
+	// 約要求「不得取 emit mutex、且不持鎖時也能安全讀」，唯一滿足的來源就是
+	// sink 內部那個 atomic offset（見 appcore.JSONLSink.End）。開檔失敗時為
+	// nil，此時不接 index。
+	eventSink *appcore.JSONLSink
 
 	// M3b §3.1：workspace session 的 durable metadata store（Task 2 的
 	// wsregistry.Store；由 Task 6 的 registry 載入流程接上）。介面而非具體型別，
@@ -184,6 +198,32 @@ type App struct {
 	shutMu       sync.Mutex
 	shuttingDown bool
 	inflight     sync.WaitGroup
+
+	// ---- replay index 的 runtime 重建排程（§3.5.7；rebuild_orchestrator.go）----
+	//
+	// rebuildMu 保護以下五個欄位。single-flight 由 rebuildRunning 保證：
+	// replayindex.RuntimeRebuild 自己也會對重入回 ErrRebuildInProgress，但
+	// 「不得疊呼叫」的責任在排程這一側——ErrRebuildNotConverged 的 backoff 重
+	// 試若每次 degraded 通知都另起一條，會直接疊出多條互相回錯的重試鏈。
+	rebuildMu      sync.Mutex
+	rebuildRunning bool
+	rebuildCancel  context.CancelFunc
+	rebuildDone    chan struct{}   // 本輪重試迴圈結束時關閉（shutdown 的等待點）
+	rebuildStarts  int             // RuntimeRebuild 實際被呼叫的次數（測試斷言用）
+	rebuildDelays  []time.Duration // 每次未收斂之後實際等待的 backoff（同上）
+
+	// rebuildBackoffBase：backoff 首段長度（0 = defaultRebuildBackoffBase）。
+	// 測試注入小值，production 不設。
+	rebuildBackoffBase time.Duration
+
+	// hookStartupStep／hookRebuildEntered／hookRebuildResult：測試注入。
+	// hookStartupStep 是 §3.2.4 凍結啟動順序的探針；hookRebuildEntered 落在
+	// 每次 RuntimeRebuild 呼叫之前；hookRebuildResult 非 nil 時**取代**真正的
+	// RuntimeRebuild（參數是本輪第幾次嘗試，1-based），用來驅動未收斂→backoff
+	// →成功這條時序而不必真的把 audit 灌到不收斂。production 恆為 nil。
+	hookStartupStep    func(step string)
+	hookRebuildEntered func()
+	hookRebuildResult  func(attempt int) error
 
 	emitUI                  func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart  func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
@@ -631,6 +671,7 @@ func knownProvider(p string) bool { return slices.Contains(knownProviders, p) }
 // 的 API（Task 22 才有），「還原到一半失敗再回滾」根本做不到，所以用驗證取代
 // 回滾——驗證不過就一筆都不還原，不留 Manager 與 registry 不一致的半還原狀態。
 func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
+	a.startupStep("registry_load")
 	path := filepath.Join(a.stateDir, "workspace-sessions.json")
 	store, err := wsregistry.Open(path)
 	if err != nil {
@@ -642,6 +683,7 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	}
 	// Migrated() 在 Migrate 內也會再檢查一次（冪等由那裡保證）；這裡先擋一層
 	// 只為省掉 legacyEntries 對 events.jsonl 的掃描——正常啟動每次都會走到。
+	a.startupStep("migrate")
 	if !store.Migrated() {
 		legacy, lerr := a.legacyEntries()
 		if lerr != nil {
@@ -702,6 +744,7 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	}
 
 	// Pass 2：驗證通過才真的還原。
+	a.startupStep("restore_dormant")
 	for _, e := range restorable {
 		if rerr := a.manager.RestoreDormant(appcore.WSID(e.WSID), contract.Provider(e.Provider)); rerr != nil {
 			return nil, fmt.Errorf("app: restore dormant wsid=%s provider=%s: %w", e.WSID, e.Provider, rerr)
@@ -719,6 +762,133 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	}
 	a.wsReg = store
 	return restorable, nil
+}
+
+// startupStep：§3.2.4 凍結啟動順序的探針。步驟名代表「這個階段跑到了」，
+// 不是「這個階段做了事」——`migrate` 在 registry 已遷移時仍會發（該階段的
+// 工作就是判定要不要遷），`index_verify` 同理。唯一的例外是
+// `emit_stream_error`：它命名的是一個**動作**，只有真的補了修復事件才發，
+// 否則「重跑必須冪等」那條測試就會看到一個沒有事件的步驟。
+func (a *App) startupStep(step string) {
+	if a.hookStartupStep != nil {
+		a.hookStartupStep(step)
+	}
+}
+
+// restoreSessions：§3.2.4 的完整凍結序列。
+//
+//	registry_load → migrate → restore_dormant   （loadSessionRegistry，Task 6）
+//	→ index_verify → detect_incomplete → emit_stream_error
+//	→ open_ui（修復完才開放 UI 與 provider 啟動）
+//
+// 順序不可調換的兩個理由：(1) incomplete turn 的判定來源是 replay index 的
+// per-WSID open turn 狀態，index 必須先與 audit 對齊才問得出正確答案；
+// (2) 修復本身會 emit 事件、也會再寫回 index，若 UI／provider 已經開放，
+// 使用者送出的新 turn 會與修復事件交錯，`stream_error → failed` 可能落在新
+// turn 中間。
+//
+// 錯誤處置分兩級（刻意不同）：
+//   - registry 載入／遷移失敗 → 回錯，呼叫端據此不啟動 provider（§3.2.6）。
+//   - index 驗證／重建失敗 → **不回錯**。index 是快取，讓它擋住整個 app 啟
+//     動就是把快取升級成權威；改為 audit ＋ 啟動警告，跳過 incomplete turn
+//     修復（沒有可信的偵測來源就不猜）並照常開放 UI。
+func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
+	live, err := a.loadSessionRegistry()
+	if err != nil {
+		return nil, err
+	}
+
+	a.startupStep("index_verify")
+	indexUsable := a.replayIndex != nil
+	if indexUsable {
+		if verr := a.replayIndex.VerifyOrRebuild(a.eventsPath()); verr != nil {
+			indexUsable = false
+			a.audit("replay_index_verify_error", map[string]any{"error": verr.Error()})
+			a.noteStartupWarning("replay index 驗證／重建失敗（未完成 turn 修復本次跳過）：" + verr.Error())
+		}
+	}
+	if indexUsable {
+		if rerr := a.repairIncompleteTurns(live); rerr != nil {
+			// 修復本身失敗不阻擋啟動：受影響的只有那個 WSID 的 view 會停在未
+			// 完成 turn，其餘 session 完全正常。但必須 fail loud。
+			a.audit("startup_repair_error", map[string]any{"error": rerr.Error()})
+			a.noteStartupWarning("未完成 turn 修復失敗：" + rerr.Error())
+		}
+	} else {
+		a.startupStep("detect_incomplete") // 階段仍走到，只是沒有可信來源可偵測
+	}
+
+	a.openUIAndProviders()
+	return live, nil
+}
+
+// errAppRestartInterrupted：§3.2.3 的修復事件內容。文字是使用者在 transcript
+// 裡會看到的那一行，措辭凍結——前端與稽核都靠它辨識這是重啟修復、不是
+// provider 真的回報了錯誤。
+var errAppRestartInterrupted = errors.New("app restart: interrupted turn")
+
+// repairIncompleteTurns：§3.2.3 stuck busy 解除。某個 WSID 的最後一個 turn 未
+// 完成時，經 Manager emit 一筆帶 WSID 的 stream_error，由 reducer 追發
+// `state_change=failed` 結束該 turn。
+//
+// 「最後一個 turn 未完成」的唯一判定來源是 replay index 的 open turn 狀態——
+// 它就是 audit 的重放結果（VerifyOrRebuild 剛把它與 events.jsonl 對齊過），
+// 不另外實作一份 audit 尾掃描。
+//
+// **冪等**（§3.2.3 明文要求，crash 於修復中途、重啟重跑不得疊加）由同一個
+// 判定來源保證，不需要額外的「末筆是不是 app-restart stream_error」比對：
+// 補上的 stream_error 會導出 terminal `state_change=failed`，turn boundary 狀
+// 態機看到它就把該 WSID 的 turn 收掉。所以修復過的 WSID 下一次啟動不再有
+// open turn（不論是同一個 process 內重跑，或 crash 後重啟——後者由
+// VerifyOrRebuild 重掃 audit 得到相同結論）。
+//
+// 逐 WSID 的失敗不中斷其他 WSID（errors.Join 收集）：一個 session 的 slot 出
+// 問題不該讓其他 session 停在未完成 turn。WSID 排序後處理，讓多 session 的
+// 修復事件順序穩定、可重現。
+func (a *App) repairIncompleteTurns(entries []wsregistry.Entry) error {
+	a.startupStep("detect_incomplete")
+
+	var incomplete []wsregistry.Entry
+	for _, e := range entries {
+		if _, open := a.replayIndex.OpenTurnStart(e.WSID); open {
+			incomplete = append(incomplete, e)
+		}
+	}
+	if len(incomplete) == 0 {
+		return nil
+	}
+	slices.SortFunc(incomplete, func(x, y wsregistry.Entry) int { return strings.Compare(x.WSID, y.WSID) })
+
+	a.startupStep("emit_stream_error")
+	var errs []error
+	for _, e := range incomplete {
+		if err := a.manager.Emit(appcore.WSID(e.WSID), contract.Event{
+			Provider: contract.Provider(e.Provider),
+			Kind:     contract.KindStreamError,
+			Err:      errAppRestartInterrupted,
+			Raw:      []byte(`{"source":"app_restart_repair"}`),
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("wsid=%s: %w", e.WSID, err))
+		}
+	}
+	a.audit("startup_repaired_incomplete_turns",
+		map[string]any{"count": len(incomplete) - len(errs), "failed": len(errs)})
+	return errors.Join(errs...)
+}
+
+// openUIAndProviders：§3.2.4 的最後一步——修復序列全部跑完才開放。
+//
+// 目前的「開放」形式：發一則 workspace 級 UI 訊號。它不是門閂，門閂在結構
+// 上——startup() 是同步的，而 provider 相關入口（CreateSession → StartSession）
+// 全部要求 a.wsReg 已接線，那是本序列成功走完才發生的事。這裡刻意不另外加
+// 一道 beginAppTxn 級的 ready 閘：那會改變所有既有入口的行為，遠超本 task 的
+// 範圍，且在同步啟動下買不到額外保證。
+func (a *App) openUIAndProviders() {
+	a.startupStep("open_ui")
+	a.emit("workbench:ready", map[string]any{
+		"replay_index":  a.replayIndex != nil,
+		"startup_error": a.startupErr,
+	})
 }
 
 // emit：UI 事件唯一出口（wails EventsEmit 的可注入包裝）。
@@ -765,22 +935,40 @@ func (a *App) startup(ctx context.Context) {
 	if sink == nil { // manager 必須存在；sink 失敗已 fail loud 於 startupErr
 		auditSink = failedSink{reason: serr}
 	}
+	a.eventSink = sink
+	// replay index（§3.5）：必須在 Manager 之前開，才能一併接進 Config.Index。
+	// 開檔／checkpoint 解析失敗**不阻擋啟動**——index 是快取，audit 權威不受
+	// 影響；但要 fail loud（audit ＋ 啟動警告），因為此後 §3.8 視窗化載入與
+	// incomplete turn 偵測都會停用。sink 失敗時一併不接：沒有可信的 receipt
+	// 來源，index 只會累積錯的 offset。
+	if sink != nil {
+		idx, ierr := replayindex.OpenWith(filepath.Join(a.stateDir, "replay-index"),
+			replayindex.Config{Notify: a.onIndexDegraded})
+		if ierr == nil {
+			a.replayIndex = idx
+		} else {
+			a.audit("replay_index_open_error", map[string]any{"error": ierr.Error()})
+			a.noteStartupWarning("replay index 開啟失敗（視窗化載入停用，稽核不受影響）：" + ierr.Error())
+		}
+	}
 	a.manager = appcore.New(appcore.Config{
 		Sink: auditSink,
 		Emit: func(env contract.Envelope) { a.emit("workbench:event", env) },
 		// Task 4 live probe VERDICT=per-turn（turn2 output 9 << turn1 642）→ 累加制
 		ClaudeUsageCumulative: false,
+		Index:                 indexOrNil(a.replayIndex),
 	})
 	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
 	a.restore = rs
 	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
 		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
 	}
-	// M3b §3.2.4 前半段：載入／遷移 workspace-sessions.json → 還原 dormant slots。
-	// 必須在 restore store 開啟之後（legacy 遷移的來源）與 manager 建立之後。
-	// 失敗一律 fail loud：a.wsReg 維持 nil，CreateSession 早退，不以猜測的狀態
-	// 繼續（§3.2.6）。
-	if _, lerr := a.loadSessionRegistry(); lerr != nil {
+	// M3b §3.2.4 完整凍結序列：載入／遷移 registry → 還原 dormant slots →
+	// 驗證／重建 replay index → 偵測 incomplete turn → emit stream_error →
+	// 才開放 UI 與 provider 啟動。必須在 restore store 開啟之後（legacy 遷移
+	// 的來源）與 manager 建立之後。失敗一律 fail loud：a.wsReg 維持 nil，
+	// CreateSession 早退，不以猜測的狀態繼續（§3.2.6）。
+	if _, lerr := a.restoreSessions(); lerr != nil {
 		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
 		a.noteStartupWarning("session registry load failed: " + lerr.Error())
 	}
@@ -1191,12 +1379,26 @@ func (a *App) shutdown(ctx context.Context) {
 	a.stopPlanWatch()                          // 1a′) 停 plan/ watcher，同上理由
 	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
 	a.reclaimEvidenceRuns()                    // 1b′) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
+	a.cancelRebuild()                          // 1b″) 取消 replay index 重建重試迴圈並等它收斂（見其 doc）
 	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
 	if a.manager != nil {
 		_ = a.manager.Close() // 全部 finalize 之後才關 sink（pending queue abort+flush 兜底）
+	}
+	// replay index flush／checkpoint（§3.6.5 總序：**在 Manager.Close 之後**）。
+	// Manager.Close 會 flush pending queue，那些事件仍要進 index，所以 index
+	// 不得在它之前停止接收。
+	//
+	// 為什麼正常關閉需要這一步：checkpoint 落盤被節流到 turn boundary（見
+	// replayindex.Observe），關閉當下若有 WSID 的 turn 還開著，磁碟 checkpoint
+	// 會停在上一個 boundary——效果跟 crash 一樣，得靠下次啟動的補掃修復。正常
+	// 關閉不該依賴 crash 修復機制。
+	if a.replayIndex != nil {
+		if err := a.replayIndex.Flush(); err != nil {
+			a.audit("replay_index_flush_error", map[string]any{"error": err.Error()})
+		}
 	}
 	if o, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
 		// §3.4.2 的收尾總序（terminate → wait → stdout 汲取完成 → detach →

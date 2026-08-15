@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
+	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/replayindex"
 	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
@@ -30,7 +32,20 @@ func newTestAppAt(t *testing.T, stateDir string) *App {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.manager = appcore.New(appcore.Config{Sink: sink})
+	a.eventSink = sink
+	// Task 20：replay index 一併接上——§3.2.4 的後半段（index 驗證、incomplete
+	// turn 修復）以它為唯一判定來源，helper 不接就等於把整段序列測空。emitUI
+	// 與 Manager 的 Emit 也要給（修復會 emit 事件，nil func 會直接 panic）。
+	idx, err := replayindex.OpenWith(filepath.Join(stateDir, "replay-index"),
+		replayindex.Config{Notify: a.onIndexDegraded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.replayIndex = idx
+	a.emitUI = func(string, any) {}
+	a.manager = appcore.New(appcore.Config{Sink: sink,
+		Emit:  func(contract.Envelope) {},
+		Index: indexOrNil(idx)})
 	t.Cleanup(func() { _ = a.manager.Close() })
 	af, err := os.OpenFile(filepath.Join(stateDir, "audit.jsonl"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -166,7 +181,7 @@ func TestLoadRegistryTriggersMigrationOnce(t *testing.T) {
 }
 
 // TestMigrationPersistFailureBlocksProviderStart：MarkMigrated 落盤失敗
-//（stateDir 唯讀）必須 fail loud（§3.2.6）。本 task 不做 provider 啟動，
+// （stateDir 唯讀）必須 fail loud（§3.2.6）。本 task 不做 provider 啟動，
 // 「不啟動 provider」在現行程式碼的唯一可觀測形式是 registry 未接上 App ——
 // CreateSession 因此一律早退，不會有任何新 session 被建到未遷移的 registry 上。
 func TestMigrationPersistFailureBlocksProviderStart(t *testing.T) {
@@ -406,7 +421,7 @@ func seedRegistryRaw(t *testing.T, stateDir string, entries map[string]map[strin
 
 // TestInvalidEntriesSkippedWithoutPartialRestore（review #1）：手動編輯可造出
 // 兩種「Pass 1 放行、Pass 2 中途才爆」的 entry——WSID 欄位為空
-//（RestoreDormant 回 ErrSessionNotFound）與重複 WSID（回 ErrProviderMismatch）。
+// （RestoreDormant 回 ErrSessionNotFound）與重複 WSID（回 ErrProviderMismatch）。
 // 兩者都必須在 Pass 1 就被跳過，否則前面幾筆已還原、之後才失敗，就留下
 // 「Manager 有 slot、wsReg 為 nil」的半還原狀態。
 func TestInvalidEntriesSkippedWithoutPartialRestore(t *testing.T) {

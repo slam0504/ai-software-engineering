@@ -100,8 +100,8 @@ func TestJSONLSinkShortWriteRecalibratesOffset(t *testing.T) {
 		t.Fatal("want short-write error")
 	}
 	wantOffset := int64(fw.buf.Len()) // 真實檔案長度：含短寫落地的殘餘 bytes
-	if s.offset != wantOffset {
-		t.Fatalf("短寫後 offset 未重新校正：got %d want %d", s.offset, wantOffset)
+	if s.End() != wantOffset {
+		t.Fatalf("短寫後 offset 未重新校正：got %d want %d", s.End(), wantOffset)
 	}
 	r3, err := s.Write(contract.Envelope{EventID: "e3", Kind: "message"})
 	if err != nil {

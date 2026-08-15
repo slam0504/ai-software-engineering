@@ -52,10 +52,27 @@ type SessionToken struct{ gen, seq uint64 }
 // ResetToken：NewSession 的 reset ownership token（M1.5；plan §5.4）。
 type ResetToken struct{ gen, seq uint64 }
 
+// TurnIndex：replay index 的 Manager 側視角（*replayindex.Index 滿足）。
+// 介面而非具體型別是為了避免 import cycle——replayindex 依賴 appcore 的
+// AppendReceipt，反向依賴不成立。
+//
+// 契約（§3.5.4／§3.5.7）：
+//   - Observe 在 Manager 的序列化 mutex 內、**audit 寫入成功之後**被呼叫，
+//     所以 index 看到的順序與 events.jsonl 的 byte 順序完全一致；
+//   - **Observe 絕不能讓 provider turn 失敗**：實作端自行 latch degraded 並
+//     回 nil，Manager 這側也不因它的回傳值改變任何行為（見 writeAndEmitLocked）。
+type TurnIndex interface {
+	Observe(env contract.Envelope, receipt AppendReceipt) error
+}
+
 type Config struct {
 	Sink                  AuditSink                   // 必填
 	Emit                  func(env contract.Envelope) // 必填：UI 出口
 	ClaudeUsageCumulative bool                        // Task 4 VERDICT=per-turn → false（累加制）
+
+	// Index：replay index（可為 nil——index 只是快取，沒有它 Manager 行為
+	// 完全不變）。Task 20 接線；只有 App 的 production 啟動流程會填。
+	Index TurnIndex
 }
 
 type pendingEntry struct {
@@ -809,9 +826,22 @@ func (m *Manager) emitStateLocked(sl *slot, provider contract.Provider, sessionI
 
 func (m *Manager) writeAndEmitLocked(env contract.Envelope) {
 	// closed 已在所有公開入口最先攔截；emitLocked 不可能於 closed 後執行。
-	// receipt 本 task（Task 14）先接住、暫不使用——replay index 接線見 Task 20。
 	receipt, sinkErr := m.cfg.Sink.Write(env)
-	_ = receipt
+	if sinkErr == nil && m.cfg.Index != nil {
+		// §3.5.4 latch-but-not-block（凍結取捨）：index 只是快取，**它壞掉
+		// 絕不能讓 provider turn 失敗**。Observe 的契約是自行 latch degraded
+		// 並回 nil，所以這裡既不看回傳值、也不改變後續任何一步——事件照樣
+		// 出 UI、呼叫端照樣拿到成功。degraded 的可觀測性由 Config.Notify 那
+		// 條路徑負責（呼叫端會據此排程重建），不是靠這裡的錯誤傳播。
+		//
+		// 只在 sinkErr == nil 時餵：receipt 在寫入失敗時是零值，餵給
+		// index 會把 offset 0 當成真實位置，直接汙染 checkpoint。
+		//
+		// 位置固定在「同一個 mutex 內、Sink.Write 之後」：§3.5.7 的重建接回
+		// 要靠「取得這把鎖 = 凍結 audit 進度且 index 不會再前移」才有原子性，
+		// 把 Observe 移到鎖外就沒有那個保證了。
+		_ = m.cfg.Index.Observe(env, receipt)
+	}
 	m.cfg.Emit(env) // 原 envelope 先出（ID 較小），合成事件後出——輸出序嚴格遞增
 	if sinkErr != nil {
 		if m.auditErr == nil {
@@ -863,6 +893,15 @@ func (m *Manager) AuditErr() error {
 	defer m.mu.Unlock()
 	return m.auditErr
 }
+
+// EmitLocker：序列化「audit append ＋ index.Observe」的那一把鎖，供 replay
+// index 的 runtime 重建（§3.5.7 第 3 步）取得——重建的原子接回正是建立在
+// 「持有這把鎖期間不可能有新的 append」之上。
+//
+// 呼叫端契約：持有它時**不得呼叫任何 Manager 方法**（sync.Mutex 不可重入，
+// 當場自我死鎖），也不得跨 goroutine 傳遞 Unlock 的責任。目前唯一呼叫端是
+// App 的 rebuild orchestrator。
+func (m *Manager) EmitLocker() sync.Locker { return &m.mu }
 
 // Closed 回報 Manager 是否已 Close（shutdown 收束序 assert 用）。
 func (m *Manager) Closed() bool {

@@ -74,6 +74,10 @@ export function ListWorkspace(arg1) {
   return window['go']['main']['App']['ListWorkspace'](arg1);
 }
 
+export function LoadTurnsBefore(arg1, arg2, arg3) {
+  return window['go']['main']['App']['LoadTurnsBefore'](arg1, arg2, arg3);
+}
+
 export function Logout(arg1) {
   return window['go']['main']['App']['Logout'](arg1);
 }
