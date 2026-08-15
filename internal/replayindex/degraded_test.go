@@ -29,17 +29,6 @@ func userMsg(wsid string, k int) contract.Envelope {
 	}
 }
 
-// workspaceNotice：degraded 通知本身進 audit 時的事件形狀——非 canonical
-// user message、非 terminal state_change，因此不會被 turn 狀態機解讀成開／
-// 收 turn，單純用來驗證通知路徑不會遞迴觸發新的 index 失敗。
-func workspaceNotice(wsid string) contract.Envelope {
-	return contract.Envelope{
-		EventID:            wsid + "-notice",
-		Kind:               string(contract.KindSystemOther),
-		WorkspaceSessionID: wsid,
-	}
-}
-
 // receipt：offset k 對應的 AppendReceipt，供本檔測試共用。
 func receipt(k int) appcore.AppendReceipt {
 	off := int64(k) * 10
@@ -70,12 +59,21 @@ func TestIndexFailureDoesNotBreakAuditAndNotifiesOnce(t *testing.T) {
 	}
 }
 
+// TestNotificationEventDoesNotRecurse：Notify callback 內再呼叫 Observe，注
+// 入的事件必須是「真的會走到寫入路徑」的 canonical user message（開
+// turn）——用一個 turn 狀態機在分類階段就會直接忽略的事件（例如
+// system_other）測不出「先通知、後 latch」寫反的問題：那種事件不論 latch
+// 是否已生效都不會呼叫 writeCheckpointFile／appendTurnRecord，遞迴永遠沒有
+// 機會級聯，測試會恆真通過（re-review 2026-08-15 指出的缺陷，brief 原版即
+// 是這個弱化寫法）。這裡改用同樣會觸發開 turn 的 userMsg，讓遞迴真的有機會
+// 撞上 forceWriteErr 再次失敗、再次嘗試通知，才真正驗證到 latch 必須先於
+// Notify 生效這件事。
 func TestNotificationEventDoesNotRecurse(t *testing.T) {
 	var notices int
 	var i *Index
 	i, _ = OpenWith(t.TempDir(), Config{Notify: func(string) {
 		notices++
-		_ = i.Observe(workspaceNotice("w1"), receipt(99)) // 通知本身也進 audit
+		_ = i.Observe(userMsg("w1", 1), receipt(1)) // 通知本身也進 audit，且會嘗試開 turn
 	}})
 	i.ForceWriteErrForTest(errors.New("boom"))
 	_ = i.Observe(userMsg("w1", 0), receipt(0))
@@ -129,5 +127,44 @@ func TestClearDegradedOpensNextGeneration(t *testing.T) {
 	}
 	if !i.Degraded() || notices != 2 {
 		t.Fatalf("下一個 generation 應各自再通知一次：degraded=%v notices=%d", i.Degraded(), notices)
+	}
+}
+
+// TestOpenTurnFailureRollsBackTurnState：mutation 驗證（re-review 2026-08-15
+// Important finding）——開 turn 時 writeCheckpointFile 失敗，不能只回滾
+// checkpointOffset，連 turns[wsid] 的 open/startOffset/firstEventID 也要一起
+// 回滾。ClearDegraded 只重置 degraded／degradedErr／degradedNotified 三個欄
+// 位，不會動 turns map；若開 turn失敗那次留下 turns[wsid].open==true，latch
+// 解除後同一個 wsid 再送 canonical user message，狀態機會誤判成「已經在
+// turn 中」而直接忽略（!st.open 條件不成立），該 turn 就永遠不會入 index。
+func TestOpenTurnFailureRollsBackTurnState(t *testing.T) {
+	i, _ := OpenWith(t.TempDir(), Config{})
+	i.ForceWriteErrForTest(errors.New("boom"))
+
+	feedUserMsg(t, i, "w1", 0)
+	if !i.Degraded() {
+		t.Fatal("必須 latch degraded")
+	}
+	if _, ok := i.OpenTurnStart("w1"); ok {
+		t.Fatal("開 turn 失敗必須連同 turns map 一起回滾，不能留下已開的 turn")
+	}
+
+	i.ForceWriteErrForTest(nil)
+	i.ClearDegraded()
+
+	// 回滾若沒做，這裡 st.open 仍是 true，狀態機會把下面這則 canonical user
+	// message 直接忽略，永遠不會開新 turn。
+	feedUserMsg(t, i, "w1", 100)
+	if off, ok := i.OpenTurnStart("w1"); !ok || off != 100 {
+		t.Fatalf("回滾後應能重新開 turn：off=%d ok=%v", off, ok)
+	}
+
+	feed(t, i, "w1", string(contract.KindStateChange), string(contract.StateDone), 110)
+	turns, err := i.RecentTurns("w1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || turns[0].StartOffset != 100 {
+		t.Fatalf("回滾後的 turn 應能正常收尾入 index：%+v", turns)
 	}
 }

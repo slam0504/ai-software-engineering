@@ -194,6 +194,18 @@ func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) 
 			if werr := idx.writeCheckpointFile(); werr != nil {
 				idx.checkpointOffset = prevOffset
 				idx.checkpointLastEventID = prevEventID
+				// applyTurnState 對「開 turn」無條件先 mutate turns[wsid]、才
+				// 回 boundary=true；若接下來的 checkpoint 落盤失敗，這份
+				// turns map 的變動也要一併回滾，否則會停在「已開 turn」但
+				// checkpoint／稽核都不知情——latch 解除、開新 generation 之
+				// 後，同一 wsid 再收到 canonical user message 會被狀態機誤判
+				// 成「已經在 turn 中」而直接忽略，該 turn 永遠不入 index。
+				// 收 turn（terminal state_change）不需要對應回滾：
+				// appendTurnRecord 失敗時 applyTurnState 在 st.open=false
+				// 賦值之前就已經回錯，turns map 本來就沒被動過。
+				if isCanonicalUserMessage(env) {
+					idx.rollbackOpenedTurn(env.WorkspaceSessionID)
+				}
 				err = werr
 			}
 		}
@@ -303,6 +315,20 @@ func (idx *Index) applyTurnState(env contract.Envelope, receipt appcore.AppendRe
 		return true, nil
 	}
 	return false, nil
+}
+
+// rollbackOpenedTurn：呼叫端須持有 idx.mu。把 wsid 的 turnState 回滾成「未開
+// turn」——只在 Observe 的開 turn 分支因 writeCheckpointFile 失敗而需要回滾
+// 時呼叫（見 Observe）。只重置這一個 wsid，不影響其他 wsid 目前合法的 open
+// turn。
+func (idx *Index) rollbackOpenedTurn(wsid string) {
+	st, ok := idx.turns[wsid]
+	if !ok {
+		return
+	}
+	st.open = false
+	st.startOffset = 0
+	st.firstEventID = ""
 }
 
 func isCanonicalUserMessage(env contract.Envelope) bool {
