@@ -189,6 +189,9 @@ func TestRebuildCoversPreLockWindow(t *testing.T) {
 	if len(turns) != 3 {
 		t.Fatalf("鎖前窗口的事件必須被鎖內補掃涵蓋：%d", len(turns))
 	}
+	// 註：rev3 之後這條是**第二層**守衛。cursor 單調遞增（結構性預防）之外還
+	// 隔了一層去重，所以就算 cursor 不變量被破壞，這裡也不會變紅——守 cursor
+	// 的是 TestRebuildRetryResumesFromCursorWithoutRebulk 的段末斷言。
 	if dup := duplicateRanges(turns); dup != 0 {
 		t.Fatalf("不得產生重複 record：%d", dup)
 	}
@@ -256,6 +259,56 @@ func TestRuntimeRebuildRequiresDegraded(t *testing.T) {
 	}
 	if i.Degraded() {
 		t.Fatal("不得靜默補 latch")
+	}
+}
+
+// TestRuntimeRebuildIsSingleFlight：同一時間只能有一輪 RuntimeRebuild。
+// ErrNotDegraded 擋不住這個——兩輪並行時**兩邊都看到 degraded=true**。
+//
+// 並行的第二輪從段間窗口（hookBetweenScanSegments）進場，那正是 rev2 的分段釋
+// 放拉長的窗口：分段之前並行者大部分時間被擋在 idx.mu 上，分段之後它隨時進得
+// 來。用真的 goroutine ＋ channel 交握，不用 sleep：第一輪在段間停下來等第二輪
+// 回覆，時序完全確定。
+func TestRuntimeRebuildIsSingleFlight(t *testing.T) {
+	dir, audit := seedAuditWithTurns(t, 1)
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.latchDegraded(errors.New("seed"))
+
+	var emitMu sync.Mutex
+	var secondErr error
+	sawSecond := false
+	// 「只做一次」用 buffered channel 當 token，**不用 sync.Once**：single-flight
+	// 若被拿掉，第二輪會跑進自己的段間 hook，而 sync.Once.Do 會讓它**卡住等第
+	// 一次 Do 返回**，第一次 Do 又在等第二輪——測試變成 hang 而不是 FAIL，缺
+	// 陷訊號會被埋掉。select/default 讓非第一個呼叫者直接略過。
+	firstSegment := make(chan struct{}, 1)
+	firstSegment <- struct{}{}
+	i.hookBetweenScanSegments = func() {
+		select {
+		case <-firstSegment:
+		default:
+			return
+		}
+		done := make(chan error, 1)
+		go func() { done <- i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)) }()
+		secondErr = <-done
+		sawSecond = true
+	}
+
+	if err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)); err != nil {
+		t.Fatalf("第一輪應正常完成：%v", err)
+	}
+	if !sawSecond {
+		t.Fatal("測試前提不成立：第二輪從未在段間窗口進場")
+	}
+	if !errors.Is(secondErr, ErrRebuildInProgress) {
+		t.Fatalf("重入必須 fail loud，不得兩輪並行：%v", secondErr)
+	}
+	if i.Degraded() {
+		t.Fatal("第一輪成功應解除 latch")
 	}
 }
 
@@ -375,6 +428,8 @@ func TestRebuildOverLimitUnderLockUnlocksAndRetries(t *testing.T) {
 	if i.UnlockRetriesForTest() < 2 {
 		t.Fatalf("超限應立即解鎖重試：%d", i.UnlockRetriesForTest())
 	}
+	// 同 TestRebuildCoversPreLockWindow：rev3 之後這是第二層守衛，cursor 不變
+	// 量本身由 TestRebuildRetryResumesFromCursorWithoutRebulk 的段末斷言守。
 	if dup := duplicateRanges(mustTurns(t, i, "w1")); dup != 0 {
 		t.Fatalf("重試不得產生重複 record：%d", dup)
 	}
@@ -581,6 +636,16 @@ func TestRebuildRetryResumesFromCursorWithoutRebulk(t *testing.T) {
 
 	// 第二輪：停止灌入，殘量收斂得了。
 	i.hookAfterUnlockedCatchUp = nil
+	// **段末**斷言，不是只看輪末：cursor 若被重設回 checkpointOffset 再重掃，
+	// 輪末它一樣會回到 EOF，所以「輪末 cursor 沒倒退」量不到重跑 bulk。而且
+	// rev3 的去重會把重掃的 record 靜默略過，turn 數與 duplicateRanges 兩條也
+	// 一起失去牙齒——這條直接綁「cursor 單調遞增」這個不變量本身，不經由 turn
+	// 數、不受去重層影響。
+	i.hookBetweenScanSegments = func() {
+		if c := i.RebuildCursorForTest(); c < cursorAfterFirst {
+			t.Errorf("重試不得倒退重跑 bulk：段末 cursor %d < %d", c, cursorAfterFirst)
+		}
+	}
 	if err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)); err != nil {
 		t.Fatal(err)
 	}

@@ -93,6 +93,11 @@ type Index struct {
 	maxLockedScanBytes int64
 	lockSegments       int
 
+	// rebuilding：目前是否有一輪 RuntimeRebuild 正在進行（single-flight 旗
+	// 標）。與 degraded 檢查在**同一次 idx.mu 臨界區內**一起 CAS，見
+	// beginRebuildRun。
+	rebuilding bool
+
 	// rebuildSeen：重建期間的 turn record 去重集合，wsid -> `(StartOffset,
 	// LastEventID)` 鍵集。**nil 代表去重關閉**，這是 live 路徑（Observe）的常
 	// 態——live append 是單一 writer、offset 單調遞增，重複在結構上不可能，掛
@@ -571,6 +576,18 @@ func (idx *Index) appendTurnRecord(wsid string, rec TurnRecord) error {
 // turnRecordKey：turn record 的唯一鍵。StartOffset 是該 turn 的 canonical user
 // message 在 audit 中的起點、LastEventID 是收尾那筆 terminal state_change 的
 // id——兩者相同就是同一個 turn，不可能是不同的兩筆。
+//
+// **LastEventID 在目前的資料模型下對 StartOffset 功能相依**：events.jsonl 是
+// append-only 且永不裁切，同一個起點永遠指向同一筆事件、也就永遠導出同一個
+// turn。所以拿掉 LastEventID 不會改變任何行為，也**無法用測試綁住**（實測：把
+// 鍵改成只有 StartOffset，整個套件仍全綠）。這裡刻意不為它補測試——唯一能讓那
+// 個 mutation 變紅的方法是建構一個 production 到不了的狀態，那會把一個不存在的
+// 不變量凍進測試。
+//
+// 仍然保留它，理由有二：(1) §3.5.7 指定的就是這組鍵，一致性本身有價值；(2) 它
+// 是第二層——如果哪天 audit 換檔或被裁切（目前模型排除，但那是模型的保證、不是
+// 這個函式的），同一個 StartOffset 會指向不同事件，屆時 LastEventID 就是唯一能
+// 分辨的依據。**不要「順手簡化」掉它，也不要為了讓 mutation 變紅而補假測試。**
 func turnRecordKey(rec TurnRecord) string {
 	return fmt.Sprintf("%d|%s", rec.StartOffset, rec.LastEventID)
 }
@@ -601,9 +618,15 @@ func (idx *Index) endRebuildDedupLocked() {
 // turn record 的鍵集。每個 wsid 每次重建只讀一次檔案；turn record 每筆約 100
 // bytes，相對於整份 audit 掃描是雜訊。
 //
-// 惰性載入（而非重建開始時一次掃全部 wsid）有個必要性：checkpoint 不可信或中段
-// 損壞的路徑會先 quarantine 掉所有 *.turns.jsonl 再全量重掃，鍵集必須在那之後
-// 才建立，否則會拿被搬走的舊檔內容去擋新寫入。
+// 「鍵集必須在 quarantine 之後才建立」這個**要求**確實存在（checkpoint 不可信
+// 或中段損壞的路徑會先搬走所有 *.turns.jsonl 再全量重掃，拿舊檔內容建鍵集會擋
+// 掉正確的新寫入），但保證它的是**呼叫點位置**——resetTurnFilesLocked ／
+// repairTurnFileCorruptionLocked 都排在 rescanFromLocked 之前——不是惰性本身；
+// 以目前的接線，在 beginRebuildDedupLocked 當下一次載入全部 wsid 同樣安全。
+//
+// 惰性真正買到的是：只讀本次掃描實際碰到的 wsid（多 session 工作區常態是大部分
+// wsid 這一輪根本沒有新 turn），以及日後若把 begin 往上搬到 quarantine 之前也
+// 不會壞掉的耐受度。
 //
 // 刻意不重用 readTurnFileLocked：那個函式帶有損壞分級的副作用（尾端損壞會就地
 // truncate 磁碟檔案）與 *midCorruptionError 語意，去重只需要「檔案裡目前有哪些

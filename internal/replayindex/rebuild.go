@@ -472,6 +472,10 @@ var ErrRebuildNotConverged = errors.New("replayindex: catch-up 未收斂，保�
 // 以靜默容忍的狀況，見 RuntimeRebuild 的「前提」段落。
 var ErrNotDegraded = errors.New("replayindex: RuntimeRebuild 只服務 degraded latch，index 目前不是 degraded")
 
+// ErrRebuildInProgress：已經有一輪 RuntimeRebuild 在跑。single-flight 是強制
+// 的，見 beginRebuildRun。
+var ErrRebuildInProgress = errors.New("replayindex: 已有一輪 RuntimeRebuild 進行中")
+
 // RuntimeRebuild：app **運行中**（degraded latch 觸發）重建 turn 索引並把
 // writer 原子接回，實作 §3.5.7 凍結的五步序列。與啟動期的 VerifyOrRebuild 的
 // 關鍵差異是：這裡 provider turn 仍持續 append audit，所以**不能邊掃邊解除
@@ -498,6 +502,9 @@ var ErrNotDegraded = errors.New("replayindex: RuntimeRebuild 只服務 degraded 
 // I/O 錯誤（開檔、掃描、checkpoint 落盤失敗）不屬於這兩種分支，直接回傳原始
 // 錯誤，latch 同樣保留。
 //
+// **前提：single-flight**——同一時間只能有一輪 RuntimeRebuild，重入直接回傳
+// ErrRebuildInProgress，見 beginRebuildRun。
+//
 // **前提：index 必須已經處於 degraded latch**，否則回傳 ErrNotDegraded。這不
 // 是防禦性檢查而是本函式正確性的必要條件：整套「同一段 audit 只會被掃一次、
 // 所以不需要去重」的論證，隱含前提是重建期間 Observe 停著（degraded 時它是空
@@ -515,23 +522,10 @@ var ErrNotDegraded = errors.New("replayindex: RuntimeRebuild 只服務 degraded 
 // 鎖，且呼叫 RuntimeRebuild 時**不得已經持有它**（本函式自己取得）；auditEnd
 // 另有契約，見 auditEndFunc 的說明。
 func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd auditEndFunc) error {
-	if !idx.Degraded() {
-		return ErrNotDegraded
+	if err := idx.beginRebuildRun(); err != nil {
+		return err
 	}
-	idx.resetRebuildStats()
-
-	// 去重整輪開著（含分段掃描與第 5 步的鎖內補掃）：本輪的起掃點可能落在
-	// 「上一個 process 的重建已寫進 turn file」的區段之前，見
-	// beginRebuildDedupLocked。跨輪不保留鍵集——backoff 重試是新的一輪，重新
-	// 從磁碟載入才反映得出上一輪實際寫成功了哪些。
-	idx.mu.Lock()
-	idx.beginRebuildDedupLocked()
-	idx.mu.Unlock()
-	defer func() {
-		idx.mu.Lock()
-		idx.endRebuildDedupLocked()
-		idx.mu.Unlock()
-	}()
+	defer idx.endRebuildRun()
 
 	if err := idx.bulkRebuild(auditPath); err != nil { // 1. 掃至初始高水位（不持 emitMu）
 		return err
@@ -779,7 +773,14 @@ func (idx *Index) finalCatchUpAndAttach(auditPath string, end int64) error {
 	if err != nil {
 		return err
 	}
-	if info, serr := os.Stat(auditPath); serr == nil && info.Size() > idx.rebuildCursor {
+	info, serr := os.Stat(auditPath)
+	if serr != nil {
+		// stat 失敗不能當成「檢查通過」——那會讓這道護欄在最需要它的時候靜默
+		// 關掉，正好是它要防的失效模式。此刻持有 emitMu，audit 檔 stat 不到本
+		// 身就是異常訊號，回錯並保留 latch。
+		return fmt.Errorf("replayindex: stat audit %s（接回前的檔尾核對）: %w", auditPath, serr)
+	}
+	if info.Size() > idx.rebuildCursor {
 		return fmt.Errorf(
 			"replayindex: auditEnd 低報檔尾（回報 %d，實際到 %d 仍有未索引資料），保留 degraded latch",
 			end, info.Size())
@@ -797,18 +798,57 @@ func (idx *Index) finalCatchUpAndAttach(auditPath string, end int64) error {
 	return nil
 }
 
-// resetRebuildStats／countCatchUpAttempt／countUnlockRetry／countLockSegment：
-// 本輪統計的維護。統計是 per-call 的（每次 RuntimeRebuild 歸零），語意是「本輪
-// 用掉多少嘗試」，不是行程累計——backoff 重試是另一輪，各自有完整的嘗試界限。
-// rebuildCursor **不在**歸零範圍內：它是跨輪保留的索引進度（見 bulkRebuild）。
-func (idx *Index) resetRebuildStats() {
+// beginRebuildRun：一輪 RuntimeRebuild 的入口守衛。**兩個前提在同一次 idx.mu
+// 臨界區內一起檢查並 CAS**——分成兩次取鎖等於自己造一個 check-then-act 競態。
+//
+// single-flight 是強制的、不是文件約定（同 ErrNotDegraded 的標準：把呼叫端前提
+// 變成不變量）。兩輪並行會壞在兩處：
+//
+//   - A 跑完第 5 步、解除 latch、放掉 emitMu 之後，B 才取得 emitMu，卻帶著**過
+//     期的 end** 進 finalCatchUpAndAttach，把 checkpointOffset 覆寫成同樣過期的
+//     rebuildCursor——latch 已解除、Observe 早就推過 checkpoint（但不會推
+//     rebuildCursor），結果是 **checkpoint 倒退並落盤**。
+//   - A 的 endRebuildRun 會在 B 還在跑時把 rebuildSeen 設成 nil，兩者的
+//     begin/end 互踩，B 的去重靜默失效。
+//
+// 這個缺口是本 task 的分段釋放（見 scanSegmentBytes）放大的：分段之前 bulk 全程
+// 持 idx.mu，並行者大部分時間被擋在鎖上；分段之後窗口顯著拉長。Task 20 要接的
+// 正是最容易疊起來的形狀（ErrRebuildNotConverged → backoff 重試排程）。
+//
+// 一併在同一個臨界區做本輪初始化：統計歸零（per-call 語意，「本輪用掉多少嘗
+// 試」，不是行程累計）與開啟去重。rebuildCursor **不在**歸零範圍內：它是跨輪保
+// 留的索引進度（見 bulkRebuild）。去重整輪開著（含分段掃描與第 5 步的鎖內補
+// 掃），但跨輪不保留鍵集——backoff 重試是新的一輪，重新從磁碟載入才反映得出上
+// 一輪實際寫成功了哪些。
+func (idx *Index) beginRebuildRun() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	if !idx.degraded {
+		return ErrNotDegraded
+	}
+	if idx.rebuilding {
+		return ErrRebuildInProgress
+	}
+	idx.rebuilding = true
+
 	idx.catchUpAttempts = 0
 	idx.unlockRetries = 0
 	idx.maxLockedScanBytes = 0
 	idx.lockSegments = 0
+	idx.beginRebuildDedupLocked()
+	return nil
 }
+
+// endRebuildRun：釋放 single-flight 旗標並關閉去重。
+func (idx *Index) endRebuildRun() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.rebuilding = false
+	idx.endRebuildDedupLocked()
+}
+
+// countCatchUpAttempt／countUnlockRetry／countLockSegment：本輪統計的維護，歸零
+// 在 beginRebuildRun。
 
 func (idx *Index) countCatchUpAttempt() {
 	idx.mu.Lock()
