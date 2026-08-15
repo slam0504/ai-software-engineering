@@ -47,8 +47,23 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
   `thread/resume` 引用前文、單一 server 跨 session 重用
 - **雙 provider session 並存**——切換 provider 時對話視窗跟著切、session 保留，一邊 turn 進行中另一邊仍可送訊息；
   切回零丟失，背景以 unread 計數提示
-- 每個 provider 各自維持一個 active session；按下「開新對話」（New）只會結束並重設目前 provider 的 session，
-  不影響另一個 provider（先 quiesce 舊 session、等事件收乾與錄流收尾，再開新）
+- 按下「開新對話」（New）只會結束並重設目前 focused 的那個 session，不影響其他 session
+  （先 quiesce 舊 session、等事件收乾與錄流收尾，再開新）
+
+### 多 session 工作區（M3b）
+- **每個 provider 最多 4 個 session slot**（共 8）——同時保留並可並行執行，每個 session 至多一個進行中 turn；
+  超限 fail loud，左欄 SessionList 顯示 `n / 4`，不會自動終止任何 session
+- **workspace session id（WSID）** 是 host 端穩定身分（provider 的 session／thread id 只是附掛資訊）；
+  session 建立走「保留名額 → registry 落盤 → 正式建立」三段交易，任一步失敗都退回名額且不留下孤兒
+- **雙 pane 並看**——固定 50/50 並排、兩邊都持續接收串流／Timeline／狀態／unread；任一時刻恰一個 focused pane
+  可操作（composer、快捷鍵、End／Terminate／New 只作用於它），點另一邊即切焦點、不卸載也不重設捲動
+- **approval 依 WSID 路由**——來源在另一個 pane 會自動切焦點；來源沒被釘選則以暫時視圖顯示在次要 pane，
+  決定／逾時／關閉後自動還原原本的釘選
+- **重啟成本與事件量脫鉤**——只有兩個釘選的 pane 會重建對話（各載入最近 20 個完整 turn ＋ 未結束的那一輪），
+  其餘 session 只載 metadata；向上捲到頂以每次 20 turn 分頁。背後是 per-WSID 的 byte-offset replay index
+  （`events.jsonl` 仍是唯一權威，index 只是可重建的快取，損壞會自動 quarantine 重建並通知）
+- **關閉 session ＝ 保留稽核的 tombstone**——不刪除任何事件與錄流；名額在收尾與落盤全部成功後才釋放，
+  已關閉的 session 不會在重啟或索引重建後復活
 
 ### 重啟自動恢復
 - 未按 New 的 view 於 app 重啟後還原對話（重放 `events.jsonl`），並在下一輪自動 resume 接續前文
@@ -179,6 +194,11 @@ npm --prefix frontend run test   # vitest（store／scroll／sanitizer／i18n／
 npm --prefix frontend run build  # vue-tsc typecheck + vite build
 ```
 
+> **三個 gate 分開跑，不要併跑**：`internal/codex`（`TestAppServerTerminateKillsGroup`）、
+> `internal/assist`、`internal/claude` 有三處**量牆鐘**的既有測試，機器負載高時會偽陽
+> （實測：單獨跑 0.02s、負載下 30s 逾時）。這三處紅了先單獨重跑該 package 再判定，
+> 詳見 [`docs/spikes/m3b-results.md`](docs/spikes/m3b-results.md) §7。
+
 ---
 
 ## 架構
@@ -209,6 +229,11 @@ internal/
   escalation/            升級收件匣：item journal、append-only transition、projection、
                          block_scope 查詢
   assist/                SpecAssist／PlanAssist 隔離 one-shot（Claude／Codex，provider-enforced 零變更）
+  wsregistry/            workspace session registry（workspace-sessions.json）：durable metadata
+                         白名單、legacy 遷移 marker、tombstone
+  replayindex/           per-WSID turn 索引：turn boundary、checkpoint、crash 三態修復、
+                         損壞分級（尾端 truncate／中段 quarantine）、runtime 重建
+  wirelog/               Codex connection-wide wire log：per-generation 錄流、可重建 frame index
   ports/                 consumer-owned 介面（Turns、Exit）
   claude/                Claude CLI adapter：stream-json decode、多輪 session、resume registry
   codex/                 Codex app-server adapter：JSON-RPC conn、ThreadRunner、錄流 tee
@@ -276,7 +301,7 @@ flowchart TB
   esc --> sink2
 ```
 
-**Session lifecycle（per provider slot）**
+**Session lifecycle（per session slot；M3b 起 slot 以 WSID 定址，每 provider 至多 4 個）**
 
 ```mermaid
 stateDiagram-v2
@@ -327,7 +352,10 @@ stateDiagram-v2
 | `evidence/` | evidence journal（evidence.jsonl）＋mutation／stdout／stderr 的 CAS 內容定址儲存 |
 | `audit.jsonl` | App 層稽核（啟動資訊、核可決定、登入事件） |
 | `recordings/` | wire 錄流與 meta |
-| `sessions.json` | Claude resume registry（session id ↔ cwd 綁定） |
+| `sessions.json` | Claude resume registry（session id ↔ cwd 綁定，per-WSID） |
+| `workspace-sessions.json` | workspace session registry（WSID、provider、resume 身分、task label、view boundary、tombstone、pane 釘選；只存 durable metadata，不存 runtime 狀態） |
+| `replay-index/` | per-WSID 的 turn byte-offset 索引＋`checkpoint.json`（可重建的快取，不是第二份事件歷史） |
+| `wire-logs/` | Codex 每個 app-server generation 一份 connection-wide wire log（transport 層完整原文） |
 
 ---
 
@@ -341,6 +369,7 @@ stateDiagram-v2
 | **M2** Stage A 閉環 | ✅ merged | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ merged | vue-i18n 語系化，預設繁體中文＋完整英文 locale |
 | **M3a** 計畫與測試契約閉環 | ✅ merged | 任務 DAG、Gate 2、Test Contract Approval（本機 evidence runner）、升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；多 session 並看延後至 **M3b**） |
+| **M3b** 多 session 工作區 | ✅ 實作完成 | 每 provider 4 個 session slot、雙 pane 並看與焦點語意、WSID 建立交易與 tombstone 移除、Codex connection-wide wire log、per-WSID replay index 與視窗化重啟（[驗收結果](docs/spikes/m3b-results.md)——含未覆蓋項與待實機驗收項） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、forge adapter（SC4：單任務全程不切出 app） |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（OpenCode 首個目標）、保留 Claude／Codex 原生 adapter、capability negotiation（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 

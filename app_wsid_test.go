@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -235,6 +237,59 @@ func TestCommitAndRollbackBothFailEnterDegraded(t *testing.T) {
 	if err := a.SendMessage(wsidStr(t, a, "claude"), "still works"); err != nil {
 		t.Fatalf("degraded 不得影響既有 session：%v", err)
 	}
+}
+
+// TestCreateSessionRejectedByShutdownBarrier：§3.1「shutdown 以 beginAppTxn 為
+// 柵欄：shutdown 開始後拒絕新 app txn，故不會插入 reservation 與 persist 之間」
+// ——spec §5.1 最後一條（Reserve × shutdown barrier）。Task 31 驗收時發現這條
+// 凍結契約在 App 層沒有任何測試釘住（其他入口有 TestShutdownGateBlocksLateCodexStart
+// ／TestShutdownGateBlocksLateEnsure，但都守不到 CreateSession 這一格）。
+//
+// **窗口刻意停在 shutdown 的第一步**（`reject_new_txn`：shuttingDown 已翻 true、
+// Manager 尚未 Close）。若改成「shutdown 全部跑完後才呼叫 CreateSession」，
+// Manager.ReserveSession 的 ErrClosed 會結構性兜底——拿掉 beginAppTxn 那道柵欄
+// 測試照樣綠，等於什麼都沒守。下面的 Reserve／AbortCreate 探針就是這個窗口成立
+// 與否的反向守門。
+func TestCreateSessionRejectedByShutdownBarrier(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.hookShutdownStep = func(step string) {
+		if step != "reject_new_txn" {
+			return
+		}
+		close(entered)
+		<-release
+	}
+	shutDone := make(chan struct{})
+	go func() { a.shutdown(context.Background()); close(shutDone) }()
+	<-entered // 柵欄已升起、shutdown 其餘步驟尚未開始
+
+	// 反向守門：Manager 必須還開著，否則本測試被 ErrClosed 兜底（見上方 doc）。
+	_, tok, err := a.manager.ReserveSession("claude")
+	if err != nil {
+		t.Fatalf("窗口不成立——Manager 已 Close，本測試會被 ErrClosed 兜底：%v", err)
+	}
+	if err := a.manager.AbortCreate(tok); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.CreateSession("claude", "late"); err == nil ||
+		!strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("shutdown 開始後不得再建立 session（§3.1 app txn 柵欄）：%v", err)
+	}
+	if got := reg.Live(); len(got) != 0 {
+		t.Fatalf("被柵欄拒絕的建立不得留下 registry entry：%v", got)
+	}
+	if got := a.manager.SlotCount("claude"); got != 0 {
+		t.Fatalf("被柵欄拒絕的建立不得吃名額：%d", got)
+	}
+
+	close(release)
+	<-shutDone
 }
 
 // ---- Task 26：ListSessions（registry × working slot 的調和）----

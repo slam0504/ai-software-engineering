@@ -198,6 +198,13 @@ func TestClaudeApprovalCarriesWSID(t *testing.T) {
 	}
 	// Task 26：UI 事件本身也必須帶 wsid——前端依它做 pane 路由（§3.6.4），
 	// 只有 apprPending 帶著沒用，對話框看不到。
+	//
+	// **必須等條件、不能直接讀**（Task 31 驗收時打紅的既有測試競態）：`seedApproval`
+	// 等的是 `pendingByID(id) != nil`，而 production 的 `pumpApprovals` 是
+	// registerApproval → EmitApprovalRequest → emit("approval:request") 三步，
+	// 登記完成**嚴格早於** UI 事件送出。直接讀等於跟 pump goroutine 賽跑，負載高時
+	// 會偽陽。沿用 app_test.go:367 既有慣例（同一個事件、同一種等法）。
+	waitFor(t, "approval:request dialog event", func() bool { return len(ui.find("approval:request")) > 0 })
 	reqs := ui.find("approval:request")
 	if len(reqs) == 0 {
 		t.Fatal("必須發出 approval:request UI 事件")
