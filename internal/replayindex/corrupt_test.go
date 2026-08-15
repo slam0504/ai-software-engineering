@@ -2,6 +2,7 @@ package replayindex
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,6 +91,13 @@ func TestMidCorruptionQuarantinesAndRebuilds(t *testing.T) {
 	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
 		t.Fatalf("必須全量重建：%d", len(turns))
 	}
+	// 重建範圍是全域（quarantine 全部既有 turn file、從頭全量重掃），不是只
+	// 精修受損的 w1——未受損的 sibling wsid（w2）在重建後也必須完整、不重
+	// 複、不遺漏，這正是這次 review 核心爭議「全域重建範圍是否安全」的直接
+	// 證據。
+	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 3 {
+		t.Fatalf("全域重建不該誤殺未受損的 sibling wsid（w2）：%d", len(turns))
+	}
 	if notices != 1 {
 		t.Fatalf("必須發一次復原通知：%d", notices)
 	}
@@ -157,5 +165,119 @@ func TestMidCorruptionDoesNotLoseEvents(t *testing.T) {
 			t.Fatalf("turn %d 內容錯誤（不可猜測事件）：got first=%s last=%s want first=%s last=%s",
 				k, turn.FirstEventID, turn.LastEventID, wantFirst, wantLast)
 		}
+	}
+
+	// 未受損的 sibling wsid（w2）同樣經過全域重建，內容也必須精確對應
+	// audit、不重複不遺漏——涵蓋「全域重建範圍」這個決策的另一半證據。
+	w2turns, err := i.RecentTurns("w2", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w2turns) != 3 {
+		t.Fatalf("全域重建必須精確復原 sibling wsid w2 的全部 3 筆 turn：%d", len(w2turns))
+	}
+	for k, turn := range w2turns {
+		wantFirst := "w2-user-t" + strconv.Itoa(k)
+		wantLast := "w2-done-t" + strconv.Itoa(k)
+		if turn.FirstEventID != wantFirst || turn.LastEventID != wantLast {
+			t.Fatalf("w2 turn %d 內容錯誤（不可猜測事件）：got first=%s last=%s want first=%s last=%s",
+				k, turn.FirstEventID, turn.LastEventID, wantFirst, wantLast)
+		}
+	}
+}
+
+// writeRawTurnFile：純檔案 I/O 直接把 lines 逐行寫進 dir/<wsid>.turns.jsonl
+// （不經過 Index／appendTurnRecord），讓下面兩則邊界測試能精確控制檔案裡每
+// 一行是 valid TurnRecord 或任意壞行，不受 seedAuditWithTurns 產生的固定內
+// 容侷限。
+func writeRawTurnFile(t *testing.T, dir, wsid string, lines []string) {
+	t.Helper()
+	var buf bytes.Buffer
+	for _, l := range lines {
+		buf.WriteString(l)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, wsid+".turns.jsonl"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// validTurnRecordLine：組出一筆可解析的 TurnRecord JSON 行，供 writeRawTurnFile
+// 的呼叫端標出「這一行是 valid」。
+func validTurnRecordLine(t *testing.T, eventID string) string {
+	t.Helper()
+	b, err := json.Marshal(TurnRecord{FirstEventID: eventID, LastEventID: eventID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestMidCorruptionWithConsecutiveBadLinesIsStillDetected：中段判定邊界
+// (b)——壞行之後緊接著又是另一行壞行，再之後才出現 valid 行。判定演算法必
+// 須「掃到底找第一筆可解析」，不能只看壞行的下一行：若只看下一行（也是壞
+// 行）就判定沒有 valid 行在後、當成尾端 truncate，會直接把後面真正 valid 的
+// 記錄連同壞行一起截掉、遺失事件——這正是 mutation 驗證要抓的錯誤實作。
+func TestMidCorruptionWithConsecutiveBadLinesIsStillDetected(t *testing.T) {
+	dir := t.TempDir()
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		validTurnRecordLine(t, "e0"),
+		"{not json 1",
+		"{not json 2", // 壞行的下一行仍是壞行
+		validTurnRecordLine(t, "e1"), // 再下一行才是 valid：整體仍是中段
+	}
+	writeRawTurnFile(t, dir, "w1", lines)
+
+	if _, err := i.RecentTurns("w1", 10); err == nil {
+		t.Fatal("壞行之後即使緊接著另一個壞行，只要再往後掃到 valid 行仍須判定中段、fail loud，不能誤判尾端而截斷遺失後面的 valid 記錄")
+	}
+
+	// 中段判定不該讓 readTurnFileLocked 自行動磁碟（沒有 audit path、無法安
+	// 全重建）——確認檔案內容原封不動，遺失防線交給握有 audit 的
+	// VerifyOrRebuild，不是這裡默默截斷。
+	b, err := os.ReadFile(filepath.Join(dir, "w1.turns.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want bytes.Buffer
+	for _, l := range lines {
+		want.WriteString(l)
+		want.WriteByte('\n')
+	}
+	if !bytes.Equal(b, want.Bytes()) {
+		t.Fatalf("中段判定不該改動磁碟內容：got=%q want=%q", b, want.Bytes())
+	}
+}
+
+// TestSingleLineFileFullyCorruptIsTailTruncatedToEmpty：中段判定邊界
+// (d)——單行檔案、該行本身就是壞行。壞行之後沒有任何行（valid 或壞行都沒
+// 有），依判定規則（壞行之後沒有 valid 行 ⇒ 尾端）屬於尾端 corruption，應
+// truncate 續用（清空該檔），不是回錯、也不是誤判成中段。
+func TestSingleLineFileFullyCorruptIsTailTruncatedToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRawTurnFile(t, dir, "w1", []string{"{not json at all"})
+
+	turns, err := i.RecentTurns("w1", 10)
+	if err != nil {
+		t.Fatalf("單行檔案全壞、後面沒有 valid 行屬於尾端 corruption，不該 fail loud：%v", err)
+	}
+	if len(turns) != 0 {
+		t.Fatalf("truncate 後應該沒有任何 valid turn：%d", len(turns))
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, "w1.turns.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bytes.TrimSpace(b)) != 0 {
+		t.Fatalf("尾端 truncate 必須真的清空磁碟上的單行全壞檔：%q", b)
 	}
 }
