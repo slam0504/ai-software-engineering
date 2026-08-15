@@ -13,7 +13,6 @@
 package replayindex
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -504,8 +503,21 @@ func (idx *Index) appendTurnRecord(wsid string, rec TurnRecord) error {
 }
 
 // readTurnFileLocked：呼叫端須持有 idx.mu。缺檔視為「尚無完整 turn」，非
-// 錯誤。中段損壞的分級處置（尾端 truncate vs 中段 quarantine）是 Task 18
-// 範圍；本 task 對任何無法解析的行一律 fail loud。
+// 錯誤。損壞分級（§3.5.6，Task 18，凍結判定）：第一個無法解析的行之後，若
+// 檔案裡還有其他能解析的行 ⇒ 中段損壞；否則（壞行就是最後一筆、或壞行之
+// 後只剩空白行）⇒ 尾端損壞。
+//
+//   - 尾端損壞：truncate 至最後一筆 valid record、續用——真的改寫磁碟上的
+//     檔案（見 writeTurnFileLinesAtomicLocked），不是只在記憶體忽略最後一
+//     行；否則下次啟動、下次呼叫都會再撞到同一個壞行。不需要 quarantine、
+//     不需要通知（§3.5.6：尾端是正常操作可能留下的半筆寫入，不算需要人工
+//     關注的異常）。
+//   - 中段損壞：本函式沒有 audit path，無法安全重建，回傳 *midCorruptionError
+//     sentinel、不做任何磁碟異動。RecentTurns／TurnsBefore 這些一般呼叫端
+//     視同一般錯誤 fail loud（與改動前行為一致：中段損壞本來就該回錯，不能
+//     猜）；唯一知道如何安全處理的是握有 auditPath 的 VerifyOrRebuild（見
+//     corrupt.go 的 repairTurnFileCorruptionLocked），它會辨識這個 sentinel
+//     並觸發 quarantine＋全量重建＋復原通知。
 func (idx *Index) readTurnFileLocked(wsid string) ([]TurnRecord, error) {
 	path := idx.turnFilePath(wsid)
 	b, err := os.ReadFile(path)
@@ -515,22 +527,70 @@ func (idx *Index) readTurnFileLocked(wsid string) ([]TurnRecord, error) {
 		}
 		return nil, fmt.Errorf("replayindex: read %s: %w", path, err)
 	}
+	lines := nonEmptyLines(b)
+
 	var out []TurnRecord
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	sc.Buffer(make([]byte, 0, 64*1024), 10<<20)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
+	badIdx := -1
+	for i, line := range lines {
 		var rec TurnRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("replayindex: malformed turn record in %s: %w", path, err)
+			badIdx = i
+			break
 		}
 		out = append(out, rec)
 	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("replayindex: scan %s: %w", path, err)
+	if badIdx == -1 {
+		return out, nil
+	}
+
+	for i := badIdx + 1; i < len(lines); i++ {
+		var rec TurnRecord
+		if json.Unmarshal(lines[i], &rec) == nil {
+			return nil, &midCorruptionError{
+				wsid: wsid,
+				err:  fmt.Errorf("replayindex: malformed turn record at line %d in %s, valid records follow", badIdx, path),
+			}
+		}
+	}
+
+	if err := writeTurnFileLinesAtomicLocked(path, lines[:badIdx]); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+// nonEmptyLines：把整份檔案內容按換行切成非空白行（去除前後空白），維持與
+// 改動前 bufio.Scanner 逐行掃描相同的語意（略過空白行）。整份內容已由
+// os.ReadFile 讀進記憶體，turn record 本身很小（見 RecentTurns 的說明），不
+// 需要 bufio.Scanner 的行長度上限機制。
+func nonEmptyLines(b []byte) [][]byte {
+	var lines [][]byte
+	for _, raw := range bytes.Split(b, []byte("\n")) {
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// writeTurnFileLinesAtomicLocked：呼叫端須持有 idx.mu。把 lines 逐行寫回
+// path（temp file + atomic rename，同 writeCheckpointFile 的慣例），用於尾端
+// corruption truncate——真的落盤，讓下次讀取（不論是同一個 process 內或下次
+// 啟動）都不會再看到被截掉的壞行。
+func writeTurnFileLinesAtomicLocked(path string, lines [][]byte) error {
+	var buf bytes.Buffer
+	for _, line := range lines {
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("replayindex: write turn file tmp %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replayindex: rename turn file %s: %w", path, err)
+	}
+	return nil
 }

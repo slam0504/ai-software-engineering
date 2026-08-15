@@ -87,7 +87,7 @@ var openAuditFile = func(path string) (auditFile, error) {
 // maxLineWindow 說明），一旦真的發生，每次重啟都會靜默觸發全量重建，正是
 // 這個套件存在理由要避免的事。
 func (idx *Index) VerifyOrRebuild(auditPath string) error {
-	windowTruncated, err := func() (bool, error) {
+	windowTruncated, corruptionRebuilt, err := func() (bool, bool, error) {
 		idx.mu.Lock()
 		defer idx.mu.Unlock()
 		return idx.verifyOrRebuildLocked(auditPath)
@@ -100,6 +100,15 @@ func (idx *Index) VerifyOrRebuild(auditPath string) error {
 				maxLineWindow))
 		}
 	}
+	if err == nil && corruptionRebuilt {
+		// 復原通知只在中段損壞才發（§3.5.6）；尾端損壞在
+		// repairTurnFileCorruptionLocked／readTurnFileLocked 內已經就地
+		// truncate 續用，不會走到這裡。同 windowTruncated 的慣例：鎖外才呼
+		// 叫 Notify，避免持鎖時觸發可能回呼 Index 方法的 callback。
+		if notify := idx.cfg.Notify; notify != nil {
+			notify("replayindex: turn index 中段損壞，已 quarantine 並全量重建（§3.5.6）")
+		}
+	}
 	return err
 }
 
@@ -107,21 +116,28 @@ func (idx *Index) VerifyOrRebuild(auditPath string) error {
 // 特意重新從磁碟讀入 checkpoint.json（見 reloadCheckpointFromDiskLocked），
 // 不信任 Open() 當時快取在記憶體裡的值——這是獨立於 Open 的驗證步驟，職責
 // 就是核對「磁碟現在記的狀態」是否仍與 audit 一致。
-func (idx *Index) verifyOrRebuildLocked(auditPath string) (windowTruncated bool, err error) {
+//
+// corruptionRebuilt（Task 18，§3.5.6）：checkpoint 本身可信時，既有
+// *.turns.jsonl 檔案內容仍可能中段損壞（checkpoint 只記全域 offset／event
+// id，不驗證 turn file 內容）——repairTurnFileCorruptionLocked 負責偵測並在
+// 偵測到中段損壞時觸發與「checkpoint 不可信」相同的 quarantine＋全量重建路
+// 徑。尾端損壞則完全不影響這裡的流程：readTurnFileLocked 內部就地 truncate
+// 續用，corruptionRebuilt 維持 false。
+func (idx *Index) verifyOrRebuildLocked(auditPath string) (windowTruncated, corruptionRebuilt bool, err error) {
 	if err := idx.reloadCheckpointFromDiskLocked(); err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	var auditSize int64
 	if info, err := os.Stat(auditPath); err == nil {
 		auditSize = info.Size()
 	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("replayindex: stat audit %s: %w", auditPath, err)
+		return false, false, fmt.Errorf("replayindex: stat audit %s: %w", auditPath, err)
 	}
 
 	trusted, truncated, err := idx.checkpointTrustedLocked(auditPath, auditSize)
 	if err != nil {
-		return truncated, err
+		return truncated, false, err
 	}
 
 	from := idx.checkpointOffset
@@ -133,17 +149,27 @@ func (idx *Index) verifyOrRebuildLocked(auditPath string) (windowTruncated bool,
 		idx.checkpointLastEventID = ""
 		idx.turns = map[string]*turnState{}
 		if err := idx.resetTurnFilesLocked(); err != nil {
-			return truncated, err
+			return truncated, false, err
 		}
 		from = 0
-	} else if err := idx.hydrateOpenTurnFirstEventIDsLocked(auditPath); err != nil {
-		// 已存在的 checkpoint 若記錄某 WSID 有 open turn，loadCheckpoint 只
-		// 帶回 offset（§3.5.5），firstEventID 尚未知——從 audit 補讀，否則
-		// 之後這個 turn 收尾時 appendTurnRecord 會寫出空字串的 FirstEventID。
-		return truncated, err
+	} else {
+		rebuilt, err := idx.repairTurnFileCorruptionLocked()
+		if err != nil {
+			return truncated, false, err
+		}
+		if rebuilt {
+			corruptionRebuilt = true
+			from = 0
+		} else if err := idx.hydrateOpenTurnFirstEventIDsLocked(auditPath); err != nil {
+			// 已存在的 checkpoint 若記錄某 WSID 有 open turn，loadCheckpoint
+			// 只帶回 offset（§3.5.5），firstEventID 尚未知——從 audit 補
+			// 讀，否則之後這個 turn 收尾時 appendTurnRecord 會寫出空字串的
+			// FirstEventID。
+			return truncated, false, err
+		}
 	}
 
-	return truncated, idx.rescanFromLocked(auditPath, from)
+	return truncated, corruptionRebuilt, idx.rescanFromLocked(auditPath, from)
 }
 
 // reloadCheckpointFromDiskLocked：呼叫端須持有 idx.mu。無條件捨棄目前記憶體
