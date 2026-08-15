@@ -87,6 +87,9 @@ export default {
       send: '送出',
     },
   },
+  dualPane: {
+    empty: '這個 pane 還沒有釘選任何 session——從左側清單釘選一個',
+  },
   gate: {
     action: {
       approve: '核可',

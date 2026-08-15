@@ -46,6 +46,12 @@ export interface Bindings {
   StartSession(wsid: string, prompt: string, resume: string, recordCase: string,
     taskLabel: string, approvalPolicy: string): Promise<void>
   SendMessage(wsid: string, prompt: string): Promise<void>
+  // EndSession：Task 28 新增，**optional**——store 自己的 actions 仍只消費上面兩個
+  // （不擴大既有「唯一消費」的宣稱）。DualPane 的 focused-pane End 控制項需要走
+  // 同一個 s.setBindings() 注入路徑（測試才能只 mock s.bindings、不必另開一份
+  // wailsjs module mock），因此掛在這裡；optional 讓既有 okBindings() 等字面量
+  // 不必補欄位。
+  EndSession?(wsid: string): Promise<void>
 }
 // SessionLifecycleBindings：以 WSID 定址的其餘 lifecycle 入口（Task 26 一併
 // 切換）。與 Bindings 分開的理由同 EvidenceBindings：session store 的 mock 只

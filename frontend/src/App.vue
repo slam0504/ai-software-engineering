@@ -16,7 +16,8 @@ import { escalationBadge } from './lib/escalationBadge'
 import { resolveResubmitTarget } from './lib/staleNav'
 import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
-import ChatPanel from './components/ChatPanel.vue'
+import DualPane from './components/DualPane.vue'
+import SessionList from './components/SessionList.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
 import FileTree from './components/FileTree.vue'
@@ -236,7 +237,10 @@ onMounted(async () => {
       <span v-if="cliInfo.startupError" class="err">{{ t('app.startupError', { error: cliInfo.startupError }) }}</span>
     </div>
     <div class="body">
-      <aside><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></aside>
+      <aside class="side">
+        <div class="side-sessions"><SessionList /></div>
+        <div class="side-files"><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></div>
+      </aside>
       <main>
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
@@ -247,7 +251,7 @@ onMounted(async () => {
           <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
           <button :class="{ active: tab === 'tca' }" @click="tab = 'tca'">{{ t('app.tab.tca') }}</button>
         </nav>
-        <ChatPanel v-show="tab === 'chat'" />
+        <DualPane v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
         <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" />
@@ -318,6 +322,9 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
+.side { display: flex; flex-direction: column; }
+.side-sessions { flex: 0 1 45%; overflow-y: auto; border-bottom: 1px solid var(--border); }
+.side-files { flex: 1; overflow-y: auto; min-height: 0; }
 .gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
 .gate-panel .side-nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .gate-panel .side-nav button { border: none; background: transparent; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }

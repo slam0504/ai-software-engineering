@@ -87,6 +87,9 @@ export default {
       send: 'Send',
     },
   },
+  dualPane: {
+    empty: 'No session pinned to this pane yet — pin one from the list on the left',
+  },
   gate: {
     action: {
       approve: 'Approve',
