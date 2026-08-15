@@ -85,23 +85,27 @@ type Index struct {
 	// runtime 重建的本輪統計（持 idx.mu）：catchUpAttempts 是鎖外 catch-up 的
 	// 嘗試次數（界限 MaxCatchUpAttempts，證明不會 busy-loop）、unlockRetries
 	// 是「取鎖後殘量又超限、立即解鎖重試」的次數、maxLockedScanBytes 是鎖內
-	// 單次補掃處理量的最大值（證明鎖內處理量不超過凍結上限）。只有測試會讀，
-	// 讀取入口在 runtime_rebuild_test.go。
+	// 單次補掃處理量的最大值（證明鎖內處理量不超過凍結上限）、lockSegments 是
+	// 鎖外掃描實際分了幾段（證明 idx.mu 真的有在段間釋放，不是整段掃描霸佔到
+	// 底）。只有測試會讀，讀取入口在 runtime_rebuild_test.go。
 	catchUpAttempts    int
 	unlockRetries      int
 	maxLockedScanBytes int64
+	lockSegments       int
 
 	// holdingEmitLock：目前是否持有呼叫端傳入的 emit mutex。**不受 idx.mu 保
 	// 護**是刻意的：注入的 auditEndFunc 可能在任何時機被呼叫（含 idx.mu 已被
 	// 持有時），若這個旗標也走 idx.mu 就會自我死鎖。
 	holdingEmitLock atomic.Bool
 
-	// hookAfterUnlockedCatchUp／hookAfterResidualOKBeforeLock 是 barrier 測試
-	// 專用的鉤子，用來把事件精準塞進「鎖外補掃剛結束」與「殘量已達標、mutex
-	// 尚未取得」這兩個窗口，取代 time.Sleep。production 路徑永遠是 nil；由測
-	// 試在呼叫 RuntimeRebuild 之前於同一 goroutine 設定，故不需另外同步。
+	// hookAfterUnlockedCatchUp／hookAfterResidualOKBeforeLock／
+	// hookBetweenScanSegments 是 barrier 測試專用的鉤子，用來把事件精準塞進
+	// 「鎖外補掃剛結束」「殘量已達標、mutex 尚未取得」「鎖外掃描剛釋放
+	// idx.mu」這三個窗口，取代 time.Sleep。production 路徑永遠是 nil；由測試
+	// 在呼叫 RuntimeRebuild 之前於同一 goroutine 設定，故不需另外同步。
 	hookAfterUnlockedCatchUp      func()
 	hookAfterResidualOKBeforeLock func()
+	hookBetweenScanSegments       func()
 
 	// forceWriteErr 是測試專用的故障注入鉤子，唯一設值入口是 degraded_test.go
 	// 的 ForceWriteErrForTest；production 路徑永遠不會設它。同慣例見

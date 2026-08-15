@@ -22,11 +22,12 @@
 // **實際讀到的位置**，不是推算，因此不違反凍結取捨。
 //
 // 啟動期無並行（§3.2.4 序列：VerifyOrRebuild 在開 UI 前完成，尚無並行
-// append）。app 運行中觸發的重建（degraded latch／中段 quarantine）條件完全
-// 不同——provider turn 仍持續 append audit，必須走 §3.5.7 凍結的五步序列，見
-// 本檔後半段的 RuntimeRebuild（Task 19）。兩條路徑共用 scanAuditRangeLocked
-// 的掃描迴圈，差別只在「掃到的進度寫進哪裡」：啟動期直接寫 checkpoint，
-// runtime 期只前移 rebuildCursor。
+// append）。app 運行中由 degraded latch 觸發的重建條件完全不同——provider turn
+// 仍持續 append audit，必須走 §3.5.7 凍結的五步序列，見本檔後半段的
+// RuntimeRebuild（Task 19）。兩條路徑共用 scanAuditRangeLocked 的掃描迴圈，差
+// 別在「掃到的進度寫進哪裡」（啟動期直接寫 checkpoint，runtime 期只前移
+// rebuildCursor）以及「一次掃多少」（啟動期一次掃到底，runtime 期分段釋放
+// idx.mu，見 scanSegmentBytes）。
 //
 // 已知限制（非本 task 要解的問題，記錄供 Task 18／19 或未來維運參考）：連續
 // 多次「crash → 判定不可信 → resetTurnFilesLocked quarantine」循環，quarantine
@@ -40,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -278,7 +280,7 @@ func (idx *Index) hydrateOpenTurnFirstEventIDsLocked(auditPath string) error {
 // 補一次，磁碟 checkpoint 會停在掃描前的舊值，下次重啟會重掃同一段 suffix、
 // 但這段已經在本次 appendTurnRecord 寫過的 turn record 會被重複補寫。
 func (idx *Index) rescanFromLocked(auditPath string, from int64) error {
-	_, found, err := idx.scanAuditRangeLocked(auditPath, from, func(receipt appcore.AppendReceipt, boundary bool) error {
+	_, found, err := idx.scanAuditRangeLocked(auditPath, from, unlimitedScanBudget, func(receipt appcore.AppendReceipt, boundary bool) error {
 		idx.checkpointOffset = receipt.EndOffset
 		idx.checkpointLastEventID = receipt.EventID
 		if boundary {
@@ -301,11 +303,16 @@ func (idx *Index) rescanFromLocked(auditPath string, from int64) error {
 // 決定要把進度記到哪裡——啟動期（rescanFromLocked）直接寫 checkpoint，runtime
 // 重建（scanIntoRebuildCursorLocked）只前移 rebuildCursor。
 //
+// budget 是本次最多處理的 byte 數，**在處理每筆事件之前檢查**：所以 budget 為
+// 0 時一筆都不會處理（finalCatchUpAndAttach 用它把補掃終點夾在既定的 end），而
+// budget 為正時至少會處理一筆事件（即使該筆單獨就超過 budget），保證分段掃描
+// 的進度必然前進、不會空轉。啟動期傳 unlimitedScanBudget 一次掃到底。
+//
 // 回傳 cur 是實際掃到的終點 offset；found=false 代表 audit 檔不存在（呼叫端自
 // 行決定這是不是問題）。commit 或 applyTurnState 回錯時立即中止並回傳當下的
 // cur——即「最後一筆成功提交的事件結尾」，讓 runtime 重建的重試能從那裡續掃、
 // 不重複索引已經寫進 turn file 的 record。
-func (idx *Index) scanAuditRangeLocked(auditPath string, from int64, commit func(receipt appcore.AppendReceipt, boundary bool) error) (cur int64, found bool, err error) {
+func (idx *Index) scanAuditRangeLocked(auditPath string, from, budget int64, commit func(receipt appcore.AppendReceipt, boundary bool) error) (cur int64, found bool, err error) {
 	f, oerr := os.Open(auditPath)
 	if oerr != nil {
 		if os.IsNotExist(oerr) {
@@ -324,6 +331,9 @@ func (idx *Index) scanAuditRangeLocked(auditPath string, from int64, commit func
 	r := bufio.NewReader(f)
 	cur = from
 	for {
+		if cur-from >= budget {
+			break // 本段預算用完：進度已記在 cur，呼叫端決定要不要續掃
+		}
 		line, rerr := r.ReadBytes('\n')
 		if n := int64(len(line)); n > 0 {
 			trimmed := bytes.TrimRight(line, "\n")
@@ -427,6 +437,18 @@ const (
 // 尾在哪裡（例如 sink 內部有 buffer 尚未 flush 時，檔案大小並不等於已受理的
 // append 進度）。
 //
+// **呼叫端契約（違反會直接死鎖或 data race）**：
+//
+//   - RuntimeRebuild 的第 4 步會在**已持有 emitMu 的情況下**呼叫 auditEnd，所
+//     以 auditEnd **不得再取得 emitMu**——sync.Mutex 不可重入，`m.mu.Lock();
+//     return sink.offset` 這種最自然的寫法會當場自我死鎖。
+//   - 同時 auditEnd 也會在**完全不持任何鎖**的情況下被呼叫（第 2 步），所以它
+//     必須自行保證讀取 sink offset 的併發安全。appcore.JSONLSink 的 offset 沒
+//     有自己的鎖（見 internal/appcore/sink.go：正確性完全依賴呼叫端序列
+//     化），直接讀會被 -race 抓到。
+//   - 可行的作法例如：sink offset 改用 atomic 型別讀寫，或呼叫端另外維護一個
+//     只給 auditEnd 用的 atomic 鏡像值，總之**不要重用 emitMu**。
+//
 // 它同時是 barrier 測試唯一能模擬「等待 emit mutex 期間其他 goroutine 仍在
 // append」的注入點：production 中 append 必須持有同一把 emit mutex，所以測試
 // 不可能（也不該）在鎖內真的 append 一筆事件到 audit——鎖內 append 是不可能發
@@ -441,11 +463,15 @@ type auditEndFunc func() (int64, error)
 // RuntimeRebuild，屆時會從 rebuildCursor 續掃、不重跑 bulk。
 var ErrRebuildNotConverged = errors.New("replayindex: catch-up 未收斂，保留 degraded latch")
 
-// RuntimeRebuild：app **運行中**（degraded latch 或中段 quarantine 觸發）重建
-// turn 索引並把 writer 原子接回，實作 §3.5.7 凍結的五步序列。與啟動期的
-// VerifyOrRebuild 的關鍵差異是：這裡 provider turn 仍持續 append audit，所以
-// **不能邊掃邊解除 latch**——掃描高水位之後、writer 接回之前抵達的事件會留下
-// 永久缺口。五步序列就是為了消掉那個窗口：
+// ErrNotDegraded：對一個不是 degraded 的 index 呼叫 RuntimeRebuild。這不是可
+// 以靜默容忍的狀況，見 RuntimeRebuild 的「前提」段落。
+var ErrNotDegraded = errors.New("replayindex: RuntimeRebuild 只服務 degraded latch，index 目前不是 degraded")
+
+// RuntimeRebuild：app **運行中**（degraded latch 觸發）重建 turn 索引並把
+// writer 原子接回，實作 §3.5.7 凍結的五步序列。與啟動期的 VerifyOrRebuild 的
+// 關鍵差異是：這裡 provider turn 仍持續 append audit，所以**不能邊掃邊解除
+// latch**——掃描高水位之後、writer 接回之前抵達的事件會留下永久缺口。五步序列
+// 就是為了消掉那個窗口：
 //
 //  1. bulk 重建至初始高水位（**不持 emitMu**，append 照常進行）；
 //  2. 鎖外反覆 catch-up 至最新 audit 檔尾，直到殘量低於收斂上限。迭代本身有
@@ -467,9 +493,26 @@ var ErrRebuildNotConverged = errors.New("replayindex: catch-up 未收斂，保�
 // I/O 錯誤（開檔、掃描、checkpoint 落盤失敗）不屬於這兩種分支，直接回傳原始
 // 錯誤，latch 同樣保留。
 //
+// **前提：index 必須已經處於 degraded latch**，否則回傳 ErrNotDegraded。這不
+// 是防禦性檢查而是本函式正確性的必要條件：整套「同一段 audit 只會被掃一次、
+// 所以不需要去重」的論證，隱含前提是重建期間 Observe 停著（degraded 時它是空
+// 操作）。若 index 是活的，Observe 會與 catch-up 交錯取得 idx.mu、各自前移
+// checkpoint 並寫 turn record，下一輪 catch-up 又從落後的 cursor 把同一段掃一
+// 次——重複 record ＋ turn 狀態機互踩。這裡不靜默補 latch：那會發出呼叫端沒預
+// 期的 degraded 通知，掩蓋掉「呼叫端用錯了」這件事。
+//
+// 因此本函式**只服務 degraded latch**。§3.5.6 的中段損壞 quarantine 並不會
+// latch degraded，需要的也是不同的動作（reset turn files ＋從 offset 0 全量重
+// 建），本函式的 bulkRebuild 永遠從 max(cursor, checkpoint) 起掃，給不了那個
+// 語意——那條路徑目前沒有 runtime 入口，是 Task 20 的範圍。
+//
 // 呼叫端契約：emitMu 必須是「audit append 與 Observe 共用」的那一把序列化
-// 鎖，且呼叫 RuntimeRebuild 時**不得已經持有它**（本函式自己取得）。
+// 鎖，且呼叫 RuntimeRebuild 時**不得已經持有它**（本函式自己取得）；auditEnd
+// 另有契約，見 auditEndFunc 的說明。
 func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd auditEndFunc) error {
+	if !idx.Degraded() {
+		return ErrNotDegraded
+	}
 	idx.resetRebuildStats()
 
 	if err := idx.bulkRebuild(auditPath); err != nil { // 1. 掃至初始高水位（不持 emitMu）
@@ -486,7 +529,7 @@ func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd 
 			idx.hookAfterUnlockedCatchUp()
 		}
 
-		ok, err := idx.residualWithinLimit(auditPath, auditEnd)
+		ok, _, err := idx.residualWithinLimit(auditPath, auditEnd)
 		if err != nil {
 			return err
 		}
@@ -501,7 +544,7 @@ func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd 
 		emitMu.Lock() // 3. 殘量達標才取鎖
 		idx.holdingEmitLock.Store(true)
 
-		ok, err = idx.residualWithinLimit(auditPath, auditEnd) // 4. 鎖內重讀
+		ok, end, err := idx.residualWithinLimit(auditPath, auditEnd) // 4. 鎖內重讀
 		if err != nil || !ok {
 			idx.holdingEmitLock.Store(false)
 			emitMu.Unlock() // 超限即解鎖重試，不在鎖內硬掃
@@ -512,7 +555,7 @@ func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd 
 			continue
 		}
 
-		err = idx.finalCatchUpAndAttach(auditPath) // 5. 補掃＋checkpoint＋接回＋解 latch
+		err = idx.finalCatchUpAndAttach(auditPath, end) // 5. 補掃＋checkpoint＋接回＋解 latch
 		idx.holdingEmitLock.Store(false)
 		emitMu.Unlock()
 		return err
@@ -542,38 +585,76 @@ func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd 
 // 重啟才需要回答的問題（Task 17）。
 func (idx *Index) bulkRebuild(auditPath string) error {
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
 	if idx.rebuildCursor < idx.checkpointOffset {
 		idx.rebuildCursor = idx.checkpointOffset
 		idx.rebuildLastEventID = idx.checkpointLastEventID
 	}
-	_, err := idx.scanIntoRebuildCursorLocked(auditPath)
-	return err
+	idx.mu.Unlock()
+	return idx.catchUpUnlocked(auditPath)
 }
 
-// catchUpUnlocked：五步序列第 2 步的單輪掃描。從 rebuildCursor 續掃到目前檔
-// 尾。**不持 emitMu**（audit 照常 append），但仍持 idx.mu——掃描會 mutate
-// idx.turns 並 append turn record，必須與 RecentTurns／OpenTurnStart 等讀取端
-// 互斥。持有 idx.mu 期間 Observe 會被擋住，但 degraded 期間 Observe 只是取鎖
-// 後立即 return，不會與掃描搶奪實際工作。
+// scanSegmentBytes：鎖外掃描（bulk 與 catch-up）每次持有 idx.mu 的最大掃描
+// 量。掃完一段就釋放 idx.mu、再重新取得續掃下一段。
+//
+// 為什麼必須分段：**不能只看「degraded 期間 Observe 取鎖後只做一件事」就以為
+// 它不會被阻塞**——Observe 等鎖的時間就是整段掃描的時間。而接線後 append 路徑
+// 是 emitMu → Observe → idx.mu，所以一個 append 執行緒會**握著 emitMu 卡在
+// idx.mu 上**，被停住的不是 UI 而是整條 provider 事件管線。那正是第 4 步「不
+// 得在鎖內硬掃」要禁止的形狀，只是換成另一把鎖，不能因為 §3.5.7 的字面只講
+// emitMu 就放過。
+//
+// 為什麼是 256KB：取「單段掃描的停頓小到感覺不出來」與「重取鎖／重開檔的固定
+// 成本不要放大」之間。events.jsonl 單筆事件常態在數百 bytes 到數 KB，256KB 約
+// 是數十到數百筆，單段解析時間在毫秒級；同時它是 MaxCatchUpBytes（1MB）的
+// 1/4，代表即使殘量剛好卡在收斂上限，鎖外 catch-up 也至少會讓出 idx.mu 四
+// 次。真正需要調整的訊號是實測到 append 路徑因重建而出現可觀測的延遲尖峰，屆
+// 時往下調即可——分段本身不影響正確性（rebuildCursor 是續掃形狀，段與段之間的
+// 狀態是完整的）。
+const scanSegmentBytes = 256 << 10
+
+// unlimitedScanBudget：啟動期掃描不需要分段（§3.2.4：尚無並行 append，也還沒
+// 有任何讀取端），一次掃到底。
+const unlimitedScanBudget = int64(math.MaxInt64)
+
+// catchUpUnlocked：五步序列第 1／2 步的掃描本體。從 rebuildCursor 續掃到目前檔
+// 尾，**不持 emitMu**（audit 照常 append），idx.mu 則是**每段取一次**：掃滿
+// scanSegmentBytes 就釋放，讓 Observe／RecentTurns 等待鎖的一方有機會插進來，
+// 再重新取得續掃。
+//
+// 迴圈終止：scanAuditRangeLocked 的 budget 是在處理每筆事件**之前**檢查的，所
+// 以每段至少會處理一筆事件（即使該筆單獨就超過 budget），進度必然前進；掃到檔
+// 尾時該段回傳 scanned==0，迴圈結束。
 func (idx *Index) catchUpUnlocked(auditPath string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	_, err := idx.scanIntoRebuildCursorLocked(auditPath)
-	return err
+	for {
+		idx.mu.Lock()
+		scanned, err := idx.scanIntoRebuildCursorLocked(auditPath, scanSegmentBytes)
+		idx.mu.Unlock()
+
+		idx.countLockSegment()
+		if idx.hookBetweenScanSegments != nil {
+			idx.hookBetweenScanSegments()
+		}
+		if err != nil {
+			return err
+		}
+		if scanned == 0 {
+			return nil // 已到檔尾
+		}
+	}
 }
 
-// scanIntoRebuildCursorLocked：呼叫端須持有 idx.mu。從 rebuildCursor 掃到檔
-// 尾，把進度記進 rebuildCursor／rebuildLastEventID 而**不碰 checkpoint、不寫
-// checkpoint.json**——degraded 期間 checkpoint 依 §3.5.4 不得前移，只有成功接
-// 回（finalCatchUpAndAttach）才一次寫入。回傳本次實際掃過的 byte 數。
+// scanIntoRebuildCursorLocked：呼叫端須持有 idx.mu。從 rebuildCursor 起掃，最
+// 多處理 budget bytes，把進度記進 rebuildCursor／rebuildLastEventID 而**不碰
+// checkpoint、不寫 checkpoint.json**——degraded 期間 checkpoint 依 §3.5.4 不得
+// 前移，只有成功接回（finalCatchUpAndAttach）才一次寫入。回傳本次實際掃過的
+// byte 數。
 //
 // 進度逐事件更新（而非掃完才一次更新）：中途出錯時 rebuildCursor 停在最後一
 // 筆成功處理的事件結尾，重試從那裡續掃，已寫進 turn file 的 record 不會被重複
 // 補寫。
-func (idx *Index) scanIntoRebuildCursorLocked(auditPath string) (int64, error) {
+func (idx *Index) scanIntoRebuildCursorLocked(auditPath string, budget int64) (int64, error) {
 	from := idx.rebuildCursor
-	_, _, err := idx.scanAuditRangeLocked(auditPath, from, func(receipt appcore.AppendReceipt, _ bool) error {
+	_, _, err := idx.scanAuditRangeLocked(auditPath, from, budget, func(receipt appcore.AppendReceipt, _ bool) error {
 		idx.rebuildCursor = receipt.EndOffset
 		idx.rebuildLastEventID = receipt.EventID
 		return nil
@@ -591,10 +672,13 @@ func (idx *Index) scanIntoRebuildCursorLocked(auditPath string) (int64, error) {
 //
 // 檔尾回報值小於等於 cursor（append-only 檔理論上不會，但注入的 auditEnd 可能
 // 回報保守值）視為殘量 0、達標。
-func (idx *Index) residualWithinLimit(auditPath string, auditEnd auditEndFunc) (bool, error) {
+//
+// 一併回傳這次讀到的 end：第 4 步通過檢查後，第 5 步的鎖內補掃要以**同一個
+// end** 為終點（見 finalCatchUpAndAttach），不能各自重新取一次。
+func (idx *Index) residualWithinLimit(auditPath string, auditEnd auditEndFunc) (bool, int64, error) {
 	end, err := auditEnd()
 	if err != nil {
-		return false, fmt.Errorf("replayindex: audit end: %w", err)
+		return false, 0, fmt.Errorf("replayindex: audit end: %w", err)
 	}
 
 	idx.mu.Lock()
@@ -602,16 +686,16 @@ func (idx *Index) residualWithinLimit(auditPath string, auditEnd auditEndFunc) (
 	idx.mu.Unlock()
 
 	if end <= cursor {
-		return true, nil
+		return true, end, nil
 	}
 	if end-cursor > MaxCatchUpBytes {
-		return false, nil
+		return false, end, nil
 	}
 	records, err := countRecordsBetween(auditPath, cursor, end)
 	if err != nil {
-		return false, err
+		return false, end, err
 	}
-	return records <= MaxCatchUpRecords, nil
+	return records <= MaxCatchUpRecords, end, nil
 }
 
 // countRecordsBetween：[from, to) 這段 audit 內的完整 record 筆數（數換行，不
@@ -644,16 +728,43 @@ func countRecordsBetween(auditPath string, from, to int64) (int, error) {
 // 「接回 writer」在本套件裡就是解除 degraded latch——Index 沒有獨立的 writer
 // handle，Observe 是唯一寫入路徑，latch 解除的那一刻它就恢復工作，而此刻
 // emitMu 仍在手上，保證沒有 in-flight 的 append 被漏掉。
-func (idx *Index) finalCatchUpAndAttach(auditPath string) error {
+//
+// end 是第 4 步剛通過收斂檢查的那個檔尾，補掃終點必須**夾在它**、而不是掃到檔
+// 案真實 EOF：兩者一般相同（持有 emitMu 期間不會有新 append），但 auditEnd 若
+// 低報（sink 有未 flush 的 buffer、或呼叫端實作有誤），掃到 EOF 會讓鎖內處理量
+// 靜默超過凍結上限——maxLockedScanBytes 只是事後記錄，不會攔住任何東西。夾在
+// end 之後，超出的部分留給下一輪：latch 沒解除，下一次 RuntimeRebuild 會從
+// rebuildCursor 續掃。
+//
+// 夾在 end 之後多一道檢查：補掃完若檔案實際上還有 rebuildCursor 之後的資料，
+// 代表 auditEnd 低報了檔尾（違反 auditEndFunc 的契約）。此刻持有 emitMu、不可
+// 能有 in-flight append，所以「檔案大小 > cursor」是明確的契約違反訊號。這種
+// 情況必須 fail loud、保留 latch：若照樣接回，latch 解除後 Observe 會從
+// checkpoint（= 低報的 end）繼續，中間那段永遠不會有人索引——把「鎖內處理量靜
+// 默超標」換成「索引靜默留缺口」，兩個都不能接受。
+//
+// 這裡**不分段釋放 idx.mu**（與鎖外 catch-up 相反）：補掃量已被收斂上限與 end
+// 夾住、有界，而且第 5 步的原子性正是建立在「補掃到接回之間沒有任何人插進來」
+// 之上。
+func (idx *Index) finalCatchUpAndAttach(auditPath string, end int64) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	scanned, err := idx.scanIntoRebuildCursorLocked(auditPath)
+	budget := end - idx.rebuildCursor
+	if budget < 0 {
+		budget = 0
+	}
+	scanned, err := idx.scanIntoRebuildCursorLocked(auditPath, budget)
 	if scanned > idx.maxLockedScanBytes {
 		idx.maxLockedScanBytes = scanned
 	}
 	if err != nil {
 		return err
+	}
+	if info, serr := os.Stat(auditPath); serr == nil && info.Size() > idx.rebuildCursor {
+		return fmt.Errorf(
+			"replayindex: auditEnd 低報檔尾（回報 %d，實際到 %d 仍有未索引資料），保留 degraded latch",
+			end, info.Size())
 	}
 
 	prevOffset, prevEventID := idx.checkpointOffset, idx.checkpointLastEventID
@@ -668,16 +779,17 @@ func (idx *Index) finalCatchUpAndAttach(auditPath string) error {
 	return nil
 }
 
-// resetRebuildStats／countCatchUpAttempt／countUnlockRetry：本輪統計的維護。
-// 統計是 per-call 的（每次 RuntimeRebuild 歸零），語意是「本輪用掉多少嘗試」，
-// 不是行程累計——backoff 重試是另一輪，各自有完整的嘗試界限。rebuildCursor
-// **不在**歸零範圍內：它是跨輪保留的索引進度（見 bulkRebuild）。
+// resetRebuildStats／countCatchUpAttempt／countUnlockRetry／countLockSegment：
+// 本輪統計的維護。統計是 per-call 的（每次 RuntimeRebuild 歸零），語意是「本輪
+// 用掉多少嘗試」，不是行程累計——backoff 重試是另一輪，各自有完整的嘗試界限。
+// rebuildCursor **不在**歸零範圍內：它是跨輪保留的索引進度（見 bulkRebuild）。
 func (idx *Index) resetRebuildStats() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.catchUpAttempts = 0
 	idx.unlockRetries = 0
 	idx.maxLockedScanBytes = 0
+	idx.lockSegments = 0
 }
 
 func (idx *Index) countCatchUpAttempt() {
@@ -690,6 +802,12 @@ func (idx *Index) countUnlockRetry() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.unlockRetries++
+}
+
+func (idx *Index) countLockSegment() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.lockSegments++
 }
 
 // eventIDAtOffset：讀取 auditPath 在 offset 處起始的那一行、回傳其 event id
