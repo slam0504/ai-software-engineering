@@ -32,9 +32,15 @@ const loadingOlder = ref(false) // 防止捲動在到頂區間連續觸發多次
 
 // onScroll：review Critical 修復——loadOlder()／setScrollAnchor() 過去零 UI
 // 呼叫端（brief 的 Files 清單明講要改這個檔案，先前那版沒動到）。捲到頂
-// （isAtTop）才觸發向上分頁；載入期間用 loadingOlder 擋重入。錨點記錄的是
-// 「觸發分頁當下最舊的已載入事件」，用來在插入更舊內容後把畫面位置補回去，
-// 不讓新內容把使用者原本在看的位置往下推。
+// （isAtTop）才觸發向上分頁；載入期間用 loadingOlder 擋重入。
+//
+// 「畫面不因為插入的舊內容而跳動」完全靠下面 `el.scrollTop += 高度差` 這行
+// 補償，跟 setScrollAnchor 寫入的值**無關**。s.setScrollAnchor() 這裡照樣
+// 呼叫，是因為它是 Task 26 就存在、本票 brief 自己的 Step 1 測試也直接斷言
+// 的 store per-session 契約（`scrollAnchors` 在 unpin 之後仍保留）；review
+// round 3 確認：**目前沒有任何讀取端消費這個值**，保留它是維持既有 store
+// 契約完整（brief 要求、非 YAGNI 可刪範圍），不是這裡的位置補償機制依賴它
+// ——之前這裡的註解暗示兩者有關，不準確，已更正。
 async function onScroll() {
   const el = listEl.value
   if (!el) return

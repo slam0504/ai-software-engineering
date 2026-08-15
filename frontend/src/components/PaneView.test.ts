@@ -1,6 +1,7 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
+import { flushPromises } from '@vue/test-utils'
 import PaneView from './PaneView.vue'
 import { useSession } from '../stores/session'
 import { mountWithI18n } from '../test/i18n'
@@ -236,6 +237,37 @@ describe('PaneView：捲到頂觸發向上分頁（模擬捲動事件，不是�
     expect(load).toHaveBeenCalledWith('w9', 'h1', 20) // 'h1'＝pin() 尾端視窗載入的最舊事件
     expect(s.scrollAnchors['w9']).toBe('h1')
     expect(w.find('[data-test=pane-0]').text()).toContain('older turn text')
+  })
+
+  // review Important：上一條測試用的是靜態 stubGeometry，loadOlder 前後
+  // scrollHeight 沒變化，`el.scrollTop += 高度差` 那行在測試環境裡等於
+  // no-op（reviewer 手動刪掉那行、13 條全過，證實抓不到）。這裡讓
+  // LoadTurnsBefore mock 在被呼叫的當下（同步）把 scrollHeight 改成更大的
+  // 值，模擬「插入更舊內容後 DOM 真的變高」，才驗得到補償算式本身。
+  it('捲到頂分頁後補償捲動位置，避免插入的舊內容把畫面往下推', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w9', provider: 'claude', taskLabel: '' })
+    const load = vi.fn(async (w: string) => hist(w)) // 尾端視窗那次
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), LoadTurnsBefore: load })
+    const w = mountWithI18n(PaneView, { props: { idx: 0 } })
+    await s.pin(0, 'w9')
+    await nextTick()
+    const el = w.find('.msgs').element as HTMLElement
+    stubGeometry(el, 0, 400, 200) // 分頁觸發前：在頂端、內容高 400
+    load.mockImplementationOnce(async () => {
+      // 同步 side effect：onScroll 之後讀 el.scrollHeight 讀到的是「插入後」
+      // 的新高度，不是觸發當下那個舊值——跟真實瀏覽器插入 DOM 後 scrollHeight
+      // 變大是同一件事，只是 jsdom 不會自動算，得手動反映。
+      stubGeometry(el, 0, 900, 200)
+      return [{ event_id: 'older-1', ts: 't0', provider: 'claude', kind: 'message', role: 'user', text: 'older turn text', workspace_session_id: 'w9' }]
+    })
+    await w.find('.msgs').trigger('scroll')
+    // onScroll 內部是 await loadOlder() → await nextTick() → 補償捲動位置，
+    // 巢狀層數比前面幾條測試（只驗 DOM 內容／loadOlder 有無被呼叫）多一層。
+    // flushPromises()（巨集任務邊界）確保整條鏈真的跑完，不是外部隨意疊
+    // await nextTick() 賭微任務排隊次數。
+    await flushPromises()
+    expect(el.scrollTop).toBe(500) // 900 - 400：補回被撐開的高度，畫面視覺位置不跳動
   })
 
   it('不在頂端（scrollTop 遠大於 slack）捲動不觸發 loadOlder', async () => {
