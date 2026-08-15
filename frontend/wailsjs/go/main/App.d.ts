@@ -71,6 +71,8 @@ export function RecoverCodexRecording():Promise<void>;
 
 export function RegisterMutation(arg1:string,arg2:string):Promise<string>;
 
+export function RemoveSession(arg1:string):Promise<void>;
+
 export function ResolveApproval(arg1:string,arg2:boolean,arg3:string):Promise<void>;
 
 export function RestartCodexServerRecorded(arg1:string):Promise<void>;

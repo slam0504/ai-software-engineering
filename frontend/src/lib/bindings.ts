@@ -1,5 +1,5 @@
 import {
-  StartSession, SendMessage, CreateSession, RecoverCodexRecording, LoadTurnsBefore,
+  StartSession, SendMessage, CreateSession, RemoveSession, RecoverCodexRecording, LoadTurnsBefore,
   RegisterMutation, RunEvidence, EvidenceGet, SubmitTestContract, ValidateTestCommit, EvidenceCommitCandidates,
   EscalationList, EscalationCreate, EscalationAck, EscalationResolve,
 } from '../../wailsjs/go/main/App'
@@ -12,7 +12,8 @@ import type {
 // 逐參數轉發——單參數 adapter 會把 provider 名當成訊息內容送出）。Task 22 加入
 // TCA workspace 六個綁定、Task 25 加入 escalation 收件匣四個綁定，同一教訓
 // 套用：多參數呼叫每個都逐參數轉發、順序與 Go 簽章一致（見 bindings.test.ts）。
-// M3b Task 4 加入 CreateSession（純新增，多參數）——同一教訓再套一次；
+// M3b Task 4 加入 CreateSession（純新增，多參數）——同一教訓再套一次；Task 22
+// 加入 RemoveSession（純新增，單參數）；
 // Task 13 加入無參數的 RecoverCodexRecording（§3.4.6 錄流 latch 的復原入口）；
 // Task 20 加入 LoadTurnsBefore（§3.8 視窗化載入／向上分頁，三個參數）。
 // 回傳型別交集 Bindings & WorkspaceSessionBindings & EvidenceBindings &
@@ -24,6 +25,7 @@ export function makeBindings(): Bindings & WorkspaceSessionBindings & CodexRecor
     StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
     SendMessage: (p, t) => SendMessage(p, t),
     CreateSession: (p, taskLabel) => CreateSession(p, taskLabel),
+    RemoveSession: (wsid) => RemoveSession(wsid),
     RecoverCodexRecording: () => RecoverCodexRecording(),
     LoadTurnsBefore: (wsid, beforeEventID, n) => LoadTurnsBefore(wsid, beforeEventID, n),
     RegisterMutation: (taskRef, patch) => RegisterMutation(taskRef, patch),

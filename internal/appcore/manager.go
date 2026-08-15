@@ -27,6 +27,11 @@ var (
 	ErrSessionNotFound  = errors.New("appcore: unknown workspace session")
 	ErrStaleCreate      = errors.New("appcore: stale create token")
 	ErrProviderMismatch = errors.New("appcore: event provider != slot provider")
+
+	// M3b §3.6.2：移除＝釋放名額的最後一步。呼叫端必須先完成 teardown（slot 收
+	// 回 idle），才能呼叫 RemoveSession——非 idle 一律拒絕，不得把「還在收尾」
+	// 的 slot 直接砍掉。
+	ErrSessionNotIdle = errors.New("appcore: session must be idle to remove")
 )
 
 // MaxSessionsPerProvider：凍結常數——不進 config、不讀環境變數（M3b §3.1.4）。
@@ -265,6 +270,33 @@ func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error {
 	sl := newSlot()
 	sl.wsid, sl.provider, sl.committed = w, p, true
 	m.slots[w] = sl
+	return nil
+}
+
+// RemoveSession：三段建立交易的逆操作（§3.6.2）——刪除 committed slot，釋放該
+// provider 的名額。這是「釋放名額」本身這一步，不做 teardown／registry
+// tombstone：呼叫端（App.RemoveSession）必須先完成 deny approvals／teardown／
+// lease finalize／cleanup／tombstone persist 全部成功，才能呼叫到這裡（§3.6.2
+// 凍結順序：釋放名額必須是最後一步）。
+//
+// 只接受 idle phase：非 idle（starting／active／ending／resetting）代表呼叫端
+// 尚未真的把 session 收尾，直接砍掉 slot 會讓仍在跑的 goroutine（pump／teardown
+// reaper）之後對一個已消失的 WSID 操作，回一堆 ErrSessionNotFound 掩蓋真正的
+// bug——寧可 fail loud。
+func (m *Manager) RemoveSession(w WSID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	if sl.phase != phaseIdle {
+		return ErrSessionNotIdle
+	}
+	delete(m.slots, w)
 	return nil
 }
 

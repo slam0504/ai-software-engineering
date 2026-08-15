@@ -46,6 +46,9 @@ export interface Bindings {
 // 欄位；WSID 化的 store 切換是 Task 26 的原子改動，這裡不提前擴大 Bindings。
 export interface WorkspaceSessionBindings {
   CreateSession(provider: string, taskLabel: string): Promise<string>
+  // RemoveSession：M3b Task 22 純新增——使用者明確移除（tombstone，§3.6.1），
+  // 與 CreateSession 同一群組。
+  RemoveSession(wsid: string): Promise<void>
 }
 // CodexRecordingBindings：M3b Task 13 純新增的 RecoverCodexRecording——§3.4.6
 // recorder error latch 的 in-process 復原入口（latch 期間新 Codex session 被拒，

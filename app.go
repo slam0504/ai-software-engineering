@@ -117,6 +117,39 @@ type App struct {
 	// closed／stale token 時失敗，兩者都無法在不破壞 Manager 狀態下重現）。
 	hookForceCommitCreateError error
 
+	// crTokenMu／crTokens：Remove × New 共用的 provider-scoped ownership token
+	// （§3.6.2）——CreateSession 與 RemoveSession 對同一 provider 互斥序列化，
+	// 兩者的「持有期間」分別涵蓋各自整段編排（Reserve→Commit／deny_approvals→
+	// decrement_count），而不只是其中一步，否則兩者仍可能交錯看到半完成狀態。
+	//
+	// 鎖序（凍結；避免 plan 階段抓到的那個 deadlock）：token 一律是兩條路徑
+	// 最先取得的鎖，且在成功取得之前兩者都不持有任何其他 App 內部鎖
+	// （a.mu／apprMu／manager 內部 mutex／createDegradedMu 皆不會在等 token 期間
+	// 被持有）——因此不存在「A 等 B 持有的鎖、B 等 A 持有的鎖」的反向鎖序，
+	// 兩條路徑只可能互相等待這一把鎖本身，不會死鎖。crTokenMu 只保護 map 本身
+	// 的建立，不是要序列化的那把鎖，取得後立即釋放，不跨臨界區持有。
+	crTokenMu sync.Mutex
+	crTokens  map[contract.Provider]*sync.Mutex
+
+	// removeTokenHeld：測試專用——RemoveSession 目前是否持有 provider token
+	// （TestRemoveXNewShareOwnershipToken 用來斷言 Create 不會在 Remove 持有
+	// 期間搶到）。由 removeTokenHeldForTest 讀取；production 無讀者。
+	removeTokenHeld atomic.Bool
+
+	// hookRemoveStep：測試注入——RemoveSession §3.6.2 凍結順序的探針（同
+	// startupStep／wireStep 慣例：步驟名代表「跑到了」，不代表每一步都做了新
+	// 工作——lease_finalize 對 claude 是 teardown 內已完成的檢查點、對 codex
+	// 無 session-scoped lease 故恆為 no-op）。production 恆為 nil。
+	hookRemoveStep func(step string)
+
+	// hookRemoveHoldingToken：測試注入——RemoveSession 取得 provider token 之後
+	// 呼叫，用來確定性地讓測試把 Remove 卡在「持有 token、尚未完成」的窗口。
+	// hookCreateWaitingForToken／hookCreateAcquiredToken：CreateSession 對應的
+	// 等待／取得探針。三者皆 production 恆為 nil。
+	hookRemoveHoldingToken    func()
+	hookCreateWaitingForToken func()
+	hookCreateAcquiredToken   func()
+
 	auditMu sync.Mutex
 	auditF  *os.File
 
@@ -455,6 +488,26 @@ func (a *App) commitCreate(tok appcore.CreateToken) error {
 	return a.manager.CommitCreate(tok)
 }
 
+// crToken：Remove × New 共用的 provider-scoped ownership token（見 crTokens
+// 欄位 doc 的鎖序凍結）。惰性建立，crTokenMu 只保護 map 本身、不是要序列化的
+// 那把鎖。
+func (a *App) crToken(p contract.Provider) *sync.Mutex {
+	a.crTokenMu.Lock()
+	defer a.crTokenMu.Unlock()
+	if a.crTokens == nil {
+		a.crTokens = map[contract.Provider]*sync.Mutex{}
+	}
+	tok, ok := a.crTokens[p]
+	if !ok {
+		tok = &sync.Mutex{}
+		a.crTokens[p] = tok
+	}
+	return tok
+}
+
+// removeTokenHeldForTest：測試專用（見 removeTokenHeld 欄位 doc）。
+func (a *App) removeTokenHeldForTest() bool { return a.removeTokenHeld.Load() }
+
 // CreateSession 建立一個新的 workspace session，回傳其 WSID（純新增 binding；
 // 既有 provider-keyed 的 StartSession／SendMessage／EndSession 不受影響）。
 //
@@ -493,6 +546,17 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	if a.wsReg == nil { // 名額尚未被佔用，直接早退
 		return "", errNoSessionRegistry
 	}
+	// Remove × New 共用 provider token（§3.6.2）：等待與持有涵蓋 Reserve→Commit
+	// 整段，與 RemoveSession 對同一 provider 互斥（見 crTokens 欄位 doc 的鎖序）。
+	crt := a.crToken(p)
+	if h := a.hookCreateWaitingForToken; h != nil {
+		h()
+	}
+	crt.Lock()
+	if h := a.hookCreateAcquiredToken; h != nil {
+		h()
+	}
+	defer crt.Unlock()
 	w, tok, err := a.manager.ReserveSession(p)
 	if err != nil {
 		return "", err
@@ -4710,12 +4774,135 @@ func (a *App) EndSession(provider string) error {
 	}
 	defer a.endAppTxn()
 	w := a.legacyWSIDFor(contract.Provider(provider)) // 兩個 provider 都 WSID 定址（§3.3）
+	return a.endSessionFlowForWSID(w, contract.Provider(provider))
+}
+
+// endSessionFlowForWSID：provider-dispatch 的收尾編排本體，原內聯於 EndSession
+// ——RemoveSession（Task 22）需要對「任意 WSID」（而不是 legacyWSIDFor 解析出的
+// 那一個）跑同一段收尾，抽出以供兩者共用，行為與抽出前逐字一致。
+func (a *App) endSessionFlowForWSID(w appcore.WSID, p contract.Provider) error {
 	h := a.hostFor(w)
-	if provider == "claude" {
+	if p == contract.ProviderClaude {
 		return appcore.EndSessionFlow(a.manager, w, nil, a.claudeTeardown(h))
 	}
 	busy := func() bool { return h != nil && h.runner != nil && h.runner.ActiveTurnID() != "" }
 	return appcore.EndSessionFlow(a.manager, w, busy, func() error { return a.codexTeardown(h) })
+}
+
+// removeStep：§3.6.2 凍結順序的探針（同 startupStep／hookWireStep 慣例——步驟名
+// 代表「編排跑到了這裡」，不代表每一步都做了新工作；見 hookRemoveStep 欄位 doc）。
+func (a *App) removeStep(step string) {
+	if a.hookRemoveStep != nil {
+		a.hookRemoveStep(step)
+	}
+}
+
+// denyApprovalsForRemove：§3.6.3——待移除 WSID 的全部顯示中／排隊 approval，一律
+// best-effort fail-closed deny（reason=session_removed）。單筆失敗不中斷其餘筆
+// 數的 deny，錯誤以 errors.Join 收集回傳；呼叫端不因此中斷 teardown（spec 原文：
+// 「deny 部分失敗時仍 terminate provider」）。
+//
+// 先在 apprMu 下 snapshot 目標 id（排序取得決定性順序，不隨 map 迭代漂移），釋放
+// 鎖之後才逐筆呼叫 ResolveApproval——後者本身會重新取 apprMu，若在鎖內呼叫會自我
+// 死鎖。
+func (a *App) denyApprovalsForRemove(w appcore.WSID) error {
+	a.apprMu.Lock()
+	var ids []string
+	for id, p := range a.apprPending {
+		if p.wsid == w {
+			ids = append(ids, id)
+		}
+	}
+	a.apprMu.Unlock()
+	slices.Sort(ids)
+	var errs []error
+	for _, id := range ids {
+		if err := a.ResolveApproval(id, false, "session_removed"); err != nil {
+			errs = append(errs, fmt.Errorf("approval %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// cleanupRemovedFiles：per-WSID 殘留檔案清理（risk item 3：「Claude per-WSID
+// socket／MCP config 的檔案數與清理」）。socket 檔已由 teardown 內的
+// broker.Close() 處理（listener 一關就 unlink）；這裡補的是 teardown 不管的
+// 那一份——per-WSID 的 MCP config 檔（`mcp-<wsid>.json`）本身從未被刪除過，見
+// startClaude 對 host.mcpPath 的寫入。純粹依 WSID 算路徑，不需要 host 指標
+// （此時 host 已由 teardown take-then-dispose 處置掉）；不存在（codex／從未啟動
+// 過的 dormant session）視為已達目標狀態，不算錯誤。
+func (a *App) cleanupRemovedFiles(w appcore.WSID) error {
+	path := filepath.Join(a.stateDir, "mcp-"+string(w)+".json")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("app: cleanup mcp config %s: %w", path, err)
+	}
+	return nil
+}
+
+// RemoveSession：使用者明確移除（§3.6.1-3；純新增 binding）——registry 留
+// tombstone（`removed_at`／`remove_reason`），不是刪除 record；與建立失敗回滾的
+// DeleteUncommitted（不留痕）語意不同，不得混用。
+//
+// 凍結順序（§3.6.2）：deny_approvals → teardown → lease_finalize →
+// cleanup_files → tombstone_persist → decrement_count——釋放名額（Manager 側
+// 刪除 slot）必須是最後一步，任一步失敗都保留 slot（fail loud，使用者可重試
+// 移除）。lease_finalize 對 claude 是 teardown（CloseSequence）內已完成的檢查
+// 點，不是另一次呼叫；codex 沒有 session-scoped lease，同樣是 no-op 檢查點——
+// 兩者都只是步驟探針，不代表這裡對它們各自另做了一次副作用。
+//
+// Remove × New 同一 provider 序列化（見 crTokens 欄位 doc 的鎖序凍結）：token
+// 涵蓋整段編排，過程中不會有 CreateSession 為同一 provider reserve／commit 新
+// slot，也不會有另一個 RemoveSession 併發跑同一 provider 的收尾。
+func (a *App) RemoveSession(wsid string) error {
+	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
+		return err
+	}
+	defer a.endAppTxn()
+	w := appcore.WSID(wsid)
+	p, ok := a.manager.ProviderOf(w)
+	if !ok {
+		return fmt.Errorf("app: remove session %s: %w", wsid, appcore.ErrSessionNotFound)
+	}
+	if a.wsReg == nil {
+		return errNoSessionRegistry
+	}
+
+	crt := a.crToken(p)
+	crt.Lock()
+	a.removeTokenHeld.Store(true)
+	defer func() {
+		a.removeTokenHeld.Store(false)
+		crt.Unlock()
+	}()
+	if h := a.hookRemoveHoldingToken; h != nil {
+		h()
+	}
+
+	a.removeStep("deny_approvals")
+	denyErr := a.denyApprovalsForRemove(w)
+
+	a.removeStep("teardown")
+	tearErr := a.endSessionFlowForWSID(w, p)
+
+	a.removeStep("lease_finalize")
+
+	a.removeStep("cleanup_files")
+	cleanupErr := a.cleanupRemovedFiles(w)
+
+	if err := errors.Join(denyErr, tearErr, cleanupErr); err != nil {
+		return fmt.Errorf("app: remove session %s: %w（slot 保留，可重試移除）", wsid, err)
+	}
+
+	a.removeStep("tombstone_persist")
+	if err := a.wsReg.Remove(wsid, "user_removed"); err != nil {
+		return fmt.Errorf("app: remove session %s: tombstone persist 失敗：%w（slot 保留，可重試移除）", wsid, err)
+	}
+
+	a.removeStep("decrement_count")
+	if err := a.manager.RemoveSession(w); err != nil {
+		return fmt.Errorf("app: remove session %s: 已 tombstone 但釋放名額失敗：%w", wsid, err)
+	}
+	return nil
 }
 
 func (a *App) TerminateSession(provider string) error {

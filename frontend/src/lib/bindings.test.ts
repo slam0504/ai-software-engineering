@@ -4,6 +4,7 @@ const h = vi.hoisted(() => ({
   StartSession: vi.fn(async () => {}),
   SendMessage: vi.fn(async () => {}),
   CreateSession: vi.fn(async () => 'wsid-1'),
+  RemoveSession: vi.fn(async () => {}),
   RecoverCodexRecording: vi.fn(async () => {}),
   LoadTurnsBefore: vi.fn(async () => []),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
@@ -42,6 +43,13 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.CreateSession('claude', 'my-task')
     expect(h.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
+  })
+
+  // M3b Task 22：RemoveSession 逐參數轉發——purely additive binding。
+  it('RemoveSession 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.RemoveSession('w1')
+    expect(h.RemoveSession).toHaveBeenCalledWith('w1')
   })
 
   // M3b Task 13：RecoverCodexRecording 無參數，仍要鎖「adapter 真的打到 Go 綁定」

@@ -130,6 +130,10 @@ export function RegisterMutation(arg1, arg2) {
   return window['go']['main']['App']['RegisterMutation'](arg1, arg2);
 }
 
+export function RemoveSession(arg1) {
+  return window['go']['main']['App']['RemoveSession'](arg1);
+}
+
 export function ResolveApproval(arg1, arg2, arg3) {
   return window['go']['main']['App']['ResolveApproval'](arg1, arg2, arg3);
 }

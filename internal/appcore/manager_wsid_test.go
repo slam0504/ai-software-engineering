@@ -61,6 +61,56 @@ func TestAbortCreateReleasesSlot(t *testing.T) {
 	}
 }
 
+// TestRemoveSessionReleasesIdleSlot（§3.6.2）：RemoveSession 是三段建立交易的
+// 逆操作——committed、idle 的 slot 必須可以被刪除，名額釋放；重複呼叫同一
+// WSID 必須 fail loud（slot 已不存在）。
+func TestRemoveSessionReleasesIdleSlot(t *testing.T) {
+	m := New(Config{Sink: &memSink{}})
+	w, tok, err := m.ReserveSession("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CommitCreate(tok); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.SlotCount("claude"); got != 1 {
+		t.Fatalf("commit 後應佔 1 個名額：%d", got)
+	}
+	if err := m.RemoveSession(w); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.SlotCount("claude"); got != 0 {
+		t.Fatalf("RemoveSession 必須釋放名額：%d", got)
+	}
+	if err := m.RemoveSession(w); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("重複移除同一 WSID 必須 fail loud（slot 已不存在）：%v", err)
+	}
+}
+
+// TestRemoveSessionRejectsNonIdlePhase：非 idle phase（starting／active／
+// ending／resetting）代表呼叫端（App.RemoveSession）尚未真的把 session 收尾就
+// 呼叫到這裡——直接砍掉 slot 會讓仍在跑的 goroutine 之後對一個已消失的 WSID
+// 操作，必須 fail loud、不得釋放名額。
+func TestRemoveSessionRejectsNonIdlePhase(t *testing.T) {
+	m := New(Config{Sink: &memSink{}})
+	w, tok, err := m.ReserveSession("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CommitCreate(tok); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.BeginNewSessionSubmit(w, "task"); err != nil { // idle → starting
+		t.Fatal(err)
+	}
+	if err := m.RemoveSession(w); !errors.Is(err, ErrSessionNotIdle) {
+		t.Fatalf("非 idle phase 必須拒絕移除：%v", err)
+	}
+	if got := m.SlotCount("claude"); got != 1 {
+		t.Fatalf("拒絕的移除不得釋放名額：%d", got)
+	}
+}
+
 func TestUnknownWSIDNeverCreatesSlot(t *testing.T) {
 	m := New(Config{Sink: &memSink{}})
 	if _, err := m.BeginNewSessionSubmit("no-such", "t"); !errors.Is(err, ErrSessionNotFound) {

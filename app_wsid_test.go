@@ -16,6 +16,7 @@ type stubRegistry struct {
 	mu        sync.Mutex
 	putErr    error
 	deleteErr error
+	removeErr error
 
 	entries              map[string]wsregistry.Entry
 	deletedUncommitted   bool
@@ -55,7 +56,11 @@ func (s *stubRegistry) DeleteUncommitted(wsid string) error {
 func (s *stubRegistry) Remove(wsid, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.removeErr != nil {
+		return s.removeErr
+	}
 	s.removedWithTombstone = true
+	delete(s.entries, wsid)
 	return nil
 }
 
