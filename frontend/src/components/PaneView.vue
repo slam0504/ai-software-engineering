@@ -11,10 +11,11 @@ import { isAtBottom } from '../lib/scroll'
 // 無關）——composer 是唯一「只有 focused pane 才有」的東西（§3.7：Enter/
 // Shift+Enter／SettingsBar 的 End/Terminate/New 只作用於 focused pane）。
 //
-// End 走 s.bindings.EndSession 而非另開一份 wailsjs import：理由見
-// types.ts Bindings.EndSession 的 doc——DualPane 的測試只 mock s.bindings，
-// 不另外 vi.mock wailsjs module。New／Terminate 這張票沒有測試涵蓋，不新增
-// （brief 沒要求；SettingsBar 頂欄仍是唯一入口，見 task 報告的 scope 決策）。
+// review round 1：End／Terminate／New 一律留在 SettingsBar 頂欄（§3.7 原文
+// 只點名 SettingsBar，§4 對 PaneView 的描述只到「綁 WSID；focus 樣式明確」）。
+// PaneView 原本自帶一份等價 End 按鈕，會在預設畫面（tab='chat'、SettingsBar
+// 恆掛頂端、DualPane 用 v-show）同時出現兩顆「結束」，裁決收斂回 SettingsBar，
+// 這裡不再重複。
 const props = defineProps<{ idx: 0 | 1 }>()
 const { t } = useI18n()
 const s = useSession()
@@ -26,7 +27,7 @@ const focused = computed(() => s.focused === props.idx)
 
 const draft = ref('')
 const listEl = ref<HTMLElement | null>(null)
-const follow = ref(true) // BAT 慣例：使用者上捲後停止自動跟隨（同 ChatPanel）
+const follow = ref(true) // BAT 慣例：使用者上捲後停止自動跟隨
 
 function onScroll() {
   const el = listEl.value
@@ -39,19 +40,6 @@ async function send() {
   draft.value = ''
   follow.value = true
   await s.submit(text) // submit() 作用於 focused pane，composer 只在 focused 時渲染，故一致
-}
-
-async function endSession() {
-  const w = wsid.value
-  if (!w) return
-  const action = t('settings.operationAction.end')
-  try {
-    if (!s.bindings?.EndSession) throw new Error(t('store.bindingsNotReady'))
-    await s.bindings.EndSession(w)
-    s.note(t('settings.operation.success', { action }), w)
-  } catch (e) {
-    s.pushError(t('settings.operation.failure', { action, error: String(e) }), w)
-  }
 }
 
 watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.length ?? 0), () =>
@@ -68,7 +56,6 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
         <span class="provider">{{ meta?.provider }}</span>
         <span v-if="meta?.taskLabel" class="label">{{ meta.taskLabel }}</span>
         <span v-if="meta" :class="['state', meta.state]">{{ resolveState(sessionStateKeys, meta.state, t) }}</span>
-        <button v-if="focused" data-test="end-session" @click.stop="endSession">{{ t('settings.action.end') }}</button>
       </div>
       <div ref="listEl" class="msgs" @scroll.passive="onScroll">
         <div v-for="(m, i) in view?.chat ?? []" :key="i" :class="['bubble', m.role]">

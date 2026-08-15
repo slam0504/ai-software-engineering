@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import DualPane from './DualPane.vue'
+import SettingsBar from './SettingsBar.vue'
 import { useSession } from '../stores/session'
 import { makeI18n } from '../test/i18n'
 import type { Bindings } from '../types'
@@ -30,7 +31,7 @@ describe('DualPane（雙 pane 並看＋單一 focused pane 操作語意，§3.7�
   beforeEach(() => {
     pinia = createPinia()
     setActivePinia(pinia)
-    // jsdom 未實作 scrollTo（follow-tail watch 會呼叫，同 ChatPanel.test.ts 慣例）
+    // jsdom 未實作 scrollTo（PaneView 的 follow-tail watch 會呼叫）
     Element.prototype.scrollTo = Element.prototype.scrollTo ?? (() => {})
     const s = useSession()
     s.setBindings(mockBindings())
@@ -80,10 +81,17 @@ describe('DualPane（雙 pane 並看＋單一 focused pane 操作語意，§3.7�
     expect(s.bindings?.SendMessage).toHaveBeenCalledWith('w2', 'hello')
   })
 
+  // review round 1（Task 28）：PaneView 原本自帶一份等價 End 按鈕，跟
+  // SettingsBar 頂欄的 End 在預設畫面（tab='chat'）同時可見、行為完全等價，
+  // 裁決收斂到 SettingsBar（spec §3.7 原文只點名 SettingsBar 的 End/
+  // Terminate/New，§4 對 PaneView 只到「綁 WSID；focus 樣式明確」）。這條測試
+  // 因此改為真的 mount SettingsBar（不是 DualPane），驗證它的 End 只作用於
+  // focused pane 的 WSID——雙 pane 情境下 focus 切到 pane 1（w2）時，SettingsBar
+  // 仍讀 s.focusedWsid，行為與單 pane 時一致。
   it('SettingsBar 的 End 只作用於 focused pane', async () => {
     const s = useSession()
     s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(1)
-    const w = mount(DualPane, { global: { plugins: [pinia, i18n] } })
+    const w = mount(SettingsBar, { global: { plugins: [pinia, i18n] } })
     await nextTick()
     await w.find('[data-test=end-session]').trigger('click')
     expect(s.bindings?.EndSession).toHaveBeenCalledWith('w2')

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // wailsjs 綁定全部 mock：分頁切換不得觸發任何 backend 呼叫
 const mocks = vi.hoisted(() => ({
-  TerminateSession: vi.fn(), EndSession: vi.fn(), NewSession: vi.fn(),
+  TerminateSession: vi.fn(), NewSession: vi.fn(),
   CreateSession: vi.fn(async () => 'w-new'), AuthStatus: vi.fn(),
   StartLogin: vi.fn(), CancelLogin: vi.fn(), Logout: vi.fn(),
   RestartCodexServerRecorded: vi.fn(),
@@ -15,8 +15,14 @@ import { useSession } from '../stores/session'
 import { mountWithI18n } from '../test/i18n'
 
 // two：兩個已註冊 session，w1 釘在 pane 0（focused）、w2 尚未釘選。
+// review round 1（Task 28）：End 改走 s.bindings.EndSession（不再是 wailsjs
+// 原始 import），這裡改用 s.setBindings() 注入同一份 mock，斷言也從
+// mocks.EndSession 改成 s.bindings.EndSession。
 function two() {
   const s = useSession()
+  s.setBindings({
+    StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), EndSession: vi.fn(async () => {}),
+  })
   s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
   s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
   s.pin(0, 'w1')
@@ -62,12 +68,12 @@ describe('SettingsBar session 分頁（Task 26：WSID 定址）', () => {
     const w = mountWithI18n(SettingsBar)
     s.setFocus(0)
     await w.find('[data-test=end-session]').trigger('click')
-    expect(mocks.EndSession).toHaveBeenCalledWith('w1')
+    expect(s.bindings?.EndSession).toHaveBeenCalledWith('w1')
     await w.find('[data-test=session-tab-w2]').trigger('click')
     await w.find('[data-test=end-session]').trigger('click')
-    expect(mocks.EndSession).toHaveBeenLastCalledWith('w2')
-    expect(mocks.EndSession).not.toHaveBeenCalledWith('claude')
-    expect(mocks.EndSession).not.toHaveBeenCalledWith('codex')
+    expect(s.bindings?.EndSession).toHaveBeenLastCalledWith('w2')
+    expect(s.bindings?.EndSession).not.toHaveBeenCalledWith('claude')
+    expect(s.bindings?.EndSession).not.toHaveBeenCalledWith('codex')
   })
 
   it('建立按鈕登記新 session 並釘進目前 pane', async () => {

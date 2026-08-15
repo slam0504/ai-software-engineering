@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { PROVIDERS, useSession } from '../stores/session'
 import type { ProviderKey } from '../stores/session'
 import {
-  TerminateSession, EndSession, NewSession, CreateSession, AuthStatus, StartLogin, CancelLogin,
+  TerminateSession, NewSession, CreateSession, AuthStatus, StartLogin, CancelLogin,
   Logout, RestartCodexServerRecorded,
 } from '../../wailsjs/go/main/App'
 
@@ -36,6 +36,15 @@ async function createSession(p: ProviderKey) {
 const resumeInput = computed({ get: () => s.resumeInput, set: (v: string) => s.setResumeInput(v) })
 const taskLabel = computed({ get: () => s.taskLabel, set: (v: string) => s.setTaskLabel(v) })
 const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.setRecordCase(v) })
+
+// endSession：Task 28 review round 1——走 s.bindings.EndSession 而非原始
+// wailsjs import，理由：DualPane 需要 End 是 focused-pane 專屬控制項且測試
+// 只 mock s.bindings（不另開 vi.mock wailsjs module）；PaneView 原本自帶一份
+// 等價按鈕會造成「同一畫面兩顆結束」，裁決收斂到這裡、刪掉 PaneView 那份。
+async function endSession() {
+  if (!s.bindings?.EndSession) throw new Error(t('store.bindingsNotReady'))
+  await s.bindings.EndSession(wsid.value)
+}
 
 // opKey ∈ settings.operationAction 的 key（new/terminate/end/authStatus/login/cancelLogin/logout/b1Probe）
 async function call(fn: () => Promise<unknown>, opKey: string) {
@@ -89,7 +98,7 @@ async function call(fn: () => Promise<unknown>, opKey: string) {
     <!-- NewSession 原子流程（收尾＋恢復視窗重設）；失敗由 call() 顯示且不 reset -->
 
     <button :disabled="!wsid" @click="call(() => TerminateSession(wsid), 'terminate')">{{ t('settings.action.terminate') }}</button>
-    <button :disabled="!wsid" data-test="end-session" @click="call(() => EndSession(wsid), 'end')">{{ t('settings.action.end') }}</button>
+    <button :disabled="!wsid" data-test="end-session" @click="call(endSession, 'end')">{{ t('settings.action.end') }}</button>
     <span class="spacer" />
     <button @click="call(() => AuthStatus(s.provider), 'authStatus')">{{ t('settings.action.authStatus') }}</button>
     <button @click="call(() => StartLogin(s.provider), 'login')">{{ t('settings.action.login') }}</button>
