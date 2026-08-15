@@ -33,7 +33,17 @@ function summary(i: TimelineItem) {
   if (e.kind === 'state_change') return t('timeline.summary.stateChange', { state: resolveState(sessionStateKeys, e.state ?? '', t) })
   if (e.kind === 'retry') return t('timeline.summary.retry')
   if (e.kind === 'message' && e.role === 'tool') return t('timeline.summary.toolResult')
+  // workspace-scope 事件的訊息在 payload 裡：Manager.EmitWorkspace 只填
+  // Envelope.Payload，而 Envelope.Error 是 omitempty **從未被它填過**（app.go 的
+  // 六個 EmitWorkspace(stream_error) 呼叫點皆然）。不讀 payload 的話這裡會落到
+  // `return e.kind`，使用者只看得到一個沒有內容的 "stream_error"。
+  const p = (e.payload ?? {}) as Record<string, unknown>
+  if (e.kind === 'codex_broadcast') {
+    return t('timeline.summary.codexBroadcast', { method: typeof p.method === 'string' ? p.method : 'raw' })
+  }
   if (e.error) return e.error
+  const detail = [p.component, p.error ?? p.event].filter(v => typeof v === 'string').join(': ')
+  if (detail) return detail
   return e.kind
 }
 function toggle(set: Set<number> | Set<string>, key: never) {

@@ -80,6 +80,21 @@ describe('SettingsBar session 分頁（Task 26：WSID 定址）', () => {
     expect(s.pins[0]).toBe('w-new')
   })
 
+  it('registry 有、Manager 無 slot 的 session 在清單上明確標示不可操作', async () => {
+    const s = useSession()
+    s.hydrateSessions([
+      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: '', created_at: '', available: true, state: 'idle' },
+      { wsid: 'wOrphan', provider: 'codex', task_label: 'b', resume_session_id: '', created_at: '', available: false, state: '' },
+    ])
+    const w = mountWithI18n(SettingsBar)
+    await w.vm.$nextTick()
+    const orphan = w.find('[data-test=session-tab-wOrphan]')
+    expect(orphan.classes()).toContain('unavailable') // 不隱藏、據實呈現
+    expect(orphan.attributes('title')).toContain('wOrphan') // tooltip 說明為什麼
+    expect(w.find('[data-test=session-tab-w1]').classes()).not.toContain('unavailable')
+    void s
+  })
+
   it('沒有 focused session 時 lifecycle 按鈕停用（避免打空 WSID）', async () => {
     useSession()
     const w = mountWithI18n(SettingsBar)

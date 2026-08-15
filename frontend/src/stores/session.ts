@@ -6,13 +6,6 @@ const NOISE_KINDS = new Set(['system_other', 'unknown'])
 export const PROVIDERS = ['claude', 'codex'] as const
 export type ProviderKey = (typeof PROVIDERS)[number]
 
-// APPROVAL_RESTORE_TRIGGERS：§3.6.4 凍結的「恢復原釘選」觸發全列。定成 const
-// tuple 而非散落的字串：型別由它導出，呼叫端漏掉一種就是編譯錯誤，而不是執行期
-// 才發現 transient pin 卡住。
-export const APPROVAL_RESTORE_TRIGGERS =
-  ['allow', 'deny', 'timeout', 'dismiss', 'remove', 'shutdown'] as const
-export type ApprovalRestoreTrigger = (typeof APPROVAL_RESTORE_TRIGGERS)[number]
-
 // SessionMeta：per-WSID 的 session 狀態（§3.8「非釘選只保留 metadata」的那一半）。
 //
 // 契約凍結（plan Task 26）：busy／unread／awaitingApproval／state 一律讀寫這裡，
@@ -82,7 +75,9 @@ interface State {
   // 這是修掉「degraded 通知被 gate store 靜默丟棄」那條路徑的落點。
   notices: TimelineItem[]
   // unrouted：conversation lane 但沒帶 workspace_session_id 的事件數。丟棄是
-  // 刻意的（沒有 lane 可放），但不靜默：計數會顯示在 UI 並可被測試斷言。
+  // 刻意的（沒有 lane 可放）。**目前沒有任何渲染端**——這個計數只在測試裡看得
+  // 見，接進 UI 是 Task 28 的事（DualPane／狀態列）。在那之前，丟棄的事件對使
+  // 用者仍是無聲的，稽核（events.jsonl）才是唯一完整的證據來源。
   unrouted: number
   approvalPolicy: string
   bindings: Bindings | null
@@ -191,7 +186,13 @@ export const useSession = defineStore('session', {
           wsid: e.wsid, provider: providerOf(e.provider), taskLabel: e.task_label,
           resume: e.resume_session_id, available: e.available,
         })
-        if (e.state) this.sessions[e.wsid].state = e.state
+        // slot phase 只在 registry 說得出來時才覆寫：available=false 代表沒有
+        // slot，任何 phase（含 newMeta 的預設 'idle'）都是假的，清成空字串＝
+        // 「未知」。反過來也不能無條件覆寫——ListSessions 的 State 是 Manager
+        // slot phase（starting／active／ending），與 envelope state_change 的
+        // 值域（waiting／streaming／awaiting_approval）不同，重新整理時無條件
+        // 蓋回去會把 runtime 推導出來的狀態抹掉。
+        this.sessions[e.wsid].state = e.available ? (e.state || this.sessions[e.wsid].state) : ''
       }
     },
 
@@ -258,9 +259,11 @@ export const useSession = defineStore('session', {
       if (!this.views[wsid]) this.views[wsid] = newView()
     },
 
-    // resolveApprovalPresentation：六種凍結觸發（allow／deny／timeout／dismiss／
-    // remove／shutdown）之後恢復原釘選。無 transient 顯示中時為 no-op。
-    resolveApprovalPresentation(_trigger: ApprovalRestoreTrigger) {
+    // resolveApprovalPresentation：§3.6.4 凍結的六種觸發（allow／deny／timeout／
+    // dismiss／remove／shutdown）之後恢復原釘選。**六種的行為完全相同**，因此不
+    // 收 trigger 參數——收一個永遠沒人分支的參數只會讓人以為它有分歧。呼叫端
+    // （ApprovalDialog）負責在六種情境都呼叫到。無 transient 顯示中時為 no-op。
+    resolveApprovalPresentation() {
       const pane = this.transientPane
       if (pane === null) return
       const shown = this.pins[pane]

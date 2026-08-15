@@ -4,7 +4,6 @@ import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ResolveApproval } from '../../wailsjs/go/main/App'
 import { useSession } from '../stores/session'
-import type { ApprovalRestoreTrigger } from '../stores/session'
 
 // Req：後端 a.emit("approval:request", …) 的 payload。Task 26 加入 wsid——
 // 多 session 之後 provider 不足以定位來源 session（§3.6.4 的 pane 路由）。
@@ -26,16 +25,7 @@ function present(r: Req | undefined) {
   s.routeApproval(r.wsid)
 }
 
-// dismissCause → §3.6.4 凍結的六種恢復觸發。remove／shutdown 都是走
-// denyApprovals → ResolveApproval 出去的（cause=resolved），只有 reason 分得出來。
-function triggerOf(cause: string, why: string): ApprovalRestoreTrigger {
-  if (cause === 'timeout') return 'timeout'
-  if (why === 'session_removed') return 'remove'
-  if (why === 'shutdown') return 'shutdown'
-  return 'dismiss'
-}
-
-function removeById(id: string, trigger: ApprovalRestoreTrigger) {
+function removeById(id: string) {
   const idx = queue.value.findIndex(r => r.id === id)
   if (idx === -1) return
   const wasCurrent = idx === 0
@@ -45,7 +35,7 @@ function removeById(id: string, trigger: ApprovalRestoreTrigger) {
   error.value = ''
   // 先恢復原釘選，再讓下一筆（若有）重新路由——順序反過來的話，第二筆的
   // transient 會被緊接著的恢復動作立刻撤掉。
-  s.resolveApprovalPresentation(trigger)
+  s.resolveApprovalPresentation()
   present(queue.value[0]) // promotion：輪到顯示才切 pane
 }
 
@@ -57,16 +47,17 @@ EventsOn('approval:request', (r: Req) => {
     present(r)
   }
 })
-// timeout／resolved：按 ID 移除正確項目（cause＋reason 決定恢復觸發）
-EventsOn('approval:dismiss', (d: { id: string; cause?: string; reason?: string }) =>
-  removeById(d.id, triggerOf(d.cause ?? '', d.reason ?? '')))
+// timeout／resolved：按 ID 移除正確項目。§3.6.4 六種觸發（allow／deny／timeout／
+// dismiss／remove／shutdown）的**恢復行為完全相同**，前端因此不區分——後端
+// approval:dismiss 仍帶 cause／reason，那是給 audit 與事後對帳用的。
+EventsOn('approval:dismiss', (d: { id: string }) => removeById(d.id))
 
 async function decide(allow: boolean, why?: string) {
   const r = current.value
   if (!r) return
   try {
     await ResolveApproval(r.id, allow, why ?? reason.value)
-    removeById(r.id, allow ? 'allow' : 'deny')
+    removeById(r.id)
   } catch (e: any) {
     error.value = String(e)
   }

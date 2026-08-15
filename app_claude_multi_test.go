@@ -15,7 +15,9 @@ import (
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
+	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // ---- M3b Task 8：Claude 遷入 sessionHost＋per-WSID socket／MCP ----
@@ -306,4 +308,176 @@ func TestExportedBindingsRejectUncommittedReservation(t *testing.T) {
 	if err := a.TerminateSession(string(w)); !errors.Is(err, appcore.ErrSessionNotFound) {
 		t.Fatalf("TerminateSession 必須先以 ErrSessionNotFound 拒絕（不得落到 host 查詢）：%v", err)
 	}
+}
+
+// 🔴 Critical 迴歸（Task 26 review）：restore.json 是 provider-keyed，而本票的
+// 建立入口讓「同 provider 多 session」第一次可從 UI 到達。若 StartSession 仍無
+// 條件套用該 provider 的 resume，一個全新、從未對話過的 session B 會被靜默接到
+// session A 的對話上（argv 出現 --resume <A 的 session id>）。
+//
+// 斷言看的是 **fake CLI 落檔的 argv**，不是內部旗標——「接錯對話」正是從 argv
+// 那一刻起變成事實的。
+func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	enableAudit(t, a)
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argvFile := filepath.Join(a.stateDir, "argv-cross.txt")
+	script := "#!/bin/sh\necho \"$@\" >> " + argvFile + "\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-A\"}'\n" +
+		"while read -r _line; do\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
+	_ = a.registry.Bind("sess-A", cwd)
+
+	wA := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wA)) })
+	waitFor(t, "A 的 resume 已 commit 進 restore.json", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+
+	// 第二個 claude session：resume 參數留空，且從未對話過
+	wB := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(wB), "hi B", "", "", "task-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
+
+	waitFor(t, "兩次 start 的 argv 都已落檔", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Count(string(b), "--mcp-config") >= 2
+	})
+	b, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("前提不成立：需要兩次 start 的 argv，got %q", string(b))
+	}
+	// 第一個 session 本來就沒有 resume 可接（restore 當時是空的）
+	if strings.Contains(lines[0], "--resume") {
+		t.Fatalf("前提不成立：第一個 session 不該帶 resume：%q", lines[0])
+	}
+	if strings.Contains(lines[1], "--resume") {
+		t.Fatalf("同 provider 第二個 session 不得繼承 provider-keyed 的 resume（會接到別人的對話）：%q", lines[1])
+	}
+	if !auditHas(t, a.stateDir, "resume_fallback_skipped") {
+		t.Fatal("跳過 resume 必須 fail loud 進 audit，不得靜默")
+	}
+}
+
+// NewSession 的 ResetView 同樣是 provider-keyed 的破壞性寫入：對 B 按「開新對話」
+// 不得清掉 A 的 resume id。
+func TestNewSessionDoesNotResetAnotherSessionsRestoreEntry(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	enableAudit(t, a)
+	// A 必須真的 commit 出一個 resume id，才驗得到「B 的 New 不得清掉它」
+	writeInitClaude(t, a, "sess-A")
+
+	wA := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wA)) })
+	waitFor(t, "A 的 resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID != ""
+	})
+	before := a.restore.Get("claude").ResumeSessionID
+
+	wB := mustCreate(t, a, "claude") // dormant，從未 start
+	if err := a.NewSession(string(wB)); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.restore.Get("claude").ResumeSessionID; got != before {
+		t.Fatalf("對 B 開新對話不得清掉 A 的 resume：%q → %q", before, got)
+	}
+	if !auditHas(t, a.stateDir, "reset_view_skipped") {
+		t.Fatal("跳過 ResetView 必須 fail loud 進 audit")
+	}
+}
+
+// providerRestoreUnambiguous 的判定取 Manager slot 與 registry live entry 的
+// **聯集上界**。兩邊各自都會漏，所以兩個非對稱情境都要驗——只驗「CreateSession
+// 兩次」是驗不出來的（那條路徑同時寫進兩邊，任一邊單獨都足以偵測）。
+func TestProviderRestoreUnambiguousUsesBothSources(t *testing.T) {
+	pv := contract.ProviderClaude
+
+	t.Run("零個／恰一個 session 視為明確", func(t *testing.T) {
+		a, _ := newTestApp(t)
+		a.wsReg = &stubRegistry{}
+		if !a.providerRestoreUnambiguous(pv) {
+			t.Fatal("零個 session 時必須視為明確")
+		}
+		mustCreate(t, a, "claude")
+		if !a.providerRestoreUnambiguous(pv) {
+			t.Fatal("恰一個 session 時必須視為明確")
+		}
+		if _, err := a.CreateSession("codex", "t"); err != nil {
+			t.Fatal(err)
+		}
+		if !a.providerRestoreUnambiguous(pv) {
+			t.Fatal("另一 provider 的 session 不得影響判定")
+		}
+		if _, err := a.CreateSession("claude", "t2"); err != nil {
+			t.Fatal(err)
+		}
+		if a.providerRestoreUnambiguous(pv) {
+			t.Fatal("同 provider 兩個 session 必須視為不明確")
+		}
+	})
+
+	// registry 有兩筆、Manager 只還原了其中一筆（或一筆都沒有）——只看 Manager
+	// slot 會誤判成「只有一個」，而那筆沒被還原的 dormant session 一樣是使用者的
+	// session，restore.json 同樣指不清楚。
+	t.Run("registry 兩筆但 Manager 無對應 slot", func(t *testing.T) {
+		a, _ := newTestApp(t)
+		reg := &stubRegistry{}
+		a.wsReg = reg
+		for _, id := range []string{"01DORMANTA000000000000001", "01DORMANTB000000000000001"} {
+			if err := reg.Put(wsregistry.Entry{WSID: id, Provider: "claude",
+				CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := a.manager.SlotCount(pv); got != 0 {
+			t.Fatalf("前提不成立：Manager 應為 0 個 slot，got %d", got)
+		}
+		if a.providerRestoreUnambiguous(pv) {
+			t.Fatal("registry 兩筆 live entry 時必須視為不明確（Manager 看不到它們）")
+		}
+	})
+
+	// Manager 有兩個 slot、registry 一筆都沒有（registry 未接線或該筆尚未落盤）
+	// ——只看 registry 會誤判成「只有一個」。
+	t.Run("Manager 兩個 slot 但 registry 為空", func(t *testing.T) {
+		a, _ := newTestApp(t)
+		a.wsReg = &stubRegistry{}
+		for i := 0; i < 2; i++ {
+			w, tok, err := a.manager.ReserveSession(pv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := a.manager.CommitCreate(tok); err != nil {
+				t.Fatal(err)
+			}
+			_ = w
+		}
+		if len(a.wsReg.Live()) != 0 {
+			t.Fatal("前提不成立：registry 應為空")
+		}
+		if a.providerRestoreUnambiguous(pv) {
+			t.Fatal("Manager 兩個 slot 時必須視為不明確（registry 看不到它們）")
+		}
+	})
 }

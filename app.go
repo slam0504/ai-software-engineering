@@ -680,6 +680,59 @@ func (a *App) resolveWSID(op, wsid string) (appcore.WSID, contract.Provider, err
 	return w, p, nil
 }
 
+// providerRestoreUnambiguous：provider-keyed 的 restore.json 是否能一一對應到
+// 呼叫端的那個 WSID。
+//
+// restore.json（resume session id ＋ view 視窗）是 M3a 留下的 per-provider 結構，
+// 至今沒有 per-WSID writer——registry 的 ResumeSessionID 只有 CreateSession／
+// Migrate 兩個寫入點（`wsReg.Put` 在 production 只出現在 CreateSession），之後每
+// 一輪的 session id 都只寫回 restore.json。同 provider 只有一個 session 時它仍是
+// 正確的續聊來源；一旦有第二個，它的語意退化成「上一次是誰在講話」，套到別的
+// WSID 上就是把一個全新的 session 靜默接到別人的對話上。
+//
+// 判定取 Manager slot 與 registry live entry 的**聯集上界**：任一邊看到超過一個
+// 就視為不明確。兩邊各自都會漏——Manager 看不到尚未還原成 slot 的 dormant
+// entry，registry 未接線（nil）時什麼都看不到——取聯集才不會因為單邊失明而誤判
+// 成「只有一個」。registry 為 nil 時回 true 是安全的：CreateSession 同樣被
+// errNoSessionRegistry 擋著，UI 開不出第二個 session。
+func (a *App) providerRestoreUnambiguous(p contract.Provider) bool {
+	if a.manager.SlotCount(p) > 1 {
+		return false
+	}
+	if a.wsReg == nil {
+		return true
+	}
+	n := 0
+	for _, e := range a.wsReg.Live() {
+		if contract.Provider(e.Provider) != p {
+			continue
+		}
+		if n++; n > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// providerResumeFallback：StartSession 的 resume 參數留空時的續聊來源。
+//
+// 不明確時**回空字串、不猜**（＝開新對話）。失敗方向是刻意選的：空 resume 只是
+// 少了續聊，接到別人的對話從使用者角度是資料損毀。真正的 per-WSID resume writer
+// 是後續 task 的事，在那之前這裡是唯一的守門。
+func (a *App) providerResumeFallback(p contract.Provider) string {
+	id := a.restore.Get(string(p)).ResumeSessionID
+	if id == "" {
+		return ""
+	}
+	if !a.providerRestoreUnambiguous(p) {
+		// fail loud：使用者會看到「沒有接續」，audit 說明為什麼
+		a.audit("resume_fallback_skipped", map[string]any{
+			"provider": string(p), "reason": "multiple sessions for provider", "candidate": id})
+		return ""
+	}
+	return id
+}
+
 // noteWSEmitError：...WS 出口的錯誤處置（Emit／approval 共用）。舊的 provider-keyed
 // 入口沒有回傳值，遷到 ...WS 之後多了三種錯誤：ErrClosed 是 shutdown 的正常收尾
 // （Manager 自己已發過 closed-drop 通知，不重複記）；其餘（WSID 解析不到、
@@ -4843,12 +4896,7 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 		return err
 	}
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
-		// resume 權威仍是 provider-keyed 的 restore.json：registry 的
-		// ResumeSessionID 只在 CreateSession／Migrate 當下寫入，之後每一輪的
-		// session id 沒有任何寫入端（見 CreateSession 的 wsReg.Put 是唯一入口），
-		// 現在改讀它等於靜默失去續聊能力。權威轉移要連同 registry 的 resume
-		// writer 一起做，不在本 task 範圍（見 task-26 報告）。
-		resume = a.restore.Get(string(prov)).ResumeSessionID
+		resume = a.providerResumeFallback(prov)
 	}
 	id, err := a.manager.BeginNewSessionSubmit(w, taskLabel)
 	if err != nil {
@@ -6208,6 +6256,9 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 // 那正是 UI 最需要 session:done 的時刻：不發的話，收尾流程會把 slot 收回 idle，
 // 而前端那個 session 永遠停在「執行中」。沒有 host 就沒有 lease／track 可收，
 // 因此只發事件、回 nil。
+// w 只服務 h == nil 的分支（那條路徑沒有 host 可問 WSID）；h != nil 時一律用
+// h.wsid。兩者恆等——全部呼叫端傳的 w 都是取得該 host 的同一個 WSID（`hostFor(w)`
+// 或 `h.wsid` 本身），host registry 也以 WSID 為 key，不可能取到別人的 host。
 func (a *App) codexTeardown(w appcore.WSID, h *sessionHost) error {
 	if h == nil {
 		a.emitCodexSessionDone(w, "")
@@ -6429,11 +6480,13 @@ func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 // 不回寫 audit）。
 //
 // **Task 26 之後前端不再呼叫它**：session 清單改由 ListSessions（registry 權威）
-// 提供，transcript 改由 §3.8 的 LoadTurnsBefore 以 WSID 視窗化載入。這裡刻意
-// 保留而非刪除——restore.json 仍是 resume 的權威（registry 的 ResumeSessionID
-// 只有 CreateSession／Migrate 兩個寫入點，沒有「每輪更新」的 writer），本方法
-// 是那份 store ＋ replayViewWindow 的既有唯讀出口，M1.5 的恢復語意測試整組掛在
-// 它上面。權威轉移要連同 registry 的 resume writer 一起做，不在本 task 範圍。
+// 提供，transcript 改由 §3.8 的 LoadTurnsBefore 以 WSID 視窗化載入；`frontend/src`
+// 對它零引用，連 makeBindings 都沒有轉發。
+//
+// 保留的理由僅有一個且要說準：它是 M1.5 恢復語意測試的既有唯讀出口（Go 端 6 處
+// **測試**引用），刪掉會連帶重寫那一組。它**不是** resume 的讀取端——production
+// 的 resume 讀取在 StartSession 直接走 a.restore.Get(...)／providerResumeFallback，
+// 不經這裡。待 Task 29 的視窗化載入落地後，本方法應直接刪除或改為 WSID-keyed。
 func (a *App) RestoreViews() map[string]RestoredView {
 	out := map[string]RestoredView{}
 	for _, p := range []string{"claude", "codex"} {
@@ -6503,7 +6556,17 @@ func (a *App) NewSession(wsid string) error {
 	if h := a.hookDuringReset; h != nil { // 測試 barrier：teardown 完成與 restore reset 之間
 		h()
 	}
-	rerr := a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
+	// ResetView 同樣是 provider-keyed 的破壞性寫入（清空該 provider 的 resume ＋
+	// 前移 view 視窗）：同 provider 有第二個 session 時，對 B 按「開新對話」會把
+	// A 的 resume 一併清掉。不明確時跳過並 fail loud 進 audit——少前移一次視窗
+	// 只是多重放一段歷史，清掉別人的 resume 則是不可逆的。
+	var rerr error
+	if a.providerRestoreUnambiguous(pv) {
+		rerr = a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
+	} else {
+		a.audit("reset_view_skipped", map[string]any{
+			"provider": provider, "wsid": string(w), "reason": "multiple sessions for provider"})
+	}
 	finErr := a.manager.FinishReset(w, rtok) // restore 失敗仍 FinishReset 回 idle
 	if rerr != nil {
 		return errors.Join(rerr, finErr) // 失敗回錯：UI 不重設

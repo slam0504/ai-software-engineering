@@ -297,6 +297,7 @@ export default {
       approvalDecision: '核可決定：{text}',
       stateChange: '狀態 → {state}',
       retry: 'provider 重試',
+      codexBroadcast: 'codex 廣播：{method}',
       toolResult: '工具結果',
     },
     raw: '原始資料',

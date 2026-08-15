@@ -297,6 +297,7 @@ export default {
       approvalDecision: 'Approval decision: {text}',
       stateChange: 'State → {state}',
       retry: 'provider retry',
+      codexBroadcast: 'codex broadcast: {method}',
       toolResult: 'tool result',
     },
     raw: 'raw',

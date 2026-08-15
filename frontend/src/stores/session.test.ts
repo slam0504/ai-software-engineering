@@ -1,6 +1,6 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { APPROVAL_RESTORE_TRIGGERS, useSession } from './session'
+import { useSession } from './session'
 import type { Envelope } from '../types'
 
 // env：所有 conversation lane 事件都帶 workspace_session_id（§3.1.5 之後為必填）。
@@ -111,23 +111,22 @@ describe('session store：per-WSID lane 路由（§3.7-8）', () => {
 describe('session store：approval 路由（§3.6.4）', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
-  it('未釘選來源以 transient 顯示，六種觸發都恢復原釘選', () => {
+  // 六種凍結觸發（allow／deny／timeout／dismiss／remove／shutdown）在 store 這一層
+  // 行為完全相同，因此這裡驗的是「反覆進出 transient 都能回到原釘選」（冪等 ＋
+  // 不累積殘留）。**六種觸發各自真的都會呼叫到這裡**，由 ApprovalDialog.test.ts
+  // 的六條情境測試（按鈕 allow／deny ＋ dismiss 事件的四種 cause／reason）守住。
+  it('未釘選來源以 transient 顯示，反覆進出都恢復原釘選', () => {
     const s = useSession()
     s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
-    for (const trigger of APPROVAL_RESTORE_TRIGGERS) {
+    for (let i = 0; i < 6; i++) {
       s.routeApproval('w3')
       expect(s.pins[1]).toBe('w3')
       expect(s.persistentPins[1]).toBe('w2')
       expect(s.focused).toBe(0) // transient 不搶走 composer 焦點
-      s.resolveApprovalPresentation(trigger)
+      s.resolveApprovalPresentation()
       expect(s.pins[1]).toBe('w2')
       expect(s.views['w3']).toBeUndefined() // transient transcript 一併釋放
     }
-  })
-
-  it('恢復原釘選的觸發清單凍結為六項', () => {
-    expect([...APPROVAL_RESTORE_TRIGGERS]).toEqual(
-      ['allow', 'deny', 'timeout', 'dismiss', 'remove', 'shutdown'])
   })
 
   it('來源在另一 pane 時自動切 focus', () => {
@@ -153,7 +152,7 @@ describe('session store：approval 路由（§3.6.4）', () => {
     s.routeApproval('w4') // FIFO promotion：下一筆同樣未釘選
     expect(s.pins[1]).toBe('w4')
     expect(s.persistentPins[1]).toBe('w2') // 不得被 w3 覆蓋
-    s.resolveApprovalPresentation('allow')
+    s.resolveApprovalPresentation()
     expect(s.pins[1]).toBe('w2')
   })
 })
@@ -348,10 +347,17 @@ describe('session store：reducer 行為（M1 契約，改 per-WSID 後不變）
 describe('session store：workspace 通知（degraded 到得了使用者）', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
+  // fixture 用 production 實際的形狀：Manager.EmitWorkspace 只填 Payload，
+  // 頂層 Envelope.Error 是 omitempty 且從未被它填過。用頂層 error 當 fixture 會
+  // 遮住「訊息內容到不了使用者」那半（見 Timeline.test.ts）。
+  const workspaceErr = (id: string, error: string) => ({
+    event_id: id, ts: 't', provider: '', kind: 'stream_error',
+    scope: 'workspace', payload: { error },
+  })
+
   it('applyNotice 進 notices 並出現在 focused timeline', () => {
     const s = focusedSession()
-    s.applyNotice({ event_id: 'wn1', ts: 't', provider: '', kind: 'stream_error',
-      scope: 'workspace', error: 'replay index degraded' })
+    s.applyNotice(workspaceErr('wn1', 'replay index degraded'))
     expect(s.notices).toHaveLength(1)
     expect(s.timeline.map(i => i.env.event_id)).toContain('wn1')
   })
@@ -359,15 +365,14 @@ describe('session store：workspace 通知（degraded 到得了使用者）', ()
   it('workspace 通知不落進任何 session lane', () => {
     const s = focusedSession()
     s.applyNotice({ event_id: 'wn1', ts: 't', provider: 'codex', kind: 'codex_broadcast',
-      scope: 'workspace' })
+      scope: 'workspace', payload: { provider: 'codex', method: 'account/updated' } })
     expect(s.views['w1'].timeline).toHaveLength(0)
     expect(s.views['w1'].chat).toHaveLength(0)
   })
 
   it('沒有釘選 pane 時通知仍看得見', () => {
     const s = useSession()
-    s.applyNotice({ event_id: 'wn1', ts: 't', provider: '', kind: 'stream_error',
-      scope: 'workspace', error: 'boom' })
+    s.applyNotice(workspaceErr('wn1', 'boom'))
     expect(s.timeline.map(i => i.env.event_id)).toContain('wn1')
   })
 })
@@ -384,6 +389,18 @@ describe('session store：registry hydrate（registry × working slot）', () =>
     expect(s.sessions['w1']).toMatchObject({ provider: 'claude', taskLabel: 'a', resume: 's1', available: true })
     expect(s.sessions['w2'].available).toBe(false)
     expect(s.sessionList.map(m => m.wsid)).toEqual(['w1', 'w2'])
+    // slot phase 必須帶進來：SessionList／StatusBar 顯示的就是它，丟掉會讓
+    // 重啟後每個 session 都顯示成預設的 idle（含正在 ending 的）。
+    expect(s.sessions['w1'].state).toBe('idle')
+    expect(s.sessions['w2'].state).toBe('') // 無 slot：不假造 phase
+  })
+
+  it('hydrateSessions 帶入非 idle 的 slot phase', () => {
+    const s = useSession()
+    s.hydrateSessions([
+      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: '', created_at: '', available: true, state: 'ending' },
+    ])
+    expect(s.sessions['w1'].state).toBe('ending')
   })
 
   it('不可操作的 session 不得被 submit', async () => {

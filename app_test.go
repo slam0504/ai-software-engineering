@@ -183,6 +183,21 @@ func wsidFor(t *testing.T, a *App, p contract.Provider) appcore.WSID {
 	return w
 }
 
+// enableAudit：newTestApp 預設不開 audit.jsonl（a.auditF 為 nil，a.audit 是
+// no-op）。需要斷言 audit 軌跡的測試呼叫這個，開法與 startup 逐字一致。
+func enableAudit(t *testing.T, a *App) {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.auditMu.Lock()
+	a.auditF = f
+	a.auditMu.Unlock()
+	t.Cleanup(func() { _ = f.Close() })
+}
+
 // wsidStr：wsidFor 的字串版（exported binding 收的是 string）。
 func wsidStr(t *testing.T, a *App, provider string) string {
 	t.Helper()
@@ -451,6 +466,25 @@ func writeMultiTurnClaude(t *testing.T, a *App) {
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// writeInitClaude：fake claude CLI——先發 init（帶 session_id，讓
+// commitClaudeResume 有東西可 commit），之後每一輪回一個 result。
+func writeInitClaude(t *testing.T, a *App, sessionID string) {
+	t.Helper()
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"" + sessionID + "\"}'\n" +
+		"while read -r _line; do\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
+	_ = a.registry.Bind(sessionID, cwd)
 }
 
 // startCodexForTest：以 production 交易（BeginNewSessionSubmit→startCodexHost→Accept）
