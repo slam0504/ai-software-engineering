@@ -468,28 +468,11 @@ func writeMultiTurnClaude(t *testing.T, a *App) {
 	}
 }
 
-// writeInitClaude：fake claude CLI——先發 init（帶 session_id，讓
-// commitClaudeResume 有東西可 commit），之後每一輪回一個 result。
-func writeInitClaude(t *testing.T, a *App, sessionID string) {
-	t.Helper()
-	bin := a.claudeCLIPath()
-	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	script := "#!/bin/sh\n" +
-		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"" + sessionID + "\"}'\n" +
-		"while read -r _line; do\n" +
-		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
-	_ = a.registry.Bind(sessionID, cwd)
-}
-
-// writeArgvClaude：writeInitClaude ＋ 把每次啟動的 argv 逐行落檔，回傳檔案路徑。
-// 「有沒有接到別人的對話」只有在 argv 那一刻才變成事實，內部旗標驗不到。
-func writeArgvClaude(t *testing.T, a *App, sessionID string) string {
+// writeInitClaude：fake claude CLI——每次啟動把 argv 逐行落檔、先發 init（帶
+// session_id，讓 commitClaudeResume 有東西可 commit），之後每一輪回一個 result。
+// 回傳 argv 落檔路徑：「有沒有接到別人的對話」只有在 argv 那一刻才變成事實，
+// 內部旗標驗不到。
+func writeInitClaude(t *testing.T, a *App, sessionID string) string {
 	t.Helper()
 	bin := a.claudeCLIPath()
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {

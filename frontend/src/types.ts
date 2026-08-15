@@ -61,7 +61,13 @@ export interface SessionLifecycleBindings {
 export interface SessionInfo {
   wsid: string; provider: string; task_label: string
   resume_session_id: string; created_at: string
-  available: boolean; state: string
+  available: boolean
+  // state：reducer 的 SessionState（idle／waiting／streaming／tool_running／
+  // awaiting_approval／retrying／done／failed），與 conversation lane 的
+  // state_change envelope **同一個 reducer、同一個值域**——不是 Manager 內部的
+  // slot phase（starting／active／ending，沒有對外出口）。同源是 store 可以直接
+  // 覆寫 SessionMeta.state 的理由。
+  state: string
 }
 // WorkspaceSessionBindings：M3b Task 4 純新增的 CreateSession——回傳新 session
 // 的 WSID。獨立於 Bindings（session store 用）之外，理由同 EvidenceBindings：

@@ -186,11 +186,12 @@ export const useSession = defineStore('session', {
           wsid: e.wsid, provider: providerOf(e.provider), taskLabel: e.task_label,
           resume: e.resume_session_id, available: e.available,
         })
-        // 直接採用 Go 端給的 phase：ListSessions 只在 manager.State 成功時才
-        // 同時設 Available 與 State，因此 available ⇔ state 非空是**同一個
-        // 賦值**保證的（Go 測試 TestListSessionsReconcilesRegistryWithSlots
-        // 對這一組斷言）。這裡不再補 available 的三元判斷——那個分支在真實
-        // 輸入下不可達，留著只會是一段沒有測試守得住的死碼。
+        // 無條件覆寫：ListSessions 的 state 與 conversation lane 的 state_change
+        // 是**同一個 reducer** 的輸出（值域相同），不存在「用 slot phase 蓋掉
+        // runtime 狀態」的問題。available ⇔ state 非空則是 Go 端同一個賦值保證
+        // 的（守門：TestListSessionsReconcilesRegistryWithSlots），因此這裡不再
+        // 補 available 的三元判斷——那個分支在真實輸入下不可達，留著只會是一段
+        // 沒有測試守得住的死碼。
         this.sessions[e.wsid].state = e.state
       }
     },

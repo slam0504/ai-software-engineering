@@ -629,7 +629,12 @@ type SessionInfo struct {
 	ResumeSessionID string `json:"resume_session_id"`
 	CreatedAt       string `json:"created_at"`
 	Available       bool   `json:"available"` // Manager 有對應的 committed slot
-	State           string `json:"state"`     // slot phase（Available=false 時為空）
+	// State：reducer 的 contract.SessionState（idle／waiting／streaming／
+	// tool_running／awaiting_approval／retrying／done／failed）——**不是** slot
+	// phase（starting／active／ending／resetting，那是 Manager 內部的 lifecycle
+	// 狀態機，沒有對外出口）。與 conversation lane 的 state_change envelope 同一個
+	// reducer，前端因此可以直接覆寫、值域一致。Available=false 時為空字串。
+	State string `json:"state"`
 }
 
 // ListSessions：前端 session 清單的來源（唯讀——不建立 slot、不寫 registry）。
@@ -692,14 +697,31 @@ func (a *App) resolveWSID(op, wsid string) (appcore.WSID, contract.Provider, err
 //
 // 計數取 Manager slot 與 registry live entry 的**精確聯集**（以 WSID 為身分），
 // 不是 max(|slots|, |live|)——後者是聯集的下界不是上界：兩邊各有一筆但**是不同
-// 的 WSID** 時（Manager 有 X、registry live 只有 Y），max 會得到 1 而誤判成明確。
-// 那個狀態今天可達：`RemoveSession` 的殘餘窗口（tombstone 已落盤、
-// manager.RemoveSession 釋放名額失敗）就會留下一個不在 registry live 裡的孤兒
-// slot。聯集寫法只多三行，不必依賴「slots ⊆ live」這個並非恆真的前提。
+// 的 WSID** 時（Manager 有 X、registry live 只有 Y），max 得到 1 而誤判成明確。
+//
+// **這個改動單調收緊、不可能重新打開「並存」那條缺陷**：因為
+// backed ≤ min(live, slots)，恆有 union = live + slots - backed ≥ max(live, slots)，
+// 所以凡是 max 判為不明確的，聯集也一定判為不明確。這是它最重要的性質。
+//
+// 觸發那個誤判需要**四個條件同時成立**，不是「今天就會發生」：(1) Task 27 把
+// RemoveSession 接上 UI；(2) Remove × Start 撞上 §3.6.2 的 TOCTOU 殘餘窗口，留下
+// 一個 tombstone 已落盤、slot 卻還在的孤兒；(3) 同 provider **另有**一筆
+// live-but-no-slot 的 entry（loadSessionRegistry Pass 1 跳過的壞 entry、或未還原
+// 的 dormant）——只有孤兒 slot 的話 live=0、union=1，判定仍是明確；(4) 移除路徑的
+// ClearResume 本身也失敗（否則 restore 早就空了，讀什麼都是空）。真正關掉時間軸
+// 那幾條的是 RemoveSession 裡的**無條件 ClearResume**，本函式是第二道防線。
 //
 // 兩邊都要看的理由：Manager 看不到尚未還原成 slot 的 dormant entry，registry 未
 // 接線（nil）時什麼都看不到。registry 為 nil 時只看 Manager 是安全的——
 // CreateSession 同樣被 errNoSessionRegistry 擋著，UI 開不出第二個 session。
+//
+// 兩個已知的不精確處，方向都安全、刻意不修：
+//   - backed 只比對 registry entry 的 provider，不比對 slot 的 provider。
+//     production 兩者恆一致（CreateSession 同源寫入；RestoreDormant 對不上會回
+//     ErrProviderMismatch），故不構成缺陷。
+//   - SlotCount 含尚未 CommitCreate 的 reservation，而 manager.State 走
+//     committedSlotLocked 會排除它 → backed 少算、union 高估。高估只會讓判定更
+//     保守（少接續一次），不會漏放。
 func (a *App) providerRestoreUnambiguous(p contract.Provider) bool {
 	slots := a.manager.SlotCount(p)
 	if slots > 1 {
@@ -745,6 +767,27 @@ func (a *App) providerResumeFallback(p contract.Provider) string {
 	return id
 }
 
+// resumeWriteAllowed：該 WSID 還能不能把自己的 session id 寫回 provider-keyed 的
+// restore.json。**已 tombstone 的 WSID 一律不得寫**。
+//
+// 沒有這道 guard 的可達序列（Task 26 review round-3）：RemoveSession 的 TOCTOU
+// 殘餘窗口下，併發的 StartSession 會在 tombstone 之後才替該 WSID 掛上 host，
+// 而 commitClaudeResume 的兩道既有 guard（hostFor(wsid)==host、IsActive）此刻
+// **都會通過**——於是一個已被移除的 session 的 id 被寫回 provider entry。當下的
+// providerRestoreUnambiguous 或許還擋得住（若同 provider 另有 live entry），但
+// **重啟後擋不住**：孤兒 slot 隨 process 消失、該 WSID 已 tombstone，全新建立的
+// session 面對 slots=1／live=1 的乾淨狀態，直接繼承那個死掉的 id。
+//
+// registry 未接線（nil）或查無此筆（legacy／測試路徑）一律放行——那些情境下
+// 沒有 tombstone 可言，收緊只會把正常續聊一起封掉。
+func (a *App) resumeWriteAllowed(w appcore.WSID) bool {
+	if a.wsReg == nil {
+		return true
+	}
+	e, ok := a.wsReg.Get(string(w))
+	return !ok || e.RemovedAt == ""
+}
+
 // noteWSEmitError：...WS 出口的錯誤處置（Emit／approval 共用）。舊的 provider-keyed
 // 入口沒有回傳值，遷到 ...WS 之後多了三種錯誤：ErrClosed 是 shutdown 的正常收尾
 // （Manager 自己已發過 closed-drop 通知，不重複記）；其餘（WSID 解析不到、
@@ -770,7 +813,7 @@ var legacyProviders = []string{"claude", "codex"}
 // resume identity／taskID 皆空**且 view window 內沒有事件**——而不是「
 // ViewStartEventID 是否為空」：restore.json 不存在或 malformed 時
 // openRestoreStore 會用 audit high-watermark 幫**兩個** provider 都補齊 entry
-//（restore.go:42-56），那種 entry 的 ViewStartEventID 非空但 window 內必然
+// （restore.go:42-56），那種 entry 的 ViewStartEventID 非空但 window 內必然
 // 零事件。只看欄位非空的話，只用過 claude 的使用者升級後會憑空多出一個
 // codex session 並吃掉一個名額。window 判定直接重用 replayViewWindow，因為
 // 「view window 裡有沒有事件」的定義就該和實際重放的視窗完全一致。
@@ -834,7 +877,7 @@ func knownProvider(p string) bool { return slices.Contains(knownProviders, p) }
 //
 // a.wsReg 只在整段序列成功後才接線，這是「Migrate 先於任何 Put」的第一道
 // 防線：CreateSession 唯一的 registry 入口是 a.wsReg，nil 即早退
-//（errNoSessionRegistry）。若在 Open 之後就接線，遷移失敗的那次啟動仍可
+// （errNoSessionRegistry）。若在 Open 之後就接線，遷移失敗的那次啟動仍可
 // Put，那筆 entry 會在下次啟動被 MarkMigrated 的整批取代語意無聲蒸發（或撞上
 // Migrate 的第二道 guard，讓 app 從此無法完成遷移）。wsregistry.Migrate 內的
 // entryCount guard 是最後防線，不是第一道。
@@ -4933,8 +4976,8 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 			h()
 		}
 		aerr := a.manager.AcceptSubmit(w, id, "", prompt)
-		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
-		if aerr == nil {    // Accept 成功才 commit（staged candidate；D6）
+		commit(aerr == nil)                         // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
+		if aerr == nil && a.resumeWriteAllowed(w) { // Accept 成功才 commit（staged candidate；D6）
 			if cerr := a.restore.CommitResume("claude", a.hostSessionID(host), taskLabel); cerr != nil {
 				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
 			}
@@ -4956,8 +4999,10 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 			terr := a.codexTeardown(w, a.hostFor(w)) // 冪等：撤路由＋finalize＋session:done
 			return errors.Join(err, terr)
 		}
-		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
-			a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
+		if a.resumeWriteAllowed(w) { // Accept 成功才 commit（已 tombstone 的 WSID 不得寫）
+			if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil {
+				a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
+			}
 		}
 		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
 		return nil
@@ -6507,6 +6552,9 @@ func (a *App) failLoudRestore(p contract.Provider, err error) {
 //	由 StartSession Accept 成功後補 commit）。
 func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 	if host == nil || a.hostFor(host.wsid) != host || !a.manager.IsActive(host.wsid) {
+		return
+	}
+	if !a.resumeWriteAllowed(host.wsid) { // 已 tombstone：見 resumeWriteAllowed doc
 		return
 	}
 	if err := a.restore.CommitSessionID("claude", sessionID); err != nil {

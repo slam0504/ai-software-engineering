@@ -15,7 +15,6 @@ import (
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
-	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
@@ -321,20 +320,7 @@ func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
 	a, ui := newTestApp(t)
 	a.wsReg = &stubRegistry{}
 	enableAudit(t, a)
-	bin := a.claudeCLIPath()
-	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	argvFile := filepath.Join(a.stateDir, "argv-cross.txt")
-	script := "#!/bin/sh\necho \"$@\" >> " + argvFile + "\n" +
-		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-A\"}'\n" +
-		"while read -r _line; do\n" +
-		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
-	_ = a.registry.Bind("sess-A", cwd)
+	argvFile := writeInitClaude(t, a, "sess-A")
 
 	wA := mustCreate(t, a, "claude")
 	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
@@ -530,7 +516,7 @@ func TestProviderRestoreUnambiguousUsesBothSources(t *testing.T) {
 func TestRemovedSessionsResumeIsNotInheritedByNextSession(t *testing.T) {
 	a, _ := newTestApp(t)
 	a.wsReg = &stubRegistry{}
-	argvFile := writeArgvClaude(t, a, "sess-A")
+	argvFile := writeInitClaude(t, a, "sess-A")
 	// 給 view 視窗一個**非空**的起點：newTestApp 的 events.jsonl 是空的，
 	// high-watermark 因此是空字串，不先設的話下面「視窗未被動到」的斷言會是
 	// 恆真（空 → 空）。
@@ -557,6 +543,11 @@ func TestRemovedSessionsResumeIsNotInheritedByNextSession(t *testing.T) {
 	}
 	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
 		t.Fatalf("移除後 restore 的續聊身分必須清空，got %q", got)
+	}
+	// TaskID 也屬於「續聊身分」的一部分（CommitResume 與 resume id 同一筆寫入）：
+	// 留著會讓下一個新 session 的 view 預填成已移除 session 的任務標籤。
+	if got := a.restore.Get("claude").TaskID; got != "" {
+		t.Fatalf("移除後 restore 的 TaskID 必須一併清空，got %q", got)
 	}
 	// 只清續聊身分，**不動 view 視窗**：ViewStartEventID 是 provider 層的重放
 	// 起點（restoreSessions 以 replayViewWindow 判 dormant），移除一個 session
@@ -594,7 +585,7 @@ func TestRemovedSessionsResumeIsNotInheritedByNextSession(t *testing.T) {
 func TestSoleRegistrySessionStillResumes(t *testing.T) {
 	a, _ := newTestApp(t)
 	a.wsReg = &stubRegistry{}
-	argvFile := writeArgvClaude(t, a, "sess-A")
+	argvFile := writeInitClaude(t, a, "sess-A")
 
 	w := mustCreate(t, a, "claude")
 	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
@@ -617,4 +608,162 @@ func TestSoleRegistrySessionStillResumes(t *testing.T) {
 		b, err := os.ReadFile(argvFile)
 		return err == nil && strings.Contains(string(b), "--resume sess-A")
 	})
+}
+
+// N3（review round-3）：ClearResume 必須是**無條件**的，不是「只在移除最後一個
+// session 時才清」。時間軸序列 2／3 的唯一保證就是這個無條件性——A、B 並存時
+// 移除 A，restore 仍停在 sess-A，B 下一次 StartSession 就會接到 A 的對話。
+func TestRemoveClearsResumeEvenWhenSiblingsRemain(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	argvFile := writeInitClaude(t, a, "sess-A")
+
+	wA := mustCreate(t, a, "claude")
+	wB := mustCreate(t, a, "claude") // 手足：移除 A 時仍在
+	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "A 的 resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+	if err := a.EndSession(string(wA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RemoveSession(string(wA)); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
+		t.Fatalf("還有手足存活時同樣必須清除（無條件），got %q", got)
+	}
+
+	if err := a.StartSession(string(wB), "hi B", "", "", "task-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
+	waitFor(t, "B 的 argv 已落檔", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Count(string(b), "--mcp-config") >= 2
+	})
+	b, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if strings.Contains(lines[len(lines)-1], "--resume") {
+		t.Fatalf("存活的手足不得繼承已移除 session 的 resume：%q", lines[len(lines)-1])
+	}
+}
+
+// N1（review round-3）：ClearResume 的**時點**必須在 decrement_count 之前。
+// 那是整個時點裁決的全部理由——釋放名額失敗會留下孤兒 slot，此時 restore 若還
+// 留著已 tombstone session 的 id，孤兒就把 resume 留給了別人。
+//
+// 以 hookRemoveStep 在 decrement_count 之前把 slot 推離 idle（BeginNewSessionSubmit
+// → phaseStarting），讓 manager.RemoveSession 必然回 ErrSessionNotIdle。
+func TestRemoveClearsResumeBeforeDecrementCount(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	writeInitClaude(t, a, "sess-A")
+
+	w := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+	if err := a.EndSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	a.hookRemoveStep = func(step string) {
+		if step != "decrement_count" {
+			return
+		}
+		if _, err := a.manager.BeginNewSessionSubmit(w, "block"); err != nil {
+			t.Errorf("前提不成立：無法把 slot 推離 idle：%v", err)
+		}
+	}
+	err := a.RemoveSession(string(w))
+	if err == nil {
+		t.Fatal("前提不成立：decrement_count 應失敗（否則測不到時點）")
+	}
+	if !strings.Contains(err.Error(), "已 tombstone 但釋放名額失敗") {
+		t.Fatalf("前提不成立：失敗點必須是 decrement_count：%v", err)
+	}
+	// 這就是時點的意義：名額沒釋放、slot 還在，但 restore 已經清乾淨
+	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
+		t.Fatalf("清除必須發生在 decrement_count 之前，got %q", got)
+	}
+}
+
+// N2（review round-3）：清除失敗是 Fail Loud 的綁定約束——audit ＋ workspace
+// 通知兩路都要有，否則使用者會在毫無訊號的情況下讓下一個 session 接到已移除的
+// 對話（清除失敗代表 restore 仍留著舊 id）。
+func TestRemoveFailsLoudWhenResumeClearFails(t *testing.T) {
+	a, ui := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	enableAudit(t, a)
+	writeInitClaude(t, a, "sess-A")
+
+	w := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+	if err := a.EndSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	// 讓 persist 必然失敗：把 restore.json 指到一個不存在的目錄底下
+	a.restore.path = filepath.Join(a.stateDir, "no-such-dir", "restore.json")
+
+	if err := a.RemoveSession(string(w)); err != nil {
+		t.Fatalf("清除失敗不得讓整個移除失敗（session 確實已移除）：%v", err)
+	}
+	if !auditHas(t, a.stateDir, "restore_clear_failed") {
+		t.Fatal("清除失敗必須進 audit")
+	}
+	var sawNotice bool
+	for _, env := range ui.findEnvKind(string(contract.KindStreamError)) {
+		if env.Scope == "workspace" && strings.Contains(string(env.Payload), string(w)) {
+			sawNotice = true
+		}
+	}
+	if !sawNotice {
+		t.Fatal("清除失敗必須發 workspace 通知（使用者才知道下一個 session 可能接錯對話）")
+	}
+}
+
+// 🟡 第五條時間軸序列（review round-3 裁決）：已 tombstone 的 WSID 不得把自己的
+// session id 寫回 provider entry。TOCTOU 孤兒情境下 commitClaudeResume 的兩道
+// 既有 guard（hostFor==host、IsActive）都會通過，重啟後那個死掉的 id 會被全新
+// 建立的 session 繼承。
+func TestTombstonedWSIDCannotCommitResume(t *testing.T) {
+	a, ui := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	writeInitClaude(t, a, "sess-X")
+
+	w := mustCreate(t, a, "claude")
+	// 製造孤兒：registry 已 tombstone，Manager slot 還在（§3.6.2 的殘餘窗口）
+	if err := reg.Remove(string(w), "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.manager.State(w); err != nil {
+		t.Fatalf("前提不成立：孤兒 slot 必須還在 Manager 裡：%v", err)
+	}
+
+	if err := a.StartSession(string(w), "hi", "", "", "task-x", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "一輪跑完（init ＋ result 都到）", func() bool {
+		return len(ui.findEnvKind("result")) >= 1
+	})
+	if err := a.EndSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
+		t.Fatalf("已 tombstone 的 WSID 不得寫回 resume（重啟後會被新 session 繼承）：%q", got)
+	}
 }
