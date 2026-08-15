@@ -364,7 +364,8 @@ describe('session store：workspace 通知（degraded 到得了使用者）', ()
 
   it('workspace 通知不落進任何 session lane', () => {
     const s = focusedSession()
-    s.applyNotice({ event_id: 'wn1', ts: 't', provider: 'codex', kind: 'codex_broadcast',
+    // 頂層 provider 空字串＝EmitWorkspace 的實際輸出（provider 只在 payload 裡）
+    s.applyNotice({ event_id: 'wn1', ts: 't', provider: '', kind: 'codex_broadcast',
       scope: 'workspace', payload: { provider: 'codex', method: 'account/updated' } })
     expect(s.views['w1'].timeline).toHaveLength(0)
     expect(s.views['w1'].chat).toHaveLength(0)

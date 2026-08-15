@@ -487,6 +487,27 @@ func writeInitClaude(t *testing.T, a *App, sessionID string) {
 	_ = a.registry.Bind(sessionID, cwd)
 }
 
+// writeArgvClaude：writeInitClaude ＋ 把每次啟動的 argv 逐行落檔，回傳檔案路徑。
+// 「有沒有接到別人的對話」只有在 argv 那一刻才變成事實，內部旗標驗不到。
+func writeArgvClaude(t *testing.T, a *App, sessionID string) string {
+	t.Helper()
+	bin := a.claudeCLIPath()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argvFile := filepath.Join(a.stateDir, "argv-"+sessionID+".txt")
+	script := "#!/bin/sh\necho \"$@\" >> " + argvFile + "\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"" + sessionID + "\"}'\n" +
+		"while read -r _line; do\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\ndone\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
+	_ = a.registry.Bind(sessionID, cwd)
+	return argvFile
+}
+
 // startCodexForTest：以 production 交易（BeginNewSessionSubmit→startCodexHost→Accept）
 // 建立 codex session（StartSession 的 codex 分支等價，host 換 fake wire）。
 func startCodexForTest(t *testing.T, a *App, wire *fakeCodexWire, conn *codex.Conn, recordCase, task string) {

@@ -318,7 +318,7 @@ func TestExportedBindingsRejectUncommittedReservation(t *testing.T) {
 // 斷言看的是 **fake CLI 落檔的 argv**，不是內部旗標——「接錯對話」正是從 argv
 // 那一刻起變成事實的。
 func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
-	a, _ := newTestApp(t)
+	a, ui := newTestApp(t)
 	a.wsReg = &stubRegistry{}
 	enableAudit(t, a)
 	bin := a.claudeCLIPath()
@@ -373,6 +373,17 @@ func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
 	}
 	if !auditHas(t, a.stateDir, "resume_fallback_skipped") {
 		t.Fatal("跳過 resume 必須 fail loud 進 audit，不得靜默")
+	}
+	// audit 只有事後對帳看得到；使用者端也要有訊號，否則對話莫名從頭開始而
+	// 沒有任何解釋（workspace 通知經 gateRouting 的 notice lane 進 Timeline）。
+	var sawNotice bool
+	for _, env := range ui.findEnvKind(string(contract.KindStreamError)) {
+		if env.Scope == "workspace" && strings.Contains(string(env.Payload), "不自動接續") {
+			sawNotice = true
+		}
+	}
+	if !sawNotice {
+		t.Fatal("跳過 resume 必須發 workspace 通知，使用者才知道為什麼沒有接續")
 	}
 }
 
@@ -458,6 +469,35 @@ func TestProviderRestoreUnambiguousUsesBothSources(t *testing.T) {
 		}
 	})
 
+	// 兩邊各有一筆但**是不同的 WSID**：max(|slots|,|live|) 會得到 1 而誤判成
+	// 明確——那是聯集的下界不是上界。這個狀態今天可達：RemoveSession 的殘餘窗口
+	// （tombstone 已落盤、釋放名額失敗）就會留下一個不在 registry live 裡的孤兒
+	// slot，而使用者另外還有一個正常的 session。
+	t.Run("兩邊各一筆但 WSID 不相交", func(t *testing.T) {
+		a, _ := newTestApp(t)
+		reg := &stubRegistry{}
+		a.wsReg = reg
+		// Manager 有 X（不在 registry）
+		_, tok, err := a.manager.ReserveSession(pv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.manager.CommitCreate(tok); err != nil {
+			t.Fatal(err)
+		}
+		// registry 有 Y（未還原成 slot）
+		if err := reg.Put(wsregistry.Entry{WSID: "01ONLYINREGISTRY000000001", Provider: "claude",
+			CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		if a.manager.SlotCount(pv) != 1 || len(reg.Live()) != 1 {
+			t.Fatal("前提不成立：兩邊各應恰有一筆")
+		}
+		if a.providerRestoreUnambiguous(pv) {
+			t.Fatal("兩邊各一筆但不相交＝實際有兩個 session，必須視為不明確")
+		}
+	})
+
 	// Manager 有兩個 slot、registry 一筆都沒有（registry 未接線或該筆尚未落盤）
 	// ——只看 registry 會誤判成「只有一個」。
 	t.Run("Manager 兩個 slot 但 registry 為空", func(t *testing.T) {
@@ -479,5 +519,102 @@ func TestProviderRestoreUnambiguousUsesBothSources(t *testing.T) {
 		if a.providerRestoreUnambiguous(pv) {
 			t.Fatal("Manager 兩個 slot 時必須視為不明確（registry 看不到它們）")
 		}
+	})
+}
+
+// 🟠 Important 迴歸（Task 26 review round-2）：Critical 的時間軸變體。
+// A 建立 → 對話（restore = sess-A）→ End → Remove（tombstone、名額釋放）→ 建立
+// 全新 B → StartSession(B, resume="")。此刻 Manager 與 registry 都只剩一筆，
+// 「明確」判定放行，B 會拿到 --resume sess-A。修法是移除時無條件清掉 restore
+// 的續聊身分。
+func TestRemovedSessionsResumeIsNotInheritedByNextSession(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	argvFile := writeArgvClaude(t, a, "sess-A")
+	// 給 view 視窗一個**非空**的起點：newTestApp 的 events.jsonl 是空的，
+	// high-watermark 因此是空字串，不先設的話下面「視窗未被動到」的斷言會是
+	// 恆真（空 → 空）。
+	if err := a.restore.ResetView("claude", "01SEEDWATERMARK0000000001"); err != nil {
+		t.Fatal(err)
+	}
+
+	wA := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "A 的 resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+	if err := a.EndSession(string(wA)); err != nil {
+		t.Fatal(err)
+	}
+	viewStart := a.restore.Get("claude").ViewStartEventID
+	if viewStart == "" {
+		t.Fatal("前提不成立：view 視窗起點必須非空，否則下面的斷言恆真")
+	}
+	if err := a.RemoveSession(string(wA)); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
+		t.Fatalf("移除後 restore 的續聊身分必須清空，got %q", got)
+	}
+	// 只清續聊身分，**不動 view 視窗**：ViewStartEventID 是 provider 層的重放
+	// 起點（restoreSessions 以 replayViewWindow 判 dormant），移除一個 session
+	// 把它清成空字串等於讓同 provider 的重放從 events.jsonl 最開頭重來。
+	if got := a.restore.Get("claude").ViewStartEventID; got != viewStart {
+		t.Fatalf("移除不得動到 view 視窗起點：%q → %q", viewStart, got)
+	}
+	// 前提校驗：此刻判定確實是「明確」——否則本測試會因為別的理由通過
+	wB := mustCreate(t, a, "claude")
+	if !a.providerRestoreUnambiguous(contract.ProviderClaude) {
+		t.Fatal("前提不成立：移除後只剩一個 session，判定應為明確（否則測不到本缺陷）")
+	}
+	if err := a.StartSession(string(wB), "hi B", "", "", "task-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
+
+	waitFor(t, "B 的 argv 已落檔", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Count(string(b), "--mcp-config") >= 2
+	})
+	b, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if strings.Contains(lines[len(lines)-1], "--resume") {
+		t.Fatalf("已移除 session 的 resume 不得被下一個新 session 繼承：%q", lines[len(lines)-1])
+	}
+}
+
+// 正向缺口（review round-2 Minor 5）：registry 非 nil、恰一筆 live entry 時，
+// 續聊必須照舊生效——收窄不得順手把正常路徑一起封掉。既有的
+// TestAutoResumeAfterPlainEnd 走的是 wsReg == nil 分支，涵蓋不到這條。
+func TestSoleRegistrySessionStillResumes(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	argvFile := writeArgvClaude(t, a, "sess-A")
+
+	w := mustCreate(t, a, "claude")
+	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "resume 已 commit", func() bool {
+		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	})
+	if err := a.EndSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.wsReg.Live()) != 1 {
+		t.Fatalf("前提不成立：registry 應恰有一筆 live entry，got %d", len(a.wsReg.Live()))
+	}
+	if err := a.StartSession(string(w), "again", "", "", "task-a", ""); err != nil { // resume 參數空
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(w)) })
+	waitFor(t, "第二次 start 自動接續", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Contains(string(b), "--resume sess-A")
 	})
 }

@@ -186,13 +186,12 @@ export const useSession = defineStore('session', {
           wsid: e.wsid, provider: providerOf(e.provider), taskLabel: e.task_label,
           resume: e.resume_session_id, available: e.available,
         })
-        // slot phase 只在 registry 說得出來時才覆寫：available=false 代表沒有
-        // slot，任何 phase（含 newMeta 的預設 'idle'）都是假的，清成空字串＝
-        // 「未知」。反過來也不能無條件覆寫——ListSessions 的 State 是 Manager
-        // slot phase（starting／active／ending），與 envelope state_change 的
-        // 值域（waiting／streaming／awaiting_approval）不同，重新整理時無條件
-        // 蓋回去會把 runtime 推導出來的狀態抹掉。
-        this.sessions[e.wsid].state = e.available ? (e.state || this.sessions[e.wsid].state) : ''
+        // 直接採用 Go 端給的 phase：ListSessions 只在 manager.State 成功時才
+        // 同時設 Available 與 State，因此 available ⇔ state 非空是**同一個
+        // 賦值**保證的（Go 測試 TestListSessionsReconcilesRegistryWithSlots
+        // 對這一組斷言）。這裡不再補 available 的三元判斷——那個分支在真實
+        // 輸入下不可達，留著只會是一段沒有測試守得住的死碼。
+        this.sessions[e.wsid].state = e.state
       }
     },
 

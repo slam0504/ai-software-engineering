@@ -120,6 +120,25 @@ func (rs *restoreStore) CommitSessionID(provider, sessionID string) error {
 	return nil
 }
 
+// ClearResume：清掉該 provider 的續聊身分（resume id ＋ taskID），**保留
+// ViewStartEventID**——與 ResetView 的差別就在這裡：view 視窗是 provider 層的
+// 重放起點，前移它會連帶影響同 provider 其他 session 的歷史判定
+// （restoreSessions 以 replayViewWindow 判 dormant），移除一個 session 不該動它。
+// 失敗時 entry 不變。
+func (rs *restoreStore) ClearResume(provider string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	old := rs.entries[provider]
+	e := old
+	e.ResumeSessionID, e.TaskID = "", ""
+	rs.entries[provider] = e
+	if err := rs.persistLocked(); err != nil {
+		rs.entries[provider] = old
+		return err
+	}
+	return nil
+}
+
 // ResetView：僅 NewSession 呼叫——view 視窗前進、resume 清空。失敗時 entry 不變。
 func (rs *restoreStore) ResetView(provider, highWatermark string) error {
 	rs.mu.Lock()

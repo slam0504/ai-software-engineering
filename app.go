@@ -690,28 +690,35 @@ func (a *App) resolveWSID(op, wsid string) (appcore.WSID, contract.Provider, err
 // 正確的續聊來源；一旦有第二個，它的語意退化成「上一次是誰在講話」，套到別的
 // WSID 上就是把一個全新的 session 靜默接到別人的對話上。
 //
-// 判定取 Manager slot 與 registry live entry 的**聯集上界**：任一邊看到超過一個
-// 就視為不明確。兩邊各自都會漏——Manager 看不到尚未還原成 slot 的 dormant
-// entry，registry 未接線（nil）時什麼都看不到——取聯集才不會因為單邊失明而誤判
-// 成「只有一個」。registry 為 nil 時回 true 是安全的：CreateSession 同樣被
-// errNoSessionRegistry 擋著，UI 開不出第二個 session。
+// 計數取 Manager slot 與 registry live entry 的**精確聯集**（以 WSID 為身分），
+// 不是 max(|slots|, |live|)——後者是聯集的下界不是上界：兩邊各有一筆但**是不同
+// 的 WSID** 時（Manager 有 X、registry live 只有 Y），max 會得到 1 而誤判成明確。
+// 那個狀態今天可達：`RemoveSession` 的殘餘窗口（tombstone 已落盤、
+// manager.RemoveSession 釋放名額失敗）就會留下一個不在 registry live 裡的孤兒
+// slot。聯集寫法只多三行，不必依賴「slots ⊆ live」這個並非恆真的前提。
+//
+// 兩邊都要看的理由：Manager 看不到尚未還原成 slot 的 dormant entry，registry 未
+// 接線（nil）時什麼都看不到。registry 為 nil 時只看 Manager 是安全的——
+// CreateSession 同樣被 errNoSessionRegistry 擋著，UI 開不出第二個 session。
 func (a *App) providerRestoreUnambiguous(p contract.Provider) bool {
-	if a.manager.SlotCount(p) > 1 {
+	slots := a.manager.SlotCount(p)
+	if slots > 1 {
 		return false
 	}
 	if a.wsReg == nil {
 		return true
 	}
-	n := 0
+	live, backed := 0, 0
 	for _, e := range a.wsReg.Live() {
 		if contract.Provider(e.Provider) != p {
 			continue
 		}
-		if n++; n > 1 {
-			return false
+		live++
+		if _, err := a.manager.State(appcore.WSID(e.WSID)); err == nil {
+			backed++ // 這筆 live entry 同時也是一個 Manager slot（交集）
 		}
 	}
-	return true
+	return live+(slots-backed) <= 1 // |A ∪ B| = |live| + |只存在於 Manager 的 slot|
 }
 
 // providerResumeFallback：StartSession 的 resume 參數留空時的續聊來源。
@@ -725,9 +732,14 @@ func (a *App) providerResumeFallback(p contract.Provider) string {
 		return ""
 	}
 	if !a.providerRestoreUnambiguous(p) {
-		// fail loud：使用者會看到「沒有接續」，audit 說明為什麼
+		// fail loud 兩路：audit 留稽核軌跡，workspace 通知讓**使用者**知道為什麼
+		// 這次沒有接續（只寫 audit 的話，使用者只會看到對話莫名從頭開始）。
 		a.audit("resume_fallback_skipped", map[string]any{
 			"provider": string(p), "reason": "multiple sessions for provider", "candidate": id})
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+			"component": "resume",
+			"error": "本次不自動接續舊對話：" + string(p) + " 目前有多個 session，" +
+				"provider-keyed 的 resume 記錄指不出是哪一個。需要接續請在 resume 欄位明確指定 session id"})
 		return ""
 	}
 	return id
@@ -5182,6 +5194,32 @@ func (a *App) RemoveSession(wsid string) error {
 	a.removeStep("tombstone_persist")
 	if err := a.wsReg.Remove(wsid, "user_removed"); err != nil {
 		return fmt.Errorf("app: remove session %s: tombstone persist 失敗：%w（slot 保留，可重試移除）", wsid, err)
+	}
+
+	// restore.json 的續聊身分是 **provider-keyed** 的（見 providerRestoreUnambiguous）：
+	// 移除掉最後一個 claude session 之後，restore entry 仍留著它的 resume id，而
+	// 「剩下幾個 session」的判定此時已經回到「明確」——下一個全新建立的 claude
+	// session 會靜默接到那個已被移除的對話上（Task 26 review round-2 Important）。
+	//
+	// **無條件清除**，不是只在「這是最後一個」時清：A、B 並存時 CommitResume 的三個
+	// 寫入端並未收窄，restore 隨時可能停在任何一方的 id；只清最後一個等於留下
+	// 「移除 A → B 讀到 A 的 id」這個變體。
+	//
+	// 代價（已知、刻意接受）：同 provider 還有存活的手足時，它們會一併失去續聊，
+	// 下一次 StartSession 開新對話。精確做法是讓 restore entry 記住 owner WSID，
+	// 那是持久化格式變更，與 per-WSID resume writer 一起做（後續 task）。
+	//
+	// 時點在 tombstone_persist **之後**：那是不可逆點，session 從此不會復活；
+	// 也在 teardown 之後，late init 的 commitClaudeResume 已被 host guard 擋掉，
+	// 不會在清除後又寫回去。清除失敗不讓整個移除失敗（session 確實已經移除，
+	// 回錯只會誘導使用者重試一個必然 ErrSessionNotFound 的移除），改以 audit ＋
+	// workspace 通知 fail loud。
+	if rerr := a.restore.ClearResume(string(p)); rerr != nil {
+		a.audit("restore_clear_failed", map[string]any{
+			"provider": string(p), "wsid": wsid, "error": rerr.Error()})
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+			"component": "restore", "error": "移除 " + wsid + " 後清除 resume 失敗：" + rerr.Error() +
+				"（下一個新建的 " + string(p) + " session 可能接到已移除的對話，請手動指定 resume 或清除 restore.json）"})
 	}
 
 	a.removeStep("decrement_count")

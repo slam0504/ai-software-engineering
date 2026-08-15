@@ -25,8 +25,10 @@ const wireLogDegraded: Envelope = {
   event_id: 'wn3', ts: 't', provider: '', scope: 'workspace', kind: 'stream_error',
   payload: { component: 'codex_wire_log', wireLogId: 'wl-1', error: 'disk full' },
 }
+// 頂層 provider 一律空字串：Manager.EmitWorkspace 從不設 env.Provider（provider
+// 只出現在 payload 裡），workspace lane 也不屬於任何 provider slot。
 const broadcast: Envelope = {
-  event_id: 'wn4', ts: 't', provider: 'codex', scope: 'workspace', kind: 'codex_broadcast',
+  event_id: 'wn4', ts: 't', provider: '', scope: 'workspace', kind: 'codex_broadcast',
   payload: { provider: 'codex', method: 'account/rateLimits/updated', params: {} },
 }
 
