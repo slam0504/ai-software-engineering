@@ -466,7 +466,7 @@ func TestRebuildCursorIndependentOfCheckpoint(t *testing.T) {
 // record 已經比 checkpoint 前進」的狀態，重啟後 VerifyOrRebuild 從舊
 // checkpoint 重掃同一段 audit，就有機會把同一個 turn 再寫一次。
 //
-// 實測結果（2026-08-15）：**既有機制沒有涵蓋，會產生一筆完全重複的 record**
+// 首次實測（2026-08-15）確認**既有機制沒有涵蓋**：會產生一筆完全重複的 record
 // （同一組 StartOffset／EndOffset／FirstEventID／LastEventID 出現兩次）。Task
 // 17 的 index-ahead 偵測管的是「checkpoint 超前 audit」，
 // checkpointTrustedLocked 只驗證 checkpoint 是否落在 audit 的真實行邊界、event
@@ -474,12 +474,9 @@ func TestRebuildCursorIndependentOfCheckpoint(t *testing.T) {
 // checkpoint」這個方向完全在它的視野之外：舊 checkpoint 被判定可信 →
 // rescanFromLocked 從舊 offset 重掃 → 重建期間已落盤的 turn record 再寫一次。
 //
-// 修法待 owner 裁決（見 task-19-report.md 的 Important C 章節），本 task 不
-// 動 production。測試保留並 skip：修好之後刪掉 t.Skip 這一行就是現成的回歸測
-// 試。
+// 修法（2026-08-15 裁決）：重建路徑依 `(StartOffset, LastEventID)` 唯一鍵去
+// 重，見 index.go 的 beginRebuildDedupLocked。本測試即該修法的回歸測試。
 func TestCrashDuringRuntimeRebuildDoesNotDuplicate(t *testing.T) {
-	t.Skip("已知缺陷：crash 落在 degraded 重建中途會產生重複 turn record，修法待裁決（Task 19 review Important C）")
-
 	dir, audit := seedAuditWithTurns(t, 2)
 	i, err := Open(dir)
 	if err != nil {

@@ -280,6 +280,11 @@ func (idx *Index) hydrateOpenTurnFirstEventIDsLocked(auditPath string) error {
 // 補一次，磁碟 checkpoint 會停在掃描前的舊值，下次重啟會重掃同一段 suffix、
 // 但這段已經在本次 appendTurnRecord 寫過的 turn record 會被重複補寫。
 func (idx *Index) rescanFromLocked(auditPath string, from int64) error {
+	// 重掃可能與「上一個 process 的重建已經寫進 turn file 的 record」重疊
+	// （見 beginRebuildDedupLocked），去重整段掃描期間都要開著。
+	idx.beginRebuildDedupLocked()
+	defer idx.endRebuildDedupLocked()
+
 	_, found, err := idx.scanAuditRangeLocked(auditPath, from, unlimitedScanBudget, func(receipt appcore.AppendReceipt, boundary bool) error {
 		idx.checkpointOffset = receipt.EndOffset
 		idx.checkpointLastEventID = receipt.EventID
@@ -514,6 +519,19 @@ func (idx *Index) RuntimeRebuild(auditPath string, emitMu sync.Locker, auditEnd 
 		return ErrNotDegraded
 	}
 	idx.resetRebuildStats()
+
+	// 去重整輪開著（含分段掃描與第 5 步的鎖內補掃）：本輪的起掃點可能落在
+	// 「上一個 process 的重建已寫進 turn file」的區段之前，見
+	// beginRebuildDedupLocked。跨輪不保留鍵集——backoff 重試是新的一輪，重新
+	// 從磁碟載入才反映得出上一輪實際寫成功了哪些。
+	idx.mu.Lock()
+	idx.beginRebuildDedupLocked()
+	idx.mu.Unlock()
+	defer func() {
+		idx.mu.Lock()
+		idx.endRebuildDedupLocked()
+		idx.mu.Unlock()
+	}()
 
 	if err := idx.bulkRebuild(auditPath); err != nil { // 1. 掃至初始高水位（不持 emitMu）
 		return err

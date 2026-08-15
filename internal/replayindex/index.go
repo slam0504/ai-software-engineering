@@ -93,6 +93,13 @@ type Index struct {
 	maxLockedScanBytes int64
 	lockSegments       int
 
+	// rebuildSeen：重建期間的 turn record 去重集合，wsid -> `(StartOffset,
+	// LastEventID)` 鍵集。**nil 代表去重關閉**，這是 live 路徑（Observe）的常
+	// 態——live append 是單一 writer、offset 單調遞增，重複在結構上不可能，掛
+	// 去重只是白付成本。只有重建路徑會開啟它，見 beginRebuildDedupLocked。
+	// 存取一律持 idx.mu。
+	rebuildSeen map[string]map[string]bool
+
 	// holdingEmitLock：目前是否持有呼叫端傳入的 emit mutex。**不受 idx.mu 保
 	// 護**是刻意的：注入的 auditEndFunc 可能在任何時機被呼叫（含 idx.mu 已被
 	// 持有時），若這個旗標也走 idx.mu 就會自我死鎖。
@@ -523,10 +530,23 @@ func (idx *Index) writeCheckpointFile() error {
 // appendTurnRecord：<dir>/<wsid>.turns.jsonl 只在 terminal state_change 抵達
 // 時 append 一筆——不是每個事件都寫。單筆小量寫入，不維持常駐檔案 handle。
 // forceWriteErr 非 nil 時故障注入優先於實際寫入（測試專用，見 forceWriteErr
-// 欄位說明）。
+// 欄位說明）。呼叫端須持有 idx.mu。
+//
+// 重建路徑（rebuildSeen != nil）會先比對 `(StartOffset, LastEventID)` 唯一鍵、
+// 已存在就略過，見 turnRecordKey 與 beginRebuildDedupLocked。
 func (idx *Index) appendTurnRecord(wsid string, rec TurnRecord) error {
 	if idx.forceWriteErr != nil {
 		return idx.forceWriteErr
+	}
+	var seen map[string]bool
+	if idx.rebuildSeen != nil {
+		var err error
+		if seen, err = idx.rebuildSeenKeysLocked(wsid); err != nil {
+			return err
+		}
+		if seen[turnRecordKey(rec)] {
+			return nil // 這個 turn 已經在 index 裡，重掃不重寫
+		}
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -541,7 +561,72 @@ func (idx *Index) appendTurnRecord(wsid string, rec TurnRecord) error {
 	if _, err := fmt.Fprintf(f, "%s\n", b); err != nil {
 		return fmt.Errorf("replayindex: append turn record %s: %w", path, err)
 	}
+	if seen != nil {
+		// 寫入成功才記進鍵集：寫失敗時這筆並不在檔案裡，重試必須真的寫。
+		seen[turnRecordKey(rec)] = true
+	}
 	return nil
+}
+
+// turnRecordKey：turn record 的唯一鍵。StartOffset 是該 turn 的 canonical user
+// message 在 audit 中的起點、LastEventID 是收尾那筆 terminal state_change 的
+// id——兩者相同就是同一個 turn，不可能是不同的兩筆。
+func turnRecordKey(rec TurnRecord) string {
+	return fmt.Sprintf("%d|%s", rec.StartOffset, rec.LastEventID)
+}
+
+// beginRebuildDedupLocked／endRebuildDedupLocked：呼叫端須持有 idx.mu。開啟／
+// 關閉重建期間的 turn record 去重（§3.5.7 補強，2026-08-15 裁決）。
+//
+// 為什麼重建路徑需要去重、live 路徑不需要：turn record 是**當場落盤**的，但
+// 重建進度（runtime 的 rebuildCursor、啟動期尚未前移的 checkpoint）不是。所以
+// 「重建掃到哪」這件事撐不過 process 邊界——重建進行到一半 crash，磁碟上會留下
+// 「turn record 已經比 checkpoint 前進」的狀態，重啟後 VerifyOrRebuild 從舊
+// checkpoint 重掃同一段 audit，就會把同一個 turn 再寫一次。Task 17 的
+// index-ahead 偵測接不住這個方向：checkpointTrustedLocked 只驗證 checkpoint 是
+// 否落在 audit 的真實行邊界、event id 對不對得上，從不比對 turn file 的內容。
+// 「cursor 單調遞增所以同一段只會掃一次」只在單一 process 生命週期內成立。
+//
+// live 路徑（Observe）則相反：單一 writer、offset 單調遞增，同一段永遠不會被
+// 處理第二次，掛去重只是白付每筆比對與載入的成本，所以 rebuildSeen 預設 nil。
+func (idx *Index) beginRebuildDedupLocked() {
+	idx.rebuildSeen = map[string]map[string]bool{}
+}
+
+func (idx *Index) endRebuildDedupLocked() {
+	idx.rebuildSeen = nil
+}
+
+// rebuildSeenKeysLocked：呼叫端須持有 idx.mu。取得（必要時惰性載入）wsid 既有
+// turn record 的鍵集。每個 wsid 每次重建只讀一次檔案；turn record 每筆約 100
+// bytes，相對於整份 audit 掃描是雜訊。
+//
+// 惰性載入（而非重建開始時一次掃全部 wsid）有個必要性：checkpoint 不可信或中段
+// 損壞的路徑會先 quarantine 掉所有 *.turns.jsonl 再全量重掃，鍵集必須在那之後
+// 才建立，否則會拿被搬走的舊檔內容去擋新寫入。
+//
+// 刻意不重用 readTurnFileLocked：那個函式帶有損壞分級的副作用（尾端損壞會就地
+// truncate 磁碟檔案）與 *midCorruptionError 語意，去重只需要「檔案裡目前有哪些
+// 可解析的 record」。無法解析的行不可能與即將寫入的 record 撞鍵，直接略過即可，
+// 不需要把損壞處置耦合進來。缺檔視為空集合。
+func (idx *Index) rebuildSeenKeysLocked(wsid string) (map[string]bool, error) {
+	if keys, ok := idx.rebuildSeen[wsid]; ok {
+		return keys, nil
+	}
+	keys := map[string]bool{}
+	path := idx.turnFilePath(wsid)
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("replayindex: read %s: %w", path, err)
+	}
+	for _, line := range nonEmptyLines(b) {
+		var rec TurnRecord
+		if json.Unmarshal(line, &rec) == nil {
+			keys[turnRecordKey(rec)] = true
+		}
+	}
+	idx.rebuildSeen[wsid] = keys
+	return keys, nil
 }
 
 // readTurnFileLocked：呼叫端須持有 idx.mu。缺檔視為「尚無完整 turn」，非
