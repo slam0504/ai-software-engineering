@@ -148,6 +148,26 @@ type App struct {
 	// 無 session-scoped lease 故恆為 no-op）。production 恆為 nil。
 	hookRemoveStep func(step string)
 
+	// hookShutdownStep：測試注入——shutdown §3.6.5 凍結總序的探針。步驟名一律在
+	// 該步的工作**完成之後**發出，兩個例外都寫在發出點旁邊：teardown_parallel
+	// 標記「並行階段開始」（必須早於任何 per-host hook 才有確定性順序），
+	// server_terminate_wait 標記「進入共用 app-server 收尾」——它與 wirelog_finalize
+	// 夾住同一個 GenerationOwner.FinalizeWith 呼叫（terminate → wait → drain →
+	// detach → finalize 是它內部的凍結順序，見 internal/codex/owner.go 與其
+	// owner_test.go），App 層看得到的只有「進入」與「已完成」兩個邊界。
+	// production 恆為 nil。
+	hookShutdownStep func(step string)
+
+	// hookTeardownEntered／hookTeardownDone：測試注入——每個 per-session teardown
+	// goroutine 的進場／收斂點（Claude 與 Codex 共用）。並行性 barrier 用它而不是
+	// CloseSequence 的 timer：Codex 四個 session 共用同一條 conn 與同一個 app-server，
+	// 本就不會、也不該產生 per-host 的 CloseSequence timer。
+	//
+	// 這兩個 hook 由各自的 teardown goroutine 呼叫，與 hookShutdownStep（shutdown
+	// 主 goroutine）不同 goroutine——同時記錄兩者的測試必須自行加鎖。production 恆為 nil。
+	hookTeardownEntered func(w appcore.WSID)
+	hookTeardownDone    func(w appcore.WSID)
+
 	// hookRemoveHoldingToken：測試注入——RemoveSession 取得 provider token 之後
 	// 呼叫，用來確定性地讓測試把 Remove 卡在「持有 token、尚未完成」的窗口。
 	// hookCreateWaitingForToken／hookCreateAcquiredToken：CreateSession 對應的
@@ -1470,41 +1490,108 @@ func (a *App) stopPlanWatch() {
 	}
 }
 
+// shutdown：§3.6.5 的凍結總序。每一步跑完發一次 shutdownStep（測試注入的
+// hookShutdownStep 是唯一讀者，見 TestShutdownFollowsFrozenOrder）——順序本身是
+// 契約，不是實作細節。
+//
+// **與 spec 的一處對齊（M3b Task 24）**：Codex wire log 的 finalize 原本排在
+// Manager.Close **之後**，現改為之前，理由是 finalize 那一步會先 terminate 共用
+// app-server；若 Manager 已關閉，關閉期間最後那批 frame 所導出的事件（dispatcher
+// 的歸屬失敗 fail-loud、shutdown notification、in-flight response）只會拿到
+// 「manager closed: event dropped」的 UI 通知，永遠進不了 audit。Manager.Close 必須
+// 排在**所有事件生產者都已停止**之後，這也正是原本註解寫的「全部 finalize 之後才關
+// sink」的本意。反向依賴不存在：FinalizeWith 只寫自己的 wire log 檔與 meta，不經過
+// Manager。
+//
+// 收斂上界（**不隨 session 數放大**）：
+//   - interrupt／terminate ≤ 5s：Claude 的 proc.Terminate 非阻塞（SIGTERM 後由
+//     背景 goroutine 做 grace→SIGKILL 升級）；Codex 的 turn/interrupt RPC 自帶
+//     5s ctx，8 個 session 全部並行。
+//   - per-session teardown ≤ 15s：CloseSequence 的 quiesce 5s ＋ kill 10s，逐 host
+//     並行——4 個卡死的 Claude 仍是**單一** 15s 窗口，不乘以 session 數。Codex 側的
+//     teardown 沒有等待（共用 conn，不關 server）。
+//   - 共用 app-server 收尾 ≤ 10s：FinalizeWith 內的 Terminate→Wait（proc grace 5s
+//     後 SIGKILL）＋ 等 stdout 汲取的 wireDrainTimeout 5s。**只有一份**——4 個 Codex
+//     session 共用同一條 codex.Conn 與同一個 app-server，不是每個 session 各一份。
+//   - Manager.Close／index flush／registry Sync：純檔案 I/O，無等待。
+//
+// 合計約 30s 上界，與 session 數無關（§5.4：「8 session 含一個卡死 Claude →
+// shutdown 總時間仍為單一 bounded window」）。
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
 	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
 	a.shutMu.Unlock()
-	a.stopSpecWatch()                          // 1a) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
-	a.stopPlanWatch()                          // 1a′) 停 plan/ watcher，同上理由
-	a.reclaimAssists()                         // 1b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
-	a.reclaimEvidenceRuns()                    // 1b′) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
-	a.cancelRebuild()                          // 1b″) 取消 replay index 重建重試迴圈並等它收斂（見其 doc）
-	a.inflight.Wait()                          // 2) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
-	if err := a.forcedShutdown(); err != nil { // 3) 並行 forced path（M1.5 plan D4）
+	a.shutdownStep("reject_new_txn")
+
+	a.stopSpecWatch()       // 2) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
+	a.stopPlanWatch()       // 2a) 停 plan/ watcher，同上理由
+	a.reclaimAssists()      // 2b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
+	a.reclaimEvidenceRuns() // 2c) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
+	a.cancelRebuild()       // 2d) 取消 replay index 重建重試迴圈並等它收斂（見其 doc；必須早於 inflight.Wait）
+	a.inflight.Wait()       // 2e) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
+	a.shutdownStep("stop_watchers")
+
+	// 3) snapshot：host 與 pending approval 各取一份快照，之後的每一步都用這兩份
+	// ——先拒新交易、再快照，快照之後不可能有新的 host 或新的 approval 進來。
+	hosts := a.snapshotHosts()
+	apprIDs := a.pendingApprovalIDs(nil)
+	a.shutdownStep("snapshot")
+
+	// 4) 全部 approval fail-closed deny（§3.6.5）。單筆失敗不中斷其餘筆，也不中斷
+	// 後續收尾——與 §3.6.3 的移除路徑同一裁決（「deny 部分失敗時仍 terminate provider」）。
+	if err := a.denyApprovals(apprIDs, "shutdown"); err != nil {
+		a.audit("shutdown_deny_approvals_error", map[string]any{"error": err.Error()})
+	}
+	a.shutdownStep("deny_approvals")
+
+	// 5-7) interrupt／terminate → 並行 teardown → 全部 host 收乾（步驟名由 forcedShutdown 發出）
+	if err := a.forcedShutdown(hosts); err != nil {
 		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
 	}
-	if a.manager != nil {
-		_ = a.manager.Close() // 全部 finalize 之後才關 sink（pending queue abort+flush 兜底）
+
+	// 8-9) 共用 app-server：terminate → wait（Conn.Done）→ finalize wire log。
+	// §3.4.2 的收尾總序（terminate → wait → stdout 汲取完成 → detach → finalize
+	// wire log）全在 FinalizeWith 內，與死亡 reaper／受控 replacement 共用同一份
+	// 實作；冪等，watcher 已收過就直接回原結果。Take 取出即清空 ownership，無後續
+	// 回填（shuttingDown 已擋掉所有會重建 server 的交易）。
+	a.shutdownStep("server_terminate_wait")
+	if o, ok := a.codexSingle.Take(); ok {
+		if err := o.FinalizeWith(nil); err != nil {
+			a.audit("shutdown_wire_log_finalize_error", map[string]any{"error": err.Error()})
+		}
 	}
-	// replay index flush／checkpoint（§3.6.5 總序：**在 Manager.Close 之後**）。
+	a.shutdownStep("wirelog_finalize")
+
+	// 10) 全部事件生產者都已停止，才關 sink（pending queue abort+flush 兜底）
+	if a.manager != nil {
+		_ = a.manager.Close()
+	}
+	a.shutdownStep("manager_close")
+
+	// 11) replay index flush／checkpoint（§3.6.5 總序：**在 Manager.Close 之後**）。
 	// Manager.Close 會 flush pending queue，那些事件仍要進 index，所以 index
 	// 不得在它之前停止接收。
 	//
 	// 為什麼正常關閉需要這一步：checkpoint 落盤被節流到 turn boundary（見
 	// replayindex.Observe），關閉當下若有 WSID 的 turn 還開著，磁碟 checkpoint
 	// 會停在上一個 boundary——效果跟 crash 一樣，得靠下次啟動的補掃修復。正常
-	// 關閉不該依賴 crash 修復機制。
+	// 關閉不該依賴 crash 修復機制。Index 沒有 Close：turn 檔逐次開關、checkpoint
+	// 以 atomic rename 落盤，Flush 之後沒有待關閉的 handle。
 	if a.replayIndex != nil {
 		if err := a.replayIndex.Flush(); err != nil {
 			a.audit("replay_index_flush_error", map[string]any{"error": err.Error()})
 		}
 	}
-	if o, ok := a.codexSingle.Take(); ok { // 取出即清空 ownership，無後續回填
-		// §3.4.2 的收尾總序（terminate → wait → stdout 汲取完成 → detach →
-		// finalize wire log）全在 FinalizeWith 內，與死亡 reaper／受控
-		// replacement 共用同一份實作；冪等，watcher 已收過就直接回原結果。
-		_ = o.FinalizeWith(nil)
+	a.shutdownStep("index_flush_close")
+
+	// 12) session registry Sync：tombstone／entry 的最後一次落盤（§3.6.5 末步）。
+	if a.wsReg != nil {
+		if err := a.wsReg.Sync(); err != nil {
+			a.audit("shutdown_registry_sync_error", map[string]any{"error": err.Error()})
+		}
 	}
+	a.shutdownStep("registry_sync")
+
 	// 殘留 host 的 broker：teardown 成功的 host 已把自己從 registry 取出並關掉
 	// broker，留在這裡的是 teardown 失敗／從未進入收尾的那些。**這是 best effort、
 	// 不是完整收尾**——只關 broker（釋放 socket），不 Terminate sess、不 finalize
@@ -1538,20 +1625,70 @@ func (a *App) shutdown(ctx context.Context) {
 // M3b §3.3：claude 側改為逐 sessionHost 並行收尾——每個 host 有自己的子行程、
 // broker、lease 與 WSID slot，彼此獨立；一個收尾失敗不跳過其他，錯誤全部
 // errors.Join 保留。
-func (a *App) forcedShutdown() error {
-	claudeHosts := a.hostsOf(contract.ProviderClaude)
-	codexHosts := a.hostsOf(contract.ProviderCodex)
+//
+// M3b §3.6.5（Task 24）：拆成兩段，對齊凍結總序「全部 session 先 interrupt／
+// terminate → per-session teardown 並行」。兩段各自並行、各自等收斂：第一段只發
+// 訊號（Claude 的 proc.Terminate 非阻塞、Codex 的 interrupt RPC 自帶 5s ctx），
+// 第二段才是會等 quiesce／kill 的 CloseSequence。hosts 由呼叫端在 snapshot 那一步
+// 取得（同一份快照貫穿整段 shutdown），不在這裡重新掃 registry。
+func (a *App) forcedShutdown(hosts []*sessionHost) error {
+	var claudeHosts, codexHosts []*sessionHost
+	for _, h := range hosts {
+		switch h.provider {
+		case contract.ProviderClaude:
+			if h.sess == nil || h.teardownFn == nil { // 未完成 publish 的 host 不可能存在（見 sessionHost doc）
+				continue
+			}
+			claudeHosts = append(claudeHosts, h)
+		case contract.ProviderCodex:
+			codexHosts = append(codexHosts, h)
+		}
+	}
 
+	// 第一段：全部 session 先 interrupt／terminate（並行；不做任何收尾動作）。
+	var iwg sync.WaitGroup
+	for _, ch := range claudeHosts {
+		iwg.Add(1)
+		go func() {
+			defer iwg.Done()
+			_ = ch.sess.Terminate() // 加速後續 CloseSequence 的 quiesce
+		}()
+	}
+	// codex 側：所有 session 共用同一條 conn 與長駐 server，因此這裡不 Terminate
+	// server（shutdown() 在全部 host 收乾之後才 Take＋Terminate），只 interrupt
+	// 各自的 active turn（best effort，逾時不影響收尾）。
+	for _, ch := range codexHosts {
+		iwg.Add(1)
+		go func() {
+			defer iwg.Done()
+			if ch.runner == nil || ch.runner.ActiveTurnID() == "" {
+				return
+			}
+			a.mu.Lock()
+			conn := a.codexConn
+			a.mu.Unlock()
+			if params, perr := ch.track.InterruptParams(); perr == nil && conn != nil {
+				ictx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _ = conn.Call(ictx, codex.MethodTurnInterrupt, params)
+				cancel()
+			}
+		}()
+	}
+	iwg.Wait()
+	a.shutdownStep("interrupt_terminate")
+
+	// 第二段：per-session teardown 並行（goroutine＋WaitGroup 收斂；不得逐 session
+	// 串行——4 個卡死的 Claude 必須共用單一 bounded window）。步驟名在 goroutine
+	// 啟動**之前**發出，才與 per-host 的 hookTeardownEntered 有確定性順序。
 	var wg sync.WaitGroup
 	errs := make([]error, len(claudeHosts)+len(codexHosts))
+	a.shutdownStep("teardown_parallel")
 	for i, ch := range claudeHosts {
-		if ch.sess == nil || ch.teardownFn == nil { // 未完成 publish 的 host 不可能存在（見 sessionHost doc）
-			continue
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = ch.sess.Terminate()                                  // interrupt 先行：加速 CloseSequence quiesce
+			defer a.teardownHook(a.hookTeardownDone, ch.wsid)
+			a.teardownHook(a.hookTeardownEntered, ch.wsid)
 			if h := a.hookForcedShutdownClaudeBeforeFlow; h != nil { // 測試 barrier：見 App 欄位 doc
 				h()
 			}
@@ -1572,23 +1709,12 @@ func (a *App) forcedShutdown() error {
 			}
 		}()
 	}
-	// codex 側同構（Task 9）：所有 session 共用同一條 conn 與長駐 server，因此
-	// 這裡不 Terminate server（shutdown() 在全部 finalize 之後才 Take＋Terminate），
-	// 只逐 session interrupt 自己的 turn 再走同一套收尾。一個失敗不跳過其他。
 	for i, ch := range codexHosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if ch.runner != nil && ch.runner.ActiveTurnID() != "" { // interrupt active turn（best effort）
-				a.mu.Lock()
-				conn := a.codexConn
-				a.mu.Unlock()
-				if params, perr := ch.track.InterruptParams(); perr == nil && conn != nil {
-					ictx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					_, _ = conn.Call(ictx, codex.MethodTurnInterrupt, params)
-					cancel()
-				}
-			}
+			defer a.teardownHook(a.hookTeardownDone, ch.wsid)
+			a.teardownHook(a.hookTeardownEntered, ch.wsid)
 			if err := appcore.EndSessionFlow(a.manager, ch.wsid, nil, func() error {
 				return a.codexTeardown(ch)
 			}); err != nil {
@@ -1598,7 +1724,25 @@ func (a *App) forcedShutdown() error {
 		}()
 	}
 	wg.Wait() // 每一邊都必須被等待
+	// 全部 Codex session host 收乾（§3.6.5 的第 7 步）——共用 app-server 的
+	// terminate／wait 必須排在這之後，呼叫端接著就做那一步。這裡一併等 Claude
+	// 側收斂：兩者都是同一個 WaitGroup，且 Manager.Close 本來就得等全部 host。
+	a.shutdownStep("codex_hosts_done")
 	return errors.Join(errs...)
+}
+
+// shutdownStep：§3.6.5 凍結總序的探針（同 startupStep／removeStep 慣例）。
+func (a *App) shutdownStep(step string) {
+	if a.hookShutdownStep != nil {
+		a.hookShutdownStep(step)
+	}
+}
+
+// teardownHook：per-session teardown 的進場／收斂探針（見 hookTeardownEntered doc）。
+func (a *App) teardownHook(h func(appcore.WSID), w appcore.WSID) {
+	if h != nil {
+		h(w)
+	}
 }
 
 // ---- helpers ----
@@ -4803,31 +4947,41 @@ func (a *App) removeStep(step string) {
 	}
 }
 
-// denyApprovalsForRemove：§3.6.3——待移除 WSID 的全部顯示中／排隊 approval，一律
-// best-effort fail-closed deny（reason=session_removed）。單筆失敗不中斷其餘筆
-// 數的 deny，錯誤以 errors.Join 收集回傳；呼叫端不因此中斷 teardown（spec 原文：
-// 「deny 部分失敗時仍 terminate provider」）。
-//
-// 先在 apprMu 下 snapshot 目標 id（排序取得決定性順序，不隨 map 迭代漂移），釋放
-// 鎖之後才逐筆呼叫 ResolveApproval——後者本身會重新取 apprMu，若在鎖內呼叫會自我
-// 死鎖。
-func (a *App) denyApprovalsForRemove(w appcore.WSID) error {
+// pendingApprovalIDs：目前待決 approval 的 id 快照（match 為 nil 代表全部）。
+// 在 apprMu 下取得並排序，順序因此是決定性的、不隨 map 迭代漂移；呼叫端拿到的是
+// 快照，之後才逐筆 deny——ResolveApproval 本身會重新取 apprMu，在鎖內呼叫會自我死鎖。
+func (a *App) pendingApprovalIDs(match func(*pendingApproval) bool) []string {
 	a.apprMu.Lock()
 	var ids []string
 	for id, p := range a.apprPending {
-		if p.wsid == w {
+		if match == nil || match(p) {
 			ids = append(ids, id)
 		}
 	}
 	a.apprMu.Unlock()
 	slices.Sort(ids)
+	return ids
+}
+
+// denyApprovals：對快照到的 approval 逐筆 best-effort fail-closed deny。單筆失敗
+// 不中斷其餘筆數，錯誤以 errors.Join 收集回傳；呼叫端不因此中斷 teardown（§3.6.3
+// 原文：「deny 部分失敗時仍 terminate provider」，§3.6.5 的 shutdown 同此裁決）。
+func (a *App) denyApprovals(ids []string, reason string) error {
 	var errs []error
 	for _, id := range ids {
-		if err := a.ResolveApproval(id, false, "session_removed"); err != nil {
+		if err := a.ResolveApproval(id, false, reason); err != nil {
 			errs = append(errs, fmt.Errorf("approval %s: %w", id, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// denyApprovalsForRemove：§3.6.3——待移除 WSID 的全部顯示中／排隊 approval，一律
+// best-effort fail-closed deny（reason=session_removed）。
+func (a *App) denyApprovalsForRemove(w appcore.WSID) error {
+	return a.denyApprovals(
+		a.pendingApprovalIDs(func(p *pendingApproval) bool { return p.wsid == w }),
+		"session_removed")
 }
 
 // cleanupRemovedFiles：per-WSID 殘留檔案清理（risk item 3：「Claude per-WSID

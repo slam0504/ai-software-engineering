@@ -21,6 +21,7 @@ type stubRegistry struct {
 	entries              map[string]wsregistry.Entry
 	deletedUncommitted   bool
 	removedWithTombstone bool
+	syncs                int
 }
 
 func (s *stubRegistry) Put(e wsregistry.Entry) error {
@@ -98,7 +99,20 @@ func (s *stubRegistry) Live() []wsregistry.Entry {
 	return out
 }
 
-func (s *stubRegistry) Sync() error { return nil }
+// Sync：計次（shutdown 總序的 registry_sync 那一步要能驗到「真的 Sync 過」，
+// 光看步驟名發出來不夠——見 TestShutdownFollowsFrozenOrder）。
+func (s *stubRegistry) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncs++
+	return nil
+}
+
+func (s *stubRegistry) syncCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncs
+}
 
 // TestCreateSessionHappyPathWritesEntryAndHoldsSlot：stub 級的快樂路徑——
 // 鎖住 Put 的欄位對映（WSID／Provider／TaskLabel 不得對調或寫錯來源）與
