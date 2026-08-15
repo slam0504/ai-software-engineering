@@ -169,7 +169,7 @@ describe('SessionList（Task 27，spec §4）', () => {
 
   // 帶入事項 1：RemoveSession 可能在 tombstone 已落盤後，因 Manager 釋放名額
   // 失敗而回錯（殘留 TOCTOU 窗口，見 app.go RemoveSession doc／Task 26
-  // review round-2）。這裡鎖住失敗時的據實呈現：卡片繼續存在（不静默視為已
+  // review round-2）。這裡鎖住失敗時的據實呈現：卡片繼續存在（不靜默視為已
   // 移除，使用者不會誤以為刪成功），且 store 收到錯誤訊息原文（fail loud）。
   it('RemoveSession 失敗時據實呈現——卡片不消失、錯誤原文可見，不誤判成功', async () => {
     mocks.RemoveSession.mockRejectedValueOnce(new Error('app: remove session w1: 已 tombstone 但釋放名額失敗：not idle'))
@@ -185,5 +185,25 @@ describe('SessionList（Task 27，spec §4）', () => {
     expect(w.findAll('[data-test=session-card]')).toHaveLength(1)
     const noticeText = s.notices.map(n => n.env.error ?? n.env.text ?? '').join(' ')
     expect(noticeText).toContain('已 tombstone 但釋放名額失敗')
+  })
+
+  // review fix（Important）：對一個 streaming／忙碌中的 session 按移除，
+  // Removable() 會在最前面直接擋下（ErrSubmitActive／ErrStartInProgress），
+  // 完全不碰後端狀態——但這裡從沒把 busy 設成 true，pushError 預設的清 busy
+  // 副作用不該套用在這條路徑。守住：失敗後 busy 維持原值，busy-dot 仍在。
+  it('對忙碌中的 session 移除失敗——busy 不被誤清，busy-dot 仍在', async () => {
+    mocks.RemoveSession.mockRejectedValueOnce(new Error('app: remove session w1: session not idle'))
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.sessions['w1'].busy = true
+    const w = mountWithI18n(SessionList)
+    await w.vm.$nextTick()
+    await w.find('[data-test=remove-w1]').trigger('click')
+    await w.find('[data-test=remove-confirm-submit]').trigger('click')
+    await Promise.resolve()
+    await Promise.resolve()
+    await w.vm.$nextTick()
+    expect(s.sessions['w1'].busy).toBe(true)
+    expect(w.find('[data-test=busy-w1]').exists()).toBe(true)
   })
 })

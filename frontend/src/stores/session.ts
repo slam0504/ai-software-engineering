@@ -412,10 +412,17 @@ export const useSession = defineStore('session', {
       v.noiseGroup = -1
     },
 
-    pushError(msg: string, wsid?: string) {
+    // keepBusy：預設 false（清 busy）——原本唯一呼叫端 submit() 在送出前把
+    // busy 設成 true，失敗要復原。Task 27 review 抓到第二個呼叫端
+    // （SessionList 的移除失敗）從未動過 busy，卻無條件被這行清成 false：
+    // 使用者對一個 streaming 中的 session 按移除，Removable() 在最前面就擋
+    // 下、完全沒碰後端狀態，畫面卻把 busy-dot 關掉，讀起來像「已經閒置」。
+    // keepBusy=true 讓沒有設過 busy 的呼叫端不去動它，不改動預設呼叫端
+    // （submit）的既有行為。
+    pushError(msg: string, wsid?: string, keepBusy = false) {
       const w = wsid ?? this.focusedWsid
       const m = this.sessions[w]
-      if (m) m.busy = false
+      if (m && !keepBusy) m.busy = false
       const v = this.views[w]
       if (!v) {
         this.applyNotice(uiEnv('stream_error', { error: msg }))

@@ -47,9 +47,16 @@ async function createSession(p: ProviderKey) {
 // phase（動 phase 狀態機），超出本張票範圍（見 app.go RemoveSession doc）。
 // 這裡能做、也必須做的：**據實呈現**——錯誤原文直接顯示給使用者（fail
 // loud），不吞掉、不裝作成功。失敗時**不**呼叫 markRemoved：store 端的
-// sessionList 因此繼续列出這筆，使用者不會誤以為移除已完成；下一次
+// sessionList 因此繼續列出這筆，使用者不會誤以為移除已完成；下一次
 // ListSessions() 重新整理（App.vue 下次 hydrate）才會依 registry 真實狀態
 // 收斂。
+//
+// review fix（Important）：這裡從沒把 busy 設成 true，call RemoveSession 前
+// 也不代表 session 真的忙碌——按下移除時該 session 若本來就在 streaming／
+// tool_running（Removable() 會直接擋下、完全不碰後端狀態），pushError 預設
+// 的「清 busy」副作用會把畫面上的 busy-dot 關掉，讀起來像已經閒置、可以放心
+// 操作。keepBusy=true 讓這條失敗路徑不動 busy（見 stores/session.ts
+// pushError doc）。
 const confirmTarget = ref<string | null>(null)
 function askRemove(wsid: string) { confirmTarget.value = wsid }
 function cancelRemove() { confirmTarget.value = null }
@@ -59,7 +66,7 @@ async function confirmRemove(wsid: string) {
     await RemoveSession(wsid)
     s.markRemoved(wsid)
   } catch (e) {
-    s.pushError(t('sessionList.remove.failed', { wsid, error: String(e) }), wsid)
+    s.pushError(t('sessionList.remove.failed', { wsid, error: String(e) }), wsid, true)
   }
 }
 </script>
