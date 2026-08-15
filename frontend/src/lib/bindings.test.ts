@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
 const h = vi.hoisted(() => ({
-  StartSession: vi.fn(async () => {}),
-  SendMessage: vi.fn(async () => {}),
+  StartSession: vi.fn(async (..._a: string[]) => {}),
+  SendMessage: vi.fn(async (..._a: string[]) => {}),
   CreateSession: vi.fn(async () => 'wsid-1'),
   RemoveSession: vi.fn(async () => {}),
+  EndSession: vi.fn(async () => {}),
+  NewSession: vi.fn(async () => {}),
+  TerminateSession: vi.fn(async () => {}),
+  ListSessions: vi.fn(async () => []),
   RecoverCodexRecording: vi.fn(async () => {}),
   LoadTurnsBefore: vi.fn(async () => []),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
@@ -22,20 +26,46 @@ vi.mock('../../wailsjs/go/main/App', () => h)
 
 import { makeBindings } from './bindings'
 
-// P1 迴歸：adapter 必須逐參數轉發——單參數版本會把 provider 名送成訊息內容
+// P1 迴歸：adapter 必須逐參數轉發——單參數版本會把第一參數送成訊息內容
 describe('production bindings adapter', () => {
-  it('forwards both SendMessage arguments positionally', async () => {
+  // M3b Task 26 原子切換：第一參數由 provider 改為 WSID。這條守的是「轉發的
+  // 就是呼叫端給的那個 WSID」，並明確排除誤傳 provider 名稱。
+  it('WSID 取代 provider 作為第一參數——不得誤傳 provider', async () => {
     const b = makeBindings()
-    await b.SendMessage('claude', 'the real message')
-    expect(h.SendMessage).toHaveBeenCalledWith('claude', 'the real message')
-    await b.SendMessage('codex', 'second round')
-    expect(h.SendMessage).toHaveBeenCalledWith('codex', 'second round')
+    await b.SendMessage('01JWSIDABC', 'text')
+    const [first] = vi.mocked(h.SendMessage).mock.calls.at(-1)!
+    expect(first).toBe('01JWSIDABC')
+    expect(['claude', 'codex']).not.toContain(first)
   })
 
-  it('forwards all six StartSession arguments', async () => {
+  it('forwards both SendMessage arguments positionally', async () => {
     const b = makeBindings()
-    await b.StartSession('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
-    expect(h.StartSession).toHaveBeenCalledWith('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
+    await b.SendMessage('w1', 'the real message')
+    expect(h.SendMessage).toHaveBeenCalledWith('w1', 'the real message')
+    await b.SendMessage('w2', 'second round')
+    expect(h.SendMessage).toHaveBeenCalledWith('w2', 'second round')
+  })
+
+  it('StartSession／EndSession 逐參數轉發且第一參數為 WSID', async () => {
+    const b = makeBindings()
+    await b.StartSession('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+    expect(h.StartSession).toHaveBeenCalledWith('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+    await b.EndSession('w1')
+    expect(h.EndSession).toHaveBeenCalledWith('w1')
+  })
+
+  it('NewSession／TerminateSession 以 WSID 定址', async () => {
+    const b = makeBindings()
+    await b.NewSession('w1')
+    expect(h.NewSession).toHaveBeenCalledWith('w1')
+    await b.TerminateSession('w2')
+    expect(h.TerminateSession).toHaveBeenCalledWith('w2')
+  })
+
+  it('ListSessions 轉發至 Go 綁定（前端 session 清單的唯一來源）', async () => {
+    const b = makeBindings()
+    await b.ListSessions()
+    expect(h.ListSessions).toHaveBeenCalledWith()
   })
 
   // M3b Task 4：CreateSession 是純新增的多參數綁定，同一教訓套用。

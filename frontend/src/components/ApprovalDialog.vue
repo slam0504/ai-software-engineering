@@ -4,8 +4,11 @@ import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ResolveApproval } from '../../wailsjs/go/main/App'
 import { useSession } from '../stores/session'
+import type { ApprovalRestoreTrigger } from '../stores/session'
 
-interface Req { id: string; provider: string; toolName: string; inputJson: string }
+// Req：後端 a.emit("approval:request", …) 的 payload。Task 26 加入 wsid——
+// 多 session 之後 provider 不足以定位來源 session（§3.6.4 的 pane 路由）。
+interface Req { id: string; wsid: string; provider: string; toolName: string; inputJson: string }
 
 const { t } = useI18n()
 const s = useSession()
@@ -16,21 +19,34 @@ const error = ref('')
 
 const current = computed<Req | null>(() => queue.value[0] ?? null)
 
-function focusProvider(r: Req | undefined) {
-  if (!r) return
-  s.setActiveProvider(r.provider === 'codex' ? 'codex' : 'claude') // 彈出／promotion 時自動切 tab
+// present：把來源 session 帶到使用者眼前（§3.6.4）——已釘選就切 focus，未釘選
+// 則由 store 做 transient secondary presentation。
+function present(r: Req | undefined) {
+  if (!r?.wsid) return
+  s.routeApproval(r.wsid)
 }
 
-function removeById(id: string) {
+// dismissCause → §3.6.4 凍結的六種恢復觸發。remove／shutdown 都是走
+// denyApprovals → ResolveApproval 出去的（cause=resolved），只有 reason 分得出來。
+function triggerOf(cause: string, why: string): ApprovalRestoreTrigger {
+  if (cause === 'timeout') return 'timeout'
+  if (why === 'session_removed') return 'remove'
+  if (why === 'shutdown') return 'shutdown'
+  return 'dismiss'
+}
+
+function removeById(id: string, trigger: ApprovalRestoreTrigger) {
   const idx = queue.value.findIndex(r => r.id === id)
   if (idx === -1) return
   const wasCurrent = idx === 0
   queue.value.splice(idx, 1)
-  if (wasCurrent) {
-    reason.value = ''
-    error.value = ''
-    focusProvider(queue.value[0]) // promotion：輪到顯示才切 tab
-  }
+  if (!wasCurrent) return
+  reason.value = ''
+  error.value = ''
+  // 先恢復原釘選，再讓下一筆（若有）重新路由——順序反過來的話，第二筆的
+  // transient 會被緊接著的恢復動作立刻撤掉。
+  s.resolveApprovalPresentation(trigger)
+  present(queue.value[0]) // promotion：輪到顯示才切 pane
 }
 
 EventsOn('approval:request', (r: Req) => {
@@ -38,17 +54,19 @@ EventsOn('approval:request', (r: Req) => {
   if (queue.value.length === 1) { // 立即顯示的第一筆
     reason.value = ''
     error.value = ''
-    focusProvider(r)
+    present(r)
   }
 })
-EventsOn('approval:dismiss', (d: { id: string }) => removeById(d.id)) // timeout／resolved：按 ID 移除正確項目
+// timeout／resolved：按 ID 移除正確項目（cause＋reason 決定恢復觸發）
+EventsOn('approval:dismiss', (d: { id: string; cause?: string; reason?: string }) =>
+  removeById(d.id, triggerOf(d.cause ?? '', d.reason ?? '')))
 
 async function decide(allow: boolean, why?: string) {
   const r = current.value
   if (!r) return
   try {
     await ResolveApproval(r.id, allow, why ?? reason.value)
-    removeById(r.id)
+    removeById(r.id, allow ? 'allow' : 'deny')
   } catch (e: any) {
     error.value = String(e)
   }

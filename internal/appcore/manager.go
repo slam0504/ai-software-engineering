@@ -104,12 +104,11 @@ type slot struct {
 	totalCost  float64
 	totalUsage contract.Usage
 
-	// M3b §3.1：slot identity。wsid 供 emit 路徑回填 Envelope.WorkspaceSessionID；
-	// legacy slot 的 wsid 留空，遷移窗口內落在它上面的 envelope 因此與 M3a 完全一致。
+	// M3b §3.1：slot identity。wsid 供 emit 路徑回填 Envelope.WorkspaceSessionID。
+	// Task 26 之後每個 slot 都由 ReserveSession 建立，wsid 必非空。
 	wsid      WSID
 	provider  contract.Provider
 	committed bool   // false = 只保留名額，尚未 CommitCreate；一律拒絕
-	isLegacy  bool   // LegacyWSID 惰性建立（Task 26 刪除）：不計入 countLocked
 	createSeq uint64 // CreateToken 比對用
 
 	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken／ResetToken 全部失效
@@ -147,35 +146,28 @@ func newSlot() *slot { return &slot{reducer: contract.NewReducer()} }
 //
 // slot 以 WSID 為 key（同一 provider 最多 MaxSessionsPerProvider 個）。建立走
 // ReserveSession → CommitCreate／AbortCreate 三段交易：reservation 當下即佔名額，
-// 未 commit 的 slot 對新入口不可見。全部入口只讀不建（Task 9 已刪除 provider-keyed
-// 簽名）；唯一的例外是 LegacyWSID，見其 doc。
+// 未 commit 的 slot 對新入口不可見。**全部入口一律只讀不建**（Task 9 刪除
+// provider-keyed 簽名、Task 26 刪除最後的 LegacyWSID 惰性建立入口）。
 type Manager struct {
 	mu         sync.Mutex
 	cfg        Config
 	slots      map[WSID]*slot
-	legacy     map[contract.Provider]WSID // LegacyWSID 的 provider → legacy slot（Task 26 刪除）
 	reserveSeq uint64
 	auditErr   error
 	closed     bool
 }
 
 func New(cfg Config) *Manager {
-	return &Manager{cfg: cfg, slots: map[WSID]*slot{}, legacy: map[contract.Provider]WSID{}}
+	return &Manager{cfg: cfg, slots: map[WSID]*slot{}}
 }
 
 // countLocked：該 provider 已佔用的名額（含尚未 commit 的 reservation）。
-//
-// legacy slot 是遷移期產物，不佔使用者名額：它是 app 層 legacyWSIDFor 最後順位
-// 的落點（全新安裝、registry 空、無 live host 時），由 LegacyWSID 惰性建立。若把
-// 它計入，遷移窗口內每個 provider 的可建立數就會從 4 掉到 3——使用者看得到的差異，
-// 而 legacy slot 本身不是使用者建立的 session。
-//
-// 因此**遷移期每 provider 實際上限為 MaxSessionsPerProvider + 1 = 5**：m.legacy[p]
-// 是一對一 map，每個 provider 最多一個 legacy slot。Task 26 刪除相容層後回歸 4。
+// Task 26 刪除 legacy slot 之後 slots 裡只剩使用者的 session，每 provider 的
+// 上限因此就是 MaxSessionsPerProvider，無任何豁免項。
 func (m *Manager) countLocked(p contract.Provider) int {
 	n := 0
 	for _, sl := range m.slots {
-		if sl.provider == p && !sl.isLegacy {
+		if sl.provider == p {
 			n++
 		}
 	}
@@ -294,15 +286,6 @@ func (m *Manager) RemoveSession(w WSID) error {
 	if err != nil {
 		return err
 	}
-	// legacy slot（LegacyWSID 惰性建立，m.legacy[p] 一對一指回它）不得被
-	// RemoveSession 刪掉：它不計入 countLocked，delete 之後既不釋放任何名額，
-	// 又讓 m.legacy[p] 變成指向一個已消失 slot 的懸空 key——之後每個經
-	// legacyWSIDFor 第 4 順位落到它的呼叫都會 ErrSessionNotFound（review
-	// round-2 Minor #1）。App 層的使用者移除流程理論上到不了這裡（legacy WSID
-	// 從未寫進 wsRegistry，tombstone_persist 會先擋下），這裡是第二道防線。
-	if sl.isLegacy {
-		return ErrSessionNotFound
-	}
 	if sl.phase != phaseIdle {
 		return ErrSessionNotIdle
 	}
@@ -344,7 +327,7 @@ func (m *Manager) Removable(w WSID) error {
 	return nil
 }
 
-// SlotCount：該 provider 目前佔用的名額（reservation 亦計入；legacy slot 不計入）。
+// SlotCount：該 provider 目前佔用的名額（reservation 亦計入）。
 func (m *Manager) SlotCount(p contract.Provider) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -376,31 +359,6 @@ func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
 		return nil, ErrSessionNotFound
 	}
 	return sl, nil
-}
-
-// legacyWSIDLocked：LegacyWSID 專用——「讀取時隱式建立」的 per-provider fallback
-// slot。legacy slot 不計入 countLocked（見其 doc）。
-func (m *Manager) legacyWSIDLocked(p contract.Provider) WSID {
-	if w, ok := m.legacy[p]; ok {
-		return w
-	}
-	w := WSID("legacy-" + string(p))
-	sl := newSlot()
-	sl.provider, sl.committed, sl.isLegacy = p, true, true
-	m.slots[w], m.legacy[p] = sl, w
-	return w
-}
-
-// LegacyWSID：provider → legacy slot WSID。Task 9 刪掉全部 provider-keyed 入口之後
-// 它只剩一個呼叫端：app 層 legacyWSIDFor 的**最後順位**（全新安裝、registry 空、
-// 該 provider 沒有 live host）。那個順位需要一個「保證對 WSID 入口可解析」的 WSID
-// ——legacy slot 是惰性建立的，光靠字面 key 猜不到、也可能還不存在，故保留
-// legacyWSIDLocked 的「讀取時隱式建立」語意。legacy slot 的 sl.wsid 留空，envelope
-// 的 workspace_session_id 因此與 M3a 完全一致。與 legacyWSIDFor 一起在 Task 26 刪除。
-func (m *Manager) LegacyWSID(p contract.Provider) WSID {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.legacyWSIDLocked(p)
 }
 
 // newSessionLocked：flush 該 slot 殘留 queue（掛舊 task）→ 換代 → 重設。
@@ -883,7 +841,7 @@ func (m *Manager) emitLocked(sl *slot, ev contract.Event, correlationID string) 
 		}
 	}
 	env := contract.Wrap(ev, sl.taskID)
-	env.WorkspaceSessionID = string(sl.wsid) // legacy slot 為空值：遷移期輸出不變
+	env.WorkspaceSessionID = string(sl.wsid) // conversation lane 必填（§3.1.5）
 	if correlationID != "" {
 		env.CorrelationID = correlationID // §3.6.4：approval id 供事件流精確對應
 	}

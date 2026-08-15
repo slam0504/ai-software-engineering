@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateDecisionContext, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateDecisionContext, GateList, ListSessions, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
@@ -190,11 +190,12 @@ function onGateResizeStart(e: MouseEvent) {
   window.addEventListener('mouseup', onGateResizeEnd)
 }
 
-// 快捷鍵：Cmd+1/2 切 provider tab、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
+// 快捷鍵：Cmd+1/2 切 pane 焦點、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
+// ——Task 26 之後 pane 綁 WSID，不再是 provider tab。
 function onGlobalKeydown(e: KeyboardEvent) {
   if (!e.metaKey) return
-  if (e.key === '1') { e.preventDefault(); s.setActiveProvider('claude') }
-  else if (e.key === '2') { e.preventDefault(); s.setActiveProvider('codex') }
+  if (e.key === '1') { e.preventDefault(); s.setFocus(0) }
+  else if (e.key === '2') { e.preventDefault(); s.setFocus(1) }
   else if (e.key === 'k') {
     e.preventDefault()
     document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus()
@@ -211,10 +212,15 @@ onMounted(async () => {
     else if (dst === 'assist') assist.applyAssistEvent(e)
     else if (dst === 'plan') plan.applyAssistEvent(e)
     else if (dst === 'evidence') evidence.applyEvidenceEvent(e)
+    // workspace scope 但非 gate／evidence 的事件（replay index degraded、codex
+    // broadcast、dispatch fail loud）——此前全被丟進 gate store 靜默丟棄。
+    else if (dst === 'notice') s.applyNotice(e)
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
-  try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
+  // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
+  // Task 29 的 lazy load，這裡只 hydrate metadata。
+  try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
   await refreshEscalation()

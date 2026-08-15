@@ -6,8 +6,19 @@ import type { Envelope } from '../types'
 import { mountWithI18n } from '../test/i18n'
 
 const env = (over: Partial<Envelope>): Envelope => ({
-  event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta', ...over,
+  event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta',
+  workspace_session_id: 'w1', ...over,
 })
+
+// pinned：ChatPanel 讀 focused pane，因此測試前要有一個釘選中的 session
+// （Task 26：store 改為 per-WSID lane）。
+function pinned() {
+  const s = useSession()
+  s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: '' })
+  s.pin(0, 'w1')
+  s.setFocus(0)
+  return s
+}
 
 // V3 normative：thinking 摺疊——thinking 內容渲染於預設收合的 <details>
 describe('ChatPanel thinking fold', () => {
@@ -19,7 +30,7 @@ describe('ChatPanel thinking fold', () => {
 
   it('renders accumulated thinking inside a collapsed details block', async () => {
     const wrapper = mountWithI18n(ChatPanel)
-    const s = useSession()
+    const s = pinned()
     s.apply(env({ kind: 'delta', text: 'ans-', thinking: 'step one; ' }))
     s.apply(env({ kind: 'delta', text: 'wer', thinking: 'step two' }))
     await wrapper.vm.$nextTick()
@@ -33,7 +44,7 @@ describe('ChatPanel thinking fold', () => {
 
   it('omits details when message has no thinking', async () => {
     const wrapper = mountWithI18n(ChatPanel)
-    const s = useSession()
+    const s = pinned()
     s.apply(env({ kind: 'delta', text: 'plain' }))
     await wrapper.vm.$nextTick()
     expect(wrapper.find('details.thinking').exists()).toBe(false)

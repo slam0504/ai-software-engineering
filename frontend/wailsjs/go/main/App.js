@@ -70,6 +70,10 @@ export function GateList() {
   return window['go']['main']['App']['GateList']();
 }
 
+export function ListSessions() {
+  return window['go']['main']['App']['ListSessions']();
+}
+
 export function ListWorkspace(arg1) {
   return window['go']['main']['App']['ListWorkspace'](arg1);
 }

@@ -87,21 +87,6 @@ func TestRemoveSessionReleasesIdleSlot(t *testing.T) {
 	}
 }
 
-// TestRemoveSessionRejectsLegacySlot（review round-2 Minor #1）：legacy slot
-// （LegacyWSID 惰性建立）不計入 countLocked、且 m.legacy[p] 一對一指回它——若
-// 被 RemoveSession 刪掉，m.legacy[p] 會變成懸空 key，之後每個經 legacyWSIDFor
-// 第 4 順位落到它的呼叫都會撞到一個已消失的 slot。
-func TestRemoveSessionRejectsLegacySlot(t *testing.T) {
-	m := New(Config{Sink: &memSink{}})
-	w := m.LegacyWSID("claude")
-	if err := m.RemoveSession(w); !errors.Is(err, ErrSessionNotFound) {
-		t.Fatalf("legacy slot 必須拒絕移除：%v", err)
-	}
-	if got := m.LegacyWSID("claude"); got != w {
-		t.Fatalf("拒絕之後 legacy slot 必須維持原樣（未被刪一半）：want %s got %s", w, got)
-	}
-}
-
 // TestRemoveSessionRejectsNonIdlePhase：非 idle phase（starting／active／
 // ending／resetting）代表呼叫端（App.RemoveSession）尚未真的把 session 收尾就
 // 呼叫到這裡——直接砍掉 slot 會讓仍在跑的 goroutine 之後對一個已消失的 WSID
@@ -181,21 +166,3 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 	}
 }
 
-// LegacyWSID 是 Task 9 之後唯一殘留的相容入口（app 層 legacyWSIDFor 的最後順位）：
-// 必須「讀取時隱式建立」出一個對 WSID 入口可解析的 slot，且不吃使用者名額。
-func TestLegacyWSIDResolvesAndCostsNoQuota(t *testing.T) {
-	m := New(Config{Sink: &memSink{}})
-	w := m.LegacyWSID("claude")
-	if w == "" {
-		t.Fatal("legacy slot WSID 不得為空")
-	}
-	if _, err := m.BeginNewSessionSubmit(w, "t"); err != nil {
-		t.Fatalf("legacy WSID 必須對 WSID 入口可解析：%v", err)
-	}
-	if got := m.LegacyWSID("claude"); got != w { // 同 provider 恆為同一個 slot
-		t.Fatalf("LegacyWSID 必須冪等：%s vs %s", got, w)
-	}
-	if got := m.SlotCount("claude"); got != 0 {
-		t.Fatalf("legacy slot 不得佔使用者名額：%d", got)
-	}
-}

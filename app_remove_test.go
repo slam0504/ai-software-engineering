@@ -123,30 +123,6 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 	}
 }
 
-// TestRemoveInvalidatesLastCreatedWSIDCache（review round-2 裁決）：移除掉最近
-// 一次 CreateSession 的 WSID 之後，legacyWSIDFor 第 2 順位（lastCreatedWSID）
-// 不得繼續回傳這個已消失的 WSID——否則 provider-keyed 舊 binding
-//（StartSession 等）之後會解析到一個已 tombstone 的 WSID，得到
-// ErrSessionNotFound，即使另一個較早建立的 dormant session 明明還在。
-func TestRemoveInvalidatesLastCreatedWSIDCache(t *testing.T) {
-	a, _ := newTestApp(t)
-	older := mustCreate(t, a, "claude") // 較早建立，之後仍應可解析
-	newest := mustCreate(t, a, "claude")
-	if got := a.legacyWSIDFor(contract.ProviderClaude); got != newest {
-		t.Fatalf("前置條件：第 2 順位應回最近一次建立的 WSID：want %s got %s", newest, got)
-	}
-
-	if err := a.RemoveSession(string(newest)); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := a.legacyWSIDFor(contract.ProviderClaude); got == newest {
-		t.Fatalf("legacyWSIDFor 不得繼續回傳已移除的 WSID：%s", got)
-	} else if got != older {
-		t.Fatalf("失效後應落到仍存在的較早 entry（第 3 順位）：want %s got %s", older, got)
-	}
-}
-
 // TestRemoveOrderIsFrozen（§3.6.2）：六步凍結順序——釋放名額（decrement_count）
 // 必須是最後一步。lease_finalize／cleanup_files 是獨立步驟探針，即使對 claude
 // 而言 lease finalize 的實際工作已經包在 teardown（CloseSequence）內完成，順序
@@ -249,10 +225,8 @@ func TestRemovedTombstoneSurvivesRestartAndRebuild(t *testing.T) {
 // broker.Close()、releaseSockIndex）一次都不會被呼叫——等於沒把「teardown 內層
 // 的鎖與上界」納進 Create 排隊等 token 的並行窗口，token 臨界區內只驗到最外層
 // 的 crToken，測不到 teardown 內層是否也正確地在臨界區內執行。用「最後一個」
-// 是為了迴避 legacyWSIDFor 第 1 順位（恰有一個 live host）在多個 host 併存時
-// 的誤路由：其餘 hosts[:-1] 全部只 mustCreate（dormant、無 host），此時
-// legacyWSIDFor 落到第 2 順位（lastCreatedWSID，正好是最後建立的那個），
-// mustStartClaude(t, a, victim) 才能正確命中 victim 本身。
+// 是沿用當初 legacyWSIDFor 解析順位的寫法；Task 26 之後 mustStartClaude 直接
+// 帶 victim 的 WSID，選第幾個已不影響命中，保留原選擇不改動測試意圖。
 func TestRemoveXNewShareOwnershipToken(t *testing.T) {
 	a, _ := newTestApp(t)
 	var hosts []appcore.WSID

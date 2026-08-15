@@ -207,10 +207,10 @@ func TestCommitAndRollbackBothFailEnterDegraded(t *testing.T) {
 	// 既有 session 走 legacy 入口先建起來（degraded 不得影響它）——SendMessage
 	// 需要真的有一個 active claude session，沿用 app_test.go 的 fake CLI 慣例。
 	writeMultiTurnClaude(t, a)
-	if err := a.StartSession("claude", "hi claude", "", "claude-degraded", "task-c", ""); err != nil {
+	if err := a.StartSession(wsidStr(t, a, "claude"), "hi claude", "", "claude-degraded", "task-c", ""); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = a.EndSession("claude") })
+	t.Cleanup(func() { _ = a.EndSession(wsidStr(t, a, "claude")) })
 	waitFor(t, "claude first result", func() bool { return len(ui.findEnvKind("result")) >= 1 })
 
 	a.hookForceCommitCreateError = errors.New("injected commit failure")
@@ -232,7 +232,69 @@ func TestCommitAndRollbackBothFailEnterDegraded(t *testing.T) {
 		t.Fatal("degraded 應 per-provider")
 	}
 	// 既有 session 不受影響：走 legacy 入口的既有路徑仍可送訊息
-	if err := a.SendMessage("claude", "still works"); err != nil {
+	if err := a.SendMessage(wsidStr(t, a, "claude"), "still works"); err != nil {
 		t.Fatalf("degraded 不得影響既有 session：%v", err)
+	}
+}
+
+// ---- Task 26：ListSessions（registry × working slot 的調和）----
+
+// registry 是「有哪些 session」的權威、Manager slot 是「能不能操作」的權威，
+// 兩邊不一致時必須據實呈現而不是把落單的那筆藏起來——否則稽核裡有事件、UI 卻
+// 沒有這個 session，使用者也無從重試移除。
+func TestListSessionsReconcilesRegistryWithSlots(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+
+	live := mustCreate(t, a, "claude") // registry ＋ committed slot 都有
+	// registry 有、Manager 沒有（RestoreDormant 未掛回去／名額釋放失敗留下的落差）
+	orphan := "01ORPHAN00000000000000001"
+	if err := reg.Put(wsregistry.Entry{WSID: orphan, Provider: "codex",
+		TaskLabel: "orphaned", ResumeSessionID: "th-1", CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	// tombstone 不得出現在清單（§3.6.1：removed 不顯示）
+	buried := mustCreate(t, a, "codex")
+	if err := reg.Remove(string(buried), "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := a.ListSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byWSID := map[string]SessionInfo{}
+	for _, s := range got {
+		byWSID[s.WSID] = s
+	}
+	if len(got) != 2 {
+		t.Fatalf("清單應為 registry 的 live entries：%+v", got)
+	}
+	if _, ok := byWSID[string(buried)]; ok {
+		t.Fatal("tombstone 不得出現在清單")
+	}
+	if s := byWSID[string(live)]; !s.Available || s.State == "" || s.Provider != "claude" {
+		t.Fatalf("有 slot 的 session 必須標為可操作並帶 phase：%+v", s)
+	}
+	if s := byWSID[orphan]; s.Available || s.State != "" {
+		t.Fatalf("registry 有、Manager 無 slot 的 session 必須標為不可操作：%+v", s)
+	}
+	if s := byWSID[orphan]; s.TaskLabel != "orphaned" || s.ResumeSessionID != "th-1" {
+		t.Fatalf("durable metadata 必須原樣帶出：%+v", s)
+	}
+	// 順序穩定（ULID 遞增），不隨 map 迭代漂移
+	for i := 1; i < len(got); i++ {
+		if got[i-1].WSID >= got[i].WSID {
+			t.Fatalf("清單順序必須以 WSID 遞增：%+v", got)
+		}
+	}
+}
+
+// registry 尚未接線時必須 fail loud——回空清單會讓使用者以為 session 都不見了。
+func TestListSessionsFailsLoudWithoutRegistry(t *testing.T) {
+	a, _ := newTestApp(t)
+	if _, err := a.ListSessions(); !errors.Is(err, errNoSessionRegistry) {
+		t.Fatalf("registry 不可用必須 fail loud：%v", err)
 	}
 }

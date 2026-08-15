@@ -1,295 +1,411 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useSession } from './session'
+import { APPROVAL_RESTORE_TRIGGERS, useSession } from './session'
 import type { Envelope } from '../types'
 
-const env = (over: Partial<Envelope>): Envelope => ({
-  event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta', ...over,
+// env：所有 conversation lane 事件都帶 workspace_session_id（§3.1.5 之後為必填）。
+const env = (wsid: string, over: Partial<Envelope>): Envelope => ({
+  event_id: String(Math.random()), ts: 't', provider: 'claude', kind: 'delta',
+  workspace_session_id: wsid, ...over,
 })
 
-const okBindings = () => ({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}) })
+const okBindings = () => ({
+  StartSession: vi.fn(async () => {}),
+  SendMessage: vi.fn(async () => {}),
+})
 
-describe('session store', () => {
+// 一個已註冊＋釘選在 pane 0 並取得焦點的 session（多數測試的起點）。
+function focusedSession(wsid = 'w1', provider: 'claude' | 'codex' = 'claude') {
+  const s = useSession()
+  s.registerSession({ wsid, provider, taskLabel: 'a' })
+  s.pin(0, wsid)
+  s.setFocus(0)
+  return s
+}
+
+describe('session store：per-WSID lane 路由（§3.7-8）', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
-  it('adds user bubble only from host envelope', () => {
+  it('apply 依 workspace_session_id 路由，不再依 provider', () => {
     const s = useSession()
-    expect(s.chat.length).toBe(0)
-    s.apply(env({ kind: 'message', role: 'user', text: 'hi' }))
-    expect(s.chat[0]).toMatchObject({ role: 'user', text: 'hi' })
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2')
+    s.apply(env('w2', { kind: 'delta', text: 'hello' }))
+    expect(s.views['w2'].chat.at(-1)?.text).toBe('hello')
+    expect(s.views['w1'].chat).toHaveLength(0)
   })
 
-  it('routes tool-role echo to timeline, not chat', () => {
-    const s = useSession()
-    s.apply(env({ kind: 'message', role: 'tool', text: 'tool result echo' }))
-    expect(s.chat.length).toBe(0)
-    expect(s.timeline.at(-1)!.env.text).toBe('tool result echo')
+  it('busy／unread 只在 SessionMeta 上，views 不承載狀態', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'message', role: 'user' }))
+    expect(s.sessions['w1'].busy).toBe(true)
+    expect((s.views['w1'] as unknown as Record<string, unknown>).busy).toBeUndefined()
+    expect((s.views['w1'] as unknown as Record<string, unknown>).unread).toBeUndefined()
+    s.apply(env('w1', { kind: 'result' }))
+    expect(s.sessions['w1'].busy).toBe(false)
   })
 
-  it('accumulates deltas then finalizes on assistant message', () => {
+  it('非釘選 session 只更新 metadata 與 unread，不保留 transcript', () => {
     const s = useSession()
-    s.apply(env({ kind: 'delta', text: 'a', thinking: 'th1-' }))
-    s.apply(env({ kind: 'delta', text: 'b', thinking: 'th2' }))
-    expect(s.chat.at(-1)).toMatchObject({ role: 'assistant', text: 'ab', thinking: 'th1-th2', streaming: true })
-    s.apply(env({ kind: 'message', role: 'assistant', text: 'ab!' }))
-    expect(s.chat.at(-1)).toMatchObject({ text: 'ab!', thinking: 'th1-th2', streaming: false })
+    s.registerSession({ wsid: 'w3', provider: 'codex', taskLabel: 'c' })
+    s.apply(env('w3', { provider: 'codex', kind: 'result' }))
+    expect(s.sessions['w3'].unread).toBe(1)
+    expect(s.views['w3']).toBeUndefined()
+    s.apply(env('w3', { provider: 'codex', kind: 'state_change', state: 'awaiting_approval' }))
+    expect(s.sessions['w3'].state).toBe('awaiting_approval')
+    expect(s.sessions['w3'].awaitingApproval).toBe(true)
   })
 
-  it('result finalizes trailing streaming bubble', () => {
+  it('釘選中的 session 不計 unread（兩 pane 都看得見）', () => {
     const s = useSession()
-    s.apply(env({ kind: 'delta', text: 'hi' }))
-    s.apply(env({ kind: 'message', role: 'assistant', text: 'hi' }))
-    s.apply(env({ kind: 'delta', text: '' }))
-    s.apply(env({ kind: 'result' }))
-    expect(s.chat.length).toBe(1)
-    expect(s.chat.at(-1)).toMatchObject({ text: 'hi', streaming: false })
-    s.apply(env({ kind: 'delta', text: 'partial tail' }))
-    s.apply(env({ kind: 'result' }))
-    expect(s.chat.at(-1)).toMatchObject({ text: 'partial tail', streaming: false })
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    s.apply(env('w2', { kind: 'result' })) // 背景 pane 但仍可見
+    expect(s.sessions['w2'].unread).toBe(0)
   })
 
-  it('overwrites usage snapshot instead of adding', () => {
-    const s = useSession()
-    s.apply(env({ kind: 'usage', usage: { input_tokens: 10, output_tokens: 1 } }))
-    s.apply(env({ kind: 'usage', usage: { input_tokens: 15, output_tokens: 3 } }))
-    expect(s.totals.input).toBe(15)
-    s.apply(env({ kind: 'result', cost_usd: 0.25, usage: { input_tokens: 20, output_tokens: 5 } }))
-    expect(s.totals.input).toBe(20)
-    expect(s.totals.cost).toBeCloseTo(0.25)
+  it('解除釘選釋放 transcript，保留 metadata、已讀與捲動錨點', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'delta', text: 'x' }))
+    s.setScrollAnchor('w1', 'e1')
+    s.unpin(0)
+    expect(s.views['w1']).toBeUndefined()
+    expect(s.sessions['w1'].unread).toBe(0)
+    expect(s.sessions['w1'].taskLabel).toBe('a')
+    expect(s.scrollAnchors['w1']).toBe('e1')
   })
 
-  it('shows — when provider reports no cost', () => {
+  it('釘選時 unread 歸零', () => {
     const s = useSession()
-    expect(s.costDisplay).toBe('—')
-    s.apply(env({ kind: 'result', cost_usd: 0.5 }))
-    expect(s.costDisplay).toBe('$0.5000')
+    s.registerSession({ wsid: 'w3', provider: 'codex', taskLabel: 'c' })
+    s.apply(env('w3', { provider: 'codex', kind: 'result' }))
+    expect(s.sessions['w3'].unread).toBe(1)
+    s.pin(1, 'w3')
+    expect(s.sessions['w3'].unread).toBe(0)
   })
 
-  it('tracks usage semantics for provider_latest marker', () => {
+  it('未知 WSID 的事件自動登記，不靜默丟棄', () => {
     const s = useSession()
-    s.apply(env({ kind: 'usage', usage: { input_tokens: 10, output_tokens: 1 }, usage_semantics: 'provider_latest' }))
-    expect(s.usageSemantics).toBe('provider_latest')
-    s.apply(env({ kind: 'result', usage: { input_tokens: 5, output_tokens: 2 }, usage_semantics: 'session_total' }))
-    expect(s.usageSemantics).toBe('session_total')
+    s.apply(env('w-surprise', { provider: 'codex', kind: 'result' }))
+    expect(s.sessions['w-surprise']).toMatchObject({ provider: 'codex', unread: 1 })
   })
 
-  it('tracks identity and state; result unlocks busy', () => {
-    const s = useSession()
-    s.setBindings(okBindings())
-    void s.submit('hello')
-    expect(s.busy).toBe(true)
-    s.apply(env({ kind: 'init', session_id: 's1', task_id: 'task-1' }))
-    s.apply(env({ kind: 'state_change', state: 'waiting' }))
-    s.apply(env({ kind: 'result' }))
-    expect(s.busy).toBe(false)
-    expect(s.sessionId).toBe('s1')
-    expect(s.taskId).toBe('task-1')
-    expect(s.state).toBe('waiting')
+  it('沒有 WSID 的 conversation 事件計入 unrouted，不落到任何 lane', () => {
+    const s = focusedSession()
+    s.apply({ event_id: 'e0', ts: 't', provider: 'claude', kind: 'delta', text: 'orphan' })
+    expect(s.unrouted).toBe(1)
+    expect(s.views['w1'].chat).toHaveLength(0)
   })
 
-  it('submit routes first to StartSession then to SendMessage', async () => {
+  it('registerSession 不覆寫既有 runtime 狀態', () => {
     const s = useSession()
-    const start = vi.fn(async () => {})
-    const send = vi.fn(async () => {})
-    s.setBindings({ StartSession: start, SendMessage: send })
+    s.apply(env('w9', { provider: 'codex', kind: 'result' })) // 先由事件建出 metadata
+    s.registerSession({ wsid: 'w9', provider: 'codex', taskLabel: 'from-registry' })
+    expect(s.sessions['w9'].unread).toBe(1) // registry hydrate 不得清掉 unread
+    expect(s.sessions['w9'].taskLabel).toBe('from-registry')
+  })
+})
+
+describe('session store：approval 路由（§3.6.4）', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+
+  it('未釘選來源以 transient 顯示，六種觸發都恢復原釘選', () => {
+    const s = useSession()
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    for (const trigger of APPROVAL_RESTORE_TRIGGERS) {
+      s.routeApproval('w3')
+      expect(s.pins[1]).toBe('w3')
+      expect(s.persistentPins[1]).toBe('w2')
+      expect(s.focused).toBe(0) // transient 不搶走 composer 焦點
+      s.resolveApprovalPresentation(trigger)
+      expect(s.pins[1]).toBe('w2')
+      expect(s.views['w3']).toBeUndefined() // transient transcript 一併釋放
+    }
+  })
+
+  it('恢復原釘選的觸發清單凍結為六項', () => {
+    expect([...APPROVAL_RESTORE_TRIGGERS]).toEqual(
+      ['allow', 'deny', 'timeout', 'dismiss', 'remove', 'shutdown'])
+  })
+
+  it('來源在另一 pane 時自動切 focus', () => {
+    const s = useSession()
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    s.routeApproval('w2')
+    expect(s.focused).toBe(1)
+    expect(s.pins).toEqual(['w1', 'w2']) // 已釘選：不動 pin
+  })
+
+  it('來源就是 focused pane 時不動 pin 也不動 focus', () => {
+    const s = useSession()
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(1)
+    s.routeApproval('w2')
+    expect(s.focused).toBe(1)
+    expect(s.pins).toEqual(['w1', 'w2'])
+  })
+
+  it('transient 期間第二筆 approval 不覆蓋原釘選的備份', () => {
+    const s = useSession()
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    s.routeApproval('w3')
+    s.routeApproval('w4') // FIFO promotion：下一筆同樣未釘選
+    expect(s.pins[1]).toBe('w4')
+    expect(s.persistentPins[1]).toBe('w2') // 不得被 w3 覆蓋
+    s.resolveApprovalPresentation('allow')
+    expect(s.pins[1]).toBe('w2')
+  })
+})
+
+describe('session store：focused pane 操作（§3.7）', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+
+  it('submit 作用於 focused pane 的 WSID', async () => {
+    const s = useSession()
+    const b = okBindings()
+    s.setBindings(b)
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(1)
+    await s.submit('go')
+    expect(b.StartSession).toHaveBeenCalledWith('w2', 'go', '', '', 'b', 'untrusted')
+    expect(b.SendMessage).not.toHaveBeenCalled()
+  })
+
+  it('第二輪走 SendMessage 且仍帶 WSID', async () => {
+    const s = focusedSession()
+    const b = okBindings()
+    s.setBindings(b)
     await s.submit('one')
-    expect(start).toHaveBeenCalledOnce()
-    s.apply(env({ kind: 'result' }))
+    s.apply(env('w1', { kind: 'result' }))
     await s.submit('two')
-    expect(send).toHaveBeenCalledWith('claude', 'two')
+    expect(b.SendMessage).toHaveBeenCalledWith('w1', 'two')
   })
 
-  it('submit failure pushes error and unlocks without user bubble', async () => {
+  it('A busy 不擋 B 送出', async () => {
     const s = useSession()
-    s.setBindings({ StartSession: vi.fn(async () => { throw new Error('busy') }), SendMessage: vi.fn(async () => {}) })
-    await s.submit('x')
+    const b = okBindings()
+    s.setBindings(b)
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    await s.submit('claude go')
+    expect(s.sessions['w1'].busy).toBe(true)
+    s.setFocus(1)
     expect(s.busy).toBe(false)
-    expect(s.chat.length).toBe(0)
+    await s.submit('other go')
+    expect(b.StartSession).toHaveBeenCalledTimes(2)
+    expect(s.sessions['w2'].busy).toBe(true)
+  })
+
+  it('submit 失敗推錯誤並解除 busy，不本地新增 user 氣泡', async () => {
+    const s = focusedSession()
+    s.setBindings({
+      StartSession: vi.fn(async () => { throw new Error('busy') }),
+      SendMessage: vi.fn(async () => {}),
+    })
+    await s.submit('x')
+    expect(s.sessions['w1'].busy).toBe(false)
+    expect(s.chat).toHaveLength(0)
     expect(s.timeline.at(-1)!.env.error).toContain('busy')
   })
 
-  it('note enters timeline as info item', () => {
+  it('沒有 focused session 時 submit 不呼叫綁定', async () => {
     const s = useSession()
-    s.note('auth ok')
-    expect(s.timeline.at(-1)!.env).toMatchObject({ kind: 'note', text: 'auth ok' })
+    const b = okBindings()
+    s.setBindings(b)
+    await s.submit('nowhere')
+    expect(b.StartSession).not.toHaveBeenCalled()
+    expect(s.notices.at(-1)!.env.kind).toBe('stream_error')
   })
 
-  it('remembers inputs per view across switches', () => {
+  it('輸入欄位 per session 隔離', async () => {
     const s = useSession()
-    s.setResumeInput('claude-id')
-    s.setTaskLabel('label-c')
-    s.setActiveProvider('codex')
-    expect(s.resumeInput).toBe('')
-    s.setResumeInput('codex-id')
-    expect(s.resumeInput).toBe('codex-id')
-    s.setActiveProvider('claude')
-    expect(s.resumeInput).toBe('claude-id')
-    expect(s.taskLabel).toBe('label-c')
+    const b = okBindings()
+    s.setBindings(b)
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: '' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: '' })
+    s.pin(0, 'w1'); s.pin(1, 'w2')
+    s.setFocus(0); s.setTaskLabel('task-c'); s.setRecordCase('rec-c')
+    s.setFocus(1); s.setTaskLabel('task-x')
+    expect(s.recordCase).toBe('')
+    await s.submit('go x')
+    expect(b.StartSession).toHaveBeenCalledWith('w2', 'go x', '', '', 'task-x', 'untrusted')
+    s.setFocus(0)
+    expect(s.taskLabel).toBe('task-c')
+    expect(s.recordCase).toBe('rec-c')
   })
 
-  it('groups consecutive system noise in timeline', () => {
+  it('applyDone 依 payload 的 wsid 路由', () => {
     const s = useSession()
-    s.apply(env({ kind: 'system_other' }))
-    s.apply(env({ kind: 'system_other' }))
-    s.apply(env({ kind: 'unknown' }))
-    s.apply(env({ kind: 'tool_use', text: 'Bash' }))
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    s.sessions['w2'].busy = true
+    s.sessions['w2'].active = true
+    s.applyDone({ wsid: 'w2', provider: 'codex', processStillRunning: true })
+    expect(s.sessions['w2'].busy).toBe(false)
+    expect(s.sessions['w2'].active).toBe(false)
+    expect(s.views['w2'].timeline.at(-1)!.env.kind).toBe('session_done')
+    expect(s.views['w1'].timeline).toHaveLength(0)
+  })
+
+  it('reset 只清 focused pane 的 transcript，保留輸入欄位', () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'keep-me' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    s.apply(env('w1', { kind: 'message', role: 'user', text: 'c' }))
+    s.apply(env('w2', { kind: 'message', role: 'user', text: 'x' }))
+    s.reset()
+    expect(s.chat).toHaveLength(0)
+    expect(s.taskLabel).toBe('keep-me')
+    expect(s.sessions['w1'].active).toBe(false)
+    expect(s.views['w2'].chat).toHaveLength(1)
+  })
+
+  it('markRemoved 釋放 pane 與 transcript，metadata 留下 tombstone 標記', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'delta', text: 'x' }))
+    s.markRemoved('w1')
+    expect(s.pins[0]).toBeNull()
+    expect(s.views['w1']).toBeUndefined()
+    expect(s.sessions['w1'].removed).toBe(true)
+    expect(s.sessionList.map(m => m.wsid)).not.toContain('w1')
+  })
+})
+
+describe('session store：reducer 行為（M1 契約，改 per-WSID 後不變）', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+
+  it('user 氣泡只由 host envelope 產生', () => {
+    const s = focusedSession()
+    expect(s.chat).toHaveLength(0)
+    s.apply(env('w1', { kind: 'message', role: 'user', text: 'hi' }))
+    expect(s.chat[0]).toMatchObject({ role: 'user', text: 'hi' })
+  })
+
+  it('tool 角色只進 timeline 不進 chat', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'message', role: 'tool', text: 'tool result echo' }))
+    expect(s.chat).toHaveLength(0)
+    expect(s.timeline.at(-1)!.env.text).toBe('tool result echo')
+  })
+
+  it('delta 累積後由 assistant message 收尾', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'delta', text: 'a', thinking: 'th1-' }))
+    s.apply(env('w1', { kind: 'delta', text: 'b', thinking: 'th2' }))
+    expect(s.chat.at(-1)).toMatchObject({ role: 'assistant', text: 'ab', thinking: 'th1-th2', streaming: true })
+    s.apply(env('w1', { kind: 'message', role: 'assistant', text: 'ab!' }))
+    expect(s.chat.at(-1)).toMatchObject({ text: 'ab!', thinking: 'th1-th2', streaming: false })
+  })
+
+  it('result 收掉尾端 streaming 氣泡', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'delta', text: 'hi' }))
+    s.apply(env('w1', { kind: 'message', role: 'assistant', text: 'hi' }))
+    s.apply(env('w1', { kind: 'delta', text: '' }))
+    s.apply(env('w1', { kind: 'result' }))
+    expect(s.chat).toHaveLength(1)
+    expect(s.chat.at(-1)).toMatchObject({ text: 'hi', streaming: false })
+  })
+
+  it('usage 為 snapshot 覆寫、cost 累加', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'usage', usage: { input_tokens: 10, output_tokens: 1 } }))
+    s.apply(env('w1', { kind: 'usage', usage: { input_tokens: 15, output_tokens: 3 } }))
+    expect(s.totals.input).toBe(15)
+    s.apply(env('w1', { kind: 'result', cost_usd: 0.25, usage: { input_tokens: 20, output_tokens: 5 } }))
+    expect(s.totals.input).toBe(20)
+    expect(s.totals.cost).toBeCloseTo(0.25)
+    expect(s.costDisplay).toBe('$0.2500')
+  })
+
+  it('identity／state 追蹤在 SessionMeta 上', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'init', session_id: 's1', task_id: 'task-1' }))
+    s.apply(env('w1', { kind: 'state_change', state: 'waiting' }))
+    expect(s.sessionId).toBe('s1')
+    expect(s.taskId).toBe('task-1')
+    expect(s.state).toBe('waiting')
+    expect(s.sessions['w1'].resume).toBe('s1') // 續聊自動接續
+  })
+
+  it('連續系統雜訊在 timeline 併成一組', () => {
+    const s = focusedSession()
+    s.apply(env('w1', { kind: 'system_other' }))
+    s.apply(env('w1', { kind: 'system_other' }))
+    s.apply(env('w1', { kind: 'unknown' }))
+    s.apply(env('w1', { kind: 'tool_use', text: 'Bash' }))
     const groups = new Set(s.timeline.map(i => i.group).filter(g => g !== undefined))
     expect(groups.size).toBe(1)
     expect(s.timeline.at(-1)!.group).toBeUndefined()
   })
+})
 
-  // ---- M1.5：per-provider views ----
+describe('session store：workspace 通知（degraded 到得了使用者）', () => {
+  beforeEach(() => setActivePinia(createPinia()))
 
-  it('routes events to per-provider views', () => {
+  it('applyNotice 進 notices 並出現在 focused timeline', () => {
+    const s = focusedSession()
+    s.applyNotice({ event_id: 'wn1', ts: 't', provider: '', kind: 'stream_error',
+      scope: 'workspace', error: 'replay index degraded' })
+    expect(s.notices).toHaveLength(1)
+    expect(s.timeline.map(i => i.env.event_id)).toContain('wn1')
+  })
+
+  it('workspace 通知不落進任何 session lane', () => {
+    const s = focusedSession()
+    s.applyNotice({ event_id: 'wn1', ts: 't', provider: 'codex', kind: 'codex_broadcast',
+      scope: 'workspace' })
+    expect(s.views['w1'].timeline).toHaveLength(0)
+    expect(s.views['w1'].chat).toHaveLength(0)
+  })
+
+  it('沒有釘選 pane 時通知仍看得見', () => {
     const s = useSession()
-    s.apply(env({ provider: 'claude', kind: 'delta', text: 'c1' }))
-    s.apply(env({ provider: 'codex', kind: 'delta', text: 'x1' }))
-    expect(s.views.claude.chat.at(-1)!.text).toBe('c1')
-    expect(s.views.codex.chat.at(-1)!.text).toBe('x1')
-    s.apply(env({ provider: 'codex', kind: 'usage', usage: { input_tokens: 9, output_tokens: 1 } }))
-    expect(s.views.codex.totals.input).toBe(9)
-    expect(s.views.claude.totals.input).toBe(0) // 隔離
-  })
-
-  it('switching provider preserves both views', () => {
-    const s = useSession()
-    s.apply(env({ provider: 'claude', kind: 'message', role: 'user', text: 'hi-c' }))
-    s.setActiveProvider('codex')
-    s.apply(env({ provider: 'codex', kind: 'message', role: 'user', text: 'hi-x' }))
-    expect(s.chat.at(-1)!.text).toBe('hi-x')
-    s.setActiveProvider('claude')
-    expect(s.chat.at(-1)!.text).toBe('hi-c') // 切回零丟失
-    expect(s.views.codex.chat.at(-1)!.text).toBe('hi-x')
-  })
-
-  it('background view counts unread per completed turn', () => {
-    const s = useSession() // active = claude
-    s.apply(env({ provider: 'codex', kind: 'delta', text: 'streaming…' })) // 非 turn 完成：不計
-    expect(s.unreadOf('codex')).toBe(0)
-    s.apply(env({ provider: 'codex', kind: 'message', role: 'assistant', text: 'done' })) // 訊息也不計
-    expect(s.unreadOf('codex')).toBe(0)
-    s.apply(env({ provider: 'codex', kind: 'result' })) // 每完成 turn +1
-    expect(s.unreadOf('codex')).toBe(1)
-    s.apply(env({ provider: 'codex', kind: 'result' }))
-    expect(s.unreadOf('codex')).toBe(2)
-    s.apply(env({ provider: 'claude', kind: 'result' })) // active view 不計 unread
-    expect(s.unreadOf('claude')).toBe(0)
-  })
-
-  it('unread clears on switch', () => {
-    const s = useSession()
-    s.apply(env({ provider: 'codex', kind: 'result' }))
-    expect(s.unreadOf('codex')).toBe(1)
-    s.setActiveProvider('codex')
-    expect(s.unreadOf('codex')).toBe(0)
-  })
-
-  it('per-view busy: A busy does not block B submit', async () => {
-    const s = useSession()
-    const b = okBindings()
-    s.setBindings(b)
-    await s.submit('claude go') // claude busy=true（等 result）
-    expect(s.views.claude.busy).toBe(true)
-    s.setActiveProvider('codex')
-    expect(s.busy).toBe(false) // codex view 不受影響
-    await s.submit('codex go')
-    expect(b.StartSession).toHaveBeenCalledTimes(2)
-    expect(s.views.codex.busy).toBe(true)
-  })
-
-  it('applyDone routes by payload provider', () => {
-    const s = useSession() // active = claude
-    s.views.codex.active = true
-    s.views.codex.busy = true
-    s.applyDone({ provider: 'codex', processStillRunning: true })
-    expect(s.views.codex.busy).toBe(false)
-    expect(s.views.codex.active).toBe(false)
-    expect(s.views.codex.timeline.at(-1)!.env.kind).toBe('session_done')
-    expect(s.views.claude.timeline.length).toBe(0) // 不進 active view
-  })
-
-  it('awaiting_approval flags the owning view', () => {
-    const s = useSession() // active = claude
-    s.apply(env({ provider: 'codex', kind: 'state_change', state: 'awaiting_approval' }))
-    expect(s.awaitingOf('codex')).toBe(true)
-    expect(s.awaitingOf('claude')).toBe(false)
-  })
-
-  it('taskLabel is isolated per view', async () => {
-    const s = useSession()
-    const b = okBindings()
-    s.setBindings(b)
-    s.setTaskLabel('task-c')
-    s.setActiveProvider('codex')
-    s.setTaskLabel('task-x')
-    await s.submit('go x') // codex submit 帶自己的標籤
-    expect(b.StartSession).toHaveBeenCalledWith('codex', 'go x', '', '', 'task-x', 'untrusted')
-    s.setActiveProvider('claude')
-    expect(s.taskLabel).toBe('task-c') // A 設標籤不影響 B、各帶各的
-    await s.submit('go c')
-    expect(b.StartSession).toHaveBeenCalledWith('claude', 'go c', '', '', 'task-c', 'untrusted')
-  })
-
-  it('recordCase is isolated per view', () => {
-    const s = useSession()
-    s.setRecordCase('claude-rec')
-    s.setActiveProvider('codex')
-    expect(s.recordCase).toBe('')
-    s.setRecordCase('codex-rec')
-    s.setActiveProvider('claude')
-    expect(s.recordCase).toBe('claude-rec')
-    expect(s.views.codex.recordCase).toBe('codex-rec')
-  })
-
-  it('reset only resets the active view', () => {
-    const s = useSession()
-    s.apply(env({ provider: 'claude', kind: 'message', role: 'user', text: 'c' }))
-    s.apply(env({ provider: 'codex', kind: 'message', role: 'user', text: 'x' }))
-    s.setTaskLabel('keep-me')
-    s.reset()
-    expect(s.chat.length).toBe(0)
-    expect(s.taskLabel).toBe('keep-me') // 輸入欄位保留
-    expect(s.views.codex.chat.length).toBe(1) // 另一 view 不動
+    s.applyNotice({ event_id: 'wn1', ts: 't', provider: '', kind: 'stream_error',
+      scope: 'workspace', error: 'boom' })
+    expect(s.timeline.map(i => i.env.event_id)).toContain('wn1')
   })
 })
 
-describe('restore replay (M1.5 D6)', () => {
+describe('session store：registry hydrate（registry × working slot）', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
-  it('replays envelopes to rebuild views without unread', () => {
+  it('hydrateSessions 帶入 durable metadata 與可操作性', () => {
     const s = useSession()
-    s.restoreViews({
-      claude: {
-        envelopes: [
-          env({ provider: 'claude', kind: 'message', role: 'user', text: 'old q' }),
-          env({ provider: 'claude', kind: 'result', cost_usd: 0.3, usage: { input_tokens: 5, output_tokens: 2 }, usage_semantics: 'session_total' }),
-        ],
-        resumeSessionId: 'sA', taskId: 'task-a',
-      },
-      codex: {
-        envelopes: [env({ provider: 'codex', kind: 'result' })],
-        resumeSessionId: 'tX', taskId: 'task-x',
-      },
-    })
-    expect(s.views.claude.chat.at(-1)!.text).toBe('old q')
-    expect(s.views.claude.totals.cost).toBeCloseTo(0.3)
-    expect(s.views.claude.taskLabel).toBe('task-a')
-    expect(s.views.claude.resume).toBe('sA') // resume 預填
-    expect(s.views.codex.resume).toBe('tX')
-    expect(s.unreadOf('claude')).toBe(0) // 重放不計 unread
-    expect(s.unreadOf('codex')).toBe(0)
-    expect(s.views.claude.active).toBe(false) // 恢復不 spawn：下一次 submit 走 StartSession
+    s.hydrateSessions([
+      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: 's1', created_at: '', available: true, state: 'idle' },
+      { wsid: 'w2', provider: 'codex', task_label: 'b', resume_session_id: '', created_at: '', available: false, state: '' },
+    ])
+    expect(s.sessions['w1']).toMatchObject({ provider: 'claude', taskLabel: 'a', resume: 's1', available: true })
+    expect(s.sessions['w2'].available).toBe(false)
+    expect(s.sessionList.map(m => m.wsid)).toEqual(['w1', 'w2'])
   })
 
-  it('restored resume feeds the next StartSession', async () => {
+  it('不可操作的 session 不得被 submit', async () => {
     const s = useSession()
-    const start = vi.fn(async () => {})
-    s.setBindings({ StartSession: start, SendMessage: vi.fn(async () => {}) })
-    s.restoreViews({
-      claude: { envelopes: [], resumeSessionId: 'sA', taskId: 'task-a' },
-      codex: { envelopes: [], resumeSessionId: '', taskId: '' },
-    })
-    await s.submit('continue please')
-    expect(start).toHaveBeenCalledWith('claude', 'continue please', 'sA', '', 'task-a', 'untrusted')
+    const b = okBindings()
+    s.setBindings(b)
+    s.hydrateSessions([
+      { wsid: 'w2', provider: 'codex', task_label: 'b', resume_session_id: '', created_at: '', available: false, state: '' },
+    ])
+    s.pin(0, 'w2'); s.setFocus(0)
+    await s.submit('go')
+    expect(b.StartSession).not.toHaveBeenCalled()
+    expect(s.notices.at(-1)!.env.error).toContain('w2')
+  })
+
+  it('countOf 依 provider 計數且不含已移除', () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: '' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: '' })
+    s.registerSession({ wsid: 'w3', provider: 'codex', taskLabel: '' })
+    s.markRemoved('w2')
+    expect(s.countOf('claude')).toBe(1)
+    expect(s.countOf('codex')).toBe(1)
   })
 })

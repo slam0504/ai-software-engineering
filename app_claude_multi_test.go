@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
-	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // ---- M3b Task 8：Claude 遷入 sessionHost＋per-WSID socket／MCP ----
@@ -35,17 +35,17 @@ func mustCreate(t *testing.T, a *App, provider string) appcore.WSID {
 }
 
 // mustStartClaude：走 production 的 exported binding 啟動 claude，並確認 host
-// 掛在預期的 WSID 上（同時驗到 legacyWSIDFor 第 2 順位：最近一次 CreateSession）。
+// 掛在傳入的 WSID 上（Task 26 之後 binding 直接收 WSID，不再有解析層）。
 func mustStartClaude(t *testing.T, a *App, w appcore.WSID) {
 	t.Helper()
 	writeMultiTurnClaude(t, a)
-	if err := a.StartSession("claude", "hi", "", "", "task-"+string(w), ""); err != nil {
+	if err := a.StartSession(string(w), "hi", "", "", "task-"+string(w), ""); err != nil {
 		t.Fatalf("StartSession: %v", err)
 	}
 	if a.hostFor(w) == nil {
-		t.Fatalf("host 必須掛在 legacyWSIDFor 解析出的 WSID %s 上", w)
+		t.Fatalf("host 必須掛在 StartSession 帶入的 WSID %s 上", w)
 	}
-	t.Cleanup(func() { _ = a.EndSession("claude") })
+	t.Cleanup(func() { _ = a.EndSession(string(w)) })
 }
 
 // seedApprovalSeq：seedApproval 的 id 去重計數器——同一個 WSID 在單一測試內可能
@@ -182,7 +182,7 @@ func TestClaudeApprovalSocketFitsInLongStateDir(t *testing.T) {
 // approval 必須帶提出請求的 WSID——多 session 之後 provider 不足以定位它該回哪個
 // slot（§3.3）。
 func TestClaudeApprovalCarriesWSID(t *testing.T) {
-	a, _ := newTestApp(t)
+	a, ui := newTestApp(t)
 	writeMultiTurnClaude(t, a)
 	w := mustCreate(t, a, "claude")
 	commit, err := a.startClaude(w, "p", "", "")
@@ -195,8 +195,46 @@ func TestClaudeApprovalCarriesWSID(t *testing.T) {
 	if pa := a.pendingByID(id); pa == nil || pa.wsid != w {
 		t.Fatalf("approval 必須帶 WSID：%+v", pa)
 	}
+	// Task 26：UI 事件本身也必須帶 wsid——前端依它做 pane 路由（§3.6.4），
+	// 只有 apprPending 帶著沒用，對話框看不到。
+	reqs := ui.find("approval:request")
+	if len(reqs) == 0 {
+		t.Fatal("必須發出 approval:request UI 事件")
+	}
+	d := reqs[len(reqs)-1].data.(map[string]any)
+	if d["wsid"] != string(w) {
+		t.Fatalf("approval:request 必須帶 wsid=%s：%+v", w, d)
+	}
 	if err := a.ResolveApproval(id, false, "test"); err != nil {
 		t.Fatalf("resolve: %v", err)
+	}
+	// dismiss 同樣帶 wsid ＋ reason（remove／shutdown 兩種恢復觸發只有 reason 分得出來）
+	dis := ui.find("approval:dismiss")
+	if len(dis) == 0 {
+		t.Fatal("resolve 後必須發出 approval:dismiss")
+	}
+	dd := dis[len(dis)-1].data.(map[string]any)
+	if dd["wsid"] != string(w) || dd["reason"] != "test" {
+		t.Fatalf("approval:dismiss 必須帶 wsid 與 reason：%+v", dd)
+	}
+}
+
+// session:done 必須帶 wsid——多 session 之後 provider 不足以決定該收哪個 pane
+// 的 busy 狀態（前端 applyDone 依它路由）。
+func TestSessionDoneCarriesWSID(t *testing.T) {
+	a, ui := newTestApp(t)
+	writeMultiTurnClaude(t, a)
+	w := mustCreate(t, a, "claude")
+	mustStartClaude(t, a, w)
+	if err := a.EndSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "session:done", func() bool { return len(ui.find("session:done")) > 0 })
+	for _, e := range ui.find("session:done") {
+		d := e.data.(map[string]any)
+		if d["wsid"] != string(w) {
+			t.Fatalf("session:done 必須帶 wsid=%s：%+v", w, d)
+		}
 	}
 }
 
@@ -211,109 +249,61 @@ func TestNoClaudeSingletonFieldsRemain(t *testing.T) {
 	}
 }
 
-// exported binding 在 Task 26 的原子切換之前不得改簽名，否則前端會中途壞掉。
-func TestExportedBindingSignatureUnchanged(t *testing.T) {
+// Task 26 原子切換的 Go 端守門：exported binding 的第一參數改為 WSID。
+//
+// 反射只看得到 string（provider 與 WSID 同型別），因此這裡守的是**可觀察行為**：
+// 傳 provider 名稱必須失敗、傳真正的 WSID 必須成功。舊的
+// TestExportedBindingSignatureUnchanged（Task 8 遷移窗口的守門「簽名不得改」）
+// 由本測試取代——切換後留著必然自相矛盾。
+func TestExportedBindingsAddressByWSID(t *testing.T) {
 	a, _ := newTestApp(t)
 	w := mustCreate(t, a, "claude")
 	mustStartClaude(t, a, w)
-	m, ok := reflect.TypeOf(&App{}).MethodByName("SendMessage")
-	if !ok {
-		t.Fatal("SendMessage 必須仍是 exported binding")
+
+	// provider 名稱不再是合法位址（此前 legacyWSIDFor 會把它解析成某個 slot）
+	for _, name := range []string{"claude", "codex"} {
+		if err := a.SendMessage(name, "hi"); !errors.Is(err, appcore.ErrSessionNotFound) {
+			t.Fatalf("SendMessage(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
+		}
+		if err := a.EndSession(name); !errors.Is(err, appcore.ErrSessionNotFound) {
+			t.Fatalf("EndSession(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
+		}
+		if err := a.NewSession(name); !errors.Is(err, appcore.ErrSessionNotFound) {
+			t.Fatalf("NewSession(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
+		}
+		if err := a.TerminateSession(name); !errors.Is(err, appcore.ErrSessionNotFound) {
+			t.Fatalf("TerminateSession(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
+		}
+		if err := a.StartSession(name, "hi", "", "", "t", ""); !errors.Is(err, appcore.ErrSessionNotFound) {
+			t.Fatalf("StartSession(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
+		}
 	}
-	// 比 reflect.Type 本身而非 Kind()：named string type（如 appcore.WSID）的
-	// Kind() 同樣是 reflect.String，用 Kind 守門擋不住 Task 26 最可能做的那個改動。
-	if got := m.Type.In(1); got != reflect.TypeOf("") {
-		t.Fatalf("SendMessage 第一參數型別不得改變：%v", got)
-	}
-	if err := a.SendMessage("claude", "hi"); err != nil {
-		t.Fatalf("provider-keyed exported binding 必須仍可用：%v", err)
+	// 真正的 WSID 仍可用（同一個 session）
+	if err := a.SendMessage(string(w), "hi"); err != nil {
+		t.Fatalf("WSID 定址的 SendMessage 必須成功：%v", err)
 	}
 }
 
-// legacyWSIDFor 的四段解析順序（coordinator 2026-08-15 凍結；第 3 順位由 Task 9 補入）。
-func TestLegacyWSIDForResolutionOrder(t *testing.T) {
+// resolveWSID：尚未 CommitCreate 的 reservation 不得被 exported binding 定址。
+//
+// SendMessage／EndSession／NewSession／StartSession 這幾條就算 resolveWSID 放行
+// 也會被 Manager 的 committedSlotLocked 兜底成同一個 error——**TerminateSession
+// 不會**：它只讀 hostFor(w)，reservation 沒有 host，回的是「no active claude
+// session」這種與「這個 WSID 不存在」語意不同的錯誤。因此把 TerminateSession
+// 一併納入斷言，這條測試才真的在守 resolveWSID 的驗證，而不是重複驗 Manager。
+func TestExportedBindingsRejectUncommittedReservation(t *testing.T) {
 	a, _ := newTestApp(t)
-	pv := contract.ProviderClaude
-
-	// 4) 無 host、無 CreateSession、registry 空 → legacy slot WSID（且可解析）
-	legacy := a.legacyWSIDFor(pv)
-	if legacy == "" {
-		t.Fatal("legacy slot WSID 不得為空")
-	}
-	if _, err := a.manager.BeginNewSessionSubmit(legacy, "task"); err != nil {
-		t.Fatalf("legacy WSID 必須對 WSID 入口可解析：%v", err)
-	}
-
-	// 2) 有 CreateSession 紀錄、尚無 host → 最近一次建立的 WSID
-	w := mustCreate(t, a, "claude")
-	if got := a.legacyWSIDFor(pv); got != w {
-		t.Fatalf("第 2 順位應回最近一次 CreateSession 的 WSID：want %s got %s", w, got)
-	}
-
-	// 1) 恰有一個 live host → 它的 WSID（優先於 CreateSession 紀錄）
-	other := mustCreate(t, a, "claude")
-	a.putHost(&sessionHost{wsid: w, provider: pv})
-	if got := a.legacyWSIDFor(pv); got != w {
-		t.Fatalf("第 1 順位應回唯一 live host 的 WSID：want %s got %s", w, got)
-	}
-	if other == w {
-		t.Fatal("CreateSession 必須產生相異 WSID")
-	}
-}
-
-// 第 3 順位（Task 9）：Task 5／6 把使用者既有的 session 遷進 registry 並還原成
-// dormant，但在這一層加入之前，使用者實際上仍工作在 legacy slot 上——那筆遷移
-// 出來的 entry 從此不反映現實。本測試守住「遷移真的生效」。
-func TestLegacyWSIDForPrefersSoleRestoredRegistryEntry(t *testing.T) {
-	a, _ := newTestApp(t)
-	pv := contract.ProviderCodex
-	reg := &stubRegistry{}
-	a.wsReg = reg
-
-	// registry 有一筆 live entry，且已被啟動修復序列還原成 committed slot
-	restored := appcore.WSID("01RESTOREDWSID000000000001")
-	if err := reg.Put(wsregistry.Entry{WSID: string(restored), Provider: "codex",
-		TaskLabel: "migrated", CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+	w, _, err := a.manager.ReserveSession(contract.ProviderClaude)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.manager.RestoreDormant(restored, pv); err != nil {
-		t.Fatal(err)
+	if _, ok := a.manager.ProviderOf(w); !ok {
+		t.Fatal("前提不成立：ProviderOf 應認得未 commit 的 reservation")
 	}
-	if got := a.legacyWSIDFor(pv); got != restored {
-		t.Fatalf("第 3 順位應回 registry 中唯一的 live entry：want %s got %s", restored, got)
+	if err := a.SendMessage(string(w), "hi"); !errors.Is(err, appcore.ErrSessionNotFound) {
+		t.Fatalf("未 commit 的 reservation 必須以 ErrSessionNotFound 拒絕，got %v", err)
 	}
-
-	// 未被還原成 committed slot 的 entry 不可回傳——否則之後每個 lifecycle 呼叫
-	// 都會拿到 ErrSessionNotFound，比落到 legacy slot 更糟。
-	a2, _ := newTestApp(t)
-	reg2 := &stubRegistry{}
-	a2.wsReg = reg2
-	if err := reg2.Put(wsregistry.Entry{WSID: "01NOTRESTORED0000000000001", Provider: "codex",
-		CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
-		t.Fatal(err)
-	}
-	got := a2.legacyWSIDFor(pv)
-	if got == "01NOTRESTORED0000000000001" {
-		t.Fatal("未還原成 committed slot 的 entry 不得被解析出來")
-	}
-	if _, err := a2.manager.BeginNewSessionSubmit(got, "t"); err != nil {
-		t.Fatalf("fallback 必須是可解析的 WSID：%v", err)
-	}
-
-	// 兩筆以上 live entry → 無從判斷，落到下一順位（legacy slot）
-	a3, _ := newTestApp(t)
-	reg3 := &stubRegistry{}
-	a3.wsReg = reg3
-	for _, id := range []string{"01TWOA0000000000000000001", "01TWOB0000000000000000001"} {
-		if err := reg3.Put(wsregistry.Entry{WSID: id, Provider: "codex",
-			CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
-			t.Fatal(err)
-		}
-		if err := a3.manager.RestoreDormant(appcore.WSID(id), pv); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := a3.legacyWSIDFor(pv); got != a3.manager.LegacyWSID(pv) {
-		t.Fatalf("多筆 live entry 時應落到 legacy slot，got %s", got)
+	if err := a.TerminateSession(string(w)); !errors.Is(err, appcore.ErrSessionNotFound) {
+		t.Fatalf("TerminateSession 必須先以 ErrSessionNotFound 拒絕（不得落到 host 查詢）：%v", err)
 	}
 }

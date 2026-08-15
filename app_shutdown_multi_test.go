@@ -80,9 +80,8 @@ func seedSessions(t *testing.T, nClaude, nCodex int) *shutdownFixture {
 
 // startClaudeOn／startCodexOn：以 production 的完整 start 交易
 // （BeginNewSessionSubmit → provider 啟動 → AcceptSubmit）在**指定 WSID** 上開一個
-// session。刻意不用 StartSession：它的 WSID 解析走 legacyWSIDFor（Task 26 前端改為
-// 直接帶 WSID 之前的相容層），同一 provider 已有一個 host 時會解析回那個 host，
-// 第二個 session 起就會拿到 ErrSessionActive。
+// session。Task 26 之後 StartSession 本身就收 WSID，這兩個 helper 保留的理由改為
+// 「不啟動真正的 provider 子行程」——它們直接組裝 start 交易與假 host。
 func startClaudeOn(t *testing.T, a *App, w appcore.WSID) {
 	t.Helper()
 	id, err := a.manager.BeginNewSessionSubmit(w, "task-c")

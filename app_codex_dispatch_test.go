@@ -243,11 +243,9 @@ func TestCodexCompletedBeforeResponseOnProductionPath(t *testing.T) {
 	a.wireCodexConn(conn)
 
 	// 另一個 committed 但沒有 host 的 codex WSID：pending start 期間的事件若歸屬
-	// 錯誤，最可能落到的就是這種「已存在的別的 slot」。刻意不讓它有 live host
-	// ——legacyWSIDFor 第 1 順位會優先回唯一的 live host，那樣 StartSession 就會
-	// 開在 wOther 上，測不到本測試要驗的東西。
+	// 錯誤，最可能落到的就是這種「已存在的別的 slot」。
 	wOther := mustCreate(t, a, "codex")
-	w := mustCreate(t, a, "codex") // 第 2 順位：最近一次 CreateSession
+	w := mustCreate(t, a, "codex") // StartSession 明確開在這一個上
 	script := newCodexScript(t, wire, "th-late")
 	script.beforeStartResponse = func(threadID string) { // pending start 窗口
 		script.notify(codex.MethodThreadStarted, map[string]any{"threadId": threadID})
@@ -257,7 +255,7 @@ func TestCodexCompletedBeforeResponseOnProductionPath(t *testing.T) {
 	}
 	handshakeFake(t, conn) // 握手必須在 script 安裝 onReq 之後（否則 initialize 無人回應）
 	a.codexHostOverride = fakeCodexHost{conn}
-	if err := a.StartSession("codex", "hi", "", "", "task-late", "untrusted"); err != nil {
+	if err := a.StartSession(string(w), "hi", "", "", "task-late", "untrusted"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -280,7 +278,7 @@ func TestCodexCompletedBeforeResponseOnProductionPath(t *testing.T) {
 	if errs := dispatchErrors(ui); len(errs) != 0 {
 		t.Fatalf("pending start 窗口內的通知必須歸屬得到，不得 fail loud：%+v", errs)
 	}
-	if err := a.EndSession("codex"); err != nil {
+	if err := a.EndSession(string(w)); err != nil {
 		t.Fatalf("end: %v", err)
 	}
 }
@@ -512,10 +510,10 @@ func (p *pendingWindowProbe) noteWindowOpen(threadID string) {
 func (p *pendingWindowProbe) start(t *testing.T) {
 	t.Helper()
 	a := p.app
-	if err := a.StartSession("codex", "hi", "", "", "task-pending", "untrusted"); err != nil {
+	if err := a.StartSession(string(p.wsid), "hi", "", "", "task-pending", "untrusted"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = a.EndSession("codex") })
+	t.Cleanup(func() { _ = a.EndSession(string(p.wsid)) })
 }
 
 func (p *pendingWindowProbe) assertWindowWasOpen(t *testing.T, windowOpenErr error) {

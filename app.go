@@ -264,11 +264,6 @@ type App struct {
 	// sessionHosts 無法讓併發的 startClaude 原子地佔住槽位。
 	sockIndexOwner map[int]*sessionHost
 
-	// lastCreatedWSID：每個 provider 最近一次 CreateSession 成功的 WSID，供
-	// legacyWSIDFor 的第 2 順位使用（見其 doc）。在 a.mu 下讀寫；Task 26 前端
-	// 改為直接帶 WSID 之後連同 legacyWSIDFor 一併刪除。
-	lastCreatedWSID map[contract.Provider]appcore.WSID
-
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
 	// apprOrder：apprPending 的登記順序（§3.6.4：多筆待核可 FIFO promotion）——
@@ -607,83 +602,82 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 		}
 		return "", errors.Join(cerr, a.manager.AbortCreate(tok))
 	}
-	a.mu.Lock()
-	if a.lastCreatedWSID == nil {
-		a.lastCreatedWSID = map[contract.Provider]appcore.WSID{}
-	}
-	a.lastCreatedWSID[p] = w // legacyWSIDFor 第 2 順位（見其 doc）
-	a.mu.Unlock()
 	return string(w), nil
 }
 
-// legacyWSIDFor：exported provider-keyed binding（StartSession／SendMessage／
-// EndSession／NewSession／TerminateSession）在遷移窗口內的 provider → WSID 解析
-// 器。這些 binding 的簽名要維持到 Task 26 才與前端原子切換，但內部的 Claude
-// ownership 與 lifecycle 已全面 WSID 定址，中間需要這一層。
+// SessionInfo：ListSessions 回傳的單筆 session 描述（前端 session 清單的唯一
+// 資料來源）。
 //
-// 解析順序凍結（coordinator 2026-08-15，Task 9 補入第 3 順位）：
-//  1. 該 provider 恰有一個 live sessionHost → 回它的 WSID；
-//  2. 否則 → 回該 provider 最近一次 CreateSession 的 WSID；
-//  3. 否則 → registry 中該 provider 恰有一個 live（非 tombstone）entry，且它已被
-//     還原成 Manager 的 committed slot → 回它的 WSID；
-//  4. 都沒有 → 回 Manager 的 legacy slot WSID（讀取時隱式建立，其 slot.wsid
-//     留空，envelope 輸出與 M3a 完全一致）。
+// **registry 與 working slot 的權責分工（Task 26 裁決）**：
+//   - registry（workspace-sessions.json）是「這個 workspace 有哪些 session」的
+//     durable 權威——清單一律以它為準逐筆列出（tombstone 不列）。
+//   - Manager slot 是 lifecycle 入口能解析的對象；WSID 能不能被 StartSession／
+//     SendMessage／EndSession 定址，只有它說了算。
 //
-// 理由：exported binding 在遷移窗口（Task 8-25）內必須維持「操作使用者當前那個
-// session」的既有可觀察行為。窗口內前端仍是單 session／provider，第 1 條恆成立。
-// 同一個 session 的整段生命週期必須解析到同一個 WSID，否則 start 交易與收尾會
-// 落在不同 slot——這也是所有 exported binding 一律經本函式（而非各自猜）的原因。
+// 兩邊本來就可能不一致（例：tombstone 已落盤但 RemoveSession 遞減名額失敗、或
+// registry 有 entry 但 RestoreDormant 沒把它掛回去）。**不隱藏、不猜**：以
+// Available=false ＋空 State 據實呈現一筆「有紀錄但目前不可操作」的 session，
+// 讓使用者看得到並可重試移除；反過來把它從清單濾掉，會讓稽核裡有事件、UI 卻
+// 沒有這個 session，等於把不一致藏起來。
 //
-// 第 3 順位（registry tier）的必要性：Task 5／6 把使用者既有的 session 遷進
-// registry 並在啟動時還原成 dormant slot，但使用者實際上仍工作在第 4 順位的
-// legacy slot 上——那筆遷移出來的 entry 從此不反映現實，到 Task 26 前端 WSID 化
-// 時會多出一筆過時的 session。加這一層，遷移出來的 entry 才真的被接手。
-// 「恰一個」是刻意的：多筆時無從判斷使用者指的是哪個，落到第 4 順位反而是安全的
-// 已知行為（多 session 本來就要等 Task 26 前端帶 WSID 才有意義）。
-//
-// 「已被還原成 committed slot」的檢查不可省：registry 是磁碟權威，Manager 才是
-// lifecycle 入口能解析的對象。若回一個沒被 RestoreDormant 掛回去的 WSID，之後每個
-// 呼叫都會拿到 ErrSessionNotFound——比落到第 4 順位糟。
-// Task 26 前端切換後整層刪除。
-func (a *App) legacyWSIDFor(p contract.Provider) appcore.WSID {
-	if hs := a.hostsOf(p); len(hs) == 1 {
-		return hs[0].wsid
-	}
-	a.mu.Lock()
-	w, ok := a.lastCreatedWSID[p]
-	a.mu.Unlock()
-	if ok {
-		return w
-	}
-	if rw, ok := a.soleRegistryWSID(p); ok {
-		return rw
-	}
-	return a.manager.LegacyWSID(p)
+// 只帶 durable metadata ＋ slot 可解析性：busy／待核可／unread 是 §3.2.1 明列
+// 的 in-memory 推導值，由前端 store 從 runtime envelope 推導，不從這裡回傳。
+type SessionInfo struct {
+	WSID            string `json:"wsid"`
+	Provider        string `json:"provider"`
+	TaskLabel       string `json:"task_label"`
+	ResumeSessionID string `json:"resume_session_id"`
+	CreatedAt       string `json:"created_at"`
+	Available       bool   `json:"available"` // Manager 有對應的 committed slot
+	State           string `json:"state"`     // slot phase（Available=false 時為空）
 }
 
-// soleRegistryWSID：registry 中該 provider 唯一的 live entry（見 legacyWSIDFor
-// 第 3 順位）。唯讀——不建立 slot、不寫 registry。
-func (a *App) soleRegistryWSID(p contract.Provider) (appcore.WSID, bool) {
+// ListSessions：前端 session 清單的來源（唯讀——不建立 slot、不寫 registry）。
+// 排序以 WSID（ULID，建立時間單調）遞增，清單順序因此穩定、不隨 map 迭代漂移。
+//
+// registry 尚未接線（malformed／載入失敗，見 loadSessionRegistry 的 fail loud）
+// 時回 errNoSessionRegistry：此時 CreateSession 也是同一個錯誤，UI 顯示的是
+// 「registry 不可用」而不是「沒有 session」——後者會讓使用者以為 session 沒了。
+func (a *App) ListSessions() ([]SessionInfo, error) {
 	if a.wsReg == nil {
-		return "", false
+		return nil, errNoSessionRegistry
 	}
-	var found appcore.WSID
-	for _, e := range a.wsReg.Live() {
-		if contract.Provider(e.Provider) != p {
-			continue
+	entries := a.wsReg.Live()
+	out := make([]SessionInfo, 0, len(entries))
+	for _, e := range entries {
+		info := SessionInfo{
+			WSID: e.WSID, Provider: e.Provider, TaskLabel: e.TaskLabel,
+			ResumeSessionID: e.ResumeSessionID, CreatedAt: e.CreatedAt,
 		}
-		if found != "" { // 兩筆以上：無從判斷，交給下一順位
-			return "", false
+		if st, err := a.manager.State(appcore.WSID(e.WSID)); err == nil {
+			info.Available, info.State = true, string(st)
 		}
-		found = appcore.WSID(e.WSID)
+		out = append(out, info)
 	}
-	if found == "" {
-		return "", false
+	slices.SortFunc(out, func(x, y SessionInfo) int { return strings.Compare(x.WSID, y.WSID) })
+	return out, nil
+}
+
+// resolveWSID：exported WSID binding 共用的解析入口——WSID → provider，且保證
+// 該 WSID 對應一個 Manager 能定址的 committed slot。Task 26 的原子切換之後，
+// 前端一律直接帶 WSID（不再有 provider → WSID 的猜測層），這裡只做驗證。
+//
+// 解析不到一律 ErrSessionNotFound 包上呼叫端的操作名：使用者可能拿著一個已被
+// 移除／尚未還原的 WSID（例如另一個視窗剛移除它），必須是明確錯誤而不是靜默
+// 落到某個別的 session 上。
+// 用 State 而非只用 ProviderOf 做存在性檢查：ProviderOf 連「尚未 CommitCreate
+// 的 reservation」都認得，而那種 slot 對所有 lifecycle 入口都是
+// ErrSessionNotFound——放行只會把錯誤延後到下一行才炸。
+func (a *App) resolveWSID(op, wsid string) (appcore.WSID, contract.Provider, error) {
+	w := appcore.WSID(wsid)
+	if _, err := a.manager.State(w); err != nil {
+		return "", "", fmt.Errorf("app: %s %s: %w", op, wsid, err)
 	}
-	if _, err := a.manager.State(found); err != nil { // 未還原成 committed slot
-		return "", false
+	p, ok := a.manager.ProviderOf(w)
+	if !ok { // State 已成立卻查不到 provider＝slot registry 自相矛盾，fail loud
+		return "", "", fmt.Errorf("app: %s %s: %w", op, wsid, appcore.ErrSessionNotFound)
 	}
-	return found, true
+	return w, p, nil
 }
 
 // noteWSEmitError：...WS 出口的錯誤處置（Emit／approval 共用）。舊的 provider-keyed
@@ -1742,9 +1736,9 @@ func (a *App) forcedShutdown(hosts []*sessionHost) error {
 			defer a.teardownHook(a.hookTeardownDone, ch.wsid)
 			a.teardownHook(a.hookTeardownEntered, ch.wsid)
 			if err := appcore.EndSessionFlow(a.manager, ch.wsid, nil, func() error {
-				return a.codexTeardown(ch)
+				return a.codexTeardown(ch.wsid, ch)
 			}); err != nil {
-				terr := a.codexTeardown(ch) // lifecycle 擋住：直接收（lease.Finalize 冪等）
+				terr := a.codexTeardown(ch.wsid, ch) // lifecycle 擋住：直接收（lease.Finalize 冪等）
 				errs[len(claudeHosts)+i] = errors.Join(err, terr)
 			}
 		}()
@@ -4793,7 +4787,10 @@ func (a *App) ResolveApproval(id string, allow bool, reason string) error {
 	err := p.resolve(allow, reason)
 	// 廣播 dismiss：dev 模式（原生視窗＋browser devserver）或多視窗下，
 	// 未按下按鈕的前端也要收掉彈窗
-	a.emit("approval:dismiss", map[string]any{"id": id, "cause": "resolved"})
+	// reason 一併帶出：§3.6.4 凍結的六種「恢復原釘選」觸發裡，remove 與 shutdown
+	// 都是經 denyApprovals → 這條 resolved 路徑出去的，只看 cause 分不出來。
+	a.emit("approval:dismiss", map[string]any{
+		"id": id, "wsid": string(p.wsid), "cause": "resolved", "reason": reason})
 	return err
 }
 
@@ -4821,8 +4818,10 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 		})
 		a.noteWSEmitError("approval_request", w,
 			a.manager.EmitApprovalRequest(w, id, sessionID(), req.ToolName, req.Input))
+		// wsid：前端依它把對話框路由到來源 session 的 pane（§3.6.4；未釘選時
+		// transient secondary presentation）。provider 保留供顯示用。
 		a.emit("approval:request", map[string]any{
-			"id": id, "provider": string(provider), "toolName": req.ToolName,
+			"id": id, "wsid": string(w), "provider": string(provider), "toolName": req.ToolName,
 			"inputJson": string(req.Input),
 		})
 	}
@@ -4832,21 +4831,25 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 
 // StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
 // process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
-func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
-	if !knownProvider(provider) {
-		return fmt.Errorf("unknown provider %q", provider)
-	}
-	prov := contract.Provider(provider)
-	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
-		resume = a.restore.Get(provider).ResumeSessionID
-	}
+func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
 	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 Start
 		return err
 	}
 	defer a.endAppTxn()
-	// 兩個 provider 都已遷入 sessionHost（§3.3）：整段 start 交易一律 WSID 定址，
-	// WSID 由 legacyWSIDFor 解析（Task 26 前端改為直接帶 WSID 後刪除該層）。
-	w := a.legacyWSIDFor(prov)
+	// Task 26 原子切換：WSID 直接來自前端（session 由 CreateSession 建立、
+	// ListSessions 列出），不再有 provider → WSID 的解析層。
+	w, prov, err := a.resolveWSID("start session", wsid)
+	if err != nil {
+		return err
+	}
+	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
+		// resume 權威仍是 provider-keyed 的 restore.json：registry 的
+		// ResumeSessionID 只在 CreateSession／Migrate 當下寫入，之後每一輪的
+		// session id 沒有任何寫入端（見 CreateSession 的 wsReg.Put 是唯一入口），
+		// 現在改讀它等於靜默失去續聊能力。權威轉移要連同 registry 的 resume
+		// writer 一起做，不在本 task 範圍（見 task-26 報告）。
+		resume = a.restore.Get(string(prov)).ResumeSessionID
+	}
 	id, err := a.manager.BeginNewSessionSubmit(w, taskLabel)
 	if err != nil {
 		return err // ErrSessionActive／ErrSubmitActive 原樣回 UI
@@ -4890,7 +4893,7 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 			// 第三輪 P1-5：host（runner／lease／路由）已發布——Accept 失敗必須
 			// 回收，否則 shutdown snapshot 之後才發布的資源會漏收（破壞
 			// 「全部 finalize 後才 Manager.Close」保證）
-			terr := a.codexTeardown(a.hostFor(w)) // 冪等：撤路由＋finalize＋session:done
+			terr := a.codexTeardown(w, a.hostFor(w)) // 冪等：撤路由＋finalize＋session:done
 			return errors.Join(err, terr)
 		}
 		if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil { // Accept 成功才 commit
@@ -4901,14 +4904,13 @@ func (a *App) StartSession(provider, prompt, resume, recordCase, taskLabel, appr
 	}
 }
 
-// SendMessage：指定 provider 既有 session 的後續輪（僅該 slot phaseActive 允許；
-// 錯誤原樣回 UI）。雙 session 並存：一個 provider busy 不影響另一個。
-func (a *App) SendMessage(provider, prompt string) error {
-	if !knownProvider(provider) {
-		return fmt.Errorf("unknown provider %q", provider)
+// SendMessage：指定 WSID 既有 session 的後續輪（僅該 slot phaseActive 允許；
+// 錯誤原樣回 UI）。多 session 並存：一個 session busy 不影響另一個。
+func (a *App) SendMessage(wsid, prompt string) error {
+	w, pv, err := a.resolveWSID("send message", wsid)
+	if err != nil {
+		return err
 	}
-	pv := contract.Provider(provider)
-	w := a.legacyWSIDFor(pv) // 兩個 provider 都已遷入 sessionHost（§3.3）：WSID 定址
 	h := a.hostFor(w)
 	if pv == contract.ProviderClaude {
 		id, err := a.manager.BeginSubmit(w)
@@ -4968,28 +4970,27 @@ func (a *App) SendMessage(provider, prompt string) error {
 // 是否共用都不會有第二次真正執行——與自然收尾 reaper 競速（跟 shutdown 無關
 // 的既有情境，見 fix/shutdown-end-in-progress report concern 3）因此維持原行為
 // 未變動，殘留面已知、非本輪修復範圍。
-func (a *App) EndSession(provider string) error {
-	if !knownProvider(provider) {
-		return fmt.Errorf("unknown provider %q", provider)
-	}
+func (a *App) EndSession(wsid string) error {
 	if err := a.beginAppTxn(); err != nil { // shutdown gate：見上方 doc
 		return err
 	}
 	defer a.endAppTxn()
-	w := a.legacyWSIDFor(contract.Provider(provider)) // 兩個 provider 都 WSID 定址（§3.3）
-	return a.endSessionFlowForWSID(w, contract.Provider(provider))
+	w, p, err := a.resolveWSID("end session", wsid)
+	if err != nil {
+		return err
+	}
+	return a.endSessionFlowForWSID(w, p)
 }
 
 // endSessionFlowForWSID：provider-dispatch 的收尾編排本體，原內聯於 EndSession
-// ——RemoveSession（Task 22）需要對「任意 WSID」（而不是 legacyWSIDFor 解析出的
-// 那一個）跑同一段收尾，抽出以供兩者共用，行為與抽出前逐字一致。
+// ——RemoveSession（Task 22）需要對任意 WSID 跑同一段收尾，抽出以供兩者共用。
 func (a *App) endSessionFlowForWSID(w appcore.WSID, p contract.Provider) error {
 	h := a.hostFor(w)
 	if p == contract.ProviderClaude {
 		return appcore.EndSessionFlow(a.manager, w, nil, a.claudeTeardown(h))
 	}
 	busy := func() bool { return h != nil && h.runner != nil && h.runner.ActiveTurnID() != "" }
-	return appcore.EndSessionFlow(a.manager, w, busy, func() error { return a.codexTeardown(h) })
+	return appcore.EndSessionFlow(a.manager, w, busy, func() error { return a.codexTeardown(w, h) })
 }
 
 // removeStep：§3.6.2 凍結順序的探針（同 startupStep／hookWireStep 慣例——步驟名
@@ -5140,24 +5141,16 @@ func (a *App) RemoveSession(wsid string) error {
 		return fmt.Errorf("app: remove session %s: 已 tombstone 但釋放名額失敗：%w", wsid, err)
 	}
 
-	// legacyWSIDFor 第 2 順位的快取失效（review round-2 裁決）：不清除的話，
-	// 移除掉最近一次 CreateSession 的 WSID 之後，provider-keyed 舊 binding
-	// （StartSession 等）仍可能經 legacyWSIDFor 解析到這個已消失的 WSID，得到
-	// ErrSessionNotFound，即使另一個較早建立的 dormant session 明明還在。
-	a.mu.Lock()
-	if a.lastCreatedWSID[p] == w {
-		delete(a.lastCreatedWSID, p)
-	}
-	a.mu.Unlock()
 	return nil
 }
 
-func (a *App) TerminateSession(provider string) error {
-	if !knownProvider(provider) {
-		return fmt.Errorf("unknown provider %q", provider)
+func (a *App) TerminateSession(wsid string) error {
+	w, p, err := a.resolveWSID("terminate session", wsid)
+	if err != nil {
+		return err
 	}
-	h := a.hostFor(a.legacyWSIDFor(contract.Provider(provider)))
-	if provider == "claude" {
+	h := a.hostFor(w)
+	if p == contract.ProviderClaude {
 		if h == nil || h.sess == nil {
 			return errors.New("no active claude session")
 		}
@@ -5258,7 +5251,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		a.apprMu.Unlock()
 		a.noteWSEmitError("approval_decision", w,
 			a.manager.EmitApprovalDecision(w, id, sessionID(), "timeout", ""))
-		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
+		a.emit("approval:dismiss", map[string]any{"id": id, "wsid": string(w), "cause": "timeout"})
 	})
 	go a.pumpApprovals(w, contract.ProviderClaude, br, sessionID)
 
@@ -5401,8 +5394,8 @@ func (a *App) claudeTeardown(host *sessionHost) func() error {
 		if err != nil {
 			recErrText = err.Error()
 		}
-		payload := map[string]any{"provider": "claude", "stderrTail": ex.StderrTail,
-			"recorderError": recErrText}
+		payload := map[string]any{"provider": "claude", "wsid": string(host.wsid),
+			"stderrTail": ex.StderrTail, "recorderError": recErrText}
 		if ex.Exited {
 			payload["exitCode"] = ex.Code
 		}
@@ -6059,7 +6052,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	a.noteWSEmitError("approval_request", w,
 		a.manager.EmitApprovalRequest(w, id, threadID, method, params))
 	a.emit("approval:request", map[string]any{
-		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
+		"id": id, "wsid": string(w), "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
 	uiDecision := "deny"
 	reason := ""
@@ -6076,7 +6069,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 		a.apprMu.Unlock()
 		uiDecision = "timeout"
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
-		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
+		a.emit("approval:dismiss", map[string]any{"id": id, "wsid": string(w), "cause": "timeout"})
 	}
 	a.noteWSEmitError("approval_decision", w,
 		a.manager.EmitApprovalDecision(w, id, threadID, uiDecision, reason))
@@ -6215,9 +6208,9 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 // 那正是 UI 最需要 session:done 的時刻：不發的話，收尾流程會把 slot 收回 idle，
 // 而前端那個 session 永遠停在「執行中」。沒有 host 就沒有 lease／track 可收，
 // 因此只發事件、回 nil。
-func (a *App) codexTeardown(h *sessionHost) error {
+func (a *App) codexTeardown(w appcore.WSID, h *sessionHost) error {
 	if h == nil {
-		a.emitCodexSessionDone("")
+		a.emitCodexSessionDone(w, "")
 		return nil
 	}
 	a.takeHost(h)
@@ -6226,18 +6219,18 @@ func (a *App) codexTeardown(h *sessionHost) error {
 	// §3.4.4 之後 codex 已無 session-scoped 錄流可 finalize（lease 只由
 	// startClaude 寫入），這裡因此沒有 recorder 錯誤可回報。簽名保留 error 是
 	// EndSessionFlow 的 teardown 契約要求。
-	a.emitCodexSessionDone("")
+	a.emitCodexSessionDone(h.wsid, "")
 	return nil
 }
 
 // emitCodexSessionDone：codex 收尾的 UI 事件（長駐 server 不隨 session 退出，
 // 因此 processStillRunning 恆為 true、stderr 取 live snapshot）。
-func (a *App) emitCodexSessionDone(recorderErr string) {
+func (a *App) emitCodexSessionDone(w appcore.WSID, recorderErr string) {
 	stderr := ""
 	if srv, serr := a.currentAppServer(); serr == nil {
 		stderr = srv.StderrSnapshot()
 	}
-	a.emit("session:done", map[string]any{"provider": "codex",
+	a.emit("session:done", map[string]any{"provider": "codex", "wsid": string(w),
 		"processStillRunning": true, "stderrTail": stderr, "recorderError": recorderErr})
 }
 
@@ -6432,7 +6425,15 @@ func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 	}
 }
 
-// RestoreViews：啟動時的 view 重放來源（唯讀——不 spawn provider、不回寫 audit）。
+// RestoreViews：provider-keyed 的 view 重放來源（唯讀——不 spawn provider、
+// 不回寫 audit）。
+//
+// **Task 26 之後前端不再呼叫它**：session 清單改由 ListSessions（registry 權威）
+// 提供，transcript 改由 §3.8 的 LoadTurnsBefore 以 WSID 視窗化載入。這裡刻意
+// 保留而非刪除——restore.json 仍是 resume 的權威（registry 的 ResumeSessionID
+// 只有 CreateSession／Migrate 兩個寫入點，沒有「每輪更新」的 writer），本方法
+// 是那份 store ＋ replayViewWindow 的既有唯讀出口，M1.5 的恢復語意測試整組掛在
+// 它上面。權威轉移要連同 registry 的 resume writer 一起做，不在本 task 範圍。
 func (a *App) RestoreViews() map[string]RestoredView {
 	out := map[string]RestoredView{}
 	for _, p := range []string{"claude", "codex"} {
@@ -6454,20 +6455,16 @@ func (a *App) RestoreViews() map[string]RestoredView {
 // endAppTxn）——理由與 EndSession 上方 doc 完全相同（同一類 shutdown race，
 // NewSession 也是「BeginEndSession 成功才會呼叫 teardown、失敗就直接回錯」，
 // 沒有 fallback 兜底重跑，故同樣不需要共用 host.teardownFn）。
-func (a *App) NewSession(provider string) error {
-	if !knownProvider(provider) {
-		return fmt.Errorf("unknown provider %q", provider)
-	}
+func (a *App) NewSession(wsid string) error {
 	if err := a.beginAppTxn(); err != nil { // shutdown gate：見 EndSession doc
 		return err
 	}
 	defer a.endAppTxn()
-	pv := contract.Provider(provider)
-
-	// 兩個 provider 都已遷入 sessionHost（§3.3）：整段 lifecycle 走同一個 WSID 的
-	// 入口。同一個 session 的 start／teardown 必須落在同一個 slot，StartSession
-	// 既然由 legacyWSIDFor 解析，這裡也必須用同一個解析結果。
-	w := a.legacyWSIDFor(pv)
+	w, pv, err := a.resolveWSID("new session", wsid)
+	if err != nil {
+		return err
+	}
+	provider := string(pv)
 	host := a.hostFor(w)
 
 	var rtok appcore.ResetToken
@@ -6483,7 +6480,7 @@ func (a *App) NewSession(provider string) error {
 		if pv == contract.ProviderClaude {
 			tearErr = a.claudeTeardown(host)()
 		} else {
-			tearErr = a.codexTeardown(host)
+			tearErr = a.codexTeardown(w, host)
 		}
 		if tearErr != nil { // 第三輪 P1-2：收尾失敗立即返回——lifecycle 以
 			// FinishEndSession 收束回 idle、restore entry 保留、UI 不重設

@@ -41,10 +41,8 @@ func TestApprovalCarriesWSIDAndFIFOPromotion(t *testing.T) {
 	writeMultiTurnClaude(t, a)
 	w1, w2 := mustCreate(t, a, "claude"), mustCreate(t, a, "claude")
 	// 兩個 concurrent claude session：走 a.startClaude 直接建（同
-	// TestTwoClaudeSessionsDoNotShareSocketOrMCP 的作法）——mustStartClaude 底層的
-	// StartSession 靠 legacyWSIDFor 猜 WSID，「唯一一個 host 就用它」這條第一
-	// 順位在第二個 session 啟動時會誤解回第一個，不適合用來建兩個並存的 claude
-	// session。
+	// TestTwoClaudeSessionsDoNotShareSocketOrMCP 的作法）——只需要 host ＋ broker，
+	// 不需要整段 StartSession 交易。
 	commit1, err := a.startClaude(w1, "p1", "", "")
 	if err != nil {
 		t.Fatalf("startClaude(w1): %v", err)

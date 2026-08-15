@@ -1,11 +1,12 @@
 import {
-  StartSession, SendMessage, CreateSession, RemoveSession, RecoverCodexRecording, LoadTurnsBefore,
+  StartSession, SendMessage, EndSession, NewSession, TerminateSession,
+  CreateSession, RemoveSession, ListSessions, RecoverCodexRecording, LoadTurnsBefore,
   RegisterMutation, RunEvidence, EvidenceGet, SubmitTestContract, ValidateTestCommit, EvidenceCommitCandidates,
   EscalationList, EscalationCreate, EscalationAck, EscalationResolve,
 } from '../../wailsjs/go/main/App'
 import type {
-  Bindings, WorkspaceSessionBindings, CodexRecordingBindings, TurnWindowBindings,
-  EvidenceBindings, EscalationBindings,
+  Bindings, SessionLifecycleBindings, WorkspaceSessionBindings, CodexRecordingBindings,
+  TurnWindowBindings, EvidenceBindings, EscalationBindings,
 } from '../types'
 
 // production bindings adapter（M1.5 第三輪 review P1-1：SendMessage 必須
@@ -16,16 +17,24 @@ import type {
 // 加入 RemoveSession（純新增，單參數）；
 // Task 13 加入無參數的 RecoverCodexRecording（§3.4.6 錄流 latch 的復原入口）；
 // Task 20 加入 LoadTurnsBefore（§3.8 視窗化載入／向上分頁，三個參數）。
+// **Task 26 原子切換**：StartSession／SendMessage／EndSession／NewSession／
+// TerminateSession 的第一參數由 provider 改為 WSID，並加入 ListSessions
+// （session 清單來源）。轉發順序與「第一參數不得是 provider 名」由
+// bindings.test.ts 鎖住。
 // 回傳型別交集 Bindings & WorkspaceSessionBindings & EvidenceBindings &
 // EscalationBindings：session store 只取用 Bindings 那兩個欄位，App.vue 把其餘
 // 綁定個別當 prop 傳給 TcaWorkspace／EscalationInbox 等元件。
-export function makeBindings(): Bindings & WorkspaceSessionBindings & CodexRecordingBindings
-  & TurnWindowBindings & EvidenceBindings & EscalationBindings {
+export function makeBindings(): Bindings & SessionLifecycleBindings & WorkspaceSessionBindings
+  & CodexRecordingBindings & TurnWindowBindings & EvidenceBindings & EscalationBindings {
   return {
-    StartSession: (p, prompt, resume, rc, task, policy) => StartSession(p, prompt, resume, rc, task, policy),
-    SendMessage: (p, t) => SendMessage(p, t),
+    StartSession: (wsid, prompt, resume, rc, task, policy) => StartSession(wsid, prompt, resume, rc, task, policy),
+    SendMessage: (wsid, text) => SendMessage(wsid, text),
+    EndSession: (wsid) => EndSession(wsid),
+    NewSession: (wsid) => NewSession(wsid),
+    TerminateSession: (wsid) => TerminateSession(wsid),
     CreateSession: (p, taskLabel) => CreateSession(p, taskLabel),
     RemoveSession: (wsid) => RemoveSession(wsid),
+    ListSessions: () => ListSessions(),
     RecoverCodexRecording: () => RecoverCodexRecording(),
     LoadTurnsBefore: (wsid, beforeEventID, n) => LoadTurnsBefore(wsid, beforeEventID, n),
     RegisterMutation: (taskRef, patch) => RegisterMutation(taskRef, patch),

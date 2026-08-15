@@ -38,6 +38,7 @@ export default {
     },
     operationAction: {
       new: '開新對話',
+      create: '建立 session',
       terminate: '強制終止',
       end: '結束對話',
       authStatus: '查詢登入狀態',
@@ -56,6 +57,7 @@ export default {
     },
     recordCase: {
       placeholder: '{provider}-case（錄流，可空）',
+      codexLabelOnly: 'codex 錄流已是 connection-wide（§3.4.4）：本欄僅作為稽核標籤，不控制錄製',
     },
     resumeId: {
       placeholder: 'resume id（可空）',
@@ -65,6 +67,9 @@ export default {
       untrusted: 'untrusted（每次核可）',
       onRequest: 'on-request',
       never: 'never（不核可，風險自負）',
+    },
+    createSession: {
+      tooltip: '建立新的 {provider} session 並釘到目前的 pane',
     },
     newSession: {
       tooltip: '結束目前 session，等待舊 provider 收尾後開新對話',
@@ -299,6 +304,8 @@ export default {
   },
   store: {
     bindingsNotReady: '綁定尚未就緒',
+    noFocusedSession: '焦點 pane 沒有釘選任何 session——請先建立或釘選一個',
+    sessionUnavailable: 'session {wsid} 有紀錄但目前無法操作（沒有對應的 working slot）；請重啟 app 或將它移除',
   },
   escalation: {
     section: {

@@ -266,7 +266,6 @@ func TestRecoveryRefusedWhileLiveHostOrInFlightTurn(t *testing.T) {
 			a, _, ctl := newTestAppWithFakeWire(t)
 			conn, wire := newFakeCodexConn(t)
 			a.wireCodexConn(conn)
-			mustCreate(t, a, "codex")
 			startCodexForTest(t, a, wire, conn, "", "task-x")
 			if c == "in_flight_turn" {
 				mustBeginCodexTurn(t, a, wire)
@@ -303,10 +302,10 @@ func mustBeginCodexTurn(t *testing.T, a *App, wire *fakeCodexWire) {
 				"turn": map[string]any{"id": "turn-busy", "status": "inProgress"}}})
 		}
 	})
-	if err := a.SendMessage("codex", "long task"); err != nil {
+	if err := a.SendMessage(wsidStr(t, a, "codex"), "long task"); err != nil {
 		t.Fatal(err)
 	}
-	h := a.hostFor(a.legacyWSIDFor(contract.ProviderCodex))
+	h := a.hostFor(wsidFor(t, a, contract.ProviderCodex))
 	if h == nil {
 		t.Fatal("precondition: codex host 必須已發布")
 	}
@@ -433,11 +432,11 @@ func TestLatchAllowsExistingSessionTeardown(t *testing.T) {
 	a, _, _ := newTestAppWithFakeWire(t)
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
-	w := mustCreate(t, a, "codex")
+	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
 	startCodexForTest(t, a, wire, conn, "", "task-x")
 	a.latchWireRecorder(errors.New("disk full"))
 
-	if err := a.EndSession("codex"); err != nil {
+	if err := a.EndSession(string(w)); err != nil {
 		t.Fatalf("latch 不得擋既有 session 的收尾：%v", err)
 	}
 	if a.hostFor(w) != nil {
@@ -451,7 +450,7 @@ func TestLatchBlocksProviderStart(t *testing.T) {
 	a, _, _ := newTestAppWithFakeWire(t)
 	conn, _ := newFakeCodexConn(t)
 	a.codexHostOverride = fakeCodexHost{conn}
-	w := mustCreate(t, a, "codex")
+	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
 	a.latchWireRecorder(errors.New("disk full"))
 	_, _, err := a.startCodex(w, "hi", "", "", "untrusted")
 	if !errors.Is(err, errWireLogDegraded) {
@@ -473,7 +472,7 @@ func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
 		t.Fatalf("precondition: connection-wide 錄流必須掛得上：%v", err)
 	}
 
-	w := mustCreate(t, a, "codex")
+	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
 	startCodexForTest(t, a, wire, conn, "codex-label", "task-x") // 帶 recordCase 仍須成功
 
 	if frames.Load() == 0 {
@@ -489,7 +488,7 @@ func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
 		t.Fatal("session 必須已發布")
 	}
 	// 收尾同樣不得摘掉 connection-wide sink（舊版 lease.Finalize 會 StopRecording）
-	if err := a.EndSession("codex"); err != nil {
+	if err := a.EndSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.BeginRecording(func([]byte) error { return nil }); err == nil {

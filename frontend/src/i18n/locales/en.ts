@@ -38,6 +38,7 @@ export default {
     },
     operationAction: {
       new: 'new session',
+      create: 'create session',
       terminate: 'terminate',
       end: 'end session',
       authStatus: 'auth status query',
@@ -56,6 +57,7 @@ export default {
     },
     recordCase: {
       placeholder: '{provider}-case (recording, optional)',
+      codexLabelOnly: 'codex recording is connection-wide (§3.4.4): this field is an audit label only',
     },
     resumeId: {
       placeholder: 'resume id (optional)',
@@ -65,6 +67,9 @@ export default {
       untrusted: 'untrusted (approve each)',
       onRequest: 'on-request',
       never: 'never (no approval, at your own risk)',
+    },
+    createSession: {
+      tooltip: 'create a new {provider} session and pin it to the focused pane',
     },
     newSession: {
       tooltip: 'End current session, wait for the old provider to wind down, then start a new chat',
@@ -299,6 +304,8 @@ export default {
   },
   store: {
     bindingsNotReady: 'bindings not ready',
+    noFocusedSession: 'no session is pinned to the focused pane — create or pin one first',
+    sessionUnavailable: 'session {wsid} is recorded but not addressable (no working slot); restart the app or remove it',
   },
   escalation: {
     section: {

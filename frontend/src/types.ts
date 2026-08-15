@@ -11,6 +11,9 @@ export interface Envelope {
   // M2 Stage A：scope/purpose 分流用（§3.4c）＋ gate/assist payload 欄位
   scope?: string; bindings?: ApprovalBinding[]; payload?: unknown
   correlation_id?: string; purpose?: string
+  // M3b §3.1.5：conversation lane 的 host-side session identity。session store
+  // 依它路由到 per-WSID lane（workspace lane 的事件維持空值）。
+  workspace_session_id?: string
 }
 // gate.ts 的 projection entry（Task 14 console 消費）
 export interface GateEntry {
@@ -35,10 +38,30 @@ export interface CommitCandidate { oid: string; subject: string }
 // Bindings：session store（stores/session.ts）唯一消費的形狀——只有
 // StartSession／SendMessage，維持原樣不擴大（session.test.ts 的 mock 只給這兩
 // 個欄位，見 EvidenceBindings 的分離理由）。
+//
+// M3b Task 26 原子切換：第一參數由 provider 改為 **WSID**。型別同為 string，
+// 編譯器擋不住傳錯，守門因此在 bindings.test.ts（轉發順序）與 Go 端的
+// TestExportedBindingsAddressByWSID（provider 名稱一律 ErrSessionNotFound）。
 export interface Bindings {
-  StartSession(provider: string, prompt: string, resume: string, recordCase: string,
+  StartSession(wsid: string, prompt: string, resume: string, recordCase: string,
     taskLabel: string, approvalPolicy: string): Promise<void>
-  SendMessage(provider: string, prompt: string): Promise<void>
+  SendMessage(wsid: string, prompt: string): Promise<void>
+}
+// SessionLifecycleBindings：以 WSID 定址的其餘 lifecycle 入口（Task 26 一併
+// 切換）。與 Bindings 分開的理由同 EvidenceBindings：session store 的 mock 只
+// 需要 StartSession／SendMessage 兩個欄位。
+export interface SessionLifecycleBindings {
+  EndSession(wsid: string): Promise<void>
+  NewSession(wsid: string): Promise<void>
+  TerminateSession(wsid: string): Promise<void>
+}
+// SessionInfo：ListSessions 的單筆結果（逐字鏡射 Go 的 main.SessionInfo json
+// tag）。registry 是「有哪些 session」的權威，available 反映 Manager 是否真的
+// 能定址它——false 時 UI 顯示為不可操作，而不是把它藏起來。
+export interface SessionInfo {
+  wsid: string; provider: string; task_label: string
+  resume_session_id: string; created_at: string
+  available: boolean; state: string
 }
 // WorkspaceSessionBindings：M3b Task 4 純新增的 CreateSession——回傳新 session
 // 的 WSID。獨立於 Bindings（session store 用）之外，理由同 EvidenceBindings：
@@ -46,6 +69,9 @@ export interface Bindings {
 // 欄位；WSID 化的 store 切換是 Task 26 的原子改動，這裡不提前擴大 Bindings。
 export interface WorkspaceSessionBindings {
   CreateSession(provider: string, taskLabel: string): Promise<string>
+  // ListSessions：M3b Task 26——前端 session 清單的唯一來源（registry live
+  // entries ＋ slot 可解析性）。
+  ListSessions(): Promise<SessionInfo[]>
   // RemoveSession：M3b Task 22 純新增——使用者明確移除（tombstone，§3.6.1），
   // 與 CreateSession 同一群組。
   RemoveSession(wsid: string): Promise<void>
