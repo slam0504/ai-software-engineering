@@ -13,14 +13,15 @@
 **四個收尾 gate 全綠**（含本里程碑首次執行的 `wails build`）。
 
 **spec §5「production-path barrier 必備清單」35 條**：綠 34、**未覆蓋 1**。
-**spec §6 實機驗收 10 項**：**無法執行 9、部分執行 1**——本 session 是非互動 agent 環境，
-沒有 GUI 操作能力；Codex 帳號用量限制至 2026-08-20，涉及 Codex live turn 的項目另有外部阻塞。
+**spec §6 實機驗收 10 項**：**無法執行 8、部分執行 1、未實作 1（A5）**——本 session 是非互動
+agent 環境，沒有 GUI 操作能力；Codex 帳號用量限制至 2026-08-20，涉及 Codex live turn 的項目
+另有外部阻塞。**A5 與環境無關**：pane pins 沒有持久化路徑，就算有 GUI 也會失敗（§3.3）。
 **另有 1 項 spec 前提未受保護**（single-instance guard），**待 owner 裁決**。
 
-| 類別 | 綠 | 未覆蓋 | 部分執行 | 無法執行 |
+| 類別 | 綠 | 未覆蓋／未實作 | 部分執行 | 無法執行 |
 |---|---|---|---|---|
 | spec §5 條款（35） | 34 | 1 | – | – |
-| spec §6 實機驗收（10） | – | – | 1（A10） | 9 |
+| spec §6 實機驗收（10） | – | 1（A5＝未實作，§3.3） | 1（A10） | 8 |
 | spec §7 待驗證假設（5） | 3（§7.3／§7.4／§7.5，既有測試覆蓋，見 §2.8） | – | 1（§7.1＝A10） | 1（§7.2＝Task 0 probe 重跑） |
 | **本票新發現**的未受保護前提（1） | – | 1 | – | – |
 | 收尾 gate（4） | 4 | – | – | – |
@@ -32,7 +33,9 @@
 
 > **本文件的判定規則**：只有「本次實際跑過並看到輸出」才記綠；「有測試但本次未跑」不記綠；
 > 「型別層有測試、production 沒有呼叫端」記**未覆蓋**，不記綠；「環境或外部限制導致無法執行」
-> 記無法執行並寫出阻塞原因與後續建議。
+> 記無法執行並寫出阻塞原因與後續建議；**「拿掉環境限制也仍會失敗（production 缺實作）」記
+> 未實作，不得記成無法執行**——後者會讓一個實作缺口偽裝成環境問題（A5 原本就記錯，final
+> review 已更正）。
 >
 > **「綠 34」的精確含義**：34 條有**本次實跑通過**的對應測試，**不等於**這 34 條的守門力
 > 在本票被重新驗證過——後者需要把 Task 0-30 的 60+ 個 mutation 全部重跑（見 §4 末段的方法論說明）。
@@ -161,7 +164,7 @@ spec 那句的字面要求是「**舊測試語意遷移不減**」——嚴格�
 
 ---
 
-## 3. 未覆蓋清單（2 項）
+## 3. 未覆蓋清單（3 項）
 
 ### 3.1 §5.2 第 11 條：`[]WireSegmentRef` 跨 generation —— **未接線，不可能綠**
 
@@ -220,6 +223,39 @@ $ grep -rnE "flock|O_EXCL|LOCK_EX|lockfile" --include='*.go' .
 **會改變啟動行為並新增一條使用者可見的失敗路徑**（第二個視窗開不起來），落在「會改變使用者可見行為」
 的決策邊界。**本票不自行實作。**
 
+### 3.3 pane pins 持久化 —— **未接線，A5 不可能通過**（final review 更正，原記為「無法執行(G)」）
+
+**事實**（final review 獨立核對）：
+
+```
+$ grep -rn "SetLayout|\.Layout\(\)" --include='*.go' .
+internal/wsregistry/store.go:213,218,231   （宣告本體）
+internal/wsregistry/store_test.go:202,205,…（只有型別層測試）
+→ production 呼叫端：零
+$ grep -rni "layout" frontend/wailsjs/go/main/App.d.ts
+（零命中 → 沒有任何 layout 相關 Wails binding）
+```
+
+`frontend/src` 唯一的持久化是 `lib/persist.ts` 的 localStorage 包裝，用途只有
+timeline 摺疊／高度與 gate 面板寬度三個 key（`App.vue:151-158` 的 `wb.tl.open`／
+`wb.tl.height`／`wb.gate.width`），**完全沒碰 pins**。`App.vue:224` 的 `onMounted`
+只做 `hydrateSessions(await ListSessions())`——那條路徑只回填 session metadata 與狀態，
+不還原釘選；`stores/session.ts:162` 的 `pins` 初始恆為 `[null, null]`。
+
+**後果**：每次重啟兩個 pane 都是空的，使用者必須重新釘選。spec §3.8「啟動只重建兩個釘選 pane」
+在 production **沒有輸入可用**——A5 因此不是被 GUI 環境擋住，是**沒有可驗收的實作**。
+（釘選**之後**的視窗化載入本身是完整且綠的，見 A5 那列列出的三條測試。）
+
+**與 spec 的關係**：spec §3.2.1 的 registry durable metadata 凍結白名單**明列**「pane pins／
+focused pane」（design 文件 L62），因此這是凍結契約中的一項，不是可選增強。
+
+**成因**：與 §3.1 同型的排程缺口——plan 第 244-245 行只列了
+`func (s *Store) SetLayout(l Layout) error` 與 `func (s *Store) Layout() Layout` 兩個簽名，
+**沒有任何後續 task 接它**：Task 2 定義了型別、Task 26-29 的前端從未取用，責任掉在兩者之間。
+
+**後續建議**：獨立開票（binding + 前端 pin/unpin/focus 的寫入時機 + 啟動 hydrate 順序，
+還要決定「釘選的 session 已被移除」時的還原語意）。**本輪不實作——那是新功能，待 owner 裁決。**
+
 ---
 
 ## 4. 本票新增的一條測試（§5.1 第 5 條）＋mutation 交叉矩陣
@@ -259,12 +295,16 @@ mutation 已還原：`grep -rn MUTATION --include='*.go' .` 為空，`git diff` 
 
 ## 5. spec §6 實機驗收矩陣（A1-A10）
 
-**全部 9 項無法執行、1 項部分執行。** 阻塞原因分兩類，逐項標明：
+**8 項無法執行、1 項部分執行、1 項未實作。** 阻塞原因分兩類，逐項標明：
 
 - **(G) 無 GUI 操作能力**：本 session 是非互動 agent 環境，`wails build` 產出的 `.app` 可以建置
   但無法由 agent 進行點擊／切焦點／捲動／確認對話框等操作。這些驗收項的判定條件本身就是**人眼與滑鼠**。
 - **(Q) Codex 帳號用量限制至 2026-08-20**：涉及 Codex live turn 的項目另有外部阻塞
   （同一阻塞已記錄於 Task 0 ledger，`cmd/probe-codex-parallel` 的 live 重跑也因此停擺）。
+
+> **A5 不屬於上面兩類**（final review 更正）：它先前被記成「無法執行（G）」，但**就算給它 GUI
+> 也會失敗**——pane pins 在 production 沒有持久化路徑，重啟後根本沒有釘選 pane 可恢復。
+> 它不是被環境擋住，是**未實作**，因此改記 ❌ 未實作並列進 §3 缺口章節（§3.3）。
 
 | # | 項目 | 判定 | 阻塞 | 已具備的自動化替代覆蓋（**不等於實機通過**） |
 |---|---|---|---|---|
@@ -272,7 +312,7 @@ mutation 已還原：`grep -rn MUTATION --include='*.go' .` 為空，`git diff` 
 | A2 | 雙 pane 並看與焦點切換、unread | 🚫 無法執行 | G | `frontend/src/components/DualPane.test.ts`（並排與焦點切換）、`PaneView.test.ts`＋`stores/session.test.ts`（focused pane 操作語意、unread） |
 | A3 | approval 跨 pane／未釘選 transient 路由 | 🚫 無法執行 | G＋Q | §5.6 兩條全綠（store＋ApprovalDialog）；後端路由 `TestApprovalCarriesWSIDAndFIFOPromotion` |
 | A4 | 8/8 上限拒絕＋`n / 4` 顯示＋關閉釋放名額 | 🚫 無法執行 | G＋Q | `TestReserveSessionLimitIsAtomic`（恰 4）、`SessionList.test.ts`（`n / 4` 渲染與移除確認）、`TestRemoveReleasesSlotOnlyAfterAllStepsSucceed` |
-| A5 | 重啟：釘選 lazy 恢復（20 turn）、非釘選 metadata、向上分頁 | 🚫 無法執行 | G | `TestRestoreLoadsLast20TurnsPlusOpenTurn`、`TestPagingUsesBeforeEventIDCursor`、`TestWindowExcludesOtherSessions`；前端 `session.test.ts` 的 `loadOlder` 去重與捲動補償 |
+| A5 | 重啟：釘選 lazy 恢復（20 turn）、非釘選 metadata、向上分頁 | ❌ **未實作** | 不是環境阻塞 | **就算有 GUI 這項也會失敗**：pane pins 沒有持久化，重啟後 `pins` 恆為 `[null, null]`，沒有「釘選 pane」可恢復。詳見 §3.3。已具備的是**釘選之後**的視窗化載入：`TestRestoreLoadsLast20TurnsPlusOpenTurn`、`TestPagingUsesBeforeEventIDCursor`、`TestWindowExcludesOtherSessions`；前端 `session.test.ts` 的 `loadOlder` 去重與捲動補償 |
 | A6 | index 落後補掃／注入損壞 → 重建＋通知 | 🚫 無法執行 | G | §5.5 六條全綠（落後／超前／truncate／quarantine／degraded 通知／runtime 重建） |
 | A7 | 未完成 turn 重啟 → failed 解除 busy | 🚫 無法執行 | G | §5.3 第 2／3 條全綠（`app_startup_repair_test.go` 七條） |
 | A8 | 舊 workspace 升級：legacy 歸屬、resume 可用、重啟不產生第二枚 WSID | 🚫 無法執行 | G | §5.3 第 1 條＋`TestLegacyJournalWithoutWSIDAttributes`、`TestLegacyViewWindowWithEventsMigrated`、`TestLegacyEmptyViewWindowNotMigrated` |

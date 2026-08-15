@@ -635,3 +635,41 @@ func TestVerifyFailureMakesWindowFailLoud(t *testing.T) {
 		t.Fatalf("驗證失敗後的視窗載入必須 fail loud，不得靜默回不完整的視窗：%v", err)
 	}
 }
+
+// TestRegistryLoadFailureMakesWindowFailLoud：registry 載入失敗讓 restoreSessions
+// 提前 return，`index_verify` **根本沒跑到**——但 replayIndex 早已建立並接進
+// Manager 的 Config.Index，第一筆 live 事件（workspace lane 的 gate／assist／通知
+// 不需要 session slot）就會把 checkpointOffset 推到它自己的 EndOffset，shutdown
+// 的 Flush() 再落盤，下次啟動的 checkpoint 反而變成「可信」，中間那段 audit 從此
+// 沒人補。這與「驗證跑了但失敗」是同一個靜默且永久的缺口，所以同一個 latch 必須
+// 涵蓋這一格。
+func TestRegistryLoadFailureMakesWindowFailLoud(t *testing.T) {
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","workspace_session_id":"w1","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"state_change","workspace_session_id":"w1","state":"done"}`)
+	// wsregistry.Open 對 malformed JSON 直接回錯（不重建、不改名），使用者手改
+	// 檔案或降版即觸發；per-provider 超限與 RestoreDormant 失敗走同一條 return。
+	if err := os.WriteFile(filepath.Join(dir, "workspace-sessions.json"),
+		[]byte("{ not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppAt(t, dir)
+	var steps []string
+	a.hookStartupStep = func(s string) { steps = append(steps, s) }
+
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("malformed registry 必須回錯（否則本測試根本沒走到缺口路徑）")
+	}
+	// 機制釘死：缺口的來源是「驗證從未執行」，不是「驗證執行後失敗」。
+	for _, s := range steps {
+		if s == "index_verify" {
+			t.Fatalf("registry 失敗後不該跑到 index_verify（步驟：%v）", steps)
+		}
+	}
+	got, err := a.LoadTurnsBefore("w1", "", turnPageSize)
+	if !errors.Is(err, errIndexUnverified) {
+		t.Fatalf("registry 載入失敗後 index 從未與 audit 對齊，視窗載入必須 fail loud；"+
+			"實際靜默回了 %d 筆、err=%v", len(got), err)
+	}
+}

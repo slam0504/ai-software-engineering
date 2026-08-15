@@ -73,7 +73,10 @@ type App struct {
 	// 都以 index 為唯一來源，不另做一份掃描實作）。
 	replayIndex *replayindex.Index
 
-	// indexUnverified：啟動期 VerifyOrRebuild 失敗的 latch。
+	// indexUnverified：啟動期 index 未通過驗證的 latch——涵蓋兩種來源：
+	// (a) VerifyOrRebuild 執行後失敗；(b) registry 載入失敗讓 restoreSessions
+	// 提前 return，`index_verify` 根本沒跑到（見 restoreSessions 的 early return）。
+	// 兩者留下的都是「index 從未與 audit 對齊」，後果相同。
 	//
 	// 為什麼「失敗就不能再信」而不是「失敗但還能用」：verifyOrRebuildLocked
 	// 是**邊做邊改狀態**的——先清 checkpoint／turns、必要時 quarantine turn
@@ -1024,6 +1027,18 @@ func (a *App) startupStep(step string) {
 func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
 	live, err := a.loadSessionRegistry()
 	if err != nil {
+		// registry 載入失敗 → `index_verify` 這一步**從未執行**，但 a.replayIndex
+		// 早在 startup() 就已建立並接進 Manager 的 Config.Index：Observe 會無條件
+		// 把 checkpointOffset 推到第一筆 live 事件的 receipt.EndOffset（workspace
+		// lane 的 gate／assist／通知不需要 session slot，照樣會發），shutdown 的
+		// Flush() 再把它落盤——下次啟動的 checkpoint 反而變成「可信」，中間那段
+		// audit 從此沒人會補。這與「驗證跑了但失敗」是同一個靜默且永久的缺口
+		// （見 indexUnverified 欄位 doc），只是缺口來自「驗證根本沒跑」。
+		//
+		// 同樣只 latch、不排程 runtime 重建：bulkRebuild 從
+		// max(rebuildCursor, checkpointOffset) 起掃，而驗證沒跑過時那個值本身
+		// 不可信，自動重建只會把缺口固化。
+		a.indexUnverified.Store(true)
 		return nil, err
 	}
 
