@@ -3,7 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useSession } from '../stores/session'
 import { resolveState, sessionStateKeys } from '../i18n/stateKeys'
-import { isAtBottom } from '../lib/scroll'
+import { isAtBottom, isAtTop } from '../lib/scroll'
 
 // PaneView（Task 28，spec §3.7）：單一 pane，綁定 DualPane 分配給它的 WSID
 // （`s.pins[idx]`）。不管是否 focused，pane 都持續接收該 WSID 的串流／狀態／
@@ -28,10 +28,29 @@ const focused = computed(() => s.focused === props.idx)
 const draft = ref('')
 const listEl = ref<HTMLElement | null>(null)
 const follow = ref(true) // BAT 慣例：使用者上捲後停止自動跟隨
+const loadingOlder = ref(false) // 防止捲動在到頂區間連續觸發多次 loadOlder（review Critical）
 
-function onScroll() {
+// onScroll：review Critical 修復——loadOlder()／setScrollAnchor() 過去零 UI
+// 呼叫端（brief 的 Files 清單明講要改這個檔案，先前那版沒動到）。捲到頂
+// （isAtTop）才觸發向上分頁；載入期間用 loadingOlder 擋重入。錨點記錄的是
+// 「觸發分頁當下最舊的已載入事件」，用來在插入更舊內容後把畫面位置補回去，
+// 不讓新內容把使用者原本在看的位置往下推。
+async function onScroll() {
   const el = listEl.value
-  if (el) follow.value = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+  if (!el) return
+  follow.value = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+  if (!wsid.value || loadingOlder.value || !isAtTop(el.scrollTop)) return
+  const anchor = view.value?.timeline[0]?.env.event_id
+  if (anchor) s.setScrollAnchor(wsid.value, anchor)
+  loadingOlder.value = true
+  const prevHeight = el.scrollHeight
+  try {
+    await s.loadOlder(wsid.value)
+    await nextTick()
+    el.scrollTop += el.scrollHeight - prevHeight // 補回被撐開的高度，畫面位置不跳動
+  } finally {
+    loadingOlder.value = false
+  }
 }
 
 async function send() {

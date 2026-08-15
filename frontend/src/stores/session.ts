@@ -283,7 +283,19 @@ export const useSession = defineStore('session', {
       const load = this.bindings?.LoadTurnsBefore
       if (!load) return
       const envs = await load(wsid, '', TURN_WINDOW_SIZE)
-      const v = this.views[wsid] // await 期間可能已被 unpin／再次釋放，重新取一次
+      // await 期間可能已被切走／釋放，重新取一次——這是存在性檢查，不是身分
+      // 檢查（不比對「這個 view 是不是我剛剛建立的那個實例」）。它正確防住的
+      // 是「pin(A) 載入中，同一 pane 被切去 pin(B)」（releaseView(A) 會
+      // delete views[A]，見下方 pin(A)→pin(B) 的測試）與「A 在等待期間被
+      // RemoveSession／markRemoved 刪除」。它**沒有**防住「同一個 wsid 的
+      // view 被刪除後又重建」（unpin → 再 pin 回同一個 wsid，此時 v 存在但是
+      // 新實例，這批舊 envelope 會不去重地疊上去，因為只有 loadOlder() 做
+      // event_id 去重、這裡的尾端載入沒有）。這條分支目前**不可達**：
+      // unpin() 在整個 frontend/src 零 UI 呼叫端（SessionList／SettingsBar／
+      // PaneView 都沒有「解除釘選」控制項）。只要日後任何票加一顆解除釘選
+      // 按鈕，這個分支就會變可達，屆時需要在這裡也比對「view 是不是同一個
+      // 尾端載入啟動時建立的那個實例」（例如帶一個 generation 計數）。
+      const v = this.views[wsid]
       if (!v || !envs) return
       for (const e of envs) applyToView(v, e)
     },

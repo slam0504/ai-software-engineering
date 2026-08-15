@@ -137,6 +137,30 @@ describe('session store：釘選觸發尾端視窗 lazy load（§3.8，Task 29�
     expect(s.views['w9'].chat.map(c => c.text)).toEqual(['hist user', 'hist reply'])
     expect(s.sessions['w9'].taskLabel).toBe('resumed') // metadata 這半本來就正常，順帶確認沒被歷史回放蓋掉
   })
+
+  // review Important：pin() 的 await-window 防護只做存在性檢查，不是身分
+  // 檢查。真正可達的分支是「pin(A) 載入中，同一 pane 被切去 pin(B)」——
+  // unpin() 目前零 UI 呼叫端，所以「同一 wsid 刪除後重建」那條不可達，不在
+  // 這裡測（見 pin() 內的文件）。
+  it('pin(A) 載入中切去 pin(B)：A 稍後才回來的歷史事件不得汙染 B 的 view', async () => {
+    const s = useSession()
+    let resolveA!: (envs: Envelope[]) => void
+    const loadA = new Promise<Envelope[]>(r => { resolveA = r })
+    const load = vi.fn()
+      .mockImplementationOnce(() => loadA) // pin(0,'A') 卡住，模擬慢請求
+      .mockImplementationOnce(async () => hist('B'))
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), LoadTurnsBefore: load })
+    s.registerSession({ wsid: 'A', provider: 'claude', taskLabel: '' })
+    s.registerSession({ wsid: 'B', provider: 'claude', taskLabel: '' })
+
+    const pinA = s.pin(0, 'A') // 不 await：卡在 LoadTurnsBefore 那個 await
+    await s.pin(0, 'B') // 使用者在 A 還沒回來前把同一個 pane 切去 B
+    resolveA(hist('A')) // A 的慢請求這時才回來
+    await pinA
+
+    expect(s.views['A']).toBeUndefined() // 已被 releaseView 刪除，不該被稍後回來的資料復活
+    expect(s.views['B'].chat.map(c => c.text)).toEqual(['hist user', 'hist reply']) // B 沒被汙染
+  })
 })
 
 describe('PaneView：歷史真的渲染成 DOM（不只是 mock 被呼叫，見 review 教訓 D）', () => {
@@ -171,5 +195,62 @@ describe('PaneView：歷史真的渲染成 DOM（不只是 mock 被呼叫，見 
     const bubbles = w.findAll('.bubble')
     expect(bubbles[0].text()).toContain('older turn text') // 較舊的插到最前面，不是 push 到最後
     expect(bubbles.at(-1)!.text()).toContain('hist reply')
+  })
+})
+
+// review Critical：loadOlder()／setScrollAnchor() 過去零 UI 呼叫端——store 邏輯
+// 對、mutation 也守得住，但 onScroll() 從沒偵測「捲到頂」也沒呼叫它們，功能在
+// 真實 app 裡使用者碰不到（跟 Task 27 SessionList 沒掛上 App.vue 同一個形狀）。
+// 這裡直接模擬 DOM 'scroll' 事件（不是像上面幾條測試直接呼叫 s.loadOlder()），
+// 證明 onScroll() 真的接上了。
+describe('PaneView：捲到頂觸發向上分頁（模擬捲動事件，不是直接呼叫 store action）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    Element.prototype.scrollTo = Element.prototype.scrollTo ?? (() => {})
+  })
+
+  // jsdom 不做真實版面計算，scrollTop／scrollHeight／clientHeight 這幾個唯讀
+  // getter 要手動覆寫成可控值，才能模擬「捲到頂」這個幾何狀態。
+  function stubGeometry(el: HTMLElement, scrollTop: number, scrollHeight: number, clientHeight: number) {
+    Object.defineProperty(el, 'scrollTop', { value: scrollTop, configurable: true, writable: true })
+    Object.defineProperty(el, 'scrollHeight', { value: scrollHeight, configurable: true })
+    Object.defineProperty(el, 'clientHeight', { value: clientHeight, configurable: true })
+  }
+
+  it('捲到頂（scrollTop 在 slack 內）觸發 loadOlder，游標帶目前最舊 event_id，並記錄捲動錨點', async () => {
+    const s = useSession()
+    s.setBindings(bindingsWithHistory())
+    s.registerSession({ wsid: 'w9', provider: 'claude', taskLabel: '' })
+    const w = mountWithI18n(PaneView, { props: { idx: 0 } })
+    await s.pin(0, 'w9')
+    await nextTick()
+    const load = vi.mocked(s.bindings!.LoadTurnsBefore!)
+    load.mockClear()
+    load.mockResolvedValueOnce([
+      { event_id: 'older-1', ts: 't0', provider: 'claude', kind: 'message', role: 'user', text: 'older turn text', workspace_session_id: 'w9' },
+    ])
+    const el = w.find('.msgs').element as HTMLElement
+    stubGeometry(el, 0, 400, 200) // scrollTop=0：在頂端
+    await w.find('.msgs').trigger('scroll')
+    await nextTick()
+    expect(load).toHaveBeenCalledWith('w9', 'h1', 20) // 'h1'＝pin() 尾端視窗載入的最舊事件
+    expect(s.scrollAnchors['w9']).toBe('h1')
+    expect(w.find('[data-test=pane-0]').text()).toContain('older turn text')
+  })
+
+  it('不在頂端（scrollTop 遠大於 slack）捲動不觸發 loadOlder', async () => {
+    const s = useSession()
+    s.setBindings(bindingsWithHistory())
+    s.registerSession({ wsid: 'w9', provider: 'claude', taskLabel: '' })
+    const w = mountWithI18n(PaneView, { props: { idx: 0 } })
+    await s.pin(0, 'w9')
+    await nextTick()
+    const load = vi.mocked(s.bindings!.LoadTurnsBefore!)
+    load.mockClear()
+    const el = w.find('.msgs').element as HTMLElement
+    stubGeometry(el, 500, 1000, 200) // 遠離頂端也遠離底部
+    await w.find('.msgs').trigger('scroll')
+    await nextTick()
+    expect(load).not.toHaveBeenCalled()
   })
 })
