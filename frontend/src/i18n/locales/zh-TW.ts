@@ -308,6 +308,24 @@ export default {
     noFocusedSession: '焦點 pane 沒有釘選任何 session——請先建立或釘選一個',
     sessionUnavailable: 'session {wsid} 有紀錄但目前無法操作（沒有對應的 working slot）；請重啟 app 或將它移除',
   },
+  sessionList: {
+    empty: '目前沒有任何 session——用上方的建立按鈕開一個',
+    action: {
+      create: '建立',
+      pin: '釘選',
+      remove: '移除',
+    },
+    busyTooltip: '等待回覆中',
+    create: {
+      failed: '建立 {provider} session 失敗：{error}',
+    },
+    remove: {
+      confirmText: '移除後這個 session 會從清單消失，但稽核事件與錄流會永久保留（不會被刪除）。確定要移除嗎？',
+      confirmSubmit: '確認移除',
+      cancel: '取消',
+      failed: '移除 session {wsid} 失敗：{error}',
+    },
+  },
   escalation: {
     section: {
       open: '待處理',

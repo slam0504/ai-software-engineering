@@ -308,6 +308,24 @@ export default {
     noFocusedSession: 'no session is pinned to the focused pane — create or pin one first',
     sessionUnavailable: 'session {wsid} is recorded but not addressable (no working slot); restart the app or remove it',
   },
+  sessionList: {
+    empty: 'No sessions yet — use the create buttons above to start one',
+    action: {
+      create: 'Create',
+      pin: 'Pin',
+      remove: 'Remove',
+    },
+    busyTooltip: 'Waiting on a reply',
+    create: {
+      failed: 'Create {provider} session failed: {error}',
+    },
+    remove: {
+      confirmText: 'The session will disappear from this list, but audit events and recordings are retained permanently (not deleted). Remove it?',
+      confirmSubmit: 'Confirm removal',
+      cancel: 'Cancel',
+      failed: 'Remove session {wsid} failed: {error}',
+    },
+  },
   escalation: {
     section: {
       open: 'Open',
