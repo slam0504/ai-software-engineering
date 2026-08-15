@@ -92,12 +92,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // fail loud 守住，所以「第一輪還在跑就送第二筆」不再是可以靠運氣通過的事——
 // 需要送第二輪（或直接 BeginSubmit）的測試必須先等第一輪落地。等的是**條件**
 // 不是時間（同 waitFor 慣例），因此不引入 time.Sleep 式的牆鐘相依。
+//
+// **不把 StateIdle 算成收尾**：idle 是「還沒開始」而不是「已經結束」，收進來
+// 的話這個 helper 對一個根本還沒 StartSession 的 WSID 會立刻回傳，等於什麼都
+// 沒等（假綠 helper）。真的處在 idle 的 slot，BeginSubmit 本來就回 ErrNoSession，
+// 不需要靠這裡放行。
 func waitTurnSettled(t *testing.T, a *App, w appcore.WSID) {
 	t.Helper()
 	waitFor(t, "turn 收尾（"+string(w)+"）", func() bool {
 		st, err := a.manager.State(w)
-		return err == nil && (st == contract.StateDone || st == contract.StateFailed ||
-			st == contract.StateIdle)
+		return err == nil && (st == contract.StateDone || st == contract.StateFailed)
 	})
 }
 

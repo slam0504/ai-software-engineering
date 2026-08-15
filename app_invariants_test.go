@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"os"
@@ -24,33 +23,19 @@ import (
 
 // readEventIDs：events.jsonl 的 event_id（依**檔案順序**，不排序）。
 // 檔案順序正是不變量的受測對象，任何排序都會把它測掉。
-func readEventIDs(t *testing.T, path string) []string {
+//
+// 直接沿用既有的 readEvents（app_startup_repair_test.go:30）：它已經是同樣的
+// 大 buffer scanner、同樣對壞行 fail loud（並行寫入交錯就是那個形狀）、同樣
+// 保留檔案順序。另外複製一份只會多一個要一起維護的解析器。
+func readEventIDs(t *testing.T, stateDir string) []string {
 	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var ids []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		if len(sc.Bytes()) == 0 {
-			continue
-		}
-		var e struct {
-			EventID string `json:"event_id"`
-		}
-		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			t.Fatalf("events.jsonl 有無法解析的行（並行寫入交錯即為此形狀）：%q", sc.Text())
-		}
+	evs := readEvents(t, stateDir)
+	ids := make([]string, 0, len(evs))
+	for _, e := range evs {
 		if e.EventID == "" {
-			t.Fatalf("每一筆稽核事件都必須帶 event_id：%q", sc.Text())
+			t.Fatalf("每一筆稽核事件都必須帶 event_id：%+v", e)
 		}
 		ids = append(ids, e.EventID)
-	}
-	if err := sc.Err(); err != nil {
-		t.Fatal(err)
 	}
 	return ids
 }
@@ -97,7 +82,7 @@ func TestEventIDMonotonicAcross8ParallelSessions(t *testing.T) {
 	if len(ws) != 8 {
 		t.Fatalf("precondition：必須有 8 個並行 session：%d", len(ws))
 	}
-	before := len(readEventIDs(t, a.eventsPath()))
+	before := len(readEventIDs(t, a.stateDir))
 
 	var wg sync.WaitGroup
 	for _, w := range ws {
@@ -116,7 +101,7 @@ func TestEventIDMonotonicAcross8ParallelSessions(t *testing.T) {
 	}()
 	wg.Wait()
 
-	ids := readEventIDs(t, a.eventsPath())
+	ids := readEventIDs(t, a.stateDir)
 	// 非空性：8×20 筆 trigger ＋ 各自的合成 state_change ＋ 20 筆 workspace。
 	// 少於這個數量代表受測路徑沒被走到（例如 Emit 全部回錯），不得算通過。
 	if got := len(ids) - before; got < 8*20+20 {
@@ -157,13 +142,27 @@ func TestReducerCascadeIsAtomicAcrossSessions(t *testing.T) {
 		if k == 0 {
 			t.Fatalf("state_change 不可能是檔案第一筆（它必然由前一筆事件追發）：%+v", e)
 		}
+		// WSID 缺漏要先擋掉並給專屬訊息：`emitStateLocked` 忘記回填 WSID 時
+		// 下面的比對同樣會不相等，但錯誤訊息會說「被其他 session 插隊」，把
+		// 讀者指向完全錯的 root cause。（那條 regression 的正規守門在
+		// appcore：TestEmitFillsWSIDAndRejectsProviderMismatch。）
+		if e.WorkspaceSessionID == "" {
+			t.Fatalf("合成 state_change 必須帶 WSID（§3.1.5，第 %d 行）：%+v", k+1, e)
+		}
 		if prev := evs[k-1]; prev.WorkspaceSessionID != e.WorkspaceSessionID {
 			t.Fatalf("reducer cascade 被其他 session 的事件插隊（第 %d 行）：\n"+
 				"trigger=%s/%s\ncascade=%s/%s",
 				k+1, prev.WorkspaceSessionID, prev.Kind, e.WorkspaceSessionID, e.Kind)
 		}
 	}
-	// 非空性：delta↔result 交替讓每一筆都換狀態，8 個 session 各 20 筆。
+	// 非空性門檻 8×20 的推導（實測約 168，餘裕不大，故寫清楚來源）：
+	//   - emitTurn 的 delta↔result 交替讓**每一筆**都換狀態 → 20 筆／WSID；
+	//     唯一的例外是第一筆 delta 撞上「該 slot 已經是 streaming」（claude 的
+	//     fake CLI 在 start 那一輪就送過 assistant message），那筆不產生 change
+	//     → 19 筆。
+	//   - 但那種 WSID 的 start 交易本身至少貢獻 2 筆（idle→waiting、
+	//     waiting→streaming），其餘 WSID 至少貢獻 1 筆（canonical user message）。
+	//   兩者相加，每個 WSID 的下限都是 20 → 8×20 是安全下限，不是實測值。
 	if cascades < 8*20 {
 		t.Fatalf("受測路徑未被走到：只看到 %d 筆合成 state_change", cascades)
 	}
@@ -281,10 +280,13 @@ func TestSecondInFlightTurnRejected(t *testing.T) {
 	} else if !errors.Is(err, appcore.ErrTurnInFlight) {
 		t.Fatalf("拒絕原因必須是 in-flight turn：%v", err)
 	}
-	// 被拒不得吃掉 submission ownership：若 BeginSubmit 已把 submitting 佔住
-	// 才回錯，這個 slot 之後永遠 ErrSubmitActive。
-	if evs := readEvents(t, a.stateDir); evs[len(evs)-1].Text == "second" {
-		t.Fatal("被拒的第二筆不得寫進稽核（canonical user message 只屬於被接受的 turn）")
+	// 被拒的第二筆不得留下任何痕跡。掃**全部**事件而不是只看最後一筆：
+	// canonical user envelope 未必落在檔尾（provider stream 隨時可能追加事件），
+	// 只看 evs[len-1] 既漏檢也會在空檔案時 index out of range。
+	for _, e := range readEvents(t, a.stateDir) {
+		if e.Text == "second" {
+			t.Fatalf("被拒的第二筆不得寫進稽核（canonical user message 只屬於被接受的 turn）：%+v", e)
+		}
 	}
 
 	// turn 結束後必須恢復：否則這條 guard 就是個永久 latch。
@@ -466,7 +468,11 @@ func TestWireLogCapturesFramesOfEverySession(t *testing.T) {
 	script.completeTurn(thA, thA+"-turn-1")
 	script.completeTurn(thB, thB+"-turn-1")
 	path := filepath.Join(a.wireLogDir(), "wire-e2e.jsonl")
-	waitFor(t, "兩個 session 的 turn/completed 都進 connection-wide 錄流", func() bool {
+	// waitFor 的 what 字串刻意指名 §3.4.5：這裡逾時**不是環境問題**，而是
+	// 「有 frame 沒被錄下來」——turn/completed 是 notification（無 request id），
+	// 正是最容易被「解不出歸屬就丟掉」那類 bug 吃掉的一種 frame。
+	waitFor(t, "兩個 session 的 turn/completed 都進 connection-wide 錄流"+
+		"（逾時＝frame 被丟棄，違反 §3.4.5「無法歸屬的 frame 仍須照寫」）", func() bool {
 		b, rerr := os.ReadFile(path)
 		return rerr == nil && strings.Count(string(b), codex.MethodTurnCompleted) >= 2
 	})
