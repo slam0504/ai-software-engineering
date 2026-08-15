@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -46,6 +48,11 @@ func mustStartClaude(t *testing.T, a *App, w appcore.WSID) {
 	t.Cleanup(func() { _ = a.EndSession("claude") })
 }
 
+// seedApprovalSeq：seedApproval 的 id 去重計數器——同一個 WSID 在單一測試內可能
+// 被呼叫多次（例如 FIFO promotion 測試同一 session 送出兩筆待核可），純用 WSID
+// 組 id 會撞號、讓後一筆蓋掉前一筆的 apprPending 登記。
+var seedApprovalSeq atomic.Int64
+
 // seedApproval：走真實 approval 路徑——dial 該 host 自己的 approval socket 送一筆
 // 請求，等 pumpApprovals 把它登記進 apprPending，回傳 approval id。
 func seedApproval(t *testing.T, a *App, w appcore.WSID) string {
@@ -54,7 +61,7 @@ func seedApproval(t *testing.T, a *App, w appcore.WSID) string {
 	if h == nil {
 		t.Fatalf("no session host for %s", w)
 	}
-	id := "appr-" + string(w)
+	id := "appr-" + string(w) + "-" + strconv.FormatInt(seedApprovalSeq.Add(1), 10)
 	go func() { // client 端等裁決回覆才收線（與 mcp-approval 的行為一致）
 		conn, err := net.Dial("unix", h.sockPath)
 		if err != nil {

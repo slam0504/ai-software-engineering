@@ -130,11 +130,11 @@ func (x *tm) State(p contract.Provider) contract.SessionState {
 }
 
 func (x *tm) EmitApprovalRequest(p contract.Provider, sessionID, toolName string, raw []byte) {
-	_ = x.Manager.EmitApprovalRequest(x.w(p), sessionID, toolName, raw)
+	_ = x.Manager.EmitApprovalRequest(x.w(p), "", sessionID, toolName, raw)
 }
 
 func (x *tm) EmitApprovalDecision(p contract.Provider, sessionID, decision, reason string) {
-	_ = x.Manager.EmitApprovalDecision(x.w(p), sessionID, decision, reason)
+	_ = x.Manager.EmitApprovalDecision(x.w(p), "", sessionID, decision, reason)
 }
 
 // endFlow：EndSessionFlow 的 provider → WSID 轉接（理由同 tm 型別 doc）。

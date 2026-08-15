@@ -271,6 +271,10 @@ type App struct {
 
 	apprMu      sync.Mutex
 	apprPending map[string]*pendingApproval
+	// apprOrder：apprPending 的登記順序（§3.6.4：多筆待核可 FIFO promotion）——
+	// map 迭代順序不保證，promotionOrder 靠這份 slice 回答「該先顯示哪一筆」。
+	// 在 apprMu 下與 apprPending 同步增刪（見 registerApproval／unregisterApproval）。
+	apprOrder []string
 
 	// shutdown gate（第四輪 review P1）：shutdown 先拒新 StartSession、等已取得
 	// start ownership 的交易 accept／abort 完成，才 snapshot／teardown／Close／Take——
@@ -4742,7 +4746,30 @@ func assistEnvelopeToEvent(prov contract.Provider, env contract.Envelope) contra
 func (a *App) registerApproval(id string, w appcore.WSID, provider string, resolve func(bool, string) error) {
 	a.apprMu.Lock()
 	a.apprPending[id] = &pendingApproval{wsid: w, provider: provider, resolve: resolve}
+	a.apprOrder = append(a.apprOrder, id)
 	a.apprMu.Unlock()
+}
+
+// removeApprOrderLocked：從 apprOrder 移除 id——呼叫端須持有 apprMu，且與
+// apprPending 的刪除同一把鎖內完成，避免 promotionOrder 短暫看到已從 map 消失
+// 但仍留在 order 裡的 id。找不到（例如重複刪除）視為 no-op。
+func (a *App) removeApprOrderLocked(id string) {
+	for i, oid := range a.apprOrder {
+		if oid == id {
+			a.apprOrder = append(a.apprOrder[:i], a.apprOrder[i+1:]...)
+			return
+		}
+	}
+}
+
+// promotionOrder：目前 pending approval 的登記順序快照（§3.6.4：多筆待核可
+// FIFO promotion）——供前端／呼叫端決定同時有多筆待核可時該先顯示哪一筆。
+func (a *App) promotionOrder() []string {
+	a.apprMu.Lock()
+	defer a.apprMu.Unlock()
+	out := make([]string, len(a.apprOrder))
+	copy(out, a.apprOrder)
+	return out
 }
 
 // pendingByID：唯讀查詢 pending approval（不移除；ResolveApproval 才是消費端）。
@@ -4755,7 +4782,10 @@ func (a *App) pendingByID(id string) *pendingApproval {
 func (a *App) ResolveApproval(id string, allow bool, reason string) error {
 	a.apprMu.Lock()
 	p, ok := a.apprPending[id]
-	delete(a.apprPending, id)
+	if ok {
+		delete(a.apprPending, id)
+		a.removeApprOrderLocked(id)
+	}
 	a.apprMu.Unlock()
 	if !ok {
 		return fmt.Errorf("no pending approval %s (timed out?)", id)
@@ -4786,11 +4816,11 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 			}
 			err := br.Resolve(id, approval.Decision{Behavior: behavior, Message: reason})
 			a.noteWSEmitError("approval_decision", w,
-				a.manager.EmitApprovalDecision(w, sessionID(), decision, reason))
+				a.manager.EmitApprovalDecision(w, id, sessionID(), decision, reason))
 			return err
 		})
 		a.noteWSEmitError("approval_request", w,
-			a.manager.EmitApprovalRequest(w, sessionID(), req.ToolName, req.Input))
+			a.manager.EmitApprovalRequest(w, id, sessionID(), req.ToolName, req.Input))
 		a.emit("approval:request", map[string]any{
 			"id": id, "provider": string(provider), "toolName": req.ToolName,
 			"inputJson": string(req.Input),
@@ -5224,9 +5254,10 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 	br.SetTimeoutHook(func(id string) { // 逾時 deny 後收掉 UI 的過期彈窗
 		a.apprMu.Lock()
 		delete(a.apprPending, id)
+		a.removeApprOrderLocked(id)
 		a.apprMu.Unlock()
 		a.noteWSEmitError("approval_decision", w,
-			a.manager.EmitApprovalDecision(w, sessionID(), "timeout", ""))
+			a.manager.EmitApprovalDecision(w, id, sessionID(), "timeout", ""))
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	})
 	go a.pumpApprovals(w, contract.ProviderClaude, br, sessionID)
@@ -6026,7 +6057,7 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	a.audit("codex_approval_request", map[string]any{"id": id, "method": method,
 		"wsid": string(w), "raw_params": json.RawMessage(params)})
 	a.noteWSEmitError("approval_request", w,
-		a.manager.EmitApprovalRequest(w, threadID, method, params))
+		a.manager.EmitApprovalRequest(w, id, threadID, method, params))
 	a.emit("approval:request", map[string]any{
 		"id": id, "provider": "codex", "toolName": method, "inputJson": string(params)})
 	decision := "decline"
@@ -6041,13 +6072,14 @@ func (a *App) codexApproval(method string, params json.RawMessage) map[string]st
 	case <-time.After(approvalTimeout()):
 		a.apprMu.Lock()
 		delete(a.apprPending, id)
+		a.removeApprOrderLocked(id)
 		a.apprMu.Unlock()
 		uiDecision = "timeout"
 		a.audit("codex_approval_timeout", map[string]any{"id": id})
 		a.emit("approval:dismiss", map[string]any{"id": id, "cause": "timeout"})
 	}
 	a.noteWSEmitError("approval_decision", w,
-		a.manager.EmitApprovalDecision(w, threadID, uiDecision, reason))
+		a.manager.EmitApprovalDecision(w, id, threadID, uiDecision, reason))
 	a.audit("codex_approval_decision", map[string]any{"id": id, "decision": decision})
 	return map[string]string{"decision": decision}
 }

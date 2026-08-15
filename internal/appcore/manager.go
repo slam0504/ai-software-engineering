@@ -82,7 +82,8 @@ type Config struct {
 
 type pendingEntry struct {
 	ev             contract.Event
-	resolveApprove bool // EmitApprovalDecision 的 reducer side effect 隨事件入列
+	resolveApprove bool   // EmitApprovalDecision 的 reducer side effect 隨事件入列
+	correlationID  string // §3.6.4：approval id，供 Envelope.CorrelationID 回填（其他事件留空）
 }
 
 type sessionPhase int
@@ -655,7 +656,7 @@ func (m *Manager) queueOrEmitLocked(sl *slot, e pendingEntry) {
 		sl.pendingBuf = append(sl.pendingBuf, e)
 		return
 	}
-	m.emitLocked(sl, e.ev)
+	m.emitLocked(sl, e.ev, e.correlationID)
 	if e.resolveApprove {
 		if st, changed := sl.reducer.ResolveApproval(); changed {
 			m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
@@ -729,7 +730,7 @@ func (m *Manager) acceptSubmitLocked(sl *slot, id SubmissionID, sessionID, text 
 	sl.submitting, sl.fromNewSession = nil, false
 	m.emitLocked(sl, contract.Event{Provider: sl.provider, Kind: contract.KindMessage,
 		Role: "user", SessionID: sessionID, Text: text,
-		Raw: []byte(`{"source":"workbench_user_input"}`)})
+		Raw: []byte(`{"source":"workbench_user_input"}`)}, "")
 	m.flushLocked(sl)
 	return nil
 }
@@ -760,7 +761,7 @@ func (m *Manager) flushLocked(sl *slot) {
 	buf := sl.pendingBuf
 	sl.pendingBuf = nil
 	for _, e := range buf {
-		m.emitLocked(sl, e.ev)
+		m.emitLocked(sl, e.ev, e.correlationID)
 		if e.resolveApprove {
 			if st, changed := sl.reducer.ResolveApproval(); changed {
 				m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
@@ -814,19 +815,22 @@ func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose 
 	}
 }
 
-// approvalRequestEvent／approvalDecisionEvent：新舊入口共用的事件組裝。
-func approvalRequestEvent(p contract.Provider, sessionID, toolName string, raw []byte) pendingEntry {
+// approvalRequestEvent／approvalDecisionEvent：新舊入口共用的事件組裝。id 是
+// approval id，回填到 pendingEntry.correlationID（§3.6.4：讓 approval 相關
+// Envelope 可用 CorrelationID 精確對應回單一 approval request，而非只靠 WSID
+// ／SessionID——同一 WSID 可能同時有多筆 pending approval）。
+func approvalRequestEvent(p contract.Provider, id, sessionID, toolName string, raw []byte) pendingEntry {
 	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApproval,
-		SessionID: sessionID, Text: toolName, Raw: raw}}
+		SessionID: sessionID, Text: toolName, Raw: raw}, correlationID: id}
 }
 
-func approvalDecisionEvent(p contract.Provider, sessionID, decision, reason string) pendingEntry {
+func approvalDecisionEvent(p contract.Provider, id, sessionID, decision, reason string) pendingEntry {
 	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApprovalDecision,
 		SessionID: sessionID, Text: decision, Thinking: reason,
-		Raw: []byte(`{"decision":"` + decision + `"}`)}, resolveApprove: true}
+		Raw: []byte(`{"decision":"` + decision + `"}`)}, resolveApprove: true, correlationID: id}
 }
 
-func (m *Manager) EmitApprovalRequest(w WSID, sessionID, toolName string, raw []byte) error {
+func (m *Manager) EmitApprovalRequest(w WSID, id, sessionID, toolName string, raw []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先：drop 通知不因 WSID 是否存在而異
@@ -838,11 +842,11 @@ func (m *Manager) EmitApprovalRequest(w WSID, sessionID, toolName string, raw []
 	if err != nil {
 		return err
 	}
-	m.queueOrEmitLocked(sl, approvalRequestEvent(sl.provider, sessionID, toolName, raw))
+	m.queueOrEmitLocked(sl, approvalRequestEvent(sl.provider, id, sessionID, toolName, raw))
 	return nil
 }
 
-func (m *Manager) EmitApprovalDecision(w WSID, sessionID, decision, reason string) error {
+func (m *Manager) EmitApprovalDecision(w WSID, id, sessionID, decision, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先：drop 通知不因 WSID 是否存在而異
@@ -854,11 +858,11 @@ func (m *Manager) EmitApprovalDecision(w WSID, sessionID, decision, reason strin
 	if err != nil {
 		return err
 	}
-	m.queueOrEmitLocked(sl, approvalDecisionEvent(sl.provider, sessionID, decision, reason))
+	m.queueOrEmitLocked(sl, approvalDecisionEvent(sl.provider, id, sessionID, decision, reason))
 	return nil
 }
 
-func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
+func (m *Manager) emitLocked(sl *slot, ev contract.Event, correlationID string) {
 	semantics := ""
 	switch {
 	case ev.Kind == contract.KindUsage && ev.Usage != nil: // codex snapshot：覆寫
@@ -880,6 +884,9 @@ func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
 	}
 	env := contract.Wrap(ev, sl.taskID)
 	env.WorkspaceSessionID = string(sl.wsid) // legacy slot 為空值：遷移期輸出不變
+	if correlationID != "" {
+		env.CorrelationID = correlationID // §3.6.4：approval id 供事件流精確對應
+	}
 	if ev.Kind == contract.KindUsage || ev.Kind == contract.KindResult {
 		snap := sl.totalUsage
 		env.Usage = &snap // 輸出一律該 slot 的累計 snapshot
