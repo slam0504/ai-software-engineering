@@ -5,10 +5,10 @@
 //  1. 落後——checkpoint 是 audit 中某個真實行邊界，只是還沒追上最新進度：
 //     從該 offset 續掃 audit suffix 補齊缺的 turn record。
 //  2. 超前／offset 超界／event ID 不符——checkpoint 指到 audit 裡不存在、或
-//     對不上的位置：整份視為不可信快取，丟棄後從頭全量重建（§3.5.3 第 6 項
-//     的「尾端 truncate vs 中段 quarantine＋復原通知」分級處置是 Task 18 範
-//     圍，本檔先以「不可信就整份重建」這個安全但較保守的處置頂住，不做分
-//     級、不留 quarantine 備份）。
+//     對不上的位置：整份視為不可信快取，既有 *.turns.jsonl **quarantine**
+//     （改名保留、非刪除，§3.5.6 凍結用字）後從頭全量重建（尾端 truncate
+//     vs 中段細分、復原通知是 Task 18 範圍，本檔先以「不可信就整份重建＋
+//     quarantine 舊檔」這個安全但較保守的處置頂住，不做進一步分級）。
 //  3. checkpoint 越過未完成 turn——checkpointOffset 是單一全域欄位、不是
 //     per-WSID，故某個 WSID 的 open turn 起點可能早於目前全域 checkpoint。
 //     這種狀況下 checkpoint.json 的 open_turn_start_offsets 仍會正確保存該
@@ -34,10 +34,32 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
+
+// maxLineWindow：checkpointTrustedLocked／lineEventIDEndingAt 驗證 checkpoint
+// 時，往回讀取的最大 window（bytes）。checkpoint 只會落在 turn boundary 事
+// 件（canonical user message 或 terminal state_change）的行尾，這兩種事件
+// 本身都不攜帶大量內容（delta 的大塊文字不會觸發 boundary），1MB 對單行給
+// 了充裕餘裕。這個常數是 replayindex 存在的理由本身：驗證 checkpoint 不能
+// 隨 events.jsonl 成長而變慢，見 lineEventIDEndingAt。
+const maxLineWindow = 1 << 20
+
+// auditFile：lineEventIDEndingAt 讀取 audit 檔所需的最小介面。生產環境一律
+// 是 *os.File；測試可透過覆寫 openAuditFile 換成計數 wrapper，驗證「checkpoint
+// 驗證只讀 window、不需隨檔案大小全掃」（見 rebuild_test.go 的
+// TestCheckpointVerificationDoesNotScanWholeFile）。
+type auditFile interface {
+	io.ReaderAt
+	io.Closer
+}
+
+var openAuditFile = func(path string) (auditFile, error) {
+	return os.Open(path)
+}
 
 // VerifyOrRebuild：啟動期呼叫一次，驗證 checkpoint 相對 auditPath（events.jsonl
 // 權威檔）是否可信，落後則補掃、超前或對不上則整份重建，並補回任何未完成
@@ -136,17 +158,25 @@ func (idx *Index) checkpointTrustedLocked(auditPath string, auditSize int64) (bo
 	return found && id == idx.checkpointLastEventID, nil // event ID 不符 → false
 }
 
-// resetTurnFilesLocked：呼叫端須持有 idx.mu。刪除 idx.dir 下所有既有
-// *.turns.jsonl——只在 checkpoint 被判定不可信、即將整份重掃時呼叫，避免
-// 重掃寫出的 turn record 疊加在舊內容之上造成重複。
+// resetTurnFilesLocked：呼叫端須持有 idx.mu。把 idx.dir 下所有既有
+// *.turns.jsonl **quarantine**（改名搬移，非刪除）——§3.5.6 凍結用字是
+// 「quarantine」：索引本身可從 audit 完全重建，遺失不算資料遺失，但保留損
+// 壞／不可信的舊檔是明文要求的診斷與復原通知資產，Task 18 落實完整分級處
+// 置時可以直接沿用這個搬移動作，不必先拆掉刪除邏輯。只在 checkpoint 被判
+// 定不可信、即將整份重掃時呼叫，避免重掃寫出的 turn record 疊加在舊內容之
+// 上造成重複。
+//
+// quarantine 檔名帶奈秒時間戳只為了同一秒內對同一 wsid 觸發多次時仍保持唯
+// 一，不是供程式解析用的正式格式；解析／復原通知是 Task 18 範圍。
 func (idx *Index) resetTurnFilesLocked() error {
 	matches, err := filepath.Glob(filepath.Join(idx.dir, "*.turns.jsonl"))
 	if err != nil {
 		return fmt.Errorf("replayindex: glob turn files: %w", err)
 	}
 	for _, p := range matches {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("replayindex: remove stale turn file %s: %w", p, err)
+		quarantined := fmt.Sprintf("%s.quarantine-%d", p, time.Now().UnixNano())
+		if err := os.Rename(p, quarantined); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("replayindex: quarantine stale turn file %s: %w", p, err)
 		}
 	}
 	return nil
@@ -228,39 +258,45 @@ func (idx *Index) rescanFromLocked(auditPath string, from int64) error {
 	return idx.writeCheckpointFile()
 }
 
-// lineEventIDEndingAt：從 auditPath 開頭逐行掃描，找出「行的結尾恰好落在
-// target offset」的那一行，回傳其 event id。找不到（target 不在任何行邊界
-// 上，或掃到檔尾仍未到達）回傳 found=false、非錯誤——由呼叫端決定這代表
-// checkpoint 不可信，不是硬性 I/O 失敗。
+// lineEventIDEndingAt：找出 auditPath 中「行的結尾恰好落在 target offset」
+// 的那一行、回傳其 event id。**O(1) 相對檔案總大小**——只讀 target 之前最多
+// maxLineWindow bytes（見該常數說明），不從頭掃整份 audit：重啟驗證 checkpoint
+// 若退化成又一次全掃 events.jsonl，就違背了 replayindex 存在的理由（讓重啟
+// 不必全掃）。找不到（target 不在任何行邊界上，或該行無法解析）回傳
+// found=false、非錯誤——由呼叫端決定這代表 checkpoint 不可信，不是硬性 I/O
+// 失敗。
 func lineEventIDEndingAt(auditPath string, target int64) (id string, found bool, err error) {
-	f, err := os.Open(auditPath)
+	if target <= 0 {
+		return "", false, nil
+	}
+	f, err := openAuditFile(auditPath)
 	if err != nil {
 		return "", false, fmt.Errorf("replayindex: open audit %s: %w", auditPath, err)
 	}
 	defer f.Close()
 
-	r := bufio.NewReader(f)
-	var cur int64
-	for {
-		line, rerr := r.ReadBytes('\n')
-		if n := int64(len(line)); n > 0 {
-			end := cur + n
-			if end == target {
-				var env contract.Envelope
-				if jerr := json.Unmarshal(bytes.TrimRight(line, "\n"), &env); jerr != nil {
-					return "", false, nil // 該行本身無法解析：視為對不上，不是硬錯
-				}
-				return env.EventID, true, nil
-			}
-			if end > target {
-				return "", false, nil // target 沒有落在任何行邊界上
-			}
-			cur = end
-		}
-		if rerr != nil {
-			return "", false, nil // 掃到檔尾仍未到 target
-		}
+	windowStart := target - maxLineWindow
+	if windowStart < 0 {
+		windowStart = 0
 	}
+	buf := make([]byte, target-windowStart)
+	if _, err := f.ReadAt(buf, windowStart); err != nil {
+		return "", false, nil // window 讀不滿（例如 target 超過檔案長度）：視為對不上
+	}
+	if buf[len(buf)-1] != '\n' {
+		return "", false, nil // target 沒有落在行邊界上
+	}
+	body := buf[:len(buf)-1] // 去掉行尾換行
+	// 找 body 內最後一個換行——其後到 body 結尾就是 target 對應的那一整行。
+	// windowStart 可能切在更早一行的中間，但那不影響這裡：我們只在乎「最後
+	// 一個」換行之後的內容，不需要 window 起點恰好對齊行邊界。
+	lineStart := bytes.LastIndexByte(body, '\n')
+	line := body[lineStart+1:]
+	var env contract.Envelope
+	if jerr := json.Unmarshal(line, &env); jerr != nil {
+		return "", false, nil // 該行本身無法解析（可能是超長行被 window 切斷）：視為對不上
+	}
+	return env.EventID, true, nil
 }
 
 // eventIDAtOffset：讀取 auditPath 在 offset 處起始的那一行、回傳其 event id

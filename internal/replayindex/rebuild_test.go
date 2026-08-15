@@ -1,6 +1,7 @@
 package replayindex
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -72,9 +73,12 @@ func (r *seedRig) done(wsid, id string) {
 	r.write(contract.Envelope{EventID: id, Kind: string(contract.KindStateChange), State: string(contract.StateDone), WorkspaceSessionID: wsid})
 }
 
-// seedAuditWithTurns：建出一組 (index dir, audit path)，audit 含 wsid "w1"
-// 依序 n 個完整 turn（user → delta → done），dir 是完全跟上 audit 的 index
-// （checkpoint＋w1.turns.jsonl 皆反映全部 n 個 turn）。
+// seedAuditWithTurns：建出一組 (index dir, audit path)，audit 交錯 wsid "w1"
+// 與 "w2" 各自 n 個完整 turn；每個 turn k 是 w1 開、w2 開、w1 delta、w2
+// delta、w2 收尾、w1 收尾——兩個 WSID 在收尾前同時各自開著 turn、各自累積
+// 事件，模擬 brief 強調的「checkpointOffset 是單一全域欄位，落後量是所有
+// open turn 累積量之和」，不只是單一 WSID 的單一 turn。dir 是完全跟上 audit
+// 的 index（checkpoint＋w1.turns.jsonl／w2.turns.jsonl 皆反映全部 n 個 turn）。
 func seedAuditWithTurns(t *testing.T, n int) (dir, auditPath string) {
 	t.Helper()
 	tmp := t.TempDir()
@@ -83,9 +87,12 @@ func seedAuditWithTurns(t *testing.T, n int) (dir, auditPath string) {
 	r := newSeedRig(t, dir, auditPath)
 	for k := 0; k < n; k++ {
 		base := fmt.Sprintf("t%d", k)
-		r.userMsg("w1", "user-"+base)
-		r.delta("w1", "delta-"+base)
-		r.done("w1", "done-"+base)
+		r.userMsg("w1", "w1-user-"+base)
+		r.userMsg("w2", "w2-user-"+base) // w1 turn 仍開著時，w2 也開了一個 turn
+		r.delta("w1", "w1-delta-"+base)
+		r.delta("w2", "w2-delta-"+base)
+		r.done("w2", "w2-done-"+base)
+		r.done("w1", "w1-done-"+base)
 	}
 	return dir, auditPath
 }
@@ -202,6 +209,9 @@ func firstEventIDAt(t *testing.T, path string, off int64) string {
 	return env.EventID
 }
 
+// TestIndexBehindIsCaughtUp：落後補掃須跨 w1／w2 兩個 WSID 各自重建，不是
+// 只顧單一 WSID——checkpointOffset 是單一全域欄位，crash 前若兩個 WSID 都
+// 只確實持久化到各自第 1 個 turn，補掃必須把兩者都追回全部 3 個 turn。
 func TestIndexBehindIsCaughtUp(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 3)
 	i, err := Open(dir)
@@ -209,20 +219,29 @@ func TestIndexBehindIsCaughtUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	truncateIndexTo(t, dir, "w1", 1)
+	truncateIndexTo(t, dir, "w2", 1)
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
 	}
 	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
-		t.Fatalf("落後必須補掃：%d", len(turns))
+		t.Fatalf("落後必須補掃（w1）：%d", len(turns))
+	}
+	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 3 {
+		t.Fatalf("落後必須補掃（w2）：%d", len(turns))
 	}
 }
 
+// TestIndexAheadIsRepaired：不可信 checkpoint 觸發的全量重建同樣須跨多個
+// WSID 正確重建，且既有的 *.turns.jsonl 必須被 quarantine（改名保留、非刪
+// 除，§3.5.6 用字），不是直接消失。
 func TestIndexAheadIsRepaired(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 2)
 	i, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	staleW1 := filepath.Join(dir, "w1.turns.jsonl")
+	staleW2 := filepath.Join(dir, "w2.turns.jsonl")
 	writeBogusCheckpoint(t, dir, 1<<30, "e-nonexistent")
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
@@ -231,10 +250,127 @@ func TestIndexAheadIsRepaired(t *testing.T) {
 	if off > auditSize(t, audit) || last == "e-nonexistent" {
 		t.Fatalf("超前的不可信 checkpoint 未修復：%d %s", off, last)
 	}
-	// 修復後仍應保有兩個完整 turn（不可信重建須以「丟棄舊快取＋全量重掃」
-	// 完成，不能留下 0 筆或重複筆數）。
+	// 修復後仍應保有兩個 WSID 各兩個完整 turn（不可信重建須以「丟棄舊快取
+	// ＋全量重掃」完成，不能留下 0 筆、遺漏其中一個 WSID，或重複筆數）。
 	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 2 {
-		t.Fatalf("超前修復後應精確重建 2 個 turn、不重複不遺漏：%d", len(turns))
+		t.Fatalf("超前修復後應精確重建 2 個 turn、不重複不遺漏（w1）：%d", len(turns))
+	}
+	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 2 {
+		t.Fatalf("超前修復後應精確重建 2 個 turn、不重複不遺漏（w2）：%d", len(turns))
+	}
+	// 舊的 turns.jsonl 內容必須被 quarantine（改名保留一份），不是直接被
+	// 刪除、憑空消失（§3.5.6）——原檔名之後會被全量重掃重新建立（內容是
+	// 剛剛驗證過的、正確的 2 個 turn），所以不斷言原檔名不存在，只斷言舊
+	// 內容有被搬移保留一份。
+	quarantined, err := filepath.Glob(staleW1 + ".quarantine-*")
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("應留下唯一一份 w1 quarantine 檔：matches=%v err=%v", quarantined, err)
+	}
+	if quarantined2, err := filepath.Glob(staleW2 + ".quarantine-*"); err != nil || len(quarantined2) != 1 {
+		t.Fatalf("應留下唯一一份 w2 quarantine 檔：matches=%v err=%v", quarantined2, err)
+	}
+}
+
+// writeRawAuditEvents：直接以純檔案 I/O 寫入 n 筆合法 JSONL 事件到 path（不
+// 經過 seedRig／Index，不觸發任何 checkpoint 落盤）——只為快速產生一個遠大
+// 於 maxLineWindow 的 audit 檔，避免 TestCheckpointVerificationDoesNotScanWholeFile
+// 為了造出夠大的檔案而付出 seedRig 逐筆 Observe（含每個 boundary 都做一次
+// atomic rename 落盤）的開銷。回傳最後一筆事件的 EndOffset／EventID，供呼叫
+// 端組出對應的 checkpoint.json。
+func writeRawAuditEvents(t *testing.T, path string, n int) (lastEndOffset int64, lastEventID string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	var offset int64
+	for k := 0; k < n; k++ {
+		id := fmt.Sprintf("e-%d", k)
+		env := contract.Envelope{
+			EventID: id, Kind: string(contract.KindStateChange),
+			State: string(contract.StateDone), WorkspaceSessionID: "w1",
+		}
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := fmt.Fprintf(w, "%s\n", b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset += int64(n)
+		lastEndOffset = offset
+		lastEventID = id
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	return lastEndOffset, lastEventID
+}
+
+// countingAuditFile：包住真實 *os.File、累計 ReadAt 實際讀到的 byte
+// 數——供 TestCheckpointVerificationDoesNotScanWholeFile 量測 checkpoint 驗
+// 證的真實 I/O 量，不是靠猜測或計時。
+type countingAuditFile struct {
+	f         *os.File
+	bytesRead int64
+}
+
+func (c *countingAuditFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := c.f.ReadAt(p, off)
+	c.bytesRead += int64(n)
+	return n, err
+}
+
+func (c *countingAuditFile) Close() error { return c.f.Close() }
+
+// TestCheckpointVerificationDoesNotScanWholeFile：mutation 驗證（Important
+// #2）——checkpoint 驗證只應讀 target 附近的 window，讀取量必須遠小於整份
+// audit 檔案大小、且不超過 maxLineWindow。若日後有人把 lineEventIDEndingAt
+// 改回「從 offset 0 逐行掃到 target」的寫法，這則測試會直接爆掉：那正是
+// replayindex 存在的理由本身（讓重啟不必全掃 events.jsonl）。
+func TestCheckpointVerificationDoesNotScanWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "events.jsonl")
+	lastEnd, lastID := writeRawAuditEvents(t, auditPath, 30000)
+	writeCheckpointFileForTest(t, dir, lastEnd, lastID, nil)
+
+	total := auditSize(t, auditPath)
+	if total <= maxLineWindow {
+		t.Fatalf("測試前提不成立：audit 檔（%d bytes）必須大於 maxLineWindow（%d bytes）才能證明 O(1)", total, maxLineWindow)
+	}
+
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var opened *countingAuditFile
+	orig := openAuditFile
+	openAuditFile = func(path string) (auditFile, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		opened = &countingAuditFile{f: f}
+		return opened, nil
+	}
+	t.Cleanup(func() { openAuditFile = orig })
+
+	if err := i.VerifyOrRebuild(auditPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if opened == nil {
+		t.Fatal("checkpoint 驗證應透過 openAuditFile 開檔（測試前提未成立）")
+	}
+	if opened.bytesRead >= total {
+		t.Fatalf("checkpoint 驗證讀取量應遠小於檔案大小（O(1) 相對檔案大小），實際讀了 %d／總共 %d bytes", opened.bytesRead, total)
+	}
+	if opened.bytesRead > maxLineWindow {
+		t.Fatalf("checkpoint 驗證讀取量不應超過 maxLineWindow：%d > %d", opened.bytesRead, int64(maxLineWindow))
 	}
 }
 
