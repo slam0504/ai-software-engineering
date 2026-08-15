@@ -1495,13 +1495,27 @@ func (a *App) stopPlanWatch() {
 // 契約，不是實作細節。
 //
 // **與 spec 的一處對齊（M3b Task 24）**：Codex wire log 的 finalize 原本排在
-// Manager.Close **之後**，現改為之前，理由是 finalize 那一步會先 terminate 共用
-// app-server；若 Manager 已關閉，關閉期間最後那批 frame 所導出的事件（dispatcher
-// 的歸屬失敗 fail-loud、shutdown notification、in-flight response）只會拿到
-// 「manager closed: event dropped」的 UI 通知，永遠進不了 audit。Manager.Close 必須
-// 排在**所有事件生產者都已停止**之後，這也正是原本註解寫的「全部 finalize 之後才關
-// sink」的本意。反向依賴不存在：FinalizeWith 只寫自己的 wire log 檔與 meta，不經過
-// Manager。
+// Manager.Close **之後**，現改為之前。理由是 finalize 那一步會先 terminate 共用
+// app-server，所以它是**事件生產者**，必須排在 sink 關閉之前——這也正是原本註解
+// 寫的「全部 finalize 之後才關 sink」的本意。
+//
+// 修掉的**不是** wire log 本身（§3.4.2「關閉期間最後的 frame 不得漏錄」在兩種順序
+// 下都成立：完整性由 FinalizeWith 內部的 drain→detach→finalize 自己保證，與
+// Manager.Close 的相對位置無關），而是**由那批 frame 導出的 events.jsonl 稽核事件**：
+// Manager 關閉後 emitCodexBroadcast／emitCodexUnknownBroadcast／Manager.Emit 一律走
+// emitClosedDroppedLocked——只發一則 UI stream_error、不寫 sink。（歸屬失敗那一類另有
+// failLoudCodexDispatch 自己的 a.audit，走獨立的 audit.jsonl，不受影響。）
+//
+// 新順序有 happens-before 保證、不只是「比較合理」：Conn.readLoop 把 notification
+// handler **同步**跑在 readLoop goroutine 上，而 FinalizeWith 的 drainStdout 等的正是
+// Conn.Done()（readLoop 讀到 EOF 才關）——所以 FinalizeWith 返回時，末段 frame 的
+// dispatcher 回呼都已經返回，那些事件必然落在 Manager.Close() 之前。
+//
+// （已知殘留：OnServerRequest 走 `go c.handleServerRequest(...)`，那條 approval
+// goroutine 仍可能在 Manager.Close() 之後 emit。修它要動 internal/codex，不在本 task
+// 範圍。）
+//
+// 反向依賴不存在：FinalizeWith 只寫自己的 wire log 檔與 meta，不經過 Manager。
 //
 // 收斂上界（**不隨 session 數放大**）：
 //   - interrupt／terminate ≤ 5s：Claude 的 proc.Terminate 非阻塞（SIGTERM 後由
@@ -1531,8 +1545,16 @@ func (a *App) shutdown(ctx context.Context) {
 	a.inflight.Wait()       // 2e) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
 	a.shutdownStep("stop_watchers")
 
-	// 3) snapshot：host 與 pending approval 各取一份快照，之後的每一步都用這兩份
-	// ——先拒新交易、再快照，快照之後不可能有新的 host 或新的 approval 進來。
+	// 3) snapshot：host 與 pending approval 各取一份快照，之後的每一步都用這兩份。
+	//
+	// 兩份快照的完整性保證**不同，不要混為一談**：
+	//   - host：先拒新交易（reject_new_txn）再快照，之後不可能有新的 host 進來
+	//     ——建立 host 的入口一律經 beginAppTxn。
+	//   - approval：**沒有這個保證**。registerApproval 的兩條來源（Claude 的
+	//     pumpApprovals、Codex 的 OnServerRequest → codexApproval）都不經
+	//     shuttingDown 閘門，快照之後仍可能登記新的 approval，那些不會拿到下一步
+	//     的顯式 deny。它們仍是 fail-closed，但兜底的是各自的 broker／RPC timeout
+	//     與子行程退出，不是這裡的 deny。
 	hosts := a.snapshotHosts()
 	apprIDs := a.pendingApprovalIDs(nil)
 	a.shutdownStep("snapshot")
@@ -1724,9 +1746,10 @@ func (a *App) forcedShutdown(hosts []*sessionHost) error {
 		}()
 	}
 	wg.Wait() // 每一邊都必須被等待
-	// 全部 Codex session host 收乾（§3.6.5 的第 7 步）——共用 app-server 的
-	// terminate／wait 必須排在這之後，呼叫端接著就做那一步。這裡一併等 Claude
-	// 側收斂：兩者都是同一個 WaitGroup，且 Manager.Close 本來就得等全部 host。
+	// 步驟名是 §3.6.5 的凍結字串（第 7 步「全部 Codex session host 收完」），但這裡
+	// **實際等的是全部 host、含 Claude**——單一 WaitGroup，Codex 收乾必然涵蓋其中。
+	// 刻意不拆成兩個 WaitGroup 只為讓 Claude 與共用 app-server 收尾重疊那幾秒：多一
+	// 份狀態、換不到 bounded window 的改善（Manager.Close 本來就得等全部 host）。
 	a.shutdownStep("codex_hosts_done")
 	return errors.Join(errs...)
 }
