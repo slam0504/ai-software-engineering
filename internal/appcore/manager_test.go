@@ -986,7 +986,7 @@ func TestPumpQuiesceBeforeNewSession(t *testing.T) { // 晚到事件不進新 ta
 	ch <- contract.Event{Provider: p, Kind: contract.KindDelta, Raw: []byte("{}")}
 	ch <- contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")}
 	close(ch) // provider 收尾（EndSession 的 Close → EOF）
-	if err := WaitQuiesce(done, 5*time.Second); err != nil {
+	if err := WaitQuiesce(done, 5*time.Second, RealAfter); err != nil {
 		t.Fatal(err)
 	}
 	m.NewSession(p, "new-task") // quiesce 完成後才換代
@@ -1005,11 +1005,11 @@ func TestPumpQuiesceBeforeNewSession(t *testing.T) { // 晚到事件不進新 ta
 func TestWaitQuiesceTimeout(t *testing.T) {
 	ch := make(chan contract.Event)
 	done := Pump(ch, func(contract.Event) {})
-	if err := WaitQuiesce(done, 50*time.Millisecond); err == nil { // channel 未關 → 逾時
+	if err := WaitQuiesce(done, 50*time.Millisecond, RealAfter); err == nil { // channel 未關 → 逾時
 		t.Fatal("quiesce must time out when pump still running")
 	}
 	close(ch)
-	if err := WaitQuiesce(done, time.Second); err != nil {
+	if err := WaitQuiesce(done, time.Second, RealAfter); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1036,7 +1036,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	var finExit ports.Exit
 	ex, err := CloseSequence(log("close"), done, time.Second, time.Second, log("terminate"),
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 0} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err != nil || !ex.Exited || ex.Code != 0 || !finExit.Exited || finExit.Code != 0 {
 		t.Fatalf("normal: %v %+v %+v", err, ex, finExit)
 	}
@@ -1051,7 +1051,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	ex, err = CloseSequence(log("close"), hung, 30*time.Millisecond, 5*time.Second,
 		func() error { mu.Lock(); calls = append(calls, "terminate"); mu.Unlock(); return nil },
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 143} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "quiesce timeout") { // timeout 不被吞
 		t.Fatalf("quiesce timeout must surface: %v", err)
 	}
@@ -1069,7 +1069,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	_, err = CloseSequence(log("close"), stuck, 20*time.Millisecond, 30*time.Millisecond,
 		log("terminate"),
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "did not quiesce") {
 		t.Fatalf("stuck path must error: %v", err)
 	}

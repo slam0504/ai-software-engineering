@@ -262,6 +262,11 @@ type App struct {
 	hookForcedShutdownClaudeBeforeFlow func() // 測試注入：forcedShutdown 的 sess.Terminate() 之後、呼叫 EndSessionFlow 之前
 	hookForcedShutdownClaudeBenign     func() // 測試注入：forcedShutdown 判定 ErrEndInProgress 為 benign、等待收斂之前
 
+	// afterFn：claudeTeardown 的 appcore.CloseSequence 等待來源，nil = appcore.RealAfter
+	// （production）。測試覆寫成受控 timer，讓 shutdown quiesce/kill 逾時測試不必依賴牆鐘
+	// （Task 21；為 Task 24 bounded-window barrier 鋪路）。
+	afterFn appcore.After
+
 	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
 	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
 	// （gitignored app state；不隨測試覆寫的 stateDir 漂移，永遠綁 workspace 本身）。
@@ -4150,6 +4155,15 @@ func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
 	return gen.correlationID, err
 }
 
+// after：claudeTeardown 的 appcore.CloseSequence 等待來源，nil（production）
+// 回 appcore.RealAfter；測試以 afterFn 注入受控 timer（見 App 欄位 doc）。
+func (a *App) after() appcore.After {
+	if a.afterFn != nil {
+		return a.afterFn
+	}
+	return appcore.RealAfter
+}
+
 // newAssistRunner：production 造 provider 專屬隔離 one-shot Runner；測試以
 // assistRunnerFactory 注入 fake。
 func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
@@ -4938,7 +4952,7 @@ func (a *App) claudeTeardown(host *sessionHost) func() error {
 			return nil
 		}
 		ex, err := appcore.CloseSequence(host.sess.Close, host.pumpDone, 5*time.Second, 10*time.Second,
-			host.sess.Terminate, host.sess.Wait, fin)
+			host.sess.Terminate, host.sess.Wait, fin, a.after())
 		// take-then-dispose（見 dropHost doc）：先把 host 自 registry 取出——之後
 		// 沒有新讀者能拿到它——才在鎖外處置。identity check 保證不會誤刪同一
 		// WSID 上已換代的新 host；broker 與 socket 槽位都是本 host 自己的，無論

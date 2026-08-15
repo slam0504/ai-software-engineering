@@ -20,12 +20,19 @@ func Pump(events <-chan contract.Event, emit func(contract.Event)) <-chan struct
 	return done
 }
 
+// After 是可注入的等待來源；production 傳 RealAfter，測試傳受控 timer
+// （見 Task 24 的 bounded-window barrier）。
+type After func(d time.Duration) <-chan time.Time
+
+// RealAfter 是 After 的 production 實作，直接轉呼叫 time.After。
+func RealAfter(d time.Duration) <-chan time.Time { return time.After(d) }
+
 // WaitQuiesce 等 pump 結束；逾時回 error（呼叫端據此升級 Terminate）。
-func WaitQuiesce(done <-chan struct{}, timeout time.Duration) error {
+func WaitQuiesce(done <-chan struct{}, timeout time.Duration, after After) error {
 	select {
 	case <-done:
 		return nil
-	case <-time.After(timeout):
+	case <-after(timeout):
 		return errors.New("appcore: pump quiesce timeout")
 	}
 }
@@ -41,13 +48,13 @@ func WaitQuiesce(done <-chan struct{}, timeout time.Duration) error {
 func CloseSequence(closeFn func() error, done <-chan struct{},
 	quiesceTimeout, killTimeout time.Duration,
 	terminate func() error, wait func() ports.Exit,
-	finalize func(ports.Exit) error) (ports.Exit, error) {
+	finalize func(ports.Exit) error, after After) (ports.Exit, error) {
 	closeErr := closeFn()
-	qErr := WaitQuiesce(done, quiesceTimeout) // 原始 timeout 一律保留
+	qErr := WaitQuiesce(done, quiesceTimeout, after) // 原始 timeout 一律保留
 	var termErr error
 	if qErr != nil {
 		termErr = terminate()
-		if killErr := WaitQuiesce(done, killTimeout); killErr != nil {
+		if killErr := WaitQuiesce(done, killTimeout, after); killErr != nil {
 			// pump 卡死：wait() 可能同樣阻塞——以 Exit{Exited:false} 盡力 finalize
 			unknown := ports.Exit{Exited: false}
 			finErr := finalize(unknown)
