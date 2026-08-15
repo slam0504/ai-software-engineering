@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
+	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
 
@@ -300,5 +307,154 @@ func TestRemoveXNewShareOwnershipToken(t *testing.T) {
 	// hookRemoveHoldingToken 的窗口內被跳過。
 	if h := a.hostFor(victim); h != nil {
 		t.Fatalf("teardown 之後 host 必須已從 registry 移除：%+v", h)
+	}
+}
+
+// ---- M3b Task 23：待核可時移除——全部 deny＋部分失敗保留 dormant slot（§3.6.3）----
+//
+// denyApprovalsForRemove／cleanupRemovedFiles 本身已在 Task 22（9efd9f3／
+// 23f59f6）落地；這裡補的是 Task 22 沒寫到的兩個行為：(1) 多筆 pending
+// approval 必須「每一筆都被嘗試」而不是處理第一筆就代表全部，(2) 其中一筆
+// deny 失敗時，best-effort 仍要跑完（errors.Join 回傳、teardown／lease
+// finalize 照常、slot 保留）。
+
+// seedPendingApprovals：seedApproval（app_claude_multi_test.go）的多筆版本，走
+// 真實 broker／socket——用於「全部成功」情境，才需要真的驗到 broker 端收到
+// n 筆決定回覆；「部分失敗」情境改用 registerApproval 直接注入（見下方
+// TestPartialDenyFailureKeepsDormantSlot 的 doc，理由是逾時／goroutine 洩漏
+// 風險）。回傳依 id 字串排序後的清單——與 denyApprovalsForRemove 內部
+// slices.Sort 的走訪順序一致，方便斷言處理順序。
+func seedPendingApprovals(t *testing.T, a *App, w appcore.WSID, n int) []string {
+	t.Helper()
+	h := a.hostFor(w)
+	if h == nil {
+		t.Fatalf("no session host for %s", w)
+	}
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("appr-%s-%d", w, i)
+		ids[i] = id
+		go func(id string) { // client 端等裁決回覆才收線，同 seedApproval
+			conn, err := net.Dial("unix", h.sockPath)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			b, _ := json.Marshal(approval.Request{ID: id, ToolName: "Bash",
+				Input: json.RawMessage(`{"command":"ls"}`)})
+			if _, werr := conn.Write(append(b, '\n')); werr != nil {
+				return
+			}
+			var d approval.Decision
+			_ = json.NewDecoder(bufio.NewReader(conn)).Decode(&d)
+		}(id)
+	}
+	for _, id := range ids {
+		waitFor(t, "approval "+id+" registered", func() bool { return a.pendingByID(id) != nil })
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// TestRemoveDeniesAllPendingApprovalsAndCleansFiles（§3.6.3／§3.3）：
+// TestRemoveDeniesPendingApprovals（Task 22）只驗過單筆——n=1 測不出「每一筆
+// 都要被 deny」，一筆處理完迴圈本來就結束了。這裡把待核可數量拉到 3，同時把
+// TestRemoveCleansUpPerWSIDMCPConfig 沒驗過的 socket 檔（broker.Close() 內建
+// unlink）一併釘住——risk item 3 原文明確點名「socket／MCP config 的檔案數與
+// 清理」兩者，之前的測試只驗了後者。
+func TestRemoveDeniesAllPendingApprovalsAndCleansFiles(t *testing.T) {
+	a, ui := newTestApp(t)
+	w := mustCreate(t, a, "claude")
+	mustStartClaude(t, a, w)
+	h := a.hostFor(w)
+	sockPath, mcpPath := h.sockPath, h.mcpPath
+	ids := seedPendingApprovals(t, a, w, 3)
+
+	if err := a.RemoveSession(string(w)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if pa := a.pendingByID(id); pa != nil {
+			t.Fatalf("移除必須清空待核可登記 %s：%+v", id, pa)
+		}
+	}
+	var denyCount int
+	for _, env := range ui.findEnvKind("approval_decision") {
+		if env.WorkspaceSessionID == string(w) && env.Text == "deny" && env.Thinking == "session_removed" {
+			denyCount++
+		}
+	}
+	if denyCount != 3 {
+		t.Fatalf("3 筆待核可都必須以 reason=session_removed fail-closed deny 送出決定事件：got %d", denyCount)
+	}
+	for _, p := range []string{sockPath, mcpPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("移除必須清除 per-WSID 檔案 %s（§3.3）", p)
+		}
+	}
+}
+
+// TestPartialDenyFailureKeepsDormantSlot（§3.6.2／§3.6.3）：deny_approvals 是
+// best-effort——單筆失敗不得讓其餘筆數陪葬（提早中斷），也不得讓移除因此靜默
+// 假裝成功。用 registerApproval 直接注入（略過真實 broker／socket）：這條測
+// 的是 denyApprovalsForRemove 的 orchestration（逐筆 recover＋errors.Join），
+// 不是 broker 接線本身——後者已由 TestRemoveDeniesAllPendingApprovalsAndCleansFiles
+// 覆蓋。若走真實 socket，被跳過那筆的 client 會卡在 broker 逾時（預設 120s）
+// 才收到回覆，讓測試不必要地慢，且該 goroutine 在 host teardown 之後仍會留著
+// 等逾時（broker.Close() 只停止 accept，不強制關已建立的連線）。
+//
+// removability gate（Task 22 review round-2，Manager.Removable）跑在 deny 之
+// 前——先顯式呼叫一次確認 gate 這裡真的放行，確定這條測試測到的是 deny 分
+// 支本身，不是被 gate 擋在門口就直接失敗（gate 擋下的情境已有
+// TestRemoveGateBlocksSideEffectsWhenNotRemovable 覆蓋，兩者不得混淆）。
+func TestPartialDenyFailureKeepsDormantSlot(t *testing.T) {
+	a, _ := newTestApp(t)
+	w := mustCreate(t, a, "claude")
+	mustStartClaude(t, a, w)
+	if err := a.manager.Removable(w); err != nil {
+		t.Fatalf("前置條件：gate 必須先放行，測的才是 deny 分支：%v", err)
+	}
+
+	const n = 3
+	ids := make([]string, n)
+	attempted := make([]atomic.Bool, n)
+	for i := 0; i < n; i++ {
+		i := i
+		id := fmt.Sprintf("appr-%s-%d", w, i)
+		ids[i] = id
+		a.registerApproval(id, w, "claude", func(allow bool, reason string) error {
+			attempted[i].Store(true)
+			if i == 1 { // 中間那筆注入失敗——若實作在第一個錯誤就中斷，index 2 測得出來
+				return errors.New("deny failed: injected test failure")
+			}
+			return nil
+		})
+	}
+
+	err := a.RemoveSession(string(w))
+	if err == nil {
+		t.Fatal("deny 部分失敗不得靜默移除")
+	}
+	if !strings.Contains(err.Error(), "deny failed") {
+		t.Fatalf("錯誤未完整 Join（看不到被注入的失敗原因）：%v", err)
+	}
+	for i, id := range ids { // 每一筆都必須被嘗試——不得在第一個錯誤就中斷
+		if !attempted[i].Load() {
+			t.Fatalf("approval %s（index %d）未被嘗試 deny", id, i)
+		}
+		if pa := a.pendingByID(id); pa != nil {
+			t.Fatalf("approval %s 即使 deny 失敗，也必須從 pending 移除（不得卡死 UI）：%+v", id, pa)
+		}
+	}
+
+	if h := a.hostFor(w); h != nil {
+		t.Fatal("deny 部分失敗時仍須完成 teardown（§3.6.3）：host 必須已收尾")
+	}
+	if got := a.manager.SlotCount("claude"); got != 1 {
+		t.Fatalf("必須保留 dormant slot 供重試移除：%d", got)
+	}
+	e, ok := a.wsReg.Get(string(w))
+	if !ok || e.RemovedAt != "" {
+		t.Fatalf("未成功移除時 registry entry 必須保留且不得標 tombstone：ok=%v entry=%+v", ok, e)
 	}
 }
