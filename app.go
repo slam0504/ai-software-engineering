@@ -768,7 +768,13 @@ func (a *App) providerResumeFallback(p contract.Provider) string {
 }
 
 // resumeWriteAllowed：該 WSID 還能不能把自己的 session id 寫回 provider-keyed 的
-// restore.json。**已 tombstone 的 WSID 一律不得寫**。
+// restore.json——registry 說它已 tombstone 就拒絕。
+//
+// **這是收窄，不是完全消除**：本函式讀 registry 到呼叫端實際 CommitResume 之間
+// 仍是 check-then-act，RemoveSession 可以整個插進來（tombstone ＋ ClearResume 都
+// 做完），舊 id 又被寫回去。這個窗口比下面那條序列窄得多，且與 §3.6.2 已登記的
+// 殘餘 TOCTOU 同源——徹底關閉需要一個獨立的 removing phase（會動到 phase 狀態
+// 機），已裁決超出範圍。
 //
 // 沒有這道 guard 的可達序列（Task 26 review round-3）：RemoveSession 的 TOCTOU
 // 殘餘窗口下，併發的 StartSession 會在 tombstone 之後才替該 WSID 掛上 host，

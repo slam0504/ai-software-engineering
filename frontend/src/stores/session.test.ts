@@ -390,18 +390,21 @@ describe('session store：registry hydrate（registry × working slot）', () =>
     expect(s.sessions['w1']).toMatchObject({ provider: 'claude', taskLabel: 'a', resume: 's1', available: true })
     expect(s.sessions['w2'].available).toBe(false)
     expect(s.sessionList.map(m => m.wsid)).toEqual(['w1', 'w2'])
-    // slot phase 必須帶進來：SessionList／StatusBar 顯示的就是它，丟掉會讓
-    // 重啟後每個 session 都顯示成預設的 idle（含正在 ending 的）。
+    // state 必須帶進來：SessionList／StatusBar 顯示的就是它，丟掉會讓重啟後每個
+    // session 都顯示成 newMeta 的預設值。值域是 reducer 的 SessionState
+    // （idle／waiting／streaming／tool_running／awaiting_approval／…），與
+    // conversation lane 的 state_change 同源——**不是** Manager 內部的 slot
+    // phase（starting／active／ending，沒有對外出口，production 不會出現在這裡）。
     expect(s.sessions['w1'].state).toBe('idle')
-    expect(s.sessions['w2'].state).toBe('') // 無 slot：不假造 phase
+    expect(s.sessions['w2'].state).toBe('') // 無 slot：不假造狀態
   })
 
-  it('hydrateSessions 帶入非 idle 的 slot phase', () => {
+  it('hydrateSessions 帶入非 idle 的 reducer 狀態', () => {
     const s = useSession()
     s.hydrateSessions([
-      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: '', created_at: '', available: true, state: 'ending' },
+      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: '', created_at: '', available: true, state: 'awaiting_approval' },
     ])
-    expect(s.sessions['w1'].state).toBe('ending')
+    expect(s.sessions['w1'].state).toBe('awaiting_approval')
   })
 
   it('不可操作的 session 不得被 submit', async () => {

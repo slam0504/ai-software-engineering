@@ -739,6 +739,12 @@ func TestRemoveFailsLoudWhenResumeClearFails(t *testing.T) {
 // session id 寫回 provider entry。TOCTOU 孤兒情境下 commitClaudeResume 的兩道
 // 既有 guard（hostFor==host、IsActive）都會通過，重啟後那個死掉的 id 會被全新
 // 建立的 session 繼承。
+//
+// **本測試守的是 commitClaudeResume 那一個寫入端**：不設 barrier 時 Accept 早於
+// init，`hostSessionID(host)` 在 Accept 當下是空字串，`CommitResume` 的
+// `if sessionID != ""` 讓 StartSession 那端根本沒寫到 id。StartSession 的兩個
+// 寫入端各自由下面兩支測試守（review round-4：三個呼叫點只有一個被 mutation
+// 守住，其餘兩個拿掉 guard 仍全綠）。
 func TestTombstonedWSIDCannotCommitResume(t *testing.T) {
 	a, ui := newTestApp(t)
 	reg := &stubRegistry{}
@@ -765,5 +771,75 @@ func TestTombstonedWSIDCannotCommitResume(t *testing.T) {
 	}
 	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
 		t.Fatalf("已 tombstone 的 WSID 不得寫回 resume（重啟後會被新 session 繼承）：%q", got)
+	}
+	if got := a.restore.Get("claude").TaskID; got != "" {
+		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
+	}
+}
+
+// review round-4：StartSession 的 **claude 分支**寫入端。init-before-Accept 正是
+// 那段 code 存在的理由（host.sessionID 先被 init 回填，Accept 成功後由
+// StartSession 補 commit）——以 hookAfterProviderStart 等到 init 回填才放行
+// Accept，這個寫入端才真的被執行到。
+func TestTombstonedWSIDCannotCommitResumeFromStartSession(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	writeInitClaude(t, a, "sess-X")
+
+	w := mustCreate(t, a, "claude")
+	if err := reg.Remove(string(w), "user_removed"); err != nil { // 孤兒：tombstone ＋ slot 還在
+		t.Fatal(err)
+	}
+	a.hookAfterProviderStart = func() { // Accept 之前先等 init 回填 host.sessionID
+		waitFor(t, "init 抵達（Accept 之前）", func() bool {
+			return a.hostSessionID(a.hostFor(w)) == "sess-X"
+		})
+	}
+	if err := a.StartSession(string(w), "hi", "", "", "task-x", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(w)) })
+
+	// 前提校驗：沒有 guard 的話這一刻確實會寫（host.sessionID 非空）
+	if got := a.hostSessionID(a.hostFor(w)); got != "sess-X" {
+		t.Fatalf("前提不成立：Accept 當下 host.sessionID 必須非空，got %q", got)
+	}
+	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
+		t.Fatalf("已 tombstone 的 WSID 不得由 StartSession 補寫 resume：%q", got)
+	}
+	if got := a.restore.Get("claude").TaskID; got != "" {
+		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
+	}
+}
+
+// review round-4：StartSession 的 **codex 分支**寫入端。threadID 恆非空，因此
+// 不需要 barrier——只要 guard 沒擋，CommitResume 一定會寫進去。
+func TestTombstonedWSIDCannotCommitResumeCodex(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+
+	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
+	if err := reg.Put(wsregistry.Entry{WSID: string(w), Provider: "codex",
+		CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Remove(string(w), "user_removed"); err != nil { // 孤兒
+		t.Fatal(err)
+	}
+	startCodexForTest(t, a, wire, conn, "", "task-x")
+	t.Cleanup(func() { _ = a.EndSession(string(w)) })
+
+	if h := a.hostFor(w); h == nil || h.runner == nil || h.runner.ThreadID() == "" {
+		t.Fatalf("前提不成立：codex host 必須已發布且 threadID 非空：%+v", h)
+	}
+	if got := a.restore.Get("codex").ResumeSessionID; got != "" {
+		t.Fatalf("已 tombstone 的 WSID 不得由 StartSession 補寫 codex resume：%q", got)
+	}
+	if got := a.restore.Get("codex").TaskID; got != "" {
+		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
 	}
 }
