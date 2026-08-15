@@ -21,12 +21,22 @@
 |---|---|---|---|---|
 | spec §5 條款（35） | 34 | 1 | – | – |
 | spec §6 實機驗收（10） | – | – | 1（A10） | 9 |
-| spec 前提／假設（1） | – | 1 | – | – |
+| spec §7 待驗證假設（5） | 3（§7.3／§7.4／§7.5，既有測試覆蓋，見 §2.8） | – | 1（§7.1＝A10） | 1（§7.2＝Task 0 probe 重跑） |
+| **本票新發現**的未受保護前提（1） | – | 1 | – | – |
 | 收尾 gate（4） | 4 | – | – | – |
+
+> **spec §7 那列與 §6 那列有重疊**：§7.1 就是 A10、§7.2 就是 Task 0 的 live probe，兩處各記一次
+> 是為了讓「spec 的五項待驗證假設逐項有交代」這件事看得見，不是兩份獨立成績。
+> **最後一列（single-instance guard）不在 spec §7 的五項之內**——它是本票從
+> `internal/appcore/sink.go` 的 doc 推出來的新發現，見 §3.2。
 
 > **本文件的判定規則**：只有「本次實際跑過並看到輸出」才記綠；「有測試但本次未跑」不記綠；
 > 「型別層有測試、production 沒有呼叫端」記**未覆蓋**，不記綠；「環境或外部限制導致無法執行」
 > 記無法執行並寫出阻塞原因與後續建議。
+>
+> **「綠 34」的精確含義**：34 條有**本次實跑通過**的對應測試，**不等於**這 34 條的守門力
+> 在本票被重新驗證過——後者需要把 Task 0-30 的 60+ 個 mutation 全部重跑（見 §4 末段的方法論說明）。
+> 本票只對新增的那一條做了完整 mutation 交叉矩陣。
 
 ---
 
@@ -38,7 +48,7 @@
 
 | Gate | 指令 | 結果 |
 |---|---|---|
-| Go | `go build ./... && go vet ./... && go test -race ./... -count=1` | ✅ 全綠（21 package；package main 117.8s） |
+| Go | `go build ./... && go vet ./... && go test -race ./... -count=1` | ✅ 全綠（`go list ./...` 共 **22** 個 package，其中 `cmd/probe-multiturn`／`internal/ports` 無測試檔 → **20 行 `ok`**；package main 117.8s） |
 | 前端測試 | `npm --prefix frontend run test` | ✅ 36 files / 326 tests passed（17.27s） |
 | 前端 build | `npm --prefix frontend run build` | ✅ built in 9.54s |
 | **`wails build`** | `wails build` | ✅ Built `build/bin/sdlc-workbench.app`（darwin/amd64，27.7s） |
@@ -94,7 +104,7 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 |---|---|---|---|---|
 | 3.1 | legacy migration 的 crash／restart 得到**相同 WSID**（原子持久化＋migration marker） | 自動化 | ✅ 綠 | `internal/wsregistry/migrate_test.go` `TestMigrateIsIdempotentAcrossRestart`、`TestMigrateRefusesWhenLiveEntriesExistWithoutMarker`；`app_restore_dormant_test.go` `TestLoadRegistryTriggersMigrationOnce`、`TestMigrationPersistFailureBlocksProviderStart` |
 | 3.2 | incomplete turn restart → `stream_error`＋failed，不殘留 busy／pending approval | 自動化 | ✅ 綠 | `app_startup_repair_test.go` `TestStartupRepairEmitsStreamErrorThenFailed`、`TestRepairCoversEveryIncompleteWSID`、`TestCompleteTurnIsNotRepaired` |
-| 3.3 | 啟動修復序列 crash 後重跑冪等、收斂到相同狀態 | 自動化 | ✅ 綠 | 同檔 `TestStartupRepairIsIdempotent`、`TestStartupRepairIsIdempotentAfterIndexLoss`、`TestStartupOrderIsFrozen`、`TestUIOpensOnlyAfterRepair` |
+| 3.3 | 啟動修復序列 crash 後重跑冪等、收斂到相同狀態 | 自動化 | ✅ 綠（**斷言維度是計數，見右**） | 同檔 `TestStartupRepairIsIdempotent`、`TestStartupRepairIsIdempotentAfterIndexLoss`、`TestStartupOrderIsFrozen`、`TestUIOpensOnlyAfterRepair`。**限制**：兩條冪等測試的斷言都是 `len(second) != len(first)`——抓得到「重複 append `stream_error`」這個主要失效形狀，但 spec 那句「**收斂到相同狀態**」的**內容面**（第二次跑出的事件是否逐筆等同）**沒有斷言**。`AfterIndexLoss` 變體補強的是「權威來源是 audit 而非 index」，斷言維度仍是計數。本票**不改測試**，只記錄這個邊界 |
 
 ### §5.4 移除與 shutdown（4 條）
 
@@ -121,7 +131,7 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 | # | 條款 | 驗證方式 | 結果 | 證據 |
 |---|---|---|---|---|
 | 6.1 | 雙 pane 已滿時，未釘選來源以 transient secondary presentation 顯示，persistent pin 不被改寫 | 自動化（vitest） | ✅ 綠 | `frontend/src/stores/session.test.ts`「未釘選來源以 transient 顯示…」「transient 期間第二筆 approval 不覆蓋原釘選的備份」；`frontend/src/components/ApprovalDialog.test.ts`「未釘選來源 transient 顯示於次要 pane，allow 後恢復原釘選」 |
-| 6.2 | 六種凍結觸發（allow／deny／timeout／dismiss／remove／shutdown）各自恢復原 pin | 自動化（vitest） | ✅ 綠 | `ApprovalDialog.test.ts` 的 `it.each`（timeout／dismiss／remove／shutdown 四種 dismiss cause）＋allow／deny 兩條按鈕情境 |
+| 6.2 | 六種凍結觸發（allow／deny／timeout／dismiss／remove／shutdown）各自恢復原 pin | 自動化（vitest） | ✅ 綠（**但前端只有 2 條分支，見右**） | `ApprovalDialog.test.ts` 的 `it.each`（timeout／dismiss／remove／shutdown 四個 case）＋allow／deny 兩條按鈕情境。**不要把 `it.each` 的四個 case 讀成四條獨立分支**：它們走的是**同一個** `approval:dismiss` handler，`timeout` 與 `resolved` 差在 `cause`，而 `remove`／`shutdown` **只差一個前端根本沒讀的 `reason` 欄位**（`ApprovalDialog.vue` 的 `reason` 是使用者輸入框，不是 payload 欄位）。**六種觸發在前端收斂為 dismiss／resolve 兩條路徑，reason 由後端區分**（`app.go:1676` shutdown、`app.go:5149` session_removed）。這不是假綠——恢復原 pin 的行為確實被驗到，但覆蓋維度是 2 不是 6 |
 
 ### §5.7 跨切面不變量（3 條）
 
@@ -130,6 +140,24 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 | 7.1 | event_id 檔案級單調在 8 session 並行 turn 下成立 | 自動化 | ✅ 綠 | `app_invariants_test.go` `TestEventIDMonotonicAcross8ParallelSessions`（另 `TestReducerCascadeIsAtomicAcrossSessions` 守 cascade 相鄰性） |
 | 7.2 | 舊 journal（無 WSID）legacy 歸屬 fixture | 自動化 | ✅ 綠 | 同檔 `TestLegacyJournalWithoutWSIDAttributes` |
 | 7.3 | 每 session 單一 in-flight turn，拒絕第二筆 | 自動化 | ✅ 綠 | 同檔 `TestSecondInFlightTurnRejected`、`TestInFlightTurnDoesNotBlockNewSession`（**production 行為變更，見 §6**） |
+
+### §2.8 spec §7「風險與待驗證假設」逐項對照（5 項）
+
+spec §7 列了五項待驗證假設。前兩項屬實測／live probe（與 §5 的 A10、§5.0 是同一件事，
+在那裡有完整記錄）；後三項是**工程假設**，本次以既有測試的綠色跑次交代。
+
+| # | spec §7 假設 | 結果 | 證據／說明 |
+|---|---|---|---|
+| 7.1 | Claude 多常駐子行程的實際資源占用（4 session RAM/CPU） | 🟡 部分執行 | 見 §5.1（idle 實測 385 MB／process；負載中實測待 owner 實機） |
+| 7.2 | Codex 單一 app-server 多 thread 並行 turn 的實際行為 | 🚫 重跑無法執行 | 見 §5.0（2026-08-14 已判定 GATE GO；帳號用量限制至 2026-08-20） |
+| 7.3 | Claude per-WSID socket／MCP config 的檔案數與清理 | ✅ 既有測試覆蓋 | `app_claude_multi_test.go` `TestTwoClaudeSessionsDoNotShareSocketOrMCP`（各自獨立 socket／mcp／broker／子行程）、`TestClaudeApprovalSocketFitsInLongStateDir`（104 byte sockaddr 上限）；`session_host_test.go` `TestSockIndexFreeList`、`TestSockIndexExhaustionFailsLoud`（檔案數上界與回收）；`app_remove_test.go` `TestRemoveCleansUpPerWSIDMCPConfig`、`TestRemoveDeniesAllPendingApprovalsAndCleansFiles`（remove 時一併清） |
+| 7.4 | 既有 M1.5 恢復測試基線大改（restore v2）——舊測試語意遷移不減 | ✅ 既有測試覆蓋（**但見下方限制**） | `app_test.go` `TestRestoreViewWindowReplay`、`TestResumeCandidateStagedThenCommitted`、`TestNewSessionRestoreWriteFailureKeepsEntry`；`app_claude_multi_test.go` 的 resume 歸屬八條（`TestSecondSessionOfSameProviderDoesNotInheritResume`、`TestProviderRestoreUnambiguousUsesBothSources`、`TestSoleRegistrySessionStillResumes`、`TestRemovedSessionsResumeIsNotInheritedByNextSession` 等）；`app_restore_dormant_test.go` 全檔 |
+| 7.5 | `AppendReceipt` 改動 M1 核心路徑——以既有 audit 測試全綠＋event_id 單調護欄 | ✅ 既有測試覆蓋 | `internal/appcore/sink_test.go` `TestJSONLSinkReceiptMatchesFileOffsets`、`TestSinkReopenContinuesOffsets`、`TestJSONLSinkShortWriteRecalibratesOffset`；`internal/appcore/manager_test.go` `TestFileLevelEventIDMonotonicAcrossProviders`、`TestAuditFailureIsLoud`；`internal/appcore/manager_index_test.go` `TestIndexNotFedWhenSinkWriteFails`；`app_invariants_test.go` `TestEventIDMonotonicAcross8ParallelSessions` |
+
+**§7.4 的判定限制（誠實邊界）**：上表證明的是「restore v2 的語意有測試、且本次全綠」。
+spec 那句的字面要求是「**舊測試語意遷移不減**」——嚴格驗證需要把 M1.5 當時的測試清單與現行清單
+逐條比對「哪一條被哪一條取代」，**本票沒有做這件清單比對**。以「不減」的字面標準看，
+這一列是「**未反證**」而不是「已逐條證實」。
 
 ---
 
@@ -168,7 +196,10 @@ server 意外死亡）與 session start／end 算出 per-WSID frame range 並 `A
 `SegmentSet` ownership 放在 App 哪一層，並定義 crash 後與 `RebuildFrameIndex` 的對齊方式。
 **這是一張獨立票的量，不是收尾補丁。**
 
-### 3.2 無 single-instance guard —— **spec §3.5.2 的前提未受保護，待 owner 裁決**
+### 3.2 無 single-instance guard —— **本票新發現的未受保護前提（不在 spec §7 五項之內），待 owner 裁決**
+
+> **這一項不是 spec 列出的待驗證假設**（spec §7 的五項見 §2.8），而是驗收時從
+> `internal/appcore/sink.go` 的 doc 讀出來的**新發現**：doc 寫了一個假設，但 repo 沒有任何機制保證它。
 
 **事實**（本票獨立核對）：
 
