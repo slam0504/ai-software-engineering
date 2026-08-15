@@ -293,10 +293,53 @@ func (m *Manager) RemoveSession(w WSID) error {
 	if err != nil {
 		return err
 	}
+	// legacy slot（LegacyWSID 惰性建立，m.legacy[p] 一對一指回它）不得被
+	// RemoveSession 刪掉：它不計入 countLocked，delete 之後既不釋放任何名額，
+	// 又讓 m.legacy[p] 變成指向一個已消失 slot 的懸空 key——之後每個經
+	// legacyWSIDFor 第 4 順位落到它的呼叫都會 ErrSessionNotFound（review
+	// round-2 Minor #1）。App 層的使用者移除流程理論上到不了這裡（legacy WSID
+	// 從未寫進 wsRegistry，tombstone_persist 會先擋下），這裡是第二道防線。
+	if sl.isLegacy {
+		return ErrSessionNotFound
+	}
 	if sl.phase != phaseIdle {
 		return ErrSessionNotIdle
 	}
 	delete(m.slots, w)
+	return nil
+}
+
+// Removable：RemoveSession 動手（deny approvals／teardown／cleanup 檔案）之前
+// 的唯讀前置檢查（review round-2 Important）——若 slot 目前正處於
+// starting／ending／resetting，或 active 但有 in-flight submission，這次移除
+// 的 teardown 注定會在 BeginEndSession 撞到同樣的錯誤而失敗；deny_approvals／
+// cleanup_files 不該在那之前先做，否則失敗的移除會對仍存活的 session 留下
+// 「approval 已被 deny、MCP config 已被刪」這種不可逆副作用（§3.6.2「任一步
+// 失敗都保留 slot」的精神是失敗不得留下傷害，不只是不遞減名額）。
+//
+// 仍是 check-then-act：本方法只唯讀、不做任何狀態轉移，呼叫端從這裡回來到
+// 真正呼叫 BeginEndSession 之間，phase 理論上仍可能被其他路徑改變（例如
+// StartSession 開始一筆新 submit）。徹底收斂需要一個獨立的 removing phase
+// （會動到 phase 狀態機，超出本次改動範圍），這裡只把窗口從「整個六步」收窄
+// 到「gate 與 teardown 之間那一小段」——殘餘窗口見 App.RemoveSession doc。
+func (m *Manager) Removable(w WSID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	switch sl.phase {
+	case phaseStarting:
+		return ErrStartInProgress
+	case phaseEnding:
+		return ErrEndInProgress
+	case phaseResetting:
+		return ErrResetInProgress
+	}
+	if sl.submitting != nil {
+		return ErrSubmitActive
+	}
 	return nil
 }
 

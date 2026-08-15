@@ -128,6 +128,12 @@ type App struct {
 	// 被持有）——因此不存在「A 等 B 持有的鎖、B 等 A 持有的鎖」的反向鎖序，
 	// 兩條路徑只可能互相等待這一把鎖本身，不會死鎖。crTokenMu 只保護 map 本身
 	// 的建立，不是要序列化的那把鎖，取得後立即釋放，不跨臨界區持有。
+	//
+	// 持有時間上界（review round-2 Minor #3）：RemoveSession 的 teardown
+	// （claudeTeardown 的 CloseSequence）跑在 token 臨界區內，一次移除最長可能
+	// 卡住同一 provider 的 CreateSession／另一個 RemoveSession 達 quiesce(5s)+
+	// kill(10s) ≈ 15s。這是 §3.6.2「token 涵蓋整段編排」的必然代價，不是 bug；
+	// token 不是輕量互斥，呼叫端（含未來新增的入口）不得假設它總是瞬間釋放。
 	crTokenMu sync.Mutex
 	crTokens  map[contract.Provider]*sync.Mutex
 
@@ -4850,9 +4856,29 @@ func (a *App) cleanupRemovedFiles(w appcore.WSID) error {
 // 點，不是另一次呼叫；codex 沒有 session-scoped lease，同樣是 no-op 檢查點——
 // 兩者都只是步驟探針，不代表這裡對它們各自另做了一次副作用。
 //
+// 六步之前另有一道 manager.Removable 前置檢查（review round-2 Important；純
+// 新增、不重排凍結的六步）：deny_approvals／cleanup_files 對外都有可見副作用
+// （approval 被 deny、MCP config 被刪），若沒有先確認 teardown 這次真的會成
+// 功，就有可能在 teardown 失敗、slot 保留（session 照常存活）的情況下，已經
+// 對一個仍存活的 session 造成不可逆的傷害——「任一步失敗都保留 slot」的精神
+// 是失敗不得留下傷害，不只是不遞減名額。
+//
 // Remove × New 同一 provider 序列化（見 crTokens 欄位 doc 的鎖序凍結）：token
 // 涵蓋整段編排，過程中不會有 CreateSession 為同一 provider reserve／commit 新
 // slot，也不會有另一個 RemoveSession 併發跑同一 provider 的收尾。
+//
+// 殘餘 TOCTOU 窗口（review round-2 Important，登記給 Task 26）：token **不**
+// 涵蓋 StartSession——manager.Removable 只唯讀、不做狀態轉移，它回來之後到
+// 真正呼叫 BeginEndSession 之間，另一條路徑（例如 StartSession）仍可能把同一
+// WSID 的 phase 推成 starting。若恰好卡在這個窗口，tombstone_persist 可能已
+// 成功落盤，但隨後 manager.RemoveSession 因 phase 非 idle 而回
+// ErrSessionNotIdle——結果是 registry 說已移除、Manager 卻仍佔著名額、上面還
+// 起了一個新的 provider 子行程，且重啟後這筆不會被 registry 還原（tombstone
+// 已經生效）。錯誤本身是 fail loud 的，但 in-process 無法自行收斂；徹底關閉
+// 需要一個獨立的 removing phase（會動到 phase 狀態機），超出本次改動範圍。
+// 今天不可達：exported binding 只在 bindings.ts／bindings.test.ts 有 wiring，
+// 前端沒有任何呼叫路徑會在使用者可觸及的時間點於同一 WSID 上讓 Remove 與
+// StartSession 真正競速。
 func (a *App) RemoveSession(wsid string) error {
 	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
 		return err
@@ -4876,6 +4902,10 @@ func (a *App) RemoveSession(wsid string) error {
 	}()
 	if h := a.hookRemoveHoldingToken; h != nil {
 		h()
+	}
+
+	if err := a.manager.Removable(w); err != nil {
+		return fmt.Errorf("app: remove session %s: %w（slot 保留，可重試移除；未觸碰 approval／檔案）", wsid, err)
 	}
 
 	a.removeStep("deny_approvals")
@@ -4902,6 +4932,16 @@ func (a *App) RemoveSession(wsid string) error {
 	if err := a.manager.RemoveSession(w); err != nil {
 		return fmt.Errorf("app: remove session %s: 已 tombstone 但釋放名額失敗：%w", wsid, err)
 	}
+
+	// legacyWSIDFor 第 2 順位的快取失效（review round-2 裁決）：不清除的話，
+	// 移除掉最近一次 CreateSession 的 WSID 之後，provider-keyed 舊 binding
+	// （StartSession 等）仍可能經 legacyWSIDFor 解析到這個已消失的 WSID，得到
+	// ErrSessionNotFound，即使另一個較早建立的 dormant session 明明還在。
+	a.mu.Lock()
+	if a.lastCreatedWSID[p] == w {
+		delete(a.lastCreatedWSID, p)
+	}
+	a.mu.Unlock()
 	return nil
 }
 

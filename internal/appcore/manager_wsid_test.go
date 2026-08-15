@@ -87,6 +87,21 @@ func TestRemoveSessionReleasesIdleSlot(t *testing.T) {
 	}
 }
 
+// TestRemoveSessionRejectsLegacySlot（review round-2 Minor #1）：legacy slot
+// （LegacyWSID 惰性建立）不計入 countLocked、且 m.legacy[p] 一對一指回它——若
+// 被 RemoveSession 刪掉，m.legacy[p] 會變成懸空 key，之後每個經 legacyWSIDFor
+// 第 4 順位落到它的呼叫都會撞到一個已消失的 slot。
+func TestRemoveSessionRejectsLegacySlot(t *testing.T) {
+	m := New(Config{Sink: &memSink{}})
+	w := m.LegacyWSID("claude")
+	if err := m.RemoveSession(w); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("legacy slot 必須拒絕移除：%v", err)
+	}
+	if got := m.LegacyWSID("claude"); got != w {
+		t.Fatalf("拒絕之後 legacy slot 必須維持原樣（未被刪一半）：want %s got %s", w, got)
+	}
+}
+
 // TestRemoveSessionRejectsNonIdlePhase：非 idle phase（starting／active／
 // ending／resetting）代表呼叫端（App.RemoveSession）尚未真的把 session 收尾就
 // 呼叫到這裡——直接砍掉 slot 會讓仍在跑的 goroutine 之後對一個已消失的 WSID

@@ -53,14 +53,27 @@ func (s *stubRegistry) DeleteUncommitted(wsid string) error {
 	return nil
 }
 
+// Remove：鏡射真實 wsregistry.Store 的 tombstone 語意（review round-2 Minor
+// #2）——留下 entry、填 RemovedAt／RemoveReason，不整筆刪除。之前直接
+// delete(s.entries, wsid) 讓 stub 的 Get() 語意與 production 相反（真實
+// Store.Remove 之後 Get 仍回 ok=true，帶 tombstone 欄位），會誤導任何斷言
+// 「移除後 Get 仍看得到 tombstone entry」的測試。
 func (s *stubRegistry) Remove(wsid, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.removeErr != nil {
 		return s.removeErr
 	}
+	e, ok := s.entries[wsid]
+	if !ok {
+		e = wsregistry.Entry{WSID: wsid}
+	}
+	e.RemovedAt, e.RemoveReason = "removed", reason
+	if s.entries == nil {
+		s.entries = map[string]wsregistry.Entry{}
+	}
+	s.entries[wsid] = e
 	s.removedWithTombstone = true
-	delete(s.entries, wsid)
 	return nil
 }
 
@@ -71,11 +84,15 @@ func (s *stubRegistry) Get(wsid string) (wsregistry.Entry, bool) {
 	return e, ok
 }
 
+// Live：排除 tombstone（RemovedAt 非空），同 wsregistry.Store.Live 的語意。
 func (s *stubRegistry) Live() []wsregistry.Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]wsregistry.Entry, 0, len(s.entries))
 	for _, e := range s.entries {
+		if e.RemovedAt != "" {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
