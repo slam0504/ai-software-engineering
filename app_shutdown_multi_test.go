@@ -472,6 +472,7 @@ func TestIndexAcceptsEventsUntilManagerClose(t *testing.T) {
 	f := seedSessions(t, 1, 0)
 	a, w := f.a, f.claude[0]
 
+	waitTurnSettled(t, a, w) // §1.1 in-flight guard：先讓 seedSessions 那一輪落地
 	if _, err := a.manager.BeginSubmit(w); err != nil {
 		t.Fatalf("BeginSubmit: %v", err)
 	}

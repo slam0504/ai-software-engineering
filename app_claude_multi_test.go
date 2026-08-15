@@ -279,7 +279,10 @@ func TestExportedBindingsAddressByWSID(t *testing.T) {
 			t.Fatalf("StartSession(%q) 必須以 ErrSessionNotFound 拒絕，got %v", name, err)
 		}
 	}
-	// 真正的 WSID 仍可用（同一個 session）
+	// 真正的 WSID 仍可用（同一個 session）。先等 mustStartClaude 那一輪收尾
+	// ——§1.1 的 in-flight guard（Task 30）會把還沒收尾的第二筆擋掉，那不是本
+	// 測試要驗的東西。
+	waitTurnSettled(t, a, w)
 	if err := a.SendMessage(string(w), "hi"); err != nil {
 		t.Fatalf("WSID 定址的 SendMessage 必須成功：%v", err)
 	}

@@ -86,6 +86,21 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timeout waiting for %s", what)
 }
 
+// waitTurnSettled：等某個 WSID 的上一輪 turn 收尾（reducer 進 terminal）。
+//
+// Task 30 之後 §1.1「每 session 至多一個進行中 turn」由 appcore.BeginSubmit
+// fail loud 守住，所以「第一輪還在跑就送第二筆」不再是可以靠運氣通過的事——
+// 需要送第二輪（或直接 BeginSubmit）的測試必須先等第一輪落地。等的是**條件**
+// 不是時間（同 waitFor 慣例），因此不引入 time.Sleep 式的牆鐘相依。
+func waitTurnSettled(t *testing.T, a *App, w appcore.WSID) {
+	t.Helper()
+	waitFor(t, "turn 收尾（"+string(w)+"）", func() bool {
+		st, err := a.manager.State(w)
+		return err == nil && (st == contract.StateDone || st == contract.StateFailed ||
+			st == contract.StateIdle)
+	})
+}
+
 func newTestApp(t *testing.T) (*App, *uiCapture) {
 	t.Helper()
 	a := NewApp()
@@ -536,10 +551,11 @@ func TestDualSessionsConcurrently(t *testing.T) {
 		t.Fatal("both sessions must be active concurrently")
 	}
 
-	// 各自 SendMessage 一輪（claude 等 result 解鎖後送；codex turn/start 立即回）
-	waitFor(t, "claude first result", func() bool {
-		return len(ui.findEnvKind("result")) >= 1
-	})
+	// 各自 SendMessage 一輪（claude 等 result 解鎖後送；codex turn/start 立即回）。
+	// 等的是**該 WSID 自己的** turn 收尾：findEnvKind("result") 不分 provider，
+	// codex 先回的 result 就會讓它提早放行，第二筆撞上 §1.1 的 in-flight guard。
+	waitTurnSettled(t, a, wsidFor(t, a, contract.ProviderClaude))
+	waitTurnSettled(t, a, wsidFor(t, a, contract.ProviderCodex))
 	if err := a.SendMessage(wsidStr(t, a, "claude"), "round 2"); err != nil {
 		t.Fatalf("claude send: %v", err)
 	}

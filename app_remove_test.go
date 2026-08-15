@@ -99,6 +99,7 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 	id := seedApproval(t, a, w)
 	mcpPath := filepath.Join(a.stateDir, "mcp-"+string(w)+".json")
 
+	waitTurnSettled(t, a, w) // §1.1 in-flight guard：先讓第一輪落地才拿得到 submission
 	subID, err := a.manager.BeginSubmit(w)
 	if err != nil {
 		t.Fatal(err)

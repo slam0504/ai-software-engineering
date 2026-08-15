@@ -32,7 +32,26 @@ var (
 	// 回 idle），才能呼叫 RemoveSession——非 idle 一律拒絕，不得把「還在收尾」
 	// 的 slot 直接砍掉。
 	ErrSessionNotIdle = errors.New("appcore: session must be idle to remove")
+
+	// M3b §1.1：每 session 至多一個進行中 turn。Codex 端 ThreadRunner 另有
+	// ErrTurnActive 擋在 wire 層，但那是 provider 專屬的；Claude 走 stream-json
+	// stdin，多送一筆不會被 CLI 拒絕。因此不變量統一由本層守（見 turnInFlight）。
+	ErrTurnInFlight = errors.New("appcore: a turn is already in flight for this session")
 )
+
+// turnInFlight：reducer 狀態是否代表「上一輪還沒收尾」。
+//
+// 白名單寫成「terminal 才算閒置」而非「列舉進行中狀態」：新增一個 SessionState
+// 時，未列舉的預設會落在**保守**的那一邊（視為進行中、擋住第二筆），而不是靜默
+// 放行第二個 turn。idle 是 Reset() 之後的起點，done／failed 是 §5.4 的兩個
+// terminal 狀態。
+func turnInFlight(st contract.SessionState) bool {
+	switch st {
+	case contract.StateIdle, contract.StateDone, contract.StateFailed:
+		return false
+	}
+	return true
+}
 
 // MaxSessionsPerProvider：凍結常數——不進 config、不讀環境變數（M3b §3.1.4）。
 const MaxSessionsPerProvider = 4
@@ -649,6 +668,14 @@ func (m *Manager) beginSubmitLocked(sl *slot) (SubmissionID, error) {
 	}
 	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
+	}
+	// §1.1：每 session 至多一個進行中 turn。位置在**取得 ownership 之前**——先
+	// 佔住 sl.submitting 再回錯的話，這個 slot 從此永遠 ErrSubmitActive。
+	//
+	// 只擋 BeginSubmit，不擋 beginNewSessionSubmitLocked：後者是「開新對話」，
+	// newSessionLocked 會先 reducer.Reset()，上一代的殘留狀態依定義不再適用。
+	if turnInFlight(sl.reducer.Current()) {
+		return SubmissionID{}, ErrTurnInFlight
 	}
 	sl.seq++
 	id := SubmissionID{gen: sl.gen, seq: sl.seq}
