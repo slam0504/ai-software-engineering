@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -334,7 +335,7 @@ func (c *countingAuditFile) Close() error { return c.f.Close() }
 func TestCheckpointVerificationDoesNotScanWholeFile(t *testing.T) {
 	dir := t.TempDir()
 	auditPath := filepath.Join(dir, "events.jsonl")
-	lastEnd, lastID := writeRawAuditEvents(t, auditPath, 30000)
+	lastEnd, lastID := writeRawAuditEvents(t, auditPath, 250000) // maxLineWindow=16MB，需要遠超它的檔案大小才能證明 O(1)
 	writeCheckpointFileForTest(t, dir, lastEnd, lastID, nil)
 
 	total := auditSize(t, auditPath)
@@ -371,6 +372,100 @@ func TestCheckpointVerificationDoesNotScanWholeFile(t *testing.T) {
 	}
 	if opened.bytesRead > maxLineWindow {
 		t.Fatalf("checkpoint 驗證讀取量不應超過 maxLineWindow：%d > %d", opened.bytesRead, int64(maxLineWindow))
+	}
+}
+
+// writeAuditWithOversizedLine：構造一個 audit 檔——先有 wsid "w1" 一個正常
+// 大小的完整 turn，接著 wsid "w2" 開一個 turn，其 canonical user message 的
+// Text 刻意超過 maxLineWindow（模擬使用者貼一段超大 log／diff 進單則訊
+// 息，這是正常操作，不是對抗性輸入；contract.Envelope／JSONLSink.Write 都
+// 沒有行長度上限）。回傳這筆超大行所屬的 wsid／起訖 offset／event id，供
+// 呼叫端組出對應的 checkpoint.json 與正確性核對基準。
+func writeAuditWithOversizedLine(t *testing.T, path string) (wsid string, startOffset, endOffset int64, eventID string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	var offset int64
+	write := func(env contract.Envelope) {
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := fmt.Fprintf(w, "%s\n", b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset += int64(n)
+	}
+	write(contract.Envelope{EventID: "pre-user", Kind: string(contract.KindMessage), Role: "user", WorkspaceSessionID: "w1"})
+	write(contract.Envelope{EventID: "pre-done", Kind: string(contract.KindStateChange), State: string(contract.StateDone), WorkspaceSessionID: "w1"})
+
+	wsid = "w2"
+	eventID = "huge-user-msg"
+	startOffset = offset
+	hugeText := strings.Repeat("x", maxLineWindow+1024) // 確定超過 window
+	b, err := json.Marshal(contract.Envelope{
+		EventID: eventID, Kind: string(contract.KindMessage), Role: "user",
+		WorkspaceSessionID: wsid, Text: hugeText,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := fmt.Fprintf(w, "%s\n", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset += int64(n)
+	endOffset = offset
+
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	return wsid, startOffset, endOffset, eventID
+}
+
+// TestCheckpointVerificationDegradesObservablyOnOversizedLine：mutation 驗證
+// （re-review Important）——checkpoint 驗證的 window 不是硬保證，單一超大
+// user message 仍可能超出 maxLineWindow。此時必須 (a) 安全地降級為全量重
+// 建、結果仍正確（不 panic、其他 WSID 的既有 turn 與這個超大行本身的 open
+// turn 起點都要對得上）；(b) 降級不能靜默——必須透過 Config.Notify 發出一
+// 次可觀測訊號，否則每次重啟都會悄悄全量重建卻無人知曉。
+func TestCheckpointVerificationDegradesObservablyOnOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "events.jsonl")
+	wsid, startOffset, endOffset, eventID := writeAuditWithOversizedLine(t, auditPath)
+
+	// checkpoint 指向這筆超大行的結尾，且記錄它開了一個尚未收尾的
+	// turn——crash 發生在這筆巨大訊息落盤之後的合法 checkpoint 狀態。
+	writeCheckpointFileForTest(t, dir, endOffset, eventID, map[string]int64{wsid: startOffset})
+
+	var notices []string
+	i, err := OpenWith(dir, Config{Notify: func(msg string) { notices = append(notices, msg) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := i.VerifyOrRebuild(auditPath); err != nil {
+		t.Fatalf("超長單行必須安全降級為全量重建，不得回錯：%v", err)
+	}
+
+	// (a) 降級後仍須正確重建：超大行所屬 wsid 的 open turn 起點必須精準；
+	// 前置的正常 turn（w1）也必須被全量重建保留，不是只顧那一個 WSID。
+	if off, ok := i.OpenTurnStart(wsid); !ok || off != startOffset {
+		t.Fatalf("降級為全量重建後仍須正確還原 open turn 起點：off=%d ok=%v want=%d", off, ok, startOffset)
+	}
+	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 1 {
+		t.Fatalf("全量重建須保留其他 WSID 既有的完整 turn：%d", len(turns))
+	}
+
+	// (b) 降級必須可觀測。
+	if len(notices) != 1 {
+		t.Fatalf("window 截斷降級必須發出一次可觀測訊號：%v", notices)
 	}
 }
 

@@ -24,6 +24,10 @@
 // 啟動期無並行（§3.2.4 序列：VerifyOrRebuild 在開 UI 前完成，尚無並行
 // append）——runtime 重建（有並行 append、需要 bulk＋鎖外 catch-up＋鎖內收
 // 斂的完整序列）是 Task 19 範圍，本檔不處理。
+//
+// 已知限制（非本 task 要解的問題，記錄供 Task 18／19 或未來維運參考）：連續
+// 多次「crash → 判定不可信 → resetTurnFilesLocked quarantine」循環，quarantine
+// 檔會無限累積在 idx.dir 底下，目前沒有清理／保留期限策略。
 package replayindex
 
 import (
@@ -41,12 +45,20 @@ import (
 )
 
 // maxLineWindow：checkpointTrustedLocked／lineEventIDEndingAt 驗證 checkpoint
-// 時，往回讀取的最大 window（bytes）。checkpoint 只會落在 turn boundary 事
-// 件（canonical user message 或 terminal state_change）的行尾，這兩種事件
-// 本身都不攜帶大量內容（delta 的大塊文字不會觸發 boundary），1MB 對單行給
-// 了充裕餘裕。這個常數是 replayindex 存在的理由本身：驗證 checkpoint 不能
-// 隨 events.jsonl 成長而變慢，見 lineEventIDEndingAt。
-const maxLineWindow = 1 << 20
+// 時，往回讀取的最大 window（bytes）。對齊 repo 讀 audit／JSONL 的既有慣例
+// ——internal/codex/rpc.go、internal/assist/oneshot.go、
+// internal/wirelog/frameindex.go、internal/claude/session.go、restore.go
+// 六處讀 audit 相關內容一律用 16MB scanner buffer，這裡跟隨同一個先例（而
+// 非同 package 內 index.go:520 那個 10MB——那是掃小得多的 turn record，不
+// 是 audit 本體）。
+//
+// 16MB 仍不是硬保證：canonical user message 的 Text 長度不受限
+// （contract.Envelope、JSONLSink.Write 都沒有行長度上限），使用者貼一段超
+// 大 log／diff 進單則訊息是正常操作。單行仍可能超出這個 window——這種情況
+// 不會誤判、也不會 panic（見 lineEventIDEndingAt 的 windowTruncated 分支），
+// 但會安全地退化成全量重建；VerifyOrRebuild 對此一律透過 Config.Notify 發
+// 出可觀測訊號，不能讓這個退化靜默發生。
+const maxLineWindow = 16 << 20
 
 // auditFile：lineEventIDEndingAt 讀取 audit 檔所需的最小介面。生產環境一律
 // 是 *os.File；測試可透過覆寫 openAuditFile 換成計數 wrapper，驗證「checkpoint
@@ -63,29 +75,53 @@ var openAuditFile = func(path string) (auditFile, error) {
 
 // VerifyOrRebuild：啟動期呼叫一次，驗證 checkpoint 相對 auditPath（events.jsonl
 // 權威檔）是否可信，落後則補掃、超前或對不上則整份重建，並補回任何未完成
-// turn 的 firstEventID。全程持 idx.mu；呼叫時尚無並行 append（§3.2.4）。
+// turn 的 firstEventID。呼叫時尚無並行 append（§3.2.4）。
 //
-// 特意重新從磁碟讀入 checkpoint.json（見 reloadCheckpointFromDiskLocked），
-// 不信任 Open() 當時快取在記憶體裡的值——VerifyOrRebuild 是獨立於 Open 的驗
-// 證步驟，其職責就是核對「磁碟現在記的狀態」是否仍與 audit 一致。
+// 實際邏輯在 verifyOrRebuildLocked（全程持 idx.mu）；這裡只多做一件事：把
+// 「checkpoint 驗證因單行超出 maxLineWindow 而降級為全量重建」這個訊號帶出
+// 鎖外才呼叫 Config.Notify——同 Observe 的「先處理、後解鎖、再通知」慣例
+// （見 Observe 的說明），避免在持鎖時呼叫可能回呼 Index 方法的 callback 造
+// 成死鎖。這個通知與 §3.5.4 的 degraded latch 無關（VerifyOrRebuild 完全不
+// 觸碰 idx.degraded），純粹是「這次重啟多做了一次原本不該發生的全量重建」
+// 這件事本身需要可觀測，不能靠人猜——16MB window 仍不是硬保證（見
+// maxLineWindow 說明），一旦真的發生，每次重啟都會靜默觸發全量重建，正是
+// 這個套件存在理由要避免的事。
 func (idx *Index) VerifyOrRebuild(auditPath string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	windowTruncated, err := func() (bool, error) {
+		idx.mu.Lock()
+		defer idx.mu.Unlock()
+		return idx.verifyOrRebuildLocked(auditPath)
+	}()
 
+	if err == nil && windowTruncated {
+		if notify := idx.cfg.Notify; notify != nil {
+			notify(fmt.Sprintf(
+				"replayindex: checkpoint 驗證因單行超出 window（%d bytes）無法判讀，已降級為全量重建",
+				maxLineWindow))
+		}
+	}
+	return err
+}
+
+// verifyOrRebuildLocked：呼叫端須持有 idx.mu。VerifyOrRebuild 的實際流程；
+// 特意重新從磁碟讀入 checkpoint.json（見 reloadCheckpointFromDiskLocked），
+// 不信任 Open() 當時快取在記憶體裡的值——這是獨立於 Open 的驗證步驟，職責
+// 就是核對「磁碟現在記的狀態」是否仍與 audit 一致。
+func (idx *Index) verifyOrRebuildLocked(auditPath string) (windowTruncated bool, err error) {
 	if err := idx.reloadCheckpointFromDiskLocked(); err != nil {
-		return err
+		return false, err
 	}
 
 	var auditSize int64
 	if info, err := os.Stat(auditPath); err == nil {
 		auditSize = info.Size()
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("replayindex: stat audit %s: %w", auditPath, err)
+		return false, fmt.Errorf("replayindex: stat audit %s: %w", auditPath, err)
 	}
 
-	trusted, err := idx.checkpointTrustedLocked(auditPath, auditSize)
+	trusted, truncated, err := idx.checkpointTrustedLocked(auditPath, auditSize)
 	if err != nil {
-		return err
+		return truncated, err
 	}
 
 	from := idx.checkpointOffset
@@ -97,17 +133,17 @@ func (idx *Index) VerifyOrRebuild(auditPath string) error {
 		idx.checkpointLastEventID = ""
 		idx.turns = map[string]*turnState{}
 		if err := idx.resetTurnFilesLocked(); err != nil {
-			return err
+			return truncated, err
 		}
 		from = 0
 	} else if err := idx.hydrateOpenTurnFirstEventIDsLocked(auditPath); err != nil {
 		// 已存在的 checkpoint 若記錄某 WSID 有 open turn，loadCheckpoint 只
 		// 帶回 offset（§3.5.5），firstEventID 尚未知——從 audit 補讀，否則
 		// 之後這個 turn 收尾時 appendTurnRecord 會寫出空字串的 FirstEventID。
-		return err
+		return truncated, err
 	}
 
-	return idx.rescanFromLocked(auditPath, from)
+	return truncated, idx.rescanFromLocked(auditPath, from)
 }
 
 // reloadCheckpointFromDiskLocked：呼叫端須持有 idx.mu。無條件捨棄目前記憶體
@@ -143,19 +179,20 @@ func (idx *Index) reloadCheckpointFromDiskLocked() error {
 // checkpointTrustedLocked：呼叫端須持有 idx.mu。判斷目前記憶體中的
 // checkpointOffset／checkpointLastEventID 是否確實對應 auditPath 裡一個真實
 // 的行邊界與 event id。offset 0（從未索引過）視為天然可信的基線。
-func (idx *Index) checkpointTrustedLocked(auditPath string, auditSize int64) (bool, error) {
+// windowTruncated 原樣轉傳 lineEventIDEndingAt 的訊號（見該函式說明）。
+func (idx *Index) checkpointTrustedLocked(auditPath string, auditSize int64) (trusted, windowTruncated bool, err error) {
 	if idx.checkpointOffset == 0 {
 		// offset 0 卻宣稱有 last_event_id 是自相矛盾的資料，不可信。
-		return idx.checkpointLastEventID == "", nil
+		return idx.checkpointLastEventID == "", false, nil
 	}
 	if idx.checkpointOffset < 0 || idx.checkpointOffset > auditSize {
-		return false, nil // 超前／offset 超界
+		return false, false, nil // 超前／offset 超界
 	}
-	id, found, err := lineEventIDEndingAt(auditPath, idx.checkpointOffset)
+	id, found, truncated, err := lineEventIDEndingAt(auditPath, idx.checkpointOffset)
 	if err != nil {
-		return false, err
+		return false, truncated, err
 	}
-	return found && id == idx.checkpointLastEventID, nil // event ID 不符 → false
+	return found && id == idx.checkpointLastEventID, truncated, nil // event ID 不符 → false
 }
 
 // resetTurnFilesLocked：呼叫端須持有 idx.mu。把 idx.dir 下所有既有
@@ -262,16 +299,24 @@ func (idx *Index) rescanFromLocked(auditPath string, from int64) error {
 // 的那一行、回傳其 event id。**O(1) 相對檔案總大小**——只讀 target 之前最多
 // maxLineWindow bytes（見該常數說明），不從頭掃整份 audit：重啟驗證 checkpoint
 // 若退化成又一次全掃 events.jsonl，就違背了 replayindex 存在的理由（讓重啟
-// 不必全掃）。找不到（target 不在任何行邊界上，或該行無法解析）回傳
-// found=false、非錯誤——由呼叫端決定這代表 checkpoint 不可信，不是硬性 I/O
-// 失敗。
-func lineEventIDEndingAt(auditPath string, target int64) (id string, found bool, err error) {
+// 不必全掃）。
+//
+// 找不到目標行（target 不在任何行邊界上，或該行無法解析）回傳 found=false、
+// 非錯誤——由呼叫端決定這代表 checkpoint 不可信，不是硬性 I/O 失敗。
+//
+// windowTruncated=true 是其中一種更明確的子情況：window 內完全沒有找到
+// target 那一行**之前**的換行符，代表 target 那一行本身可能超出
+// maxLineWindow、我們讀到的只是被截斷的中後段片段，不是這一行的完整內
+// 容——這種「讀不完整」與「讀到完整但對不上」不同，呼叫端（VerifyOrRebuild）
+// 需要為此發出可觀測訊號，不能讓它跟一般的「事件 ID 不符」混在一起靜默處
+// 理。windowStart==0 時（window 已涵蓋到檔案開頭）沒有這個歧義，不算截斷。
+func lineEventIDEndingAt(auditPath string, target int64) (id string, found, windowTruncated bool, err error) {
 	if target <= 0 {
-		return "", false, nil
+		return "", false, false, nil
 	}
 	f, err := openAuditFile(auditPath)
 	if err != nil {
-		return "", false, fmt.Errorf("replayindex: open audit %s: %w", auditPath, err)
+		return "", false, false, fmt.Errorf("replayindex: open audit %s: %w", auditPath, err)
 	}
 	defer f.Close()
 
@@ -281,22 +326,25 @@ func lineEventIDEndingAt(auditPath string, target int64) (id string, found bool,
 	}
 	buf := make([]byte, target-windowStart)
 	if _, err := f.ReadAt(buf, windowStart); err != nil {
-		return "", false, nil // window 讀不滿（例如 target 超過檔案長度）：視為對不上
+		return "", false, false, nil // window 讀不滿（例如 target 超過檔案長度）：視為對不上
 	}
 	if buf[len(buf)-1] != '\n' {
-		return "", false, nil // target 沒有落在行邊界上
+		return "", false, false, nil // target 沒有落在行邊界上
 	}
 	body := buf[:len(buf)-1] // 去掉行尾換行
 	// 找 body 內最後一個換行——其後到 body 結尾就是 target 對應的那一整行。
 	// windowStart 可能切在更早一行的中間，但那不影響這裡：我們只在乎「最後
 	// 一個」換行之後的內容，不需要 window 起點恰好對齊行邊界。
 	lineStart := bytes.LastIndexByte(body, '\n')
+	if lineStart == -1 && windowStart > 0 {
+		return "", false, true, nil // window 被單一一行佔滿，讀到的只是被截斷的片段
+	}
 	line := body[lineStart+1:]
 	var env contract.Envelope
 	if jerr := json.Unmarshal(line, &env); jerr != nil {
-		return "", false, nil // 該行本身無法解析（可能是超長行被 window 切斷）：視為對不上
+		return "", false, false, nil // 該行本身無法解析：視為對不上
 	}
-	return env.EventID, true, nil
+	return env.EventID, true, false, nil
 }
 
 // eventIDAtOffset：讀取 auditPath 在 offset 處起始的那一行、回傳其 event id
