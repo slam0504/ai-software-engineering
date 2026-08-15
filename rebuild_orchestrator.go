@@ -21,10 +21,17 @@ import (
 // ——那正是 §3.5 要消滅的行為。
 var errNoReplayIndex = errors.New("app: replay index 未啟用（本次啟動已 fail loud，見 startup 警告）")
 
-// errIndexUnverified：啟動期 VerifyOrRebuild 失敗，index 內容不可信（可能有靜
-// 默缺口，見 App.indexUnverified 的 doc）。回錯而不是回一份可能少 turn 的視窗
-// ——後者使用者分辨不出來。in-process 沒有安全的復原路徑，只能重啟。
-var errIndexUnverified = errors.New("app: replay index 啟動驗證失敗，內容不可信；請重啟 app 讓啟動期重建再跑一次")
+// errIndexUnverified：index 內容不可信（可能有靜默缺口，見 App.indexUnverified
+// 的 doc）。回錯而不是回一份可能少 turn 的視窗——後者使用者分辨不出來。
+//
+// 兩個成因，復原方式不同：
+//   - 啟動期 VerifyOrRebuild 失敗：重啟即可讓啟動期重建再跑一次。
+//   - registry 載入失敗（restoreSessions 提前 return，index_verify 從未執行）：
+//     單純重啟無效，同一份損毀的 workspace-sessions.json 下次啟動會走同一條
+//     early return。要先依 startup 警告處理該檔案。
+//
+// in-process 沒有安全的復原路徑，兩者都得重啟。
+var errIndexUnverified = errors.New("app: replay index 未通過啟動驗證，內容不可信；若 startup 警告指出 registry 損毀，請先依該警告處理 workspace-sessions.json，再重啟")
 
 // indexOrNil：*replayindex.Index → appcore.TurnIndex，nil 指標回 nil 介面。
 // 直接把 typed nil 塞進介面欄位會讓 `cfg.Index != nil` 恆為真，接著在第一筆

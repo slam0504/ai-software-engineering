@@ -369,7 +369,7 @@ stateDiagram-v2
 | **M2** Stage A 閉環 | ✅ merged | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ merged | vue-i18n 語系化，預設繁體中文＋完整英文 locale |
 | **M3a** 計畫與測試契約閉環 | ✅ merged | 任務 DAG、Gate 2、Test Contract Approval（本機 evidence runner）、升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；多 session 並看延後至 **M3b**） |
-| **M3b** 多 session 工作區 | ✅ 實作完成 | 每 provider 4 個 session slot、雙 pane 並看與焦點語意、WSID 建立交易與 tombstone 移除、Codex connection-wide wire log、per-WSID replay index 與視窗化重啟（[驗收結果](docs/spikes/m3b-results.md)——含未覆蓋項與待實機驗收項） |
+| **M3b** 多 session 工作區 | ✅ 實作完成 | 每 provider 4 個 session slot、雙 pane 並看與焦點語意、WSID 建立交易與 tombstone 移除、Codex connection-wide wire log、per-WSID replay index 與視窗化載入（pane pins 持久化未接線，重啟後需重新釘選——見[驗收結果](docs/spikes/m3b-results.md) §3.3；該文另含未覆蓋、未實作與待實機驗收項） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、forge adapter（SC4：單任務全程不切出 app） |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（OpenCode 首個目標）、保留 Claude／Codex 原生 adapter、capability negotiation（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 
