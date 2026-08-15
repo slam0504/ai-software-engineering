@@ -5,6 +5,10 @@ import type { Bindings, ChatItem, Envelope, SessionInfo, TimelineItem } from '..
 const NOISE_KINDS = new Set(['system_other', 'unknown'])
 export const PROVIDERS = ['claude', 'codex'] as const
 export type ProviderKey = (typeof PROVIDERS)[number]
+// TURN_WINDOW_SIZE：§3.8 凍結的分頁大小，鏡射 Go 端 rebuild_orchestrator.go
+// 的 turnPageSize（同一常數，兩邊各自持有——沒有共用型別可以跨語言匯入，
+// 見 SessionList.vue 的 MAX_SESSIONS_PER_PROVIDER 同一慣例）。
+const TURN_WINDOW_SIZE = 20
 
 // SessionMeta：per-WSID 的 session 狀態（§3.8「非釘選只保留 metadata」的那一半）。
 //
@@ -56,6 +60,62 @@ function newMeta(wsid: string, provider: ProviderKey): SessionMeta {
     awaitingApproval: false, removed: false,
     sessionId: '', taskId: '', active: false, recordCase: '', resume: '',
     available: true,
+  }
+}
+
+// applyToView：把單一 envelope 疊進某 SessionView——transcript（chat／
+// timeline／totals／usageSemantics／noise 分組）唯一的寫入邏輯。apply()
+// （即時串流）與 §3.8 視窗化載入（pin()／loadOlder()，Task 29）共用同一份
+// reducer：使用者當下看到的畫面跟重新載入歷史後看到的畫面若各走一套邏輯，
+// 兩邊遲早會漂移不一致。**只碰 view，不碰 SessionMeta**（busy／unread／
+// state／identity 是 apply() 自己在 switch 那段的職責；歷史回放不重放這些
+// 副作用——重放時 unread 再 ++ 或 busy 被短暫撥動都是錯的，見 pin() 文件）。
+function applyToView(v: SessionView, env: Envelope) {
+  if (env.usage) {
+    v.totals.input = env.usage.input_tokens
+    v.totals.output = env.usage.output_tokens
+  }
+  if (env.usage_semantics) v.usageSemantics = env.usage_semantics
+
+  if (env.kind === 'result') {
+    v.totals.cost += env.cost_usd ?? 0
+    const tail = v.chat.at(-1)
+    if (tail && tail.role === 'assistant' && tail.streaming) {
+      if (tail.text === '' && tail.thinking === '') v.chat.pop()
+      else tail.streaming = false
+    }
+  }
+
+  if (env.kind === 'delta') {
+    const last = v.chat.at(-1)
+    if (last && last.role === 'assistant' && last.streaming) {
+      last.text += env.text ?? ''
+      last.thinking += env.thinking ?? ''
+    } else {
+      v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: true })
+    }
+    return // delta 不進 timeline
+  }
+  if (env.kind === 'message' && env.role === 'user') {
+    v.chat.push({ role: 'user', text: env.text ?? '', thinking: '', streaming: false })
+  } else if (env.kind === 'message' && env.role === 'assistant') {
+    const last = v.chat.at(-1)
+    if (last && last.role === 'assistant' && last.streaming) {
+      last.text = env.text ?? last.text
+      if (env.thinking) last.thinking = env.thinking
+      last.streaming = false
+    } else {
+      v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: false })
+    }
+  }
+  // role==='tool' 的 message 只進 timeline
+
+  if (NOISE_KINDS.has(env.kind)) {
+    if (v.noiseGroup === -1) v.noiseGroup = v.nextGroup++
+    v.timeline.push({ env, group: v.noiseGroup })
+  } else {
+    v.noiseGroup = -1
+    v.timeline.push({ env })
   }
 }
 
@@ -202,17 +262,30 @@ export const useSession = defineStore('session', {
       if (w && this.sessions[w]) this.sessions[w].unread = 0
     },
 
-    // pin：把 session 釘進 pane（persistent）。建立 transcript 容器並清 unread。
-    // 尾端視窗的 lazy load 是 Task 29 的事，這裡只負責容器與 pin 狀態。
-    pin(idx: 0 | 1, wsid: string) {
+    // pin：把 session 釘進 pane（persistent）。已有 view（例如同一 wsid 仍釘在
+    // 另一 pane）就沿用既有 transcript，不重新載入；否則建立容器並觸發 §3.8
+    // 尾端視窗 lazy load（Task 29——修掉 Task 26→28 刻意接受的暫時降級：重啟
+    // 後重新釘選一個既有 session，畫面只有 metadata／unread／狀態是對的，歷史
+    // 對話看不到，因為 pin() 過去只建空殼、從不回填）。沒有
+    // bindings.LoadTurnsBefore（dev 尚未 setBindings、或測試 mock 未提供）時
+    // 退回舊行為：空殼 view、不拋錯。
+    async pin(idx: 0 | 1, wsid: string) {
       const prev = this.pins[idx]
       if (prev && prev !== wsid) this.releaseView(prev, idx)
       this.persistentPins[idx] = wsid
       this.pins[idx] = wsid
       if (this.transientPane === idx) this.transientPane = null
-      if (!this.views[wsid]) this.views[wsid] = newView()
+      const isNew = !this.views[wsid]
+      if (isNew) this.views[wsid] = newView()
       const m = this.sessions[wsid]
       if (m) m.unread = 0
+      if (!isNew) return
+      const load = this.bindings?.LoadTurnsBefore
+      if (!load) return
+      const envs = await load(wsid, '', TURN_WINDOW_SIZE)
+      const v = this.views[wsid] // await 期間可能已被 unpin／再次釋放，重新取一次
+      if (!v || !envs) return
+      for (const e of envs) applyToView(v, e)
     },
 
     unpin(idx: 0 | 1) {
@@ -233,6 +306,31 @@ export const useSession = defineStore('session', {
 
     setScrollAnchor(wsid: string, eventID: string) {
       this.scrollAnchors[wsid] = eventID
+    },
+
+    // loadOlder：使用者捲到頂——§3.8 向上分頁，游標是目前 timeline 最舊事件的
+    // event_id（帶 cursor＝該 turn 之前的一頁，語意見 TurnWindowBindings 文件）。
+    // 以 event_id 去重：TurnsBefore 契約上是開區間、不該與已載入的重疊，但這裡
+    // 仍防禦性去重而不假設呼叫端一定遵守（這個 session 稍早的測試教訓：只寫在
+    // 註解裡的保證＝沒有守門）。舊 turn 的 usage／cost 快照**不**回寫
+    // totals／usageSemantics——那是「該 turn 當下」的值，覆寫畫面現在顯示的
+    // 最新累計值只會讓 cost／token 顯示倒退，因此另建 scratch view 疊算，只取
+    // 它的 chat／timeline 往前插入。
+    async loadOlder(wsid: string) {
+      const load = this.bindings?.LoadTurnsBefore
+      const v = this.views[wsid]
+      if (!load || !v) return
+      const cursor = v.timeline[0]?.env.event_id ?? ''
+      if (!cursor) return // 尚未有任何已載入事件：沒有游標可分頁
+      const envs = await load(wsid, cursor, TURN_WINDOW_SIZE)
+      if (!envs?.length) return
+      const known = new Set(v.timeline.map(i => i.env.event_id))
+      const fresh = envs.filter(e => !known.has(e.event_id))
+      if (!fresh.length) return
+      const scratch = newView()
+      for (const e of fresh) applyToView(scratch, e)
+      v.timeline.unshift(...scratch.timeline)
+      v.chat.unshift(...scratch.chat)
     },
 
     // routeApproval（§3.6.4）：把核可請求的來源帶到使用者眼前。
@@ -273,8 +371,15 @@ export const useSession = defineStore('session', {
     },
 
     // apply：host conversation envelope 的唯一入口，依 workspace_session_id 路由。
-    // metadata（busy／unread／state／identity）一律更新；transcript 只在該 WSID
-    // 有 view（釘選或 transient 顯示中）時才累積。
+    // metadata（busy／unread／state／identity）一律更新；transcript 的實際寫入
+    // 委給 applyToView（只在該 WSID 有 view——釘選或 transient 顯示中——時才
+    // 呼叫，見底下 `if (!v) return`）。
+    //
+    // 注意：§3.8 視窗化載入（pin()／loadOlder()，Task 29）的歷史回放**不**經
+    // 這個方法——它直接呼叫 applyToView，跳過整段 metadata switch。這是刻意
+    // 的：歷史事件重放時再讓 unread++／busy 撥動一次都是錯的（那些副作用在
+    // 事件第一次抵達時已經發生過，registry hydrate／目前的 runtime 狀態才是
+    // 權威）。
     apply(env: Envelope) {
       const wsid = env.workspace_session_id ?? ''
       if (!wsid) { // 沒有 lane 可放：丟棄但不靜默（見 State.unrouted）
@@ -283,12 +388,6 @@ export const useSession = defineStore('session', {
       }
       const m = this.metaFor(wsid, providerOf(env.provider))
       const v = this.views[wsid]
-
-      if (v && env.usage) {
-        v.totals.input = env.usage.input_tokens
-        v.totals.output = env.usage.output_tokens
-      }
-      if (v && env.usage_semantics) v.usageSemantics = env.usage_semantics
 
       switch (env.kind) {
         case 'init':
@@ -304,23 +403,11 @@ export const useSession = defineStore('session', {
             m.awaitingApproval = env.state === 'awaiting_approval'
           }
           break
-        case 'result': {
-          if (v) v.totals.cost += env.cost_usd ?? 0
+        case 'result':
           m.busy = false
           // unread：只有「看不到」的 session 才累積——兩個 pane 都是可見的。
-          // 重放（Task 29 的視窗化載入）進來的歷史事件同樣會走這裡；那條路徑
-          // 需要一個「重放中不計 unread」的旗標，由該 task 連同它的寫入端一起
-          // 加——現在先不留一個沒有寫入端的死旗標。
           if (!this.pins.includes(wsid)) m.unread++
-          if (v) {
-            const tail = v.chat.at(-1)
-            if (tail && tail.role === 'assistant' && tail.streaming) {
-              if (tail.text === '' && tail.thinking === '') v.chat.pop()
-              else tail.streaming = false
-            }
-          }
           break
-        }
       }
 
       if (env.kind === 'message' && env.role === 'user') {
@@ -328,38 +415,7 @@ export const useSession = defineStore('session', {
       }
 
       if (!v) return // 非釘選：metadata 已更新，不保留 transcript
-
-      if (env.kind === 'delta') {
-        const last = v.chat.at(-1)
-        if (last && last.role === 'assistant' && last.streaming) {
-          last.text += env.text ?? ''
-          last.thinking += env.thinking ?? ''
-        } else {
-          v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: true })
-        }
-        return // delta 不進 timeline
-      }
-      if (env.kind === 'message' && env.role === 'user') {
-        v.chat.push({ role: 'user', text: env.text ?? '', thinking: '', streaming: false })
-      } else if (env.kind === 'message' && env.role === 'assistant') {
-        const last = v.chat.at(-1)
-        if (last && last.role === 'assistant' && last.streaming) {
-          last.text = env.text ?? last.text
-          if (env.thinking) last.thinking = env.thinking
-          last.streaming = false
-        } else {
-          v.chat.push({ role: 'assistant', text: env.text ?? '', thinking: env.thinking ?? '', streaming: false })
-        }
-      }
-      // role==='tool' 的 message 只進 timeline
-
-      if (NOISE_KINDS.has(env.kind)) {
-        if (v.noiseGroup === -1) v.noiseGroup = v.nextGroup++
-        v.timeline.push({ env, group: v.noiseGroup })
-      } else {
-        v.noiseGroup = -1
-        v.timeline.push({ env })
-      }
+      applyToView(v, env)
     },
 
     // applyNotice：workspace scope 事件（不屬於任何 session）。

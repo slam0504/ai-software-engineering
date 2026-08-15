@@ -52,6 +52,13 @@ export interface Bindings {
   // wailsjs module mock），因此掛在這裡；optional 讓既有 okBindings() 等字面量
   // 不必補欄位。
   EndSession?(wsid: string): Promise<void>
+  // LoadTurnsBefore：Task 29 新增，**optional**（同 EndSession 的理由）——
+  // session store 的 pin()／loadOlder() 是本 task 起唯一真正呼叫它的地方
+  // （§3.8 lazy load／向上分頁）。optional 讓既有大量沒帶這個欄位的 bindings
+  // 字面量（okBindings()／mockBindings() 等）不必補；store 端一律用
+  // `this.bindings?.LoadTurnsBefore` 呼叫，沒提供時退回 Task 26 之前的行為
+  // （空殼 view，不拋錯）。簽章逐字鏡射 TurnWindowBindings。
+  LoadTurnsBefore?(wsid: string, beforeEventID: string, n: number): Promise<Envelope[]>
 }
 // SessionLifecycleBindings：以 WSID 定址的其餘 lifecycle 入口（Task 26 一併
 // 切換）。與 Bindings 分開的理由同 EvidenceBindings：session store 的 mock 只
