@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
@@ -71,6 +72,36 @@ type Index struct {
 	degraded         bool
 	degradedErr      error
 	degradedNotified bool
+
+	// runtime 重建（Task 19，§3.5.7）的續掃游標，**刻意獨立於 checkpoint**：
+	// degraded latch 期間 checkpoint 依 §3.5.4 不得前移，但 catch-up 必須知道
+	// 「已經重新索引到哪裡」才能一輪一輪逼近 audit 檔尾、且重試時不重跑
+	// bulk。只有在成功接回（finalCatchUpAndAttach）那一刻才寫進
+	// checkpointOffset／checkpointLastEventID。詳見 rebuild.go 的
+	// RuntimeRebuild。存取一律持 idx.mu。
+	rebuildCursor      int64
+	rebuildLastEventID string
+
+	// runtime 重建的本輪統計（持 idx.mu）：catchUpAttempts 是鎖外 catch-up 的
+	// 嘗試次數（界限 MaxCatchUpAttempts，證明不會 busy-loop）、unlockRetries
+	// 是「取鎖後殘量又超限、立即解鎖重試」的次數、maxLockedScanBytes 是鎖內
+	// 單次補掃處理量的最大值（證明鎖內處理量不超過凍結上限）。只有測試會讀，
+	// 讀取入口在 runtime_rebuild_test.go。
+	catchUpAttempts    int
+	unlockRetries      int
+	maxLockedScanBytes int64
+
+	// holdingEmitLock：目前是否持有呼叫端傳入的 emit mutex。**不受 idx.mu 保
+	// 護**是刻意的：注入的 auditEndFunc 可能在任何時機被呼叫（含 idx.mu 已被
+	// 持有時），若這個旗標也走 idx.mu 就會自我死鎖。
+	holdingEmitLock atomic.Bool
+
+	// hookAfterUnlockedCatchUp／hookAfterResidualOKBeforeLock 是 barrier 測試
+	// 專用的鉤子，用來把事件精準塞進「鎖外補掃剛結束」與「殘量已達標、mutex
+	// 尚未取得」這兩個窗口，取代 time.Sleep。production 路徑永遠是 nil；由測
+	// 試在呼叫 RuntimeRebuild 之前於同一 goroutine 設定，故不需另外同步。
+	hookAfterUnlockedCatchUp      func()
+	hookAfterResidualOKBeforeLock func()
 
 	// forceWriteErr 是測試專用的故障注入鉤子，唯一設值入口是 degraded_test.go
 	// 的 ForceWriteErrForTest；production 路徑永遠不會設它。同慣例見
@@ -240,13 +271,20 @@ func (idx *Index) Degraded() bool {
 }
 
 // ClearDegraded：以成功重建為準解除 degraded latch（§3.5.4：「解除以成功重
-// 建為準」）。本 task 不做重建本身，只提供這個入口給 Task 17-19 的 runtime
-// 重建路徑呼叫。解除的同時開啟下一個 degraded generation——degradedNotified
+// 建為準」）。解除的同時開啟下一個 degraded generation——degradedNotified
 // 一併重置，所以下一次寫入失敗仍會各自發一次通知，不會因為用過一次就永久
 // 啞掉。
+//
+// 這是給呼叫端／測試用的外部入口；runtime 重建路徑（rebuild.go 的
+// finalCatchUpAndAttach）已持有 idx.mu，走 clearDegradedLocked。
 func (idx *Index) ClearDegraded() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	idx.clearDegradedLocked()
+}
+
+// clearDegradedLocked：呼叫端須持有 idx.mu。
+func (idx *Index) clearDegradedLocked() {
 	idx.degraded = false
 	idx.degradedErr = nil
 	idx.degradedNotified = false
