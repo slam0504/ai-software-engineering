@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -71,6 +72,26 @@ type App struct {
 	// 但 §3.8 的視窗化載入與 §3.2.3 的 incomplete turn 偵測會一併停用（兩者
 	// 都以 index 為唯一來源，不另做一份掃描實作）。
 	replayIndex *replayindex.Index
+
+	// indexUnverified：啟動期 VerifyOrRebuild 失敗的 latch。
+	//
+	// 為什麼「失敗就不能再信」而不是「失敗但還能用」：verifyOrRebuildLocked
+	// 是**邊做邊改狀態**的——先清 checkpoint／turns、必要時 quarantine turn
+	// files，最後才 rescanFromLocked。若它在 rescan 中途失敗，記憶體裡留下的是
+	// 「掃到一半」的狀態；接著第一筆 live 事件進 Observe 就會把 checkpointOffset
+	// 直接推到該筆的 receipt.EndOffset，**跳過中間那段沒掃到的 audit**——那段
+	// 的 turn record 從此沒人會補（下次啟動的 rescanFrom 也是從新 checkpoint
+	// 起掃），index 出現靜默且永久的缺口，而 LoadTurnsBefore 只會少回幾個
+	// turn、不會回錯。
+	//
+	// 所以這裡 latch 成「不可信」，讓 LoadTurnsBefore fail loud 並提示重啟。
+	// 刻意**不**排程 runtime 重建：RuntimeRebuild 的 bulkRebuild 永遠從
+	// max(rebuildCursor, checkpointOffset) 起掃，而此刻那個值本身就是毒的，
+	// 重建只會把缺口固化。需要的是「reset turn files ＋從 offset 0 全量」語意，
+	// 那條路徑目前只有啟動期的 VerifyOrRebuild 有。
+	//
+	// atomic：寫在啟動序列（單執行緒），讀在 binding（Wails 另一條 goroutine）。
+	indexUnverified atomic.Bool
 
 	// eventSink：events.jsonl 的具體 sink。Manager 只需要 appcore.AuditSink，
 	// 這裡另外留一份具體型別**只為了 End()**——replayindex 的 auditEndFunc 契
@@ -201,12 +222,13 @@ type App struct {
 
 	// ---- replay index 的 runtime 重建排程（§3.5.7；rebuild_orchestrator.go）----
 	//
-	// rebuildMu 保護以下五個欄位。single-flight 由 rebuildRunning 保證：
+	// rebuildMu 保護以下六個欄位。single-flight 由 rebuildRunning 保證：
 	// replayindex.RuntimeRebuild 自己也會對重入回 ErrRebuildInProgress，但
 	// 「不得疊呼叫」的責任在排程這一側——ErrRebuildNotConverged 的 backoff 重
 	// 試若每次 degraded 通知都另起一條，會直接疊出多條互相回錯的重試鏈。
 	rebuildMu      sync.Mutex
 	rebuildRunning bool
+	rebuildClosed  bool // cancelRebuild 已執行：排程入口自此關閉（見 scheduleRebuild）
 	rebuildCancel  context.CancelFunc
 	rebuildDone    chan struct{}   // 本輪重試迴圈結束時關閉（shutdown 的等待點）
 	rebuildStarts  int             // RuntimeRebuild 實際被呼叫的次數（測試斷言用）
@@ -803,8 +825,10 @@ func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
 	if indexUsable {
 		if verr := a.replayIndex.VerifyOrRebuild(a.eventsPath()); verr != nil {
 			indexUsable = false
+			a.indexUnverified.Store(true) // latch：視窗化載入自此 fail loud（見欄位 doc）
 			a.audit("replay_index_verify_error", map[string]any{"error": verr.Error()})
-			a.noteStartupWarning("replay index 驗證／重建失敗（未完成 turn 修復本次跳過）：" + verr.Error())
+			a.noteStartupWarning("replay index 驗證／重建失敗，視窗化載入已停用（未完成 turn 修復本次跳過）；" +
+				"請重啟 app 讓啟動期重建再跑一次：" + verr.Error())
 		}
 	}
 	if indexUsable {

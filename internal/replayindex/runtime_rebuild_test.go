@@ -36,19 +36,9 @@ func (idx *Index) MaxBytesScannedUnderLockForTest() int64 {
 	return idx.maxLockedScanBytes
 }
 
-// LockSegmentsForTest：本輪鎖外掃描實際分了幾段（每段之間釋放一次 idx.mu）。
-func (idx *Index) LockSegmentsForTest() int {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	return idx.lockSegments
-}
-
-// RebuildCursorForTest：目前的 rebuild cursor（獨立於 checkpoint）。
-func (idx *Index) RebuildCursorForTest() int64 {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	return idx.rebuildCursor
-}
+// LockSegmentsForTest／RebuildCursorForTest／SetScanSegmentHookForTest 已搬到
+// index.go（production 檔）——package main 的接線測試要用它們鎖「append 落在
+// 掃描中間」這條順序斷言，跨 package 就拿不到 _test.go 裡的符號。見該處 doc。
 
 // HoldingLockForTest：目前是否持有呼叫端傳入的 emit mutex。刻意不取 idx.mu
 // ——注入的 auditEndFunc 可能在 idx.mu 已被持有時被呼叫（見 rebuild.go 的欄位

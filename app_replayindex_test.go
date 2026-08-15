@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/replayindex"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // ---- 測試專用讀取入口（同 replayindex 的慣例：欄位在 production 檔宣告，
@@ -189,9 +191,10 @@ func TestNotConvergedTriggersBackoffRetry(t *testing.T) {
 	if got := a.rebuildStartsForTest(); got != 3 {
 		t.Fatalf("未收斂應 backoff 重試至成功：%d", got)
 	}
-	if a.replayIndex.Degraded() {
-		t.Fatal("成功後應解除 degraded")
-	}
+	// 這裡刻意**不**斷言 Degraded()==false：hookRebuildResult 取代了真正的
+	// RuntimeRebuild，index 從頭到尾沒被 latch 過，那個斷言恆為 true 而不是在
+	// 驗任何東西。「重建成功會解除 latch」由走真實路徑的
+	// TestIndexDegradedNotifyDoesNotDeadlockAndRecovers 負責。
 	if !a.backoffDelaysIncreasingForTest() {
 		t.Fatal("重試必須遞增 backoff，不得 busy-loop")
 	}
@@ -253,6 +256,66 @@ func TestScheduleRebuildRejectedAfterShutdown(t *testing.T) {
 	}
 	if got := a.rebuildStartsForTest(); got != 0 {
 		t.Fatalf("shutdown 之後不得再呼叫 RuntimeRebuild：%d", got)
+	}
+}
+
+// TestScheduleRebuildRejectedOnceCancelled：關閉排程入口的判準必須是
+// cancelRebuild 自己在 rebuildMu 下設的旗標，不是另一把鎖下的 a.shuttingDown。
+//
+// 用 a.shuttingDown 判斷時，「讀完放掉 shutMu」到「取得 rebuildMu」之間有窗口：
+// shutdown 若正好在那段時間內設起旗標並跑完 cancelRebuild（那一刻 rebuildCancel
+// 還是 nil，直接返回），排程仍會起一條沒有人取消、也沒有人等待的 goroutine，跨
+// 過 Manager.Close 與 index.Flush 繼續跑 RuntimeRebuild。
+//
+// 這裡直接鎖住那個窗口收束後的不變量：**cancelRebuild 之後的排程一律不得起
+// goroutine**，與 a.shuttingDown 是否已經設起無關。以 shutMu 為判準的寫法在這
+// 條會紅（此時 shuttingDown 還是 false，排程會被放行）。
+func TestScheduleRebuildRejectedOnceCancelled(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.hookRebuildResult = func(int) error { return nil }
+
+	a.cancelRebuild() // shutdown 序列裡的那一步（此時尚未有任何 in-flight 重建）
+	a.scheduleRebuild("degraded notice racing shutdown")
+
+	if a.rebuildInFlight() {
+		t.Fatal("cancelRebuild 之後不得再起新的重建 goroutine")
+	}
+	if got := a.rebuildStartsForTest(); got != 0 {
+		t.Fatalf("cancelRebuild 之後不得再呼叫 RuntimeRebuild：%d", got)
+	}
+}
+
+// TestCancelRebuildWaitsForRacingSchedule：同一個窗口的另一半——排程先進的那條
+// 交錯。cancelRebuild 必須等它收斂，不能因為「取鎖時 rebuildDone 還是 nil」就直
+// 接返回，留下跨過 Manager.Close 的 goroutine。
+func TestCancelRebuildWaitsForRacingSchedule(t *testing.T) {
+	a, _ := newTestApp(t)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	a.hookRebuildResult = func(int) error {
+		<-release
+		close(finished)
+		return nil
+	}
+	a.scheduleRebuild("in flight")
+	waitFor(t, "rebuild 進場", func() bool { return a.rebuildStartsForTest() == 1 })
+
+	done := make(chan struct{})
+	go func() { a.cancelRebuild(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("cancelRebuild 必須等 in-flight 的那一輪收斂")
+	case <-time.After(50 * time.Millisecond): // 只確認它還沒返回，不是同步手段
+	}
+	close(release)
+	<-done
+	select {
+	case <-finished:
+	default:
+		t.Fatal("cancelRebuild 返回時那一輪必須已經跑完")
+	}
+	if a.rebuildInFlight() {
+		t.Fatal("cancelRebuild 返回後不得仍有 in-flight 重建")
 	}
 }
 
@@ -353,20 +416,23 @@ func TestIndexDegradedNotifyDoesNotDeadlockAndRecovers(t *testing.T) {
 	}
 }
 
-// TestAppendProgressesDuringRebuildScan：Task 19 把重建掃描切成分段、段間釋放
-// idx.mu，目的就是讓 append 路徑（emitMu → Observe → idx.mu）不會因為重建掃
-// 描而長時間停住。接線之後這個目的必須實際成立——不是只驗 replayindex 內部的
-// 分段計數，而是驗真正的 append 路徑。
+// TestAppendLandsMidRebuildScan：Task 19 把重建掃描切成分段、段間釋放 idx.mu，
+// 目的就是讓 append 路徑（emitMu → Observe → idx.mu）不會因為重建掃描而長時間
+// 停住。接線之後這個目的必須實際成立——不是只驗 replayindex 內部的分段計數，
+// 而是驗真正的 append 路徑。
 //
-// 形狀：先讓 index degraded 並卡住重建（hookRebuildEntered），灌進遠大於單段
-// 上限的 audit，放行重建，然後在重建期間持續 append，量**單筆 append 的最長
-// 阻塞**相對於整輪重建的長度。
+// 判準是**順序**不是時間：一筆真實 append 必須在鎖外掃描**還沒掃到本輪高水位**
+// 之前就返回。
 //
-// 判別力已實測（darwin/arm64、-race、-count=3）：把 scanSegmentBytes 改成
-// 1<<40（等於不分段）後三次全紅——單筆阻塞 463～491ms／重建全長 565～660ms
-// （78%）；分段版是 135～137ms／1.29～1.37s（10%）。門檻取 1/4 落在兩者之
-// 間，且兩個量在機器負載下會一起放大，比率相對穩定。
-func TestAppendProgressesDuringRebuildScan(t *testing.T) {
+//   - 分段版：append 由第一次段間鉤子觸發，最多被下一段擋住 → 返回時 cursor 約
+//     一兩段（數百 KB），遠小於 4MB 的高水位。
+//   - 不分段（scanSegmentBytes 調大到涵蓋整份檔案）：段間鉤子要等整段掃完才會
+//     第一次觸發，append 因此從一開始就落在 cursor 已達檔尾之後 → **恆紅**。
+//
+// 前一版用「單筆最長阻塞 / 重建全長」的比率斷言，餘裕不足（熱檔案快取下重建全
+// 長掉到 ~390ms，任何無關的 scheduler／GC 停頓卡個 100ms 就誤紅），已改掉：這
+// 條守的是 §3.5.7 的核心不變量，最不該變成「紅了先猜是不是 flake」的那一條。
+func TestAppendLandsMidRebuildScan(t *testing.T) {
 	a, _ := newTestApp(t)
 	w := dormantWSID(t, a, "w1", contract.ProviderClaude)
 
@@ -383,40 +449,38 @@ func TestAppendProgressesDuringRebuildScan(t *testing.T) {
 	for i := 0; i < bulkEvents; i++ {
 		a.manager.EmitWorkspace("bulk", nil, map[string]string{"p": payload})
 	}
+	highWater := a.eventSink.End() // 本輪掃描的高水位：放行之前的 audit 檔尾
 
-	// 判準是**單筆 append 的最長阻塞**，不是「重建期間完成幾筆」：後者數到的
-	// 是重建收斂得多快，掃描霸不霸佔 idx.mu 都差不多（實測兩者同樣落在 20 幾
-	// 筆）。真正的差別在於，整段掃描持鎖時會有一筆 append 卡滿整個 bulk 掃描，
-	// 分段釋放則最多卡一段。
-	started := time.Now()
+	// 段間鉤子（掃完一段、idx.mu 已釋放時觸發）：第一次進來就派一條 goroutine
+	// 做一筆真實 append，並在鉤子內等它**確實開始跑**才放行下一段——否則
+	// goroutine 可能遲到，變成量到排程延遲而不是鎖行為。
+	var once sync.Once
+	appendCursor := make(chan int64, 1)
+	a.replayIndex.SetScanSegmentHookForTest(func() {
+		once.Do(func() {
+			running := make(chan struct{})
+			go func() {
+				close(running)
+				a.manager.EmitWorkspace("live", nil, map[string]string{"i": "x"})
+				appendCursor <- a.replayIndex.RebuildCursorForTest()
+			}()
+			<-running
+		})
+	})
+
 	close(ready) // 放行重建：從 checkpoint 起掃 ≈4MB
-	var maxBlocked time.Duration
-	duringRebuild := 0
-	const appends = 200
-	for i := 0; i < appends; i++ {
-		t0 := time.Now()
-		a.manager.EmitWorkspace("live", nil, map[string]string{"i": "x"})
-		d := time.Since(t0)
-		if !a.rebuildInFlight() {
-			continue // 重建已結束：這筆不可能被它擋到
-		}
-		duringRebuild++
-		if d > maxBlocked {
-			maxBlocked = d
-		}
-	}
+	cursor := <-appendCursor
 	waitFor(t, "rebuild 收斂", func() bool { return !a.rebuildInFlight() })
-	total := time.Since(started)
 
-	t.Logf("重建全長 %v；期間完成 %d/%d 筆 append，單筆最長阻塞 %v",
-		total, duringRebuild, appends, maxBlocked)
-	if duringRebuild < 3 {
-		t.Fatalf("重建期間幾乎沒有 append 完成（%d/%d），這條測試沒有真的測到重疊",
-			duringRebuild, appends)
+	segments := a.replayIndex.LockSegmentsForTest()
+	t.Logf("append 返回時 cursor=%d（高水位 %d），本輪共分 %d 段", cursor, highWater, segments)
+	if cursor >= highWater {
+		t.Fatalf("append 一直等到掃描抵達高水位才返回（cursor=%d >= %d）"+
+			"——分段釋放 idx.mu 沒有生效，整條 provider 事件管線會被重建掃描停住",
+			cursor, highWater)
 	}
-	if maxBlocked*4 >= total {
-		t.Fatalf("單筆 append 被重建掃描卡了 %v，佔重建全長 %v 的一大截"+
-			"——分段釋放 idx.mu 沒有生效（整條 provider 事件管線會跟著停）", maxBlocked, total)
+	if segments < 2 {
+		t.Fatalf("本輪只分了 %d 段，這條測試沒有真的測到段間窗口", segments)
 	}
 	if a.replayIndex.Degraded() {
 		t.Fatal("重建應收斂並解除 degraded")
@@ -538,5 +602,36 @@ func TestLoadTurnsBeforeWithoutIndexFailsLoud(t *testing.T) {
 	a.replayIndex = nil
 	if _, err := a.LoadTurnsBefore("w1", "", turnPageSize); !errors.Is(err, errNoReplayIndex) {
 		t.Fatalf("index 不可用必須 fail loud：%v", err)
+	}
+}
+
+// TestVerifyFailureMakesWindowFailLoud：啟動期 VerifyOrRebuild 失敗之後，index
+// 可能停在「掃到一半」的狀態——接下來第一筆 live 事件會把 checkpoint 直接推到
+// 它自己的 offset，跳過中間沒掃到的那段，留下靜默且永久的缺口。此時
+// LoadTurnsBefore 只會少回幾個 turn 而不會回錯，使用者分辨不出來，所以必須
+// latch 成 fail loud 並提示重啟。
+func TestVerifyFailureMakesWindowFailLoud(t *testing.T) {
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","workspace_session_id":"w1","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"state_change","workspace_session_id":"w1","state":"done"}`)
+	seedRegistry(t, dir, wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"})
+	a := newTestAppAt(t, dir)
+
+	// 壞掉的 checkpoint.json 讓 verifyOrRebuildLocked 在解析階段就回錯（同一個
+	// latch 對 rescan 中途失敗也成立，只是那個時序在測試裡造不出來）。
+	if err := os.WriteFile(filepath.Join(dir, "replay-index", "checkpoint.json"),
+		[]byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatalf("index 驗證失敗不得阻擋啟動（它是快取，不是權威）：%v", err)
+	}
+	if !strings.Contains(a.startupErr, "重啟") {
+		t.Fatalf("啟動警告必須給出可操作指引：%q", a.startupErr)
+	}
+	if _, err := a.LoadTurnsBefore("w1", "", turnPageSize); !errors.Is(err, errIndexUnverified) {
+		t.Fatalf("驗證失敗後的視窗載入必須 fail loud，不得靜默回不完整的視窗：%v", err)
 	}
 }

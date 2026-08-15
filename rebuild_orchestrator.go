@@ -21,6 +21,11 @@ import (
 // ——那正是 §3.5 要消滅的行為。
 var errNoReplayIndex = errors.New("app: replay index 未啟用（本次啟動已 fail loud，見 startup 警告）")
 
+// errIndexUnverified：啟動期 VerifyOrRebuild 失敗，index 內容不可信（可能有靜
+// 默缺口，見 App.indexUnverified 的 doc）。回錯而不是回一份可能少 turn 的視窗
+// ——後者使用者分辨不出來。in-process 沒有安全的復原路徑，只能重啟。
+var errIndexUnverified = errors.New("app: replay index 啟動驗證失敗，內容不可信；請重啟 app 讓啟動期重建再跑一次")
+
 // indexOrNil：*replayindex.Index → appcore.TurnIndex，nil 指標回 nil 介面。
 // 直接把 typed nil 塞進介面欄位會讓 `cfg.Index != nil` 恆為真，接著在第一筆
 // 事件上對 nil 指標取 idx.mu 而 panic——這是 Go 的經典陷阱，不是防禦性檢查。
@@ -76,19 +81,20 @@ const (
 // ErrRebuildInProgress 互相打回，然後各自 backoff、各自再試——實際重建進度沒
 // 有變快，卻疊出無界的 goroutine 與無界的檔案掃描。
 //
-// shutdown 之後一律拒絕：Manager.Close 會 flush pending queue，那些事件仍會
-// 走 Observe，若此時 index 才第一次寫失敗，通知會在 shutdown 收斂之後又起一
+// cancelRebuild 之後一律拒絕：Manager.Close 會 flush pending queue，那些事件仍
+// 會走 Observe，若此時 index 才第一次寫失敗，通知會在 shutdown 收斂之後又起一
 // 條沒有人會等的 goroutine。
+//
+// 「拒絕」的判準刻意是 rebuildClosed（cancelRebuild 在**同一把 rebuildMu 下**
+// 設的），不是 a.shuttingDown：後者要另取 shutMu，讀完放鎖到取得 rebuildMu 之
+// 間有窗口——shutdown 若正好在那段時間內把旗標設起來並跑完 cancelRebuild（那
+// 一刻 rebuildCancel 還是 nil，直接返回），這條排程仍會起一條沒有人取消、也沒
+// 有人等待的 goroutine，跨過 Manager.Close 與 index.Flush 繼續跑
+// RuntimeRebuild。同一把鎖之後兩種交錯都安全：schedule 先進 → cancelRebuild 讀
+// 得到 done 並等它；cancel 先進 → schedule 直接被拒。
 func (a *App) scheduleRebuild(reason string) {
-	a.shutMu.Lock()
-	down := a.shuttingDown
-	a.shutMu.Unlock()
-	if down {
-		return
-	}
-
 	a.rebuildMu.Lock()
-	if a.rebuildRunning {
+	if a.rebuildClosed || a.rebuildRunning {
 		a.rebuildMu.Unlock()
 		return
 	}
@@ -107,7 +113,10 @@ func (a *App) rebuildInFlight() bool {
 	return a.rebuildRunning
 }
 
-// cancelRebuild：shutdown 用——取消重試迴圈並**等它真的收斂**。
+// cancelRebuild：shutdown 用——關閉排程入口、取消重試迴圈並**等它真的收斂**。
+//
+// rebuildClosed 與「讀取 cancel／done」在同一個臨界區內完成，這是
+// scheduleRebuild 那側不再有 check-then-act 窗口的前提（見其 doc）。
 //
 // 取消的粒度是「兩次 RuntimeRebuild 之間」：正在進行的那一次會跑完才返回。
 // 這是刻意的，也是有界的——RuntimeRebuild 自身受 MaxCatchUpAttempts 與收斂上
@@ -116,6 +125,7 @@ func (a *App) rebuildInFlight() bool {
 // 待（可能長達 maxRebuildBackoff），那由 ctx 立即解除。
 func (a *App) cancelRebuild() {
 	a.rebuildMu.Lock()
+	a.rebuildClosed = true
 	cancel, done := a.rebuildCancel, a.rebuildDone
 	a.rebuildMu.Unlock()
 	if cancel != nil {
@@ -251,6 +261,9 @@ const turnPageSize = 20
 func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error) {
 	if a.replayIndex == nil {
 		return nil, errNoReplayIndex
+	}
+	if a.indexUnverified.Load() {
+		return nil, errIndexUnverified
 	}
 	if wsid == "" {
 		return nil, errors.New("app: LoadTurnsBefore 需要 workspace session id")

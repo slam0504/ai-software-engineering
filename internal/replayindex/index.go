@@ -465,6 +465,38 @@ func (idx *Index) Checkpoint() (int64, string) {
 	return idx.checkpointOffset, idx.checkpointLastEventID
 }
 
+// ---- 測試專用入口（**production 路徑一律不得呼叫**）----
+//
+// 同套件的測試存取器（CatchUpAttemptsForTest 等）都放在 _test.go，那是慣例；
+// 以下三個例外地放在 production 檔，理由只有一個：**跨 package 用得到**。
+// package main 的接線測試要鎖住「append 落在鎖外掃描的**中間**、不是等整段掃
+// 完才返回」這條順序斷言（§3.5.7 分段釋放 idx.mu 的存在理由），而那個斷言需要
+// 從 package main 掛段間鉤子並讀掃描進度——_test.go 裡的符號跨 package 拿不到。
+// 名字一律帶 ForTest 後綴，就是為了讓 production 呼叫端在 code review 當場露餡。
+
+// LockSegmentsForTest：本輪鎖外掃描實際分了幾段（每段之間釋放一次 idx.mu）。
+func (idx *Index) LockSegmentsForTest() int {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.lockSegments
+}
+
+// RebuildCursorForTest：目前的 rebuild cursor（獨立於 checkpoint）。
+func (idx *Index) RebuildCursorForTest() int64 {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.rebuildCursor
+}
+
+// SetScanSegmentHookForTest：設定「鎖外掃描每掃完一段、釋放 idx.mu 之後」呼叫
+// 的鉤子（見 hookBetweenScanSegments 欄位）。必須在 RuntimeRebuild 開始之前設
+// 定，且呼叫端要自行建立 happens-before 邊（鉤子欄位在掃描迴圈中不持鎖讀取）。
+func (idx *Index) SetScanSegmentHookForTest(f func()) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.hookBetweenScanSegments = f
+}
+
 // Flush：強制把記憶體中目前的 checkpoint 狀態（含所有 WSID 的
 // open_turn_start_offset）落盤，冪等。
 //
