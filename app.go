@@ -246,6 +246,11 @@ type App struct {
 	// 就是永久的證據缺口。形狀與 internal/evidence／internal/gate 的 journal 同款。
 	wireSegments *wirelog.SegmentSet
 
+	// wireOpenSegs：wire_log_id → 目前在該 generation 上開著 segment 的 host。
+	// 在 wireMu 下讀寫。只服務一件事——判定「這一段期間有沒有別的 session 也在
+	// 同一代上活著」，好在證據出口標明 range 非排他（見 closeWireSegment）。
+	wireOpenSegs map[string]map[appcore.WSID]*sessionHost
+
 	// hookWireStep：測試注入——受控復原／replacement 的步驟順序探針（§3.4.7 的
 	// 順序是凍結契約）。production 恆為 nil。
 	hookWireStep func(step string)
@@ -6033,16 +6038,71 @@ func (a *App) openWireSegments() {
 // 就會把它們漏在 range 外——W6 的「codex resume 以錄流佐證」正是靠 range 涵蓋
 // thread/resume 才成立。
 //
-// wireGen 為 nil（測試 seam codexHostOverride 走的路徑、或錄流尚未建立）時不記段：
-// 沒有 connection-wide 錄流就沒有 frame range 可指，記一段空的只是造假。
-func (a *App) beginWireSegment(h *sessionHost) {
-	a.wireMu.Lock()
-	gen := a.wireGen
-	a.wireMu.Unlock()
+// **generation 必須由本 session 的 conn 決定，不能讀全域 a.wireGen**（review
+// Minor）：a.wireGen 是「目前這一代」，但這個 session 綁的是 ensureAppServer 當下
+// 那一台 server；兩步之間若有另一個 goroutine 因 server 死亡換代，讀 a.wireGen 會
+// 把 range 記在**這個 session 一個 frame 都沒寫過的那一代**上——不是漏證據，是假
+// 證據。GenerationOwner 本來就把 server↔generation 綁成同一個 ownership 單位，
+// 直接用 conn 反查即可（generationForConn）。
+//
+// 查不到（測試 seam codexHostOverride 的外來 conn、錄流尚未建立）時不記段：
+// 沒有對得上的 connection-wide 錄流就沒有 frame range 可指，記一段只是造假。
+func (a *App) beginWireSegment(h *sessionHost, conn *codex.Conn) {
+	gen := a.generationForConn(conn)
 	if gen == nil {
 		return
 	}
-	h.wireGen, h.wireStart = gen, gen.Frames()
+	h.wireGen = gen
+	a.wireMu.Lock()
+	defer a.wireMu.Unlock()
+	h.wireStart = gen.Frames()
+	// 並行重疊登記（§3.4.4 的誠實邊界）：同一 generation 上同時開著兩段以上時，
+	// 每一段的 frame range 都不是排他的——共用一條 codex.Conn，連續 range 不可能
+	// 互斥。這裡把重疊事實記進**雙方**（新來的與既有的），收尾時才有辦法在證據
+	// 出口標明「此 range 非排他」，而不是讓稽核者照排他證據讀。
+	if a.wireOpenSegs == nil {
+		a.wireOpenSegs = map[string]map[appcore.WSID]*sessionHost{}
+	}
+	open := a.wireOpenSegs[gen.ID()]
+	if open == nil {
+		open = map[appcore.WSID]*sessionHost{}
+		a.wireOpenSegs[gen.ID()] = open
+	}
+	if len(open) > 0 {
+		h.wireOverlap.Store(true)
+		for _, other := range open {
+			other.wireOverlap.Store(true)
+		}
+	}
+	open[h.wsid] = h
+}
+
+// generationForConn：conn 對應的 generation。server↔generation 的綁定權威是
+// codexSingle 持有的 GenerationOwner，不是 a.wireGen（後者只是「最近一次發布的
+// 那一代」，供 checkWireRecorder 輪詢用）。
+func (a *App) generationForConn(conn *codex.Conn) *wirelog.Generation {
+	if conn == nil {
+		return nil
+	}
+	o, ok := a.codexSingle.Current()
+	if !ok || o.Server == nil || o.Server.Conn() != conn {
+		return nil
+	}
+	return o.Generation
+}
+
+// releaseWireSegment：把 h 自「目前開著段」的登記中移除，並回報這一段期間是否
+// 曾與別的 session 重疊。
+func (a *App) releaseWireSegment(h *sessionHost, genID string) bool {
+	a.wireMu.Lock()
+	defer a.wireMu.Unlock()
+	if open := a.wireOpenSegs[genID]; open != nil {
+		delete(open, h.wsid)
+		if len(open) == 0 {
+			delete(a.wireOpenSegs, genID)
+		}
+	}
+	return h.wireOverlap.Load()
 }
 
 // closeWireSegment：session 收尾時把 [start, end] 這一段 SegmentRef 落盤，並把該
@@ -6057,7 +6117,11 @@ func (a *App) beginWireSegment(h *sessionHost) {
 func (a *App) closeWireSegment(h *sessionHost) {
 	h.wireSegOnce.Do(func() {
 		gen := h.wireGen
-		if gen == nil || a.wireSegments == nil {
+		if gen == nil {
+			return
+		}
+		overlapped := a.releaseWireSegment(h, gen.ID())
+		if a.wireSegments == nil {
 			return
 		}
 		ref := wirelog.SegmentRef{WireLogID: gen.ID(), StartFrame: h.wireStart, EndFrame: gen.Frames() - 1}
@@ -6078,8 +6142,23 @@ func (a *App) closeWireSegment(h *sessionHost) {
 		// 寫的是**整份** view 而不只本次新增的那一段：§3.4.4 要回答的是「這個
 		// WSID 的錄流散落在哪幾個 generation 的哪些 frame range」，增量回答不了
 		// 跨 generation 的問題，而稽核者不該被迫自己重組。
-		a.audit("codex_wire_segments", map[string]any{
-			"wsid": string(h.wsid), "segments": a.wireSegments.For(string(h.wsid))})
+		//
+		// label：§3.4.4 末句「既有 recordCase 轉為**該 view 的 label**」——label
+		// 屬於這份 view，不是另一條要靠 wsid 事後 join 的獨立稽核線。
+		//
+		// exclusive／note：**這一格是 Fail Loud 的要求**。range 是「本 session 在
+		// 該 generation 存活期間的 frame 窗口」；同一 generation 上若有並行 session，
+		// 它們的 frame 就落在這個窗口內。沒有這個限定詞，稽核者會把 range 當排他
+		// 證據讀——長命 session 的單一 range 甚至會吞掉它之後在同一代起的每一個
+		// session 的全部 frame，實質等於「整代錄流」。
+		rec := map[string]any{
+			"wsid": string(h.wsid), "label": h.recordLabel,
+			"segments": a.wireSegments.For(string(h.wsid)), "exclusive": !overlapped}
+		if overlapped {
+			rec["note"] = "本次 range 期間同一 generation 上有並行 session：" +
+				"range 內含他 session 的 frame，不得當作排他證據讀（§3.4.4 已知邊界）"
+		}
+		a.audit("codex_wire_segments", rec)
 	})
 }
 
@@ -6748,9 +6827,11 @@ func (a *App) startCodex(w appcore.WSID, prompt, resume, recordCase, approvalPol
 // recorder。一條 codex.Conn 只容許一個 sink，而該 sink 已經是 §3.4.1 的
 // connection-wide always-on wire log（由 GenerationOwner 在 handshake 之前掛上、
 // 錄到 server 生命終點）；session 若再 attach 一次只會拿到「recording already in
-// progress」，整個 session 起不來。recordCase 因此降為 **label**：只進 audit 供
-// 觀測，不控制 recorder attach（刻意不存進 sessionHost——production 沒有讀者，
-// 等 []WireSegmentRef 接線時再加，不預留用不到的欄位）。W6 的「codex resume 以
+// progress」，整個 session 起不來。recordCase 因此降為 **label**：不控制 recorder
+// attach，改掛在該 session 的 []WireSegmentRef view 上（`sessionHost.recordLabel`
+// → `codex_wire_segments` 的 label 欄位，§3.4.4 末句的「轉為該 view 的 label」）。
+// 起始那筆獨立 audit（codex_record_label）保留：它記的是「這個 session 起手時宣告
+// 的 label」，與收尾時附在證據上的那份是不同時點的事實。W6 的「codex resume 以
 // JSON-RPC 錄流佐證」改由 wire log 承載——**錨點也換了人守**：舊版是這裡的
 // attach 鎖住「送 resume 之前就開錄」，新版由 RunOwnedHandshake 的
 // gen_id → start → attach → handshake 順序負責（見 owner_test.go 與
@@ -6768,8 +6849,9 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 	// §3.4.4 錄流 segment：host 先建、起點先記，兩者都必須早於 thread/start 送出
 	// （見 beginWireSegment 的 doc）。h 在 publishCodexHost 之前只有本 goroutine
 	// 看得到，threadID 補上去仍符合「publish 前寫定」的規約。
-	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1, runner: runner}
-	a.beginWireSegment(h)
+	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1,
+		runner: runner, recordLabel: recordCase}
+	a.beginWireSegment(h, conn) // generation 由本 session 的 conn 決定，不讀全域 a.wireGen
 
 	// pending start 窗口：登記 → 送 thread/start｜resume → response 抵達 → host
 	// publish 完成才解除（見函式 doc 的發布順序）。codexStartMu 讓同一時間至多

@@ -12,9 +12,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
+	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 )
 
@@ -139,7 +141,8 @@ func bootWireApp(t *testing.T, a *App, ctl *respondingWire) {
 func runCodexSession(t *testing.T, a *App, ctl *respondingWire, w appcore.WSID, thread, resume string) {
 	t.Helper()
 	ctl.setNextThread(thread)
-	if err := a.StartSession(string(w), "hi "+thread, resume, "", "task-"+thread, ""); err != nil {
+	// recordCase 帶值：§3.4.4 末句要求它轉成該 view 的 label，不帶就測不到那一半。
+	if err := a.StartSession(string(w), "hi "+thread, resume, "rec-"+thread, "task-"+thread, ""); err != nil {
 		t.Fatalf("StartSession(%s): %v", w, err)
 	}
 	waitTurnSettled(t, a, w)
@@ -247,27 +250,33 @@ func assertSegmentsExcludeThread(t *testing.T, a *App, segs []wirelog.SegmentRef
 	}
 }
 
+// segmentView 是稽核出口 codex_wire_segments 的形狀。
+type segmentView struct {
+	WSID      string               `json:"wsid"`
+	Label     string               `json:"label"`
+	Segments  []wirelog.SegmentRef `json:"segments"`
+	Exclusive bool                 `json:"exclusive"`
+	Note      string               `json:"note"`
+}
+
 // auditSegments：稽核可讀出口——codex_wire_segments 記錄的最後一份 view。
 // §3.4.4 沒有要求 UI 呈現 []WireSegmentRef，證據的消費者因此是稽核而不是畫面；
 // 這個 helper 就是那一格的讀者。
-func auditSegments(t *testing.T, a *App, wsid appcore.WSID) []wirelog.SegmentRef {
+func auditSegments(t *testing.T, a *App, wsid appcore.WSID) segmentView {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(a.stateDir, "audit.jsonl"))
 	if err != nil {
 		t.Fatalf("讀 audit.jsonl：%v", err)
 	}
-	var got []wirelog.SegmentRef
+	var got segmentView
 	found := false
 	for _, line := range strings.Split(string(b), "\n") {
 		if line == "" {
 			continue
 		}
 		var rec struct {
-			Kind string `json:"kind"`
-			Data struct {
-				WSID     string               `json:"wsid"`
-				Segments []wirelog.SegmentRef `json:"segments"`
-			} `json:"data"`
+			Kind string      `json:"kind"`
+			Data segmentView `json:"data"`
 		}
 		if json.Unmarshal([]byte(line), &rec) != nil || rec.Kind != "codex_wire_segments" {
 			continue
@@ -275,7 +284,7 @@ func auditSegments(t *testing.T, a *App, wsid appcore.WSID) []wirelog.SegmentRef
 		if rec.Data.WSID != string(wsid) {
 			continue
 		}
-		got, found = rec.Data.Segments, true
+		got, found = rec.Data, true
 	}
 	if !found {
 		t.Fatalf("稽核裡沒有 %s 的 codex_wire_segments——session 級錄流證據沒有可讀出口", wsid)
@@ -331,8 +340,18 @@ func TestWireSegmentsSpanControlledRestart(t *testing.T) {
 	assertSegmentsExcludeThread(t, a, seg2, "t-w1")
 
 	// 稽核可讀：最後一次收尾寫下的 view 與記憶體／磁碟一致。
-	if got := auditSegments(t, a, w1); len(got) != 2 || got[0] != segs[0] || got[1] != segs[1] {
-		t.Fatalf("稽核記錄的 view 必須是完整有序的兩段：%+v（want %+v）", got, segs)
+	view := auditSegments(t, a, w1)
+	if len(view.Segments) != 2 || view.Segments[0] != segs[0] || view.Segments[1] != segs[1] {
+		t.Fatalf("稽核記錄的 view 必須是完整有序的兩段：%+v（want %+v）", view.Segments, segs)
+	}
+	// §3.4.4 末句：recordCase 轉為**該 view 的 label**（不是另一條要靠 wsid join
+	// 的獨立稽核線）。
+	if view.Label != "rec-t-w1" {
+		t.Fatalf("view 必須帶 recordCase label：%q", view.Label)
+	}
+	// 本測試三個 session 完全序列化（前一個收尾後才起下一個），range 是排他的。
+	if !view.Exclusive {
+		t.Fatalf("序列化情境下 range 必須標為排他：%+v", view)
 	}
 }
 
@@ -371,9 +390,29 @@ func TestWireSegmentsSurviveServerDeath(t *testing.T) {
 	})
 
 	// w2 讓 ensureAppServer 重建 → a.wireGen 換成 gen2，而 w1 的 host 還在 registry。
-	runCodexSession(t, a, ctl, w2, "t-b", "")
-	if currentWireLogID(a) == gen1ID {
+	// **多送一輪**：兩代的 frame 數必須不同，尾界斷言才有辨識力（見下方 precondition
+	// ——第一版兩代都是「handshake ＋ 一個 session 一輪」，frame 數剛好都是 8，
+	// 「尾界改讀 a.wireGen」的 mutation 完全量不到，reviewer 抓到）。
+	ctl.setNextThread("t-b")
+	if err := a.StartSession(string(w2), "hi", "", "", "task-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w2)
+	if err := a.SendMessage(string(w2), "second turn"); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w2)
+	if err := a.EndSession(string(w2)); err != nil {
+		t.Fatal(err)
+	}
+	gen2ID := currentWireLogID(a)
+	if gen2ID == gen1ID {
 		t.Fatal("precondition：死亡重建必須開新 generation，否則這條測試量不到尾界來源")
+	}
+	gen1Frames, gen2Frames := len(readWireLog(t, a, gen1ID)), len(readWireLog(t, a, gen2ID))
+	if gen1Frames == gen2Frames {
+		t.Fatalf("precondition：兩代的 frame 數必須不同，否則尾界斷言沒有辨識力（gen1=%d gen2=%d）",
+			gen1Frames, gen2Frames)
 	}
 
 	if err := a.EndSession(string(w1)); err != nil { // 尾界在 a.wireGen 已換人之後才結算
@@ -384,7 +423,7 @@ func TestWireSegmentsSurviveServerDeath(t *testing.T) {
 	if len(segs) != 1 || segs[0].WireLogID != gen1ID {
 		t.Fatalf("w1 的段必須留在自己那份 generation：%+v（gen1=%s）", segs, gen1ID)
 	}
-	if want := len(readWireLog(t, a, gen1ID)) - 1; segs[0].EndFrame != want {
+	if want := gen1Frames - 1; segs[0].EndFrame != want {
 		t.Fatalf("尾界必須是 gen1 自己的 frame 計數：EndFrame=%d，want %d（讀成 a.wireGen 就會偏掉）",
 			segs[0].EndFrame, want)
 	}
@@ -449,6 +488,226 @@ func TestWireSegmentsSurviveAppRestart(t *testing.T) {
 	assertSegmentsCoverThread(t, b, segs[1:], "t-x")
 	if rows := readWireLog(t, b, segs[0].WireLogID); len(rows) == 0 {
 		t.Fatalf("重啟前那份 wire log 不得消失：%s", segs[0].WireLogID)
+	}
+}
+
+// TestWireSegmentsConcurrentRangeIsNotExclusive：**並行情境的誠實邊界**（§5.2
+// 第 2 條的「不混入」在並行下只成立於 set-level）。
+//
+// 場景是多 session 工作台的常態：w1 起了 session 跑完一輪但不收尾（長命 session），
+// w2 在**同一個 generation** 上整段起跑收尾，最後才收 w1。
+//
+// 這條測試同時斷言三件事：
+//
+//  1. **set-level 的「不混入」仍成立**——For(w1) 不含 w2 的 SegmentRef，反之亦然。
+//     並行情境此前連這一半都零覆蓋。
+//  2. **frame-level 的汙染是真的**——w1 的 range 內確實含 w2 的 frame。刻意把它寫成
+//     斷言而不是註解：這是已知邊界，哪天實作改成在別的 session 起／收的邊界切段，
+//     這條會紅，那時必須連同證據出口的限定詞一起重審。
+//  3. **證據出口有限定詞**——codex_wire_segments 的 exclusive=false ＋ note。
+//     沒有它，稽核者會照排他證據讀一個實質是「整代錄流」的 range，違反 Fail Loud。
+//
+// mutation：beginWireSegment 拿掉重疊登記（wireOpenSegs 那段）→ 第 3 點紅、
+// 前兩點照樣綠（限定詞是獨立的一格）。
+func TestWireSegmentsConcurrentRangeIsNotExclusive(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &respondingWire{}
+	bootWireApp(t, a, ctl)
+
+	w1 := mustCreate(t, a, "codex")
+	w2 := mustCreate(t, a, "codex")
+
+	ctl.setNextThread("t-long")
+	if err := a.StartSession(string(w1), "hi", "", "rec-long", "task-long", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w1)
+
+	// w1 尚未收尾：w2 整段落在 w1 的窗口內（reviewer 實測的形狀）。
+	runCodexSession(t, a, ctl, w2, "t-short", "")
+
+	if err := a.EndSession(string(w1)); err != nil {
+		t.Fatal(err)
+	}
+
+	s1, s2 := a.wireSegments.For(string(w1)), a.wireSegments.For(string(w2))
+	if len(s1) != 1 || len(s2) != 1 {
+		t.Fatalf("兩個 session 各留一段：w1=%+v w2=%+v", s1, s2)
+	}
+	// (1) set-level：各自的 view 不得含對方的 SegmentRef。
+	if s1[0] == s2[0] {
+		t.Fatalf("For 不得回傳他 session 的 segment：w1=%+v w2=%+v", s1, s2)
+	}
+	for _, r := range s1 {
+		if r == s2[0] {
+			t.Fatalf("For(w1) 混入了 w2 的 segment：%+v", s1)
+		}
+	}
+
+	// (2) frame-level 汙染是真的（已知邊界，見 doc）。
+	polluted := 0
+	for _, row := range readWireLog(t, a, s1[0].WireLogID) {
+		if row.Frame < s1[0].StartFrame || row.Frame > s1[0].EndFrame {
+			continue
+		}
+		if strings.Contains(string(row.Raw), `"t-short"`) {
+			polluted++
+		}
+	}
+	if polluted == 0 {
+		t.Fatalf("precondition：並行汙染應該存在（w1 range=%+v）——若實作已改成邊界切段，"+
+			"這條與證據出口的限定詞要一起重審", s1[0])
+	}
+
+	// (3) 證據出口必須帶限定詞。
+	v1 := auditSegments(t, a, w1)
+	if v1.Exclusive {
+		t.Fatalf("並行情境下 range 非排他，稽核出口必須標明：%+v", v1)
+	}
+	if v1.Note == "" {
+		t.Fatalf("非排他時必須附白話說明，不能只給一個 bool：%+v", v1)
+	}
+	if v2 := auditSegments(t, a, w2); v2.Exclusive {
+		t.Fatalf("重疊是雙向的，被包住的那一段同樣非排他：%+v", v2)
+	}
+}
+
+// TestWireSegmentNotRecordedForForeignConn：起點的 generation 必須由**本 session 的
+// conn** 決定，不能讀全域 a.wireGen（review Minor）。
+//
+// 場景：a.wireGen 指著一份活著的 generation，但這個 session 掛在**另一條 conn** 上
+// （production 的可達形狀是「ensureAppServer 取得 srv 之後、thread/start 送出之前，
+// 另一個 goroutine 因 server 死亡換了代」——窄窗，但後果是假證據而不是漏證據）。
+// 這個 session 一個 frame 都沒寫進 a.wireGen 那份錄流，卻會拿到一段涵蓋**別人
+// frame** 的 range。
+//
+// 讓汙染看得見：w1 全程活著並在 w2 的窗口內送第二輪（frame 進真的那份錄流）。
+// mutation：beginWireSegment 改回讀 a.wireGen → For(w2) 不再是空的 → 紅。
+func TestWireSegmentNotRecordedForForeignConn(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &respondingWire{}
+	bootWireApp(t, a, ctl)
+
+	w1 := mustCreate(t, a, "codex")
+	w2 := mustCreate(t, a, "codex")
+
+	ctl.setNextThread("t-real")
+	if err := a.StartSession(string(w1), "hi", "", "", "task-real", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w1)
+	if currentWireLogID(a) == "" {
+		t.Fatal("precondition：必須有一份活著的 generation")
+	}
+
+	// w2 掛在一條與目前 generation 無關的 conn 上。
+	foreign, fwire := newFakeCodexConn(t)
+	var turnSeq atomic.Int32
+	fwire.setOnReq(func(f codex.Frame) {
+		switch f.Method {
+		case codex.MethodInitialize:
+			fwire.send(map[string]any{"id": *f.ID, "result": map[string]any{}})
+		case codex.MethodThreadStart:
+			fwire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"thread": map[string]any{"id": "t-foreign"}}})
+		case codex.MethodTurnStart:
+			turnID := fmt.Sprintf("fturn-%d", turnSeq.Add(1))
+			fwire.send(map[string]any{"id": *f.ID, "result": map[string]any{
+				"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			fwire.send(map[string]any{"method": codex.MethodTurnCompleted, "params": map[string]any{
+				"threadId": "t-foreign", "turn": map[string]any{"id": turnID, "status": "completed"}}})
+		}
+	})
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	if err := foreign.Handshake(hctx, clientInfo()); err != nil {
+		t.Fatal(err)
+	}
+	a.wireCodexConn(foreign) // 外來 conn 也要掛 dispatcher，w2 的 turn/completed 才回得來
+	a.codexHostOverride = fakeCodexHost{foreign}
+	if err := a.StartSession(string(w2), "hi", "", "", "task-foreign", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w2)
+
+	// w2 的窗口內，真的那份錄流有新 frame 進來（讀 a.wireGen 就會把它們吞進 w2 的 range）。
+	if err := a.SendMessage(string(w1), "second turn"); err != nil {
+		t.Fatal(err)
+	}
+	waitTurnSettled(t, a, w1)
+
+	if err := a.EndSession(string(w2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.wireSegments.For(string(w2)); len(got) != 0 {
+		t.Fatalf("掛在別條 conn 上的 session 不得拿到 connection-wide 錄流的 range（假證據）：%+v", got)
+	}
+}
+
+// TestWireSegmentEmptyRangeIsAuditedNotFabricated：range 為空時不得補一段假的、
+// 也不得無聲跳過（Fail Loud）。
+//
+// **直接呼叫 closeWireSegment，不走完整 production 路徑**，並且是刻意的：起點改成
+// 由 conn 反查 generation 之後，「有 generation 但期間零 frame」在 production 路徑上
+// 已經不可達（EnsureThread 必然至少寫一筆 c2s）。分支仍保留當防禦，這條測試覆蓋
+// 的就是那個防禦分支本身。
+func TestWireSegmentEmptyRangeIsAuditedNotFabricated(t *testing.T) {
+	a, _ := newTestApp(t)
+	enableAudit(t, a)
+
+	gen, err := a.newWireGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &sessionHost{wsid: appcore.WSID("W-EMPTY"), provider: contract.ProviderCodex, sockIndex: -1}
+	h.wireGen, h.wireStart = gen, gen.Frames() // 期間一個 frame 都沒寫
+
+	a.closeWireSegment(h)
+
+	if got := a.wireSegments.For("W-EMPTY"); len(got) != 0 {
+		t.Fatalf("空 range 不得落盤成假證據：%+v", got)
+	}
+	if !auditHasKind(t, a.stateDir, "codex_wire_segment_empty") {
+		t.Fatal("空 range 必須留下稽核，不得無聲跳過")
+	}
+}
+
+// TestOpenWireSegmentsFailureDegradesLoudly：segment 索引開不起來時，fail loud
+// （audit ＋ 啟動警告）但**不阻擋 codex session**——錄流本體（wire log）不受影響，
+// 缺的只是 session 級歸屬索引。
+func TestOpenWireSegmentsFailureDegradesLoudly(t *testing.T) {
+	a, _ := newTestApp(t)
+	enableAudit(t, a)
+	// 在 segment journal 的位置放一個目錄：OpenSegmentSet 必然開檔失敗。
+	if err := a.wireSegments.Close(); err != nil { // newTestAppIn 已經開過一份
+		t.Fatal(err)
+	}
+	if err := os.Remove(a.wireSegmentsPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(a.wireSegmentsPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.wireSegments = nil
+	a.openWireSegments()
+
+	if a.wireSegments != nil {
+		t.Fatal("開檔失敗不得留下半成品的 SegmentSet")
+	}
+	if !auditHasKind(t, a.stateDir, "wire_segments_open_error") {
+		t.Fatal("開檔失敗必須留下稽核")
+	}
+	if !strings.Contains(a.startupErr, "segment") {
+		t.Fatalf("開檔失敗必須進啟動警告（UI 讀得到）：%q", a.startupErr)
+	}
+
+	// 降級之後 codex session 仍要起得來、wire log 照錄。
+	ctl := &respondingWire{}
+	bootWireApp(t, a, ctl)
+	w := mustCreate(t, a, "codex")
+	runCodexSession(t, a, ctl, w, "t-degraded", "")
+	if rows := readWireLog(t, a, currentWireLogID(a)); len(rows) == 0 {
+		t.Fatal("segment 索引降級不得影響 wire log 本體")
 	}
 }
 

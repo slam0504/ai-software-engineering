@@ -5,8 +5,17 @@
 // （handshake 前即開始，不採 recordCase reference count 啟停），session 級的錄流
 // 證據改用有序的 []SegmentRef 表示（Task 11）。
 //
-// 本檔只提供基礎設施：一份 generation 的錄流檔（Generation）與可重建的 frame
-// index。不接線到 codex.Conn 或 App（Task 12/13）。
+// 本檔提供基礎設施：一份 generation 的錄流檔（Generation）與可重建的 frame
+// index。接線狀態（2026-08-17，§3.4.4 接線票之後）：
+//
+//   - Generation：由 codex.GenerationOwner 掛成 codex.Conn 的錄流 sink，
+//     App 經 replaceCodexGeneration 建立／替換。
+//   - SegmentSet（segments.go）：由 App 的 openWireSegments／beginWireSegment／
+//     closeWireSegment 接線，落盤在 <stateDir>/wire-segments.jsonl。
+//   - FrameIndex／RebuildFrameIndex／Generation.Attribute：**仍未接線**。
+//     §3.4.3 只要求 frame index「可重建」這個性質（由本套件測試驗收），
+//     而 §3.4.3 的 frame-level threadID／turnID→WSID 歸屬目前沒有 production
+//     承載者——Line 一律寫 wsid:""，Attribute 零呼叫端。獨立票處理。
 package wirelog
 
 import (

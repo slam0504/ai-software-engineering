@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
@@ -88,8 +89,16 @@ type sessionHost struct {
 	//
 	// wireSegOnce 讓「這個 session 至多留下一段 SegmentRef」——teardown 有多條
 	// 路徑（EndSession／forcedShutdown／StartTurn rollback）且 lease 慣例是冪等。
+	// recordLabel 是 §3.4.4 末句的 label（既有 recordCase）：不控制 recorder
+	// attach，只掛在該 session 的 []SegmentRef view 上。
+	//
+	// wireOverlap 是**唯一**在 publish 之後仍會被改寫的錄流欄位，因此用 atomic：
+	// 設值者是「後來在同一 generation 上開段的別的 session」的 goroutine
+	// （beginWireSegment），讀者是本 host 的收尾路徑。
 	wireGen     *wirelog.Generation
 	wireStart   int
+	wireOverlap atomic.Bool
+	recordLabel string
 	wireSegOnce sync.Once
 
 	sessionID string
