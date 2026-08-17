@@ -109,6 +109,19 @@ type Store struct {
 	// hook：persistLocked 四個步驟的唯一測試注入點；production 恆為 nil
 	// （見 fsync_test.go 的 ForceStepHookForTest）。mu 保護。
 	hook func(fsyncStep) error
+
+	// compareHook：SetLayout 冪等比對點的觀測鉤子；production 恆為 nil
+	// （見 layout_test.go 的 ForceCompareHookForTest）。mu 保護。
+	//
+	// 為什麼需要一個**只為了測試**的接點：判準「比對與更新必須在同一把鎖內」
+	// 是**結構性**要求，不是可從黑箱狀態推出來的行為——SetLayout 的記憶體更新
+	// 早於落盤，等到外界觀察得到差異時狀態早已是新值，因此純黑箱沒有確定性的
+	// 判別點（曾試過用 persist 鉤子卡住製造 rollback 窗口，做不到）。把比對點
+	// 露出來，測試就能在**比對當下**直接量「有沒有人持鎖」（TryLock）與「比對
+	// 是不是每次呼叫剛好發生一次」，單執行緒、不靠排程、不靠 -race。
+	// 慣例與 hook／ForceStrongSyncForTest 相同：欄位在 production 檔、注入器只
+	// 存在於 _test.go，production 路徑只多一個 nil 比較。
+	compareHook func()
 }
 
 // Uncertain：是否已進入 ErrRegistryUncertain latch。給 app 側的 lifecycle 入口
@@ -498,8 +511,10 @@ func layoutEqual(a, b Layout) bool {
 //     現在與未來的 caller 一律涵蓋。
 //   - **比對與更新必須在同一把鎖內**：在鎖外先讀一次再進來寫，兩個併發的
 //     「改成同一個新值」會各自看到舊值、各自落盤一次（而且鎖外讀 `s.file.Layout`
-//     本身就是 data race）。`TestSetLayoutComparesAndUpdatesUnderOneLock` 以
-//     `-race` ＋落盤步驟計數守這一點。
+//     本身就是 data race——撕裂的 slice header 餵進 slices.Equal 在 Go 記憶體模型
+//     上是 UB）。守門：`TestSetLayoutComparesUnderTheSameLock`（確定性，經
+//     compareHook 量比對當下的持鎖狀態）＋
+//     `TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites`（併發下的落盤次數）。
 //
 // 不改變任何可觀測狀態，所以刻意排在 latch 檢查（persistOrRollback）之前：
 // no-op 沒有東西可以變得不確定，回 error 只會讓呼叫端以為排列沒被記下來。
@@ -507,6 +522,9 @@ func layoutEqual(a, b Layout) bool {
 func (s *Store) SetLayout(l Layout) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.compareHook != nil {
+		s.compareHook()
+	}
 	if layoutEqual(s.file.Layout, l) {
 		return nil
 	}

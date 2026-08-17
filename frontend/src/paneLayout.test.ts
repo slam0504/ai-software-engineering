@@ -420,7 +420,7 @@ describe('寫入失敗：fail loud 但不擋路', () => {
   // 移除 w1 觸發 persistLayout 失敗。
   //
   // mutation：`persistLayout` 的 catch 改成 `this.pushError(...)` → **只**紅在本條
-  // 的 busy 斷言（`expected false to be true`），全檔其餘 11 條照樣綠。
+  // 的 busy 斷言（`expected false to be true`），全檔其餘 14 條照樣綠。
   it('寫入失敗不得清掉別的 session 正在跑的 turn（pushNotice 的真正理由）', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
@@ -504,6 +504,49 @@ describe('approval 的暫時焦點切換不得洩漏進 durable layout（owner 2
     await w.find('.dialog .allow').trigger('click')
     await flushPromises()
     expect(s.focused, '核可後畫面焦點必須還原').toBe(0)
+  })
+
+  // **restore 側的同一個洩漏**（rev2 review：這一行零守門，刪掉它全套 361 條照樣綠）。
+  //
+  // `restoreLayout` 只設 `focused`、不設 `durableFocusPane` 時：重啟後畫面焦點在
+  // pane 1，但 durable 仍是 0。接下來任何**不是 setFocus** 的 layout 寫入
+  //（pin()／markRemoved()／unpin()）都會送 `pins[0]`，**把使用者的焦點選擇靜默
+  // 改成 pane 0**。這正是本輪要消滅的「durable Focused 被不相干寫入污染」，
+  // 只是來源從 approval 換成了 restore——② 的裁決在 approval 側守到了，restore
+  // 側沒有。
+  //
+  // 這裡用「移除另一格的 session」當那個不相干寫入（走 SessionList 的兩段式移除
+  // UI，完全不碰 setFocus）。失敗形態很清楚：正確版寫出 focused='w2'，漏設版寫出
+  // focused=''——使用者的焦點選擇就這樣沒了，而空字串是合法值、Go 端不會擋。
+  //
+  // mutation：拿掉 restoreLayout 的 `this.durableFocusPane = at`
+  //   → 紅在「durable focused 必須是還原時那一格」，且跨重啟那段也紅。
+  it('restore 還原的焦點必須同時是 durable 的，不被後續不相干寫入洗掉', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w2' }
+    const first = await mountApp()
+    const s = useSession()
+    expect(s.focused, '前提：還原到 pane 1').toBe(1)
+    expect(setLayoutCalls(), '前提：還原本身不寫').toHaveLength(0)
+
+    // 不相干的 layout 寫入，**完全不經過 setFocus**
+    await first.find('[data-test=remove-w1]').trigger('click')
+    await first.find('[data-test=remove-confirm-submit]').trigger('click')
+    await flushPromises()
+
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    expect(pins, '前提：pane 0 的釘選被清掉了').toEqual(['', 'w2'])
+    expect(focused, 'durable focused 必須是還原時那一格，不得被洗成 pane 0').toBe('w2')
+
+    // 跨重啟：洗掉之後重開就再也回不來，所以這一維要一起守
+    first.unmount()
+    resetEnv()
+    appMocks.ListSessions.mockImplementation(async () => [session('w2', 'codex', 'beta')])
+    appMocks.state.layout = { pins, focused }
+    const second = await mountApp()
+    expect(useSession().focused, '重啟後仍須停在使用者的那一格').toBe(1)
   })
 
   // 跨重啟（形狀 F）：approval 期間的焦點不得洩漏到重啟後。新的 pinia＋新的

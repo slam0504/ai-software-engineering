@@ -2,6 +2,7 @@ package wsregistry
 
 import (
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -11,9 +12,9 @@ import (
 // owner 指定守門至少要證明三件事，本檔逐條對應一個測試：
 //  1. 相同 layout：零落盤步驟、檔案 mtime 不變 → TestSetLayoutSkipsPersistWhenUnchanged
 //  2. layout 有變：恰好執行一次四步落盤 → TestSetLayoutPersistsExactlyOnceWhenChanged
-//  3. 比對與更新在同一把 registry 鎖內 → TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites
-//     （**覆蓋範圍有限，見該測試的 doc**：確定性守得到「守衛整個消失」，鎖外比對
-//     那個變體只由 `-race` 機率性攔到，兩段式取鎖的變體守不到）
+//  3. 比對與更新在同一把 registry 鎖內 → TestSetLayoutComparesUnderTheSameLock
+//     （**確定性**：經 compareHook 在比對當下量持鎖狀態與呼叫次數）＋
+//     TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites（併發下的落盤次數）
 //
 // 第 1 條的判準刻意**量磁碟事實**而不是「有沒有呼叫某個函式」：除了步驟計數，
 // 還比對 os.SameFile（dev+ino）與 ModTime。四步落盤是 temp file ＋ atomic
@@ -37,6 +38,10 @@ func layoutFileID(t *testing.T, path string) os.FileInfo {
 // Store（真的重讀磁碟）必須仍拿到正確的排列。「不寫」的正確性只有在重啟後
 // 才看得出來：一個把 layout 寫壞又跳過修正的實作，在同一個 process 內用記憶體
 // 讀回來永遠是對的。
+//
+// **斷言不得用 layoutEqual 當比對器**（rev2 review：自我指涉的 oracle）——
+// layoutEqual 正是受測對象，「layoutEqual 恆 true」那一刀會讓斷言恆真，整條
+// 測試連紅都不會紅（實測 PASS）。這裡一律用 reflect.DeepEqual。
 //
 // mutation（各自只打紅一列）：
 //   - 拿掉 SetLayout 的 layoutEqual 早退 → 紅在「不得產生任何落盤步驟」。
@@ -72,7 +77,7 @@ func TestSetLayoutSkipsPersistWhenUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reopened.Layout(); !layoutEqual(got, want) {
+	if got := reopened.Layout(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("被跳過的寫入不得影響磁碟內容：重啟後 got %+v want %+v", got, want)
 	}
 }
@@ -136,13 +141,10 @@ func TestSetLayoutPersistsExactlyOnceWhenChanged(t *testing.T) {
 //   - **守得到（確定性）**：守衛整個消失 → 步驟數變成 4×N（實測 32），必紅。
 //     這是併發下的迴歸防線。
 //   - **守得到（確定性）**：最終記憶體與磁碟排列一致且等於目標值。
-//   - **只守得到機率性**：把比對搬到 `s.mu.Lock()` 之前（鎖外讀 `s.file.Layout`）
-//     是 data race，靠 repo gate 的 `-race` 攔——但**是否觸發取決於排程**，實測
-//     5 次有 3 次報 race。原因是 SetLayout 的**記憶體更新早於落盤**，等到有人能
-//     觀察到差異時狀態早已是新值，因此沒有確定性的行為判別點。
-//   - **守不到**：把比對改成先呼叫 `s.Layout()`（自己會取鎖）再另外取鎖寫入的
-//     兩段式實作——沒有 data race，也沒有可觀測的狀態差異，最壞只是多寫一次
-//     相同內容（是最佳化失效，不是狀態錯誤）。登記為已知未覆蓋。
+//   - **這條本身只守得到機率性**：把比對搬到鎖外、或改成兩段式取鎖，本測試都
+//     不保證會紅（純黑箱沒有確定性判別點——SetLayout 的記憶體更新早於落盤）。
+//     **那兩刀由 TestSetLayoutComparesUnderTheSameLock 確定性接手**，本條只是
+//     併發下的第二道。
 //
 // mutation：拿掉守衛 → 確定性紅在「恰好一次」（4 → 32 步）。
 func TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites(t *testing.T) {
@@ -191,7 +193,7 @@ func TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites(t *testing.T) {
 	}
 
 	want := Layout{Pins: []string{"w3", "w4"}, Focused: "w4"}
-	if cur := s.Layout(); !layoutEqual(cur, want) {
+	if cur := s.Layout(); !reflect.DeepEqual(cur, want) {
 		t.Fatalf("記憶體排列 got %+v want %+v", cur, want)
 	}
 	s.ForceStepHookForTest(nil)
@@ -199,7 +201,74 @@ func TestSetLayoutPersistsOnceUnderConcurrentIdenticalWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cur := reopened.Layout(); !layoutEqual(cur, want) {
+	if cur := reopened.Layout(); !reflect.DeepEqual(cur, want) {
 		t.Fatalf("重啟後排列 got %+v want %+v", cur, want)
 	}
+}
+
+// TestSetLayoutComparesUnderTheSameLock：判準 3 的**確定性**守門。
+//
+// rev2 review 推翻了「判準 3 沒有確定性守法」這個結論，並給了可運作的原型：
+// 判準 3 是**結構性**要求（「在同一把鎖內」），用 repo 自己的白箱注入慣例守它
+// 才是 owner 判準的字面意思。做法——在比對點掛一個觀測 hook，於 hook 內：
+//
+//  1. `s.mu.TryLock()` 探測**比對當下**有沒有人持鎖。sync.Mutex 不可重入，
+//     所以「自己正持著」時必回 false；回 true 就代表比對跑在鎖外。
+//     （TryLock 成功時必須立刻 Unlock，否則後面真正的 Lock 會死鎖。）
+//  2. 記錄呼叫次數：比對必須是 SetLayout 內**唯一**的決策點，每次呼叫剛好一次。
+//     繞過 hook 另做一份比對的實作會在這裡露餡（次數變 0）。
+//
+// 單執行緒、無 time.Sleep、不依賴 -race、不依賴排程。
+//
+// 相同輸入（走早退）與不同輸入（走落盤）兩條路都要驗——只驗一條的話，把守衛
+// 搬到鎖外但保留鎖內第二次比對之類的實作會漏掉。
+//
+// mutation（實測）：
+//   - 比對（連同 hook）搬到 s.mu.Lock() 之前 → 紅在「必須與更新在同一把鎖內」。
+//   - 改成兩段式（先 s.Layout() 比對、再取鎖寫入），hook 隨比對走 → 紅在同一行。
+//   - 兩段式且繞過 hook → 紅在「比對必須是唯一的決策點」（次數 0）。
+func TestSetLayoutComparesUnderTheSameLock(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.SetLayout(Layout{Pins: []string{"w1", ""}, Focused: "w1"}); err != nil {
+		t.Fatalf("前提：第一次寫入要成功，got %v", err)
+	}
+
+	calls := 0
+	heldAtCompare := []bool{}
+	s.ForceCompareHookForTest(func() {
+		calls++
+		if s.mu.TryLock() { // 拿得到＝比對當下沒有人持鎖
+			s.mu.Unlock()
+			heldAtCompare = append(heldAtCompare, false)
+			return
+		}
+		heldAtCompare = append(heldAtCompare, true)
+	})
+
+	// 兩條路都要走到：相同（早退）與不同（落盤）
+	if err := s.SetLayout(Layout{Pins: []string{"w1", ""}, Focused: "w1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetLayout(Layout{Pins: []string{"w2", ""}, Focused: "w2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if calls != 2 {
+		t.Fatalf("比對必須是 SetLayout 內唯一的決策點（每次呼叫剛好一次），got %d", calls)
+	}
+	for i, held := range heldAtCompare {
+		if !held {
+			t.Fatalf("判準 3：冪等比對必須與更新在同一把 registry 鎖內，實際在鎖外（第 %d 次呼叫）", i+1)
+		}
+	}
+}
+
+// ---- 測試專用注入器（同 fsync_test.go 的 ForceStepHookForTest 慣例：欄位在
+// production 檔宣告、注入器只存在於 _test.go）----
+
+// ForceCompareHookForTest：裝上 SetLayout 冪等比對點的觀測鉤子。傳 nil 清除。
+func (s *Store) ForceCompareHookForTest(hook func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compareHook = hook
 }
