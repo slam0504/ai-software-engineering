@@ -31,7 +31,8 @@ type fakeCodexServer struct {
 	closeWire func()
 	steps     func(string)
 	hsErr     error
-	stopErr   error // 非 nil：StopRecording 回這個錯（舊 owner 收尾失敗）
+	hsFn      func(context.Context, codex.ClientInfo) error // 見 Handshake
+	stopErr   error                                         // 非 nil：StopRecording 回這個錯（舊 owner 收尾失敗）
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -49,8 +50,13 @@ func (s *fakeCodexServer) StopRecording() error {
 	}
 	return s.stopErr
 }
-func (s *fakeCodexServer) Handshake(context.Context, codex.ClientInfo) error {
+// hsFn 非 nil 時代替預設的「只記步驟、不真的握手」行為（app_wire_segments_test.go
+// 的 responding wire 需要 conn 真的 initialize，否則後續 Call 會被 rpc 層擋掉）。
+func (s *fakeCodexServer) Handshake(ctx context.Context, ci codex.ClientInfo) error {
 	s.steps("handshake")
+	if s.hsFn != nil {
+		return s.hsFn(ctx, ci)
+	}
 	return s.hsErr
 }
 func (s *fakeCodexServer) Terminate() error {

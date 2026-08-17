@@ -230,6 +230,21 @@ type App struct {
 	wireGen *wirelog.Generation
 	wireErr error
 	wireSeq int
+	wireRun string // 本次 app 執行的 wire_log_id run token（見 newWireGeneration）
+
+	// wireSegments（§3.4.4）：session 級錄流證據——每個 WSID 一份有序的
+	// []SegmentRef，讓同一 WSID 在 B1 受控 restart、server 意外死亡或 **app
+	// 重啟**之後仍能跨 generation 延續（單一 wire_log_id 涵蓋不了）。
+	//
+	// 只在 openWireSegments（startup）寫一次，之後只讀；型別自帶鎖，故不受
+	// wireMu 保護。nil 代表開檔失敗（已 fail loud，見 openWireSegments）——此時
+	// 不記段，其餘功能不受影響。
+	//
+	// 刻意獨立成 wire-logs/segments.jsonl 而不寫進 session registry：registry 是
+	// mutable current-state ＋ 受 uncertain latch 約束（latch 期間一律不寫），而
+	// SegmentRef 是「這個 WSID 曾擁有這段 frame range」的只增事實，被 latch 擋掉
+	// 就是永久的證據缺口。形狀與 internal/evidence／internal/gate 的 journal 同款。
+	wireSegments *wirelog.SegmentSet
 
 	// hookWireStep：測試注入——受控復原／replacement 的步驟順序探針（§3.4.7 的
 	// 順序是凍結契約）。production 恆為 nil。
@@ -1511,6 +1526,9 @@ func (a *App) startup(ctx context.Context) {
 			a.noteStartupWarning("replay index 開啟失敗（視窗化載入停用，稽核不受影響）：" + ierr.Error())
 		}
 	}
+	// §3.4.4 session 級錄流證據：必須在任何 codex session 起得來之前開，且它自己
+	// 就是跨 app 重啟的載入點（磁碟上前幾次執行的 segment 在這裡 replay 回來）。
+	a.openWireSegments()
 	a.manager = appcore.New(appcore.Config{
 		Sink: auditSink,
 		Emit: func(env contract.Envelope) { a.emit("workbench:event", env) },
@@ -2025,6 +2043,16 @@ func (a *App) shutdown(ctx context.Context) {
 		}
 	}
 	a.shutdownStep("wirelog_finalize")
+
+	// §3.4.4：segment journal 的 handle 收尾。排在 wirelog_finalize 之後、
+	// manager_close 之前——最後一批 Append 發生在步驟 5-7 的 codexTeardown 裡，
+	// 這時已經全部收斂。刻意不另立 shutdownStep：關一個 append-only handle 沒有
+	// 順序契約要守，加一個步驟名只會讓既有的總序斷言多一個無意義的節點。
+	if a.wireSegments != nil {
+		if err := a.wireSegments.Close(); err != nil {
+			a.audit("wire_segments_close_error", map[string]any{"error": err.Error()})
+		}
+	}
 
 	// 10) 全部事件生產者都已停止，才關 sink（pending queue abort+flush 兜底）
 	if a.manager != nil {
@@ -5965,6 +5993,96 @@ var errWireLogDegraded = errors.New("codex wire log degraded: 已停止建立新
 // app-server generation、一個是 session。
 func (a *App) wireLogDir() string { return filepath.Join(a.stateDir, "wire-logs") }
 
+// ---- §3.4.4 session 級錄流證據：[]WireSegmentRef ----
+
+// wireSegmentsPath：per-WSID segment 的 append-only journal 落點。
+//
+// 刻意**不放進 wire-logs/**：那個目錄的內容物是「一個 generation 一份實體錄流」，
+// §3.4 的 connection-wide 不變量（TestWireLogCapturesFramesOfEverySession 的第 4
+// 項）就是靠「該目錄下的 .jsonl 恰好一份」守的；把索引檔混進去會讓那條斷言失去
+// 意義。segment 是索引不是錄流，放 stateDir 根目錄。
+func (a *App) wireSegmentsPath() string { return filepath.Join(a.stateDir, "wire-segments.jsonl") }
+
+// openWireSegments：startup 的 SegmentSet 開檔（跨 app 重啟的載入點——磁碟上既有
+// 的 segment 在這裡 replay 回記憶體，For 因此從第一刻起就涵蓋前幾次執行的
+// generation）。
+//
+// 失敗不阻擋啟動、但 fail loud（audit ＋ 啟動警告），比照 replay index 的處置：
+// 錄流本體（wire log）仍照錄，缺的是 session 級歸屬索引。刻意不 fallback 到
+// NewSegmentSet 的純記憶體版——那會讓「有記錄」與「記錄活不過重啟」在行為上無法
+// 區分，正是 §3.4.4 要求 durable 的理由。
+func (a *App) openWireSegments() {
+	if err := os.MkdirAll(a.stateDir, 0o755); err != nil {
+		a.audit("wire_segments_open_error", map[string]any{"error": err.Error()})
+		a.noteStartupWarning("codex 錄流 segment 索引開啟失敗（session 級錄流歸屬停用，wire log 本體不受影響）：" + err.Error())
+		return
+	}
+	s, err := wirelog.OpenSegmentSet(a.wireSegmentsPath())
+	if err != nil {
+		a.audit("wire_segments_open_error", map[string]any{"error": err.Error()})
+		a.noteStartupWarning("codex 錄流 segment 索引開啟失敗（session 級錄流歸屬停用，wire log 本體不受影響）：" + err.Error())
+		return
+	}
+	a.wireSegments = s
+}
+
+// beginWireSegment：登記 h 在目前 generation 的錄流起點。
+//
+// **必須在送出 thread/start｜resume 之前呼叫**：那筆 c2s frame、以及 pending start
+// 窗口內抵達的 s2c 通知都屬於這個 session，起點晚一步（例如等到 publishCodexHost）
+// 就會把它們漏在 range 外——W6 的「codex resume 以錄流佐證」正是靠 range 涵蓋
+// thread/resume 才成立。
+//
+// wireGen 為 nil（測試 seam codexHostOverride 走的路徑、或錄流尚未建立）時不記段：
+// 沒有 connection-wide 錄流就沒有 frame range 可指，記一段空的只是造假。
+func (a *App) beginWireSegment(h *sessionHost) {
+	a.wireMu.Lock()
+	gen := a.wireGen
+	a.wireMu.Unlock()
+	if gen == nil {
+		return
+	}
+	h.wireGen, h.wireStart = gen, gen.Frames()
+}
+
+// closeWireSegment：session 收尾時把 [start, end] 這一段 SegmentRef 落盤，並把該
+// WSID 的**完整有序 view** 寫進 audit（§3.4.4 的稽核可讀出口）。
+//
+// 尾界取自 h.wireGen 自己的 frame 計數，不是 a.wireGen：server 意外死亡後
+// ensureAppServer 會把 a.wireGen 換成新 generation，用它算尾界會把別的 generation
+// 的 frame 併進這一段。
+//
+// 冪等（h.wireSegOnce）：EndSession、forcedShutdown 與 StartTurn rollback 都可能
+// 對同一個 host 呼叫收尾。
+func (a *App) closeWireSegment(h *sessionHost) {
+	h.wireSegOnce.Do(func() {
+		gen := h.wireGen
+		if gen == nil || a.wireSegments == nil {
+			return
+		}
+		ref := wirelog.SegmentRef{WireLogID: gen.ID(), StartFrame: h.wireStart, EndFrame: gen.Frames() - 1}
+		if ref.EndFrame < ref.StartFrame {
+			// 這個 session 期間該 generation 一個 frame 都沒寫（錄流已 latch 住寫入
+			// 錯誤時可達）。不得補一段空 range 假裝有證據，但也不能無聲跳過。
+			a.audit("codex_wire_segment_empty", map[string]any{
+				"wsid": string(h.wsid), "wireLogId": ref.WireLogID, "startFrame": ref.StartFrame})
+			return
+		}
+		if err := a.wireSegments.Append(string(h.wsid), ref); err != nil {
+			a.audit("codex_wire_segment_error", map[string]any{
+				"wsid": string(h.wsid), "wireLogId": ref.WireLogID, "error": err.Error()})
+			a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+				"component": "codex_wire_segments", "wsid": string(h.wsid), "error": err.Error()})
+			return
+		}
+		// 寫的是**整份** view 而不只本次新增的那一段：§3.4.4 要回答的是「這個
+		// WSID 的錄流散落在哪幾個 generation 的哪些 frame range」，增量回答不了
+		// 跨 generation 的問題，而稽核者不該被迫自己重組。
+		a.audit("codex_wire_segments", map[string]any{
+			"wsid": string(h.wsid), "segments": a.wireSegments.For(string(h.wsid))})
+	})
+}
+
 // wireStep：受控復原／replacement 的步驟探針（測試注入，見 hookWireStep）。
 func (a *App) wireStep(step string) {
 	if h := a.hookWireStep; h != nil {
@@ -5975,10 +6093,22 @@ func (a *App) wireStep(step string) {
 // newWireGeneration 配置新的 wire_log_id 並開檔。序號讓同一秒內的多次
 // replacement 也不會撞 id（wirelog.NewGeneration 與 recorder.New 同慣例，同名
 // 會直接覆寫舊檔，不做去重保護）。
+//
+// **run token（§3.4.4 接線時補）**：秒級時間戳＋序號只在同一個 app 執行內唯一，
+// 序號每次啟動都從 1 重數——崩潰後立即重開、或使用者連續重啟，兩次執行的第一個
+// generation 會落在同一秒而配到同一個 id，新檔直接覆寫舊檔。此前這只是「舊錄流
+// 被蓋掉」，接上 []SegmentRef 之後更嚴重：上一次執行留下的 SegmentRef 會指向一
+// 份內容已被換掉的 wire log，frame range 對應到別人的 frame。run token 是 app
+// 啟動後第一次配置 generation 時取一次的 ULID 尾碼，把唯一性擴到跨執行。
 func (a *App) newWireGeneration() (*wirelog.Generation, error) {
 	a.wireMu.Lock()
+	if a.wireRun == "" {
+		u := contract.NewULID(time.Now())
+		a.wireRun = strings.ToLower(u[len(u)-8:]) // 尾碼即 ULID 的 randomness 段
+	}
 	a.wireSeq++
-	id := fmt.Sprintf("codex-wire-%s-%03d", time.Now().UTC().Format("20060102T150405"), a.wireSeq)
+	id := fmt.Sprintf("codex-wire-%s-%s-%03d", time.Now().UTC().Format("20060102T150405"),
+		a.wireRun, a.wireSeq)
 	a.wireMu.Unlock()
 	return wirelog.NewGeneration(a.wireLogDir(), id)
 }
@@ -6635,6 +6765,12 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 		a.audit("codex_record_label", map[string]any{"wsid": string(w), "label": recordCase})
 	}
 
+	// §3.4.4 錄流 segment：host 先建、起點先記，兩者都必須早於 thread/start 送出
+	// （見 beginWireSegment 的 doc）。h 在 publishCodexHost 之前只有本 goroutine
+	// 看得到，threadID 補上去仍符合「publish 前寫定」的規約。
+	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1, runner: runner}
+	a.beginWireSegment(h)
+
 	// pending start 窗口：登記 → 送 thread/start｜resume → response 抵達 → host
 	// publish 完成才解除（見函式 doc 的發布順序）。codexStartMu 讓同一時間至多
 	// 一筆 pending，pending 歸屬因此唯一。
@@ -6658,11 +6794,14 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 
 	threadID, err := runner.EnsureThread(ctx, resume, approvalPolicy)
 	if err != nil {
+		// session 起不來，但 thread/start｜resume 那幾筆 frame 已經進了 wire log
+		// ——證據照留（失敗的嘗試同樣要可稽核，比照失敗 generation 仍保留
+		// wire_log_id 與收尾證據）。
+		a.closeWireSegment(h)
 		return "", false, err
 	}
 
-	h := &sessionHost{wsid: w, provider: contract.ProviderCodex, sockIndex: -1,
-		runner: runner, threadID: threadID}
+	h.threadID = threadID
 	a.publishCodexHost(h) // 發布：首輪事件的 handler ownership（host ＋ threadId 路由）
 	endPending()          // host 已可經 threadId 命中：pending 窗口到此為止
 
@@ -6670,6 +6809,7 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 	if err != nil {
 		a.takeHost(h) // rollback：registry 不留半成品
 		a.forgetCodexHostRouting(h)
+		a.closeWireSegment(h) // 同上：已寫進 wire log 的 frame 仍要歸屬得到
 		return "", false, err
 	}
 
@@ -6712,6 +6852,10 @@ func (a *App) codexTeardown(w appcore.WSID, h *sessionHost) error {
 	a.takeHost(h)
 	a.forgetCodexHostRouting(h)
 	h.track.NoteEnded()
+	// §3.4.4：session 級錄流證據在這裡落盤——收尾點正是 frame range 的尾界。
+	// 排在 takeHost 之後：此後沒有新讀者能拿到這個 host，也就不會再有新的 frame
+	// 被歸屬到它。
+	a.closeWireSegment(h)
 	// §3.4.4 之後 codex 已無 session-scoped 錄流可 finalize（lease 只由
 	// startClaude 寫入），這裡因此沒有 recorder 錯誤可回報。簽名保留 error 是
 	// EndSessionFlow 的 teardown 契約要求。

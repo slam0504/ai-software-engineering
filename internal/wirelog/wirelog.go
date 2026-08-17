@@ -206,6 +206,19 @@ func (g *Generation) FinalMeta() recorder.Meta {
 	return g.finalMeta
 }
 
+// Frames 回傳本 generation 目前已配發出去的 frame 數（＝下一個 frame 編號）。
+//
+// 這是 §3.4.4 session 級 []SegmentRef 的邊界來源：session 開始當下的 Frames()
+// 即該段的 start_frame，收尾當下的 Frames()-1 即 end_frame。**Finalize 之後計數
+// 凍結**（Finalize 不重設 nextFrame，且 Line 在關檔後只會寫失敗），所以「session
+// 還活著、generation 已被收尾」的順序（server 意外死亡）仍讀得到正確的尾界，不會
+// 把下一個 generation 的 frame 算進來。
+func (g *Generation) Frames() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.nextFrame
+}
+
 // Err 回傳目前 latch 住的寫入錯誤（可能在 Finalize 之前就已 latch）。
 func (g *Generation) Err() error {
 	g.mu.Lock()

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/approval"
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/codex"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 )
 
 // sessionHost：per-WSID 版本的「單例 ownership」（M3b Phase 2，§3.3）——把原本
@@ -72,6 +74,23 @@ type sessionHost struct {
 	runner   *codex.ThreadRunner
 	threadID string
 	track    appcore.TurnTrack
+
+	// ---- §3.4.4 session 級錄流證據（[]WireSegmentRef）----
+	//
+	// wireGen／wireStart 記錄「本 session 開始時掛著的 connection-wide 錄流
+	// generation，以及它在那份錄流裡的起始 frame」。兩者都在 publishCodexHost
+	// **之前**由 beginWireSegment 寫定、之後不可變（同上方規約）。
+	//
+	// 刻意存 *wirelog.Generation 而不只是 wire_log_id：收尾當下 a.wireGen 可能
+	// 已經指向下一個 generation（server 意外死亡 → ensureAppServer 重建），拿
+	// 那一份的 frame 計數當尾界會把別的 generation 的 frame 算進來。Generation
+	// 的 frame 計數在 Finalize 之後凍結，握著原本那份就永遠讀得到正確尾界。
+	//
+	// wireSegOnce 讓「這個 session 至多留下一段 SegmentRef」——teardown 有多條
+	// 路徑（EndSession／forcedShutdown／StartTurn rollback）且 lease 慣例是冪等。
+	wireGen     *wirelog.Generation
+	wireStart   int
+	wireSegOnce sync.Once
 
 	sessionID string
 }
