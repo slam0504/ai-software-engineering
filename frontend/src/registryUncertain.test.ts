@@ -236,7 +236,7 @@ describe('Timeline 收合時的可見性（rev2 review C2／rev3 review 修正�
     // 錯誤放在**目前 focus 的** w1 自己的 lane：投影版本在「切走再切回」時會看到
     // 0→1 的變化而再加一次，這正是 reviewer 說的誤報。用 workspace notice 驗不
     // 出來（notices 對兩個 pane 都可見，投影值不會變）。
-    s.apply({ event_id: 'e-w1', ts: 't', provider: 'claude', kind: 'stream_error',
+    fire({ event_id: 'e-w1', ts: 't', provider: 'claude', kind: 'stream_error',
       error: 'claude 那邊壞了', workspace_session_id: 'w1' })
     await w.vm.$nextTick()
     expect(w.find('[data-test=tl-unread]').text()).toBe('1')
@@ -256,7 +256,7 @@ describe('Timeline 收合時的可見性（rev2 review C2／rev3 review 修正�
     s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
     s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
 
-    s.apply({ event_id: 'e-w2', ts: 't', provider: 'codex', kind: 'stream_error',
+    fire({ event_id: 'e-w2', ts: 't', provider: 'codex', kind: 'stream_error',
       error: 'codex 那邊壞了', workspace_session_id: 'w2' })
     await w.vm.$nextTick()
     expect(w.find('[data-test=tl-unread]').exists(), '非 focus pane 的錯誤不得漏報').toBe(true)
@@ -439,6 +439,50 @@ describe('registry uncertain latch：同步拒絕的使用者可見出口（矩�
     const txt = timelineText(w)
     expect(txt).toContain('開新對話失敗')
     expect(txt).toContain('請重啟 app')
+  })
+
+  // rev4 review Important：`pushError` 裡的 `bumpError` 零守門——刪掉那一行，
+  // rev4 的 17 條全綠。後果不是理論的：StartSession／NewSession／SettingsBar
+  // 的**每一個**操作失敗都走 pushError，它同時餵 badge 與 latchSeq，所以刪掉
+  // 之後「收合狀態下送訊息被 latch 拒絕」就不再強制展開，使用者在一個已經停止
+  // 寫入的 registry 上繼續按，畫面完全沒有說明。
+  //
+  // mutation：拿掉 pushError 的 `this.bumpError(msg)` → 紅在「pushError 也必須
+  // 餵 latchSeq」。
+  it('收合狀態下 submit 被 latch 拒絕 → 強制展開（pushError 也要餵 latchSeq）', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.pin(0, 'w1')
+    s.setFocus(0)
+    s.setBindings({ StartSession: vi.fn(async () => { throw new Error(GO_ERROR) }) } as any)
+    await w.vm.$nextTick()
+    expect(w.find('.tl').isVisible(), '前提：起始為收合').toBe(false)
+
+    await s.submit('go')
+    await w.vm.$nextTick()
+
+    expect(w.find('.tl').isVisible(), 'pushError 也必須餵 latchSeq，否則這條路徑不會強制展開').toBe(true)
+    expect(timelineText(w)).toContain('請重啟 app')
+  })
+
+  // 非 latch 的失敗只餵 badge，不強制展開（證明 errorSeq／latchSeq 沒有混在一起）。
+  // mutation：pushError 的 bumpError 改成只加 latchSeq → 紅在「非 latch 不得展開」。
+  it('收合狀態下非 latch 的 submit 失敗 → 不展開，但有未讀 badge', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.pin(0, 'w1')
+    s.setFocus(0)
+    s.setBindings({ StartSession: vi.fn(async () => { throw new Error('claude CLI not found') }) } as any)
+
+    await s.submit('go')
+    await w.vm.$nextTick()
+
+    expect(w.find('.tl').isVisible(), '非 latch 不得搶畫面').toBe(false)
+    expect(w.find('[data-test=tl-unread]').text(), 'pushError 必須餵 badge').toBe('1')
   })
 
   // StartSession：composer 送出（store.submit 的第一輪）。錯誤進**該 WSID 自己

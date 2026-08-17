@@ -163,7 +163,7 @@ interface State {
 // 跨語言字面值共用，沿用 MAX_SESSIONS_PER_PROVIDER／TURN_WINDOW_SIZE 的既有
 // 慣例；Go 端 `TestErrRegistryUncertainKeepsUIMarker` 守住它不漂移（改了 Go
 // 訊息卻沒改這裡，那條測試會紅）。
-export const REGISTRY_UNCERTAIN_MARK = 'session registry 上一次寫入的結果不確定'
+const REGISTRY_UNCERTAIN_MARK = 'session registry 上一次寫入的結果不確定'
 
 function providerOf(p: string | undefined): ProviderKey {
   return p === 'codex' ? 'codex' : 'claude'
@@ -463,9 +463,13 @@ export const useSession = defineStore('session', {
       }
     },
 
-    // bumpError：錯誤計數的唯一入口（errorSeq 恆增；latch 另計）。集中在一處
-    // 是為了讓「哪些路徑會被 badge 算到」只有一個答案——散在各 push 點遲早
-    // 會漏一條，而漏掉的那條正是使用者看不到的那條。
+    // bumpError：錯誤計數的唯一入口（errorSeq 恆增；含 latch 片語時 latchSeq
+    // 另計）。三個呼叫點：apply()（session lane）、applyNotice()（workspace
+    // lane）、pushError()（UI 自己產生的錯誤，含所有 binding 失敗）。
+    //
+    // pushError 那條特別要緊：StartSession／NewSession／SettingsBar 的每一個
+    // 操作失敗都走它，所以它同時餵 badge **與 latchSeq**——漏掉它，「收合狀態下
+    // 送訊息被 latch 拒絕」就不再強制展開。三個呼叫點各自有守門測試。
     bumpError(text: string) {
       this.errorSeq++
       if (text.includes(REGISTRY_UNCERTAIN_MARK)) this.latchSeq++
@@ -516,17 +520,20 @@ export const useSession = defineStore('session', {
       v.noiseGroup = -1
     },
 
-    // keepBusy：預設 false（清 busy）——原本唯一呼叫端 submit() 在送出前把
-    // busy 設成 true，失敗要復原。Task 27 review 抓到第二個呼叫端
-    // （SessionList 的移除失敗）從未動過 busy，卻無條件被這行清成 false：
-    // 使用者對一個 streaming 中的 session 按移除，Removable() 在最前面就擋
-    // 下、完全沒碰後端狀態，畫面卻把 busy-dot 關掉，讀起來像「已經閒置」。
-    // keepBusy=true 讓沒有設過 busy 的呼叫端不去動它，不改動預設呼叫端
-    // （submit）的既有行為。
-    pushError(msg: string, wsid?: string, keepBusy = false) {
+    // pushError：**pane-scoped** 的錯誤出口——寫進該 WSID 自己的 transcript，
+    // 並清掉它的 busy。用在「錯誤真的屬於某一個 session 的當前 turn」時
+    // （submit 送不出去、SettingsBar 對 focused session 的 lifecycle 操作失敗）。
+    // 作用範圍不是單一 session 的錯誤請用 pushNotice（見下）。
+    //
+    // 清 busy 是這個出口的本職：呼叫端在送出前把 busy 設成 true，失敗要復原。
+    // 曾經有一個 keepBusy 參數給「從沒設過 busy 的呼叫端」用（SessionList 的
+    // 移除失敗）——那條路徑改走 pushNotice 之後零呼叫端，參數已移除；
+    // 「不該動 busy 的錯誤不要走 pushError」現在是結構上的分工，不是一個要記得
+    // 傳對的旗標。
+    pushError(msg: string, wsid?: string) {
       const w = wsid ?? this.focusedWsid
       const m = this.sessions[w]
-      if (m && !keepBusy) m.busy = false
+      if (m) m.busy = false
       const v = this.views[w]
       if (!v) {
         this.applyNotice(uiEnv('stream_error', { error: msg })) // 計數由 applyNotice 負責

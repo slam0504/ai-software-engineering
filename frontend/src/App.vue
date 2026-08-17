@@ -184,6 +184,10 @@ watch(timelineOpen, v => { if (v) tlUnread.value = 0 })
 //
 // 這**不是**第三條通知管道：出口仍然是 Timeline 那一條，只是保證它在那一刻是
 // 開的。one-shot flag 讓使用者之後可以自己收合，不會被反覆搶走畫面。
+//
+// **已知副作用**：`timelineOpen` 有一個 watcher 會 save 進 localStorage，所以
+// 強制展開會**改寫使用者記憶的收合偏好**。判斷是可接受——latch 之後使用者本來
+// 就該看 timeline，而他隨時可以再收合（收合同樣會被記住）。
 const latchForcedOpen = ref(false)
 watch(() => s.latchSeq, n => {
   if (n > 0 && !latchForcedOpen.value) {

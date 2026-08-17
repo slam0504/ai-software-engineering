@@ -35,7 +35,12 @@ async function createSession(p: ProviderKey) {
     s.pin(s.focused, w)
   } catch (e) {
     // pushNotice（app-wide lane）而非 pushError：建立失敗根本還沒有 WSID，
-    // 綁到 focused pane 的 view 只會在「剛好有 pane 被 focus」時才看得到。
+    // 而 pushError 會落到 `focusedWsid`——把訊息掛到一個**不相干**的 session
+    // 上，並且順手清掉那個 session 的 busy（它可能正在 streaming）。可見性不是
+    // 問題（focused view 依定義看得到），錯的是歸屬與那個 busy 副作用。
+    //
+    // 已知未收斂：SettingsBar 的建立按鈕仍走 `call()` → pushError，同一個
+    // 副作用還在（登記給後續，不在本票範圍）。
     s.pushNotice(t('sessionList.create.failed', { provider: p, error: String(e) }))
   }
 }
@@ -53,12 +58,7 @@ async function createSession(p: ProviderKey) {
 // ListSessions() 重新整理（App.vue 下次 hydrate）才會依 registry 真實狀態
 // 收斂。
 //
-// review fix（Important）：這裡從沒把 busy 設成 true，call RemoveSession 前
-// 也不代表 session 真的忙碌——按下移除時該 session 若本來就在 streaming／
-// tool_running（Removable() 會直接擋下、完全不碰後端狀態），pushError 預設
-// 的「清 busy」副作用會把畫面上的 busy-dot 關掉，讀起來像已經閒置、可以放心
-// 操作。keepBusy=true 讓這條失敗路徑不動 busy（見 stores/session.ts
-// pushError doc）。
+// 失敗訊息走 pushNotice（app-wide lane），理由見 confirmRemove 內的註解。
 const confirmTarget = ref<string | null>(null)
 function askRemove(wsid: string) { confirmTarget.value = wsid }
 function cancelRemove() { confirmTarget.value = null }
@@ -74,8 +74,10 @@ async function confirmRemove(wsid: string) {
     // 所以失敗訊息會落進一個畫面上根本沒顯示的 view：畫面上只剩「卡片沒消失」，
     // 沒有任何說明。改走 app-wide 的 notices lane（訊息本身已帶 wsid）。
     //
-    // 一併解掉 keepBusy 的顧慮：pushNotice 從頭到尾不碰 busy，所以「對 streaming
-    // 中的 session 按移除，busy-dot 不得被誤清」是結構上成立，不再靠參數。
+    // 一併解掉 busy 的問題：這條路徑從沒把 busy 設成 true，而 pushError 會無條件
+    // 清掉該 session 的 busy——對一個 streaming 中的 session 按移除（Removable()
+    // 在最前面就擋下、完全沒碰後端狀態），busy-dot 會被關掉，讀起來像已經閒置。
+    // pushNotice 從頭到尾不碰 busy，所以這件事變成結構上成立，不再靠傳對參數。
     s.pushNotice(t('sessionList.remove.failed', { wsid, error: String(e) }))
   }
 }

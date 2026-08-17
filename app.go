@@ -59,8 +59,14 @@ type App struct {
 	workspaceSrc string
 	startupErr   string
 	// startupBlockers：已經插到最前面的第一則 blocker（見 appendStartup）。
-	// 只用來判斷「要不要再插一次」——第二則之後照時序往後接，否則多則 blocker
-	// 會互相把對方擠到後面，順序變成反向。
+	// 只用來判斷「要不要再插一次」——若每一則 blocker 都前插，多則之間的順序會
+	// 變成反向（後到的排最前）。
+	//
+	// **已知代價**：第二則之後的 blocker 會排在既有的良性 warning **後面**，
+	// 也就是嚴重度排序對它們不成立。目前不可達（兩個 blocker 呼叫點在同一次
+	// 啟動中互斥：registry 載入失敗會直接 return，走不到 backfill），所以刻意
+	// 不為此加一份 blocker／warning 分開累積的資料結構。新增第三個 blocker
+	// 呼叫點時要重新檢查這個前提。
 	startupBlockers string
 	toolsDirPath    string
 	toolsSource     string
