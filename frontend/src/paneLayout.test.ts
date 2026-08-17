@@ -320,6 +320,44 @@ describe('pins 寫入：production 入口與跨重啟', () => {
     expect(setLayoutCalls().length, '移除未釘選的 session 不改變排列').toBe(afterPinned)
   })
 
+  // **restore 側的 durable focus**（rev3 review：這一行曾經零守門，刪掉它全套照樣綠）。
+  //
+  // `restoreLayout` 只設 `focused`、不設 `durableFocusPane` 時：重啟後畫面焦點在
+  // pane 1，但 durable 仍是 0。接下來任何**不是 pane 選擇**的 layout 寫入
+  //（`markRemoved()`／`unpin()`）都會送 `pins[0]`，**把使用者的焦點選擇靜默改成
+  // pane 0**。這與 approval 側是同一種污染，只是來源換成 restore。
+  //
+  // 用「移除另一格的 session」當那個寫入（走 SessionList 兩段式移除，不碰 pane
+  // 選擇）。失敗形態很清楚：正確版寫出 focused='w2'，漏設版寫出 focused=''。
+  //
+  // mutation：拿掉 restoreLayout 的 `this.durableFocusPane = at`
+  //   → 紅在「durable focused 必須是還原時那一格」，且跨重啟那段也紅。
+  it('restore 還原的焦點必須同時是 durable 的，不被後續非 pane 選擇的寫入洗掉', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w2' }
+    const first = await mountApp()
+    const s = useSession()
+    expect(s.focused, '前提：還原到 pane 1').toBe(1)
+    expect(setLayoutCalls(), '前提：還原本身不寫').toHaveLength(0)
+
+    await first.find('[data-test=remove-w1]').trigger('click')
+    await first.find('[data-test=remove-confirm-submit]').trigger('click')
+    await flushPromises()
+
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    expect(pins, '前提：pane 0 的釘選被清掉了').toEqual(['', 'w2'])
+    expect(focused, 'durable focused 必須是還原時那一格，不得被洗成 pane 0').toBe('w2')
+
+    first.unmount()
+    resetEnv()
+    appMocks.ListSessions.mockImplementation(async () => [session('w2', 'codex', 'beta')])
+    appMocks.state.layout = { pins, focused }
+    const second = await mountApp()
+    expect(useSession().focused, '重啟後仍須停在使用者的那一格').toBe(1)
+  })
+
   // §3.6.4：persistent pin 永不被 transient view 改寫——durable 層的落點。
   // 走 production 路徑：ApprovalDialog 自己註冊的 `approval:request` handler。
   //
@@ -451,143 +489,208 @@ describe('寫入失敗：fail loud 但不擋路', () => {
 
 })
 
-describe('approval 的暫時焦點切換不得洩漏進 durable layout（owner 2026-08-17 裁決）', () => {
+describe('釘選＝明確選定 session ＋ pane，approval 的暫時切換不算（owner 2026-08-17 裁決）', () => {
   beforeEach(resetEnv)
 
-  // 裁決：approval routing 是**系統為了處理待核可事件而做的暫時焦點切換**，不等於
-  // 使用者選定啟動後要恢復的 pane，因此不得改動 durable layout 的 `Focused`。
+  // ---- 判準 1／2：釘進哪一格，focus 就跟到哪一格 ----
   //
-  // owner 特別點名改版前的狀態是三種語意裡最不穩定的一種：「當下不持久化、日後被
-  // 不相干的 persistLayout 順便寫入」——重啟結果取決於後來有沒有碰巧發生其他
-  // layout 寫入。所以這條**刻意在 approval 顯示期間製造一次不相干的 layout 寫入**
-  // （使用者把第三個 session 釘進 pane 0），那正是舊行為會洩漏的時機。
+  // production 的釘選鈕永遠釘進「畫面上作用的那一格」（`s.pin(s.focused, wsid)`），
+  // 所以要讓「focus 真的移動」在 production 路徑上可觀測，就得製造出「畫面作用格 ≠
+  // durable 格」的狀態——approval 的暫時切換正好是唯一會產生它的 production 情境。
+  // 這兩條因此各自用 approval 把畫面帶到目標格，再由使用者按釘選。
   //
-  // 全程走 production：approval 經 ApprovalDialog 自己註冊的 `approval:request`
-  // handler 進來，釘選點真的 SessionList 按鈕，核可點真的 dialog 按鈕。
-  //
-  // mutation（各自只打紅一列）：
-  //   - routeApproval 的 `this.focused = at` 改回**同時**寫 durableFocusPane
-  //     → 紅在「durable focused 不得是 approval 切過去的那一格」。
-  //   - persistLayout 送 `this.focused` 而非 `this.durableFocusPane`
-  //     → 紅在同一行（這兩刀是同一個洩漏路徑的兩端）。
-  //   - resolveApprovalPresentation 拿掉 `this.focused = this.durableFocusPane`
-  //     → 紅在「核可後畫面焦點必須還原」。
-  //   - 把該行放到 `if (pane === null) return` **之後**
-  //     → 也紅在「核可後畫面焦點必須還原」（來源已釘選時 transientPane 是 null）。
-  it('approval 切焦點期間發生其他 layout 寫入，durable focused 仍是使用者選的那一格', async () => {
+  // mutation：
+  //   - pin() 完全不更新 durableFocusPane → 兩條都紅（同一行實作）。
+  //   - pin() 寫死 durableFocusPane = 0 → **只**紅判準 2 那條。
+  //   - pin() 寫死 durableFocusPane = 1 → **只**紅判準 1 那條。
+  //   後兩刀證明兩格是各自獨立被守住的，不是一條測試兼差。
+  it('判準 1：釘進第 1 格 → Pins[0] 是該 session 且 Focused 指向第 1 格', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    // durable 起點是第 2 格，approval 把畫面帶到第 1 格
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w2' }
+    const w = await mountApp()
+    const s = useSession()
+    expect(s.durableFocusPane, '前提：durable 起點是第 2 格').toBe(1)
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w1', provider: 'claude', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(s.focused, '前提：畫面被 approval 帶到第 1 格').toBe(0)
+
+    await w.find('[data-test=pin-w3]').trigger('click')
+    await flushPromises()
+
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    expect(pins[0], 'Pins[0] 必須是剛釘進去的那個 session').toBe('w3')
+    expect(focused, 'Focused 必須指向第 1 格').toBe(pins[0])
+    expect(s.durableFocusPane).toBe(0)
+  })
+
+  it('判準 2：釘進第 2 格 → focus 同步移到第 2 格', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
     ])
     appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
     const w = await mountApp()
     const s = useSession()
-    expect(s.durableFocusPane, '前提：使用者選定的是 pane 0').toBe(0)
-
-    // w2 已釘在 pane 1 → routeApproval 走「已釘選」分支，自動切焦點過去
-    const approval = runtimeMocks.handlers['approval:request']
-    approval!({ id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}' })
+    expect(s.durableFocusPane, '前提：durable 起點是第 1 格').toBe(0)
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}',
+    })
     await flushPromises()
-    expect(s.focused, '前提：畫面焦點確實被 approval 切走了').toBe(1)
-    expect(s.durableFocusPane, 'approval 不得改動使用者選定的 pane').toBe(0)
+    expect(s.focused, '前提：畫面被 approval 帶到第 2 格').toBe(1)
 
-    // **不相干的 layout 寫入**（舊行為就是在這裡把 approval 的焦點順便寫出去的）。
-    // SessionList 的釘選鈕釘進**畫面上**作用的那一格（此刻是 approval 切過去的
-    // pane 1），所以 w3 落在 pins[1]——這正好讓兩種實作寫出不同的 focused：
-    // 正確版寫 pins[0]（'w1'，使用者選的那一格），洩漏版寫 pins[1]（'w3'）。
     await w.find('[data-test=pin-w3]').trigger('click')
     await flushPromises()
-    const [pins, focused] = setLayoutCalls().at(-1)!
-    expect(pins, '前提：w3 被釘進畫面作用中的那一格').toEqual(['w1', 'w3'])
-    expect(focused, 'durable focused 不得是 approval 切過去的那一格').toBe('w1')
-
-    // 核可 → 畫面焦點還原回使用者選的那一格
-    await w.find('.dialog .allow').trigger('click')
-    await flushPromises()
-    expect(s.focused, '核可後畫面焦點必須還原').toBe(0)
-  })
-
-  // **restore 側的同一個洩漏**（rev2 review：這一行零守門，刪掉它全套 361 條照樣綠）。
-  //
-  // `restoreLayout` 只設 `focused`、不設 `durableFocusPane` 時：重啟後畫面焦點在
-  // pane 1，但 durable 仍是 0。接下來任何**不是 setFocus** 的 layout 寫入
-  //（pin()／markRemoved()／unpin()）都會送 `pins[0]`，**把使用者的焦點選擇靜默
-  // 改成 pane 0**。這正是本輪要消滅的「durable Focused 被不相干寫入污染」，
-  // 只是來源從 approval 換成了 restore——② 的裁決在 approval 側守到了，restore
-  // 側沒有。
-  //
-  // 這裡用「移除另一格的 session」當那個不相干寫入（走 SessionList 的兩段式移除
-  // UI，完全不碰 setFocus）。失敗形態很清楚：正確版寫出 focused='w2'，漏設版寫出
-  // focused=''——使用者的焦點選擇就這樣沒了，而空字串是合法值、Go 端不會擋。
-  //
-  // mutation：拿掉 restoreLayout 的 `this.durableFocusPane = at`
-  //   → 紅在「durable focused 必須是還原時那一格」，且跨重啟那段也紅。
-  it('restore 還原的焦點必須同時是 durable 的，不被後續不相干寫入洗掉', async () => {
-    appMocks.ListSessions.mockImplementation(async () => [
-      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
-    ])
-    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w2' }
-    const first = await mountApp()
-    const s = useSession()
-    expect(s.focused, '前提：還原到 pane 1').toBe(1)
-    expect(setLayoutCalls(), '前提：還原本身不寫').toHaveLength(0)
-
-    // 不相干的 layout 寫入，**完全不經過 setFocus**
-    await first.find('[data-test=remove-w1]').trigger('click')
-    await first.find('[data-test=remove-confirm-submit]').trigger('click')
-    await flushPromises()
 
     const [pins, focused] = setLayoutCalls().at(-1)!
-    expect(pins, '前提：pane 0 的釘選被清掉了').toEqual(['', 'w2'])
-    expect(focused, 'durable focused 必須是還原時那一格，不得被洗成 pane 0').toBe('w2')
-
-    // 跨重啟：洗掉之後重開就再也回不來，所以這一維要一起守
-    first.unmount()
-    resetEnv()
-    appMocks.ListSessions.mockImplementation(async () => [session('w2', 'codex', 'beta')])
-    appMocks.state.layout = { pins, focused }
-    const second = await mountApp()
-    expect(useSession().focused, '重啟後仍須停在使用者的那一格').toBe(1)
+    expect(pins[1]).toBe('w3')
+    expect(focused, 'focus 必須同步移到第 2 格').toBe(pins[1])
+    expect(s.durableFocusPane).toBe(1)
   })
 
-  // 跨重啟（形狀 F）：approval 期間的焦點不得洩漏到重啟後。新的 pinia＋新的
-  // App.vue 實例，讀上一輪實際寫出去的那組參數。
+  // ---- 判準 1 × 判準 4 的交互（coordinator 的解讀，owner 裁決的延伸）----
   //
-  // 中途那次寫入刻意**不是** setFocus（釘選 w3），否則 setFocus 會把 durable 與
-  // 畫面焦點一起改回來，正確版與洩漏版寫出同一組參數、這條就分辨不出東西
-  // ——初版就是這樣寫的，實測對 MF2 不紅，已修正。
+  // **解讀**：判準 4 約束的是「**approval 的暫時焦點切換**本身」不得改動 durable
+  // focus——approval 只是把使用者*帶到*那一格，沒有代替他選。使用者接著在那一格
+  // 按釘選，那是他自己的明確動作，符合判準 1「同時明確選了 session 與 pane」。
+  // 所以：**approval 單獨發生 → durable 不動；使用者動手 → durable 才動。**
   //
-  // mutation（各自只打紅一列）：
-  //   - persistLayout 送 `this.focused` → 紅在重啟後的 focused 斷言。
-  //   - routeApproval 同時寫 durableFocusPane → 紅在同一行。
-  it('approval 期間的焦點不洩漏到重啟後', async () => {
+  // 實作前逐條查過四條路徑，沒有發現矛盾：
+  //   (a) restoreLayout 走 persist=false，pin() 不碰 durable，焦點權威仍是
+  //       registry 的 layout.focused；
+  //   (b) resolveApprovalPresentation 還原成 durable(=1)，停在使用者剛選的那格，自洽；
+  //   (c) 來源未釘選的 transient 分支根本不移動焦點，釘選落在使用者自己那格；
+  //   (d) 要釘進正顯示 transient view 的那一格，得先點它（setFocus，本身就是明確選擇）。
+  //
+  // mutation：pin() 不更新 durableFocusPane → 紅在 durable 斷言與跨重啟那行。
+  it('交互：approval 帶到第 2 格後使用者按釘選，durable focus 跟著移動並跨重啟', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
     ])
     appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
     const first = await mountApp()
-
     runtimeMocks.handlers['approval:request']!({
       id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}',
     })
     await flushPromises()
-    expect(useSession().focused, '前提：畫面焦點被切到 pane 1').toBe(1)
 
-    // approval 仍顯示中就發生一次不相干的 layout 寫入
     await first.find('[data-test=pin-w3]').trigger('click')
     await flushPromises()
+    expect(useSession().durableFocusPane, '使用者的釘選動作才是明確選擇').toBe(1)
 
     const [pins, focused] = setLayoutCalls().at(-1)!
     first.unmount()
     resetEnv()
     appMocks.ListSessions.mockImplementation(async () => [
-      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+      session('w1', 'claude', 'alpha'), session('w3', 'claude', 'gamma'),
     ])
     appMocks.state.layout = { pins, focused }
-
     const second = await mountApp()
-    const s2 = useSession()
-    expect(paneText(second, 0), '前提：pane 0 仍是使用者原本那一格').toContain('alpha')
-    expect(s2.focused, '重啟後必須停在使用者選的 pane，不是 approval 切過去的那一格').toBe(0)
-    expect(s2.durableFocusPane).toBe(0)
+    expect(useSession().focused, '重啟後停在使用者釘進去的那一格').toBe(1)
+    expect(useSession().durableFocusPane).toBe(1)
+  })
+
+  // ---- 判準 4 的對照組：approval 單獨發生，durable 完全不動 ----
+  //
+  // mutation：
+  //   - routeApproval 同時寫 durableFocusPane → 紅在「核可後焦點回到使用者那一格」。
+  //   - resolveApprovalPresentation 拿掉焦點還原（或放到 transientPane 早退之後）
+  //     → 紅在同一行。
+  it('對照組：approval 期間使用者什麼都不做，核可後焦點回到原本那一格且全程零寫入', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+    const s = useSession()
+
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(s.focused, '前提：畫面焦點確實被帶走了').toBe(1)
+    expect(s.durableFocusPane, 'approval 本身不得改動 durable focus').toBe(0)
+
+    await w.find('.dialog .allow').trigger('click')
+    await flushPromises()
+
+    expect(s.focused, '核可後焦點回到使用者那一格').toBe(0)
+    expect(s.durableFocusPane).toBe(0)
+    expect(setLayoutCalls(), 'approval 全程不得產生任何 durable 寫入').toHaveLength(0)
+  })
+
+  // ---- 判準 4：approval 期間的**非 pane 選擇**寫入不得把 durable focus 帶走 ----
+  //
+  // 移除 session 是 session 清單的操作，不是 pane 選擇，所以它觸發的 persistLayout
+  // 必須仍以使用者選定的那一格為準。這條是 `persistLayout` 送 durableFocusPane
+  // 而非 focused 的唯一守門（釘選與切焦點兩條路徑下兩者相等，分辨不出來）。
+  //
+  // mutation：
+  //   - persistLayout 送 this.focused → 紅（寫出 '' —— 使用者的焦點就這樣沒了）。
+  //   - routeApproval 同時寫 durableFocusPane → 紅在同一行。
+  it('判準 4：approval 期間移除 session（非 pane 選擇）不得把 durable focus 帶走', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(useSession().focused, '前提：畫面焦點在第 2 格').toBe(1)
+
+    // 移除第 2 格那個 session（走 SessionList 兩段式移除，完全不碰 pane 選擇）
+    await w.find('[data-test=remove-w2]').trigger('click')
+    await w.find('[data-test=remove-confirm-submit]').trigger('click')
+    await flushPromises()
+
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    expect(pins).toEqual(['w1', ''])
+    expect(focused, 'durable focus 必須仍是使用者選的第 1 格').toBe('w1')
+  })
+
+  // ---- 判準 3：已是相同 pins 與 focus → 送出的 layout 逐字相同，由 store 冪等守衛攔下 ----
+  //
+  // 分工說清楚：**「零落盤」是 store 層的事**（`wsregistry` 的
+  // `TestSetLayoutSkipsPersistWhenUnchanged` 以步驟計數＋`os.SameFile`／mtime 驗證）。
+  // 這條驗的是它的前提——前端在「釘一個已經在該格、且該格已 focused 的 session」時，
+  // 送出的 tuple 與上一次**逐字相同**，守衛才有東西可攔。
+  //
+  // 對照組刻意放在同一條：切到另一格之後送出的 tuple **必須不同**（pins 相同但
+  // focus 不同 → 那是該落盤的，不能被冪等守衛吃掉）。
+  //
+  // mutation（實測）：
+  //   - `setFocus` 不更新 durableFocusPane → 紅在對照組（`focus 變了就必須送出不同
+  //     的 layout`）。
+  //   - persistLayout 永遠送 `pins[0]`（忽略 focus 維度）→ 紅在同一行。
+  //   **前半（逐字相同）沒有對應的 mutation**，據實記錄：它是 store 冪等守衛的
+  //   *前提檢查*（前端必須送得出一模一樣的 tuple，守衛才有東西可攔），不是行為
+  //   分歧點——真正把「零落盤」釘死的是 wsregistry 那條。
+  it('判準 3：重複釘選同一格送出逐字相同的 layout；切格則不同', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+
+    await w.find('[data-test=pin-w1]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test=pin-w1]').trigger('click')
+    await flushPromises()
+
+    const calls = setLayoutCalls()
+    expect(calls.length).toBeGreaterThanOrEqual(2)
+    expect(calls.at(-1), '相同 pins ＋ 相同 focus 必須送出逐字相同的 layout').toEqual(calls.at(-2))
+    expect(calls.at(-1)).toEqual([['w1', 'w2'], 'w1'])
+
+    // 對照組：pins 相同、focus 不同 → tuple 必須改變（該落盤，不得被守衛吃掉）
+    await w.find('[data-test=pane-1]').trigger('click')
+    await flushPromises()
+    expect(setLayoutCalls().at(-1), 'focus 變了就必須送出不同的 layout').toEqual([['w1', 'w2'], 'w2'])
   })
 })

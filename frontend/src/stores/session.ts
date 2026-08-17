@@ -379,9 +379,25 @@ export const useSession = defineStore('session', {
       this.persistentPins[idx] = wsid
       this.pins[idx] = wsid
       if (this.transientPane === idx) this.transientPane = null
+      // **釘選＝同時明確選了 session 與 pane**（owner 2026-08-17 裁決）。所以
+      // 焦點（畫面與 durable 兩者）跟著移到被釘的那一格——這也消除了同一顆釘選鈕
+      // 因為「這個 session 是否已釘選」而產生的兩種語意（已釘選走 setFocus 會移
+      // 焦點、未釘選卻不會）。
+      //
+      // 只在 persist（＝使用者動作）時做。`persist === false` 的唯一呼叫端是
+      // restoreLayout，那裡的焦點權威是 registry 的 `layout.focused`，不是「迴圈
+      // 最後釘的那一格」——不擋的話，`layout.focused` 解析不出來時 durable 會落在
+      // 一個任意的 pane 上。
+      //
+      // Pins 與 Focused **在同一次 persistLayout 送出**（owner 指定）：兩者都已
+      // 更新完才呼叫，所以只會有一次 SetLayout、一次落盤，不是兩次 45ms。
       // 在 lazy load 之前就送出：持久化的是使用者的選擇，沒有理由等 transcript
       // 載完（那一段可能因為 index 重建而慢，甚至失敗）。
-      if (persist) void this.persistLayout()
+      if (persist) {
+        this.focused = idx
+        this.durableFocusPane = idx
+        void this.persistLayout()
+      }
       const isNew = !this.views[wsid]
       if (isNew) this.views[wsid] = newView()
       const m = this.sessions[wsid]

@@ -34,6 +34,12 @@ func layoutFileID(t *testing.T, path string) os.FileInfo {
 // TestSetLayoutSkipsPersistWhenUnchanged：判準 1。相同排列不得產生任何落盤
 // 步驟，磁碟上的檔案必須原封不動（同一個 inode、同一個 mtime）。
 //
+// 這也是 owner「釘選判準 3」的**零落盤那一半**：使用者重複釘選一個已經在該格、
+// 且該格已 focused 的 session 時，前端送出的 layout 逐字相同（前端側的守門見
+// paneLayout.test.ts 的 `判準 3：重複釘選同一格送出逐字相同的 layout；切格則
+// 不同`），由這裡的守衛攔下。**注意對照組在 PersistsExactlyOnceWhenChanged**：
+// 「pins 相同但 focus 不同」是**該落盤**的，不得被守衛吃掉。
+//
 // 跨重啟（形狀 F）：被跳過的那一次寫入不得讓磁碟內容退化——重新 Open 一個
 // Store（真的重讀磁碟）必須仍拿到正確的排列。「不寫」的正確性只有在重啟後
 // 才看得出來：一個把 layout 寫壞又跳過修正的實作，在同一個 process 內用記憶體
