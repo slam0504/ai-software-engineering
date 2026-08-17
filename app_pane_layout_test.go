@@ -18,11 +18,11 @@ import (
 // TestPaneLayoutSurvivesRestart：整張票的主要保證——使用者釘選的兩個 pane 與焦點
 // 在重啟後仍在，這是 §3.8 啟動重建的唯一輸入。
 //
-// mutation：SetPaneLayout 改成不呼叫 wsReg.SetLayout（只回 nil）→ 紅在本檔第 40
-// 行（重啟後 pins 為空）。這一刀**同時打紅四條**（本條、RestoresEmptySecondPane、
-// DropsRemovedPin、UncertainLatch 的排列比對）——寫入路徑是這一組的共同前提，
-// 據實記在這裡，不宣稱它只打紅一條。各條的「只打紅自己」mutation 分別列在各自
-// 的 doc 上。
+// mutation：SetPaneLayout 改成不呼叫 wsReg.SetLayout（只回 nil）→ 紅在本條的
+// 「重啟後必須還原兩個釘選 pane」。這一刀**同時打紅四條**（本條、
+// RestoresEmptySecondPane、DropsRemovedPin、UncertainLatch 的排列比對）——寫入
+// 路徑是這一組的共同前提，據實記在這裡，不宣稱它只打紅一條。各條的「只打紅
+// 自己」mutation 分別列在各自的 doc 上。
 func TestPaneLayoutSurvivesRestart(t *testing.T) {
 	a, _ := newTestApp(t)
 	bootRegistry(t, a)
@@ -53,8 +53,8 @@ func TestPaneLayoutSurvivesRestart(t *testing.T) {
 // 這一類錯誤（第二格是空的時候，把它整個省略掉的實作在上一條測試裡看不出來，
 // 卻會讓還原時的 pane index 錯位）。
 //
-// mutation：PaneLayout 改成只回傳非空的 WSID（跳過空格）→ 紅在 focused 的
-// index 對照那一行（pins[1] 變成 w1、長度變 1）。
+// mutation：PaneLayout 改成只回傳非空的 WSID（跳過空格）→ 紅在「空的第一格
+// 必須原位保留」（pins[1] 變成 w1、長度變 1）。
 func TestPaneLayoutRestoresEmptySecondPane(t *testing.T) {
 	a, _ := newTestApp(t)
 	bootRegistry(t, a)
@@ -158,6 +158,36 @@ func TestSetPaneLayoutRefusedByUncertainLatchButReadStillWorks(t *testing.T) {
 	}
 	if got.Pins[0] != string(w1) || got.Pins[1] != "" {
 		t.Fatalf("被拒絕的寫入不得改變已持久化的排列，got %+v", got.Pins)
+	}
+}
+
+// TestSetPaneLayoutReportsPlainWriteFailure：**非 latch** 的一般寫入失敗（磁碟
+// 滿、權限、rename 失敗）必須原樣回報，不得被吞掉、也不得被誤報成 latch。
+//
+// 為什麼要跟 latch 那條分開（review #6）：兩者的處置不同——latch 是「早退、之後
+// 每次都會失敗、要重啟」，一般失敗是「這一次沒寫成、下一次可能成功」。只測 latch
+// 分支的話，`SetPaneLayout` 把 `wsReg.SetLayout` 的錯誤吞掉改回 nil 也照樣全綠，
+// 而前端的「fail loud 但不擋路」整條就沒有東西可接。
+//
+// mutation（各自只打紅一列）：
+//   - `SetPaneLayout` 改成 `_ = a.wsReg.SetLayout(...); return nil` → 紅在「必須
+//     原樣回報」。
+//   - 把一般失敗也包成 errRegistryUncertain → 紅在「不得誤報成 latch」。
+func TestSetPaneLayoutReportsPlainWriteFailure(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	boom := errors.New("write layout: no space left on device")
+	reg.mu.Lock()
+	reg.layoutErr = boom
+	reg.mu.Unlock()
+
+	err := a.SetPaneLayout([]string{"w1", ""}, "w1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("一般寫入失敗必須原樣回報（前端據此發 notice），got %v", err)
+	}
+	if errors.Is(err, errRegistryUncertain) {
+		t.Fatalf("一般寫入失敗不得誤報成 latch（處置不同：latch 要重啟），got %v", err)
 	}
 }
 

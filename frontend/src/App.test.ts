@@ -18,6 +18,16 @@ const wailsAppMocks = vi.hoisted(() => ({
   StartSession: vi.fn(), SendMessage: vi.fn(), EndSession: vi.fn(), NewSession: vi.fn(),
   TerminateSession: vi.fn(), CreateSession: vi.fn(), RemoveSession: vi.fn(),
   RecoverCodexRecording: vi.fn(), LoadTurnsBefore: vi.fn(),
+  // PaneLayout／SetPaneLayout：pane pins 持久化（owner review 修正 3）。
+  // **少了它們這個檔仍會綠，但綠得沒有意義**——App.vue 的 onMounted 會撞
+  // 「No "PaneLayout" export is defined on the mock」，被它自己的 catch 接住、
+  // 塞一筆 notice，還原路徑在這個檔從沒被執行過。本檔沒有錯誤計數斷言，所以
+  // 那條失敗分支是靜默的（失效形狀 (E)：測試環境本身量不出那個效果）。
+  //
+  // 通則：**任何 mock 這個 module 的測試檔，都有跟著 production binding 一起
+  // 補的義務**；目前靠人工，沒有機制守（見 pane-pins-report.md §6 的流程缺口）。
+  PaneLayout: vi.fn(async () => ({ pins: ['', ''], focused: '' })),
+  SetPaneLayout: vi.fn(async () => undefined),
   RegisterMutation: vi.fn(), RunEvidence: vi.fn(), EvidenceGet: vi.fn(),
   SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
   EscalationList: vi.fn(async () => []), EscalationCreate: vi.fn(), EscalationAck: vi.fn(), EscalationResolve: vi.fn(),

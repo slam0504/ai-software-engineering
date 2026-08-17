@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -471,14 +472,44 @@ func (s *Store) Live() []Entry {
 	return out
 }
 
+// layoutEqual：兩個排列是否完全相同（Pins 逐格、Focused）。slices.Equal 對
+// nil 與長度 0 視為相等，正是這裡要的語意——「沒有釘選」不因為呼叫端送 nil
+// 還是送空 slice 而變成不同的狀態。
+func layoutEqual(a, b Layout) bool {
+	return a.Focused == b.Focused && slices.Equal(a.Pins, b.Pins)
+}
+
 // SetLayout：更新 pinned／focused 排列。Pins 進來時深拷貝——若直接存呼叫端
 // 傳入的 slice，呼叫端事後原地修改（例如 append 且 cap 有餘裕）會在鎖外
 // 污染 store 內部狀態；且 persist 失敗要回滾的 old.Pins 也會指向同一塊已
 // 被污染的 backing array，回滾等於回滾到錯的資料，直接否定「記憶體與磁碟
 // 不分裂」的不變量。persist 失敗回滾記憶體。
+//
+// **冪等守衛（owner 2026-08-17 裁決）**：排列與目前完全相同時直接回傳，不進
+// 四步落盤。理由與位置都由 owner 指定——
+//
+//   - **為什麼要**：pane focus 的 UI 觸發面比想像中寬（`PaneView` 的 @click 掛在
+//     整個 pane div 上，pane 內任何點擊都會冒泡成一次 setFocus），所以「排列根本
+//     沒變卻整套 fsync 落盤一次」是常態而非例外；實測單次 SetLayout ≈45ms，而本
+//     函式全程持 `s.mu`，與 CreateSession／CommitResume／tombstone／shutdown Sync
+//     同一把鎖——白花的不只是 I/O，是所有 registry 寫入的排隊時間。
+//   - **為什麼放在 store 而不是前端**：前端層的 memo（記住上次寫出去的值）只擋得住
+//     目前這一個 caller，任何新 caller 都會繞過它。守衛放在唯一持有這份狀態的地方，
+//     現在與未來的 caller 一律涵蓋。
+//   - **比對與更新必須在同一把鎖內**：在鎖外先讀一次再進來寫，兩個併發的
+//     「改成同一個新值」會各自看到舊值、各自落盤一次（而且鎖外讀 `s.file.Layout`
+//     本身就是 data race）。`TestSetLayoutComparesAndUpdatesUnderOneLock` 以
+//     `-race` ＋落盤步驟計數守這一點。
+//
+// 不改變任何可觀測狀態，所以刻意排在 latch 檢查（persistOrRollback）之前：
+// no-op 沒有東西可以變得不確定，回 error 只會讓呼叫端以為排列沒被記下來。
+// latch 期間真正的排列變更仍然會被 persistOrRollback 拒絕。
 func (s *Store) SetLayout(l Layout) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if layoutEqual(s.file.Layout, l) {
+		return nil
+	}
 	old := s.file.Layout
 	s.file.Layout = Layout{Pins: append([]string(nil), l.Pins...), Focused: l.Focused}
 	return s.persistOrRollback(func() { s.file.Layout = old })

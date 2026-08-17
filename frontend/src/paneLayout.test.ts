@@ -61,6 +61,7 @@ vi.mock('../wailsjs/go/main/App', () => appMocks)
 
 import App from './App.vue'
 import { useSession } from './stores/session'
+import type { Envelope } from './types'
 import { makeI18n } from './test/i18n'
 
 const memStorage = {
@@ -122,6 +123,14 @@ function setLayoutCalls() {
   return vi.mocked(appMocks.SetPaneLayout).mock.calls as unknown as [string[], string][]
 }
 
+// fire：經 **production 的** `workbench:event` handler 送事件（同
+// registryUncertain.test.ts 的慣例）。測試不自己重寫一份分流。
+function fire(env: Envelope) {
+  const h = runtimeMocks.handlers['workbench:event']
+  if (!h) throw new Error('App.vue 沒有註冊 workbench:event handler')
+  h(env)
+}
+
 function timelineText(w: any) {
   return w.findAll('.tl .sum').map((n: any) => n.text()).join('\n')
 }
@@ -133,11 +142,13 @@ describe('§3.8 啟動重建兩個釘選 pane：registry 的排列是唯一輸�
   // [null, null]，重啟後兩個 pane 都是空的。
   //
   // mutation（實測結果，據實記錄）：
-  //   - 拿掉 App.vue onMounted 的 restoreLayout 呼叫 → 紅在本條 150 行（pane 內容）。
-  //     這一刀**同時打紅 5 條**（本條、跳過未知 WSID、切焦點寫入、跨重啟、transient）
-  //     ——「還原有沒有接上」是整組讀取端測試的共同前提，不宣稱它只紅一條。
-  //   - restoreLayout 不還原 focused → 紅在 155 行（另紅跨重啟那條的 274 行）。
-  //   - restoreLayout 只設 pins、不走 pin() → **只**紅在 157 行（LoadTurnsBefore），
+  //   - 拿掉 App.vue onMounted 的 restoreLayout 呼叫 → 紅在本條的 `paneText(w, 0)`
+  //     內容斷言。這一刀**同時打紅本檔 7 條**（本條、跳過未知 WSID、切焦點寫入、
+  //     移除清排列、跨重啟、transient、busy）——「還原有沒有接上」是整組讀取端
+  //     測試的共同前提，不宣稱它只紅一條。
+  //   - restoreLayout 不還原 focused → 紅在 `focused pane 必須跟著還原`
+  //     （另紅跨重啟那條的 `焦點也要跨重啟`）。
+  //   - restoreLayout 只設 pins、不走 pin() → **只**紅在 `LoadTurnsBefore` 那兩行，
   //     即 §3.8 的「各載入最近 20 個完整 turn」那一格。
   it('啟動時依 registry 的 pins 重建兩個 pane 並還原焦點與尾端視窗', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
@@ -161,7 +172,8 @@ describe('§3.8 啟動重建兩個釘選 pane：registry 的排列是唯一輸�
   // 還原是**讀取**，不該回頭寫。逐格 pin 若各寫一次，中途關掉 app 就把使用者
   // 的第二個釘選弄丟了（第一次寫出去的排列只有 pane 0）。
   // mutation：restoreLayout 改成呼叫 `this.pin(idx, w)`（預設 persist=true）→
-  // 紅在本條 173 行（另紅「點另一個 pane 切焦點」那條的 231 行前提斷言）。
+  // 紅在本條的 `啟動還原期間不得寫入排列`（另紅「點另一個 pane 切焦點」那條的
+  // `前提：還原本身不寫`）。
   it('還原不回寫 registry（啟動沒有新資訊要落盤）', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
@@ -176,7 +188,7 @@ describe('§3.8 啟動重建兩個釘選 pane：registry 的排列是唯一輸�
   // Go 端 PaneLayout() 已經濾掉 tombstone，這是第二道：沒有 metadata 的 WSID
   // 釘上去會生出一個綁不到任何 session 的 pane（provider／狀態全部讀不到）。
   // mutation：拿掉 restoreLayout 的 `!this.sessions[w]` 檢查 → **只**紅在本條
-  // 187 行（pins 變成 ['ghost', 'w2']，pane-0 渲染出一個沒有 provider 的頭列）。
+  // 的 `s.pins` 斷言（會變成 ['ghost', 'w2']，pane-0 渲染出一個沒有 provider 的頭列）。
   it('跳過沒有 metadata 的 WSID，不生出綁不到 session 的 pane', async () => {
     appMocks.ListSessions.mockImplementation(async () => [session('w2', 'codex', 'beta')])
     appMocks.state.layout = { pins: ['ghost', 'w2'], focused: 'ghost' }
@@ -191,8 +203,8 @@ describe('§3.8 啟動重建兩個釘選 pane：registry 的排列是唯一輸�
   })
 
   // 讀取失敗不得擋住啟動——降級是「兩個 pane 空白、使用者自己釘」，不是開不起來。
-  // mutation：拿掉 App.vue 的 try/catch → **只**紅在本條 201／202 行（未捕捉的
-  // rejection 讓 onMounted 後續的 refreshGate／refreshEscalation 不再執行）。
+  // mutation：拿掉 App.vue 的 try/catch → **只**紅在本條（未捕捉的 rejection 讓
+  // onMounted 後續的 refreshGate／refreshEscalation 不再執行，兩個斷言都倒）。
   it('PaneLayout 讀取失敗時 fail loud 但不擋啟動', async () => {
     appMocks.PaneLayout.mockImplementation(async () => { throw new Error('registry not loaded') })
 
@@ -207,8 +219,9 @@ describe('pins 寫入：production 入口與跨重啟', () => {
   beforeEach(resetEnv)
 
   // 寫入端的 production 入口——真的點 SessionList 卡片上的釘選鈕。
-  // mutation：拿掉 store pin() 的 `void this.persistLayout()` → 紅在本條 219 行
-  //（另紅跨重啟 273、latch 不擋路 360——三條都以「釘選會寫入」為前提）。
+  // mutation：拿掉 store pin() 的 `void this.persistLayout()` → 紅在本條的
+  // `setLayoutCalls().at(-1)`（另紅「跨重啟」與「latch 不擋路」——三條都以
+  // 「釘選會寫入」為前提）。
   it('點釘選鈕會把排列寫進 registry（帶 focused pane）', async () => {
     appMocks.ListSessions.mockImplementation(async () => [session('w1', 'claude', 'alpha')])
     const w = await mountApp()
@@ -220,8 +233,9 @@ describe('pins 寫入：production 入口與跨重啟', () => {
   })
 
   // 切焦點同樣是 §3.2.1 白名單的一部分（focused pane）。
-  // mutation：拿掉 setFocus 的 persistLayout → 紅在本條 236 行（另紅 transient
-  // 332、非 focus pane 可見性 382——那兩條都用切焦點當寫入觸發器）。
+  // mutation：拿掉 setFocus 的 persistLayout → 紅在本條的 `setLayoutCalls().at(-1)`
+  //（另紅「transient 不得寫進 durable 排列」與「失敗訊息不綁 pane」——那兩條都用
+  // 切焦點當寫入觸發器）。
   it('點另一個 pane 切焦點也會寫入', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
@@ -245,7 +259,8 @@ describe('pins 寫入：production 入口與跨重啟', () => {
   // mutation（各自只打紅一列）：
   //   - persistLayout 送 `this.pins` 而不是 `persistentPins` → 這條仍綠（沒有
   //     transient），由下面 §3.6.4 那條打紅；此處據實說明，不宣稱它守得到。
-  //   - 拿掉 pin() 的 persistLayout → 紅在本條 273 行（重啟後 pane-0 是空的）。
+  //   - 拿掉 pin() 的 persistLayout → 紅在本條的 `paneText(second, 0)`（重啟後
+  //     pane-0 是空的）。
   //   - 拿掉 App.vue 的 restoreLayout → 同上，紅在重啟後。
   it('重啟後仍是同一組釘選（新 App 實例讀上一輪寫出去的排列）', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
@@ -280,8 +295,9 @@ describe('pins 寫入：production 入口與跨重啟', () => {
   // 走 production 路徑：SessionList 的兩段式移除（先問、再送）。
   //
   // mutation（各自只打紅一列）：
-  //   - markRemoved 拿掉 `if (unpinned) void this.persistLayout()` → 紅在寫入斷言。
-  //   - 把該條件改成無條件寫入 → 紅在最後一行（移除未釘選的 session 不得寫）。
+  //   - markRemoved 拿掉 `if (unpinned) void this.persistLayout()` → 紅在本條第一個
+  //     `setLayoutCalls().at(-1)`（另紅 busy 那條——它也靠移除觸發寫入）。
+  //   - 把該條件改成無條件寫入 → **只**紅在 `移除未釘選的 session 不改變排列`。
   it('移除已釘選的 session 會清掉 durable 排列；移除未釘選的則不寫', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
@@ -308,7 +324,8 @@ describe('pins 寫入：production 入口與跨重啟', () => {
   // 走 production 路徑：ApprovalDialog 自己註冊的 `approval:request` handler。
   //
   // mutation：persistLayout 改送 `this.pins`（而不是 persistentPins）→ **只**紅在
-  // 本條 332 行（寫出去的第二格會是 w3）；上面那條跨重啟測試實測仍綠——這正是它
+  // 本條最後的 `setLayoutCalls().at(-1)`（寫出去的第二格會是 w3）；上面那條跨重啟
+  // 測試實測仍綠——這正是它
   // 需要獨立存在的理由。
   it('approval 的 transient 顯示不得寫進 durable 排列', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
@@ -341,11 +358,13 @@ describe('寫入失敗：fail loud 但不擋路', () => {
   // 釘選」。
   //
   // mutation（各自只打紅一列）：
-  //   - persistLayout 的 catch 改成清掉 pins（回滾）→ **只**紅在本條 358 行。
-  //   - 把 catch 換成靜默 `.catch(() => {})` → 紅在 360 行（通知不見了；另紅下一
-  //     條的 382）。
+  //   - persistLayout 的 catch 改成清掉 pins（回滾）→ **只**紅在
+  //     `寫入失敗不得回滾使用者剛做的釘選`。
+  //   - 把 catch 換成靜默 `.catch(() => {})` → 紅在本條的 `重啟後會遺失`
+  //     （另紅「失敗訊息不綁 pane」與 busy 那兩條的同一則通知斷言）。
   //   - catch 改用 pushError 而非 pushNotice → 本條實測**仍綠**（focused pane 剛好
-  //     是 w1，看得到），由下一條「非 focus pane 也看得到」打紅。
+  //     是 w1，看得到）。真正打紅它的是本 describe 最後那條 busy 測試，不是下一條
+  //     ——見那兩條各自的說明（review #1 更正）。
   it('registry latch 拒絕寫入時，釘選照常生效並在 notices lane fail loud', async () => {
     appMocks.ListSessions.mockImplementation(async () => [session('w1', 'claude', 'alpha')])
     appMocks.SetPaneLayout.mockImplementation(async () => { throw new Error(GO_ERROR) })
@@ -361,12 +380,17 @@ describe('寫入失敗：fail loud 但不擋路', () => {
     expect(s.latchSeq, 'latch 片語必須照常撥動 latchSeq（強制展開 timeline）').toBe(1)
   })
 
-  // pushNotice 而非 pushError 的理由：排列失敗不屬於任何單一 session。走
-  // pane-scoped 出口的話，訊息會寫進 `views[focusedWsid]`，而使用者可能正在看
-  // 另一個 pane。
+  // 這條守的是**可見性**：排列寫入失敗的訊息在任何 focus 狀態下都到得了使用者。
   //
-  // mutation：persistLayout 的 catch 改成 `this.pushError(...)` → **只**紅在本條
-  // 382 行（訊息落進 w1 的 view，focus 在 w2 時 timeline getter 讀不到）。
+  // **它守不到 `pushNotice` vs `pushError` 的選擇**（review #1 更正——原本的
+  // mutation 宣稱是錯的）：`pushError(msg)` 不帶 wsid 時 `w = this.focusedWsid`，
+  // 而 `setFocus` 是**先改 `focused`、才觸發 `persistLayout`**，所以 catch 執行時
+  // 焦點已經在使用者剛點的那個 pane，訊息一樣落進 focused view、一樣讀得到。
+  // 換成 pushError 這條實測**仍綠**。兩者真正的差異（`pushError` 會清掉該 session
+  // 的 `busy`）由下一條守。
+  //
+  // mutation：`persistLayout` 的 catch 換成靜默 `.catch(() => {})` → 紅在本條的
+  // `重啟後會遺失`。
   it('失敗訊息不綁 pane：焦點在另一個 session 也看得到', async () => {
     appMocks.ListSessions.mockImplementation(async () => [
       session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
@@ -380,5 +404,147 @@ describe('寫入失敗：fail loud 但不擋路', () => {
 
     expect(useSession().focused).toBe(1)
     expect(timelineText(w)).toContain('重啟後會遺失')
+  })
+
+  // **`pushNotice` 而非 `pushError` 的真正理由**（review #1：上一條宣稱守到、
+  // 實際沒守到，這條補上）。
+  //
+  // 兩者的差異不在可見性——在副作用：`pushError` 會無條件 `m.busy = false`。
+  // 那個出口的本職是「送出前把 busy 設成 true 的呼叫端失敗要復原」，而
+  // `persistLayout` 從頭到尾沒碰過任何 session 的 busy。走 pane-scoped 出口的話，
+  // 一次排列寫入失敗會把**焦點所在那個 session 正在跑的 turn** 標成閒置：
+  // busy-dot 消失、composer 解除 disabled，使用者以為可以送下一則訊息了。
+  //
+  // 情境全部走 production：w1／w2 各釘一格、焦點在 w2、w2 由真的 canonical user
+  // message（經 App.vue 自己的 EventsOn handler）進入 busy，然後從 SessionList
+  // 移除 w1 觸發 persistLayout 失敗。
+  //
+  // mutation：`persistLayout` 的 catch 改成 `this.pushError(...)` → **只**紅在本條
+  // 的 busy 斷言（`expected false to be true`），全檔其餘 11 條照樣綠。
+  it('寫入失敗不得清掉別的 session 正在跑的 turn（pushNotice 的真正理由）', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w2' }
+    const w = await mountApp()
+    const s = useSession()
+
+    // canonical user message ＝ turn 起點（§3.5.9）——經 production handler 進 store
+    fire({
+      event_id: 'e1', ts: 't', provider: 'codex', kind: 'message', role: 'user',
+      text: 'run it', workspace_session_id: 'w2',
+    })
+    await w.vm.$nextTick()
+    expect(s.sessions.w2.busy, '前提：w2 必須真的在跑一個 turn').toBe(true)
+
+    appMocks.SetPaneLayout.mockImplementation(async () => { throw new Error(GO_ERROR) })
+    await w.find('[data-test=remove-w1]').trigger('click')
+    await w.find('[data-test=remove-confirm-submit]').trigger('click')
+    await flushPromises()
+
+    expect(timelineText(w), '前提：失敗確實有發出通知').toContain('重啟後會遺失')
+    expect(
+      s.sessions.w2.busy,
+      '排列寫入失敗不得動到別的 session 的 busy——pushError 會清掉它',
+    ).toBe(true)
+  })
+
+})
+
+describe('approval 的暫時焦點切換不得洩漏進 durable layout（owner 2026-08-17 裁決）', () => {
+  beforeEach(resetEnv)
+
+  // 裁決：approval routing 是**系統為了處理待核可事件而做的暫時焦點切換**，不等於
+  // 使用者選定啟動後要恢復的 pane，因此不得改動 durable layout 的 `Focused`。
+  //
+  // owner 特別點名改版前的狀態是三種語意裡最不穩定的一種：「當下不持久化、日後被
+  // 不相干的 persistLayout 順便寫入」——重啟結果取決於後來有沒有碰巧發生其他
+  // layout 寫入。所以這條**刻意在 approval 顯示期間製造一次不相干的 layout 寫入**
+  // （使用者把第三個 session 釘進 pane 0），那正是舊行為會洩漏的時機。
+  //
+  // 全程走 production：approval 經 ApprovalDialog 自己註冊的 `approval:request`
+  // handler 進來，釘選點真的 SessionList 按鈕，核可點真的 dialog 按鈕。
+  //
+  // mutation（各自只打紅一列）：
+  //   - routeApproval 的 `this.focused = at` 改回**同時**寫 durableFocusPane
+  //     → 紅在「durable focused 不得是 approval 切過去的那一格」。
+  //   - persistLayout 送 `this.focused` 而非 `this.durableFocusPane`
+  //     → 紅在同一行（這兩刀是同一個洩漏路徑的兩端）。
+  //   - resolveApprovalPresentation 拿掉 `this.focused = this.durableFocusPane`
+  //     → 紅在「核可後畫面焦點必須還原」。
+  //   - 把該行放到 `if (pane === null) return` **之後**
+  //     → 也紅在「核可後畫面焦點必須還原」（來源已釘選時 transientPane 是 null）。
+  it('approval 切焦點期間發生其他 layout 寫入，durable focused 仍是使用者選的那一格', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+    const s = useSession()
+    expect(s.durableFocusPane, '前提：使用者選定的是 pane 0').toBe(0)
+
+    // w2 已釘在 pane 1 → routeApproval 走「已釘選」分支，自動切焦點過去
+    const approval = runtimeMocks.handlers['approval:request']
+    approval!({ id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}' })
+    await flushPromises()
+    expect(s.focused, '前提：畫面焦點確實被 approval 切走了').toBe(1)
+    expect(s.durableFocusPane, 'approval 不得改動使用者選定的 pane').toBe(0)
+
+    // **不相干的 layout 寫入**（舊行為就是在這裡把 approval 的焦點順便寫出去的）。
+    // SessionList 的釘選鈕釘進**畫面上**作用的那一格（此刻是 approval 切過去的
+    // pane 1），所以 w3 落在 pins[1]——這正好讓兩種實作寫出不同的 focused：
+    // 正確版寫 pins[0]（'w1'，使用者選的那一格），洩漏版寫 pins[1]（'w3'）。
+    await w.find('[data-test=pin-w3]').trigger('click')
+    await flushPromises()
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    expect(pins, '前提：w3 被釘進畫面作用中的那一格').toEqual(['w1', 'w3'])
+    expect(focused, 'durable focused 不得是 approval 切過去的那一格').toBe('w1')
+
+    // 核可 → 畫面焦點還原回使用者選的那一格
+    await w.find('.dialog .allow').trigger('click')
+    await flushPromises()
+    expect(s.focused, '核可後畫面焦點必須還原').toBe(0)
+  })
+
+  // 跨重啟（形狀 F）：approval 期間的焦點不得洩漏到重啟後。新的 pinia＋新的
+  // App.vue 實例，讀上一輪實際寫出去的那組參數。
+  //
+  // 中途那次寫入刻意**不是** setFocus（釘選 w3），否則 setFocus 會把 durable 與
+  // 畫面焦點一起改回來，正確版與洩漏版寫出同一組參數、這條就分辨不出東西
+  // ——初版就是這樣寫的，實測對 MF2 不紅，已修正。
+  //
+  // mutation（各自只打紅一列）：
+  //   - persistLayout 送 `this.focused` → 紅在重啟後的 focused 斷言。
+  //   - routeApproval 同時寫 durableFocusPane → 紅在同一行。
+  it('approval 期間的焦點不洩漏到重啟後', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const first = await mountApp()
+
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w2', provider: 'codex', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(useSession().focused, '前提：畫面焦點被切到 pane 1').toBe(1)
+
+    // approval 仍顯示中就發生一次不相干的 layout 寫入
+    await first.find('[data-test=pin-w3]').trigger('click')
+    await flushPromises()
+
+    const [pins, focused] = setLayoutCalls().at(-1)!
+    first.unmount()
+    resetEnv()
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins, focused }
+
+    const second = await mountApp()
+    const s2 = useSession()
+    expect(paneText(second, 0), '前提：pane 0 仍是使用者原本那一格').toContain('alpha')
+    expect(s2.focused, '重啟後必須停在使用者選的 pane，不是 approval 切過去的那一格').toBe(0)
+    expect(s2.durableFocusPane).toBe(0)
   })
 })

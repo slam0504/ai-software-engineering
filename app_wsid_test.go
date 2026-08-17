@@ -138,7 +138,9 @@ func (s *stubRegistry) ResetView(wsid, viewStartEventID string) error {
 }
 
 // SetLayout／Layout：鏡射真實 Store 的 pane pins 深拷貝語意（見 store.go
-// SetLayout 的說明）。layoutErr 讓「寫入失敗不得擋住釘選」那條走得到失敗分支。
+// SetLayout 的說明）。layoutErr 注入**非 latch** 的一般寫入失敗（磁碟滿、權限、
+// rename 失敗），由 TestSetPaneLayoutReportsPlainWriteFailure 使用——latch 分支
+// 走的是 uncertain 旗標，兩者的處置不同（前者原樣回報、後者早退），要分開驗。
 func (s *stubRegistry) SetLayout(l wsregistry.Layout) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

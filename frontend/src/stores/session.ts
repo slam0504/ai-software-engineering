@@ -127,7 +127,18 @@ interface State {
   // （§3.6.4）。
   persistentPins: [string | null, string | null]
   pins: [string | null, string | null]
+  // focused：**畫面上正在作用的那個 pane**（composer、Enter、SettingsBar 的
+  // End/Terminate/New 都跟著它，§3.7）。approval 路由會暫時改它。
   focused: 0 | 1
+  // durableFocusPane：**使用者明確選定**的 pane——唯一會被寫進 registry
+  // `layout.focused` 的來源，也是 approval 處理完之後 focused 要還原回去的目標。
+  //
+  // 為什麼要跟 focused 分開（owner 2026-08-17 裁決）：approval routing 是「系統
+  // 為了處理待核可事件而做的暫時焦點切換」，不等於使用者選定啟動後要恢復的
+  // pane。改版前 routeApproval 直接改 `focused` 而**當下不持久化**，於是重啟結果
+  // 取決於「之後有沒有碰巧發生其他 layout 寫入」——那是三種語意裡最不穩定的一種
+  // （既不是「不記住」也不是「記住」，而是「看運氣」）。
+  durableFocusPane: 0 | 1
   transientPane: 0 | 1 | null
   scrollAnchors: Record<string, string>
   // notices：workspace scope 的事件（replay index degraded、codex broadcast、
@@ -183,6 +194,7 @@ export const useSession = defineStore('session', {
     persistentPins: [null, null],
     pins: [null, null],
     focused: 0,
+    durableFocusPane: 0,
     transientPane: null,
     scrollAnchors: {},
     notices: [],
@@ -280,8 +292,12 @@ export const useSession = defineStore('session', {
       }
     },
 
+    // setFocus：**使用者明確點選 pane**（點 pane、Cmd+1/2、SessionList 點到已釘選
+    // 的卡片）。這是唯一會更新 durable focus 的入口——approval 的自動切換走
+    // routeApproval，不經過這裡（owner 2026-08-17 裁決）。
     setFocus(i: 0 | 1) {
       this.focused = i
+      this.durableFocusPane = i
       const w = this.pins[i]
       if (w && this.sessions[w]) this.sessions[w].unread = 0
       void this.persistLayout()
@@ -311,8 +327,11 @@ export const useSession = defineStore('session', {
       const set = this.bindings?.SetPaneLayout
       if (!set) return // dev 未 setBindings／測試字面量未提供：靜默跳過持久化
       const pins = [this.persistentPins[0] ?? '', this.persistentPins[1] ?? '']
+      // 送 durableFocusPane 而非 focused：approval 的暫時焦點切換不得洩漏進
+      // durable layout（§3.6.4 的 persistent／transient 分界，在 focus 這一維
+      // 的落點）。索引的是 persistentPins，所以 transient pin 也不會被寫出去。
       try {
-        await set(pins, pins[this.focused])
+        await set(pins, pins[this.durableFocusPane])
       } catch (e) {
         this.pushNotice(t('store.paneLayoutPersistFailed', { error: String((e as Error)?.message ?? e) }))
       }
@@ -336,9 +355,14 @@ export const useSession = defineStore('session', {
         if (!w || !this.sessions[w]) continue
         await this.pin(idx, w, false)
       }
-      // 直接設 focused 而不呼叫 setFocus()：setFocus 會觸發 persistLayout。
+      // 直接設而不呼叫 setFocus()：setFocus 會觸發 persistLayout（還原不回寫）。
+      // 兩個都要設：durableFocusPane 是「使用者選定的那一格」，focused 是畫面
+      // 當下的作用格，啟動時兩者相同。
       const at = this.pins.indexOf(l?.focused ?? '')
-      if (at === 0 || at === 1) this.focused = at
+      if (at === 0 || at === 1) {
+        this.focused = at
+        this.durableFocusPane = at
+      }
     },
 
     // pin：把 session 釘進 pane（persistent）。已有 view（例如同一 wsid 仍釘在
@@ -436,6 +460,9 @@ export const useSession = defineStore('session', {
     routeApproval(wsid: string) {
       const at = this.pins.indexOf(wsid)
       if (at === 0 || at === 1) {
+        // **transient UI focus**：只動畫面作用格，不動 durableFocusPane
+        // （owner 2026-08-17 裁決——系統為了處理待核可事件而切畫面，不算使用者
+        // 選定）。resolveApprovalPresentation 會把它還原回去。
         this.focused = at
         const m = this.sessions[wsid]
         if (m) m.unread = 0
@@ -458,6 +485,10 @@ export const useSession = defineStore('session', {
     // 收 trigger 參數——收一個永遠沒人分支的參數只會讓人以為它有分歧。呼叫端
     // （ApprovalDialog）負責在六種情境都呼叫到。無 transient 顯示中時為 no-op。
     resolveApprovalPresentation() {
+      // transient **focus** 的還原必須在 transientPane 的早退之前：來源已釘選時
+      // routeApproval 只切了焦點、沒有動 pins（transientPane 仍是 null），早退在
+      // 前面的話那次焦點切換就永遠不會被還原。
+      this.focused = this.durableFocusPane
       const pane = this.transientPane
       if (pane === null) return
       const shown = this.pins[pane]
