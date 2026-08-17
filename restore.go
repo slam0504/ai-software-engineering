@@ -12,11 +12,15 @@ import (
 )
 
 // restore.json（M1.5 plan D6 的 provider-keyed 恢復索引）自 M3b per-WSID durable
-// metadata writer 起**降級為唯讀的 legacy 來源**（owner 2026-08-17 D6）：
-// 續聊身分／task label／view boundary 三項的權威改為 workspace-sessions.json 的
-// per-WSID Entry。這裡只剩兩個消費者——§3.2.5 的一次性 legacy 遷移，以及
+// metadata writer 起**降級為 legacy 來源**（owner 2026-08-17 D6）：續聊身分／
+// task label／view boundary 三項的權威改為 workspace-sessions.json 的 per-WSID
+// Entry。這裡只剩兩個消費者——§3.2.5 的一次性 legacy 遷移，以及
 // backfillResumeFromLegacy 的升級補寫（搬完呼叫 ClearResume 把舊值清掉）。
 // 檔案刻意保留不刪：它是 M3a 使用者的最後一份備份。
+//
+// **「只讀不寫」要說準**：production 不再寫入那三個 metadata 欄位，但
+// openRestoreStore 在**首次使用**與**壞檔重建**時仍會落盤（既有行為，見下方
+// os.IsNotExist／malformed 兩條分支），backfill 完成後也會寫一次 ClearResume。
 //
 // restoreEntry：單一 provider 的恢復索引。
 type restoreEntry struct {

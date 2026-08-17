@@ -369,7 +369,12 @@ func TestViewBoundarySurvivesRestart(t *testing.T) {
 // boundary」。cursor 分頁是另一條 code path（beforeEventID 非空時提早返回，
 // 不走尾端那段），所以要單獨守。
 //
-// mutation：只在 beforeEventID == "" 時才套 boundary → 這條轉紅、上面那條仍綠。
+// **mutation 要打在正題那句（第二個斷言），不是前提校驗**（reviewer 2026-08-17
+// 更正）：拿掉 record 層過濾雖然也讓這條轉紅，但紅在上面那句「前提不成立」——
+// 那只證明 boundary 有生效，沒證明**分頁**這條路徑有守門。真正只打壞這條的
+// mutation 是「boundary 只在尾端載入時套用」（`if beforeEventID != "" {
+// viewStart = "" }`）：實測只有本測試轉紅、且紅在下面的
+// 「向上分頁不得跨越 view boundary」，其餘三條 view boundary 測試全綠。
 func TestViewBoundaryBlocksUpwardPaging(t *testing.T) {
 	a, _ := newTestApp(t)
 	bootRegistry(t, a)

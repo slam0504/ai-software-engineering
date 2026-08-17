@@ -327,7 +327,7 @@ func TestExportedBindingsRejectUncommittedReservation(t *testing.T) {
 // 斷言看的是 **fake CLI 落檔的 argv**，不是內部旗標——「接錯對話」正是從 argv
 // 那一刻起變成事實的。
 func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
-	a, ui := newTestApp(t)
+	a, _ := newTestApp(t)
 	a.wsReg = &stubRegistry{}
 	enableAudit(t, a)
 	argvFile := writeInitClaude(t, a, "sess-A")
@@ -374,7 +374,6 @@ func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
 	if got, _ := a.wsReg.Get(string(wA)); got.ResumeSessionID != "sess-A" {
 		t.Fatalf("B 啟動不得動到 A 的續聊身分：%q", got.ResumeSessionID)
 	}
-	_ = ui
 }
 
 // NewSession 的 ResetView 同樣是 provider-keyed 的破壞性寫入：對 B 按「開新對話」
@@ -609,7 +608,13 @@ func TestSoleRegistrySessionStillResumes(t *testing.T) {
 // 註解裡：**存活的手足一併失去續聊**。per-WSID 之後保證反轉——手足必須留住自己
 // 的續聊身分，而 B 讀的本來就不是 A 的 entry。
 //
-// mutation：把 RemoveSession 的 tombstone 之後補回 provider 級清除 → 這條轉紅。
+// mutation（要打對層）：把 RemoveSession 的 tombstone 之後補回 **provider 級**
+// 的 `a.restore.ClearResume(string(p))` → **這條仍然全綠**（續聊身分早已不在
+// restore.json，那行清的是一份沒人讀的舊檔）。真正打得紅的是 **registry 級**的
+// 手足清除——例如在 tombstone 之後對同 provider 的其他 live entry 呼叫
+// `a.wsReg.SetResume(sibling, "")`。保證本身沒問題，錯的是先前寫在這裡的那句
+// mutation；reviewer 實測後更正（「保證只寫在註解裡」的近親：**mutation 也只寫在
+// 註解裡而沒被實跑過**）。
 func TestRemoveKeepsSiblingResumeAndBLeavesAsIs(t *testing.T) {
 	a, _ := newTestApp(t)
 	bootRegistry(t, a)
@@ -651,6 +656,12 @@ func TestRemoveKeepsSiblingResumeAndBLeavesAsIs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
+	// **裝飾性斷言，不是本測試的守門**：兩個 session 共用同一支 fake CLI，
+	// beforeB.ResumeSessionID 其實就是 "sess-A"，所以這句分不出「B 接自己的」與
+	// 「B 接到 A 的」。載重的是上面那句 registry 比對；「B 不得繼承別人的 id」
+	// 這個威脅由 TestRemovedSessionsResumeIsNotInheritedByNextSession 與
+	// TestSecondSessionOfSameProviderDoesNotInheritResume 實質覆蓋。留著它只為
+	// 確認「移除手足之後 B 仍然真的帶得出 --resume」這條端到端路徑沒有整段斷掉。
 	waitFor(t, "B 仍自動接續自己的對話", func() bool {
 		b, err := os.ReadFile(argvFile)
 		return err == nil && strings.Contains(string(b), "--resume "+beforeB.ResumeSessionID)

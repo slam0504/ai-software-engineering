@@ -6686,10 +6686,12 @@ func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 // 提供，transcript 改由 §3.8 的 LoadTurnsBefore 以 WSID 視窗化載入；`frontend/src`
 // 對它零引用，連 makeBindings 都沒有轉發。
 //
-// 保留的理由僅有一個且要說準：它是 M1.5 恢復語意測試的既有唯讀出口（Go 端 6 處
-// **測試**引用），刪掉會連帶重寫那一組。它**不是** resume 的讀取端——production
-// 的 resume 讀取在 StartSession 直接走 a.restore.Get(...)／providerResumeFallback，
-// 不經這裡。待 Task 29 的視窗化載入落地後，本方法應直接刪除或改為 WSID-keyed。
+// 保留的理由僅有一個且要說準：它是 M1.5 恢復語意測試的既有唯讀出口（Go 端數處
+// **測試**引用），刪掉會連帶重寫那一組。它**不是** resume 的讀取端——M3b per-WSID
+// writer 之後 production 的 resume 讀取走 registryResume(wsid)（該 WSID 自己的
+// registry entry），`a.restore.Get(...)` 與 providerResumeFallback 都已不在那條
+// 路徑上（後者已移除）。restore.json 現在只剩 legacy 遷移與升級 backfill 兩個
+// 消費者，本方法可在 M3b 收尾時直接刪除。
 func (a *App) RestoreViews() map[string]RestoredView {
 	out := map[string]RestoredView{}
 	for _, p := range []string{"claude", "codex"} {
