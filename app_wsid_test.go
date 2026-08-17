@@ -21,6 +21,7 @@ type stubRegistry struct {
 	deleteErr error
 	removeErr error
 	mutateErr error
+	syncErr   error
 
 	entries              map[string]wsregistry.Entry
 	deletedUncommitted   bool
@@ -160,7 +161,7 @@ func (s *stubRegistry) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.syncs++
-	return nil
+	return s.syncErr
 }
 
 func (s *stubRegistry) syncCount() int {

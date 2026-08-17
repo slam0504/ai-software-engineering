@@ -15,6 +15,7 @@ export default {
     },
     timeline: {
       label: '執行時間軸',
+      unreadTooltip: '時間軸收合期間有未讀錯誤——展開查看（含 registry 停用等需要重啟的狀況）',
     },
     resize: {
       width: '拖曳調整寬度',

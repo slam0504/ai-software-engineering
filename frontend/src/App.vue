@@ -157,6 +157,24 @@ watch(timelineOpen, v => save('wb.tl.open', v))
 watch(timelineHeight, v => save('wb.tl.height', v))
 watch(gateWidth, v => save('wb.gate.width', v))
 
+// tlUnread：**timeline 收合期間**抵達的錯誤數（Task 2a rev2 review C2）。
+//
+// 為什麼需要：workspace 通知與 lifecycle 拒絕（registry uncertain latch、
+// 建立／移除／開新對話失敗）唯一的使用者出口就是 Timeline，而 Timeline 掛在
+// `v-show="timelineOpen"` 之下，`timelineOpen` 又被寫進 localStorage——使用者
+// 收合過一次就**跨重啟保持收合**。沒有 badge 的話，那個狀態下這條出口的可見度
+// 是零，後端 fail loud 得再大聲也沒用。
+//
+// 這不是第三條通知管道，是讓現有那一條在收合狀態下仍然可靠：只在 toggle 上
+// 顯示一個計數，不搶焦點、不強制展開。展開即歸零（使用者已經看到內容了）。
+const tlUnread = ref(0)
+const timelineErrorCount = computed(
+  () => s.timeline.filter(i => i.env.kind === 'stream_error').length)
+watch(timelineErrorCount, (now, prev) => {
+  if (!timelineOpen.value && now > prev) tlUnread.value += now - prev
+})
+watch(timelineOpen, v => { if (v) tlUnread.value = 0 })
+
 // Timeline 拖高：resize handle 垂直拖曳
 let dragStartY = 0
 let dragStartH = 0
@@ -301,6 +319,8 @@ onMounted(async () => {
     <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
     <button class="tl-toggle" @click="timelineOpen = !timelineOpen">
       {{ (timelineOpen ? '▾ ' : '▸ ') + t('app.timeline.label') }}
+      <span v-if="tlUnread > 0" class="tl-badge" data-test="tl-unread"
+        :title="t('app.timeline.unreadTooltip')">{{ tlUnread }}</span>
     </button>
     <StatusBar />
     <ApprovalDialog />
@@ -347,4 +367,5 @@ main > :not(nav) { flex: 1; min-height: 0; }
 .tl-resize { height: 4px; cursor: row-resize; background: transparent; }
 .tl-resize:hover { background: var(--accent); }
 .tl-toggle { align-self: flex-start; font-size: 11px; background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 2px 10px; }
+.tl-badge { margin-left: 6px; background: var(--err); color: var(--bg-app); border-radius: 8px; padding: 0 5px; font-weight: 600; }
 </style>

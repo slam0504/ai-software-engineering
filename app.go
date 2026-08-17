@@ -520,6 +520,25 @@ func (a *App) registryUncertain() bool {
 	return a.wsReg != nil && a.wsReg.Uncertain()
 }
 
+// noteRegistryUncertainErr：**任一** registry 寫入回 ErrRegistryUncertain 時的
+// 統一稽核，原樣回傳 err 讓呼叫端直接 `return`／繼續既有錯誤處置。
+//
+// rev2 review I2：這個標籤原本只掛在 noteRegistryWriteResult（per-WSID writer）
+// 上，但 latch 可能由**任何**寫入首次設下——CreateSession 的 Put、NewSession 的
+// ResetView、RemoveSession 的 Remove、啟動期 backfill、shutdown 的 Sync。
+// 少了那些呼叫點，post-mortem 讀 audit 時答不出「latch 是何時、被哪一次寫入
+// 設下的」，只看得到之後一連串被拒絕的操作。
+//
+// 只記錄、不改變控制流：latch 之後的處置各入口不同（早退／回錯／跳過），
+// 集中在這裡反而會把那些差異抹平。
+func (a *App) noteRegistryUncertainErr(op, wsid string, err error) error {
+	if errors.Is(err, wsregistry.ErrRegistryUncertain) {
+		a.audit("session_registry_uncertain", map[string]any{
+			"op": op, "wsid": wsid, "error": err.Error()})
+	}
+	return err
+}
+
 // createDegraded：該 provider 是否已進入 create-degraded latch。
 func (a *App) createDegraded(p contract.Provider) bool {
 	a.createDegradedMu.Lock()
@@ -633,10 +652,12 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 		WSID: string(w), Provider: provider, TaskLabel: taskLabel,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
-		return "", errors.Join(err, a.manager.AbortCreate(tok))
+		return "", errors.Join(a.noteRegistryUncertainErr("create_put", string(w), err),
+			a.manager.AbortCreate(tok))
 	}
 	if cerr := a.commitCreate(tok); cerr != nil {
-		if rerr := a.wsReg.DeleteUncommitted(string(w)); rerr != nil {
+		if rerr := a.noteRegistryUncertainErr("create_rollback", string(w),
+			a.wsReg.DeleteUncommitted(string(w))); rerr != nil {
 			a.setCreateDegraded(p) // 雙失敗：保留名額、latch，等 app restart（§3.1）
 			// WSID 一併帶進錯誤：這筆 reservation 被刻意保留、不 emit、不寫 audit，
 			// registry 那筆 entry 也還在磁碟上——錯誤字串是 post-mortem 對帳的唯一線索。
@@ -833,6 +854,8 @@ func (a *App) noteRegistryWriteResult(w appcore.WSID, p contract.Provider, op st
 	case errors.Is(err, wsregistry.ErrRegistryUncertain):
 		// 自己的稽核標籤：這不是一次普通的寫入失敗，而是「不知道有沒有寫成功」
 		// 的 latch。混進 restore_store_error 會讓 post-mortem 讀成可重試的 IO 錯誤。
+		// 這裡不走 noteRegistryUncertainErr：per-WSID writer 這條額外知道
+		// provider，丟掉那一欄是無聲的診斷降級。標籤與其他呼叫點一致。
 		a.audit("session_registry_uncertain", map[string]any{
 			"op": op, "wsid": string(w), "provider": string(p), "error": err.Error()})
 		// 使用者可見出口＝**workspace lane**（同 failLoudCodexDispatch 的形狀）。
@@ -925,12 +948,22 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 }
 
 // noteStartupWarning：把非致命的啟動警告接到既有 startupErr 通道（UI 經
-// CLIInfo().startupError 讀得到）。沿用 startup() 既有慣例——只填第一則，
-// 不覆寫更早的訊息。
+// CLIInfo().startupError 讀得到）。
+//
+// **累積、不是只填第一則**（Task 2a rev2 review I1）：原本的 first-wins 會把
+// 後到的警告靜默丟掉，而啟動序列裡最嚴重的那則正好排在後面——
+// `loadSessionRegistry` 先寫「跳過 N 筆無法還原的 entry」，之後才呼叫
+// `backfillResumeFromLegacy`，所以 registry 在 backfill 落盤時進了 uncertain
+// latch 的話，**啟動成功、registry 已停止寫入，而使用者一則相關訊息都看不到**。
+// 被丟掉的警告等於沒有 fail loud。
+//
+// 先寫的排前面：致命／較早的訊息仍然是使用者第一眼讀到的那句。
 func (a *App) noteStartupWarning(msg string) {
 	if a.startupErr == "" {
 		a.startupErr = msg
+		return
 	}
+	a.startupErr += "；" + msg
 }
 
 // knownProviders：可建立／可還原 session 的 provider 白名單（同 CreateSession
@@ -1100,7 +1133,7 @@ func (a *App) backfillResumeFromLegacy(store *wsregistry.Store) {
 			}
 		}
 	}
-	if err := store.BackfillResume(fill); err != nil {
+	if err := a.noteRegistryUncertainErr("resume_backfill", "", store.BackfillResume(fill)); err != nil {
 		a.audit("resume_backfill_failed", map[string]any{"error": err.Error()})
 		a.noteStartupWarning("session registry: 續聊身分升級補寫失敗（本次啟動不自動接續舊對話）：" + err.Error())
 		return
@@ -1368,6 +1401,7 @@ func (a *App) startup(ctx context.Context) {
 	// 的來源）與 manager 建立之後。失敗一律 fail loud：a.wsReg 維持 nil，
 	// CreateSession 早退，不以猜測的狀態繼續（§3.2.6）。
 	if _, lerr := a.restoreSessions(); lerr != nil {
+		_ = a.noteRegistryUncertainErr("registry_load", "", lerr) // 只補稽核，錯誤處置不變
 		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
 		a.noteStartupWarning("session registry load failed: " + lerr.Error())
 	}
@@ -1900,7 +1934,7 @@ func (a *App) shutdown(ctx context.Context) {
 		if a.registryUncertain() {
 			a.audit("shutdown_registry_sync_skipped", map[string]any{
 				"reason": "registry commit 結果不確定，最終落盤交給下次啟動以磁碟內容為準"})
-		} else if err := a.wsReg.Sync(); err != nil {
+		} else if err := a.noteRegistryUncertainErr("shutdown_sync", "", a.wsReg.Sync()); err != nil {
 			a.audit("shutdown_registry_sync_error", map[string]any{"error": err.Error()})
 		}
 	}
@@ -5431,7 +5465,14 @@ func (a *App) RemoveSession(wsid string) error {
 	}
 
 	a.removeStep("tombstone_persist")
-	if err := a.wsReg.Remove(wsid, "user_removed"); err != nil {
+	if err := a.noteRegistryUncertainErr("tombstone_persist", wsid,
+		a.wsReg.Remove(wsid, "user_removed")); err != nil {
+		// uncertain latch 是唯一「重試必然再被拒」的失敗原因（下一次呼叫會被
+		// RemoveSession 開頭的 gate 直接擋掉），所以不能沿用「可重試移除」那句
+		// ——兩句並列會讓使用者先去按重試，而正確處置是重啟（rev2 review M3）。
+		if errors.Is(err, wsregistry.ErrRegistryUncertain) {
+			return fmt.Errorf("app: remove session %s: tombstone persist 失敗：%w（slot 保留；重試無用，請依上述訊息重啟 app）", wsid, err)
+		}
 		return fmt.Errorf("app: remove session %s: tombstone persist 失敗：%w（slot 保留，可重試移除）", wsid, err)
 	}
 
@@ -6855,7 +6896,8 @@ func (a *App) NewSession(wsid string) error {
 	// 刪掉的下次啟動就長回來（§3.5.10：index 是快取，不是第二份事件格式）。
 	var rerr error
 	if a.wsReg != nil {
-		err := a.wsReg.ResetView(wsid, auditHighWatermark(a.eventsPath()))
+		err := a.noteRegistryUncertainErr("reset_view", wsid,
+			a.wsReg.ResetView(wsid, auditHighWatermark(a.eventsPath())))
 		switch {
 		case err == nil:
 		case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):

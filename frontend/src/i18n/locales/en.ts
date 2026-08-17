@@ -15,6 +15,7 @@ export default {
     },
     timeline: {
       label: 'Timeline',
+      unreadTooltip: 'Unread errors arrived while the timeline was collapsed — expand to read them',
     },
     resize: {
       width: 'Drag to resize width',

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -228,5 +230,148 @@ func TestShutdownSkipsRegistrySyncWhenUncertain(t *testing.T) {
 	}
 	if !auditHas(t, a.stateDir, "shutdown_registry_sync_skipped") {
 		t.Fatal("被跳過的步驟不得無聲（Fail Loud）：需留 shutdown_registry_sync_skipped 稽核")
+	}
+}
+
+// TestEveryRegistryWriteRecordsUncertainAudit：rev2 review I2——
+// `session_registry_uncertain` 必須覆蓋**所有**可能首次設下 latch 的寫入點，
+// 不只 per-WSID writer 那一條。
+//
+// 情境是「latch 由**這一次**寫入設下」：早退 gate 讀的 `Uncertain()` 此刻仍是
+// false（stub 不設 uncertain），所以呼叫進得去，寫入本身回哨兵。沒有這層稽核，
+// post-mortem 只看得到之後一連串被拒絕的操作，答不出 latch 是何時、被哪一次
+// 寫入設下的。
+//
+// mutation（各自只打紅一列）：拿掉任一呼叫點的 noteRegistryUncertainErr →
+// 紅在該入口那一行。
+func TestEveryRegistryWriteRecordsUncertainAudit(t *testing.T) {
+	sentinel := wsregistry.ErrRegistryUncertain
+
+	cases := []struct {
+		name string
+		op   string
+		run  func(t *testing.T, a *App, reg *stubRegistry)
+	}{
+		{"CreateSession→Put", "create_put", func(t *testing.T, a *App, reg *stubRegistry) {
+			reg.putErr = sentinel
+			if _, err := a.CreateSession("claude", "x"); !errors.Is(err, sentinel) {
+				t.Fatalf("前提：Put 回哨兵時 CreateSession 要回同一個錯誤，got %v", err)
+			}
+		}},
+		{"NewSession→ResetView", "reset_view", func(t *testing.T, a *App, reg *stubRegistry) {
+			w := mustCreate(t, a, "claude")
+			reg.mu.Lock()
+			reg.mutateErr = sentinel
+			reg.mu.Unlock()
+			if err := a.NewSession(string(w)); !errors.Is(err, sentinel) {
+				t.Fatalf("前提：ResetView 回哨兵時 NewSession 要回同一個錯誤，got %v", err)
+			}
+		}},
+		{"RemoveSession→Remove", "tombstone_persist", func(t *testing.T, a *App, reg *stubRegistry) {
+			w := mustCreate(t, a, "claude")
+			reg.mu.Lock()
+			reg.removeErr = sentinel
+			reg.mu.Unlock()
+			err := a.RemoveSession(string(w))
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("前提：Remove 回哨兵時 RemoveSession 要回同一個錯誤，got %v", err)
+			}
+			// rev2 review M3：uncertain 時「可重試移除」是錯的指引——重試必然被
+			// 開頭的 gate 擋掉，正確處置是重啟。
+			if strings.Contains(err.Error(), "可重試移除") {
+				t.Fatalf("uncertain 的移除失敗不得建議重試（重試必然再被拒）：%v", err)
+			}
+			if !strings.Contains(err.Error(), "重啟") {
+				t.Fatalf("必須指出正確處置是重啟：%v", err)
+			}
+		}},
+		{"shutdown→Sync", "shutdown_sync", func(t *testing.T, a *App, reg *stubRegistry) {
+			reg.syncErr = sentinel
+			a.shutdown(context.Background())
+			if reg.syncCount() == 0 {
+				t.Fatal("前提：latch 尚未設下時 shutdown 必須真的呼叫 Sync")
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newTestApp(t)
+			enableAudit(t, a)
+			reg := &stubRegistry{}
+			a.wsReg = reg
+			tc.run(t, a, reg)
+			if !auditHasOp(t, a.stateDir, "session_registry_uncertain", tc.op) {
+				t.Fatalf("%s 首次設下 latch 時必須留下 session_registry_uncertain（op=%s）稽核", tc.name, tc.op)
+			}
+		})
+	}
+}
+
+// auditHasOp：稽核裡有沒有某個 kind ＋ op 的組合。只看 kind 不夠——I2 要證明的
+// 正是「不同入口各自留得下自己的那一筆」，共用一個 kind 斷言會讓任何一個入口
+// 漏接都測不出來。
+func auditHasOp(t *testing.T, stateDir, kind, op string) bool {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("讀 audit.jsonl：%v", err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if jerr := json.Unmarshal([]byte(line), &rec); jerr != nil {
+			t.Fatalf("audit 壞行：%v（%s）", jerr, line)
+		}
+		if rec["kind"] != kind {
+			continue
+		}
+		if d, ok := rec["data"].(map[string]any); ok && d["op"] == op {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBackfillFailureStillReachesUserAfterEarlierWarning：rev2 review I1——
+// 啟動期 backfill 落盤失敗（uncertain latch 是其中一種）的警告，**不得**被
+// 較早那則「跳過 N 筆」吃掉。
+//
+// 原本的 noteStartupWarning 是 first-wins，而 loadSessionRegistry 的順序是
+// 「先寫跳過警告 → 接線 wsReg → 呼叫 backfill」，所以 backfill 的警告必然排第二、
+// 必然被丟棄：app 啟動成功、registry 已經停止寫入，而使用者一則相關訊息都沒有。
+//
+// 讓 backfill 一定失敗的方式：把暫存檔路徑用一個**目錄**佔住（O_CREATE 撞
+// EISDIR）。這是 loadSessionRegistry 在這個 setup 下唯一還會發生的落盤
+// （registry 檔已存在所以 Open 不寫、migrated 已為 true 所以不遷移），所以只
+// 打中要測的那一步。**注意**：EISDIR 是步驟 1 的失敗，不是 dir-sync 的
+// uncertain latch；這條守的是「後到的警告不得被吃掉」這件事本身，latch 只是
+// 會走到同一行的其中一種原因。
+//
+// mutation：noteStartupWarning 改回 first-wins → 紅在「後到的警告不得被吃掉」。
+func TestBackfillFailureStillReachesUserAfterEarlierWarning(t *testing.T) {
+	dir := t.TempDir()
+	a := newTestAppAt(t, dir)
+	seedRegistryRaw(t, dir, map[string]map[string]any{
+		"wX": {"wsid": "wX", "provider": "gemini", "created_at": "t0"}, // 觸發「跳過 1 筆」
+		"w1": {"wsid": "w1", "provider": "claude", "created_at": "t1"},
+	})
+	if err := os.MkdirAll(filepath.Join(dir, "workspace-sessions.json.tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.loadSessionRegistry(); err != nil {
+		t.Fatalf("backfill 失敗不得阻擋啟動（它是續聊便利性，不是資料完整性）：%v", err)
+	}
+	if !auditHas(t, dir, "resume_backfill_failed") {
+		t.Fatal("前提：backfill 必須真的失敗（否則這條測試量的是空集合）")
+	}
+	if !strings.Contains(a.startupErr, "跳過 1 筆") {
+		t.Fatalf("前提：較早的警告要先寫進去：%q", a.startupErr)
+	}
+	if !strings.Contains(a.startupErr, "續聊身分升級補寫失敗") {
+		t.Fatalf("後到的警告不得被 first-wins 吃掉（Fail Loud）：%q", a.startupErr)
 	}
 }

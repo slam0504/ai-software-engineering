@@ -180,22 +180,30 @@ func TestStrongSyncFailureIsNotSilentlyDowngraded(t *testing.T) {
 // 卻在別的平台整包編不起來（失效形狀 (E) 的另一種形狀：測試環境本身量不出
 // 那個效果）。這裡用跨平台 build 把它變成可觀測。
 //
+// 用 `go vet` 而不是 `go build`（rev2 review M1）：`go build` **不含 `_test.go`**，
+// 守不到「非 Darwin 平台上 test 檔還編不編得起來」那一維；`go vet` 會把測試檔
+// 一起型別檢查，成本相同。
+//
+// **只測 linux，刻意不含 windows**（rev2 review M2）：這個 repo 在 Windows 上
+// 本來就不 build（`internal/proc` 既有限制），而且 `syncDir` 用唯讀目錄 handle
+// 再 Sync，在 Windows 上 `FlushFileBuffers` 會失敗——把 windows 列進守門會被
+// 讀成「Windows 有覆蓋」，那是假的。這條守的範圍就是「`!darwin` 分支是一份
+// 完整、編得起來的實作」，不是跨平台正確性。
+//
 // mutation：
-//   - 刪掉 strongsync_other.go → 紅在「GOOS=linux 編譯失敗」（undefined:
+//   - 刪掉 strongsync_other.go → 紅在「GOOS=linux 檢查失敗」（undefined:
 //     platformStrongSync）。
 //   - 把 strongsync_darwin.go 的 tag 改成 `//go:build !darwin`（兩邊都納入）
-//     → 紅在「GOOS=linux 編譯失敗」（duplicate declaration）。
+//     → 同一行紅（duplicate declaration）。
 //   - 改掉其中一邊的 platformStrongSync 簽名 → 同一行紅。
 func TestStrongSyncBuildTagsCoverNonDarwin(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		t.Fatalf("編譯守門需要 go toolchain（不靜默跳過）：%v", err)
 	}
-	for _, goos := range []string{"linux", "windows"} {
-		cmd := exec.Command(goBin, "build", ".")
-		cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH=amd64", "CGO_ENABLED=0")
-		if out, berr := cmd.CombinedOutput(); berr != nil {
-			t.Fatalf("GOOS=%s 編譯失敗（!darwin 分支必須自成完整實作）：%v\n%s", goos, berr, out)
-		}
+	cmd := exec.Command(goBin, "vet", ".")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
+	if out, berr := cmd.CombinedOutput(); berr != nil {
+		t.Fatalf("GOOS=linux 檢查失敗（!darwin 分支必須自成完整實作、含 _test.go）：%v\n%s", berr, out)
 	}
 }
