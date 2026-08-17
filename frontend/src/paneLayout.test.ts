@@ -714,6 +714,103 @@ describe('釘選＝明確選定 session ＋ pane，approval 的暫時切換不�
     expect(s.pins[0]).toBe('w3')
   })
 
+  // ---- owner 裁決（rev6）：目標格被**其他 session** 的 approval transient 佔用 → 停用 ----
+  //
+  // 三條構成完整的狀態機覆蓋：外來佔用 → 停用；同 session → 可用；transient 結束 → 恢復。
+  //
+  // 裁決理由（owner）：`setFocus(1)` 之後那一格仍顯示另一個 session，是會誤導使用者的
+  // **假切換**；讓釘選順便解除 transient 則會使一般導覽動作干預待核准流程，屬 §3.6.4
+  // 恢復觸發清單（凍結）的變更。停用能保持 durable pins、durable focus 與 approval
+  // routing 三者語意分離。
+  //
+  // mutation（各自只打紅一條）：
+  //   - 拿掉 `pinBlocked` 的停用（恆 false）→ 紅在「外來佔用」那條。
+  //   - `pinBlocked` 寫成無差別（`s.transientPane !== null`）→ 紅在「同 session」那條
+  //     ——那正是要防的**過度收緊**。
+  //   - `resolveApprovalPresentation` 不清 `transientPane` → 紅在「transient 結束」那條。
+  it('狀態 1／外來佔用：目標格顯示別人的待核准 → 按鈕停用、不切焦點、不持久化', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+    const s = useSession()
+
+    // w3 未釘選 → transient 佔用非焦點格（pane 1），而 w2 durable 釘在 pane 1
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w3', provider: 'claude', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(s.transientPane).toBe(1)
+    expect(s.pins[1], '前提：pane 1 顯示的是別人（w3）').toBe('w3')
+
+    const btn = w.find('[data-test=pin-w2]')
+    expect(btn.attributes('disabled'), 'w2 的釘選鈕必須停用（按了只會是假切換）').toBeDefined()
+    expect(btn.attributes('title'), '停用必須說明原因').toContain('待核准')
+
+    await btn.trigger('click')
+    await flushPromises()
+    expect(s.focused, '停用的按鈕不得切焦點').toBe(0)
+    expect(s.durableFocusPane).toBe(0)
+    expect(setLayoutCalls(), '停用的按鈕不得持久化').toHaveLength(0)
+  })
+
+  it('狀態 2／同 session：該格顯示的就是它自己 → 按鈕可用（停用條件不得無差別）', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+    const s = useSession()
+
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w3', provider: 'claude', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    // 使用者點了那一格 → 焦點落在 transient 格上，w3 的釘選目標格因此就是它自己所在那格
+    await w.find('[data-test=pane-1]').trigger('click')
+    await flushPromises()
+    expect(s.focused).toBe(1)
+    expect(s.transientPane).toBe(1)
+    expect(s.pins[1], '前提：該格顯示的正是 w3 自己').toBe('w3')
+
+    const btn = w.find('[data-test=pin-w3]')
+    expect(btn.attributes('disabled'), '畫面內容前後一致、沒有假切換，不得停用').toBeUndefined()
+
+    await btn.trigger('click')
+    await flushPromises()
+    expect(s.persistentPins[1], 'w3 真的被釘進該格').toBe('w3')
+    expect(s.durableFocusPane).toBe(1)
+  })
+
+  it('狀態 3／transient 結束：按鈕自動恢復，點擊後正常切換並更新 durable focus', async () => {
+    appMocks.ListSessions.mockImplementation(async () => [
+      session('w1', 'claude', 'alpha'), session('w2', 'codex', 'beta'), session('w3', 'claude', 'gamma'),
+    ])
+    appMocks.state.layout = { pins: ['w1', 'w2'], focused: 'w1' }
+    const w = await mountApp()
+    const s = useSession()
+
+    runtimeMocks.handlers['approval:request']!({
+      id: 'a1', wsid: 'w3', provider: 'claude', toolName: 'bash', inputJson: '{}',
+    })
+    await flushPromises()
+    expect(w.find('[data-test=pin-w2]').attributes('disabled'), '前提：停用中').toBeDefined()
+
+    await w.find('.dialog .allow').trigger('click') // 核可 → transient 結束
+    await flushPromises()
+    expect(s.transientPane, '前提：transient 已結束').toBeNull()
+
+    const btn = w.find('[data-test=pin-w2]')
+    expect(btn.attributes('disabled'), 'transient 結束後必須自動恢復').toBeUndefined()
+
+    await btn.trigger('click')
+    await flushPromises()
+    expect(s.focused, '恢復後點擊要正常切換').toBe(1)
+    expect(s.durableFocusPane, '並更新 durable focus').toBe(1)
+    expect(setLayoutCalls().at(-1)).toEqual([['w1', 'w2'], 'w2'])
+  })
+
   // ---- owner 補充 ②：比「什麼都不做」更強的對照組（reviewer 的 survivor M10b）----
   //
   // owner 指定的形狀：durable=pane 0 → approval 暫時切到 pane 1 → **人為觸發一次

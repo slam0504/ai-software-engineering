@@ -42,6 +42,30 @@ function pin(wsid: string) {
   else s.pin(s.focused, wsid)
 }
 
+// pinTargetPane：按下這顆釘選鈕**實際會作用**的那一格（與 pin() 的兩條分支一一對應）。
+function pinTargetPane(wsid: string): 0 | 1 {
+  const at = s.persistentPins.indexOf(wsid)
+  return at === 0 || at === 1 ? (at as 0 | 1) : s.focused
+}
+
+// pinBlocked：目標格正被**其他 session** 的 approval transient 佔用（owner
+// 2026-08-17 裁決：該情境停用按鈕並說明原因）。
+//
+// 為什麼停用而不是「照按、順便解除 transient」：
+//   - `setFocus(1)` 之後那一格仍顯示另一個 session，是**會誤導使用者的假切換**；
+//   - 釘選順便解除 approval transient，會讓一般導覽動作干預待核准流程，屬 §3.6.4
+//     恢復觸發清單（凍結）的變更，是較大的 spec 改動；
+//   - 停用能保持 **durable pins、durable focus 與 approval routing 三者語意分離**。
+//
+// **「其他 session」這個限定不能省**（owner 指定）：若該格顯示的 transient 本來
+// 就是這個 session（例如使用者先點了那一格、焦點因此落在 transient 格上，再按它
+// 自己的釘選鈕），畫面內容前後完全一致、沒有假切換可言，無差別停用只會擋掉一個
+// 完全合理的操作。判別式就是最後那個 `!== wsid`。
+function pinBlocked(wsid: string): boolean {
+  const target = pinTargetPane(wsid)
+  return s.transientPane === target && s.pins[target] !== wsid
+}
+
 async function createSession(p: ProviderKey) {
   try {
     const w = await CreateSession(p, '')
@@ -135,7 +159,11 @@ async function confirmRemove(wsid: string) {
         {{ t('store.sessionUnavailable', { wsid: m.wsid }) }}
       </p>
       <div class="actions">
-        <button type="button" :data-test="'pin-' + m.wsid" @click="pin(m.wsid)">{{ t('sessionList.action.pin') }}</button>
+        <button
+          type="button" :data-test="'pin-' + m.wsid" :disabled="pinBlocked(m.wsid)"
+          :title="pinBlocked(m.wsid) ? t('sessionList.pin.blockedByApproval') : undefined"
+          @click="pin(m.wsid)"
+        >{{ t('sessionList.action.pin') }}</button>
         <button type="button" :data-test="'remove-' + m.wsid" @click="askRemove(m.wsid)">{{ t('sessionList.action.remove') }}</button>
       </div>
       <div v-if="confirmTarget === m.wsid" class="confirm" data-test="remove-confirm">

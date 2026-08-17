@@ -324,6 +324,9 @@ export default {
       remove: 'Remove',
     },
     busyTooltip: 'Waiting on a reply',
+    pin: {
+      blockedByApproval: 'This pane is showing an approval request; you can switch once the approval is completed or dismissed.',
+    },
     create: {
       failed: 'Create {provider} session failed: {error}',
     },

@@ -160,6 +160,31 @@ describe('session store：approval 路由（§3.6.4）', () => {
 describe('session store：focused pane 操作（§3.7）', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
+  // pin() 的 action 契約（owner 2026-08-17 追加裁決）：「釘進第 N 格」＝同時明確
+  // 選了 session 與 pane，所以第 N 格必須成為作用中的那一格。
+  //
+  // **為什麼要一條直接呼叫的單元測試**：`this.focused = idx` 對目前**所有**
+  // production 呼叫端都是 no-op（SessionList／createSession 都是
+  // `s.pin(s.focused, wsid)`，idx 恆等於 focused），拿掉它整套元件測試照樣綠。
+  // 但 pin() 是 store 的公開 action，這個語意不能靠「目前呼叫端剛好都已經 focus
+  // 在該格」這個外部巧合成立——日後任何「釘進另一格」的入口（拖放、右鍵選單、
+  // 快捷鍵）一加就會踩到。這條刻意直接呼叫 action，就是要在沒有 UI 入口的情況下
+  // 也守得住它。
+  //
+  // mutation：拿掉 pin() 的 `this.focused = idx` → 紅在這裡（元件測試全綠）。
+  it('pin(idx) 讓第 idx 格成為作用中那一格（durable 與畫面焦點同時移動）', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    await s.pin(0, 'w1')
+    expect(s.focused).toBe(0)
+
+    await s.pin(1, 'w2') // 釘進**另一**格：production 目前沒有這種呼叫端
+    expect(s.focused, '釘進第 2 格 → 第 2 格作用中').toBe(1)
+    expect(s.durableFocusPane, 'durable 焦點同步').toBe(1)
+    expect(s.focusedWsid).toBe('w2')
+  })
+
   it('submit 作用於 focused pane 的 WSID', async () => {
     const s = useSession()
     const b = okBindings()

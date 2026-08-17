@@ -324,6 +324,9 @@ export default {
       remove: '移除',
     },
     busyTooltip: '等待回覆中',
+    pin: {
+      blockedByApproval: '此窗格正在顯示待核准操作；完成或離開核准流程後即可切換。',
+    },
     create: {
       failed: '建立 {provider} session 失敗：{error}',
     },
