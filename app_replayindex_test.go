@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -671,5 +672,73 @@ func TestRegistryLoadFailureMakesWindowFailLoud(t *testing.T) {
 	if !errors.Is(err, errIndexUnverified) {
 		t.Fatalf("registry 載入失敗後 index 從未與 audit 對齊，視窗載入必須 fail loud；"+
 			"實際靜默回了 %d 筆、err=%v", len(got), err)
+	}
+}
+
+// TestRegistryLoadFailureDoesNotFossilizeIndexGapAcrossRestart：**跨重啟**那一維
+// 的守門。上面那條只驗第一次啟動的讀取端（App latch 擋 LoadTurnsBefore），但
+// App latch 只擋讀、不擋寫——replayindex 的兩條 durable 寫入路徑（Observe 前移
+// checkpointOffset、shutdown 的 Flush 落盤）完全不知道 App 有那個 latch。缺口
+// 因此不是「這次啟動看不到 turn」，而是**下次啟動被永久固化**：
+//
+//	registry 損壞 → index_verify 從未執行（index 記憶體 checkpoint 仍是 0）
+//	→ 一則 workspace event 進 Observe，checkpointOffset 前移到它的 EndOffset
+//	→ shutdown Flush 落盤 → 修好 registry → 第二次啟動的 checkpointTrusted 通過
+//	  （offset 確實是合法行邊界、event id 也對得上）→ rescanFrom 從那裡起掃
+//	→ 它**之前**那個完整 turn 從此沒有任何人會補進 turn file。
+//
+// 所以斷言的不是「第二次啟動有沒有報錯」，而是「第二次啟動仍讀得到舊 turn」。
+func TestRegistryLoadFailureDoesNotFossilizeIndexGapAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	// 舊的完整 turn：先於本次啟動就已經在 audit 裡，但還沒被索引過。
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","workspace_session_id":"w1","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"state_change","workspace_session_id":"w1","state":"done"}`)
+	if err := os.WriteFile(filepath.Join(dir, "workspace-sessions.json"),
+		[]byte("{ not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- 第一次啟動：restore 失敗（index_verify 從未執行）----
+	a1 := newTestAppAt(t, dir)
+	if _, err := a1.restoreSessions(); err == nil {
+		t.Fatal("malformed registry 必須回錯（否則本測試沒走到缺口路徑）")
+	}
+	// workspace lane 的事件不需要 session slot，registry 掛掉照樣會發——這正是
+	// 「驗證沒跑過也照樣有事件進 Observe」的真實來源。
+	a1.manager.EmitWorkspace(string(contract.KindStreamError), nil,
+		map[string]string{"error": "registry 損毀"})
+	// shutdown 的相關兩步（§3.6.5：Manager.Close 之後才 index Flush）。
+	if err := a1.manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a1.replayIndex.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- 修好 registry（等同使用者依 startup 警告修掉那份損毀檔案）----
+	if err := os.Remove(filepath.Join(dir, "workspace-sessions.json")); err != nil {
+		t.Fatal(err)
+	}
+	seedRegistry(t, dir, wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"})
+
+	// ---- 第二次啟動：驗證這次真的跑得到 ----
+	a2 := newTestAppAt(t, dir)
+	var steps []string
+	a2.hookStartupStep = func(s string) { steps = append(steps, s) }
+	if _, err := a2.restoreSessions(); err != nil {
+		t.Fatalf("registry 已修好，第二次啟動不該再失敗：%v", err)
+	}
+	if !slices.Contains(steps, "index_verify") {
+		t.Fatalf("第二次啟動必須跑到 index_verify（步驟：%v）", steps)
+	}
+
+	got, err := a2.LoadTurnsBefore("w1", "", turnPageSize)
+	if err != nil {
+		t.Fatalf("第二次啟動已通過驗證，視窗載入不該回錯：%v", err)
+	}
+	if n := countCompleteTurns(got); n != 1 {
+		t.Fatalf("第一次啟動的未驗證 index 不得把 durable checkpoint 推過舊 turn："+
+			"第二次啟動只讀回 %d 個完整 turn（%d 筆 envelope），期望 1 個", n, len(got))
 	}
 }

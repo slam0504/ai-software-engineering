@@ -996,6 +996,21 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	return restorable, nil
 }
 
+// markIndexUnverified：把 replay index 切到 unverified latch（寫入端停手，見
+// replayindex 的 unverified 欄位 doc）＋發出 fail-loud 訊號。
+//
+// 訊號留在 App 層而不是 replayindex 的 Config.Notify：那個出口接的是
+// degraded → runtime 重建排程，而這個狀態需要的恰恰是**不要**自動重建；把兩
+// 者混進同一條通知路徑，使用者會收到一則語意錯誤的 degraded 通知，實際的重建
+// 又會以 ErrNotDegraded 空轉一輪。
+func (a *App) markIndexUnverified(reason string) {
+	if a.replayIndex == nil {
+		return
+	}
+	a.replayIndex.MarkUnverified()
+	a.audit("replay_index_unverified", map[string]any{"reason": reason})
+}
+
 // startupStep：§3.2.4 凍結啟動順序的探針。步驟名代表「這個階段跑到了」，
 // 不是「這個階段做了事」——`migrate` 在 registry 已遷移時仍會發（該階段的
 // 工作就是判定要不要遷），`index_verify` 同理。唯一的例外是
@@ -1038,7 +1053,14 @@ func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
 		// 同樣只 latch、不排程 runtime 重建：bulkRebuild 從
 		// max(rebuildCursor, checkpointOffset) 起掃，而驗證沒跑過時那個值本身
 		// 不可信，自動重建只會把缺口固化。
+		//
+		// **兩層 latch 缺一不可**：a.indexUnverified 是 App 層的，只擋讀
+		// （LoadTurnsBefore fail loud）；擋寫的是 index 自己的 unverified
+		// latch——Observe 與 Flush 都不知道 App 有那個旗標，沒有這一行，磁碟
+		// checkpoint 仍會被推過那段沒索引到的 audit，下次啟動驗證反而「通
+		// 過」，缺口被永久固化（見 replayindex 的 unverified 欄位 doc）。
 		a.indexUnverified.Store(true)
+		a.markIndexUnverified("registry 載入失敗，index_verify 從未執行：" + err.Error())
 		return nil, err
 	}
 
@@ -1048,6 +1070,10 @@ func (a *App) restoreSessions() ([]wsregistry.Entry, error) {
 		if verr := a.replayIndex.VerifyOrRebuild(a.eventsPath()); verr != nil {
 			indexUsable = false
 			a.indexUnverified.Store(true) // latch：視窗化載入自此 fail loud（見欄位 doc）
+			// 同上，寫入端也要停：verifyOrRebuildLocked 是邊做邊改狀態的，中途
+			// 失敗留下的記憶體 checkpoint 同樣沒有對帳過，再讓它落盤會把「掃到
+			// 一半」凍成下次啟動看起來可信的起掃點。
+			a.markIndexUnverified("VerifyOrRebuild 失敗：" + verr.Error())
 			a.audit("replay_index_verify_error", map[string]any{"error": verr.Error()})
 			a.noteStartupWarning("replay index 驗證／重建失敗，視窗化載入已停用（未完成 turn 修復本次跳過）；" +
 				"請重啟 app 讓啟動期重建再跑一次：" + verr.Error())
@@ -1726,8 +1752,15 @@ func (a *App) shutdown(ctx context.Context) {
 	// 會停在上一個 boundary——效果跟 crash 一樣，得靠下次啟動的補掃修復。正常
 	// 關閉不該依賴 crash 修復機制。Index 沒有 Close：turn 檔逐次開關、checkpoint
 	// 以 atomic rename 落盤，Flush 之後沒有待關閉的 handle。
+	//
+	// index 處於 unverified latch 時 Flush 是 no-op（見 replayindex 的欄位
+	// doc：沒對過帳的 checkpoint 落盤只會把缺口固化）。被跳過的步驟不能無
+	// 聲，這裡照樣留一筆稽核。
 	if a.replayIndex != nil {
-		if err := a.replayIndex.Flush(); err != nil {
+		if a.replayIndex.Unverified() {
+			a.audit("replay_index_flush_skipped", map[string]any{
+				"reason": "index 未通過啟動驗證，checkpoint 留給下次啟動對帳"})
+		} else if err := a.replayIndex.Flush(); err != nil {
 			a.audit("replay_index_flush_error", map[string]any{"error": err.Error()})
 		}
 	}

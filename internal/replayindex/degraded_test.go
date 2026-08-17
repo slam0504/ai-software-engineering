@@ -3,6 +3,7 @@ package replayindex
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -166,5 +167,99 @@ func TestOpenTurnFailureRollsBackTurnState(t *testing.T) {
 	}
 	if len(turns) != 1 || turns[0].StartOffset != 100 {
 		t.Fatalf("回滾後的 turn 應能正常收尾入 index：%+v", turns)
+	}
+}
+
+// ---- unverified latch（owner review 2026-08-17）----
+//
+// 下面兩條各自釘住一條 durable 寫入路徑。**刻意不合成一條**：App 層的跨重啟
+// 守門測試（app_replayindex_test.go 的
+// TestRegistryLoadFailureDoesNotFossilizeIndexGapAcrossRestart）只斷言得到兩
+// 條路徑的**連集**——只要其中一條仍是 no-op，磁碟 checkpoint 就不會前移，那條
+// 測試照樣綠。要讓「Observe 不前移」與「Flush 不落盤」各自被 mutation 打紅，
+// 必須分開量。
+
+// TestUnverifiedObserveDoesNotTouchCheckpoint：unverified 期間 Observe 是空操
+// 作——記憶體 checkpointOffset 不前移、boundary 事件也不寫 checkpoint.json。
+// 這是缺口固化的第一步：前移之後那個 offset 會是 audit 的合法行邊界、event id
+// 也對得上，下次啟動的 checkpointTrustedLocked 反而判定「可信」，它之前那段從
+// 未索引的 audit 從此沒有任何人會補。
+func TestUnverifiedObserveDoesNotTouchCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.MarkUnverified()
+
+	// canonical user message 是 boundary 事件：沒有 latch 的話它會同時前移記憶
+	// 體 checkpoint **並且**落盤。
+	feedUserMsg(t, i, "w1", 500)
+
+	if off, id := i.Checkpoint(); off != 0 || id != "" {
+		t.Fatalf("unverified 期間 Observe 不得前移 checkpoint：off=%d id=%q", off, id)
+	}
+	if off := readCheckpointOffset(t, filepath.Join(dir, "checkpoint.json")); off != 0 {
+		t.Fatalf("unverified 期間 Observe 不得寫 checkpoint.json：磁碟 offset=%d", off)
+	}
+	if _, open := i.OpenTurnStart("w1"); open {
+		t.Fatal("unverified 期間連 turn 狀態機都不該跑（Observe 全程空操作）")
+	}
+}
+
+// TestUnverifiedFlushDoesNotPersistCheckpoint：unverified 期間 Flush 不落盤。
+//
+// 這條與上一條是**不同的失效點**：checkpoint 落盤被節流到 turn boundary，所以
+// 記憶體值可以合法地跑在磁碟前面（這裡用一個 non-boundary 事件造出這個常態差
+// 距），而 shutdown 的 Flush 正是把記憶體值推上磁碟的那一步。latch 之後它必須
+// 停手——沒對過帳的值一旦落盤，下次啟動就是拿它去驗證，缺口同樣被固化。
+func TestUnverifiedFlushDoesNotPersistCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	cp := filepath.Join(dir, "checkpoint.json")
+	i, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	feedUserMsg(t, i, "w1", 0)                           // boundary：磁碟 checkpoint 前進到 10
+	feed(t, i, "w1", string(contract.KindDelta), "", 10) // non-boundary：只有記憶體到 20
+	if off := readCheckpointOffset(t, cp); off != 10 {
+		t.Fatalf("前置條件：磁碟 checkpoint 應停在上一個 boundary（10），實際 %d", off)
+	}
+	if off, _ := i.Checkpoint(); off != 20 {
+		t.Fatalf("前置條件：記憶體 checkpoint 應已跑在磁碟前面（20），實際 %d", off)
+	}
+
+	i.MarkUnverified()
+	if err := i.Flush(); err != nil {
+		t.Fatalf("Flush 在 unverified 下是 no-op，不該回錯：%v", err)
+	}
+	if off := readCheckpointOffset(t, cp); off != 10 {
+		t.Fatalf("unverified 期間 Flush 不得落盤：磁碟 offset 被推到 %d", off)
+	}
+}
+
+// TestUnverifiedIsNotDegraded：兩個 latch 語意不同，不得互相冒充——degraded 的
+// 記憶體 checkpoint 是「最後一次成功索引到哪」的忠實快照（落盤安全、可續掃重
+// 建），unverified 則是「根本沒對過帳」。若把 unverified 實作成 latch
+// degraded，Observe 確實會停，但 Flush 照樣落盤（degraded 不擋 Flush），等於
+// 用一個可能是 0 的值覆寫磁碟上原本可能還好的 checkpoint，比不修更糟。
+func TestUnverifiedIsNotDegraded(t *testing.T) {
+	i, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.MarkUnverified()
+	if !i.Unverified() {
+		t.Fatal("MarkUnverified 之後 Unverified() 必須為 true")
+	}
+	if i.Degraded() {
+		t.Fatal("unverified 不得順手 latch degraded：兩者語意不同，見 unverified 欄位 doc")
+	}
+	// degraded 的解除入口不該把 unverified 一起解掉（它只能靠重啟後的
+	// VerifyOrRebuild 在新的 Index 實例上解除）。
+	i.ClearDegraded()
+	if !i.Unverified() {
+		t.Fatal("ClearDegraded 不得解除 unverified latch")
 	}
 }

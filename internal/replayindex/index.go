@@ -73,6 +73,27 @@ type Index struct {
 	degradedErr      error
 	degradedNotified bool
 
+	// unverified latch：本次啟動的 index **從未與 audit 對過帳**——啟動序列在
+	// `index_verify` 之前就中止（registry 載入失敗讓 restoreSessions 提前
+	// return），或 VerifyOrRebuild 執行後失敗、留下掃到一半的記憶體狀態。
+	//
+	// **與 degraded 是不同語意，不共用旗標**：
+	//   - degraded＝「驗證跑過、但索引已知有問題」。記憶體 checkpoint 仍是
+	//     「最後一次成功索引到哪裡」的忠實快照（失敗那次的前移已回滾），所以
+	//     它落盤是安全的，RuntimeRebuild 也能從它續掃。
+	//   - unverified＝「根本沒對過帳，磁碟上那份的可信度未知」。此刻記憶體
+	//     checkpointOffset 只是 0（從未驗證）或載入但未經對帳的值，把它落盤等
+	//     於用一個沒有依據的值覆寫磁碟——**比不寫更糟**。
+	//
+	// 所以這個 latch 要讓兩條 durable 寫入路徑一起變成 no-op（見 Observe 與
+	// Flush）：不前移 checkpointOffset、不寫 checkpoint.json。磁碟上那份原封
+	// 不動留給**下次啟動的 VerifyOrRebuild** 對帳——那是唯一握有 audit 全文、
+	// 能判定可信度並在必要時全量重建的路徑。
+	//
+	// 單向、無 in-process 解除入口（刻意不接 ClearDegraded）：解除的唯一有效
+	// 方式是重啟後跑完 VerifyOrRebuild，而那發生在新的 Index 實例上。
+	unverified bool
+
 	// runtime 重建（Task 19，§3.5.7）的續掃游標，**刻意獨立於 checkpoint**：
 	// degraded latch 期間 checkpoint 依 §3.5.4 不得前移，但 catch-up 必須知道
 	// 「已經重新索引到哪裡」才能一輪一輪逼近 audit 檔尾、且重試時不重跑
@@ -221,6 +242,18 @@ func (idx *Index) loadCheckpoint() error {
 func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) error {
 	idx.mu.Lock()
 
+	// unverified 先於 degraded 判：兩者都讓 Observe 變成空操作，但理由不同
+	// ——unverified 期間連「checkpointOffset 前移到 receipt.EndOffset」都不可
+	// 以，因為那個前移正是把「驗證從未跑過」的缺口寫成下次啟動看起來可信的
+	// checkpoint 的手段（見欄位 doc）。這裡不 latch degraded、不發 Notify：
+	// degraded 的通知出口接的是 runtime 重建排程，而 unverified 需要的恰恰是
+	// **不要**自動重建（bulkRebuild 從 max(cursor, checkpoint) 起掃，那個值此
+	// 刻本身就不可信，重建只會把缺口固化）。
+	if idx.unverified {
+		idx.mu.Unlock()
+		return nil
+	}
+
 	if idx.degraded {
 		idx.mu.Unlock()
 		return nil
@@ -284,6 +317,27 @@ func (idx *Index) Degraded() bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	return idx.degraded
+}
+
+// MarkUnverified：呼叫端（App 的啟動序列）宣告「本次啟動的 index 從未通過與
+// audit 的對帳」，自此兩條 durable 寫入路徑（Observe 前移 checkpoint／Flush
+// 落盤）一律 no-op，見 unverified 欄位的 doc。冪等。
+//
+// 這裡刻意**不呼叫 Config.Notify**：那個出口接的是 degraded → runtime 重建排
+// 程，而 unverified 需要的恰恰是不要自動重建。進入這個狀態的 fail-loud 訊號
+// 由呼叫端負責（它才知道成因與對使用者的可操作指引）。
+func (idx *Index) MarkUnverified() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.unverified = true
+}
+
+// Unverified：index 目前是否處於 unverified latch。呼叫端（shutdown）用它交代
+// 「index flush 這一步被跳過」，不讓跳過變成無聲。
+func (idx *Index) Unverified() bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.unverified
 }
 
 // ClearDegraded：以成功重建為準解除 degraded latch（§3.5.4：「解除以成功重
@@ -507,9 +561,16 @@ func (idx *Index) SetScanSegmentHookForTest(f func()) {
 // 依賴 crash 修復機制——這個缺口是節流造成的，補救也該在本套件裡：呼叫端
 // （Task 20 起，Manager 的收尾／shutdown 路徑）應在關閉序列裡呼叫 Flush，
 // 確保 checkpoint 反映關閉當下記憶體中的即時 offset。
+//
+// unverified 時是 no-op（回 nil）：此刻記憶體 checkpoint 從未與 audit 對過
+// 帳，落盤只會覆寫掉磁碟上那份「下次啟動要拿去驗證」的值——那正是缺口被永久
+// 固化的最後一步。呼叫端（shutdown）要交代這一步被跳過，見 Unverified。
 func (idx *Index) Flush() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	if idx.unverified {
+		return nil
+	}
 	return idx.writeCheckpointFile()
 }
 
