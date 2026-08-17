@@ -3,7 +3,7 @@
 // 信的三態修復，但完全沒檢查既有 *.turns.jsonl 檔案內容本身是否可解析——若
 // 某個 wsid 的 turn file 尾端或中段有半筆寫入（例如 crash 發生在
 // appendTurnRecord 的 os.OpenFile／Fprintf 之間），checkpoint 可能仍然可
-// 信（它只記全域 offset／event id，不驗證 turn file 內容），但 RecentTurns
+// 信（它只記全域 offset／event id，不驗證 turn file 內容），但 TurnsBefore
 // 讀到那個壞行時仍會出事。本檔補上這一層。
 //
 // 判定方式（凍結）：第一個無法解析的行之後，若還有其他能解析的行 ⇒ 中段；
@@ -23,8 +23,8 @@ import (
 // midCorruptionError：readTurnFileLocked 判定某個 wsid 的 turn file 是中段損
 // 壞時回傳的 sentinel——它自己沒有 audit path，無法安全重建，只能把「這是中
 // 段損壞、不是一般 I/O 錯誤」這件事帶出去，讓握有 audit path 的呼叫端（本檔
-// 的 repairTurnFileCorruptionLocked）決定如何處置。一般呼叫端（RecentTurns／
-// TurnsBefore）不特判這個型別，走一般 error 路徑 fail loud——維持 Task 15 對
+// 的 repairTurnFileCorruptionLocked）決定如何處置。一般呼叫端（TurnsBefore）
+// 不特判這個型別，走一般 error 路徑 fail loud——維持 Task 15 對
 // 「無法安全處理的損壞」一律回錯的既有行為，不因為多了分級就對外放寬。
 type midCorruptionError struct {
 	wsid string
@@ -55,7 +55,7 @@ func (e *midCorruptionError) Unwrap() error { return e.err }
 //     wsid 精細重建），理由：resetTurnFilesLocked／rescanFromLocked(0) 是
 //     Task 17 已測試過的既有路徑，直接複用比新增一條「只重建單一 wsid」的
 //     路徑更簡單、風險更低，且全量重掃的成本相對 turns.jsonl（每筆約 100
-//     bytes）並不高（見 index.go RecentTurns 的說明）。一次呼叫最多觸發一次
+//     bytes）並不高（見 index.go TurnsBefore 的說明）。一次呼叫最多觸發一次
 //     全量重建：只要偵測到任何一個 wsid 中段損壞就立刻處理並回傳，不逐檔案
 //     累積多次 quarantine。
 func (idx *Index) repairTurnFileCorruptionLocked() (rebuilt bool, err error) {

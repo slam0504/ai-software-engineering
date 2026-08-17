@@ -408,7 +408,9 @@ func TestIndexDegradedNotifyDoesNotDeadlockAndRecovers(t *testing.T) {
 	}
 	// 解除 latch 之後 index 必須真的重新接手：新的完整 turn 要進得了 index。
 	emitCompleteTurn(t, a, w, "after recovery")
-	recs, err := a.replayIndex.RecentTurns("w1", 10)
+	// TurnsBefore(cursor="") ＝ 尾端視窗，即 production LoadTurnsBefore 首次載入
+	// 走的那條路（§3.8）。
+	recs, err := a.replayIndex.TurnsBefore("w1", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

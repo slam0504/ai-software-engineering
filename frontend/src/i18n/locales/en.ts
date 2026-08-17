@@ -25,6 +25,9 @@ export default {
     goResubmit: {
       integrityError: 'Data integrity error: the resubmit target could not be parsed — navigation cancelled',
     },
+    paneLayout: {
+      restoreFailed: 'Pinned panes could not be restored — both panes start empty; pin the sessions you want again: {error}',
+    },
   },
   settings: {
     action: {
@@ -310,6 +313,7 @@ export default {
   store: {
     bindingsNotReady: 'bindings not ready',
     noFocusedSession: 'no session is pinned to the focused pane — create or pin one first',
+    paneLayoutPersistFailed: 'pane pins were not saved, so this arrangement will be lost on restart (the pins themselves still work): {error}',
     sessionUnavailable: 'session {wsid} is recorded but not addressable (no working slot); restart the app or remove it',
   },
   sessionList: {

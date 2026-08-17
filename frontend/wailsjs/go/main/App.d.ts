@@ -51,6 +51,8 @@ export function Logout(arg1:string):Promise<void>;
 
 export function NewSession(arg1:string):Promise<void>;
 
+export function PaneLayout():Promise<main.PaneLayout>;
+
 export function PlanAssist(arg1:string,arg2:string):Promise<string>;
 
 export function PlanList():Promise<Array<main.FileNode>>;
@@ -84,6 +86,8 @@ export function RestoreViews():Promise<Record<string, main.RestoredView>>;
 export function RunEvidence(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<string>;
 
 export function SendMessage(arg1:string,arg2:string):Promise<void>;
+
+export function SetPaneLayout(arg1:Array<string>,arg2:string):Promise<void>;
 
 export function SpecAssist(arg1:string,arg2:string,arg3:string):Promise<string>;
 

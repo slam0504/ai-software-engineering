@@ -8,7 +8,7 @@
 // 掉絕不能讓 provider turn 失敗，所以寫入失敗一律 latch degraded、不回錯給
 // Observe 呼叫端。crash consistency 三態修復（Task 17）、損壞分級
 // （Task 18）、runtime 重建交接（Task 19）、App 接線（Task 20）仍是後續
-// task，本檔不涉及——Task 16 只提供 latch 狀態與 ClearDegraded 解除入口，
+// task，本檔不涉及——Task 16 只提供 latch 狀態與 clearDegradedLocked 解除入口，
 // 實際重建邏輯由那幾個 task 補上。
 package replayindex
 
@@ -38,7 +38,7 @@ type TurnRecord struct {
 // （§3.5.4）：index 寫入失敗時，Observe 先把狀態 latch 成 degraded、再（於
 // 釋放 idx.mu 之後）呼叫 Notify——順序不能反過來，否則 Notify 送進的通知事
 // 件會在 latch 生效前回灌 Observe、再次寫入失敗、無限遞迴。同一個 degraded
-// generation（由開始 latch 到 ClearDegraded 解除為止）只呼叫一次。可以是
+// generation（由開始 latch 到重建成功解除為止）只呼叫一次。可以是
 // nil，此時 Observe 只 latch、不通知。
 type Config struct {
 	Notify func(string)
@@ -68,7 +68,7 @@ type Index struct {
 	// degraded latch（§3.5.4）：index 寫入失敗時 latch，不回錯給 Observe 呼叫
 	// 端。degradedErr 是觸發 latch 的原因，僅供通知文字與未來狀態查詢使用。
 	// degradedNotified 是「每個 degraded generation 只通知一次」的守衛，
-	// ClearDegraded 解除 latch 時一併重置，開啟下一個 generation。
+	// clearDegradedLocked 解除 latch 時一併重置，開啟下一個 generation。
 	degraded         bool
 	degradedErr      error
 	degradedNotified bool
@@ -90,7 +90,7 @@ type Index struct {
 	// 不動留給**下次啟動的 VerifyOrRebuild** 對帳——那是唯一握有 audit 全文、
 	// 能判定可信度並在必要時全量重建的路徑。
 	//
-	// 單向、無 in-process 解除入口（刻意不接 ClearDegraded）：解除的唯一有效
+	// 單向、無 in-process 解除入口（刻意不接 clearDegradedLocked）：解除的唯一有效
 	// 方式是重啟後跑完 VerifyOrRebuild，而那發生在新的 Index 實例上。
 	unverified bool
 
@@ -219,10 +219,10 @@ func (idx *Index) loadCheckpoint() error {
 //     效，Observe 一開頭就直接 return nil，不會再嘗試寫入、不會再次觸發
 //     Notify，因此不會遞迴）；
 //  3. 同一個 degraded generation 只通知一次（degradedNotified），直到
-//     ClearDegraded 解除 latch、開啟下一個 generation。
+//     重建成功時 clearDegradedLocked 解除 latch、開啟下一個 generation。
 //
 // latch 之後每一次 Observe 呼叫都是空操作：不跑 turn 狀態機、不動記憶體
-// checkpoint、直接 return nil，直到 ClearDegraded 被呼叫（重建成功的入口，
+// checkpoint、直接 return nil，直到 clearDegradedLocked 被呼叫（重建成功的入口，
 // Task 17-19 範圍，本 task 只提供這個入口）。
 //
 // checkpoint.json 只在 turn boundary（開 turn／收 turn）才落盤，不是每個事件
@@ -312,7 +312,7 @@ func (idx *Index) Observe(env contract.Envelope, receipt appcore.AppendReceipt) 
 
 // Degraded：index 目前是否處於 degraded latch（§3.5.4）。true 時 Observe 是
 // 空操作、checkpoint 不再前移，需靠重建（Task 17-19）成功後呼叫
-// ClearDegraded 解除。
+// 成功重建（clearDegradedLocked）解除。
 func (idx *Index) Degraded() bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -338,19 +338,6 @@ func (idx *Index) Unverified() bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	return idx.unverified
-}
-
-// ClearDegraded：以成功重建為準解除 degraded latch（§3.5.4：「解除以成功重
-// 建為準」）。解除的同時開啟下一個 degraded generation——degradedNotified
-// 一併重置，所以下一次寫入失敗仍會各自發一次通知，不會因為用過一次就永久
-// 啞掉。
-//
-// 這是給呼叫端／測試用的外部入口；runtime 重建路徑（rebuild.go 的
-// finalCatchUpAndAttach）已持有 idx.mu，走 clearDegradedLocked。
-func (idx *Index) ClearDegraded() {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	idx.clearDegradedLocked()
 }
 
 // clearDegradedLocked：呼叫端須持有 idx.mu。
@@ -449,34 +436,20 @@ func isTerminalStateChange(env contract.Envelope) bool {
 	return env.State == string(contract.StateDone) || env.State == string(contract.StateFailed)
 }
 
-// RecentTurns：wsid 最近（檔尾）至多 n 筆完整 turn，時間遞增排列。未完成
-// turn 不含在內（§3.5.8）；wsid 尚無完整 turn 時回傳空 slice、非錯誤。
-//
-// 目前實作是 O(該 WSID 全部 turn 數)——readTurnFileLocked 整份 <wsid>.turns.jsonl
-// 讀完解析、才在記憶體中取尾，不是從檔尾反向讀。這是刻意取捨，不是疏漏：
-// turns.jsonl 每筆約 100 bytes，即使單一 WSID 累積一萬個 turn 也才 ~1MB，
-// 比它取代的 events.jsonl（動輒上百 MB）小兩到三個數量級，現在寫反向讀取
-// 器是為了還沒發生的問題增加複雜度。觸發改寫的條件：若實測某 WSID 的
-// turns.jsonl 成長到單次全讀有感（例如同一 WSID 累積數萬筆以上、或量到
-// I/O 延遲影響 UI 捲動），才值得換成真正的 tail read。
-func (idx *Index) RecentTurns(wsid string, n int) ([]TurnRecord, error) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	all, err := idx.readTurnFileLocked(wsid)
-	if err != nil {
-		return nil, err
-	}
-	return capTail(all, n), nil
-}
-
 // TurnsBefore：beforeEventID 為某個已載入 turn 的 FirstEventID（分頁 cursor，
 // 對應 §3.8「向上捲到頂」）；回傳其之前、時間遞增排列的至多 n 筆完整 turn。
-// beforeEventID 為空字串時等同 RecentTurns（首次載入無 cursor）。cursor 找
-// 不到對應 turn 時回傳空 slice、非錯誤——避免把「cursor 已經是最舊」與
-// 「cursor 不存在」混為一種呼叫端無法分辨的錯誤。
+// beforeEventID 為空字串時回傳**尾端視窗**（§3.5.1「從檔尾反向讀最近 20 筆」、
+// §3.8 首次載入無 cursor 的那一格）。cursor 找不到對應 turn 時回傳空 slice、
+// 非錯誤——避免把「cursor 已經是最舊」與「cursor 不存在」混為一種呼叫端無法
+// 分辨的錯誤。未完成 turn 不含在內（§3.5.8，由 OpenTurnStart 另行取得）。
 //
-// 與 RecentTurns 共用 readTurnFileLocked，同樣是 O(該 WSID 全部 turn 數) 的
-// 全讀取捨，理由與改寫條件見 RecentTurns 的 doc。
+// 目前實作是 O(該 WSID 全部 turn 數)——readTurnFileLocked 整份
+// <wsid>.turns.jsonl 讀完解析、才在記憶體中取尾，不是從檔尾反向讀。這是刻意
+// 取捨，不是疏漏：turns.jsonl 每筆約 100 bytes，即使單一 WSID 累積一萬個 turn
+// 也才 ~1MB，比它取代的 events.jsonl（動輒上百 MB）小兩到三個數量級，現在寫
+// 反向讀取器是為了還沒發生的問題增加複雜度。觸發改寫的條件：若實測某 WSID 的
+// turns.jsonl 成長到單次全讀有感（例如同一 WSID 累積數萬筆以上、或量到 I/O
+// 延遲影響 UI 捲動），才值得換成真正的 tail read。
 func (idx *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -510,13 +483,6 @@ func (idx *Index) OpenTurnStart(wsid string) (int64, bool) {
 		return 0, false
 	}
 	return st.startOffset, true
-}
-
-// Checkpoint：目前已索引的 audit byte offset 與最後一筆處理過的 event id。
-func (idx *Index) Checkpoint() (int64, string) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	return idx.checkpointOffset, idx.checkpointLastEventID
 }
 
 // ---- 測試專用入口（**production 路徑一律不得呼叫**）----
@@ -756,7 +722,7 @@ func (idx *Index) rebuildSeenKeysLocked(wsid string) (map[string]bool, error) {
 //     不需要通知（§3.5.6：尾端是正常操作可能留下的半筆寫入，不算需要人工
 //     關注的異常）。
 //   - 中段損壞：本函式沒有 audit path，無法安全重建，回傳 *midCorruptionError
-//     sentinel、不做任何磁碟異動。RecentTurns／TurnsBefore 這些一般呼叫端
+//     sentinel、不做任何磁碟異動。TurnsBefore 這個一般呼叫端
 //     視同一般錯誤 fail loud（與改動前行為一致：中段損壞本來就該回錯，不能
 //     猜）；唯一知道如何安全處理的是握有 auditPath 的 VerifyOrRebuild（見
 //     corrupt.go 的 repairTurnFileCorruptionLocked），它會辨識這個 sentinel
@@ -804,7 +770,7 @@ func (idx *Index) readTurnFileLocked(wsid string) ([]TurnRecord, error) {
 
 // nonEmptyLines：把整份檔案內容按換行切成非空白行（去除前後空白），維持與
 // 改動前 bufio.Scanner 逐行掃描相同的語意（略過空白行）。整份內容已由
-// os.ReadFile 讀進記憶體，turn record 本身很小（見 RecentTurns 的說明），不
+// os.ReadFile 讀進記憶體，turn record 本身很小（見 TurnsBefore 的說明），不
 // 需要 bufio.Scanner 的行長度上限機制。
 func nonEmptyLines(b []byte) [][]byte {
 	var lines [][]byte

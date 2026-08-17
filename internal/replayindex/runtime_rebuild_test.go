@@ -145,7 +145,7 @@ func duplicateRanges(turns []TurnRecord) int {
 
 func mustTurns(t *testing.T, i *Index, wsid string) []TurnRecord {
 	t.Helper()
-	turns, err := i.RecentTurns(wsid, 1000)
+	turns, err := i.recentTurns(wsid, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestRebuildCoversPreLockWindow(t *testing.T) {
 	if err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)); err != nil {
 		t.Fatal(err)
 	}
-	turns, err := i.RecentTurns("w1", 10)
+	turns, err := i.recentTurns("w1", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestRebuildUnderReportedAuditEndFailsLoud(t *testing.T) {
 		t.Fatal(err)
 	}
 	i.latchDegraded(errors.New("seed"))
-	before, _ := i.Checkpoint()
+	before, _ := i.checkpoint()
 
 	// 低報只發生在持有 emitMu 時，且要低報的正是「鎖前窗口」剛進來的那一
 	// 段——鎖外 catch-up 一律掃到檔案真實 EOF，只有第 5 步的補掃會被 end 夾
@@ -462,7 +462,7 @@ func TestRebuildUnderReportedAuditEndFailsLoud(t *testing.T) {
 	if !i.Degraded() {
 		t.Fatal("低報不得解除 latch——那會留下永遠沒人索引的缺口")
 	}
-	if off, _ := i.Checkpoint(); off != before {
+	if off, _ := i.checkpoint(); off != before {
 		t.Fatalf("低報不得前移 checkpoint：%d", off)
 	}
 }
@@ -486,10 +486,10 @@ func TestRebuildCursorIndependentOfCheckpoint(t *testing.T) {
 	}
 	i.latchDegraded(errors.New("seed"))
 	appendCompleteTurn(t, audit, "w1", "post-latch") // latch 期間 provider 仍在寫 audit
-	before, _ := i.Checkpoint()
+	before, _ := i.checkpoint()
 	var emitMu sync.Mutex
 	i.hookAfterUnlockedCatchUp = func() {
-		if off, _ := i.Checkpoint(); off != before {
+		if off, _ := i.checkpoint(); off != before {
 			t.Errorf("degraded 期間 checkpoint 不得前移：%d → %d", before, off)
 		}
 		if i.RebuildCursorForTest() <= before {
@@ -499,7 +499,7 @@ func TestRebuildCursorIndependentOfCheckpoint(t *testing.T) {
 	if err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)); err != nil {
 		t.Fatal(err)
 	}
-	if after, _ := i.Checkpoint(); after <= before {
+	if after, _ := i.checkpoint(); after <= before {
 		t.Fatal("成功接回後 checkpoint 才前移")
 	}
 }
@@ -528,7 +528,7 @@ func TestCrashDuringRuntimeRebuildDoesNotDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	i.latchDegraded(errors.New("seed"))
-	before, _ := i.Checkpoint()
+	before, _ := i.checkpoint()
 	appendCompleteTurn(t, audit, "w1", "post-latch") // latch 期間 provider 仍在寫 audit
 
 	// 逼重建不收斂而中止：post-latch turn 已經被 bulk 索引、turn record 已落
@@ -538,7 +538,7 @@ func TestCrashDuringRuntimeRebuildDoesNotDuplicate(t *testing.T) {
 	if err := i.RuntimeRebuild(audit, &emitMu, realAuditEnd(audit)); !errors.Is(err, ErrRebuildNotConverged) {
 		t.Fatalf("測試前提：本輪應未收斂：%v", err)
 	}
-	if off, _ := i.Checkpoint(); off != before {
+	if off, _ := i.checkpoint(); off != before {
 		t.Fatalf("測試前提：未收斂不得前移 checkpoint：%d", off)
 	}
 	if len(mustTurns(t, i, "w1")) != 3 {
@@ -608,7 +608,7 @@ func TestRebuildRetryResumesFromCursorWithoutRebulk(t *testing.T) {
 		t.Fatal(err)
 	}
 	i.latchDegraded(errors.New("seed"))
-	before, _ := i.Checkpoint()
+	before, _ := i.checkpoint()
 	appendCompleteTurn(t, audit, "w1", "post-latch") // 第一輪 bulk 會索引到這個 turn
 
 	var emitMu sync.Mutex
@@ -620,7 +620,7 @@ func TestRebuildRetryResumesFromCursorWithoutRebulk(t *testing.T) {
 	if cursorAfterFirst <= before {
 		t.Fatalf("第一輪應已推進 rebuild cursor：%d <= %d", cursorAfterFirst, before)
 	}
-	if off, _ := i.Checkpoint(); off != before {
+	if off, _ := i.checkpoint(); off != before {
 		t.Fatalf("未收斂不得前移 checkpoint：%d", off)
 	}
 

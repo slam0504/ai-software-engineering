@@ -69,7 +69,7 @@ func TestTailCorruptionTruncatesAndContinues(t *testing.T) {
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
 	}
-	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
+	if turns, _ := i.recentTurns("w1", 10); len(turns) != 3 {
 		t.Fatalf("尾端 corruption 應 truncate 續用：%d", len(turns))
 	}
 	if quarantineExists(t, dir) || notices != 0 {
@@ -88,14 +88,14 @@ func TestMidCorruptionQuarantinesAndRebuilds(t *testing.T) {
 	if !quarantineExists(t, dir) {
 		t.Fatal("中段 corruption 必須 quarantine（§3.5.6）")
 	}
-	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
+	if turns, _ := i.recentTurns("w1", 10); len(turns) != 3 {
 		t.Fatalf("必須全量重建：%d", len(turns))
 	}
 	// 重建範圍是全域（quarantine 全部既有 turn file、從頭全量重掃），不是只
 	// 精修受損的 w1——未受損的 sibling wsid（w2）在重建後也必須完整、不重
 	// 複、不遺漏，這正是這次 review 核心爭議「全域重建範圍是否安全」的直接
 	// 證據。
-	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 3 {
+	if turns, _ := i.recentTurns("w2", 10); len(turns) != 3 {
 		t.Fatalf("全域重建不該誤殺未受損的 sibling wsid（w2）：%d", len(turns))
 	}
 	if notices != 1 {
@@ -106,7 +106,7 @@ func TestMidCorruptionQuarantinesAndRebuilds(t *testing.T) {
 // TestTailCorruptionActuallyTruncatesDisk：品質重點——尾端 truncate 必須真的
 // 改寫磁碟上的 <wsid>.turns.jsonl，不能只在記憶體忽略最後一行；否則下次啟動
 // （新的 Index 實例、無任何記憶體殘留）又會撞到同一個壞行。刻意不透過
-// RecentTurns 間接推論，直接讀磁碟位元組核對壞行已消失、valid 內容還在。
+// recentTurns 間接推論，直接讀磁碟位元組核對壞行已消失、valid 內容還在。
 func TestTailCorruptionActuallyTruncatesDisk(t *testing.T) {
 	dir, audit := seedAuditWithTurns(t, 3)
 	i, _ := OpenWith(dir, Config{})
@@ -132,7 +132,7 @@ func TestTailCorruptionActuallyTruncatesDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turns, err := j.RecentTurns("w1", 10)
+	turns, err := j.recentTurns("w1", 10)
 	if err != nil {
 		t.Fatalf("下次啟動重新讀取不該再撞到已 truncate 的壞行：%v", err)
 	}
@@ -151,7 +151,7 @@ func TestMidCorruptionDoesNotLoseEvents(t *testing.T) {
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
 	}
-	turns, err := i.RecentTurns("w1", 10)
+	turns, err := i.recentTurns("w1", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestMidCorruptionDoesNotLoseEvents(t *testing.T) {
 
 	// 未受損的 sibling wsid（w2）同樣經過全域重建，內容也必須精確對應
 	// audit、不重複不遺漏——涵蓋「全域重建範圍」這個決策的另一半證據。
-	w2turns, err := i.RecentTurns("w2", 10)
+	w2turns, err := i.recentTurns("w2", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestMidCorruptionWithConsecutiveBadLinesIsStillDetected(t *testing.T) {
 	}
 	writeRawTurnFile(t, dir, "w1", lines)
 
-	if _, err := i.RecentTurns("w1", 10); err == nil {
+	if _, err := i.recentTurns("w1", 10); err == nil {
 		t.Fatal("壞行之後即使緊接著另一個壞行，只要再往後掃到 valid 行仍須判定中段、fail loud，不能誤判尾端而截斷遺失後面的 valid 記錄")
 	}
 
@@ -265,7 +265,7 @@ func TestSingleLineFileFullyCorruptIsTailTruncatedToEmpty(t *testing.T) {
 	}
 	writeRawTurnFile(t, dir, "w1", []string{"{not json at all"})
 
-	turns, err := i.RecentTurns("w1", 10)
+	turns, err := i.recentTurns("w1", 10)
 	if err != nil {
 		t.Fatalf("單行檔案全壞、後面沒有 valid 行屬於尾端 corruption，不該 fail loud：%v", err)
 	}

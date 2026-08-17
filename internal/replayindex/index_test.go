@@ -81,7 +81,7 @@ func TestTurnBoundaryDefinition(t *testing.T) {
 	obs("delta", "assistant", "", "e3", 20)
 	obs("result", "system", "", "e4", 30)
 	obs("state_change", "system", "done", "e5", 40) // terminal：turn 止
-	turns, err := i.RecentTurns("w1", 10)
+	turns, err := i.recentTurns("w1", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestStreamErrorClosesTurnAsFailed(t *testing.T) {
 	feedUserMsg(t, i, "w1", 0)
 	feed(t, i, "w1", string(contract.KindStreamError), "", 10)
 	feed(t, i, "w1", string(contract.KindStateChange), string(contract.StateFailed), 20)
-	if turns, err := i.RecentTurns("w1", 5); err != nil || len(turns) != 1 {
+	if turns, err := i.recentTurns("w1", 5); err != nil || len(turns) != 1 {
 		t.Fatalf("failed turn 也算完整 turn：%d %v", len(turns), err)
 	}
 }
@@ -114,7 +114,7 @@ func TestOpenTurnNotIndexed(t *testing.T) {
 	}
 	feedUserMsg(t, i, "w1", 0)
 	feed(t, i, "w1", string(contract.KindDelta), "", 10)
-	if turns, err := i.RecentTurns("w1", 5); err != nil || len(turns) != 0 {
+	if turns, err := i.recentTurns("w1", 5); err != nil || len(turns) != 0 {
 		t.Fatalf("未完成 turn 不得入 index（§3.5.8）：%d %v", len(turns), err)
 	}
 	if off, ok := i.OpenTurnStart("w1"); !ok || off != 0 {
@@ -128,7 +128,7 @@ func TestSessionDoneIsNotATurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	feed(t, i, "w1", "session_done", "", 0)
-	if turns, err := i.RecentTurns("w1", 5); err != nil || len(turns) != 0 {
+	if turns, err := i.recentTurns("w1", 5); err != nil || len(turns) != 0 {
 		t.Fatalf("session:done 不單獨構成 turn：%d %v", len(turns), err)
 	}
 }
@@ -160,12 +160,12 @@ func TestTurnsBeforePagination(t *testing.T) {
 	feedCompleteTurn(t, i, "w1", 100)
 	feedCompleteTurn(t, i, "w1", 200)
 
-	recent, err := i.RecentTurns("w1", 2)
+	recent, err := i.recentTurns("w1", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(recent) != 2 {
-		t.Fatalf("RecentTurns(2)：%+v", recent)
+		t.Fatalf("recentTurns(2)：%+v", recent)
 	}
 	before, err := i.TurnsBefore("w1", recent[0].FirstEventID, 5)
 	if err != nil {
@@ -175,13 +175,13 @@ func TestTurnsBeforePagination(t *testing.T) {
 		t.Fatalf("TurnsBefore 應回傳更早的 turn：%+v", before)
 	}
 
-	// 空字串 cursor 等同 RecentTurns（首次載入無 cursor）。
+	// 空字串 cursor 等同尾端視窗（首次載入無 cursor）。
 	first, err := i.TurnsBefore("w1", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first) != 2 || first[0].StartOffset != recent[0].StartOffset {
-		t.Fatalf("空 cursor 應等同 RecentTurns：%+v", first)
+		t.Fatalf("空 cursor 應等同尾端視窗：%+v", first)
 	}
 }
 
@@ -224,7 +224,7 @@ func TestCheckpointOnlyPersistsAtTurnBoundary(t *testing.T) {
 	if !afterDeltasInfo.ModTime().Equal(beforeInfo.ModTime()) {
 		t.Fatalf("非終止事件不得改動 checkpoint 檔 mtime：before=%v after=%v", beforeInfo.ModTime(), afterDeltasInfo.ModTime())
 	}
-	if off, _ := i.Checkpoint(); off != 60 {
+	if off, _ := i.checkpoint(); off != 60 {
 		t.Fatalf("記憶體 checkpoint 應逐事件即時更新、不受落盤節流影響：%d", off)
 	}
 
@@ -259,7 +259,7 @@ func TestFlushPersistsCurrentOffset(t *testing.T) {
 	if got := readCheckpointOffset(t, path); got != staleOnDisk {
 		t.Fatalf("前置條件錯：非終止事件不應改動磁碟，got=%d want=%d", got, staleOnDisk)
 	}
-	memOff, _ := i.Checkpoint()
+	memOff, _ := i.checkpoint()
 	if memOff == staleOnDisk {
 		t.Fatal("前置條件錯：記憶體 offset 應已領先磁碟，否則本測試無法區分 Flush 有沒有生效")
 	}
@@ -303,4 +303,45 @@ func TestOpenTurnStartSurvivesReopen(t *testing.T) {
 	if !ok || off != 0 {
 		t.Fatalf("checkpoint 的 open_turn_start_offset 必須跨 Open 存續：%d %v", off, ok)
 	}
+}
+
+// ---- 測試專用讀取／驅動入口（M3b owner review 修正 3 的裁決）----
+//
+// 這三個存取器原本是 Index 的 **exported** 方法，機械掃描抓到它們 production
+// 呼叫端為零。逐一對照 spec 之後的結論是**都不是缺口**：
+//
+//   - `RecentTurns`：§3.5.1「從檔尾反向讀最近 20 筆」／§3.8「各載入最近 20 個
+//     完整 turn」確實是凍結需求，但 production 是由 `TurnsBefore(wsid, "", n)`
+//     滿足的（app.LoadTurnsBefore → TurnsBefore ＋ OpenTurnStart，見
+//     rebuild_orchestrator.go）。RecentTurns 只是 cursor 為空時的同義入口，
+//     多一條公開 API 而已。
+//   - `Checkpoint`：§3.5.5 要求的是 checkpoint 落盤與啟動驗證，那由
+//     loadCheckpoint／flushCheckpoint 與內部欄位完成；這個 getter 沒有需求。
+//   - `ClearDegraded`：§3.5.4「解除 latch 以成功重建為準」由 rebuild.go 的
+//     `clearDegradedLocked()` 完成（finalCatchUpAndAttach 已持鎖）。exported
+//     的無鎖包裝只有測試在用。
+//
+// 因此三者都是**沒有需求支撐的公開 API**，本票移出 production 檔；觀測價值仍
+// 在（~25 個測試呼叫點），依 package 既有慣例（見 runtime_rebuild_test.go 的
+// CatchUpAttemptsForTest）以未匯出存取器留在 _test.go。
+
+// recentTurns：wsid 最近（檔尾）至多 n 筆完整 turn，時間遞增排列。
+// 等同 TurnsBefore(wsid, "", n)，測試用的簡寫。
+func (idx *Index) recentTurns(wsid string, n int) ([]TurnRecord, error) {
+	return idx.TurnsBefore(wsid, "", n)
+}
+
+// checkpoint：目前已索引的 audit byte offset 與最後一筆處理過的 event id。
+func (idx *Index) checkpoint() (int64, string) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.checkpointOffset, idx.checkpointLastEventID
+}
+
+// clearDegraded：解除 degraded latch（production 走 clearDegradedLocked，
+// 呼叫端已持鎖；這裡補上取鎖，供測試直接驅動）。
+func (idx *Index) clearDegraded() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.clearDegradedLocked()
 }

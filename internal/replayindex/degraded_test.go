@@ -55,7 +55,7 @@ func TestIndexFailureDoesNotBreakAuditAndNotifiesOnce(t *testing.T) {
 	if notices != 1 {
 		t.Fatalf("每個 degraded generation 只發一次通知：%d", notices)
 	}
-	if off, _ := i.Checkpoint(); off != 0 {
+	if off, _ := i.checkpoint(); off != 0 {
 		t.Fatalf("degraded 期間 checkpoint 不得前移：%d", off)
 	}
 }
@@ -116,9 +116,9 @@ func TestClearDegradedOpensNextGeneration(t *testing.T) {
 		t.Fatalf("同一 degraded generation 內不得重複通知：%d", notices)
 	}
 
-	i.ClearDegraded()
+	i.clearDegraded()
 	if i.Degraded() {
-		t.Fatal("ClearDegraded 後必須不再是 degraded")
+		t.Fatal("clearDegraded 後必須不再是 degraded")
 	}
 
 	// 下一個 generation 的失敗要能再通知一次。
@@ -151,7 +151,7 @@ func TestOpenTurnFailureRollsBackTurnState(t *testing.T) {
 	}
 
 	i.ForceWriteErrForTest(nil)
-	i.ClearDegraded()
+	i.clearDegraded()
 
 	// 回滾若沒做，這裡 st.open 仍是 true，狀態機會把下面這則 canonical user
 	// message 直接忽略，永遠不會開新 turn。
@@ -161,7 +161,7 @@ func TestOpenTurnFailureRollsBackTurnState(t *testing.T) {
 	}
 
 	feed(t, i, "w1", string(contract.KindStateChange), string(contract.StateDone), 110)
-	turns, err := i.RecentTurns("w1", 5)
+	turns, err := i.recentTurns("w1", 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestUnverifiedObserveDoesNotTouchCheckpoint(t *testing.T) {
 	// 體 checkpoint **並且**落盤。
 	feedUserMsg(t, i, "w1", 500)
 
-	if off, id := i.Checkpoint(); off != 0 || id != "" {
+	if off, id := i.checkpoint(); off != 0 || id != "" {
 		t.Fatalf("unverified 期間 Observe 不得前移 checkpoint：off=%d id=%q", off, id)
 	}
 	if off := readCheckpointOffset(t, filepath.Join(dir, "checkpoint.json")); off != 0 {
@@ -226,7 +226,7 @@ func TestUnverifiedFlushDoesNotPersistCheckpoint(t *testing.T) {
 	if off := readCheckpointOffset(t, cp); off != 10 {
 		t.Fatalf("前置條件：磁碟 checkpoint 應停在上一個 boundary（10），實際 %d", off)
 	}
-	if off, _ := i.Checkpoint(); off != 20 {
+	if off, _ := i.checkpoint(); off != 20 {
 		t.Fatalf("前置條件：記憶體 checkpoint 應已跑在磁碟前面（20），實際 %d", off)
 	}
 
@@ -258,7 +258,7 @@ func TestUnverifiedIsNotDegraded(t *testing.T) {
 	}
 	// degraded 的解除入口不該把 unverified 一起解掉（它只能靠重啟後的
 	// VerifyOrRebuild 在新的 Index 實例上解除）。
-	i.ClearDegraded()
+	i.clearDegraded()
 	if !i.Unverified() {
 		t.Fatal("ClearDegraded 不得解除 unverified latch")
 	}

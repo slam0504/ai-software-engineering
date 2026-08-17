@@ -59,6 +59,24 @@ export interface Bindings {
   // `this.bindings?.LoadTurnsBefore` 呼叫，沒提供時退回 Task 26 之前的行為
   // （空殼 view，不拋錯）。簽章逐字鏡射 TurnWindowBindings。
   LoadTurnsBefore?(wsid: string, beforeEventID: string, n: number): Promise<Envelope[]>
+  // SetPaneLayout：pane pins／focused pane 的 durable 寫入（§3.2.1 白名單）。
+  // **optional**（同 EndSession／LoadTurnsBefore 的理由）——session store 的
+  // persistLayout() 是唯一呼叫端，沒提供時（dev 未 setBindings、既有測試的
+  // bindings 字面量）靜默跳過持久化、其餘釘選行為完全不變。
+  SetPaneLayout?(pins: string[], focused: string): Promise<void>
+}
+// PaneLayoutInfo：PaneLayout() 的結果（逐字鏡射 Go 的 main.PaneLayout json
+// tag）。pins 固定兩格、空字串＝該 pane 沒有釘選；focused 是 pins 其中一個
+// WSID，或空字串＝focused pane 目前是空的。Go 端已濾掉 tombstone／不存在的
+// WSID（見 App.PaneLayout doc），前端不必再判斷 registry 語意。
+export interface PaneLayoutInfo { pins: string[]; focused: string }
+// PaneLayoutBindings：§3.2.1／§3.8 的 pane 釘選持久化——讀（啟動重建兩個釘選
+// pane 的唯一輸入）與寫（使用者釘選／切焦點）。獨立成一個介面，理由同
+// WorkspaceSessionBindings：session store 只從 Bindings 取用 SetPaneLayout，
+// 讀取端在 App.vue 的 onMounted。
+export interface PaneLayoutBindings {
+  PaneLayout(): Promise<PaneLayoutInfo>
+  SetPaneLayout(pins: string[], focused: string): Promise<void>
 }
 // SessionLifecycleBindings：以 WSID 定址的其餘 lifecycle 入口（Task 26 一併
 // 切換）。與 Bindings 分開的理由同 EvidenceBindings：session store 的 mock 只

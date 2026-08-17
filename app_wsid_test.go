@@ -22,6 +22,9 @@ type stubRegistry struct {
 	removeErr error
 	mutateErr error
 	syncErr   error
+	layoutErr error
+
+	layout wsregistry.Layout
 
 	entries              map[string]wsregistry.Entry
 	deletedUncommitted   bool
@@ -132,6 +135,24 @@ func (s *stubRegistry) ResetView(wsid, viewStartEventID string) error {
 	return s.mutate(wsid, func(e *wsregistry.Entry) {
 		e.ViewStartEventID, e.ResumeSessionID = viewStartEventID, ""
 	})
+}
+
+// SetLayout／Layout：鏡射真實 Store 的 pane pins 深拷貝語意（見 store.go
+// SetLayout 的說明）。layoutErr 讓「寫入失敗不得擋住釘選」那條走得到失敗分支。
+func (s *stubRegistry) SetLayout(l wsregistry.Layout) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.layoutErr != nil {
+		return s.layoutErr
+	}
+	s.layout = wsregistry.Layout{Pins: append([]string(nil), l.Pins...), Focused: l.Focused}
+	return nil
+}
+
+func (s *stubRegistry) Layout() wsregistry.Layout {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return wsregistry.Layout{Pins: append([]string(nil), s.layout.Pins...), Focused: s.layout.Focused}
 }
 
 func (s *stubRegistry) Get(wsid string) (wsregistry.Entry, bool) {

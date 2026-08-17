@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
   ListSessions: vi.fn(async () => []),
   RecoverCodexRecording: vi.fn(async () => {}),
   LoadTurnsBefore: vi.fn(async () => []),
+  PaneLayout: vi.fn(async () => ({ pins: ['', ''], focused: '' })),
+  SetPaneLayout: vi.fn(async () => {}),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
   RunEvidence: vi.fn(async () => 'evidence-id'),
   EvidenceGet: vi.fn(async () => ({})),
@@ -99,6 +101,20 @@ describe('production bindings adapter', () => {
     expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w1', 'e100', 20)
     await b.LoadTurnsBefore('w2', '', 20)
     expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w2', '', 20)
+  })
+
+  // owner review 修正 3（§3.2.1／§3.8）：pane pins 持久化的兩個綁定。
+  // SetPaneLayout 的兩個參數順序不能互換——把 focused 與 pins 對調會讓 Go 端
+  // 的「focused 必須在 pins 之中」直接回錯，釘選從此每次都持久化失敗；而讀取
+  // 端接錯則是重啟後兩個 pane 恆空，正是本票要修的那個缺陷本身。
+  it('PaneLayout／SetPaneLayout 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.PaneLayout()
+    expect(h.PaneLayout).toHaveBeenCalledWith()
+    await b.SetPaneLayout(['w1', 'w2'], 'w2')
+    expect(h.SetPaneLayout).toHaveBeenCalledWith(['w1', 'w2'], 'w2')
+    await b.SetPaneLayout(['w1', ''], 'w1')
+    expect(h.SetPaneLayout).toHaveBeenCalledWith(['w1', ''], 'w1')
   })
 
   // Task 22：TCA workspace 六個新綁定，逐一鎖參數順序與名稱——Go 測試驗不到

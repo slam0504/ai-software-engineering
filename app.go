@@ -487,6 +487,9 @@ type sessionRegistry interface {
 	CommitResume(wsid, resumeSessionID, taskLabel string) error
 	SetResume(wsid, resumeSessionID string) error
 	ResetView(wsid, viewStartEventID string) error
+	// pane pins／focused pane（§3.2.1 白名單的最後兩項，見 PaneLayout／SetPaneLayout）
+	SetLayout(l wsregistry.Layout) error
+	Layout() wsregistry.Layout
 	// Uncertain：registry 的上一次 commit 結果是否不確定（見 registryUncertain）。
 	Uncertain() bool
 }
@@ -735,6 +738,103 @@ func (a *App) ListSessions() ([]SessionInfo, error) {
 	}
 	slices.SortFunc(out, func(x, y SessionInfo) int { return strings.Compare(x.WSID, y.WSID) })
 	return out, nil
+}
+
+// ---- pane pins／focused pane 的持久化（§3.2.1 白名單、§3.8 啟動重建）----
+
+// maxPinnedPanes：§3.7 凍結的並看 pane 數（固定 50/50 兩格，M3b 明確不含
+// N-pane）。與前端 store 的 `pins: [a, b]` 兩格陣列同一個常數。
+const maxPinnedPanes = 2
+
+// PaneLayout：pane pins 與 focused pane 的 durable 排列。
+//
+// 為什麼要持久化（§3.2.1 白名單明列、§3.8 啟動只重建兩個釘選 pane）：pins 是
+// 「重啟後要花錢重建哪兩個 pane」的唯一輸入。不存的話每次重啟兩個 pane 都是空
+// 的、使用者得重新釘選一次，而 §3.8 的整套視窗化載入也就沒有起點。
+//
+// **不是 runtime state**：這裡只有使用者明確選定的排列，沒有 busy／unread／
+// approval pending，白名單不因此鬆動。
+//
+// Pins 固定兩格、空字串代表該 pane 沒有釘選（不是「未設定」——沒有第三種狀態，
+// 所以不用 pointer／omitempty）。Focused 是 Pins 其中一個 WSID，或空字串代表
+// focused pane 目前是空的。
+type PaneLayout struct {
+	Pins    []string `json:"pins"`
+	Focused string   `json:"focused"`
+}
+
+// PaneLayout：讀出目前的釘選排列（唯讀——不建立 slot、不寫 registry）。
+//
+// **latch 期間刻意不擋**：errRegistryUncertain 的處置是「mutation 拒絕、讀取一律
+// 放行」（見該變數 doc）。擋掉讀取只會讓 latch 之後的重啟連上一次的釘選都拿不到。
+//
+// 已 tombstone／已不存在的 WSID 在這裡就地濾成空字串，不留給前端判斷：registry
+// 是「這個 WSID 還算不算數」的權威，而 pins 是使用者最後一次操作的快照，兩者
+// 之間本來就可能落差（另一個路徑移除了 session、SetPaneLayout 又剛好失敗）。濾
+// 掉之後 focused 若指向被濾掉的那一格，一併降級成空字串——否則會回傳一個指向空
+// pane 的 focused，前端得再解釋一次同一件事。
+func (a *App) PaneLayout() (PaneLayout, error) {
+	if a.wsReg == nil {
+		return PaneLayout{}, errNoSessionRegistry
+	}
+	l := a.wsReg.Layout()
+	pins := make([]string, maxPinnedPanes)
+	for i := 0; i < maxPinnedPanes && i < len(l.Pins); i++ {
+		w := l.Pins[i]
+		if w == "" {
+			continue
+		}
+		if e, ok := a.wsReg.Get(w); !ok || e.RemovedAt != "" {
+			continue // 已移除／已不在 registry：該 pane 還原成空
+		}
+		pins[i] = w
+	}
+	out := PaneLayout{Pins: pins, Focused: l.Focused}
+	if out.Focused != "" && !slices.Contains(pins, out.Focused) {
+		out.Focused = ""
+	}
+	return out, nil
+}
+
+// SetPaneLayout：使用者改變釘選或焦點時的 durable 寫入。
+//
+// **寫入頻率與 debounce（本票判斷，見 pane-pins-report.md）**：觸發點是離散的
+// 使用者手勢（點 session 卡片、點另一個 pane、Cmd+1/2），不是資料流，速率上限就
+// 是人手點擊；每次成本是 wsregistry 的四步落盤，且整段在 binding 的 goroutine
+// 上、不在畫面更新路徑。因此**不做 debounce／batching**，與 persistLocked 那條
+// 契約同一個結論（省下的 sync 換不到有意義的東西），而且 debounce 會多欠一筆
+// 「shutdown 前要 flush」的義務——§3.6.5 的 shutdown 總序是凍結的，為一個 UI
+// 偏好去動它不成比例。
+//
+// **失敗不擋路**：這裡照常 fail loud 回錯（含 latch 期間的 errRegistryUncertain），
+// 但呼叫端（前端 store 的 persistLayout）只把錯誤送進 notices lane，不回滾使用者
+// 剛做的釘選——pins 是 UI 偏好，不是 resume correctness，寫不進去的正確降級是
+// 「這次的排列重啟後會遺失」，不是「不准釘選」。
+//
+// 走 beginAppTxn 的理由：§3.6.5 把 `session registry Sync` 凍結為 shutdown 的最後
+// 一步，晚於它抵達的寫入不是遺失就是把已 flush 的內容再弄髒。shutdown 柵欄是既有
+// 且唯一的擋法。
+func (a *App) SetPaneLayout(pins []string, focused string) error {
+	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
+		return err
+	}
+	defer a.endAppTxn()
+	if a.wsReg == nil {
+		return errNoSessionRegistry
+	}
+	if len(pins) > maxPinnedPanes {
+		return fmt.Errorf("app: SetPaneLayout 最多 %d 個 pane，got %d", maxPinnedPanes, len(pins))
+	}
+	// focused 必須是 pins 其中一格：不是的話代表呼叫端的兩個欄位已經不同步，
+	// 寫進去只會在下一次啟動還原出一個指向不存在 pane 的焦點。
+	if focused != "" && !slices.Contains(pins, focused) {
+		return fmt.Errorf("app: SetPaneLayout focused %q 不在 pins %v 之中", focused, pins)
+	}
+	if a.registryUncertain() {
+		return errRegistryUncertain
+	}
+	return a.noteRegistryUncertainErr("set_layout", focused,
+		a.wsReg.SetLayout(wsregistry.Layout{Pins: pins, Focused: focused}))
 }
 
 // resolveWSID：exported WSID binding 共用的解析入口——WSID → provider，且保證

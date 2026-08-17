@@ -90,6 +90,10 @@ export function NewSession(arg1) {
   return window['go']['main']['App']['NewSession'](arg1);
 }
 
+export function PaneLayout() {
+  return window['go']['main']['App']['PaneLayout']();
+}
+
 export function PlanAssist(arg1, arg2) {
   return window['go']['main']['App']['PlanAssist'](arg1, arg2);
 }
@@ -156,6 +160,10 @@ export function RunEvidence(arg1, arg2, arg3, arg4, arg5, arg6) {
 
 export function SendMessage(arg1, arg2) {
   return window['go']['main']['App']['SendMessage'](arg1, arg2);
+}
+
+export function SetPaneLayout(arg1, arg2) {
+  return window['go']['main']['App']['SetPaneLayout'](arg1, arg2);
 }
 
 export function SpecAssist(arg1, arg2, arg3) {

@@ -41,6 +41,12 @@ const appMocks = vi.hoisted(() => ({
   CreateSession: vi.fn(async () => 'w-new'),
   RemoveSession: vi.fn(async () => undefined),
   RecoverCodexRecording: vi.fn(), LoadTurnsBefore: vi.fn(),
+  // PaneLayout／SetPaneLayout：pane pins 持久化（owner review 修正 3）。這份
+  // mock 必須跟著 production 的 wailsjs module 走——少一個，App.vue 的
+  // onMounted 與 store 的 persistLayout 會各多丟一個「呼叫 undefined」的錯誤
+  // 進 notices，把本檔的錯誤計數斷言全部撞歪。
+  PaneLayout: vi.fn(async () => ({ pins: ['', ''], focused: '' })),
+  SetPaneLayout: vi.fn(async () => undefined),
   RegisterMutation: vi.fn(), RunEvidence: vi.fn(), EvidenceGet: vi.fn(),
   SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
   AuthStatus: vi.fn(), StartLogin: vi.fn(), CancelLogin: vi.fn(), Logout: vi.fn(),

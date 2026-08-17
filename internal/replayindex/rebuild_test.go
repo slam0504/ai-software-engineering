@@ -224,10 +224,10 @@ func TestIndexBehindIsCaughtUp(t *testing.T) {
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
 	}
-	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 3 {
+	if turns, _ := i.recentTurns("w1", 10); len(turns) != 3 {
 		t.Fatalf("落後必須補掃（w1）：%d", len(turns))
 	}
-	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 3 {
+	if turns, _ := i.recentTurns("w2", 10); len(turns) != 3 {
 		t.Fatalf("落後必須補掃（w2）：%d", len(turns))
 	}
 }
@@ -247,16 +247,16 @@ func TestIndexAheadIsRepaired(t *testing.T) {
 	if err := i.VerifyOrRebuild(audit); err != nil {
 		t.Fatal(err)
 	}
-	off, last := i.Checkpoint()
+	off, last := i.checkpoint()
 	if off > auditSize(t, audit) || last == "e-nonexistent" {
 		t.Fatalf("超前的不可信 checkpoint 未修復：%d %s", off, last)
 	}
 	// 修復後仍應保有兩個 WSID 各兩個完整 turn（不可信重建須以「丟棄舊快取
 	// ＋全量重掃」完成，不能留下 0 筆、遺漏其中一個 WSID，或重複筆數）。
-	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 2 {
+	if turns, _ := i.recentTurns("w1", 10); len(turns) != 2 {
 		t.Fatalf("超前修復後應精確重建 2 個 turn、不重複不遺漏（w1）：%d", len(turns))
 	}
-	if turns, _ := i.RecentTurns("w2", 10); len(turns) != 2 {
+	if turns, _ := i.recentTurns("w2", 10); len(turns) != 2 {
 		t.Fatalf("超前修復後應精確重建 2 個 turn、不重複不遺漏（w2）：%d", len(turns))
 	}
 	// 舊的 turns.jsonl 內容必須被 quarantine（改名保留一份），不是直接被
@@ -459,7 +459,7 @@ func TestCheckpointVerificationDegradesObservablyOnOversizedLine(t *testing.T) {
 	if off, ok := i.OpenTurnStart(wsid); !ok || off != startOffset {
 		t.Fatalf("降級為全量重建後仍須正確還原 open turn 起點：off=%d ok=%v want=%d", off, ok, startOffset)
 	}
-	if turns, _ := i.RecentTurns("w1", 10); len(turns) != 1 {
+	if turns, _ := i.recentTurns("w1", 10); len(turns) != 1 {
 		t.Fatalf("全量重建須保留其他 WSID 既有的完整 turn：%d", len(turns))
 	}
 

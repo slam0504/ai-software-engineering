@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { t } from '../i18n'
-import type { Bindings, ChatItem, Envelope, SessionInfo, TimelineItem } from '../types'
+import type { Bindings, ChatItem, Envelope, PaneLayoutInfo, SessionInfo, TimelineItem } from '../types'
 
 const NOISE_KINDS = new Set(['system_other', 'unknown'])
 export const PROVIDERS = ['claude', 'codex'] as const
@@ -284,6 +284,61 @@ export const useSession = defineStore('session', {
       this.focused = i
       const w = this.pins[i]
       if (w && this.sessions[w]) this.sessions[w].unread = 0
+      void this.persistLayout()
+    },
+
+    // persistLayout：把「使用者真正選定的排列」寫進 registry（§3.2.1 白名單的
+    // pane pins／focused pane）。**唯一的寫入點**——pin／unpin／setFocus／
+    // markRemoved 都經過這裡。
+    //
+    // 送出的是 persistentPins **不是** pins：approval 的 transient secondary
+    // presentation 會改 pins（§3.6.4），把它寫進 registry 等於讓一次核可對話
+    // 永久改掉使用者的釘選——§3.6.4 明文「persistent pin 永不被 transient view
+    // 改寫」，這裡是那條規則在 durable 層的落點。
+    //
+    // **失敗不回滾**（本票裁決，見 Go 端 SetPaneLayout doc）：pins 是 UI 偏好、
+    // 不是 resume correctness。寫入被 registry uncertain latch 拒絕時，正確的
+    // 降級是「這次的排列重啟後會遺失」，不是「不准釘選」。所以只把錯誤送進
+    // notices lane（app-wide，不是 pane-scoped——latch 與 registry 不可用都不
+    // 屬於任何單一 session，pushError 會把訊息掛到不相干的 pane 上並清掉它的
+    // busy），畫面上的釘選照常生效。錯誤字串帶著 latch 片語，因此 bumpError
+    // 會照常撥 latchSeq、強制展開 timeline。
+    //
+    // 不做 debounce：觸發點是離散的使用者手勢，速率上限就是人手點擊；每次寫入
+    // 都在 binding 的非同步路徑上、不擋畫面。debounce 只會多欠一筆 shutdown 前
+    // 要 flush 的義務（§3.6.5 的總序是凍結的），換不到有意義的東西。
+    async persistLayout() {
+      const set = this.bindings?.SetPaneLayout
+      if (!set) return // dev 未 setBindings／測試字面量未提供：靜默跳過持久化
+      const pins = [this.persistentPins[0] ?? '', this.persistentPins[1] ?? '']
+      try {
+        await set(pins, pins[this.focused])
+      } catch (e) {
+        this.pushNotice(t('store.paneLayoutPersistFailed', { error: String((e as Error)?.message ?? e) }))
+      }
+    },
+
+    // restoreLayout：啟動時以 registry 的排列重建兩個釘選 pane（§3.8）。
+    // App.vue 在 hydrateSessions() **之後**呼叫——pin() 需要該 WSID 的 meta 才
+    // 能歸零 unread，而 meta 來自 ListSessions()。
+    //
+    // 跳過 sessions 裡沒有的 WSID：Go 端 PaneLayout() 已經濾掉 tombstone 與不存
+    // 在的 entry，這裡是第二道——把一個沒有 metadata 的 WSID 釘上去會生出一個
+    // 綁不到任何 session 的 pane（provider／狀態全部讀不到），比少還原一格糟。
+    //
+    // pin(..., false)：還原不重寫。逐格 pin 會先寫一次只有 pane 0 的排列、再寫
+    // 一次兩格都有的，中途關掉 app 就把使用者的第二個釘選弄丟了；而且啟動本來
+    // 就沒有任何新資訊要寫回磁碟。
+    async restoreLayout(l: PaneLayoutInfo | null | undefined) {
+      const pins = l?.pins ?? []
+      for (const idx of [0, 1] as const) {
+        const w = pins[idx] ?? ''
+        if (!w || !this.sessions[w]) continue
+        await this.pin(idx, w, false)
+      }
+      // 直接設 focused 而不呼叫 setFocus()：setFocus 會觸發 persistLayout。
+      const at = this.pins.indexOf(l?.focused ?? '')
+      if (at === 0 || at === 1) this.focused = at
     },
 
     // pin：把 session 釘進 pane（persistent）。已有 view（例如同一 wsid 仍釘在
@@ -293,12 +348,16 @@ export const useSession = defineStore('session', {
     // 對話看不到，因為 pin() 過去只建空殼、從不回填）。沒有
     // bindings.LoadTurnsBefore（dev 尚未 setBindings、或測試 mock 未提供）時
     // 退回舊行為：空殼 view、不拋錯。
-    async pin(idx: 0 | 1, wsid: string) {
+    // persist=false 只有一個呼叫端：restoreLayout()（見那裡的說明）。
+    async pin(idx: 0 | 1, wsid: string, persist = true) {
       const prev = this.pins[idx]
       if (prev && prev !== wsid) this.releaseView(prev, idx)
       this.persistentPins[idx] = wsid
       this.pins[idx] = wsid
       if (this.transientPane === idx) this.transientPane = null
+      // 在 lazy load 之前就送出：持久化的是使用者的選擇，沒有理由等 transcript
+      // 載完（那一段可能因為 index 重建而慢，甚至失敗）。
+      if (persist) void this.persistLayout()
       const isNew = !this.views[wsid]
       if (isNew) this.views[wsid] = newView()
       const m = this.sessions[wsid]
@@ -330,6 +389,7 @@ export const useSession = defineStore('session', {
       this.pins[idx] = null
       if (this.transientPane === idx) this.transientPane = null
       if (w) this.releaseView(w, idx)
+      void this.persistLayout()
     },
 
     // releaseView：釋放某 WSID 的 transcript——除非它同時釘在另一個 pane 上。
@@ -597,14 +657,22 @@ export const useSession = defineStore('session', {
         m.active = false
         m.awaitingApproval = false
       }
+      let unpinned = false
       for (const idx of [0, 1] as const) {
-        if (this.persistentPins[idx] === wsid) this.persistentPins[idx] = null
+        if (this.persistentPins[idx] === wsid) {
+          this.persistentPins[idx] = null
+          unpinned = true
+        }
         if (this.pins[idx] === wsid) {
           this.pins[idx] = null
           if (this.transientPane === idx) this.transientPane = null
         }
       }
       delete this.views[wsid]
+      // 只有真的動到 persistent 釘選才寫：移除一個沒被釘選的 session 不改變排列。
+      // 不寫的話 registry 會留著一個指向 tombstone 的 pin——Go 端 PaneLayout()
+      // 讀取時會濾掉它，但那是第二道防線，不是不寫的理由。
+      if (unpinned) void this.persistLayout()
     },
 
     setTaskLabel(v: string) { const m = this.focusedSession; if (m) m.taskLabel = v },

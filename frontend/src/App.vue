@@ -261,6 +261,15 @@ onMounted(async () => {
   // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
   // Task 29 的 lazy load，這裡只 hydrate metadata。
   try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
+  // §3.8「啟動只重建兩個釘選 pane」的**輸入**：registry 的 pane pins／focused
+  // pane（§3.2.1 白名單）。必須排在 hydrateSessions 之後——restoreLayout 只釘
+  // 已經有 metadata 的 WSID（見該 action 的說明）。失敗只記錄不擋啟動：拿不到
+  // 排列的降級是「兩個 pane 是空的、使用者自己釘」，不該連 app 都開不起來。
+  try {
+    await s.restoreLayout(await wailsBindings.PaneLayout())
+  } catch (e) {
+    s.pushNotice(t('app.paneLayout.restoreFailed', { error: String(e) }))
+  }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
   await refreshEscalation()

@@ -491,6 +491,20 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class PaneLayout {
+	    pins: string[];
+	    focused: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new PaneLayout(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.pins = source["pins"];
+	        this.focused = source["focused"];
+	    }
+	}
 	export class SessionInfo {
 	    wsid: string;
 	    provider: string;

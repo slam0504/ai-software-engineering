@@ -630,7 +630,7 @@ const unlimitedScanBudget = int64(math.MaxInt64)
 
 // catchUpUnlocked：五步序列第 1／2 步的掃描本體。從 rebuildCursor 續掃到目前檔
 // 尾，**不持 emitMu**（audit 照常 append），idx.mu 則是**每段取一次**：掃滿
-// scanSegmentBytes 就釋放，讓 Observe／RecentTurns 等待鎖的一方有機會插進來，
+// scanSegmentBytes 就釋放，讓 Observe／TurnsBefore 等待鎖的一方有機會插進來，
 // 再重新取得續掃。
 //
 // 迴圈終止：scanAuditRangeLocked 的 budget 是在處理每筆事件**之前**檢查的，所
