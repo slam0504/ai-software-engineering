@@ -22,8 +22,22 @@ const s = useSession()
 
 // pin：把 session 釘進目前 focused pane（已釘選過→切 focus，不重新釘一次，
 // 沿用 SettingsBar.selectSession 的既定行為）。
+//
+// **「已釘選」一律以 `persistentPins` 判定，不是 `s.pins`**（owner 2026-08-17
+// 補充：「釘選＝明確選定」的前提是 **UI 能清楚顯示釘選會作用在哪一格**；目標格
+// 對使用者不可辨識時就不算明確選定）。
+//
+// `s.pins` 含 approval 的 transient 顯示。用它判定會產生一種使用者無法預測的
+// 第三語意：approval 把 w3 暫時顯示在 pane 1 時按 w3 的釘選鈕，`s.pins` 判定
+// 「已釘選」→ 走 `setFocus(1)` → **w3 根本沒被釘上**，卻把 durable focus 搬到
+// pane 1 並落盤，核可後 w3 就消失了。按鈕寫著「釘選」，實際效果是「什麼都沒釘、
+// 但改了持久化的焦點」。
+//
+// 改用 persistentPins 之後，那一格走的是 `s.pin(s.focused, wsid)`——w3 真的被
+// 釘進使用者當下作用中的那一格（transient 分支不移動焦點，所以就是使用者原本
+// 那格），與按鈕字面一致。
 function pin(wsid: string) {
-  const at = s.pins.indexOf(wsid)
+  const at = s.persistentPins.indexOf(wsid)
   if (at === 0 || at === 1) s.setFocus(at)
   else s.pin(s.focused, wsid)
 }

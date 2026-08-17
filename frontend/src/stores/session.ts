@@ -293,8 +293,11 @@ export const useSession = defineStore('session', {
     },
 
     // setFocus：**使用者明確點選 pane**（點 pane、Cmd+1/2、SessionList 點到已釘選
-    // 的卡片）。這是唯一會更新 durable focus 的入口——approval 的自動切換走
-    // routeApproval，不經過這裡（owner 2026-08-17 裁決）。
+    // 的卡片）。
+    //
+    // 更新 durable focus 的入口有**兩個**：這裡與 `pin()`（owner 2026-08-17 追加
+    // 裁決——「把 X 釘進第 N 格」同時明確選了 session 與 pane）。approval 的自動
+    // 切換走 `routeApproval`，**不**更新 durable。
     setFocus(i: 0 | 1) {
       this.focused = i
       this.durableFocusPane = i
