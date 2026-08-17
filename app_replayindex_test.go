@@ -708,6 +708,11 @@ func TestRegistryLoadFailureDoesNotFossilizeIndexGapAcrossRestart(t *testing.T) 
 	// 「驗證沒跑過也照樣有事件進 Observe」的真實來源。
 	a1.manager.EmitWorkspace(string(contract.KindStreamError), nil,
 		map[string]string{"error": "registry 損毀"})
+	// 進入 unverified 這件事本身要有訊號（Fail Loud）。斷言事件名，否則這條
+	// 稽核只寫在產生它的那一行、改掉不會有人發現。
+	if !auditHas(t, dir, "replay_index_unverified") {
+		t.Fatal("index 切到 unverified latch 必須留下 replay_index_unverified 稽核")
+	}
 	// shutdown 的相關兩步（§3.6.5：Manager.Close 之後才 index Flush）。
 	if err := a1.manager.Close(); err != nil {
 		t.Fatal(err)
@@ -740,5 +745,91 @@ func TestRegistryLoadFailureDoesNotFossilizeIndexGapAcrossRestart(t *testing.T) 
 	if n := countCompleteTurns(got); n != 1 {
 		t.Fatalf("第一次啟動的未驗證 index 不得把 durable checkpoint 推過舊 turn："+
 			"第二次啟動只讀回 %d 個完整 turn（%d 筆 envelope），期望 1 個", n, len(got))
+	}
+}
+
+// injectVerifyFailure：讓下一次 VerifyOrRebuild 回錯——在 replay-index 底下放一
+// 個名字符合 `*.turns.jsonl` 的**目錄**。checkpoint 可信時
+// repairTurnFileCorruptionLocked 會 glob 到它、對它 os.ReadFile 拿到 EISDIR，
+// 那既不是 IsNotExist、也不是中段損壞 sentinel，於是整個 verify 直接回錯。
+//
+// 刻意**不用**「寫壞 checkpoint.json」那招（TestVerifyFailureMakesWindowFailLoud
+// 用的是它）：checkpoint.json 正是跨重啟測試要觀察的證據，注入與觀察對象不能是
+// 同一個檔案——第二次啟動前「移除注入」會連證據一起抹掉，mutation 會假綠。回傳
+// 移除注入用的 path。
+func injectVerifyFailure(t *testing.T, stateDir string) string {
+	t.Helper()
+	p := filepath.Join(stateDir, "replay-index", "zz-inject.turns.jsonl")
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestVerifyFailureDoesNotFossilizeIndexGapAcrossRestart：與上一條對稱，守
+// `VerifyOrRebuild` 失敗那一格的接線。
+//
+// 這一格的代價比 registry 那格**大**，不是小：registry 失敗會讓 restoreSessions
+// 提前 return、a.wsReg 維持 nil、openUIAndProviders 從未被呼叫，整場根本產不出
+// provider turn；而 verify 失敗照常開放 UI 與 provider，使用者整場正常工作，每
+// 一個 turn 都進 audit。若 index 這時仍在寫 durable checkpoint，第一筆 live 事
+// 件就會把 checkpointOffset 推過**它之前所有從未索引的 turn**，Flush 落盤後下次
+// 啟動判定可信、從那裡起掃，那些舊 turn 永久消失。
+//
+// 所以序列是：舊 turn（從未索引）→ verify 失敗 → 使用者跑一個完整 live turn →
+// shutdown → 移除注入 → 第二次啟動必須讀得到**兩個** turn。
+func TestVerifyFailureDoesNotFossilizeIndexGapAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	// 舊的完整 turn：先於本次啟動就在 audit 裡，但還沒被索引過。
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","workspace_session_id":"w1","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"state_change","workspace_session_id":"w1","state":"done"}`)
+	// registry 是好的——這一格的重點正是「啟動照常完成、session 全部還原」。
+	seedRegistry(t, dir, wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"})
+
+	// ---- 第一次啟動：index_verify 跑了但失敗 ----
+	a1 := newTestAppAt(t, dir)
+	inject := injectVerifyFailure(t, dir)
+	if _, err := a1.restoreSessions(); err != nil {
+		t.Fatalf("index 驗證失敗不得阻擋啟動（它是快取，不是權威）：%v", err)
+	}
+	if !a1.indexUnverified.Load() {
+		t.Fatal("前提：VerifyOrRebuild 必須真的失敗，否則本測試沒走到缺口路徑")
+	}
+	if !auditHas(t, dir, "replay_index_unverified") {
+		t.Fatal("index 切到 unverified latch 必須留下 replay_index_unverified 稽核")
+	}
+
+	// 使用者整場正常工作：registry 沒問題、slot 已由 restore_dormant 還原。
+	emitCompleteTurn(t, a1, appcore.WSID("w1"), "live turn")
+
+	a1.shutdown(context.Background())
+	// 被跳過的 Flush 不能無聲（§3.6.5 的 index_flush_close 這一步）。
+	if !auditHas(t, dir, "replay_index_flush_skipped") {
+		t.Fatal("unverified 下 Flush 被跳過，必須留下 replay_index_flush_skipped 稽核")
+	}
+
+	// ---- 移除注入（checkpoint.json 全程沒被碰過，證據完整）----
+	if err := os.RemoveAll(inject); err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- 第二次啟動 ----
+	a2 := newTestAppAt(t, dir)
+	if _, err := a2.restoreSessions(); err != nil {
+		t.Fatalf("注入已移除，第二次啟動不該再失敗：%v", err)
+	}
+	if a2.indexUnverified.Load() {
+		t.Fatal("第二次啟動的 VerifyOrRebuild 應該成功")
+	}
+
+	got, err := a2.LoadTurnsBefore("w1", "", turnPageSize)
+	if err != nil {
+		t.Fatalf("第二次啟動已通過驗證，視窗載入不該回錯：%v", err)
+	}
+	if n := countCompleteTurns(got); n != 2 {
+		t.Fatalf("verify 失敗後 index 不得繼續前移 durable checkpoint："+
+			"第二次啟動只讀回 %d 個完整 turn（%d 筆 envelope），期望 2 個"+
+			"（seed 的舊 turn ＋ 第一次啟動那場 live turn）", n, len(got))
 	}
 }
