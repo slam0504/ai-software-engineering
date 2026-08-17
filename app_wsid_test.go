@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -78,6 +79,45 @@ func (s *stubRegistry) Remove(wsid, reason string) error {
 	s.entries[wsid] = e
 	s.removedWithTombstone = true
 	return nil
+}
+
+// mutate：鏡射 wsregistry.Store.mutate 的哨兵語意（entry 不存在／已 tombstone
+// 各回一個可辨識的錯誤）。stub 若對這兩種情況靜默成功，所有「已移除的 WSID 不得
+// 寫回續聊身分」的斷言都會變成假綠。
+func (s *stubRegistry) mutate(wsid string, fn func(*wsregistry.Entry)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[wsid]
+	if !ok {
+		return fmt.Errorf("%w: %q", wsregistry.ErrEntryNotFound, wsid)
+	}
+	if e.RemovedAt != "" {
+		return fmt.Errorf("%w: %q", wsregistry.ErrTombstoned, wsid)
+	}
+	fn(&e)
+	s.entries[wsid] = e
+	return nil
+}
+
+func (s *stubRegistry) CommitResume(wsid, resumeSessionID, taskLabel string) error {
+	return s.mutate(wsid, func(e *wsregistry.Entry) {
+		if resumeSessionID != "" {
+			e.ResumeSessionID = resumeSessionID
+		}
+		if taskLabel != "" {
+			e.TaskLabel = taskLabel
+		}
+	})
+}
+
+func (s *stubRegistry) SetResume(wsid, resumeSessionID string) error {
+	return s.mutate(wsid, func(e *wsregistry.Entry) { e.ResumeSessionID = resumeSessionID })
+}
+
+func (s *stubRegistry) ResetView(wsid, viewStartEventID string) error {
+	return s.mutate(wsid, func(e *wsregistry.Entry) {
+		e.ViewStartEventID, e.ResumeSessionID = viewStartEventID, ""
+	})
 }
 
 func (s *stubRegistry) Get(wsid string) (wsregistry.Entry, bool) {

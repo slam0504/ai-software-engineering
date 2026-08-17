@@ -337,8 +337,9 @@ func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.EndSession(string(wA)) })
-	waitFor(t, "A 的 resume 已 commit 進 restore.json", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+	waitFor(t, "A 的 resume 已 commit 進自己的 entry", func() bool {
+		e, _ := a.wsReg.Get(string(wA))
+		return e.ResumeSessionID == "sess-A"
 	})
 
 	// 第二個 claude session：resume 參數留空，且從未對話過
@@ -367,24 +368,20 @@ func TestSecondSessionOfSameProviderDoesNotInheritResume(t *testing.T) {
 	if strings.Contains(lines[1], "--resume") {
 		t.Fatalf("同 provider 第二個 session 不得繼承 provider-keyed 的 resume（會接到別人的對話）：%q", lines[1])
 	}
-	if !auditHas(t, a.stateDir, "resume_fallback_skipped") {
-		t.Fatal("跳過 resume 必須 fail loud 進 audit，不得靜默")
+	// per-WSID writer 之後不再需要「不明確就跳過並通知使用者」那套：B 讀的是
+	// **自己的** entry，本來就是空的，沒有東西可跳過、也沒有理由打擾使用者。
+	// 取而代之的正向保證是 A 的續聊身分完全沒被動到。
+	if got, _ := a.wsReg.Get(string(wA)); got.ResumeSessionID != "sess-A" {
+		t.Fatalf("B 啟動不得動到 A 的續聊身分：%q", got.ResumeSessionID)
 	}
-	// audit 只有事後對帳看得到；使用者端也要有訊號，否則對話莫名從頭開始而
-	// 沒有任何解釋（workspace 通知經 gateRouting 的 notice lane 進 Timeline）。
-	var sawNotice bool
-	for _, env := range ui.findEnvKind(string(contract.KindStreamError)) {
-		if env.Scope == "workspace" && strings.Contains(string(env.Payload), "不自動接續") {
-			sawNotice = true
-		}
-	}
-	if !sawNotice {
-		t.Fatal("跳過 resume 必須發 workspace 通知，使用者才知道為什麼沒有接續")
-	}
+	_ = ui
 }
 
 // NewSession 的 ResetView 同樣是 provider-keyed 的破壞性寫入：對 B 按「開新對話」
 // 不得清掉 A 的 resume id。
+// D5 等價改寫：舊實作的 ResetView 是 provider-keyed 的破壞性寫入，只能在
+// 「不明確」時整段跳過（代價：New 在跨重啟那一維沒有效果）。per-WSID 之後
+// **無條件執行**，保證換成「只影響自己那一筆」。
 func TestNewSessionDoesNotResetAnotherSessionsRestoreEntry(t *testing.T) {
 	a, _ := newTestApp(t)
 	a.wsReg = &stubRegistry{}
@@ -398,19 +395,22 @@ func TestNewSessionDoesNotResetAnotherSessionsRestoreEntry(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = a.EndSession(string(wA)) })
 	waitFor(t, "A 的 resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID != ""
+		e, _ := a.wsReg.Get(string(wA))
+		return e.ResumeSessionID != ""
 	})
-	before := a.restore.Get("claude").ResumeSessionID
+	beforeEntry, _ := a.wsReg.Get(string(wA))
+	before := beforeEntry.ResumeSessionID
 
 	wB := mustCreate(t, a, "claude") // dormant，從未 start
 	if err := a.NewSession(string(wB)); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.restore.Get("claude").ResumeSessionID; got != before {
-		t.Fatalf("對 B 開新對話不得清掉 A 的 resume：%q → %q", before, got)
+	if got, _ := a.wsReg.Get(string(wA)); got.ResumeSessionID != before {
+		t.Fatalf("對 B 開新對話不得清掉 A 的 resume：%q → %q", before, got.ResumeSessionID)
 	}
-	if !auditHas(t, a.stateDir, "reset_view_skipped") {
-		t.Fatal("跳過 ResetView 必須 fail loud 進 audit")
+	// 而 B 自己的 view boundary 必須真的前移（不再跳過）
+	if got, _ := a.wsReg.Get(string(wB)); got.ViewStartEventID == "" {
+		t.Fatal("多 session 情境下 New 仍必須為自己前移 view boundary，不得跳過")
 	}
 }
 
@@ -518,58 +518,41 @@ func TestProviderRestoreUnambiguousUsesBothSources(t *testing.T) {
 	})
 }
 
-// 🟠 Important 迴歸（Task 26 review round-2）：Critical 的時間軸變體。
-// A 建立 → 對話（restore = sess-A）→ End → Remove（tombstone、名額釋放）→ 建立
-// 全新 B → StartSession(B, resume="")。此刻 Manager 與 registry 都只剩一筆，
-// 「明確」判定放行，B 會拿到 --resume sess-A。修法是移除時無條件清掉 restore
-// 的續聊身分。
+// 🟠 Important 迴歸（Task 26 review round-2）的 per-WSID 等價（D5）：
+// A 建立 → 對話（resume = sess-A）→ End → Remove（tombstone）→ 建立全新 B →
+// StartSession(B, resume="")。B 不得拿到 --resume sess-A。
+//
+// 舊實作靠「移除時無條件清掉 provider-keyed 的 restore 身分」達成，代價是存活的
+// 手足一併失去續聊；現在靠 tombstone ＋ per-WSID 讀取，B 讀的本來就是自己的
+// entry（空的），而 A 的 entry 就算還留著 id 也已被 tombstone 擋住。
 func TestRemovedSessionsResumeIsNotInheritedByNextSession(t *testing.T) {
 	a, _ := newTestApp(t)
-	a.wsReg = &stubRegistry{}
+	bootRegistry(t, a)
 	argvFile := writeInitClaude(t, a, "sess-A")
-	// 給 view 視窗一個**非空**的起點：newTestApp 的 events.jsonl 是空的，
-	// high-watermark 因此是空字串，不先設的話下面「視窗未被動到」的斷言會是
-	// 恆真（空 → 空）。
-	if err := a.restore.ResetView("claude", "01SEEDWATERMARK0000000001"); err != nil {
-		t.Fatal(err)
-	}
 
 	wA := mustCreate(t, a, "claude")
 	if err := a.StartSession(string(wA), "hi A", "", "", "task-a", ""); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "A 的 resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+		e, _ := a.wsReg.Get(string(wA))
+		return e.ResumeSessionID == "sess-A"
 	})
 	if err := a.EndSession(string(wA)); err != nil {
 		t.Fatal(err)
 	}
-	viewStart := a.restore.Get("claude").ViewStartEventID
-	if viewStart == "" {
-		t.Fatal("前提不成立：view 視窗起點必須非空，否則下面的斷言恆真")
-	}
 	if err := a.RemoveSession(string(wA)); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
-		t.Fatalf("移除後 restore 的續聊身分必須清空，got %q", got)
+	// tombstone 之後那個身分不得再被讀成續聊來源（entry 本身刻意留著）
+	if got := a.registryResume(wA); got != "" {
+		t.Fatalf("已移除的 session 不得再回報續聊身分，got %q", got)
 	}
-	// TaskID 也屬於「續聊身分」的一部分（CommitResume 與 resume id 同一筆寫入）：
-	// 留著會讓下一個新 session 的 view 預填成已移除 session 的任務標籤。
-	if got := a.restore.Get("claude").TaskID; got != "" {
-		t.Fatalf("移除後 restore 的 TaskID 必須一併清空，got %q", got)
+	if e, ok := a.wsReg.Get(string(wA)); !ok || e.ResumeSessionID != "sess-A" {
+		t.Fatalf("tombstone 不需要抹掉 entry 內容（讀取端已擋）：%+v ok=%v", e, ok)
 	}
-	// 只清續聊身分，**不動 view 視窗**：ViewStartEventID 是 provider 層的重放
-	// 起點（restoreSessions 以 replayViewWindow 判 dormant），移除一個 session
-	// 把它清成空字串等於讓同 provider 的重放從 events.jsonl 最開頭重來。
-	if got := a.restore.Get("claude").ViewStartEventID; got != viewStart {
-		t.Fatalf("移除不得動到 view 視窗起點：%q → %q", viewStart, got)
-	}
-	// 前提校驗：此刻判定確實是「明確」——否則本測試會因為別的理由通過
+
 	wB := mustCreate(t, a, "claude")
-	if !a.providerRestoreUnambiguous(contract.ProviderClaude) {
-		t.Fatal("前提不成立：移除後只剩一個 session，判定應為明確（否則測不到本缺陷）")
-	}
 	if err := a.StartSession(string(wB), "hi B", "", "", "task-b", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +585,8 @@ func TestSoleRegistrySessionStillResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+		e, _ := a.wsReg.Get(string(w))
+		return e.ResumeSessionID == "sess-A"
 	})
 	if err := a.EndSession(string(w)); err != nil {
 		t.Fatal(err)
@@ -620,12 +604,15 @@ func TestSoleRegistrySessionStillResumes(t *testing.T) {
 	})
 }
 
-// N3（review round-3）：ClearResume 必須是**無條件**的，不是「只在移除最後一個
-// session 時才清」。時間軸序列 2／3 的唯一保證就是這個無條件性——A、B 並存時
-// 移除 A，restore 仍停在 sess-A，B 下一次 StartSession 就會接到 A 的對話。
-func TestRemoveClearsResumeEvenWhenSiblingsRemain(t *testing.T) {
+// D5 等價改寫（原 N3：ClearResume 必須無條件）。
+// 舊實作的無條件清除是為了防「移除 A → B 讀到 A 的 id」，代價寫在 Task 26 的
+// 註解裡：**存活的手足一併失去續聊**。per-WSID 之後保證反轉——手足必須留住自己
+// 的續聊身分，而 B 讀的本來就不是 A 的 entry。
+//
+// mutation：把 RemoveSession 的 tombstone 之後補回 provider 級清除 → 這條轉紅。
+func TestRemoveKeepsSiblingResumeAndBLeavesAsIs(t *testing.T) {
 	a, _ := newTestApp(t)
-	a.wsReg = &stubRegistry{}
+	bootRegistry(t, a)
 	argvFile := writeInitClaude(t, a, "sess-A")
 
 	wA := mustCreate(t, a, "claude")
@@ -634,45 +621,49 @@ func TestRemoveClearsResumeEvenWhenSiblingsRemain(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "A 的 resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+		e, _ := a.wsReg.Get(string(wA))
+		return e.ResumeSessionID == "sess-A"
 	})
 	if err := a.EndSession(string(wA)); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RemoveSession(string(wA)); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
-		t.Fatalf("還有手足存活時同樣必須清除（無條件），got %q", got)
-	}
-
+	// B 也先跑過一輪，拿到自己的續聊身分
 	if err := a.StartSession(string(wB), "hi B", "", "", "task-b", ""); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
-	waitFor(t, "B 的 argv 已落檔", func() bool {
-		b, err := os.ReadFile(argvFile)
-		return err == nil && strings.Count(string(b), "--mcp-config") >= 2
+	waitFor(t, "B 的 resume 已 commit", func() bool {
+		e, _ := a.wsReg.Get(string(wB))
+		return e.ResumeSessionID != ""
 	})
-	b, err := os.ReadFile(argvFile)
-	if err != nil {
+	if err := a.EndSession(string(wB)); err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if strings.Contains(lines[len(lines)-1], "--resume") {
-		t.Fatalf("存活的手足不得繼承已移除 session 的 resume：%q", lines[len(lines)-1])
+	beforeB, _ := a.wsReg.Get(string(wB))
+
+	if err := a.RemoveSession(string(wA)); err != nil {
+		t.Fatal(err)
 	}
+	if got, _ := a.wsReg.Get(string(wB)); got.ResumeSessionID != beforeB.ResumeSessionID {
+		t.Fatalf("移除手足不得讓存活 session 失去續聊：%q → %q",
+			beforeB.ResumeSessionID, got.ResumeSessionID)
+	}
+	if err := a.StartSession(string(wB), "again B", "", "", "task-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(wB)) })
+	waitFor(t, "B 仍自動接續自己的對話", func() bool {
+		b, err := os.ReadFile(argvFile)
+		return err == nil && strings.Contains(string(b), "--resume "+beforeB.ResumeSessionID)
+	})
 }
 
-// N1（review round-3）：ClearResume 的**時點**必須在 decrement_count 之前。
-// 那是整個時點裁決的全部理由——釋放名額失敗會留下孤兒 slot，此時 restore 若還
-// 留著已 tombstone session 的 id，孤兒就把 resume 留給了別人。
-//
-// 以 hookRemoveStep 在 decrement_count 之前把 slot 推離 idle（BeginNewSessionSubmit
-// → phaseStarting），讓 manager.RemoveSession 必然回 ErrSessionNotIdle。
-func TestRemoveClearsResumeBeforeDecrementCount(t *testing.T) {
+// D5 等價改寫（原 N1：ClearResume 必須早於 decrement_count）。
+// 清除步驟已經不存在，取代它的是 tombstone_persist 本身——它同樣必須早於
+// decrement_count，因為釋放名額失敗會留下孤兒 slot，而此刻那個 WSID 的續聊身分
+// 必須已經讀不到了。
+func TestTombstoneLandsBeforeDecrementCount(t *testing.T) {
 	a, _ := newTestApp(t)
-	a.wsReg = &stubRegistry{}
+	bootRegistry(t, a)
 	writeInitClaude(t, a, "sess-A")
 
 	w := mustCreate(t, a, "claude")
@@ -680,7 +671,8 @@ func TestRemoveClearsResumeBeforeDecrementCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+		e, _ := a.wsReg.Get(string(w))
+		return e.ResumeSessionID == "sess-A"
 	})
 	if err := a.EndSession(string(w)); err != nil {
 		t.Fatal(err)
@@ -700,19 +692,20 @@ func TestRemoveClearsResumeBeforeDecrementCount(t *testing.T) {
 	if !strings.Contains(err.Error(), "已 tombstone 但釋放名額失敗") {
 		t.Fatalf("前提不成立：失敗點必須是 decrement_count：%v", err)
 	}
-	// 這就是時點的意義：名額沒釋放、slot 還在，但 restore 已經清乾淨
-	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
-		t.Fatalf("清除必須發生在 decrement_count 之前，got %q", got)
+	// 這就是時點的意義：名額沒釋放、slot 還在，但續聊身分已經讀不到
+	if got := a.registryResume(w); got != "" {
+		t.Fatalf("tombstone 必須發生在 decrement_count 之前，got %q", got)
 	}
 }
 
-// N2（review round-3）：清除失敗是 Fail Loud 的綁定約束——audit ＋ workspace
-// 通知兩路都要有，否則使用者會在毫無訊號的情況下讓下一個 session 接到已移除的
-// 對話（清除失敗代表 restore 仍留著舊 id）。
-func TestRemoveFailsLoudWhenResumeClearFails(t *testing.T) {
-	a, ui := newTestApp(t)
-	a.wsReg = &stubRegistry{}
-	enableAudit(t, a)
+// D5 等價改寫（原 N2：清除失敗必須 audit ＋ workspace 通知兩路 fail loud）。
+// 清除步驟消失後，同一個位置的 Fail Loud 約束落在 tombstone_persist 上：它失敗
+// 代表 session **沒有**被移除，必須整個 RemoveSession 回錯並保留 slot，讓使用者
+// 能重試——靜默成功才是這條規則要防的東西。
+func TestRemoveFailsLoudWhenTombstonePersistFails(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
 	writeInitClaude(t, a, "sess-A")
 
 	w := mustCreate(t, a, "claude")
@@ -720,136 +713,22 @@ func TestRemoveFailsLoudWhenResumeClearFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "resume 已 commit", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "sess-A"
+		e, _ := a.wsReg.Get(string(w))
+		return e.ResumeSessionID == "sess-A"
 	})
 	if err := a.EndSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
-	// 讓 persist 必然失敗：把 restore.json 指到一個不存在的目錄底下
-	a.restore.path = filepath.Join(a.stateDir, "no-such-dir", "restore.json")
-
-	if err := a.RemoveSession(string(w)); err != nil {
-		t.Fatalf("清除失敗不得讓整個移除失敗（session 確實已移除）：%v", err)
+	reg.removeErr = errors.New("boom")
+	err := a.RemoveSession(string(w))
+	if err == nil {
+		t.Fatal("tombstone persist 失敗必須讓整個移除失敗（session 其實還在）")
 	}
-	if !auditHas(t, a.stateDir, "restore_clear_failed") {
-		t.Fatal("清除失敗必須進 audit")
+	if !strings.Contains(err.Error(), "tombstone persist 失敗") {
+		t.Fatalf("錯誤必須指出失敗點：%v", err)
 	}
-	var sawNotice bool
-	for _, env := range ui.findEnvKind(string(contract.KindStreamError)) {
-		if env.Scope == "workspace" && strings.Contains(string(env.Payload), string(w)) {
-			sawNotice = true
-		}
-	}
-	if !sawNotice {
-		t.Fatal("清除失敗必須發 workspace 通知（使用者才知道下一個 session 可能接錯對話）")
+	if _, serr := a.manager.State(w); serr != nil {
+		t.Fatalf("slot 必須保留可重試：%v", serr)
 	}
 }
 
-// 🟡 第五條時間軸序列（review round-3 裁決）：已 tombstone 的 WSID 不得把自己的
-// session id 寫回 provider entry。TOCTOU 孤兒情境下 commitClaudeResume 的兩道
-// 既有 guard（hostFor==host、IsActive）都會通過，重啟後那個死掉的 id 會被全新
-// 建立的 session 繼承。
-//
-// **本測試守的是 commitClaudeResume 那一個寫入端**：不設 barrier 時 Accept 早於
-// init，`hostSessionID(host)` 在 Accept 當下是空字串，`CommitResume` 的
-// `if sessionID != ""` 讓 StartSession 那端根本沒寫到 id。StartSession 的兩個
-// 寫入端各自由下面兩支測試守（review round-4：三個呼叫點只有一個被 mutation
-// 守住，其餘兩個拿掉 guard 仍全綠）。
-func TestTombstonedWSIDCannotCommitResume(t *testing.T) {
-	a, ui := newTestApp(t)
-	reg := &stubRegistry{}
-	a.wsReg = reg
-	writeInitClaude(t, a, "sess-X")
-
-	w := mustCreate(t, a, "claude")
-	// 製造孤兒：registry 已 tombstone，Manager slot 還在（§3.6.2 的殘餘窗口）
-	if err := reg.Remove(string(w), "user_removed"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.manager.State(w); err != nil {
-		t.Fatalf("前提不成立：孤兒 slot 必須還在 Manager 裡：%v", err)
-	}
-
-	if err := a.StartSession(string(w), "hi", "", "", "task-x", ""); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "一輪跑完（init ＋ result 都到）", func() bool {
-		return len(ui.findEnvKind("result")) >= 1
-	})
-	if err := a.EndSession(string(w)); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
-		t.Fatalf("已 tombstone 的 WSID 不得寫回 resume（重啟後會被新 session 繼承）：%q", got)
-	}
-	if got := a.restore.Get("claude").TaskID; got != "" {
-		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
-	}
-}
-
-// review round-4：StartSession 的 **claude 分支**寫入端。init-before-Accept 正是
-// 那段 code 存在的理由（host.sessionID 先被 init 回填，Accept 成功後由
-// StartSession 補 commit）——以 hookAfterProviderStart 等到 init 回填才放行
-// Accept，這個寫入端才真的被執行到。
-func TestTombstonedWSIDCannotCommitResumeFromStartSession(t *testing.T) {
-	a, _ := newTestApp(t)
-	reg := &stubRegistry{}
-	a.wsReg = reg
-	writeInitClaude(t, a, "sess-X")
-
-	w := mustCreate(t, a, "claude")
-	if err := reg.Remove(string(w), "user_removed"); err != nil { // 孤兒：tombstone ＋ slot 還在
-		t.Fatal(err)
-	}
-	a.hookAfterProviderStart = func() { // Accept 之前先等 init 回填 host.sessionID
-		waitFor(t, "init 抵達（Accept 之前）", func() bool {
-			return a.hostSessionID(a.hostFor(w)) == "sess-X"
-		})
-	}
-	if err := a.StartSession(string(w), "hi", "", "", "task-x", ""); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = a.EndSession(string(w)) })
-
-	// 前提校驗：沒有 guard 的話這一刻確實會寫（host.sessionID 非空）
-	if got := a.hostSessionID(a.hostFor(w)); got != "sess-X" {
-		t.Fatalf("前提不成立：Accept 當下 host.sessionID 必須非空，got %q", got)
-	}
-	if got := a.restore.Get("claude").ResumeSessionID; got != "" {
-		t.Fatalf("已 tombstone 的 WSID 不得由 StartSession 補寫 resume：%q", got)
-	}
-	if got := a.restore.Get("claude").TaskID; got != "" {
-		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
-	}
-}
-
-// review round-4：StartSession 的 **codex 分支**寫入端。threadID 恆非空，因此
-// 不需要 barrier——只要 guard 沒擋，CommitResume 一定會寫進去。
-func TestTombstonedWSIDCannotCommitResumeCodex(t *testing.T) {
-	a, _ := newTestApp(t)
-	reg := &stubRegistry{}
-	a.wsReg = reg
-	conn, wire := newFakeCodexConn(t)
-	a.wireCodexConn(conn)
-
-	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
-	if err := reg.Put(wsregistry.Entry{WSID: string(w), Provider: "codex",
-		CreatedAt: "2026-08-01T00:00:00Z"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := reg.Remove(string(w), "user_removed"); err != nil { // 孤兒
-		t.Fatal(err)
-	}
-	startCodexForTest(t, a, wire, conn, "", "task-x")
-	t.Cleanup(func() { _ = a.EndSession(string(w)) })
-
-	if h := a.hostFor(w); h == nil || h.runner == nil || h.runner.ThreadID() == "" {
-		t.Fatalf("前提不成立：codex host 必須已發布且 threadID 非空：%+v", h)
-	}
-	if got := a.restore.Get("codex").ResumeSessionID; got != "" {
-		t.Fatalf("已 tombstone 的 WSID 不得由 StartSession 補寫 codex resume：%q", got)
-	}
-	if got := a.restore.Get("codex").TaskID; got != "" {
-		t.Fatalf("guard 擋掉整筆 commit，TaskID 同樣不得被寫入：%q", got)
-	}
-}

@@ -9,11 +9,27 @@ package wsregistry
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"sync"
 	"time"
+)
+
+// 兩個可辨識的哨兵錯誤：per-WSID 的 durable metadata writer（resume identity／
+// task label／view boundary）在這兩種情況下必須被呼叫端當成**良性跳過**、而不是
+// 使用者可見錯誤——
+//   - ErrEntryNotFound：該 WSID 沒有 registry entry（registry 未接線的測試路徑、
+//     或 legacy／半還原狀態）。
+//   - ErrTombstoned：使用者已明確移除該 session。
+//
+// 這兩個判定發生在 Store 自己的 mutex 內、與 Remove 的 tombstone 寫入有全序，
+// 所以取代掉的 app 側 check-then-act（舊 resumeWriteAllowed）殘餘 TOCTOU 在此
+// 真正關閉：不可能出現「檢查時沒 tombstone、寫入時已 tombstone」的交錯。
+var (
+	ErrEntryNotFound = errors.New("wsregistry: entry not found")
+	ErrTombstoned    = errors.New("wsregistry: entry is tombstoned")
 )
 
 // schemaVersion：固定值，不讀設定。
@@ -38,11 +54,16 @@ type Layout struct {
 }
 
 // fileFormat：workspace-sessions.json 的完整內容。
+//
+// ResumeBackfilled 是 schema v2 的 additive 欄位（不升版本）：舊檔沒有它就是
+// false，正是「還沒 backfill 過」的正確語意；舊 build 讀新檔會忽略它，最壞情況
+// 是再跑一次 backfill，而 BackfillResume 只填空值，重跑無副作用。
 type fileFormat struct {
-	SchemaVersion int              `json:"schema_version"`
-	Entries       map[string]Entry `json:"entries"`
-	Layout        Layout           `json:"layout"`
-	Migrated      bool             `json:"migrated"`
+	SchemaVersion    int              `json:"schema_version"`
+	Entries          map[string]Entry `json:"entries"`
+	Layout           Layout           `json:"layout"`
+	Migrated         bool             `json:"migrated"`
+	ResumeBackfilled bool             `json:"resume_backfilled"`
 }
 
 // Store：workspace-sessions.json 的唯一 ownership（單一 mutex；temp file +
@@ -176,6 +197,117 @@ func (s *Store) Get(wsid string) (Entry, bool) {
 	defer s.mu.Unlock()
 	e, ok := s.file.Entries[wsid]
 	return e, ok
+}
+
+// mutate：per-WSID 欄位級的**單一交易**更新——找不到／已 tombstone 一律回哨兵
+// 錯誤，persist 失敗回滾記憶體。
+//
+// 刻意不讓呼叫端用 Get＋Put 兩段拼出來：那正是 restore.go 的 CommitSessionID
+// 當初為了消除「late init 以舊值覆寫新 commit」的競態而做掉的形狀，而且兩段式
+// 讀不到 tombstone 的全序（見 ErrTombstoned 的說明）。
+func (s *Store) mutate(wsid string, fn func(*Entry)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.file.Entries[wsid]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrEntryNotFound, wsid)
+	}
+	if old.RemovedAt != "" {
+		return fmt.Errorf("%w: %q", ErrTombstoned, wsid)
+	}
+	e := old
+	fn(&e)
+	s.file.Entries[wsid] = e
+	if err := s.persistLocked(); err != nil {
+		s.file.Entries[wsid] = old
+		return err
+	}
+	return nil
+}
+
+// CommitResume：StartSession 的 Accept 成功後，把該 WSID 這一次的續聊身分
+// （provider 回報的 session／thread id）與 task label 一次寫入。
+//
+// 兩個空值語意刻意不同：
+//   - resumeSessionID 為空＝「這次還不知道 id」（claude 的 init 可能晚於 Accept），
+//     保留既有值不動，由稍後的 SetResume 補上。
+//   - taskLabel 為空＝「這次沒帶標籤」，同樣保留既有值——TaskLabel 是 session
+//     清單 UI 顯示的名字，讓一次沒帶標籤的送出把它清空是使用者可見的退步。
+//     D3 裁決沒有 rename 入口，因此「清空 label」不是需要支援的操作。
+func (s *Store) CommitResume(wsid, resumeSessionID, taskLabel string) error {
+	return s.mutate(wsid, func(e *Entry) {
+		if resumeSessionID != "" {
+			e.ResumeSessionID = resumeSessionID
+		}
+		if taskLabel != "" {
+			e.TaskLabel = taskLabel
+		}
+	})
+}
+
+// SetResume：claude init 抵達時的單一交易——只更新續聊身分，保留 TaskLabel
+// 與 ViewStartEventID（對應 restore.go 舊有的 CommitSessionID 語意）。
+func (s *Store) SetResume(wsid, resumeSessionID string) error {
+	return s.mutate(wsid, func(e *Entry) { e.ResumeSessionID = resumeSessionID })
+}
+
+// ResetView：NewSession（「開新對話」）收尾成功後的單一交易——view boundary 前移
+// 到當下的 audit high-watermark，同時清空續聊身分。
+//
+// 兩者必須同一筆：boundary 前移代表「舊 turn 不再屬於這個 view」，若 resume 還
+// 留著，下一次 StartSession 會接回那段已經看不到的對話。TaskLabel **不清**——
+// 它是 session 的名字，不是這一段對話的身分。
+func (s *Store) ResetView(wsid, viewStartEventID string) error {
+	return s.mutate(wsid, func(e *Entry) {
+		e.ViewStartEventID, e.ResumeSessionID = viewStartEventID, ""
+	})
+}
+
+// ResumeBackfilled：是否已完成「provider-keyed restore.json → per-WSID entry」的
+// 一次性續聊身分補寫（見 BackfillResume）。
+func (s *Store) ResumeBackfilled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.file.ResumeBackfilled
+}
+
+// BackfillResume：升級補寫（D2）——把既有 build 留在 provider-keyed restore.json
+// 的續聊身分，一次性搬進對應的 per-WSID entry，並設下不可重跑的 marker。
+//
+// **marker 與「只填空值」兩層缺一不可**：只靠「只填空值」的話，使用者按過
+// NewSession（resume 已被清空）之後重啟，會被 restore.json 那個 stale 值再次
+// 回填、靜默復活舊對話。marker 保證這件事一輩子只發生一次。
+//
+// 沒有可填的 entry 時**仍然**設 marker：那代表「已經檢查過、沒有東西要搬」，
+// 不設的話每次啟動都會重新對 stale 的 restore.json 做一次判斷。
+//
+// 跳過 tombstone 與不存在的 wsid（呼叫端的候選集合可能是上一輪的快照），跳過
+// 已有值的 entry（那是比 legacy 更新的資料）。整批一次 persist，失敗回滾記憶體
+// ——marker 與 entries 必須同生共死，否則會出現「marker 已設、entries 未填」的
+// 半完成狀態，而 marker 是單向的，那些 session 從此永遠補不回來。
+func (s *Store) BackfillResume(fill map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldEntries := make(map[string]Entry, len(fill))
+	for wsid, id := range fill {
+		e, ok := s.file.Entries[wsid]
+		if !ok || e.RemovedAt != "" || e.ResumeSessionID != "" || id == "" {
+			continue
+		}
+		oldEntries[wsid] = e
+		e.ResumeSessionID = id
+		s.file.Entries[wsid] = e
+	}
+	oldMarker := s.file.ResumeBackfilled
+	s.file.ResumeBackfilled = true
+	if err := s.persistLocked(); err != nil {
+		for wsid, e := range oldEntries {
+			s.file.Entries[wsid] = e
+		}
+		s.file.ResumeBackfilled = oldMarker
+		return err
+	}
+	return nil
 }
 
 // entryCount：registry 目前持久化的 entry 總數，含 tombstone（未 export，

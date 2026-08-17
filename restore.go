@@ -11,7 +11,14 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 )
 
-// restoreEntry：單一 provider 的恢復索引（M1.5 plan D6）。
+// restore.json（M1.5 plan D6 的 provider-keyed 恢復索引）自 M3b per-WSID durable
+// metadata writer 起**降級為唯讀的 legacy 來源**（owner 2026-08-17 D6）：
+// 續聊身分／task label／view boundary 三項的權威改為 workspace-sessions.json 的
+// per-WSID Entry。這裡只剩兩個消費者——§3.2.5 的一次性 legacy 遷移，以及
+// backfillResumeFromLegacy 的升級補寫（搬完呼叫 ClearResume 把舊值清掉）。
+// 檔案刻意保留不刪：它是 M3a 使用者的最後一份備份。
+//
+// restoreEntry：單一 provider 的恢復索引。
 type restoreEntry struct {
 	ViewStartEventID string `json:"view_start_event_id"` // 僅 NewSession 重設；> 此 ID 的事件屬本 view
 	ResumeSessionID  string `json:"resume_session_id"`   // staged candidate 於 Accept 成功後 commit
@@ -103,23 +110,6 @@ func (rs *restoreStore) CommitResume(provider, sessionID, taskID string) error {
 	return nil
 }
 
-// CommitSessionID：init 抵達時的單一交易——保留現有 TaskID、只更新
-// ResumeSessionID；失敗回滾（第三輪 P1-4：取代呼叫端 Get＋Commit 兩段鎖，
-// 消除 late init 以舊 task ID 覆寫新 commit 的競態）。
-func (rs *restoreStore) CommitSessionID(provider, sessionID string) error {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	old := rs.entries[provider]
-	e := old
-	e.ResumeSessionID = sessionID
-	rs.entries[provider] = e
-	if err := rs.persistLocked(); err != nil {
-		rs.entries[provider] = old // 回滾
-		return err
-	}
-	return nil
-}
-
 // ClearResume：清掉該 provider 的續聊身分（resume id ＋ taskID），**保留
 // ViewStartEventID**——與 ResetView 的差別就在這裡：view 視窗是 provider 層的
 // 重放起點，前移它會連帶影響同 provider 其他 session 的歷史判定
@@ -134,19 +124,6 @@ func (rs *restoreStore) ClearResume(provider string) error {
 	rs.entries[provider] = e
 	if err := rs.persistLocked(); err != nil {
 		rs.entries[provider] = old
-		return err
-	}
-	return nil
-}
-
-// ResetView：僅 NewSession 呼叫——view 視窗前進、resume 清空。失敗時 entry 不變。
-func (rs *restoreStore) ResetView(provider, highWatermark string) error {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	old := rs.entries[provider]
-	rs.entries[provider] = restoreEntry{ViewStartEventID: highWatermark}
-	if err := rs.persistLocked(); err != nil {
-		rs.entries[provider] = old // 寫入失敗：entry 回滾（不變）
 		return err
 	}
 	return nil

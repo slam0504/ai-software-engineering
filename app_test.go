@@ -21,6 +21,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/replayindex"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // ---- production 接線測試基盤 ----
@@ -107,13 +108,10 @@ func waitTurnSettled(t *testing.T, a *App, w appcore.WSID) {
 
 func newTestApp(t *testing.T) (*App, *uiCapture) {
 	t.Helper()
-	a := NewApp()
-	a.ctx = context.Background()
 	ws, err := claude.NormalizeCWD(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.workspaceDir = ws
 	// stateDir 用短路徑：unix socket（approval.sock）有 ~104 byte sockaddr 上限，
 	// macOS 的 t.TempDir()（/var/folders/…）會超過。
 	short, err := os.MkdirTemp("/tmp", "wb")
@@ -121,7 +119,18 @@ func newTestApp(t *testing.T) (*App, *uiCapture) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(short) })
-	a.stateDir = filepath.Join(short, ".workbench")
+	return newTestAppIn(t, ws, filepath.Join(short, ".workbench"))
+}
+
+// newTestAppIn：綁定指定 workspace／stateDir 的完整測試 App。newTestApp 的本體，
+// 抽出來是為了「同一組目錄再開第二個 App」＝**跨重啟**——per-WSID 續聊身分與
+// view boundary 的價值全在重啟之後，同一個實例假裝重啟守不到那一維。
+func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
+	t.Helper()
+	a := NewApp()
+	a.ctx = context.Background()
+	a.workspaceDir = ws
+	a.stateDir = stateDir
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "recordings"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +515,7 @@ func writeInitClaude(t *testing.T, a *App, sessionID string) string {
 		t.Fatal(err)
 	}
 	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
-	_ = a.registry.Bind(sessionID, cwd)
+	_ = a.registry.Bind(sessionID, cwd, "") // wsid 未知（測試前置綁定）：production 的 init Bind 會補齊
 	return argvFile
 }
 
@@ -539,6 +548,12 @@ func startCodexForTest(t *testing.T, a *App, wire *fakeCodexWire, conn *codex.Co
 	if err := a.StartSession(wsidStr(t, a, "codex"), "hi codex", "", recordCase, task, "untrusted"); err != nil {
 		t.Fatal(err)
 	}
+	// 等第一輪真的落地才回傳（上面的腳本一 start 就送 turn/completed）。
+	// StartSession 回傳只代表 Accept 成功，turn/completed 是另一條 goroutine 送
+	// 進來的——不等就把「第二輪能不能送」變成排程競速。這條 wait 原本是被
+	// StartSession 尾端那次 restore.json 落盤的 I/O 延遲意外兜住的；per-WSID
+	// writer 把那次寫入移走（registry 未接線時直接返回）之後缺口就露出來了。
+	waitTurnSettled(t, a, wsidFor(t, a, contract.ProviderCodex))
 }
 
 func TestDualSessionsConcurrently(t *testing.T) {
@@ -1010,80 +1025,98 @@ func TestRestoreViewWindowReplay(t *testing.T) {
 	}
 }
 
+// M3b per-WSID writer 之後：view 視窗前移與續聊身分清空都寫進**該 WSID 自己的**
+// registry entry，不再是 provider-keyed 的 restore.json。同 provider 的手足因此
+// 不受影響（舊實作只能在「不明確」時整段跳過，見 NewSession 的說明）。
 func TestNewSessionResetsViewWindow(t *testing.T) {
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
 	writeMultiTurnClaude(t, a)
-	if err := a.StartSession(wsidStr(t, a, "claude"), "hi", "", "", "task-a", ""); err != nil {
+	wc := wsidFor(t, a, contract.ProviderClaude)
+	wx := wsidFor(t, a, contract.ProviderCodex)
+	registerWSID(t, a, wc, "claude")
+	registerWSID(t, a, wx, "codex")
+	if err := a.StartSession(string(wc), "hi", "", "", "task-a", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.restore.CommitResume("claude", "sA", "task-a"); err != nil {
+	if err := a.wsReg.CommitResume(string(wc), "sA", "task-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.restore.CommitResume("codex", "tX", "task-x"); err != nil {
+	if err := a.wsReg.CommitResume(string(wx), "tX", "task-x"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.NewSession(wsidStr(t, a, "claude")); err != nil { // active session：End→IntoReset→reset
+	if err := a.NewSession(string(wc)); err != nil { // active session：End→IntoReset→reset
 		t.Fatal(err)
 	}
-	if got := a.restore.Get("claude"); got.ResumeSessionID != "" {
+	got := registryEntryOf(t, a, wc)
+	if got.ResumeSessionID != "" {
 		t.Fatalf("resume must be cleared: %+v", got)
 	}
-	if len(a.RestoreViews()["claude"].Envelopes) != 0 { // 視窗前進：重放為空
-		t.Fatal("view window must be reset")
+	if got.ViewStartEventID == "" { // 視窗前進（消費端見 TestNewSessionViewBoundaryHidesOlderTurns）
+		t.Fatalf("view window must be reset: %+v", got)
 	}
-	if got := a.restore.Get("codex"); got.ResumeSessionID != "tX" { // 另一 provider 不受影響
-		t.Fatalf("codex entry must be untouched: %+v", got)
+	if other := registryEntryOf(t, a, wx); other.ResumeSessionID != "tX" { // 另一個 session 不受影響
+		t.Fatalf("other session entry must be untouched: %+v", other)
 	}
-	if err := a.NewSession(wsidStr(t, a, "claude")); err != nil { // 無 active session 仍能執行
+	if err := a.NewSession(string(wc)); err != nil { // 無 active session 仍能執行
 		t.Fatalf("New without active session: %v", err)
 	}
 }
 
 func TestNewSessionRestoreWriteFailureKeepsEntry(t *testing.T) {
 	a, _ := newTestApp(t)
-	if err := a.restore.CommitResume("claude", "sA", "task-a"); err != nil {
+	bootRegistry(t, a)
+	w := wsidFor(t, a, contract.ProviderClaude)
+	registerWSID(t, a, w, "claude")
+	if err := a.wsReg.CommitResume(string(w), "sA", "task-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Dir(a.restore.path), 0o500); err != nil { // temp file 建立失敗
+	if err := os.Chmod(a.stateDir, 0o500); err != nil { // temp file 建立失敗
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(filepath.Dir(a.restore.path), 0o755) })
-	err := a.NewSession(wsidStr(t, a, "claude"))
+	t.Cleanup(func() { _ = os.Chmod(a.stateDir, 0o755) })
+	err := a.NewSession(string(w))
 	if err == nil {
-		t.Fatal("restore write failure must surface (UI must not reset)")
+		t.Fatal("registry write failure must surface (UI must not reset)")
 	}
-	if got := a.restore.Get("claude"); got.ResumeSessionID != "sA" { // entry 回滾不變
+	if got := registryEntryOf(t, a, w); got.ResumeSessionID != "sA" { // entry 回滾不變
 		t.Fatalf("entry must be unchanged on failure: %+v", got)
 	}
-	_ = os.Chmod(filepath.Dir(a.restore.path), 0o755)
-	if _, err := a.manager.BeginNewSessionSubmit(wsidFor(t, a, contract.ProviderClaude), "t"); err != nil {
+	_ = os.Chmod(a.stateDir, 0o755)
+	if _, err := a.manager.BeginNewSessionSubmit(w, "t"); err != nil {
 		t.Fatalf("slot must be back to idle after failed reset: %v", err)
 	}
 }
 
 func TestResumeCandidateStagedThenCommitted(t *testing.T) {
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
+	registerWSID(t, a, wsidFor(t, a, contract.ProviderCodex), "codex")
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
-	// stage（EnsureThread 成功）到 Accept 之間：restore entry 不得出現 thread id
+	// stage（EnsureThread 成功）到 Accept 之間：entry 不得出現 thread id
 	startCodexForTest(t, a, wire, conn, "", "task-x") // 內部 Accept 成功後 commit
-	if got := a.restore.Get("codex"); got.ResumeSessionID != "t1" || got.TaskID != "task-x" {
+	got := registryEntryOf(t, a, wsidFor(t, a, contract.ProviderCodex))
+	if got.ResumeSessionID != "t1" || got.TaskLabel != "task-x" {
 		t.Fatalf("commit after Accept: %+v", got)
 	}
 }
 
 func TestResumeCandidateCommitOnAccept(t *testing.T) { // init before Accept + Accept 失敗
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
+	w := wsidFor(t, a, contract.ProviderClaude)
+	registerWSID(t, a, w, "claude")
 	writeMultiTurnClaude(t, a)
 	a.hookAfterProviderStart = func() {
 		// pump 已跑（init 可能已暫存於 claudeSessionID）；Accept 前 Close → Accept 失敗
 		_ = a.manager.Close()
 	}
-	err := a.StartSession(wsidStr(t, a, "claude"), "hi", "", "", "task-a", "")
+	err := a.StartSession(string(w), "hi", "", "", "task-a", "")
 	if !errors.Is(err, appcore.ErrClosed) {
 		t.Fatalf("accept must fail: %v", err)
 	}
-	if got := a.restore.Get("claude"); got.ResumeSessionID != "" || got.TaskID != "" {
+	if got := registryEntryOf(t, a, w); got.ResumeSessionID != "" || got.TaskLabel != "seed-claude" {
 		t.Fatalf("candidate must be discarded on accept failure: %+v", got)
 	}
 }
@@ -1244,7 +1277,7 @@ func TestRestoredResumeReachesProvider(t *testing.T) {
 	}
 	// registry 需有綁定（resume mismatch 檢查）
 	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
-	_ = a.registry.Bind("resume-id-c", cwd)
+	_ = a.registry.Bind("resume-id-c", cwd, "")
 	restored := a.RestoreViews()["claude"].ResumeSessionID
 	if restored != "resume-id-c" {
 		t.Fatalf("restored resume id = %q", restored)
@@ -1298,17 +1331,20 @@ func TestRestoredResumeReachesProvider(t *testing.T) {
 	}
 }
 
-func TestNewStartBarrier(t *testing.T) { // teardown 完成與 restore reset 之間注入 Start
+func TestNewStartBarrier(t *testing.T) { // teardown 完成與 view reset 之間注入 Start
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
+	w := wsidFor(t, a, contract.ProviderClaude)
+	registerWSID(t, a, w, "claude")
 	writeMultiTurnClaude(t, a)
-	if err := a.StartSession(wsidStr(t, a, "claude"), "hi", "", "", "task-a", ""); err != nil {
+	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
 		t.Fatal(err)
 	}
 	var injected error
 	a.hookDuringReset = func() {
-		injected = a.StartSession(wsidStr(t, a, "claude"), "sneak", "", "", "task-sneak", "")
+		injected = a.StartSession(string(w), "sneak", "", "", "task-sneak", "")
 	}
-	if err := a.NewSession(wsidStr(t, a, "claude")); err != nil {
+	if err := a.NewSession(string(w)); err != nil {
 		t.Fatal(err)
 	}
 	if !errors.Is(injected, appcore.ErrResetInProgress) { // 縫隙內的 Start 必被拒
@@ -1316,13 +1352,13 @@ func TestNewStartBarrier(t *testing.T) { // teardown 完成與 restore reset 之
 	}
 	// reset 完成後開的新 session 的 identity 不被清除
 	a.hookDuringReset = nil
-	if err := a.StartSession(wsidStr(t, a, "claude"), "hi again", "", "", "task-b", ""); err != nil {
+	if err := a.StartSession(string(w), "hi again", "", "", "task-b", ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.restore.Get("claude"); got.TaskID != "task-b" {
+	if got := registryEntryOf(t, a, w); got.TaskLabel != "task-b" {
 		t.Fatalf("new session identity must survive: %+v", got)
 	}
-	_ = a.EndSession(wsidStr(t, a, "claude"))
+	_ = a.EndSession(string(w))
 }
 
 func TestRestoreViewsIsReadOnly(t *testing.T) {
@@ -1363,18 +1399,21 @@ func TestLateClaudeInitCannotOverwriteNewGeneration(t *testing.T) {
 
 func TestNewSessionTeardownFailureKeepsRestore(t *testing.T) { // P1-2
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
+	w := wsidFor(t, a, contract.ProviderClaude)
+	registerWSID(t, a, w, "claude")
 	// manager-only session（無 process）：claudeTeardown 必回錯——teardown 失敗形狀
-	id, _ := a.manager.BeginNewSessionSubmit(wsidFor(t, a, contract.ProviderClaude), "task-a")
-	_ = a.manager.AcceptSubmit(wsidFor(t, a, contract.ProviderClaude), id, "sA", "hi")
-	if err := a.restore.CommitResume("claude", "sA", "task-a"); err != nil {
+	id, _ := a.manager.BeginNewSessionSubmit(w, "task-a")
+	_ = a.manager.AcceptSubmit(w, id, "sA", "hi")
+	if err := a.wsReg.CommitResume(string(w), "sA", "task-a"); err != nil {
 		t.Fatal(err)
 	}
-	err := a.NewSession(wsidStr(t, a, "claude"))
+	err := a.NewSession(string(w))
 	if err == nil {
 		t.Fatal("teardown failure must surface")
 	}
-	if got := a.restore.Get("claude"); got.ResumeSessionID != "sA" { // restore entry 保留
-		t.Fatalf("restore must be kept on teardown failure: %+v", got)
+	if got := registryEntryOf(t, a, w); got.ResumeSessionID != "sA" { // 續聊身分保留
+		t.Fatalf("resume identity must be kept on teardown failure: %+v", got)
 	}
 	// lifecycle 已收束回 idle：可再開 session（不卡 ending/resetting）
 	if _, err := a.manager.BeginNewSessionSubmit(wsidFor(t, a, contract.ProviderClaude), "task-b"); err != nil {
@@ -1384,6 +1423,9 @@ func TestNewSessionTeardownFailureKeepsRestore(t *testing.T) { // P1-2
 
 func TestAutoResumeAfterPlainEnd(t *testing.T) { // P1-3：一般 End 後未重啟自動 resume
 	a, _ := newTestApp(t)
+	bootRegistry(t, a)
+	registerWSID(t, a, wsidFor(t, a, contract.ProviderClaude), "claude")
+	registerWSID(t, a, wsidFor(t, a, contract.ProviderCodex), "codex")
 	// claude：fresh start（init 落 sA）→ End → 再 submit（resume 空）→ argv --resume sA
 	bin := a.claudeCLIPath()
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
@@ -1398,14 +1440,15 @@ func TestAutoResumeAfterPlainEnd(t *testing.T) { // P1-3：一般 End 後未重�
 		t.Fatal(err)
 	}
 	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
-	_ = a.registry.Bind("auto-sA", cwd)
+	_ = a.registry.Bind("auto-sA", cwd, "")
 	if err := a.StartSession(wsidStr(t, a, "claude"), "hi", "", "", "task-a", ""); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "resume committed after init", func() bool {
-		return a.restore.Get("claude").ResumeSessionID == "auto-sA"
+		e, _ := a.wsReg.Get(wsidStr(t, a, "claude"))
+		return e.ResumeSessionID == "auto-sA"
 	})
-	if err := a.EndSession(wsidStr(t, a, "claude")); err != nil { // 一般 End：不清 restore
+	if err := a.EndSession(wsidStr(t, a, "claude")); err != nil { // 一般 End：不清續聊身分
 		t.Fatal(err)
 	}
 	if err := a.StartSession(wsidStr(t, a, "claude"), "again", "", "", "task-a", ""); err != nil { // resume 參數空
@@ -1462,14 +1505,31 @@ func TestAutoResumeAfterPlainEnd(t *testing.T) { // P1-3：一般 End 後未重�
 	_ = a.EndSession(wsidStr(t, a, "codex"))
 }
 
-func TestRestoreCommitFailureKeepsSessionActive(t *testing.T) { // P1-4（plan D6 凍結語意）
+// P1-4（plan D6 凍結語意）：durable metadata 寫入失敗 → session 保持 active、
+// StartSession 照樣成功，只以 stream_error fail loud。per-WSID writer 之後失敗的
+// 是 registry 的 persist，凍結語意不變。
+func TestRestoreCommitFailureKeepsSessionActive(t *testing.T) {
 	a, ui := newTestApp(t)
 	writeMultiTurnClaude(t, a)
-	a.restore.path = filepath.Join(a.stateDir, "no-such-dir", "restore.json") // persist 必失敗
-	if err := a.StartSession(wsidStr(t, a, "claude"), "hi", "", "", "task-a", ""); err != nil {
-		t.Fatalf("StartSession must succeed despite restore failure: %v", err)
+	w := wsidFor(t, a, contract.ProviderClaude)
+	// persist 必失敗的真實 Store：目錄先建好讓 Open 成功，之後整個刪掉
+	sub := filepath.Join(a.stateDir, "brittle")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !a.manager.IsActive(wsidFor(t, a, contract.ProviderClaude)) { // session 保持 active
+	store, err := wsregistry.Open(filepath.Join(sub, "workspace-sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.wsReg = store
+	registerWSID(t, a, w, "claude")
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.StartSession(string(w), "hi", "", "", "task-a", ""); err != nil {
+		t.Fatalf("StartSession must succeed despite registry write failure: %v", err)
+	}
+	if !a.manager.IsActive(w) { // session 保持 active
 		t.Fatal("session must stay active")
 	}
 	waitFor(t, "restore failure stream_error", func() bool {

@@ -265,6 +265,16 @@ const turnPageSize = 20
 // 為什麼要逐筆比對 WorkspaceSessionID：turn record 記的是**全域** events.jsonl
 // 的 byte range，而多 session 並行時別的 WSID 的事件會夾在同一段範圍內。不過
 // 濾就會把別人的對話混進這個 pane。
+//
+// **view boundary（owner 2026-08-17 D4 凍結）**：只回傳該 WSID 的
+// ViewStartEventID **之後開始**的 turn，尾端載入與向上分頁都不得跨越它。
+// 「開新對話」＝建立新的 view 世代；只清前端記憶體而不在這裡過濾的話，舊 turn
+// 會在重新釘選、分頁或重啟後復活。判準沿用既有語意——只有 event ID **大於**
+// boundary 的事件屬於目前 view。
+//
+// 完成的 turn 以 record 的 FirstEventID 整筆判定（要嘛全進、要嘛全不進），
+// 不逐筆過濾：§3.8 明文不得從 turn 中間截斷。未完成的尾端 turn 沒有 record，
+// 只能逐筆比對 EventID。
 func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error) {
 	if a.replayIndex == nil {
 		return nil, errNoReplayIndex
@@ -282,6 +292,7 @@ func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	if err != nil {
 		return nil, err
 	}
+	viewStart := a.viewBoundary(wsid)
 
 	f, err := os.Open(a.eventsPath())
 	if err != nil {
@@ -294,7 +305,10 @@ func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 
 	var out []contract.Envelope
 	for _, rec := range recs {
-		envs, rerr := readEnvelopeRange(f, wsid, rec.StartOffset, rec.EndOffset)
+		if viewStart != "" && rec.FirstEventID <= viewStart {
+			continue // boundary 之前開始的 turn 不屬於目前 view
+		}
+		envs, rerr := readEnvelopeRange(f, wsid, "", rec.StartOffset, rec.EndOffset)
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -309,17 +323,33 @@ func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	if !open {
 		return out, nil
 	}
-	tail, err := readEnvelopeRange(f, wsid, start, -1)
+	tail, err := readEnvelopeRange(f, wsid, viewStart, start, -1)
 	if err != nil {
 		return nil, err
 	}
 	return append(out, tail...), nil
 }
 
+// viewBoundary：該 WSID 目前的 view 起點（registry 的 durable ViewStartEventID）。
+// registry 未接線或查無此筆時回空字串＝不過濾——沒有可信的 boundary 來源時
+// 少過濾（多顯示一段歷史）比多過濾（訊息憑空消失）安全。
+func (a *App) viewBoundary(wsid string) string {
+	if a.wsReg == nil {
+		return ""
+	}
+	e, ok := a.wsReg.Get(wsid)
+	if !ok {
+		return ""
+	}
+	return e.ViewStartEventID
+}
+
 // readEnvelopeRange：讀 f 的 [start, end) 這段（end < 0 = 讀到檔尾），回傳其
-// 中屬於 wsid 的 envelope。無法解析的行跳過不中斷（同 replayViewWindow 的既
-// 有慣例：稽核匯出走完整檔案，UI 視窗不因單一壞行整段消失）。
-func readEnvelopeRange(f *os.File, wsid string, start, end int64) ([]contract.Envelope, error) {
+// 中屬於 wsid 的 envelope。after 非空時額外只留 EventID 大於它的（view
+// boundary；只有沒有 turn record 可整筆判定的尾端未完成 turn 需要）。
+// 無法解析的行跳過不中斷（同 replayViewWindow 的既有慣例：稽核匯出走完整檔案，
+// UI 視窗不因單一壞行整段消失）。
+func readEnvelopeRange(f *os.File, wsid, after string, start, end int64) ([]contract.Envelope, error) {
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("app: seek events.jsonl to %d: %w", start, err)
 	}
@@ -331,7 +361,8 @@ func readEnvelopeRange(f *os.File, wsid string, start, end int64) ([]contract.En
 		if n := int64(len(line)); n > 0 {
 			if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
 				var env contract.Envelope
-				if json.Unmarshal(trimmed, &env) == nil && env.WorkspaceSessionID == wsid {
+				if json.Unmarshal(trimmed, &env) == nil && env.WorkspaceSessionID == wsid &&
+					(after == "" || env.EventID > after) {
 					out = append(out, env)
 				}
 			}

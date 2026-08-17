@@ -472,6 +472,11 @@ type sessionRegistry interface {
 	Get(wsid string) (wsregistry.Entry, bool)
 	Live() []wsregistry.Entry
 	Sync() error
+	// per-WSID durable metadata writer（M3b spec §3.2.1 白名單的 resume
+	// identity／task label／view boundary 三項）
+	CommitResume(wsid, resumeSessionID, taskLabel string) error
+	SetResume(wsid, resumeSessionID string) error
+	ResetView(wsid, viewStartEventID string) error
 }
 
 var _ sessionRegistry = (*wsregistry.Store)(nil)
@@ -691,12 +696,16 @@ func (a *App) resolveWSID(op, wsid string) (appcore.WSID, contract.Provider, err
 // providerRestoreUnambiguous：provider-keyed 的 restore.json 是否能一一對應到
 // 呼叫端的那個 WSID。
 //
-// restore.json（resume session id ＋ view 視窗）是 M3a 留下的 per-provider 結構，
-// 至今沒有 per-WSID writer——registry 的 ResumeSessionID 只有 CreateSession／
-// Migrate 兩個寫入點（`wsReg.Put` 在 production 只出現在 CreateSession），之後每
-// 一輪的 session id 都只寫回 restore.json。同 provider 只有一個 session 時它仍是
-// 正確的續聊來源；一旦有第二個，它的語意退化成「上一次是誰在講話」，套到別的
-// WSID 上就是把一個全新的 session 靜默接到別人的對話上。
+// **per-WSID writer 落地後，唯一的呼叫端是升級 backfill**（backfillResumeFromLegacy）：
+// 每一輪的續聊身分現在都寫進該 WSID 自己的 registry entry，StartSession 不再需要
+// 從 provider-keyed 記錄猜測。留著它的理由只有一個且要說準——backfill 的輸入
+// 恰恰還是那份 provider-keyed 的 restore.json，「這個 provider 的 id 該搬給誰」
+// 與本函式問的是同一個問題，判準也必須是同一個。
+//
+// restore.json（resume session id ＋ view 視窗）是 M3a 留下的 per-provider 結構。
+// 同 provider 只有一個 session 時它仍是正確的續聊來源；一旦有第二個，它的語意
+// 退化成「上一次是誰在講話」，套到別的 WSID 上就是把一個全新的 session 靜默接到
+// 別人的對話上。
 //
 // 計數取 Manager slot 與 registry live entry 的**精確聯集**（以 WSID 為身分），
 // 不是 max(|slots|, |live|)——後者是聯集的下界不是上界：兩邊各有一筆但**是不同
@@ -746,55 +755,49 @@ func (a *App) providerRestoreUnambiguous(p contract.Provider) bool {
 	return live+(slots-backed) <= 1 // |A ∪ B| = |live| + |只存在於 Manager 的 slot|
 }
 
-// providerResumeFallback：StartSession 的 resume 參數留空時的續聊來源。
+// registryResume：StartSession 的 resume 參數留空時的續聊來源——**該 WSID 自己**
+// 的 durable 續聊身分，不再是 provider-keyed 的猜測。
 //
-// 不明確時**回空字串、不猜**（＝開新對話）。失敗方向是刻意選的：空 resume 只是
-// 少了續聊，接到別人的對話從使用者角度是資料損毀。真正的 per-WSID resume writer
-// 是後續 task 的事，在那之前這裡是唯一的守門。
-func (a *App) providerResumeFallback(p contract.Provider) string {
-	id := a.restore.Get(string(p)).ResumeSessionID
-	if id == "" {
+// 這是舊 providerResumeFallback 的取代品，同時也是它整套「不明確就不接續」防線
+// 之所以可以拆掉的原因：來源本身就以 WSID 定址，「指不出是哪一個 session」這個
+// 前提消失了。tombstone 一律回空字串（entry 還在磁碟上，但那個 session 已被使用者
+// 移除，它的 id 不該再被任何人拿去續聊）。
+func (a *App) registryResume(w appcore.WSID) string {
+	if a.wsReg == nil { // registry 未接線：沒有可信來源，開新對話（安全方向）
 		return ""
-	}
-	if !a.providerRestoreUnambiguous(p) {
-		// fail loud 兩路：audit 留稽核軌跡，workspace 通知讓**使用者**知道為什麼
-		// 這次沒有接續（只寫 audit 的話，使用者只會看到對話莫名從頭開始）。
-		a.audit("resume_fallback_skipped", map[string]any{
-			"provider": string(p), "reason": "multiple sessions for provider", "candidate": id})
-		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
-			"component": "resume",
-			"error": "本次不自動接續舊對話：" + string(p) + " 目前有多個 session，" +
-				"provider-keyed 的 resume 記錄指不出是哪一個。需要接續請在 resume 欄位明確指定 session id"})
-		return ""
-	}
-	return id
-}
-
-// resumeWriteAllowed：該 WSID 還能不能把自己的 session id 寫回 provider-keyed 的
-// restore.json——registry 說它已 tombstone 就拒絕。
-//
-// **這是收窄，不是完全消除**：本函式讀 registry 到呼叫端實際 CommitResume 之間
-// 仍是 check-then-act，RemoveSession 可以整個插進來（tombstone ＋ ClearResume 都
-// 做完），舊 id 又被寫回去。這個窗口比下面那條序列窄得多，且與 §3.6.2 已登記的
-// 殘餘 TOCTOU 同源——徹底關閉需要一個獨立的 removing phase（會動到 phase 狀態
-// 機），已裁決超出範圍。
-//
-// 沒有這道 guard 的可達序列（Task 26 review round-3）：RemoveSession 的 TOCTOU
-// 殘餘窗口下，併發的 StartSession 會在 tombstone 之後才替該 WSID 掛上 host，
-// 而 commitClaudeResume 的兩道既有 guard（hostFor(wsid)==host、IsActive）此刻
-// **都會通過**——於是一個已被移除的 session 的 id 被寫回 provider entry。當下的
-// providerRestoreUnambiguous 或許還擋得住（若同 provider 另有 live entry），但
-// **重啟後擋不住**：孤兒 slot 隨 process 消失、該 WSID 已 tombstone，全新建立的
-// session 面對 slots=1／live=1 的乾淨狀態，直接繼承那個死掉的 id。
-//
-// registry 未接線（nil）或查無此筆（legacy／測試路徑）一律放行——那些情境下
-// 沒有 tombstone 可言，收緊只會把正常續聊一起封掉。
-func (a *App) resumeWriteAllowed(w appcore.WSID) bool {
-	if a.wsReg == nil {
-		return true
 	}
 	e, ok := a.wsReg.Get(string(w))
-	return !ok || e.RemovedAt == ""
+	if !ok || e.RemovedAt != "" {
+		return ""
+	}
+	return e.ResumeSessionID
+}
+
+// commitSessionIdentity：Accept 成功後把該 WSID 的續聊身分與 task label 寫進
+// durable registry（spec §3.2.1 白名單的 resume identity ＋ task label）。
+func (a *App) commitSessionIdentity(w appcore.WSID, p contract.Provider, resumeID, taskLabel string) {
+	if a.wsReg == nil {
+		return
+	}
+	a.noteRegistryWriteResult(w, p, "commit_resume", a.wsReg.CommitResume(string(w), resumeID, taskLabel))
+}
+
+// noteRegistryWriteResult：per-WSID metadata 寫入的統一處置。
+//
+// 兩類分開：entry 不存在／已 tombstone 是**良性跳過**（判定發生在 store mutex
+// 內，與 Remove 有全序——這正是取代掉 resumeWriteAllowed 那個 check-then-act 的
+// 地方），只留 audit 軌跡，不打擾使用者；真正的 persist 失敗才 fail loud，沿用
+// failLoudRestore 的凍結語意（session 保持 active、呼叫照樣成功）。
+func (a *App) noteRegistryWriteResult(w appcore.WSID, p contract.Provider, op string, err error) {
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):
+		a.audit("session_metadata_write_skipped", map[string]any{
+			"op": op, "wsid": string(w), "provider": string(p), "reason": err.Error()})
+	default:
+		a.failLoudRestore(p, err)
+	}
 }
 
 // noteWSEmitError：...WS 出口的錯誤處置（Emit／approval 共用）。舊的 provider-keyed
@@ -993,7 +996,72 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 			n, path, strings.Join(slices.Concat(unknownProv, invalid), ", ")))
 	}
 	a.wsReg = store
+	// backfill 必須在 a.wsReg 接線之後：判準（providerRestoreUnambiguous）同時看
+	// Manager slot 與 registry live entry，兩邊此刻才都就位（Pass 2 剛還原完）。
+	// 它本身不是「載入序列的一部分」，失敗不阻擋啟動——見函式 doc。
+	a.backfillResumeFromLegacy(store)
 	return restorable, nil
+}
+
+// backfillResumeFromLegacy：一次性升級補寫（owner 2026-08-17 D2）——把已經跑過
+// 現行 M3b build 的使用者留在 provider-keyed restore.json 的續聊身分，搬進對應的
+// per-WSID entry。
+//
+// 不做的話，今天能自動續聊的既有 session 升級後全部開新對話（events.jsonl 完整，
+// 但續聊斷掉）——那是使用者可見的行為退步。
+//
+// 判準沿用 providerRestoreUnambiguous：「該 provider 恰有一筆 live session」才搬，
+// 多筆時**不猜、不填**，失敗方向與它取代掉的 providerResumeFallback 完全一致
+// （少一次續聊 vs 接到別人的對話）。
+//
+// 冪等：靠 store 的 resume_backfilled marker（單向）＋「只填空值」兩層。單靠後者
+// 不夠——使用者按過 NewSession（resume 已清空）之後重啟，會被 stale 的 restore.json
+// 值再次回填、靜默復活舊對話。
+//
+// 失敗一律不阻擋啟動：backfill 是續聊的便利性，不是資料完整性。persist 失敗時
+// marker 未設，下次啟動會重試。
+func (a *App) backfillResumeFromLegacy(store *wsregistry.Store) {
+	if store.ResumeBackfilled() || a.restore == nil {
+		return
+	}
+	fill := map[string]string{}
+	for _, p := range knownProviders {
+		id := a.restore.Get(p).ResumeSessionID
+		if id == "" {
+			continue
+		}
+		if !a.providerRestoreUnambiguous(contract.Provider(p)) {
+			a.audit("resume_backfill_skipped", map[string]any{
+				"provider": p, "candidate": id, "reason": "multiple sessions for provider"})
+			continue
+		}
+		for _, e := range store.Live() {
+			if e.Provider == p && e.ResumeSessionID == "" {
+				fill[e.WSID] = id
+			}
+		}
+	}
+	if err := store.BackfillResume(fill); err != nil {
+		a.audit("resume_backfill_failed", map[string]any{"error": err.Error()})
+		a.noteStartupWarning("session registry: 續聊身分升級補寫失敗（本次啟動不自動接續舊對話）：" + err.Error())
+		return
+	}
+	if len(fill) > 0 {
+		wsids := make([]string, 0, len(fill))
+		for wsid := range fill {
+			wsids = append(wsids, wsid)
+		}
+		slices.Sort(wsids) // 固定順序：audit 訊息不得隨 map 迭代漂移
+		a.audit("resume_backfilled", map[string]any{"count": len(fill), "wsids": wsids})
+	}
+	// D6：搬完就把 restore.json 的續聊身分清空（檔案保留，作為 M3a 使用者的最後
+	// 備份與 legacy 遷移輸入）。清除失敗只是留下一份永遠不會再被讀的舊值——
+	// marker 已經落盤，backfill 不會重跑，所以不 fail loud 成使用者可見錯誤。
+	for _, p := range knownProviders {
+		if err := a.restore.ClearResume(p); err != nil {
+			a.audit("restore_clear_failed", map[string]any{"provider": p, "error": err.Error()})
+		}
+	}
 }
 
 // markIndexUnverified：把 replay index 切到 unverified latch（寫入端停手，見
@@ -5005,7 +5073,7 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 		return err
 	}
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
-		resume = a.providerResumeFallback(prov)
+		resume = a.registryResume(w)
 	}
 	id, err := a.manager.BeginNewSessionSubmit(w, taskLabel)
 	if err != nil {
@@ -5030,11 +5098,9 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 			h()
 		}
 		aerr := a.manager.AcceptSubmit(w, id, "", prompt)
-		commit(aerr == nil)                         // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
-		if aerr == nil && a.resumeWriteAllowed(w) { // Accept 成功才 commit（staged candidate；D6）
-			if cerr := a.restore.CommitResume("claude", a.hostSessionID(host), taskLabel); cerr != nil {
-				a.failLoudRestore(contract.ProviderClaude, cerr) // session 保持 active、Start 照樣成功
-			}
+		commit(aerr == nil) // 自然結束 goroutine 據此決定走 EndSessionFlow 或直接清理
+		if aerr == nil {    // Accept 成功才 commit（staged candidate；D6）
+			a.commitSessionIdentity(w, contract.ProviderClaude, a.hostSessionID(host), taskLabel)
 		}
 		return aerr
 	default: // codex
@@ -5053,11 +5119,8 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 			terr := a.codexTeardown(w, a.hostFor(w)) // 冪等：撤路由＋finalize＋session:done
 			return errors.Join(err, terr)
 		}
-		if a.resumeWriteAllowed(w) { // Accept 成功才 commit（已 tombstone 的 WSID 不得寫）
-			if cerr := a.restore.CommitResume("codex", threadID, taskLabel); cerr != nil {
-				a.failLoudRestore(contract.ProviderCodex, cerr) // session 保持 active、Start 照樣成功
-			}
-		}
+		// Accept 成功才 commit（已 tombstone 的 WSID 由 store 在自己的 mutex 內拒絕）
+		a.commitSessionIdentity(w, contract.ProviderCodex, threadID, taskLabel)
 		_ = alreadyEnded // completed 先到：busy 未設，無需額外收尾
 		return nil
 	}
@@ -5295,31 +5358,14 @@ func (a *App) RemoveSession(wsid string) error {
 		return fmt.Errorf("app: remove session %s: tombstone persist 失敗：%w（slot 保留，可重試移除）", wsid, err)
 	}
 
-	// restore.json 的續聊身分是 **provider-keyed** 的（見 providerRestoreUnambiguous）：
-	// 移除掉最後一個 claude session 之後，restore entry 仍留著它的 resume id，而
-	// 「剩下幾個 session」的判定此時已經回到「明確」——下一個全新建立的 claude
-	// session 會靜默接到那個已被移除的對話上（Task 26 review round-2 Important）。
+	// 這裡曾經有一段無條件的 restore.ClearResume（provider-keyed）：續聊身分是
+	// provider 層的，移除 A 之後不清掉，下一個新建的 session 就會接到 A 的對話；
+	// 而清掉的代價是同 provider 存活的手足**一併失去續聊**（Task 26 review
+	// round-2 明文記載的已知代價）。
 	//
-	// **無條件清除**，不是只在「這是最後一個」時清：A、B 並存時 CommitResume 的三個
-	// 寫入端並未收窄，restore 隨時可能停在任何一方的 id；只清最後一個等於留下
-	// 「移除 A → B 讀到 A 的 id」這個變體。
-	//
-	// 代價（已知、刻意接受）：同 provider 還有存活的手足時，它們會一併失去續聊，
-	// 下一次 StartSession 開新對話。精確做法是讓 restore entry 記住 owner WSID，
-	// 那是持久化格式變更，與 per-WSID resume writer 一起做（後續 task）。
-	//
-	// 時點在 tombstone_persist **之後**：那是不可逆點，session 從此不會復活；
-	// 也在 teardown 之後，late init 的 commitClaudeResume 已被 host guard 擋掉，
-	// 不會在清除後又寫回去。清除失敗不讓整個移除失敗（session 確實已經移除，
-	// 回錯只會誘導使用者重試一個必然 ErrSessionNotFound 的移除），改以 audit ＋
-	// workspace 通知 fail loud。
-	if rerr := a.restore.ClearResume(string(p)); rerr != nil {
-		a.audit("restore_clear_failed", map[string]any{
-			"provider": string(p), "wsid": wsid, "error": rerr.Error()})
-		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
-			"component": "restore", "error": "移除 " + wsid + " 後清除 resume 失敗：" + rerr.Error() +
-				"（下一個新建的 " + string(p) + " session 可能接到已移除的對話，請手動指定 resume 或清除 restore.json）"})
-	}
+	// per-WSID writer 落地後兩邊都不需要了：續聊身分存在各自的 entry 裡，
+	// tombstone 之後 registryResume 對這個 WSID 回空字串，而手足的 entry 從頭到尾
+	// 沒被碰過。tombstone_persist 這一步本身就是清除。
 
 	a.removeStep("decrement_count")
 	if err := a.manager.RemoveSession(w); err != nil {
@@ -5386,9 +5432,25 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 	if a.registry == nil {
 		return nil, fmt.Errorf("session registry unavailable (startup error: %s)", a.startupErr)
 	}
-	if resume != "" { // resume mismatch 拒絕
-		if bound, ok := a.registry.CWD(resume); !ok || bound != cwd {
-			return nil, fmt.Errorf("resume refused: session %s bound to %q, current %q", resume, bound, cwd)
+	if resume != "" { // resume mismatch 拒絕：cwd ＋ WSID **兩者都要相符**（§3.3 D1）
+		boundCWD, boundWSID, ok := a.registry.Lookup(resume)
+		if !ok || boundCWD != cwd {
+			return nil, fmt.Errorf("resume refused: session %s bound to %q, current %q", resume, boundCWD, cwd)
+		}
+		// 只比 cwd 擋得住「resume 到別的工作目錄」，擋不住「resume 到同一個
+		// workspace 裡別人的 session」——後者正是多 session 之後才第一次可達的
+		// 錯接形狀（使用者手動貼一個 id、或 backfill 判準出錯）。fail loud。
+		if boundWSID != "" && boundWSID != string(w) {
+			return nil, fmt.Errorf("resume refused: session %s belongs to workspace session %s, current %s",
+				resume, boundWSID, w)
+		}
+		if boundWSID == "" {
+			// 本 build 之前綁定的舊記錄沒有 wsid 欄位。「不知道」不等於「不符」：
+			// 一律拒絕會讓升級後所有既有對話失去續聊（正是 D2 backfill 要保住的
+			// 東西）。放行並留稽核軌跡；下一次 init 的 Bind 會補齊欄位，此後這條
+			// 分支對該 id 永不再走到。
+			a.audit("claude_resume_legacy_binding", map[string]any{
+				"wsid": string(w), "resume": resume, "cwd": cwd})
 		}
 	}
 	host := &sessionHost{
@@ -5497,7 +5559,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			}
 		}
 		if info := claude.ParseInit(ev); info != nil {
-			_ = a.registry.Bind(info.SessionID, cwd)
+			_ = a.registry.Bind(info.SessionID, cwd, string(w)) // §3.3 D1：綁定帶 WSID
 			noteSessionID(info.SessionID)
 		}
 		a.noteWSEmitError("emit", w, a.manager.Emit(w, ev))
@@ -6608,12 +6670,13 @@ func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 	if host == nil || a.hostFor(host.wsid) != host || !a.manager.IsActive(host.wsid) {
 		return
 	}
-	if !a.resumeWriteAllowed(host.wsid) { // 已 tombstone：見 resumeWriteAllowed doc
+	if a.wsReg == nil {
 		return
 	}
-	if err := a.restore.CommitSessionID("claude", sessionID); err != nil {
-		a.failLoudRestore(contract.ProviderClaude, err)
-	}
+	// 已 tombstone／entry 不存在由 SetResume 在 store mutex 內拒絕（全序，
+	// 不是 check-then-act）——見 noteRegistryWriteResult。
+	a.noteRegistryWriteResult(host.wsid, contract.ProviderClaude, "set_resume",
+		a.wsReg.SetResume(string(host.wsid), sessionID))
 }
 
 // RestoreViews：provider-keyed 的 view 重放來源（唯讀——不 spawn provider、
@@ -6696,16 +6759,28 @@ func (a *App) NewSession(wsid string) error {
 	if h := a.hookDuringReset; h != nil { // 測試 barrier：teardown 完成與 restore reset 之間
 		h()
 	}
-	// ResetView 同樣是 provider-keyed 的破壞性寫入（清空該 provider 的 resume ＋
-	// 前移 view 視窗）：同 provider 有第二個 session 時，對 B 按「開新對話」會把
-	// A 的 resume 一併清掉。不明確時跳過並 fail loud 進 audit——少前移一次視窗
-	// 只是多重放一段歷史，清掉別人的 resume 則是不可逆的。
+	// view boundary 前移 ＋ 清空續聊身分，一次交易寫進**該 WSID 自己的** entry
+	// （owner 2026-08-17 D4 凍結）。以前這是 provider-keyed 的破壞性寫入，對 B 按
+	// 「開新對話」會把 A 的 resume 一併清掉，所以只好在不明確時整段跳過——而跳過
+	// 的代價是「開新對話」在跨重啟那一維完全沒有效果。per-WSID 之後兩難消失：
+	// 無條件寫，且只影響自己。
+	//
+	// boundary 的消費端是 LoadTurnsBefore（§3.8 視窗化載入）；不得改用「刪掉
+	// index 裡的舊 turn record」來實作——VerifyOrRebuild 會從 audit 全量重建，
+	// 刪掉的下次啟動就長回來（§3.5.10：index 是快取，不是第二份事件格式）。
 	var rerr error
-	if a.providerRestoreUnambiguous(pv) {
-		rerr = a.restore.ResetView(provider, auditHighWatermark(a.eventsPath()))
-	} else {
-		a.audit("reset_view_skipped", map[string]any{
-			"provider": provider, "wsid": string(w), "reason": "multiple sessions for provider"})
+	if a.wsReg != nil {
+		err := a.wsReg.ResetView(wsid, auditHighWatermark(a.eventsPath()))
+		switch {
+		case err == nil:
+		case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):
+			// 良性：這個 WSID 已不該有 durable view（已移除／未接線的測試路徑）。
+			// lifecycle 照樣收束回 idle、UI 照樣重設，只留稽核軌跡。
+			a.audit("reset_view_skipped", map[string]any{
+				"provider": provider, "wsid": string(w), "reason": err.Error()})
+		default:
+			rerr = err
+		}
 	}
 	finErr := a.manager.FinishReset(w, rtok) // restore 失敗仍 FinishReset 回 idle
 	if rerr != nil {
