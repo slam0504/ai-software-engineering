@@ -20,11 +20,21 @@ type stubRegistry struct {
 	putErr    error
 	deleteErr error
 	removeErr error
+	mutateErr error
 
 	entries              map[string]wsregistry.Entry
 	deletedUncommitted   bool
 	removedWithTombstone bool
 	syncs                int
+	uncertain            bool
+}
+
+// Uncertain：鏡射 wsregistry.Store 的 uncertain latch（rename 成功但 directory
+// sync 失敗）。stub 恆回 false 會讓所有「latch 期間必須拒絕」的斷言假綠。
+func (s *stubRegistry) Uncertain() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uncertain
 }
 
 func (s *stubRegistry) Put(e wsregistry.Entry) error {
@@ -87,6 +97,9 @@ func (s *stubRegistry) Remove(wsid, reason string) error {
 func (s *stubRegistry) mutate(wsid string, fn func(*wsregistry.Entry)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.mutateErr != nil {
+		return s.mutateErr
+	}
 	e, ok := s.entries[wsid]
 	if !ok {
 		return fmt.Errorf("%w: %q", wsregistry.ErrEntryNotFound, wsid)

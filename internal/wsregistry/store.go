@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -30,6 +31,32 @@ import (
 var (
 	ErrEntryNotFound = errors.New("wsregistry: entry not found")
 	ErrTombstoned    = errors.New("wsregistry: entry is tombstoned")
+)
+
+// ErrRegistryUncertain：**commit 結果不確定**——rename 已經成功（新內容很可能
+// 已經在磁碟上），但隨後的 parent directory sync 失敗，所以「這次 commit 是否
+// 已經 durable」無法在 process 內判定。
+//
+// 這與其他兩個 latch 語意不同，刻意不共用機制、也不共用命名：
+//   - replayindex 的 **degraded**：已知寫入失敗、index 確定有缺口，但 index 是
+//     快取，process 內重建即可解除。
+//   - replayindex 的 **unverified**：內容未經啟動驗證、不可信，擋的是**讀取**。
+//   - 這裡的 **uncertain**：不是「已知壞掉」也不是「未經驗證」，而是**事實未知**
+//     ——記憶體與磁碟哪一份為真沒有任何 process 內的證據可以判定。因此既不能
+//     回滾（等於宣稱舊值仍具權威性，但下次啟動載入的會是新值），也不能當成成功
+//     （新值可能根本沒 durable）。唯一能收斂的方式是停手、重啟後以磁碟為權威
+//     重新載入。單向，沒有 in-process 解除路徑。
+var ErrRegistryUncertain = errors.New("wsregistry: registry 上一次寫入的 commit 結果不確定（檔案已 rename 但 directory sync 失敗），記憶體與磁碟可能不一致；已停止所有 registry 寫入，請重啟 app 以磁碟上的 workspace-sessions.json 重新載入")
+
+// fsyncStep：persistLocked 的四個順序步驟。既是 owner 凍結契約的名字，也是
+// 測試的唯一故障注入鍵（見 fsync_test.go 的 ForceStepHookForTest）。
+type fsyncStep string
+
+const (
+	stepWrite    fsyncStep = "write"          // 同目錄暫存檔寫入
+	stepFileSync fsyncStep = "file-sync"      // 暫存檔 fsync
+	stepRename   fsyncStep = "rename"         // atomic rename 到目標路徑
+	stepDirSync  fsyncStep = "directory-sync" // parent directory fsync
 )
 
 // schemaVersion：固定值，不讀設定。
@@ -67,11 +94,39 @@ type fileFormat struct {
 }
 
 // Store：workspace-sessions.json 的唯一 ownership（單一 mutex；temp file +
-// atomic rename、0600；persist 失敗回滾記憶體，同 restore.go 慣例）。
+// fsync + atomic rename + directory fsync、0600；persist 失敗回滾記憶體，同
+// restore.go 慣例，唯一例外見 persistOrRollback）。
 type Store struct {
 	mu   sync.Mutex
 	path string
 	file fileFormat
+
+	// uncertain：ErrRegistryUncertain latch（單向）。非 nil 之後所有寫入一律
+	// 拒絕，直到 app 重啟、重新 Open 以磁碟內容為權威。mu 保護。
+	uncertain error
+
+	// hook：persistLocked 四個步驟的唯一測試注入點；production 恆為 nil
+	// （見 fsync_test.go 的 ForceStepHookForTest）。mu 保護。
+	hook func(fsyncStep) error
+}
+
+// Uncertain：是否已進入 ErrRegistryUncertain latch。給 app 側的 lifecycle 入口
+// 在造成任何副作用**之前**早退用（見 App.registryUncertain）。
+func (s *Store) Uncertain() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uncertain != nil
+}
+
+// step：把四個步驟統一經過同一個接點，讓測試能逐步注入失敗、也能驗證每一步
+// 真的被走到。production 只多一個 nil 比較。
+func (s *Store) step(name fsyncStep, do func() error) error {
+	if s.hook != nil {
+		if err := s.hook(name); err != nil {
+			return err
+		}
+	}
+	return do()
 }
 
 // Open：讀取既有檔案，或於首次使用時以空白狀態初始化並落盤。
@@ -108,7 +163,21 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// persistLocked：temp file + atomic rename（0600）。呼叫端持鎖。
+// persistLocked：owner 2026-08-17 凍結的四步落盤契約。呼叫端持鎖。
+//
+//  1. 同目錄暫存檔寫入（0600）
+//  2. 暫存檔 Sync()——沒有這一步，rename 之後 metadata 指向的是還沒落盤的內容
+//  3. atomic rename
+//  4. parent directory Sync()——沒有這一步，rename 這個 **目錄項變更** 本身
+//     可能還沒 durable，斷電後目錄仍指向舊 inode
+//
+// 四步全部成功才回報成功。續聊身分（resume identity）遷進 registry 之後，這
+// 已經不只是 metadata durability：少一次 sync 就可能在斷電後回退到上一個
+// resume id，復電後接到較舊的對話。刻意不做 debounce／batching——registry
+// 寫入都是低頻 lifecycle 事件，省下的 sync 換不到任何有意義的東西。
+//
+// 步驟 4 失敗是唯一不能沿用一般錯誤處置的位置，見 ErrRegistryUncertain 與
+// persistOrRollback。
 func (s *Store) persistLocked() error {
 	s.file.SchemaVersion = schemaVersion
 	b, err := json.MarshalIndent(s.file, "", "  ")
@@ -116,10 +185,80 @@ func (s *Store) persistLocked() error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := s.writeTempLocked(tmp, b); err != nil {
+		_ = os.Remove(tmp) // 半成品暫存檔不留在 state dir
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := s.step(stepRename, func() error { return os.Rename(tmp, s.path) }); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// —— 這條線之後 commit 可能已經生效，失敗不再等於「沒發生」——
+	if err := s.step(stepDirSync, func() error { return syncDir(filepath.Dir(s.path)) }); err != nil {
+		s.uncertain = fmt.Errorf("%w（原始錯誤：%v）", ErrRegistryUncertain, err)
+		return s.uncertain
+	}
+	return nil
+}
+
+// writeTempLocked：步驟 1＋2。寫入與 Sync 都要成功、Close 也要成功才算數
+// ——Close 的錯誤在部分檔案系統上是 delayed write error 的唯一出口，吞掉它
+// 等於把「其實沒寫進去」報成成功。
+func (s *Store) writeTempLocked(tmp string, b []byte) error {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	werr := s.step(stepWrite, func() error {
+		_, e := f.Write(b)
+		return e
+	})
+	if werr == nil {
+		werr = s.step(stepFileSync, f.Sync)
+	}
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	return cerr
+}
+
+// syncDir：步驟 4。fsync parent directory，讓 rename 造成的目錄項變更本身 durable。
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	serr := d.Sync()
+	cerr := d.Close()
+	if serr != nil {
+		return serr
+	}
+	return cerr
+}
+
+// persistOrRollback：所有 mutator 共用的落盤收尾，把「什麼時候可以回滾記憶體」
+// 這個判斷收在同一個地方。
+//
+// 三種情形：
+//   - latch 已觸發：這次根本沒有碰檔案系統，回滾讓記憶體停在 latch 當下的狀態，
+//     回 ErrRegistryUncertain。
+//   - 步驟 1-3 任一失敗：commit 明確沒有發生（暫存檔已清掉、目標檔沒被碰過），
+//     舊值仍具權威性，照既有慣例回滾。
+//   - 步驟 4 失敗：**不回滾**。rename 已成功，新值很可能已經在磁碟上；退回舊值
+//     等於宣稱舊值仍是權威，但下次啟動載入的會是新值，兩邊不一致而且無法從
+//     process 內判斷何者為真。用一個看似安全的預設值掩蓋一個實際上未知的事實，
+//     比停手更危險，所以這裡只 fail loud ＋ latch。
+func (s *Store) persistOrRollback(rollback func()) error {
+	if s.uncertain != nil {
+		rollback()
+		return s.uncertain
+	}
+	err := s.persistLocked()
+	if err != nil && !errors.Is(err, ErrRegistryUncertain) {
+		rollback()
+	}
+	return err
 }
 
 // Put：新增或覆寫一筆 entry。若該 WSID 已被 Remove tombstone，拒絕覆寫——
@@ -135,15 +274,13 @@ func (s *Store) Put(e Entry) error {
 		return fmt.Errorf("wsregistry: wsid %q is tombstoned, refusing to revive via Put", e.WSID)
 	}
 	s.file.Entries[e.WSID] = e
-	if err := s.persistLocked(); err != nil {
+	return s.persistOrRollback(func() {
 		if existed {
 			s.file.Entries[e.WSID] = old
 		} else {
 			delete(s.file.Entries, e.WSID)
 		}
-		return err
-	}
-	return nil
+	})
 }
 
 // Remove：使用者明確移除——留 tombstone（RemovedAt／RemoveReason），因為
@@ -159,11 +296,7 @@ func (s *Store) Remove(wsid, reason string) error {
 	e.RemovedAt = time.Now().UTC().Format(time.RFC3339)
 	e.RemoveReason = reason
 	s.file.Entries[wsid] = e
-	if err := s.persistLocked(); err != nil {
-		s.file.Entries[wsid] = old
-		return err
-	}
-	return nil
+	return s.persistOrRollback(func() { s.file.Entries[wsid] = old })
 }
 
 // DeleteUncommitted：建立交易失敗的回滾——整筆刪除、不留 tombstone，因為
@@ -184,11 +317,7 @@ func (s *Store) DeleteUncommitted(wsid string) error {
 		return fmt.Errorf("wsregistry: wsid %q is tombstoned, refusing to delete", wsid)
 	}
 	delete(s.file.Entries, wsid)
-	if err := s.persistLocked(); err != nil {
-		s.file.Entries[wsid] = old
-		return err
-	}
-	return nil
+	return s.persistOrRollback(func() { s.file.Entries[wsid] = old })
 }
 
 // Get：回傳指定 wsid 的 entry（含 tombstone；DeleteUncommitted 後的 wsid 不存在）。
@@ -218,11 +347,7 @@ func (s *Store) mutate(wsid string, fn func(*Entry)) error {
 	e := old
 	fn(&e)
 	s.file.Entries[wsid] = e
-	if err := s.persistLocked(); err != nil {
-		s.file.Entries[wsid] = old
-		return err
-	}
-	return nil
+	return s.persistOrRollback(func() { s.file.Entries[wsid] = old })
 }
 
 // CommitResume：StartSession 的 Accept 成功後，把該 WSID 這一次的續聊身分
@@ -300,14 +425,12 @@ func (s *Store) BackfillResume(fill map[string]string) error {
 	}
 	oldMarker := s.file.ResumeBackfilled
 	s.file.ResumeBackfilled = true
-	if err := s.persistLocked(); err != nil {
+	return s.persistOrRollback(func() {
 		for wsid, e := range oldEntries {
 			s.file.Entries[wsid] = e
 		}
 		s.file.ResumeBackfilled = oldMarker
-		return err
-	}
-	return nil
+	})
 }
 
 // entryCount：registry 目前持久化的 entry 總數，含 tombstone（未 export，
@@ -352,11 +475,7 @@ func (s *Store) SetLayout(l Layout) error {
 	defer s.mu.Unlock()
 	old := s.file.Layout
 	s.file.Layout = Layout{Pins: append([]string(nil), l.Pins...), Focused: l.Focused}
-	if err := s.persistLocked(); err != nil {
-		s.file.Layout = old
-		return err
-	}
-	return nil
+	return s.persistOrRollback(func() { s.file.Layout = old })
 }
 
 // Layout：回傳目前的 pinned／focused 排列。Pins 為深拷貝，呼叫端修改回傳值
@@ -376,9 +495,9 @@ func (s *Store) Migrated() bool {
 
 // MarkMigrated：把遷移後的 entries 與 migrated marker 一次原子寫入——
 // Task 5 的冪等性靠這個原子性：中途 app crash 不會出現「entries 已寫、
-// marker 未寫」的半完成狀態，重啟後會整批重跑遷移而不是誤判已完成
-//（僅涵蓋 app crash；未做 fsync，斷電情境不在保證範圍內，同 restore.go
-// 既有慣例缺口）。
+// marker 未寫」的半完成狀態，重啟後會整批重跑遷移而不是誤判已完成。
+// Task 2a 之後這條保證延伸到斷電（persistLocked 的四步 fsync 契約）；
+// restore.json 那一側沒有 fsync，仍是既有缺口。
 //
 // entries 是整批取代既有 s.file.Entries，不是合併——呼叫端必須傳入遷移
 // 後完整的目標集合。允許空 slice（legacy 遷移來源本身就沒有 entries 時，
@@ -402,17 +521,20 @@ func (s *Store) MarkMigrated(entries []Entry) error {
 	oldMigrated := s.file.Migrated
 	s.file.Entries = newEntries
 	s.file.Migrated = true
-	if err := s.persistLocked(); err != nil {
+	return s.persistOrRollback(func() {
 		s.file.Entries = oldEntries
 		s.file.Migrated = oldMigrated
-		return err
-	}
-	return nil
+	})
 }
 
 // Sync：把目前記憶體狀態重新落盤（例如 shutdown 總序中的最終 flush）。
+// latch 之後拒絕：記憶體現況本身已經不知道是不是磁碟上那一份，再寫一次只會
+// 把一個未知狀態固化成看起來確定的樣子。
 func (s *Store) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.uncertain != nil {
+		return s.uncertain
+	}
 	return s.persistLocked()
 }

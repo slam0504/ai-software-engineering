@@ -477,6 +477,8 @@ type sessionRegistry interface {
 	CommitResume(wsid, resumeSessionID, taskLabel string) error
 	SetResume(wsid, resumeSessionID string) error
 	ResetView(wsid, viewStartEventID string) error
+	// Uncertain：registry 的上一次 commit 結果是否不確定（見 registryUncertain）。
+	Uncertain() bool
 }
 
 var _ sessionRegistry = (*wsregistry.Store)(nil)
@@ -489,6 +491,34 @@ var errCreateDegraded = errors.New("app: session create degraded（需重啟 app
 // （啟動流程先載入 registry 才開放 UI），但 nil 介面直接呼叫會 panic 在
 // ReserveSession 之後、名額已被佔走的位置——fail loud 早退比 panic 洩名額好。
 var errNoSessionRegistry = errors.New("app: session registry not loaded")
+
+// errRegistryUncertain：registry 的上一次寫入 commit 結果不確定
+// （wsregistry.ErrRegistryUncertain：檔案已 rename、parent directory sync 失敗）。
+//
+// 與另外兩個 latch 的語意差異見 wsregistry.ErrRegistryUncertain 的 doc。這裡只
+// 補 app 側的處置：**拒絕範圍是 mutation ＋ 會建立／銷毀 durable session 身分的
+// lifecycle，讀取一律放行**。
+//
+// 為什麼讀取放行：uncertain 的是「上一次寫入有沒有 durable」，不是「記憶體內容
+// 有沒有被破壞」。已載入的記憶體資料仍然是這個 process 一路看下來的狀態，擋掉
+// 讀取只會讓 UI 在最需要說明現況的時候變成空白，使用者連「發生了什麼」都看不到。
+//
+// 為什麼 mutation／lifecycle 拒絕：這些操作的正確性建立在「registry 寫得進去」
+// 之上——建立一個寫不進去的 session、移除一個 tombstone 可能沒落盤的 session、
+// 或起一個續聊身分無法被記下來的對話，都會在重啟後變成使用者分辨不出來的錯誤
+// 狀態（ghost session／復活的已移除 session／接回舊對話）。
+//
+// 單向，沒有 in-process 解除路徑：重啟時 Open 讀磁碟上實際的內容，那就是復原
+// 路徑（新的 Store 不帶 latch）。
+var errRegistryUncertain = fmt.Errorf(
+	"app: session registry 上一次寫入的結果不確定，建立／移除／開始對話／開新對話已停用；請重啟 app（重啟後 registry 以磁碟上的 workspace-sessions.json 為準重新載入）：%w",
+	wsregistry.ErrRegistryUncertain)
+
+// registryUncertain：registry 是否已進入 uncertain latch。registry 未接線時回
+// false——那是 errNoSessionRegistry 的範圍，兩個錯誤要能分辨。
+func (a *App) registryUncertain() bool {
+	return a.wsReg != nil && a.wsReg.Uncertain()
+}
 
 // createDegraded：該 provider 是否已進入 create-degraded latch。
 func (a *App) createDegraded(p contract.Provider) bool {
@@ -578,6 +608,11 @@ func (a *App) CreateSession(provider, taskLabel string) (string, error) {
 	}
 	if a.wsReg == nil { // 名額尚未被佔用，直接早退
 		return "", errNoSessionRegistry
+	}
+	// registry uncertain：在 ReserveSession 之前早退。放行的話 Put 會被 store
+	// 拒絕、名額白佔一輪，而且錯誤要等到補償路徑跑完才浮出來。
+	if a.registryUncertain() {
+		return "", errRegistryUncertain
 	}
 	// Remove × New 共用 provider token（§3.6.2）：等待與持有涵蓋 Reserve→Commit
 	// 整段，與 RemoveSession 對同一 provider 互斥（見 crTokens 欄位 doc 的鎖序）。
@@ -795,6 +830,16 @@ func (a *App) noteRegistryWriteResult(w appcore.WSID, p contract.Provider, op st
 	case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):
 		a.audit("session_metadata_write_skipped", map[string]any{
 			"op": op, "wsid": string(w), "provider": string(p), "reason": err.Error()})
+	case errors.Is(err, wsregistry.ErrRegistryUncertain):
+		// 自己的稽核標籤：這不是一次普通的寫入失敗，而是「不知道有沒有寫成功」
+		// 的 latch。混進 restore_store_error 會讓 post-mortem 讀成可重試的 IO 錯誤。
+		a.audit("session_registry_uncertain", map[string]any{
+			"op": op, "wsid": string(w), "provider": string(p), "error": err.Error()})
+		a.emit("workbench:event", contract.Envelope{
+			EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
+			Provider: string(p), Kind: string(contract.KindStreamError),
+			Error: errRegistryUncertain.Error(),
+		})
 	default:
 		a.failLoudRestore(p, err)
 	}
@@ -1835,8 +1880,13 @@ func (a *App) shutdown(ctx context.Context) {
 	a.shutdownStep("index_flush_close")
 
 	// 12) session registry Sync：tombstone／entry 的最後一次落盤（§3.6.5 末步）。
+	// uncertain latch 期間刻意跳過、只留稽核（同上方 index_flush 的處置形狀）：
+	// 記憶體現況本身已經不知道是不是磁碟上那一份，再寫一次只會把未知固化。
 	if a.wsReg != nil {
-		if err := a.wsReg.Sync(); err != nil {
+		if a.registryUncertain() {
+			a.audit("shutdown_registry_sync_skipped", map[string]any{
+				"reason": "registry commit 結果不確定，最終落盤交給下次啟動以磁碟內容為準"})
+		} else if err := a.wsReg.Sync(); err != nil {
 			a.audit("shutdown_registry_sync_error", map[string]any{"error": err.Error()})
 		}
 	}
@@ -5072,6 +5122,12 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 	if err != nil {
 		return err
 	}
+	// registry uncertain：在 BeginNewSessionSubmit／provider 啟動之前早退。
+	// 放行的話會起一個 provider 子行程、拿到新的 resume id，而 CommitResume
+	// 一定寫不進去——重啟後這個 session 會接回**上一次**的對話，使用者分辨不出來。
+	if a.registryUncertain() {
+		return errRegistryUncertain
+	}
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
 		resume = a.registryResume(w)
 	}
@@ -5321,6 +5377,13 @@ func (a *App) RemoveSession(wsid string) error {
 	}
 	if a.wsReg == nil {
 		return errNoSessionRegistry
+	}
+	// registry uncertain：必須早於 deny_approvals／teardown／cleanup_files。
+	// 那三步有不可逆的對外副作用，而 tombstone_persist 一定會被 store 拒絕
+	// ——放行等於對一個仍會存活的 session 先造成傷害，違反上面「任一步失敗
+	// 都不得留下傷害」的凍結精神。
+	if a.registryUncertain() {
+		return errRegistryUncertain
 	}
 
 	crt := a.crToken(p)
@@ -6721,6 +6784,12 @@ func (a *App) NewSession(wsid string) error {
 	w, pv, err := a.resolveWSID("new session", wsid)
 	if err != nil {
 		return err
+	}
+	// registry uncertain：在 teardown 之前早退。放行的話對話會被真的結束、UI
+	// 重設，但 view boundary 前移寫不進去——重啟後那些「已經開新對話」的舊
+	// turn 會整批復活，正是 §3.8 boundary 要防的事。
+	if a.registryUncertain() {
+		return errRegistryUncertain
 	}
 	provider := string(pv)
 	host := a.hostFor(w)
