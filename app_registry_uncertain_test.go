@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -137,14 +138,26 @@ func TestRegistryUncertainDoesNotBlockExistingConversation(t *testing.T) {
 // TestRegistryUncertainWriteIsFailLoudWithOwnSignal：latch 觸發時的訊號。
 //
 // per-WSID metadata writer（CommitResume／SetResume／ResetView）的失敗處置由
-// noteRegistryWriteResult 統一，uncertain 必須有**自己的**稽核標籤與 UI 訊息
-// ——混進 restore_store_error 會讓 post-mortem 讀成一次可重試的 IO 錯誤，而
-// 這件事的正確處置是重啟。
+// noteRegistryWriteResult 統一。這條路徑**沒有同步呼叫端可以回錯**（late claude
+// init 的 SetResume 是背景事件），所以 UI 訊號是使用者唯一的出口——它必須是前端
+// **真的會消費並渲染**的形狀，不是「有呼叫 a.emit」就算數。
+//
+// rev2 走證據鏈時抓到的缺口：舊版直接 a.emit 一個 session-scope、**不帶
+// workspace_session_id** 的 envelope。前端 routeEnvelope 把它判成 session lane，
+// session store 的 apply() 對空 WSID 只做 `unrouted++` 然後丟棄，而 unrouted
+// 至今沒有任何渲染端 → 這條 fail loud 對使用者是無聲的。改走 workspace lane
+// （Manager.EmitWorkspace）之後才會進 notices → 合併進任何 focused pane 的
+// timeline → Timeline.vue 渲染。前端那一半由
+// frontend/src/registryUncertain.test.ts 斷言實際 DOM 內容。
 //
 // mutation：
 //   - 拿掉 noteRegistryWriteResult 的 ErrRegistryUncertain 分支（落回 default）
 //     → 紅在「必須留下 session_registry_uncertain 稽核」。
 //   - 只寫 audit、不 emit → 紅在「必須發出使用者看得到的 stream_error」。
+//   - 換回舊的 a.emit(session-scope、無 WSID) 形狀 → 紅在「必須走 workspace
+//     lane」（scope 不是 workspace ＝ 前端會丟進 unrouted）。
+//   - payload 只放 error、不放 component（或反之）→ 訊息仍渲染得出來，故**不**
+//     在這裡斷言 component；前端的 summary() 契約由 Timeline.test.ts 守。
 //   - 把訊息換成不含處置說明的字串 → 紅在「訊息必須說明該怎麼辦」。
 func TestRegistryUncertainWriteIsFailLoudWithOwnSignal(t *testing.T) {
 	a, ui := newTestApp(t)
@@ -159,19 +172,39 @@ func TestRegistryUncertainWriteIsFailLoudWithOwnSignal(t *testing.T) {
 	if auditHas(t, a.stateDir, "restore_store_error") {
 		t.Fatal("uncertain 不得被記成一般的 restore store 錯誤")
 	}
-	// 走 a.emit（UI 出口），不回寫 events.jsonl——同 failLoudRestore 的既有形狀。
-	var msg string
+
+	// 兩個出口都撈：a.emit 的原始 UI 事件與 Manager 的 envelope 出口。這樣
+	// 「有沒有發」與「形狀對不對」才是兩條各自獨立的斷言——只撈 Manager 那條的
+	// 話，回到 a.emit 的 mutation 會紅在「必須發出」而不是紅在「必須走 workspace
+	// lane」，讀起來像沒發訊號，掩蓋真正的缺陷。
+	var got contract.Envelope
+	envs := ui.findEnvKind(string(contract.KindStreamError))
 	for _, ev := range ui.find("workbench:event") {
-		env, ok := ev.data.(contract.Envelope)
-		if ok && env.Kind == string(contract.KindStreamError) && strings.Contains(env.Error, "不確定") {
-			msg = env.Error
+		if env, ok := ev.data.(contract.Envelope); ok {
+			envs = append(envs, env)
 		}
 	}
-	if msg == "" {
+	for _, env := range envs {
+		if strings.Contains(string(env.Payload)+env.Error, "不確定") {
+			got = env
+		}
+	}
+	if got.EventID == "" {
 		t.Fatal("uncertain 必須發出使用者看得到的 stream_error")
 	}
-	if !strings.Contains(msg, "重啟") {
-		t.Fatalf("訊息必須說明該怎麼辦（重啟 app）：%s", msg)
+	if got.Scope != "workspace" {
+		t.Fatalf("必須走 workspace lane（session lane ＋空 WSID 會被前端 apply() 計進 unrouted 丟棄）：scope=%q wsid=%q",
+			got.Scope, got.WorkspaceSessionID)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(got.Payload, &payload); err != nil {
+		t.Fatalf("payload 必須是前端讀得懂的 map：%v（%s）", err, got.Payload)
+	}
+	if !strings.Contains(payload["error"], "重啟") {
+		t.Fatalf("訊息必須說明該怎麼辦（重啟 app）：%s", payload["error"])
+	}
+	if payload["wsid"] != "w-uncertain" {
+		t.Fatalf("訊息要帶上是哪一個 session 的寫入失敗：%+v", payload)
 	}
 }
 

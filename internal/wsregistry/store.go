@@ -214,7 +214,9 @@ func (s *Store) writeTempLocked(tmp string, b []byte) error {
 		return e
 	})
 	if werr == nil {
-		werr = s.step(stepFileSync, f.Sync)
+		// strongSync 而非 f.Sync()：macOS 的 fsync 不保證資料離開硬碟的揮發性
+		// 快取（見 strongsync.go）。
+		werr = s.step(stepFileSync, func() error { return strongSync(f) })
 	}
 	cerr := f.Close()
 	if werr != nil {
@@ -223,13 +225,17 @@ func (s *Store) writeTempLocked(tmp string, b []byte) error {
 	return cerr
 }
 
-// syncDir：步驟 4。fsync parent directory，讓 rename 造成的目錄項變更本身 durable。
+// syncDir：步驟 4。讓 rename 造成的**目錄項變更**本身 durable。
+//
+// barrier 強度與步驟 2 相同（strongSync，Darwin 上是 F_FULLFSYNC）——只把暫存檔
+// 內容 strong-sync、目錄項卻用較弱的 fsync，等於留著同一個洞：斷電後目錄仍可能
+// 指向舊 inode，前面那一次強 sync 就白做了。
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	serr := d.Sync()
+	serr := strongSync(d)
 	cerr := d.Close()
 	if serr != nil {
 		return serr

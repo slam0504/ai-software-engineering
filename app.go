@@ -835,10 +835,24 @@ func (a *App) noteRegistryWriteResult(w appcore.WSID, p contract.Provider, op st
 		// 的 latch。混進 restore_store_error 會讓 post-mortem 讀成可重試的 IO 錯誤。
 		a.audit("session_registry_uncertain", map[string]any{
 			"op": op, "wsid": string(w), "provider": string(p), "error": err.Error()})
-		a.emit("workbench:event", contract.Envelope{
-			EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
-			Provider: string(p), Kind: string(contract.KindStreamError),
-			Error: errRegistryUncertain.Error(),
+		// 使用者可見出口＝**workspace lane**（同 failLoudCodexDispatch 的形狀）。
+		//
+		// 這裡刻意不用 a.emit 直接送一個 session-scope envelope：那個形狀沒有
+		// workspace_session_id，前端 routeEnvelope 會判成 session lane，而
+		// session store 的 apply() 對空 WSID 只做 `unrouted++` 然後丟棄——
+		// unrouted 至今沒有任何渲染端，等於這條 fail loud 到不了使用者
+		// （rev2 走證據鏈時抓到的缺口）。workspace lane 會進 notices，而
+		// notices 被合併進**任何** focused pane 的 timeline：latch 是 registry
+		// 全域的事實，本來就不該只在某一個 pane 看得到。
+		//
+		// payload 用 component ＋ error 兩個 key：Timeline.vue 的 summary()
+		// 正是讀這兩個（頂層 Error 是 omitempty，EmitWorkspace 從不填它）。
+		// wsid／op 一併帶著，讓使用者知道是哪一個 session 的哪一次寫入。
+		a.manager.EmitWorkspace(string(contract.KindStreamError), nil, map[string]string{
+			"component": "session-registry",
+			"wsid":      string(w),
+			"op":        op,
+			"error":     errRegistryUncertain.Error(),
 		})
 	default:
 		a.failLoudRestore(p, err)
