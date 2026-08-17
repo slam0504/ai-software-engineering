@@ -233,18 +233,31 @@ func TestShutdownSkipsRegistrySyncWhenUncertain(t *testing.T) {
 	}
 }
 
-// TestEveryRegistryWriteRecordsUncertainAudit：rev2 review I2——
-// `session_registry_uncertain` 必須覆蓋**所有**可能首次設下 latch 的寫入點，
-// 不只 per-WSID writer 那一條。
+// TestRegistryUncertainAuditCoversStubbableWrites：rev2 review I2 的守門。
 //
 // 情境是「latch 由**這一次**寫入設下」：早退 gate 讀的 `Uncertain()` 此刻仍是
 // false（stub 不設 uncertain），所以呼叫進得去，寫入本身回哨兵。沒有這層稽核，
 // post-mortem 只看得到之後一連串被拒絕的操作，答不出 latch 是何時、被哪一次
 // 寫入設下的。
 //
-// mutation（各自只打紅一列）：拿掉任一呼叫點的 noteRegistryUncertainErr →
-// 紅在該入口那一行。
-func TestEveryRegistryWriteRecordsUncertainAudit(t *testing.T) {
+// **覆蓋範圍要說清楚（rev3 review Critical）**：`noteRegistryUncertainErr` 接了
+// 七個呼叫點，這條測試只守得住其中五個——凡是經過 `a.wsReg`（sessionRegistry
+// 介面，可換成 stub）的都守得到：
+//
+//	create_put／create_rollback／reset_view／tombstone_persist／shutdown_sync
+//
+// **另外兩個 op 標籤目前零守門**，據實記在這裡：
+//
+//	resume_backfill／registry_load
+//
+// 這兩個直接吃具體型別 `*wsregistry.Store`（`BackfillResume` 不在介面上、
+// `registry_load` 發生在 `a.wsReg` 接線之前），而讓真實 Store 的步驟 4 失敗需要
+// 它 package-private 的注入鉤子，跨 package 取不到。把鉤子 export 進 production
+// API 只為了測試，代價比這兩格的價值高——登記為已知缺口，不要讀成「已覆蓋」。
+//
+// mutation（各自只打紅一列）：拿掉表中**任一**入口的 noteRegistryUncertainErr
+// → 紅在該入口那一個 subtest。
+func TestRegistryUncertainAuditCoversStubbableWrites(t *testing.T) {
 	sentinel := wsregistry.ErrRegistryUncertain
 
 	cases := []struct {
@@ -256,6 +269,19 @@ func TestEveryRegistryWriteRecordsUncertainAudit(t *testing.T) {
 			reg.putErr = sentinel
 			if _, err := a.CreateSession("claude", "x"); !errors.Is(err, sentinel) {
 				t.Fatalf("前提：Put 回哨兵時 CreateSession 要回同一個錯誤，got %v", err)
+			}
+		}},
+		{"CreateSession→DeleteUncommitted（回滾）", "create_rollback", func(t *testing.T, a *App, reg *stubRegistry) {
+			// CommitCreate 失敗 → 走 DeleteUncommitted 回滾，而回滾本身撞上 latch。
+			// deleteErr 要真的被走到：stub 的 DeleteUncommitted 對「entry 不存在」
+			// 是冪等 no-op，所以必須讓 Put 先成功（不設 putErr）。
+			a.hookForceCommitCreateError = errors.New("commit create boom")
+			reg.mu.Lock()
+			reg.deleteErr = sentinel
+			reg.mu.Unlock()
+			_, err := a.CreateSession("claude", "x")
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("前提：回滾撞上哨兵時 CreateSession 要把它一起回報，got %v", err)
 			}
 		}},
 		{"NewSession→ResetView", "reset_view", func(t *testing.T, a *App, reg *stubRegistry) {
@@ -373,5 +399,57 @@ func TestBackfillFailureStillReachesUserAfterEarlierWarning(t *testing.T) {
 	}
 	if !strings.Contains(a.startupErr, "續聊身分升級補寫失敗") {
 		t.Fatalf("後到的警告不得被 first-wins 吃掉（Fail Loud）：%q", a.startupErr)
+	}
+	// rev3 review I1：`.meta` 是單行 ellipsis，而第一則含完整絕對路徑（>100
+	// 字元）；串在它後面等於在一般視窗寬度下被裁掉。真實路徑上也要驗排序。
+	if strings.Index(a.startupErr, "續聊身分升級補寫失敗") > strings.Index(a.startupErr, "跳過 1 筆") {
+		t.Fatalf("registry 這則必須排在「跳過 N 筆」前面，否則在單行版面上讀不到：%q", a.startupErr)
+	}
+}
+
+// TestErrRegistryUncertainKeepsUIMarker：跨語言字面值的漂移守門。
+//
+// 前端沒有別的辦法從一個 binding 錯誤**字串**判斷「這是 latch」——同步拒絕路徑
+// （Create／Start／New／Remove）拿到的只有 error message，沒有結構化欄位。所以
+// frontend/src/stores/session.ts 的 REGISTRY_UNCERTAIN_MARK 直接比對這個片語，
+// 而 App.vue 據此對 latch 做 one-shot 強制展開 timeline。
+//
+// 沒有這條測試，改一個字就會讓前端那條路徑靜默失效（訊息照樣顯示，但 latch 的
+// 強制展開不再觸發）——典型的「保證只寫在註解裡」。
+//
+// mutation：改動 errRegistryUncertain 的這段字 → 紅在下面那一行，訊息直接指出
+// 要同步改哪一個前端檔案。
+func TestErrRegistryUncertainKeepsUIMarker(t *testing.T) {
+	// 必須與 frontend/src/stores/session.ts 的 REGISTRY_UNCERTAIN_MARK 逐字相同。
+	const uiMarker = "session registry 上一次寫入的結果不確定"
+	if !strings.Contains(errRegistryUncertain.Error(), uiMarker) {
+		t.Fatalf("errRegistryUncertain 必須含前端用來辨識 latch 的片語 %q；"+
+			"改動訊息時要同步改 frontend/src/stores/session.ts 的 REGISTRY_UNCERTAIN_MARK。\ngot: %s",
+			uiMarker, errRegistryUncertain.Error())
+	}
+}
+
+// TestStartupBlockerSortsBeforeBenignWarning：rev3 review I1——`.meta` 是單行
+// ellipsis 版面，串在後面的句子在一般視窗寬度下會被裁掉。所以排序必須是**嚴重度
+// 優先**，不是時序：registry 停止寫入／載入失敗這類要排在「跳過 N 筆」前面。
+//
+// mutation：noteStartupBlocker 改成單純 append → 紅在「blocker 必須排在良性
+// 警告前面」。
+func TestStartupBlockerSortsBeforeBenignWarning(t *testing.T) {
+	a := &App{}
+	a.noteStartupWarning("session registry: 跳過 1 筆無法還原的 entry（未刪除，仍在 /very/long/path/workspace-sessions.json）")
+	a.noteStartupBlocker("session registry: 續聊身分升級補寫失敗")
+	a.noteStartupWarning("replay index 開啟失敗")
+
+	blocker := strings.Index(a.startupErr, "續聊身分升級補寫失敗")
+	benign := strings.Index(a.startupErr, "跳過 1 筆")
+	if blocker < 0 || benign < 0 {
+		t.Fatalf("兩則都必須留著（累積，不得丟棄）：%q", a.startupErr)
+	}
+	if blocker > benign {
+		t.Fatalf("blocker 必須排在良性警告前面（.meta 是單行 ellipsis，後面的會被裁掉）：%q", a.startupErr)
+	}
+	if !strings.Contains(a.startupErr, "replay index 開啟失敗") {
+		t.Fatalf("後到的良性警告仍不得被丟棄：%q", a.startupErr)
 	}
 }

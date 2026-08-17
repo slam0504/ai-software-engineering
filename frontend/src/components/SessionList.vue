@@ -34,7 +34,9 @@ async function createSession(p: ProviderKey) {
     s.registerSession({ wsid: w, provider: p, taskLabel: '' })
     s.pin(s.focused, w)
   } catch (e) {
-    s.pushError(t('sessionList.create.failed', { provider: p, error: String(e) }))
+    // pushNotice（app-wide lane）而非 pushError：建立失敗根本還沒有 WSID，
+    // 綁到 focused pane 的 view 只會在「剛好有 pane 被 focus」時才看得到。
+    s.pushNotice(t('sessionList.create.failed', { provider: p, error: String(e) }))
   }
 }
 
@@ -66,7 +68,15 @@ async function confirmRemove(wsid: string) {
     await RemoveSession(wsid)
     s.markRemoved(wsid)
   } catch (e) {
-    s.pushError(t('sessionList.remove.failed', { wsid, error: String(e) }), wsid, true)
+    // rev3 review Critical：這裡曾經是 pushError(msg, wsid, true)，寫進
+    // `views[wsid].timeline`——而 timeline getter **只讀 focused view**。使用者
+    // 可以對清單上**任何**一個 session 按移除，包括沒被釘選／不在 focus 的那些，
+    // 所以失敗訊息會落進一個畫面上根本沒顯示的 view：畫面上只剩「卡片沒消失」，
+    // 沒有任何說明。改走 app-wide 的 notices lane（訊息本身已帶 wsid）。
+    //
+    // 一併解掉 keepBusy 的顧慮：pushNotice 從頭到尾不碰 busy，所以「對 streaming
+    // 中的 session 按移除，busy-dot 不得被誤清」是結構上成立，不再靠參數。
+    s.pushNotice(t('sessionList.remove.failed', { wsid, error: String(e) }))
   }
 }
 </script>

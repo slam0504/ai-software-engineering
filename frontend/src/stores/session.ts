@@ -139,9 +139,31 @@ interface State {
   // 見，接進 UI 是 Task 28 的事（DualPane／狀態列）。在那之前，丟棄的事件對使
   // 用者仍是無聲的，稽核（events.jsonl）才是唯一完整的證據來源。
   unrouted: number
+  // errorSeq：**單調遞增**的錯誤計數（Task 2a rev3 review）。App.vue 的
+  // timeline 未讀 badge 以它為來源。刻意不從 `timeline` getter 投影推導——那個
+  // getter 只讀 focused view，非 focus pane 的錯誤數不進去（漏報），而切換
+  // pane 會讓數字上下跳動、把已讀的重新算成未讀（誤報）。
+  //
+  // 只在「事件真的被放進某個看得到的地方」時遞增；§3.8 的歷史回放（pin／
+  // loadOlder 直接走 applyToView）不算——那些錯誤第一次抵達時已經數過了。
+  errorSeq: number
+  // latchSeq：**registry uncertain latch 專屬**的單調計數。App.vue 據此做
+  // one-shot 強制展開 timeline。與 errorSeq 分開是因為成本不對稱：latch 是
+  // 「必須重啟、之後每個 lifecycle 操作都會被拒」的狀態，使用者晚看到一分鐘
+  // 就是多按 N 次都失敗，跟一般 stream_error 不同等級。
+  latchSeq: number
   approvalPolicy: string
   bindings: Bindings | null
 }
+
+// REGISTRY_UNCERTAIN_MARK：app.go `errRegistryUncertain` 訊息裡的固定片語。
+// 前端沒有別的辦法從一個 binding 錯誤字串判斷「這是 latch」——同步拒絕路徑
+// （Create／Start／New／Remove）拿到的只有字串，沒有結構化欄位。
+//
+// 跨語言字面值共用，沿用 MAX_SESSIONS_PER_PROVIDER／TURN_WINDOW_SIZE 的既有
+// 慣例；Go 端 `TestErrRegistryUncertainKeepsUIMarker` 守住它不漂移（改了 Go
+// 訊息卻沒改這裡，那條測試會紅）。
+export const REGISTRY_UNCERTAIN_MARK = 'session registry 上一次寫入的結果不確定'
 
 function providerOf(p: string | undefined): ProviderKey {
   return p === 'codex' ? 'codex' : 'claude'
@@ -165,6 +187,8 @@ export const useSession = defineStore('session', {
     scrollAnchors: {},
     notices: [],
     unrouted: 0,
+    errorSeq: 0,
+    latchSeq: 0,
     approvalPolicy: 'untrusted',
     bindings: null,
   }),
@@ -428,11 +452,23 @@ export const useSession = defineStore('session', {
 
       if (!v) return // 非釘選：metadata 已更新，不保留 transcript
       applyToView(v, env)
+      if (env.kind === 'stream_error') this.bumpError(String(env.error ?? ''))
     },
 
     // applyNotice：workspace scope 事件（不屬於任何 session）。
     applyNotice(env: Envelope) {
       this.notices.push({ env })
+      if (env.kind === 'stream_error') {
+        this.bumpError(String(env.error ?? (env.payload as any)?.error ?? ''))
+      }
+    },
+
+    // bumpError：錯誤計數的唯一入口（errorSeq 恆增；latch 另計）。集中在一處
+    // 是為了讓「哪些路徑會被 badge 算到」只有一個答案——散在各 push 點遲早
+    // 會漏一條，而漏掉的那條正是使用者看不到的那條。
+    bumpError(text: string) {
+      this.errorSeq++
+      if (text.includes(REGISTRY_UNCERTAIN_MARK)) this.latchSeq++
     },
 
     // submit：作用於 focused pane 的 session。第一輪 StartSession（帶 resume／
@@ -493,13 +529,20 @@ export const useSession = defineStore('session', {
       if (m && !keepBusy) m.busy = false
       const v = this.views[w]
       if (!v) {
-        this.applyNotice(uiEnv('stream_error', { error: msg }))
+        this.applyNotice(uiEnv('stream_error', { error: msg })) // 計數由 applyNotice 負責
         return
       }
       v.timeline.push({ env: uiEnv('stream_error', { provider: m?.provider ?? '', error: msg }) })
       v.noiseGroup = -1
+      this.bumpError(msg)
     },
 
+    // pushNotice：**app-wide** 的錯誤出口——不綁任何 pane。
+    //
+    // 什麼時候用它而不是 pushError（rev3 review Critical）：錯誤的作用範圍不是
+    // 「使用者正在看的那個 session」時。pushError 會寫進 `views[wsid].timeline`，
+    // 而 `timeline` getter **只讀 focused view**——對一個沒被 focus 的 session
+    // 按移除，錯誤就寫進一個畫面上根本沒顯示的 view，使用者只看到卡片沒消失。
     pushNotice(msg: string) {
       this.applyNotice(uiEnv('stream_error', { error: msg }))
     },

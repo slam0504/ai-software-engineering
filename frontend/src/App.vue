@@ -167,13 +167,30 @@ watch(gateWidth, v => save('wb.gate.width', v))
 //
 // 這不是第三條通知管道，是讓現有那一條在收合狀態下仍然可靠：只在 toggle 上
 // 顯示一個計數，不搶焦點、不強制展開。展開即歸零（使用者已經看到內容了）。
+// 來源是 store 的**單調** errorSeq，不是 `s.timeline` 的投影（rev3 review）：
+// 那個 getter 只讀 focused view，非 focus pane 的錯誤不會被算到（漏報），而且
+// 切 pane 會讓數字上下跳、把已讀的重新算成未讀（誤報）。
 const tlUnread = ref(0)
-const timelineErrorCount = computed(
-  () => s.timeline.filter(i => i.env.kind === 'stream_error').length)
-watch(timelineErrorCount, (now, prev) => {
-  if (!timelineOpen.value && now > prev) tlUnread.value += now - prev
+watch(() => s.errorSeq, (now, prev) => {
+  if (!timelineOpen.value) tlUnread.value += now - prev
 })
 watch(timelineOpen, v => { if (v) tlUnread.value = 0 })
+
+// latchForcedOpen：registry uncertain latch 抵達時**強制展開一次**（one-shot）。
+//
+// 為什麼 badge 不夠：latch 的成本不對稱——它是「必須重啟、之後每個 lifecycle
+// 操作都會被拒」的狀態，使用者晚一分鐘看到就是多按 N 次都失敗，跟一般
+// stream_error 不是同一個等級。
+//
+// 這**不是**第三條通知管道：出口仍然是 Timeline 那一條，只是保證它在那一刻是
+// 開的。one-shot flag 讓使用者之後可以自己收合，不會被反覆搶走畫面。
+const latchForcedOpen = ref(false)
+watch(() => s.latchSeq, n => {
+  if (n > 0 && !latchForcedOpen.value) {
+    latchForcedOpen.value = true
+    timelineOpen.value = true
+  }
+})
 
 // Timeline 拖高：resize handle 垂直拖曳
 let dragStartY = 0

@@ -92,6 +92,13 @@ const backgroundNotice: Envelope = {
   payload: { component: 'session-registry', wsid: 'w1', op: 'set_resume', error: GO_ERROR },
 }
 
+// plainError：**非 latch** 的一般 workspace 錯誤。badge 的語意（累計、不誤報）
+// 要用它驗——latch 會觸發 one-shot 強制展開，用 latch 驗 badge 等於驗不到。
+const plainError: Envelope = {
+  event_id: 'ru9', ts: 't', provider: '', scope: 'workspace', kind: 'stream_error',
+  payload: { component: 'replay-index', error: 'replay index degraded: checkpoint ahead of audit' },
+}
+
 // legacyUnroutable：rev2 之前的形狀——session lane、**不帶 workspace_session_id**。
 const legacyUnroutable: Envelope = {
   event_id: 'ru0', ts: 't', provider: 'claude', kind: 'stream_error', error: GO_ERROR,
@@ -186,21 +193,17 @@ describe('registry uncertain latch：背景失敗必須有使用者可見出口�
   })
 })
 
-describe('registry uncertain latch：Timeline 收合時仍必須看得見（rev2 review C2）', () => {
+describe('Timeline 收合時的可見性（rev2 review C2／rev3 review 修正）', () => {
   beforeEach(resetEnv)
 
-  // Timeline 掛在 `v-show="timelineOpen"` 之下，而 timelineOpen 會寫進
-  // localStorage——使用者收合過一次就跨重啟保持收合。這條先證明「收合是真的
-  // 會發生、而且真的看不到內容」，再證明 toggle 上的未讀 badge 補上了可見度。
-  //
-  // mutation：拿掉 `.tl-badge`（或不再累計 tlUnread）→ 紅在「收合時必須有未讀
-  // 標記」。直接 mount Timeline 的測試繞過整個掛載條件，量不到這一維。
-  it('收合狀態（localStorage 記憶）下 latch 通知不可見，但 toggle 有未讀 badge', async () => {
+  // badge 的來源必須是 store 的**單調** errorSeq，不是 `s.timeline` 的投影。
+  // mutation：拿掉 .tl-badge → 紅在「收合時必須有未讀標記」。
+  it('收合狀態（localStorage 記憶）下錯誤不可見，但 toggle 有未讀 badge', async () => {
     memStorage.setItem('wb.tl.open', 'false') // 上一輪使用者收合過
     const w = await mountApp()
     expect(w.find('.tl').isVisible(), '前提：收合狀態下 Timeline 內容不可見').toBe(false)
 
-    fire(backgroundNotice)
+    fire(plainError)
     await w.vm.$nextTick()
 
     const badge = w.find('[data-test=tl-unread]')
@@ -208,26 +211,126 @@ describe('registry uncertain latch：Timeline 收合時仍必須看得見（rev2
     expect(badge.text()).toBe('1')
   })
 
-  // 展開後：內容看得到、badge 歸零。
+  // rev3 review：累計性本身**零守門**——把 `tlUnread += now - prev` 改成 `= 1`
+  // 舊測試照樣全綠。這條補上。
+  // mutation：改成 `tlUnread.value = 1` → 紅在「兩則錯誤必須累計成 2」。
+  it('未讀單調累計：兩則錯誤顯示 2', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    fire(plainError)
+    fire({ ...plainError, event_id: 'ru9b' })
+    await w.vm.$nextTick()
+    expect(w.find('[data-test=tl-unread]').text()).toBe('2')
+  })
+
+  // rev3 review：badge 從 focus-dependent 的投影推導時會**誤報**——收合狀態下
+  // 切 pane 再切回（沒有新錯誤）會把已讀的重新算成未讀。
+  // mutation：badge 改回 `s.timeline.filter(...).length` 的投影 → 紅在這裡。
+  it('切換 pane 不重算未讀（單調來源，不是 focus 投影）', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+    // 錯誤放在**目前 focus 的** w1 自己的 lane：投影版本在「切走再切回」時會看到
+    // 0→1 的變化而再加一次，這正是 reviewer 說的誤報。用 workspace notice 驗不
+    // 出來（notices 對兩個 pane 都可見，投影值不會變）。
+    s.apply({ event_id: 'e-w1', ts: 't', provider: 'claude', kind: 'stream_error',
+      error: 'claude 那邊壞了', workspace_session_id: 'w1' })
+    await w.vm.$nextTick()
+    expect(w.find('[data-test=tl-unread]').text()).toBe('1')
+
+    s.setFocus(1); await w.vm.$nextTick()
+    s.setFocus(0); await w.vm.$nextTick()
+    expect(w.find('[data-test=tl-unread]').text(), '沒有新錯誤，未讀不得增加').toBe('1')
+  })
+
+  // rev3 review：**漏報**的另一半——非 focus pane 的 session lane 錯誤也必須
+  // 算進未讀（投影版本完全看不到它）。
+  it('非 focus pane 的錯誤也算進未讀', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1'); s.pin(1, 'w2'); s.setFocus(0)
+
+    s.apply({ event_id: 'e-w2', ts: 't', provider: 'codex', kind: 'stream_error',
+      error: 'codex 那邊壞了', workspace_session_id: 'w2' })
+    await w.vm.$nextTick()
+    expect(w.find('[data-test=tl-unread]').exists(), '非 focus pane 的錯誤不得漏報').toBe(true)
+  })
+
   it('展開後訊息可見且未讀歸零', async () => {
     memStorage.setItem('wb.tl.open', 'false')
     const w = await mountApp()
-    fire(backgroundNotice)
+    fire(plainError)
     await w.vm.$nextTick()
     await w.find('.tl-toggle').trigger('click')
     await w.vm.$nextTick()
 
     expect(w.find('.tl').isVisible()).toBe(true)
-    expect(timelineText(w)).toContain('請重啟 app')
+    expect(timelineText(w)).toContain('replay index degraded')
     expect(w.find('[data-test=tl-unread]').exists()).toBe(false)
   })
 
-  // 展開狀態下不累計——badge 是「沒看到的那些」，不是錯誤總數。
   it('展開狀態下不累計未讀', async () => {
     const w = await mountApp() // 預設展開
-    fire(backgroundNotice)
+    fire(plainError)
     await w.vm.$nextTick()
     expect(w.find('[data-test=tl-unread]').exists()).toBe(false)
+  })
+})
+
+describe('latch 抵達時強制展開一次（rev3 review Important）', () => {
+  beforeEach(resetEnv)
+
+  // latch 的成本不對稱：必須重啟、之後每個 lifecycle 操作都會被拒。badge 需要
+  // 使用者主動點一下，對這個等級的狀態不夠。出口仍是 Timeline 那一條，只是
+  // 保證它在那一刻是開的。
+  //
+  // mutation：拿掉 App.vue 的 latchSeq watcher → 紅在「latch 必須強制展開」。
+  it('收合狀態下 latch 抵達 → 自動展開且訊息立刻可見', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    const w = await mountApp()
+    expect(w.find('.tl').isVisible(), '前提：起始為收合').toBe(false)
+
+    fire(backgroundNotice)
+    await w.vm.$nextTick()
+
+    expect(w.find('.tl').isVisible(), 'latch 必須強制展開（不能只留一個要點的 badge）').toBe(true)
+    expect(timelineText(w)).toContain('請重啟 app')
+  })
+
+  // one-shot：使用者自己收合之後，第二則 latch 不再搶畫面。
+  // mutation：把 latchForcedOpen 的 one-shot 判斷拿掉 → 紅在「不得反覆搶畫面」。
+  it('one-shot：使用者收合後第二則 latch 不再強制展開', async () => {
+    const w = await mountApp()
+    fire(backgroundNotice)
+    await w.vm.$nextTick()
+    await w.find('.tl-toggle').trigger('click') // 使用者讀完，自己收合
+    await w.vm.$nextTick()
+    expect(w.find('.tl').isVisible()).toBe(false)
+
+    fire({ ...backgroundNotice, event_id: 'ru1b' })
+    await w.vm.$nextTick()
+    expect(w.find('.tl').isVisible(), 'one-shot：不得反覆搶畫面').toBe(false)
+    expect(w.find('[data-test=tl-unread]').exists(), '但仍要留下未讀標記').toBe(true)
+  })
+
+  // 同步拒絕路徑也是 latch：錯誤只有字串，靠 REGISTRY_UNCERTAIN_MARK 辨識。
+  // mutation：改掉 Go 或前端任一邊的片語 → Go 的
+  // TestErrRegistryUncertainKeepsUIMarker 紅；這裡則紅在「同步拒絕也要強制展開」。
+  it('同步拒絕（Create）帶的 latch 訊息同樣強制展開', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    appMocks.CreateSession.mockRejectedValueOnce(new Error(GO_ERROR))
+    const w = await mountApp()
+    await w.find('.session-list [data-test=create-claude]').trigger('click')
+    await flush2(w)
+
+    expect(w.find('.tl').isVisible(), '同步拒絕也要強制展開').toBe(true)
+    expect(timelineText(w)).toContain('請重啟 app')
   })
 })
 
@@ -250,21 +353,66 @@ describe('registry uncertain latch：同步拒絕的使用者可見出口（矩�
     expect(txt).toContain('請重啟 app')
   })
 
-  // RemoveSession：SessionList 的二段式移除。
-  // mutation：失敗時仍呼叫 markRemoved → 紅在「卡片不得消失」。
-  it('RemoveSession 被拒絕 → 卡片不消失，錯誤原文與下一步渲染出來', async () => {
+  // RemoveSession（矩陣 A9）：**rev3 review 抓到的 Critical 就在這一條的 setup**。
+  //
+  // 舊版只 `registerSession` 沒 `pin`，所以 `views['w1']` 不存在，`pushError`
+  // 落到 `applyNotice` → notices（全域可見）→ 測試綠。但 production 上使用者
+  // 通常是對**已經釘住**的 session 按移除，那時 `views[wsid]` 存在，pushError
+  // 會寫進那個 view 的 timeline——而 `timeline` getter **只讀 focused view**。
+  // 對非 focus 的 w2 按移除 ⇒ 訊息寫進看不到的 view：收合時沒 badge、展開後
+  // focused timeline 也是空的，使用者只看到「卡片沒消失」。形狀 (B)：setup 的
+  // 一條捷徑同時滿足了多個前提，把真正的路徑繞過去。
+  //
+  // 現在的 setup 就是 production 最常見的樣子：**兩個 pane 都釘著、對非 focus
+  // 的那個按移除**，而且全程走真實點擊。
+  //
+  // mutation：SessionList 的 catch 改回 `pushError(msg, wsid, true)` →
+  // 紅在「非 focus pane 的移除失敗也必須看得到」。
+  it('RemoveSession 被拒絕（對非 focus pane 的 session）→ 卡片不消失且訊息看得到', async () => {
     appMocks.RemoveSession.mockRejectedValueOnce(new Error(GO_ERROR))
     const w = await mountApp()
     const s = useSession()
     s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1')
+    s.pin(1, 'w2')
+    s.setFocus(0) // focus 在 w1，要移除的是 w2
     await w.vm.$nextTick()
-    await w.find('[data-test=remove-w1]').trigger('click')
+
+    await w.find('[data-test=remove-w2]').trigger('click')
     await w.find('[data-test=remove-confirm-submit]').trigger('click')
     await flush2(w)
 
-    expect(s.sessions['w1'].removed).toBe(false)
-    expect(w.findAll('[data-test=session-card]')).toHaveLength(1)
-    expect(timelineText(w)).toContain('請重啟 app')
+    expect(appMocks.RemoveSession).toHaveBeenCalledWith('w2')
+    expect(s.sessions['w2'].removed).toBe(false)
+    expect(w.findAll('[data-test=session-card]')).toHaveLength(2)
+    const txt = timelineText(w)
+    expect(txt, '非 focus pane 的移除失敗也必須看得到').toContain('移除 session w2 失敗')
+    expect(txt).toContain('請重啟 app')
+  })
+
+  // 同一條路徑在 timeline 收合時的樣子：latch 會強制展開，所以訊息照樣到得了。
+  // mutation：SessionList 的 catch 改回 pane-scoped pushError → latchSeq 仍會
+  // 增加（訊息含 marker）所以會展開，但 focused timeline 是空的 → 紅在文字斷言。
+  it('RemoveSession 被拒絕（收合＋非 focus）→ 強制展開且訊息看得到', async () => {
+    memStorage.setItem('wb.tl.open', 'false')
+    appMocks.RemoveSession.mockRejectedValueOnce(new Error(GO_ERROR))
+    const w = await mountApp()
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1')
+    s.pin(1, 'w2')
+    s.setFocus(0)
+    await w.vm.$nextTick()
+    expect(w.find('.tl').isVisible(), '前提：起始為收合').toBe(false)
+
+    await w.find('[data-test=remove-w2]').trigger('click')
+    await w.find('[data-test=remove-confirm-submit]').trigger('click')
+    await flush2(w)
+
+    expect(w.find('.tl').isVisible()).toBe(true)
+    expect(timelineText(w)).toContain('移除 session w2 失敗')
   })
 
   // NewSession：SettingsBar 的「開新對話」。call() 失敗時**不**呼叫 s.reset()，

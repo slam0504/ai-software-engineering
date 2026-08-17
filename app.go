@@ -58,10 +58,14 @@ type App struct {
 	stateDir     string
 	workspaceSrc string
 	startupErr   string
-	toolsDirPath string
-	toolsSource  string
-	nodePath     string
-	diagramPath  string
+	// startupBlockers：已經插到最前面的第一則 blocker（見 appendStartup）。
+	// 只用來判斷「要不要再插一次」——第二則之後照時序往後接，否則多則 blocker
+	// 會互相把對方擠到後面，順序變成反向。
+	startupBlockers string
+	toolsDirPath    string
+	toolsSource     string
+	nodePath        string
+	diagramPath     string
 
 	registry *claude.Registry
 	manager  *appcore.Manager
@@ -947,23 +951,41 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 	return out, nil
 }
 
-// noteStartupWarning：把非致命的啟動警告接到既有 startupErr 通道（UI 經
-// CLIInfo().startupError 讀得到）。
+// noteStartupWarning／noteStartupBlocker：把啟動期訊息接到既有 startupErr
+// 通道（UI 經 CLIInfo().startupError 讀得到）。
 //
 // **累積、不是只填第一則**（Task 2a rev2 review I1）：原本的 first-wins 會把
-// 後到的警告靜默丟掉，而啟動序列裡最嚴重的那則正好排在後面——
+// 後到的訊息靜默丟掉，而啟動序列裡最嚴重的那則正好排在後面——
 // `loadSessionRegistry` 先寫「跳過 N 筆無法還原的 entry」，之後才呼叫
 // `backfillResumeFromLegacy`，所以 registry 在 backfill 落盤時進了 uncertain
 // latch 的話，**啟動成功、registry 已停止寫入，而使用者一則相關訊息都看不到**。
-// 被丟掉的警告等於沒有 fail loud。
+// 被丟掉的訊息等於沒有 fail loud。
 //
-// 先寫的排前面：致命／較早的訊息仍然是使用者第一眼讀到的那句。
-func (a *App) noteStartupWarning(msg string) {
-	if a.startupErr == "" {
+// **排序是嚴重度優先，不是時序**（rev3 review I1）：`.meta` 那一行是
+// `white-space: nowrap; text-overflow: ellipsis` 的單行版面，第一則含完整絕對
+// 路徑（>100 字元）時，串在後面的第二句在一般視窗寬度下會被裁掉、只有 hover
+// title 看得到。所以 blocker（registry 停止寫入／載入失敗這類「不處理就一直
+// 壞下去」的）一律排到最前面，warning（降級但還能用的）往後接。刻意不去重做
+// `.meta` 的版面——那超出這張票。
+func (a *App) noteStartupWarning(msg string) { a.appendStartup(msg, false) }
+
+// noteStartupBlocker：嚴重度較高、必須先被讀到的那類（registry 寫入已停止、
+// registry 載入失敗）。同嚴重度之間仍照時序。
+func (a *App) noteStartupBlocker(msg string) { a.appendStartup(msg, true) }
+
+func (a *App) appendStartup(msg string, blocker bool) {
+	switch {
+	case a.startupErr == "":
 		a.startupErr = msg
-		return
+	case blocker && a.startupBlockers == "":
+		// 第一則 blocker 插到最前面，既有內容整段往後推。
+		a.startupErr = msg + "；" + a.startupErr
+	default:
+		a.startupErr += "；" + msg
 	}
-	a.startupErr += "；" + msg
+	if blocker && a.startupBlockers == "" {
+		a.startupBlockers = msg
+	}
 }
 
 // knownProviders：可建立／可還原 session 的 provider 白名單（同 CreateSession
@@ -1077,11 +1099,11 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 			return nil, fmt.Errorf("app: restore dormant wsid=%s provider=%s: %w", e.WSID, e.Provider, rerr)
 		}
 	}
-	// 跳過筆數的警告刻意留到最後才寫：noteStartupWarning 只填第一則，若在
-	// Pass 1 就寫入，之後任何致命失敗（限額、Pass 2）的訊息都會被丟棄，UI 只
-	// 看得到一句聽起來沒事的「跳過 N 筆」，實際上整個 registry 載入失敗、
-	// CreateSession 全掛。audit 不受此限（在前面就發），診斷軌跡的價值正是
-	// 在失敗時。
+	// 跳過筆數是**降級但還能用**的那一類，所以走 noteStartupWarning（往後接），
+	// 不是 blocker。rev2 之前這裡有一段「刻意留到最後才寫、因為 first-wins」的
+	// rationale——noteStartupWarning 改成累積＋嚴重度優先之後那個理由已經死了，
+	// 而它造成的順序正好把良性那則放在 `.meta` 單行版面唯一看得見的位置
+	// （rev3 review Minor）。順序現在由嚴重度決定，不由呼叫位置決定。
 	if n := len(unknownProv) + len(invalid); n > 0 {
 		a.noteStartupWarning(fmt.Sprintf(
 			"session registry: 跳過 %d 筆無法還原的 entry（未刪除，仍在 %s）：%s",
@@ -1135,7 +1157,7 @@ func (a *App) backfillResumeFromLegacy(store *wsregistry.Store) {
 	}
 	if err := a.noteRegistryUncertainErr("resume_backfill", "", store.BackfillResume(fill)); err != nil {
 		a.audit("resume_backfill_failed", map[string]any{"error": err.Error()})
-		a.noteStartupWarning("session registry: 續聊身分升級補寫失敗（本次啟動不自動接續舊對話）：" + err.Error())
+		a.noteStartupBlocker("session registry: 續聊身分升級補寫失敗（本次啟動不自動接續舊對話）：" + err.Error())
 		return
 	}
 	if len(fill) > 0 {
@@ -1403,7 +1425,7 @@ func (a *App) startup(ctx context.Context) {
 	if _, lerr := a.restoreSessions(); lerr != nil {
 		_ = a.noteRegistryUncertainErr("registry_load", "", lerr) // 只補稽核，錯誤處置不變
 		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
-		a.noteStartupWarning("session registry load failed: " + lerr.Error())
+		a.noteStartupBlocker("session registry load failed: " + lerr.Error())
 	}
 	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
 	a.nodePath = resolveNodePath()
