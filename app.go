@@ -192,6 +192,10 @@ type App struct {
 
 	auditMu sync.Mutex
 	auditF  *os.File
+	// hookAudit：測試注入，在 audit 寫入之前於**呼叫端的 goroutine** 上同步執行。
+	// 唯一用途是驗證「某筆稽核是同步寫的」——把 a.audit 換成 go a.audit 之後，hook
+	// 會跑在別的 goroutine 上，stack 裡就不會有呼叫端。production 恆為 nil。
+	hookAudit func(kind string)
 
 	// mu：sessionHosts registry ＋ codex dispatcher 索引的互斥。
 	//
@@ -291,10 +295,9 @@ type App struct {
 	wireIdxMu    sync.Mutex
 	wireIdxCache map[string]wireGenAttr
 
-	// hookWireIndexLoad／hookWireFrameResolved：測試注入（barrier 與完成訊號）。
-	// production 恆為 nil。前者是**唯一**真的碰磁碟的點，因此也是「只讀一次」的計數點。
-	hookWireIndexLoad     func(wireLogID string)
-	hookWireFrameResolved func(viewID, status string)
+	// hookWireIndexLoad：測試注入的 barrier／計數點。production 恆為 nil。這是
+	// **唯一**真的碰磁碟取歷史歸屬的地方，因此也是「一個 app run 只讀一次」的計數點。
+	hookWireIndexLoad func(wireLogID string)
 
 	// wireOpenSegs：wire_log_id → 目前在該 generation 上開著 segment 的 host。
 	// 在 wireMu 下讀寫。只服務一件事——判定「這一段期間有沒有別的 session 也在
@@ -2422,6 +2425,9 @@ func (a *App) cliVersion(provider string) string {
 }
 
 func (a *App) audit(kind string, v any) {
+	if h := a.hookAudit; h != nil {
+		h(kind) // 測試注入：在**呼叫端的 goroutine 上**同步執行，用來證明某筆稽核是同步寫的
+	}
 	a.auditMu.Lock()
 	defer a.auditMu.Unlock()
 	if a.auditF == nil {
@@ -6245,8 +6251,7 @@ func (a *App) closeWireSegment(h *sessionHost) {
 		rec["pendingWireLogs"] = pending
 		a.audit("codex_wire_segments", rec)
 		a.enqueueWireFrameJob(wireFrameJob{ViewID: viewID, WSID: string(h.wsid),
-			Label: h.recordLabel, Exclusive: !overlapped, LiveGenID: gen.ID(),
-			LiveFrames: liveFrames, Segments: segs})
+			LiveGenID: gen.ID(), LiveFrames: liveFrames})
 	})
 }
 

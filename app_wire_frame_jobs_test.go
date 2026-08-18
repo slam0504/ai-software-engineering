@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -522,5 +523,281 @@ func TestShutdownDoesNotExpandPendingHistory(t *testing.T) {
 	if len(left) < 2 {
 		t.Fatalf("沒做完的待辦必須留在 job journal 供下次啟動補完：%v", left)
 	}
+
+	// 收工訊號確實有效：放行 barrier 之後 worker 必須真的退出，不留背景 goroutine。
+	// shutdown 刻意不等它（等它＝把收尾時間綁回歷史資料量），所以「退出」這件事只能
+	// 在這裡事後驗。
 	bar.releaseAll()
+	exit := a.wireJobExit
+	if exit == nil {
+		t.Fatal("worker 的退出訊號必須存在，否則沒人驗得到它有沒有真的走掉")
+	}
+	waitFor(t, "背景 worker 收到收工訊號後退出", func() bool {
+		select {
+		case <-exit:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// ---- 守門 7：sidecar 讓已收尾的 generation 不必重讀錄流（契約第 4 條的**讀取**那一半）----
+
+// auditKinds：某個 kind 的所有記錄（data 原文）。
+func auditRecordsOfKind(t *testing.T, a *App, kind string) []map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(a.stateDir, "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("讀 audit.jsonl：%v", err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Kind string         `json:"kind"`
+			Data map[string]any `json:"data"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil || rec.Kind != kind {
+			continue
+		}
+		out = append(out, rec.Data)
+	}
+	return out
+}
+
+// rebuildCount：audit.jsonl 裡「重讀整份錄流」發生在某個 generation 上的次數。
+//
+// **一定要用增量比對**：跨重啟的測試裡好幾個 App 共寫同一份 audit.jsonl，用「有沒有
+// 出現過」判斷會把前一個 App 的紀錄算進來（第一版就是這樣假紅的）。
+func rebuildCount(t *testing.T, a *App, wireLogID string) int {
+	t.Helper()
+	n := 0
+	for _, d := range auditRecordsOfKind(t, a, "wire_frame_index_rebuilt") {
+		if id, _ := d["wireLogId"].(string); id == wireLogID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestFinalizedGenerationIsReadFromSidecarNotRebuilt：契約第 4 條。
+//
+// 「finalize 有沒有寫檔」只是這條契約的一半——**讀取**與**補建**兩邊原本都沒有守門
+// （review 實測：把讀 sidecar 與補建 sidecar 整段刪掉，六條守門一條都不紅）。
+//
+// 這裡守讀取：gen1 在 B1 restart 時被 finalize（sidecar 就此產生），app 重啟之後
+// 展開 gen1 必須走 sidecar——出現 wire_frame_index_rebuilt 就代表又把整份錄流讀了一遍。
+//
+// mutation：LoadOrBuildAttribution 永遠不讀 sidecar（每次都 RebuildFrameIndex）→ 紅。
+func TestFinalizedGenerationIsReadFromSidecarNotRebuilt(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	noDrain(a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-side", "")
+	gen1 := currentWireLogID(a)
+	if err := a.RestartCodexServerRecorded("b1-side"); err != nil { // gen1 finalize → 產生 sidecar
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(a.wireLogDir(), gen1+".frames.json")); err != nil {
+		t.Fatalf("precondition：finalize 必須直接產生 sidecar：%v", err)
+	}
+	a.shutdown(a.ctx)
+
+	// 重啟：記憶體 cache 全空，gen1 只能從磁碟取——但必須取 sidecar，不是重讀錄流。
+	b, _ := newTestAppIn(t, a.workspaceDir, a.stateDir)
+	ctl2 := &framingWire{}
+	bootFramingApp(t, b, ctl2)
+	noDrain(b)
+	before := rebuildCount(t, b, gen1)
+	runFramingSession(t, b, ctl2, w, "t-side", "t-side")
+	view := auditSegments(t, b, w)
+	res := waitForFrameResult(t, b, view.ViewID)
+	if res.FramesStatus != "resolved" || len(res.Frames[gen1]) == 0 {
+		t.Fatalf("precondition：gen1 必須真的被展開過：%+v", res)
+	}
+	if after := rebuildCount(t, b, gen1); after != before {
+		t.Fatalf("已 finalize 的 generation %s 必須走 sidecar 快路徑，不得重讀整份錄流（%d → %d）",
+			gen1, before, after)
+	}
+}
+
+// TestRebuiltGenerationIsBackfilledForNextRun：契約第 4 條的**補建**那一半。
+//
+// 沒有 sidecar 的舊資料 fallback 重讀錄流之後必須補建，否則每一次 app run 都要
+// 再讀一遍——「一個 app run 最多一次」擋不住跨 run 的重複。
+//
+// mutation：LoadOrBuildAttribution 重建後不寫 sidecar → 第二次重啟仍出現
+// wire_frame_index_rebuilt → 紅。
+func TestRebuiltGenerationIsBackfilledForNextRun(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	noDrain(a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-back", "")
+	gen1 := currentWireLogID(a)
+	if err := a.RestartCodexServerRecorded("b1-back"); err != nil {
+		t.Fatal(err)
+	}
+	// 模擬「沒有 sidecar 的舊資料」。
+	if err := os.Remove(filepath.Join(a.wireLogDir(), gen1+".frames.json")); err != nil {
+		t.Fatal(err)
+	}
+	a.shutdown(a.ctx)
+
+	b, _ := newTestAppIn(t, a.workspaceDir, a.stateDir)
+	ctl2 := &framingWire{}
+	bootFramingApp(t, b, ctl2)
+	noDrain(b)
+	beforeB := rebuildCount(t, b, gen1)
+	runFramingSession(t, b, ctl2, w, "t-back", "t-back")
+	waitForFrameResult(t, b, auditSegments(t, b, w).ViewID)
+	if rebuildCount(t, b, gen1) <= beforeB {
+		t.Fatal("precondition：沒有 sidecar 就必須重讀錄流，否則這條測不到補建")
+	}
+	if _, err := os.Stat(filepath.Join(b.wireLogDir(), gen1+".frames.json")); err != nil {
+		t.Fatalf("重建之後必須補建 sidecar：%v", err)
+	}
+	b.shutdown(b.ctx)
+
+	// 第三次執行：補建過了，不得再重讀。
+	c, _ := newTestAppIn(t, a.workspaceDir, a.stateDir)
+	ctl3 := &framingWire{}
+	bootFramingApp(t, c, ctl3)
+	noDrain(c)
+	beforeC := rebuildCount(t, c, gen1)
+	runFramingSession(t, c, ctl3, w, "t-back", "t-back")
+	waitForFrameResult(t, c, auditSegments(t, c, w).ViewID)
+	if after := rebuildCount(t, c, gen1); after != beforeC {
+		t.Fatalf("補建過的 generation %s 不得再重讀整份錄流（%d → %d）", gen1, beforeC, after)
+	}
+}
+
+// ---- 守門 8：pending 稽核必須**同步**寫（契約第 5 條的「先同步」）----
+
+// TestPendingAuditIsWrittenSynchronously：契約第 5 條字面上的「**先同步**留下 pending
+// 稽核」。
+//
+// **為什麼不能只斷言「EndSession 返回後檔案裡有那筆記錄」**（review 實測：把
+// `a.audit(codex_wire_segments, rec)` 改成 `go a.audit(...)`，七條守門全綠、-count=5
+// 仍全綠）：G1 之所以看得到 pending 而看不到 resolved，是因為 barrier 卡住 worker，
+// 與 audit 是不是同步的無關；而「返回後檔案裡有」在非同步版底下只是輸掉一次排程競賽，
+// 是機率不是保證。
+//
+// 這裡改成直接證明「**這筆稽核跑在 closeWireSegment 的 goroutine 上**」：hookAudit 在
+// 呼叫端的 goroutine 上同步執行，抓它自己的 stack。換成 go a.audit 之後 stack 屬於
+// 新的 goroutine，裡面不會有 closeWireSegment——確定性的紅，不是競賽。
+// callerFramesOnly：只留 goroutine 自己的呼叫框，砍掉尾端的 "created by …"。
+//
+// **這一行是必須的**：`go a.audit(...)` 產生的 goroutine，其 stack trace 尾端會有
+// `created by main.(*App).closeWireSegment.func1`——不砍掉的話，非同步版一樣「含有
+// closeWireSegment」，斷言就變成永遠成立的假守門（第一版實測 mutation 全綠）。
+func callerFramesOnly(stack string) string {
+	if i := strings.Index(stack, "\ncreated by "); i >= 0 {
+		return stack[:i]
+	}
+	return stack
+}
+
+func TestPendingAuditIsWrittenSynchronously(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	noDrain(a)
+
+	var mu sync.Mutex
+	var stacks []string
+	a.hookAudit = func(kind string) {
+		if kind != "codex_wire_segments" {
+			return
+		}
+		buf := make([]byte, 16<<10)
+		n := runtime.Stack(buf, false)
+		mu.Lock()
+		stacks = append(stacks, callerFramesOnly(string(buf[:n])))
+		mu.Unlock()
+	}
+
+	// **兩個分支都要走到**：沒有歷史時走 framesStatus=resolved、有歷史時走 pending。
+	// 只跑第一種的話，改動 pending 分支的 mutation 會全綠（第一版就是這個坑）。
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-sync", "") // resolved 分支
+	if err := a.RestartCodexServerRecorded("b1-sync"); err != nil {
+		t.Fatal(err)
+	}
+	runFramingSession(t, a, ctl, w, "t-sync", "t-sync") // pending 分支
+	if v := auditSegments(t, a, w); v.FramesStatus != "pending" {
+		t.Fatalf("precondition：第二次收尾必須走 pending 分支：%+v", v)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stacks) != 2 {
+		t.Fatalf("precondition：兩次收尾各寫一筆 codex_wire_segments，實際 %d 筆", len(stacks))
+	}
+	for i, st := range stacks {
+		if !strings.Contains(st, "closeWireSegment") {
+			t.Fatalf("第 %d 筆 codex_wire_segments 必須在 closeWireSegment 的 goroutine 上同步寫出，實際 stack：\n%s",
+				i, st)
+		}
+	}
+}
+
+// TestTruncatedGenerationIsAudited：截斷必須有出口（review 指出）。
+//
+// 由**檔尾不完整**的 wire log 建出來的歸屬是缺一段的答案，而 sidecar 會把它固化成
+// 後續每一次 app run 的快路徑。`framesStatus` 仍是 resolved（§3.4.5 對檔尾截斷是
+// 容忍的，不是失敗），所以若不另外留一筆稽核，「證據缺了一段」就完全沉默。
+//
+// mutation：wireGenAttribution 不發 wire_frame_index_truncated → 紅。
+func TestTruncatedGenerationIsAudited(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	noDrain(a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-trunc", "")
+	gen1 := currentWireLogID(a)
+	if err := a.RestartCodexServerRecorded("b1-trunc"); err != nil {
+		t.Fatal(err)
+	}
+	// sidecar 拿掉並在檔尾補一行寫到一半的 frame（app-server 意外死亡最典型的形狀）。
+	if err := os.Remove(filepath.Join(a.wireLogDir(), gen1+".frames.json")); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(a.wireLogDir(), gen1+".jsonl")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(b, []byte(`{"frame":99,"dir":"s2c"`)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runFramingSession(t, a, ctl, w, "t-trunc", "t-trunc")
+	view := auditSegments(t, a, w)
+	res := waitForFrameResult(t, a, view.ViewID)
+	if res.FramesStatus != "resolved" {
+		t.Fatalf("precondition：檔尾截斷是容忍的，不是 failed（§3.4.5）：%+v", res)
+	}
+	var truncated []string
+	for _, d := range auditRecordsOfKind(t, a, "wire_frame_index_truncated") {
+		if id, _ := d["wireLogId"].(string); id == gen1 {
+			if n, _ := d["truncatedTailBytes"].(float64); n <= 0 {
+				t.Fatalf("截斷量必須寫進稽核：%+v", d)
+			}
+			truncated = append(truncated, id)
+		}
+	}
+	if len(truncated) == 0 {
+		t.Fatalf("由截斷的錄流建出的歸屬是缺一段的答案，必須有稽核出口（狀態仍是 resolved）")
+	}
 }

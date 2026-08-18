@@ -28,6 +28,17 @@ type FrameAttribution struct {
 	TruncatedTailBytes int64 `json:"truncated_tail_bytes,omitempty"`
 }
 
+// AttributionResult 是一次歸屬取得的完整結果。
+//
+// TruncatedTailBytes 必須跟著結果一路傳出去（不只留在 sidecar 檔裡）：由**截斷**的
+// wire log 建出來的歸屬是不完整的答案，而 sidecar 會把它變成後續每一次 app run 的
+// 快路徑——不讓它有出口，等於把「證據缺了一段」永久固化成沉默。呼叫端負責把它送進稽核。
+type AttributionResult struct {
+	ByWSID             map[string][]int
+	FromSidecar        bool
+	TruncatedTailBytes int64
+}
+
 // AttributionPath 是某個 generation 的 sidecar 落點。
 func AttributionPath(dir, wireLogID string) string {
 	return filepath.Join(dir, wireLogID+".frames.json")
@@ -76,13 +87,15 @@ func WriteAttribution(dir, wireLogID string, idx *FrameIndex) error {
 // sidecar 解不開刻意**不 fail loud**而是重建：它是可再生的衍生檔，不是證據；而
 // 「index 檔損壞不致命」正是 §3.4.5 對 frame index 的要求。補建失敗同樣不致命
 // （回傳的歸屬照用），但會併進 err 讓呼叫端記錄——下次還是會重讀，不是靜默降級。
-func LoadOrBuildAttribution(dir, wireLogID string) (byWSID map[string][]int, fromSidecar bool, err error) {
+func LoadOrBuildAttribution(dir, wireLogID string) (res AttributionResult, err error) {
 	b, rerr := os.ReadFile(AttributionPath(dir, wireLogID))
 	if rerr == nil {
 		var fa FrameAttribution
 		if json.Unmarshal(b, &fa) == nil && fa.ByWSID != nil {
-			return fa.ByWSID, true, nil
+			return AttributionResult{ByWSID: fa.ByWSID, FromSidecar: true,
+				TruncatedTailBytes: fa.TruncatedTailBytes}, nil
 		}
+		// sidecar 解不開：不 fail loud，往下重建並覆蓋掉這份壞的（見函式 doc）。
 	} else if !errors.Is(rerr, os.ErrNotExist) {
 		// 讀得到檔案卻讀不出內容（權限／IO）：照樣往下重建，但不吞掉原因。
 		rerr = fmt.Errorf("wirelog: read attribution sidecar %s: %w", wireLogID, rerr)
@@ -92,7 +105,9 @@ func LoadOrBuildAttribution(dir, wireLogID string) (byWSID map[string][]int, fro
 
 	idx, berr := RebuildFrameIndex(filepath.Join(dir, wireLogID+".jsonl"))
 	if berr != nil {
-		return nil, false, errors.Join(rerr, berr)
+		return AttributionResult{}, errors.Join(rerr, berr)
 	}
-	return idx.AttributionByWSID(), false, errors.Join(rerr, WriteAttribution(dir, wireLogID, idx))
+	return AttributionResult{ByWSID: idx.AttributionByWSID(),
+			TruncatedTailBytes: idx.TruncatedTailBytes()},
+		errors.Join(rerr, WriteAttribution(dir, wireLogID, idx))
 }

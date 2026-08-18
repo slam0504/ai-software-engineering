@@ -47,12 +47,22 @@ type wireFrameJob struct {
 	ViewID string `json:"view_id"`
 	Done   bool   `json:"done,omitempty"`
 
-	WSID       string               `json:"wsid,omitempty"`
-	Label      string               `json:"label,omitempty"`
-	Exclusive  bool                 `json:"exclusive,omitempty"`
-	LiveGenID  string               `json:"live_wire_log_id,omitempty"`
-	LiveFrames []int                `json:"live_frames,omitempty"`
-	Segments   []wirelog.SegmentRef `json:"segments,omitempty"`
+	WSID string `json:"wsid,omitempty"`
+	// LiveGenID／LiveFrames：本次那一代在**收尾當下**的結算快照。
+	//
+	// **record 刻意不內嵌 segments**（review 指出的 O(N²)）：`SegmentSet` 永不裁剪，
+	// 第 k 次收尾時 `For(wsid)` 已有 k 段，把它寫進 record 會讓 job journal 的總體
+	// 大小變成 O(N²) bytes，而 openWireFrameJobs 是在 startup、UI 之前把整份讀進
+	// 記憶體——等於把本票要消除的「無界 I/O 在使用者等待路徑上」搬到另一端。
+	// segments 改由 worker resolve 當下向 SegmentSet 取（它本來就是 durable 權威）。
+	//
+	// LiveFrames **保留**（與 review 的字面裁決有出入，理由如下，請覆核）：它的大小
+	// 是「本 session 自己的 frame 數」，不隨歷史成長，所以不構成 O(N²)。而它不能改成
+	// resolve 時重算——那一代此刻可能還在被寫，同一個 WSID 若在同一代又起了新
+	// session，重算會把**下一個 view 的 frame** 算進這一個 view，而且會被 cache 固化。
+	// 收尾當下的快照才是這個 view 的正確答案。
+	LiveGenID  string `json:"live_wire_log_id,omitempty"`
+	LiveFrames []int  `json:"live_frames,omitempty"`
 }
 
 // wireGenAttr 是 per-generation cache 的一格：成功的歸屬，或**該代讀不出來的原因**。
@@ -115,6 +125,14 @@ func (a *App) openWireFrameJobs() {
 
 // enqueueWireFrameJob：把工作**先落盤再排隊**。順序不可顛倒——先排隊後落盤的話，
 // 「已經開始做但沒記下來」的窗口內崩潰就永遠補不回來了。
+//
+// **已知 crash 窗口（review 指出，設計取捨）**：pending 稽核與這裡的 journal append
+// 是兩筆記錄，不可能原子落盤。崩潰若正好落在「pending 稽核已寫、journal 的 fsync 尚未
+// 完成」之間，稽核會永遠停在 pending 而磁碟上沒有任何待辦——契約 5（有 pending 痕跡）
+// 仍成立，契約 6（下次啟動補完）在這個窗口內不成立。窗口涵蓋整段 fsync，不是奈秒級。
+//
+// 沒有反過來（先 journal 再 audit）的理由：那會換成「有待辦、沒有 pending 痕跡」，
+// 稽核者看到的是一筆憑空出現的 resolved。兩者取其一，選擇讓**證據**先落地。
 func (a *App) enqueueWireFrameJob(job wireFrameJob) {
 	line, err := json.Marshal(job)
 	if err == nil {
@@ -185,6 +203,9 @@ func (a *App) signalWireFrameWorker() {
 	}
 }
 
+// wireFrameWorker：唯一的背景 worker。exit 在它真正退出時關閉——收尾之後
+// 「goroutine 有沒有真的走掉」才有可斷言的訊號（見
+// TestShutdownDoesNotExpandPendingHistory 末段）。
 func (a *App) wireFrameWorker(sig <-chan struct{}, stop <-chan struct{}, exit chan<- struct{}) {
 	defer close(exit)
 	for {
@@ -230,7 +251,8 @@ func (a *App) resolveWireFrameJob(job wireFrameJob) {
 		frames[job.LiveGenID] = job.LiveFrames // 本次那一代已在同步階段結算完
 	}
 	failures := map[string]string{}
-	for _, s := range job.Segments {
+	segs := a.wireSegmentsFor(job.WSID) // durable 權威；record 不內嵌（見 wireFrameJob）
+	for _, s := range segs {
 		if _, done := frames[s.WireLogID]; done {
 			continue
 		}
@@ -254,9 +276,6 @@ func (a *App) resolveWireFrameJob(job wireFrameJob) {
 	rec["framesStatus"] = status
 	a.audit("codex_wire_segment_frames", rec)
 	a.markWireFrameJobDone(job.ViewID)
-	if h := a.hookWireFrameResolved; h != nil {
-		h(job.ViewID, status)
-	}
 }
 
 // wireGenAttribution：某一代的歸屬，**per-app-run 只碰一次磁碟**（契約第 3 條）。
@@ -272,8 +291,8 @@ func (a *App) wireGenAttribution(wireLogID string) (map[string][]int, error) {
 	if h := a.hookWireIndexLoad; h != nil {
 		h(wireLogID) // 測試 barrier／計數點：這裡是唯一真的碰磁碟的地方
 	}
-	byWSID, fromSidecar, err := wirelog.LoadOrBuildAttribution(a.wireLogDir(), wireLogID)
-	if err != nil && byWSID == nil {
+	res, err := wirelog.LoadOrBuildAttribution(a.wireLogDir(), wireLogID)
+	if err != nil && res.ByWSID == nil {
 		err = fmt.Errorf("wire log %s 的 frame 歸屬讀不出來: %w", wireLogID, err)
 	} else if err != nil {
 		// 歸屬拿到了、只是 sidecar 補建失敗：不是證據缺口，記一筆就好。
@@ -285,12 +304,28 @@ func (a *App) wireGenAttribution(wireLogID string) (map[string][]int, error) {
 	if a.wireIdxCache == nil {
 		a.wireIdxCache = map[string]wireGenAttr{}
 	}
-	a.wireIdxCache[wireLogID] = wireGenAttr{byWSID: byWSID, err: err}
+	a.wireIdxCache[wireLogID] = wireGenAttr{byWSID: res.ByWSID, err: err}
 	a.wireIdxMu.Unlock()
-	if err == nil && !fromSidecar {
+	if err == nil && !res.FromSidecar {
 		a.audit("wire_frame_index_rebuilt", map[string]any{"wireLogId": wireLogID})
 	}
-	return byWSID, err
+	// 截斷的出口（review 指出）：由不完整的 wire log 建出的歸屬會經 sidecar 成為
+	// 後續每一次 app run 的快路徑；不讓它有出口就是把證據缺口靜默固化。**每次取得
+	// 都記**（不只重建那次），因為 sidecar 命中時同樣是不完整的答案。
+	if res.TruncatedTailBytes > 0 {
+		a.audit("wire_frame_index_truncated", map[string]any{"wireLogId": wireLogID,
+			"truncatedTailBytes": res.TruncatedTailBytes, "fromSidecar": res.FromSidecar,
+			"note": "此代錄流檔尾不完整，歸屬答案缺一段（§3.4.5 檔尾截斷容忍）"})
+	}
+	return res.ByWSID, err
+}
+
+// wireSegmentsFor：SegmentSet 的取值包裝（SegmentSet 開檔失敗時為 nil）。
+func (a *App) wireSegmentsFor(wsid string) []wirelog.SegmentRef {
+	if a.wireSegments == nil {
+		return nil
+	}
+	return a.wireSegments.For(wsid)
 }
 
 // wireFrameJobsIdle：佇列空且沒有工作在跑。
@@ -316,6 +351,13 @@ func (a *App) wireFrameDrainWindow() time.Duration {
 // journal 裡（done 那一筆還沒 append），下次啟動由 openWireFrameJobs 補完。
 //
 // 逾時或有殘留一律留稽核：被跳過的工作不能無聲。
+//
+// **已知事項（review 登記，未處置）**：
+//   - 這裡用 `time.Sleep(10ms)` 輪詢等 idle。它在 production 收尾路徑上（不受測試的
+//     barrier 約束），是本檔唯一的牆鐘相依；改成條件變數要多一組狀態，尚未評估值不值得。
+//   - 收工之後 `wireJobSig` **不重置為 nil**，所以之後若還有 enqueue，工作會被排進一個
+//     已經退出的 worker 的佇列（靜默不做，但仍會落盤，下次啟動補完）。production 走不到
+//     ——`shuttingDown` 已擋掉所有會建立 session 的交易——故只登記不改。
 func (a *App) drainWireFrameJobs() {
 	a.wireJobMu.Lock()
 	stop, running := a.wireJobStop, a.wireJobSig != nil
