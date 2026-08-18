@@ -59,6 +59,10 @@ type App struct {
 	stateDir     string
 	workspaceSrc string
 	startupErr   string
+	// lockedStateDir：runApp 取得 single-instance 鎖時鎖住的 state directory
+	// （main.go）。production 一律非空。直接組裝 App 的測試基盤（newTestAppIn）
+	// 留空，代表「這次沒有鎖可以對照」，startup 的一致性檢查因此跳過。
+	lockedStateDir string
 	// startupBlockers：已經插到最前面的第一則 blocker（見 appendStartup）。
 	// 只用來判斷「要不要再插一次」——若每一則 blocker 都前插，多則之間的順序會
 	// 變成反向（後到的排最前）。
@@ -1547,6 +1551,15 @@ func (a *App) startup(ctx context.Context) {
 	a.workspaceDir, a.stateDir, a.workspaceSrc, wsErr = resolveWorkspace()
 	if wsErr != nil { // fail loud：UI 與 audit 都要看得到
 		a.startupErr = "workspace init failed: " + wsErr.Error()
+	}
+	// single-instance 鎖鎖住的是 runApp 解析出來的 state directory；這裡是同一
+	// 個 resolveWorkspace 的第二次呼叫（純解析＋idempotent MkdirAll）。兩者不一
+	// 致代表接下來要開的 writer 落在鎖的保護範圍**之外**——單一 writer 前提已
+	// 經不成立，fail loud。production 不可達（同一個 process、同一組 env／cwd）。
+	if a.lockedStateDir != "" && a.lockedStateDir != a.stateDir {
+		a.noteStartupBlocker(fmt.Sprintf(
+			"single-instance 鎖與實際 state directory 不一致（鎖：%s，實際：%s）",
+			a.lockedStateDir, a.stateDir))
 	}
 	if r, rerr := claude.OpenRegistry(filepath.Join(a.stateDir, "sessions.json")); rerr == nil {
 		a.registry = r
