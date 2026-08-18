@@ -117,16 +117,18 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - **保證範圍** — 提供的是本機可重建、可稽核的紀錄，**不提供 CI 強制管制**；執行器**不保證提供 sandbox 隔離**，
   不限制測試程式的網路與檔案系統能力
 
-### 問題升級收件匣
+### 阻擋事項收件匣
 - **三種處理狀態** — `open → acknowledged → resolved`，狀態轉移只允許附加寫入，目前狀態由既有紀錄重新計算；
   標記為 `resolved` 時必須填寫 resolution、理由與處理人
 - **系統自動建立** — 系統會在風險無法分類、binding 缺漏、Gate 2／TCA 綁定轉為 STALE、
   測試證據執行器發生錯誤／逾時／輸出超限、negative-control 未偵測到 mutation、journal 進入 degraded 狀態時，
   自動建立待處理項目（condition key 僅用來避免重複建立尚未 `resolved` 的項目）
-- **阻擋規則** — 每個項目都有 `block_scope`；尚未標記為 `resolved` 的阻擋項目會擋下對應的核可
-  （`GateDecide` 的完整判定順序見 [`docs/architecture/`](docs/architecture/)）
-- **系統管控項目** — STALE、缺少 binding、journal degraded 等項目，使用者不能自行標記為 `resolved`，
-  只能修復問題後由系統重新驗證解除；可以先標記為 `acknowledged`，但不會解除阻擋
+- **阻擋規則** — 每個項目都有 `block_scope`；尚未標記為 `resolved` 的阻擋項目會擋下對應的核可，
+  且核可的檢查與寫入在同一段不可插隊的流程內完成，不會有「檢查完才冒出新阻擋」的空窗
+  （完整判定順序、鎖範圍與 lock ordering 見
+  [架構文件 §5.6 Gate 決議一致性](docs/architecture/sdlc-workbench-app-plan.md#gate-decision-consistency)）
+- **需由系統解除的項目** — STALE、binding 缺漏、journal degraded 等項目無法手動標記為已解決；
+  修正原因後，系統會重新驗證並自動解除。使用者可標記為已知悉，但不會因此解除阻擋
 
 ### 繁體中文介面（i18n）
 - 以 vue-i18n（Composition API）提供繁體中文與完整英文語系，預設為繁體中文
@@ -234,7 +236,7 @@ internal/
                          validator、STALE resolver
   evidence/              Test Contract 證據鏈：oracle-surface 宣告、CAS store、mutation 登記、
                          detached worktree runner、matcher／結果分類
-  escalation/            問題升級收件匣：item journal、append-only transition、projection、
+  escalation/            阻擋事項收件匣：item journal、append-only transition、projection、
                          block_scope 查詢
   assist/                SpecAssist／PlanAssist 隔離的 one-shot（Claude／Codex，由 provider 強制禁止變更 workspace）
   wsregistry/            workspace session registry（workspace-sessions.json）：durable metadata
@@ -356,7 +358,7 @@ stateDiagram-v2
 |---|---|
 | `events.jsonl` | Envelope v1 稽核事件流（UI 所見即所錄） |
 | `gate.jsonl` | Gate（Gate 1／Gate 2／TCA 共用）的 gate_op 稽核紀錄（只允許附加寫入：gate_request／approval_record／transition） |
-| `escalation.jsonl` | 問題升級收件匣稽核紀錄（只允許附加寫入：escalation_item／escalation_transition） |
+| `escalation.jsonl` | 阻擋事項收件匣稽核紀錄（只允許附加寫入：escalation_item／escalation_transition） |
 | `evidence/` | evidence journal（evidence.jsonl）＋mutation／stdout／stderr 的 CAS 內容定址儲存 |
 | `audit.jsonl` | App 層稽核（啟動資訊、核可決定、登入事件） |
 | `recordings/` | wire log 與 metadata |
@@ -376,7 +378,7 @@ stateDiagram-v2
 | **M1.5** 雙 session | ✅ 已合併 | Provider 切換時對話視窗跟著切、雙 session 並存、重啟自動恢復、design token 與視覺調整（[結果](docs/spikes/m1.5-results.md)） |
 | **M2** Stage A 完整流程 | ✅ 已合併 | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離的 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ 已合併 | vue-i18n 語系支援，預設繁體中文並提供完整英文語系 |
-| **M3a** 計畫與測試契約完整流程 | ✅ 已合併 | 任務 DAG、Gate 2、測試契約核可（本機測試證據執行器）、問題升級收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；同時檢視多個 session 延後至 **M3b**） |
+| **M3a** 計畫與測試契約完整流程 | ✅ 已合併 | 任務 DAG、Gate 2、測試契約核可（本機測試證據執行器）、阻擋事項收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；同時檢視多個 session 延後至 **M3b**） |
 | **M3b** 多 session 工作區 | ✅ 實作完成 | 每 provider 4 個 session slot、雙 pane 同時檢視與焦點語意、WSID 建立交易與 tombstone 移除、Codex connection-wide wire log、per-WSID replay index 與視窗化載入（pane 釘選的持久化尚未接線，重啟後需重新釘選——見[驗收結果](docs/spikes/m3b-results.md) §3.3；該文另含未覆蓋、未實作與待實機驗收項） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外） |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（以 OpenCode 作為第一個目標）、保留 Claude／Codex 原生 adapter、能力協商（capability negotiation）（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
