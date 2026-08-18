@@ -45,48 +45,41 @@ func main() {
 		}
 		return
 	}
-	os.Exit(runApp(runWailsUI, os.Stderr))
+	os.Exit(runWailsUI(NewApp()))
 }
 
 // uiRunner：「把 App 交給視窗層，跑到使用者關閉為止」這一步。production 恆為
-// runWailsUI。barrier 測試在無 GUI 環境下替換的**只有這一步**——workspace 解
-// 析、鎖的取得位置、App 的建立、以及鎖釋放的時機全部留在 runApp 自己手上，
-// 所以「鎖是否早於 writer 初始化」「是否撐到 writer 全關才放」這兩件事測試無
-// 法從外面繞過。
+// wailsUI；barrier 測試在無 GUI 環境下替換的**只有這一步**。
+//
+// 這個 seam 現在只影響拒絕 UX（第二個實例會不會開視窗），**不影響資料正確
+// 性**——ownership lease 已經下沉到 App.startup（見 app.go 的 stateLease），
+// 任何入口（含 `runWailsUI(NewApp())` 這種完全不經 runInstance 的寫法）都無法
+// 在沒有 lease 的情況下開啟 writer。
 type uiRunner func(*App) error
 
-// runApp：production 啟動總序。
+// runInstance：production 的實例啟動骨架。
 //
-//	resolve workspace → 取得 single-instance 鎖 → 建立 App → UI 層
-//	（OnStartup 開 registry／audit／events sink／replay index／wire log／
-//	SegmentSet 並跑 registry migration；OnShutdown 收尾並關閉全部 writer）
-//	→ UI 回來（＝ shutdown 已完成）之後才釋放鎖。
+//	（開視窗之前）取得 ownership lease → UI 層（OnStartup 的 App.startup 會
+//	自行再取得／驗證同一份 lease；OnShutdown 的 App.shutdown 在全部 writer
+//	關閉之後才釋放）
 //
-// 鎖排在**第一步**不是為了 UX：AppendReceipt 的 offset 與 registry 的
-// temp/rename 都以單一 writer 為前提（見 internal/singleinstance 的檔頭），
-// 第二個 process 只要開過任何一個 writer、跑過任何一次 migration，那個前提就
-// 已經破了。所以取鎖失敗時直接退出，一個 byte 的 state 都不寫。
-func runApp(run uiRunner, msg io.Writer) int {
-	// resolveWorkspace 的錯誤在這裡刻意忽略：它在失敗時仍回傳可用的 tmp
-	// fallback 路徑，而錯誤本身由 App.startup 再解析一次時記進 startupErr／
-	// UI 橫幅（原本的 fail loud 路徑不變）。真正不可用的環境會在下一行的
-	// Acquire 開檔失敗，走 exitLockUnavailable。
-	_, stateDir, _, _ := resolveWorkspace()
-	lock, err := singleinstance.Acquire(stateDir)
-	if err != nil {
+// 這裡先取一次 lease **純粹是拒絕 UX**：讓第二個實例連視窗都不開。它不是安全
+// 邊界——安全邊界在 App.startup 裡。
+//
+// 拒絕路徑刻意直接 os.Exit 而不是把退出碼交還給 caller：這條路徑的正確性不能
+// 取決於「呼叫端記得處理回傳值」，否則 `func main() { runWailsUI(NewApp()) }`
+// 這種寫法會讓被拒的 process 以退出碼 0 靜默結束。
+func runInstance(app *App, run uiRunner, msg io.Writer) int {
+	if _, err := app.acquireStateLease(); err != nil {
 		if errors.Is(err, singleinstance.ErrAlreadyRunning) {
-			notifyRejected(msg, alreadyRunningMessage(stateDir))
-			return exitAlreadyRunning
+			notifyRejected(msg, alreadyRunningMessage(app.stateDir))
+			os.Exit(exitAlreadyRunning)
 		}
 		// fail closed：開檔／權限／檔案系統不支援 flock 等任何異常，都**不**
 		// 當成「目前沒人持鎖」而繼續啟動。
-		notifyRejected(msg, lockUnavailableMessage(stateDir, err))
-		return exitLockUnavailable
+		notifyRejected(msg, lockUnavailableMessage(app.stateDir, err))
+		os.Exit(exitLockUnavailable)
 	}
-	defer func() { _ = lock.Release() }()
-
-	app := NewApp()
-	app.lockedStateDir = stateDir
 	if err := run(app); err != nil {
 		fmt.Fprintln(msg, "Error:", err.Error())
 		return 1
@@ -94,7 +87,9 @@ func runApp(run uiRunner, msg io.Writer) int {
 	return 0
 }
 
-func runWailsUI(app *App) error {
+func runWailsUI(app *App) int { return runInstance(app, wailsUI, os.Stderr) }
+
+func wailsUI(app *App) error {
 	return wails.Run(&options.App{
 		Title:  "sdlc-workbench",
 		Width:  1024,

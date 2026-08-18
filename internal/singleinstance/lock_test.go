@@ -53,6 +53,36 @@ func TestAcquireRejectsWhileHeld(t *testing.T) {
 	}
 }
 
+// TestHeldIsCapabilityEvidence：Held/StateDir 是呼叫端拿來當 capability 判準
+// 的東西（見 app.go 的 stateLease），所以三種「不是真鎖」的值都必須是 false。
+func TestHeldIsCapabilityEvidence(t *testing.T) {
+	dir := t.TempDir()
+	var nilLock *Lock
+	if nilLock.Held() || nilLock.StateDir() != "" {
+		t.Fatal("nil 不得被當成持有中的鎖")
+	}
+	forged := &Lock{}
+	if forged.Held() || forged.StateDir() != "" {
+		t.Fatal("零值（別的 package 造得出來）不得被當成持有中的鎖")
+	}
+	l, err := Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !l.Held() || l.StateDir() != dir {
+		t.Fatalf("Acquire 取得的鎖必須 Held 且記得 state directory：held=%v dir=%q", l.Held(), l.StateDir())
+	}
+	if err := l.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if l.Held() {
+		t.Fatal("釋放之後 Held 必須為 false——已釋放的鎖不能再授權任何寫入")
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("重複 Release 必須安全（shutdown 可能跑兩次）：%v", err)
+	}
+}
+
 // TestReleaseKeepsLockFile：crash 之後磁碟上會留著這個檔案，Release 也刻意
 // 留著——unlink 會讓下一個 process 在新 inode 上拿到第二把鎖。
 func TestReleaseKeepsLockFile(t *testing.T) {

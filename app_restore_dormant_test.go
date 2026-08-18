@@ -25,6 +25,7 @@ func newTestAppAt(t *testing.T, stateDir string) *App {
 	a := NewApp()
 	a.ctx = context.Background()
 	a.stateDir = stateDir
+	a.lease = newTestStateLease(stateDir)
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

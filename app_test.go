@@ -106,6 +106,16 @@ func waitTurnSettled(t *testing.T, a *App, w appcore.WSID) {
 	})
 }
 
+// newTestStateLease：**唯一的**測試用 ownership capability 產生點。
+//
+// 這個函式只存在於 _test.go，production binary 裡沒有它——所以「測試可以不
+// 取真的 flock 就開 writer」這件事無法從 production 路徑重現。刻意不提供
+// 「lease 為 nil 就跳過檢查」的語意：沒有 lease 就是拒絕（owner 2026-08-18
+// 裁決），測試基盤必須明確出示這份 capability。
+func newTestStateLease(stateDir string) *stateLease {
+	return &stateLease{stateDir: stateDir, testOnly: true}
+}
+
 func newTestApp(t *testing.T) (*App, *uiCapture) {
 	t.Helper()
 	ws, err := claude.NormalizeCWD(t.TempDir())
@@ -131,6 +141,10 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	a.ctx = context.Background()
 	a.workspaceDir = ws
 	a.stateDir = stateDir
+	// 測試基盤明確出示 ownership capability。沒有這一行，openStateWriters 與
+	// 所有 writer 入口一律拒絕（owner 2026-08-18：production 的空 lease 一律
+	// fail closed，不得恢復成「空值就跳過檢查」）。
+	a.lease = newTestStateLease(stateDir)
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "recordings"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +179,7 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 		if f, ferr := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 			a.auditF = f
+			a.auditState = auditReady
 			t.Cleanup(func() { _ = f.Close() })
 		}
 	}
@@ -239,6 +254,9 @@ func enableAudit(t *testing.T, a *App) {
 	}
 	a.auditMu.Lock()
 	a.auditF = f
+	// 與 production 的 openStateWriters 同步：開成功＝進入 ready。少了這一行，
+	// 「ready 之後 writer 不見」的不變量在整個測試組裡都量不到（失效形狀 (E)）。
+	a.auditState = auditReady
 	a.auditMu.Unlock()
 	t.Cleanup(func() { _ = f.Close() })
 }

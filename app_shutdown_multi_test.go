@@ -230,6 +230,12 @@ func TestShutdownFollowsFrozenOrder(t *testing.T) {
 		"interrupt_terminate", "teardown_parallel", "codex_hosts_done",
 		"server_terminate_wait", "wirelog_finalize", "manager_close",
 		"index_flush_close", "registry_sync",
+		// single-instance ownership lease 的釋放（owner 2026-08-18 裁決）。
+		// 排在**最後**是硬性的：manager／replay index／registry／wire segments
+		// 的最後一次落盤都在前面幾步，任何提早釋放都讓第二個 process 能在我們
+		// 還在寫的時候進來。跨 process 的守門見 main_singleinstance_test.go 的
+		// TestLeaseHeldUntilWritersClosed。
+		"instance_lease_release",
 	}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("shutdown 總序不符 §3.6.5：\n got=%v\nwant=%v", order, want)

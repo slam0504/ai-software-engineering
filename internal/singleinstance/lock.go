@@ -40,9 +40,16 @@ const LockFileName = "instance.lock"
 var ErrAlreadyRunning = errors.New("singleinstance: 另一個 workbench 實例正持有這個 state directory 的鎖")
 
 // Lock：已持有的 state directory 獨佔鎖。
+//
+// 三個欄位全部 unexported，而且只有 Acquire 設得起來：別的 package 造得出
+// `&singleinstance.Lock{}`，但那個零值的 Held() 為 false、StateDir() 為空字
+// 串，過不了任何 ownership 檢查。呼叫端可以據此把 *Lock 當成**不可偽造的
+// capability**（見 app.go 的 stateLease）。
 type Lock struct {
-	f    *os.File
-	path string
+	f        *os.File
+	path     string
+	stateDir string
+	released bool
 }
 
 // Acquire 對 <stateDir>/instance.lock 取得非阻塞獨佔 flock。
@@ -66,15 +73,42 @@ func Acquire(stateDir string) (*Lock, error) {
 		}
 		return nil, fmt.Errorf("singleinstance: flock(%s) 失敗：%w", path, err)
 	}
-	return &Lock{f: f, path: path}, nil
+	return &Lock{f: f, path: path, stateDir: stateDir}, nil
 }
 
-// Path：鎖檔的絕對路徑（拒絕訊息與測試用）。
-func (l *Lock) Path() string { return l.path }
+// Path：鎖檔的絕對路徑（fail closed 的拒絕訊息用——要讓使用者知道是哪一個鎖
+// 檔擋住的，尤其是權限類的失敗）。
+func (l *Lock) Path() string {
+	if l == nil {
+		return ""
+	}
+	return l.path
+}
+
+// StateDir：這把鎖保護的 state directory（＝ Acquire 的引數）。
+func (l *Lock) StateDir() string {
+	if l == nil {
+		return ""
+	}
+	return l.stateDir
+}
+
+// Held：這是不是一把真的、由 Acquire 取得且尚未釋放的鎖。
+//
+// 存在的理由是 capability 語意：`&Lock{}` 這種偽造值必須過不了檢查。fd 在
+// Release 之後仍非 nil（os.File 只是被 Close），所以 Held 另外看 released
+// 旗標——「釋放過的 lease 不能拿來授權任何寫入」。
+func (l *Lock) Held() bool { return l != nil && l.f != nil && !l.released }
 
 // Release 關閉 fd，kernel 隨之釋放 flock。
 //
 // **不刪除 lock file**：unlink 之後 flock 仍掛在原本的 inode 上，另一個 process
 // 會在新建的同名檔案上取得第二把鎖——兩邊都以為自己是唯一 writer。留著空檔案
 // 沒有成本（下次 Acquire 直接重用），也正是 crash 之後磁碟上會看到的狀態。
-func (l *Lock) Release() error { return l.f.Close() }
+func (l *Lock) Release() error {
+	if l == nil || l.released {
+		return nil
+	}
+	l.released = true
+	return l.f.Close()
+}

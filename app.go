@@ -37,6 +37,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/replayindex"
+	"github.com/slam0504/sdlc-workbench/internal/singleinstance"
 	"github.com/slam0504/sdlc-workbench/internal/spec"
 	"github.com/slam0504/sdlc-workbench/internal/wirelog"
 	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
@@ -59,10 +60,15 @@ type App struct {
 	stateDir     string
 	workspaceSrc string
 	startupErr   string
-	// lockedStateDir：runApp 取得 single-instance 鎖時鎖住的 state directory
-	// （main.go）。production 一律非空。直接組裝 App 的測試基盤（newTestAppIn）
-	// 留空，代表「這次沒有鎖可以對照」，startup 的一致性檢查因此跳過。
-	lockedStateDir string
+	// lease：開啟／持有 state writer 的 ownership capability。
+	//
+	// **nil ＝沒有 capability ＝一律拒絕**，不是「沒設就當作沒問題」。所有
+	// writer 初始化入口都要求出示一份對得上 stateDir 的 lease（見 stateLease
+	// 與 openStateWriters）。
+	lease *stateLease
+	// workspaceErr：resolveWorkspace 的錯誤，由 acquireStateLease 快取（它是
+	// canonical state directory 的唯一解析點），startup 讀來 fail loud。
+	workspaceErr error
 	// startupBlockers：已經插到最前面的第一則 blocker（見 appendStartup）。
 	// 只用來判斷「要不要再插一次」——若每一則 blocker 都前插，多則之間的順序會
 	// 變成反向（後到的排最前）。
@@ -196,6 +202,19 @@ type App struct {
 
 	auditMu sync.Mutex
 	auditF  *os.File
+	// auditState：稽核寫入器的生命週期（owner 2026-08-18）。不要只靠
+	// `auditF != nil` 猜狀態——那個判斷把「還沒取得 lease，本來就不該寫」與
+	// 「已經 ready 卻寫不出去」壓成同一件事，而後者是不變量破壞。
+	//
+	//	auditUnavailable → 尚未取得 lease／啟動被拒。不寫 state audit 是正確行為，
+	//	                   拒絕原因由 startupErr／stderr／UI 呈現，不在這裡重複。
+	//	auditReady       → 已取得 lease 且 writer 開啟成功。此後 auditF 為 nil 是
+	//	                   不變量破壞，必須 fail loud（見 audit）。
+	//
+	// 刻意沒有 closed 態，理由見 auditLifecycle 常數區塊。
+	auditState auditLifecycle
+	// auditBroken：ready 之後找不到 writer 的事件種類（見 noteAuditInvariantBrokenLocked）。
+	auditBroken []string
 	// hookAudit：測試注入，在 audit 寫入之前於**呼叫端的 goroutine** 上同步執行。
 	// 唯一用途是驗證「某筆稽核是同步寫的」——把 a.audit 換成 go a.audit 之後，hook
 	// 會跑在別的 goroutine 上，stack 裡就不會有呼叫端。production 恆為 nil。
@@ -1545,31 +1564,135 @@ func NewApp() *App {
 		evidenceActive: map[string]context.CancelFunc{}}
 }
 
+// stateLease：開啟任何 state writer 所需的 ownership capability。
+//
+// 為什麼是 capability 而不是一個 bool 檢查：single-instance 保護的是**資料正
+// 確性**——JSONLSink 的 offset 是本機累加值、registry 與 replay index
+// checkpoint 走 temp write + rename，全部以「同一時間只有一個 writer」為前提。
+// 這種保證不能靠編排慣例（「呼叫端記得先取鎖」），因為換一種入口寫法就會漏
+// 掉。所以 writer 初始化的入口一律要求出示一份對得上 a.stateDir 的 lease。
+//
+// **不可偽造**：兩個授權來源都是 unexported 且只有各自的產生點設得起來——
+//   - lock：`singleinstance.Lock` 的欄位全 unexported，`&Lock{}` 這種零值的
+//     Held() 為 false；只有 Acquire 拿得到真的 flock。
+//   - testOnly：唯一設定點是 app_test.go 的 newTestStateLease，**production
+//     binary 裡不存在那個函式**。
+//
+// 零值（以及 nil）一律無效，刻意沒有「沒設就跳過檢查」這種語意。
+type stateLease struct {
+	stateDir string
+	lock     *singleinstance.Lock
+	testOnly bool
+}
+
+// ownsStateDir：這份 lease 是否授權寫入 dir。nil／零值／目錄對不上／已釋放
+// 一律 false。
+func (l *stateLease) ownsStateDir(dir string) bool {
+	if l == nil || dir == "" || l.stateDir != dir {
+		return false
+	}
+	if l.testOnly {
+		return true
+	}
+	return l.lock.Held() && l.lock.StateDir() == dir
+}
+
+func (l *stateLease) release() error {
+	if l == nil {
+		return nil
+	}
+	return l.lock.Release() // nil lock（test lease）也安全
+}
+
+// acquireStateLease：production 唯一的 ownership lease 取得入口。
+//
+// canonical state directory 的解析是它的一部分、不由 caller 傳入——鎖必須綁在
+// **實際會被寫入的那個目錄**上，否則「鎖對了但寫到別處」這種走鐘沒人擋得住。
+//
+// 冪等：同一個 App 重複呼叫回同一份 lease。runWailsUI 會在開視窗**之前**先呼
+// 叫一次（讓第二個實例連視窗都不開），App.startup 進場再呼叫一次自行驗證；
+// 兩者拿到同一把鎖，不會自我排斥。
+func (a *App) acquireStateLease() (*stateLease, error) {
+	if a.lease != nil {
+		return a.lease, nil
+	}
+	if a.stateDir == "" {
+		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = resolveWorkspace()
+	}
+	lock, err := singleinstance.Acquire(a.stateDir)
+	if err != nil {
+		return nil, err
+	}
+	a.lease = &stateLease{stateDir: a.stateDir, lock: lock}
+	return a.lease, nil
+}
+
+// instanceLeaseBlocker：取不到 lease 時 UI 橫幅要看到的內容。
+func instanceLeaseBlocker(stateDir string, err error) string {
+	if errors.Is(err, singleinstance.ErrAlreadyRunning) {
+		return "Workbench 已在執行中（" + stateDir + "）：另一個實例正持有這個 workspace 的" +
+			"單一實例鎖，本次啟動沒有開啟任何 session 狀態。請切換到已經開著的視窗。"
+	}
+	return "無法取得 workspace 的單一實例鎖（" + stateDir + "）：" + err.Error() +
+		"；為了不讓兩個實例同時寫同一份稽核與 registry，取不到鎖一律拒絕開啟 session 狀態。"
+}
+
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	var wsErr error
-	a.workspaceDir, a.stateDir, a.workspaceSrc, wsErr = resolveWorkspace()
-	if wsErr != nil { // fail loud：UI 與 audit 都要看得到
-		a.startupErr = "workspace init failed: " + wsErr.Error()
+	// canonical state directory 解析完成後的**第一件事**：取得 ownership lease。
+	//
+	// 這裡自行取得／驗證而不是相信 caller：startup 是可以被直接呼叫的
+	// （`runWailsUI(NewApp())` 就是這個形狀），保護資料正確性的東西不能放在
+	// 呼叫端的編排慣例裡。acquireStateLease 冪等，所以 runWailsUI 先取過也不
+	// 會在這裡自我排斥。
+	lease, lerr := a.acquireStateLease()
+	if a.workspaceErr != nil { // fail loud：UI 與 audit 都要看得到
+		a.startupErr = "workspace init failed: " + a.workspaceErr.Error()
 	}
-	// single-instance 鎖鎖住的是 runApp 解析出來的 state directory；這裡是同一
-	// 個 resolveWorkspace 的第二次呼叫（純解析＋idempotent MkdirAll）。兩者不一
-	// 致代表接下來要開的 writer 落在鎖的保護範圍**之外**——單一 writer 前提已
-	// 經不成立，fail loud。production 不可達（同一個 process、同一組 env／cwd）。
-	if a.lockedStateDir != "" && a.lockedStateDir != a.stateDir {
-		a.noteStartupBlocker(fmt.Sprintf(
-			"single-instance 鎖與實際 state directory 不一致（鎖：%s，實際：%s）",
-			a.lockedStateDir, a.stateDir))
+	if lerr != nil {
+		// **fail closed**：registry／audit／events sink／replay index／wire log
+		// ／SegmentSet／migration 一個都不開，一個 byte 的 state 都不寫。
+		// a.lease 維持 nil，所以 shutdown 也不會去釋放別人的鎖。
+		a.noteStartupBlocker(instanceLeaseBlocker(a.stateDir, lerr))
+		return
+	}
+	if !a.openStateWriters(lease) {
+		return
+	}
+	a.startupAfterWriters()
+}
+
+// openStateWriters：**唯一**開啟 state writer 的地方（registry／audit／events
+// sink／replay index／wire log／SegmentSet／Manager／restore store）。
+//
+// 必須出示對得上 a.stateDir 的 lease，否則一個檔案都不開、直接回 false
+// （fail closed）。這是「沒有 lease 就無法呼叫 writer initializer」那條契約的
+// 落點：拿掉 lease 參數或改成從 a 自己讀，capability 就退化成註解。
+func (a *App) openStateWriters(lease *stateLease) bool {
+	if !lease.ownsStateDir(a.stateDir) {
+		a.noteStartupBlocker("拒絕開啟 session 狀態：沒有這個 state directory 的 ownership lease（" +
+			a.stateDir + "）")
+		return false
 	}
 	if r, rerr := claude.OpenRegistry(filepath.Join(a.stateDir, "sessions.json")); rerr == nil {
 		a.registry = r
 	} else if a.startupErr == "" {
 		a.startupErr = "registry init failed: " + rerr.Error()
 	}
-	if f, ferr := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
-		a.auditF = f
+	// audit writer 開啟失敗**阻擋 startup**（owner 2026-08-18）：lease 已經在手、
+	// 已經進入 writer initialization，此時寫不出稽核就不是「這次不記錄」而是
+	// 後續每一步都失去可稽核性。這裡是 unavailable → ready 的唯一轉換點。
+	f, ferr := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if ferr != nil {
+		a.noteStartupBlocker("拒絕開啟 session 狀態：稽核寫入器開啟失敗（" +
+			filepath.Join(a.stateDir, "audit.jsonl") + "）：" + ferr.Error())
+		return false
 	}
+	a.auditMu.Lock()
+	a.auditF = f
+	a.auditState = auditReady
+	a.auditMu.Unlock()
 	sink, serr := appcore.NewJSONLSink(filepath.Join(a.stateDir, "events.jsonl"))
 	if serr != nil {
 		if a.startupErr == "" {
@@ -1612,6 +1735,13 @@ func (a *App) startup(ctx context.Context) {
 	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
 		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
 	}
+	return true
+}
+
+// startupAfterWriters：writer 全部開好之後的啟動序列（migration／還原／
+// watcher／evidence）。只有 openStateWriters 回 true 才會走到——契約要求
+// migration 也在「取得 lease 之後」。
+func (a *App) startupAfterWriters() {
 	// M3b §3.2.4 完整凍結序列：載入／遷移 registry → 還原 dormant slots →
 	// 驗證／重建 replay index → 偵測 incomplete turn → emit stream_error →
 	// 才開放 UI 與 provider 啟動。必須在 restore store 開啟之後（legacy 遷移
@@ -2186,6 +2316,23 @@ func (a *App) shutdown(ctx context.Context) {
 			_ = h.broker.Close()
 		}
 	}
+
+	// 13) single-instance ownership lease：**總序的最後一步**。
+	//
+	// 排在這裡不是美觀問題：manager（events sink）／replay index checkpoint／
+	// session registry／wire segments 的最後一次落盤全部在上面幾步，任何提早
+	// 釋放都會讓第二個 process 在我們還在寫的時候進來，AppendReceipt 的 offset
+	// 與 registry 的 temp/rename 前提就破了。
+	//
+	// 釋放之後把 a.lease 設 nil：lease 是 capability，收掉之後任何 writer
+	// 初始化都必須重新取得（Lock.Held() 在 Release 之後為 false，這裡再補一層
+	// 讓重複 shutdown 也安全）。startup 取鎖失敗那條路徑 a.lease 本來就是 nil，
+	// 所以不會誤放別人的鎖。
+	if err := a.lease.release(); err != nil {
+		a.audit("instance_lease_release_error", map[string]any{"error": err.Error()})
+	}
+	a.lease = nil
+	a.shutdownStep("instance_lease_release")
 }
 
 // forcedShutdown：shutdown 專用並行收尾（正常 EndSessionFlow 會被 busy／pending
@@ -2437,6 +2584,47 @@ func (a *App) cliVersion(provider string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// auditLifecycle：見 App.auditState 的 doc。
+type auditLifecycle int
+
+const (
+	auditUnavailable auditLifecycle = iota // 尚未取得 lease／啟動被拒
+	auditReady                             // lease 在手且 writer 已開
+)
+
+// 刻意只有兩態。owner 2026-08-18 的建議是 `unavailable → ready → closed`，但
+// production 目前**從不關閉** audit fd——shutdown 沒有 auditF.Close()，fd 由
+// process 結束時交還作業系統。多定義一個沒有 production writer 的 closed 態，
+// 就是這個里程碑一路在抓的「零接線符號」。等 shutdown 真的收 audit（owner 的
+// shutdown 先後關係第 4 步）再加，屆時 audit() 要把 closed 與 ready 分開處置。
+
+// noteAuditInvariantBrokenLocked：ready 之後卻沒有 writer——這不是「沒開 audit」
+// 而是不變量破壞，必須讓人看得到。稽核本身寫不出去，所以出口只能是 stderr 與
+// startupErr（UI 橫幅）；兩者都用，因為 UI 此刻可能已經關了。
+//
+// 呼叫端必須持有 auditMu。
+func (a *App) noteAuditInvariantBrokenLocked(kind string) {
+	// stderr 與橫幅只出第一筆。auditWriter 是 CLI stderr 的 io.Writer，破掉之後
+	// 每一行輸出都會走到這裡；重複刷只會把唯一有診斷價值的那筆沖掉。清單仍然
+	// 全收，供測試與後續診斷判定「破在哪些事件上」。
+	if len(a.auditBroken) == 0 {
+		msg := "稽核寫入器在 ready 之後消失（kind=" + kind + "）：這是不變量破壞，" +
+			"本次執行之後的稽核事件都不會被記錄"
+		fmt.Fprintln(os.Stderr, "sdlc-workbench: "+msg)
+		if a.startupErr == "" {
+			a.startupErr = msg
+		}
+	}
+	a.auditBroken = append(a.auditBroken, kind)
+}
+
+// auditInvariantBreaks 回報自 ready 之後遺失寫入器的稽核事件種類（測試 oracle）。
+func (a *App) auditInvariantBreaks() []string {
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	return append([]string(nil), a.auditBroken...)
+}
+
 func (a *App) audit(kind string, v any) {
 	if h := a.hookAudit; h != nil {
 		h(kind) // 測試注入：在**呼叫端的 goroutine 上**同步執行，用來證明某筆稽核是同步寫的
@@ -2444,6 +2632,12 @@ func (a *App) audit(kind string, v any) {
 	a.auditMu.Lock()
 	defer a.auditMu.Unlock()
 	if a.auditF == nil {
+		// unavailable：沒有 lease 就不該寫 state audit，丟棄是正確行為（拒絕
+		// 原因由 startupErr／stderr／UI 呈現）。
+		// ready：writer 不該不見——fail loud（owner 2026-08-18）。
+		if a.auditState == auditReady {
+			a.noteAuditInvariantBrokenLocked(kind)
+		}
 		return
 	}
 	rec, _ := json.Marshal(map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano),
@@ -2457,6 +2651,10 @@ func (w auditWriter) Write(p []byte) (int, error) {
 	w.a.auditMu.Lock()
 	defer w.a.auditMu.Unlock()
 	if w.a.auditF == nil {
+		// 與 audit() 同一條判準：unavailable 丟棄是對的，ready 之後不見是不變量破壞。
+		if w.a.auditState == auditReady {
+			w.a.noteAuditInvariantBrokenLocked("cli-stream")
+		}
 		return len(p), nil
 	}
 	return w.a.auditF.Write(p)
@@ -6093,6 +6291,15 @@ func (a *App) wireSegmentsPath() string { return filepath.Join(a.stateDir, "wire
 // NewSegmentSet 的純記憶體版——那會讓「有記錄」與「記錄活不過重啟」在行為上無法
 // 區分，正是 §3.4.4 要求 durable 的理由。
 func (a *App) openWireSegments() {
+	// SegmentSet 與 job journal 都是 append-only writer，同樣受 ownership
+	// lease 管轄。這個入口除了 openStateWriters 之外還被測試基盤直接呼叫，所
+	// 以檢查放在這裡而不是只放在呼叫端——測試基盤也必須持有（test-only）lease
+	// 才開得起來，不存在「沒設就跳過」的路徑。
+	if !a.lease.ownsStateDir(a.stateDir) {
+		a.noteStartupBlocker("拒絕開啟 codex 錄流 segment 索引：沒有這個 state directory 的 ownership lease（" +
+			a.stateDir + "）")
+		return
+	}
 	if err := os.MkdirAll(a.stateDir, 0o755); err != nil {
 		a.audit("wire_segments_open_error", map[string]any{"error": err.Error()})
 		a.noteStartupWarning("codex 錄流 segment 索引開啟失敗（session 級錄流歸屬停用，wire log 本體不受影響）：" + err.Error())
