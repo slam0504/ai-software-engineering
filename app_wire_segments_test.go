@@ -260,7 +260,14 @@ type segmentView struct {
 	// Frames（§3.4.3）：wire_log_id → 該代裡確實歸屬本 WSID 的 frame 編號。
 	// range 是窗口、frames 是歸屬——並行時前者必然含他 session 的 frame，
 	// 逐 frame 的答案只在這裡（見 app_wire_frames_test.go）。
-	Frames map[string][]int `json:"frames"`
+	//
+	// 同步階段**只含 live 那一代**；歷史那幾代由背景 worker 展開後另寫一筆
+	// codex_wire_segment_frames（見 app_wire_frame_jobs_test.go）。FramesStatus
+	// 就是「這份 view 的 frames 算完了沒」的可觀測狀態。
+	Frames          map[string][]int `json:"frames"`
+	ViewID          string           `json:"viewId"`
+	FramesStatus    string           `json:"framesStatus"`
+	PendingWireLogs []string         `json:"pendingWireLogs"`
 }
 
 // auditSegments：稽核可讀出口——codex_wire_segments 記錄的最後一份 view。

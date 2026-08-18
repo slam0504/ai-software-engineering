@@ -216,8 +216,16 @@ func (g *Generation) Finalize(meta recorder.Meta) error {
 	b, _ := json.MarshalIndent(meta, "", "  ")
 	metaErr := os.WriteFile(filepath.Join(g.dir, g.id+".meta.json"), b, 0o644)
 
+	// compact frame-attribution sidecar（owner 契約第 4 條）：**收尾當下直接產生**，
+	// 索引已經在記憶體裡，不必事後把整份錄流重讀一遍。讀者（App 的收尾證據出口）
+	// 因此對已收尾的 generation 只付 O(歸屬筆數)。
+	//
+	// 寫失敗不致命但不吞：sidecar 是可再生的衍生檔，遺失時 LoadOrBuildAttribution
+	// 會重讀錄流補建；併進 finalizeErr 是為了讓它進得了呼叫端的稽核，不變成靜默降級。
+	attrErr := WriteAttribution(g.dir, g.id, g.idx)
+
 	g.finalMeta = meta
-	g.finalizeErr = errors.Join(g.writeErr, metaErr)
+	g.finalizeErr = errors.Join(g.writeErr, metaErr, attrErr)
 	return g.finalizeErr
 }
 

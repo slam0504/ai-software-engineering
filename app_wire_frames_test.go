@@ -580,7 +580,19 @@ func TestWireFrameOwnersSurviveAppRestart(t *testing.T) {
 	if len(view.Segments) != 2 {
 		t.Fatalf("w 必須橫跨重啟前後兩代：%+v", view.Segments)
 	}
-	got := view.Frames[gen1]
+	// 同步階段只結算本代（owner 契約第 1／2 條）；重啟前那一代要讀磁碟，因此是
+	// pending，由背景 worker 展開後另寫一筆結果。
+	if view.FramesStatus != "pending" || len(view.PendingWireLogs) != 1 || view.PendingWireLogs[0] != gen1 {
+		t.Fatalf("重啟前那一代必須列為 pending：%+v", view)
+	}
+	if len(view.Frames[gen2]) == 0 {
+		t.Fatalf("本次執行那一代的歸屬必須同步就在：%+v", view.Frames)
+	}
+	res := waitForFrameResult(t, b, view.ViewID)
+	if res.FramesStatus != "resolved" {
+		t.Fatalf("歷史展開必須 resolved：%+v", res)
+	}
+	got := res.Frames[gen1]
 	if !equalInts(got, before) {
 		t.Fatalf("重啟後必須從磁碟重建出上一次執行的逐 frame 歸屬：%v（want %v）", got, before)
 	}
@@ -591,8 +603,8 @@ func TestWireFrameOwnersSurviveAppRestart(t *testing.T) {
 			}
 		}
 	}
-	if len(view.Frames[gen2]) == 0 {
-		t.Fatalf("本次執行那一代的歸屬也必須在：%+v", view.Frames)
+	if len(res.Frames[gen2]) == 0 {
+		t.Fatalf("本次執行那一代的歸屬也必須在結果裡：%+v", res.Frames)
 	}
 }
 

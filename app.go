@@ -32,6 +32,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/evidence"
 	"github.com/slam0504/sdlc-workbench/internal/gate"
 	"github.com/slam0504/sdlc-workbench/internal/gatepolicy"
+	"github.com/slam0504/sdlc-workbench/internal/journal"
 	"github.com/slam0504/sdlc-workbench/internal/plan"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
@@ -269,6 +270,31 @@ type App struct {
 	// 的殘留登記也在此一併釋放。
 	wireReqMu   sync.Mutex
 	wireReqWSID map[string]string
+
+	// ---- §3.4.3 歷史歸屬展開的背景 worker（owner 2026-08-18 契約，見 wire_frames.go）----
+	//
+	// wireJobMu 保護佇列／journal handle／worker 的三條 channel 與 busy 旗標。
+	// wireJobSig 非 nil 即代表 worker 已啟動（懶啟動，見 ensureWireFrameWorker）。
+	wireJobMu    sync.Mutex
+	wireJobJ     *journal.Journal
+	wireJobQueue []wireFrameJob
+	wireJobBusy  bool
+	wireJobSig   chan struct{}
+	wireJobStop  chan struct{}
+	wireJobExit  chan struct{}
+	// wireJobDrain：shutdown 的 bounded drain 窗口（nil＝production 預設）。測試設
+	// 0 即「不等」——收尾時間因此與待辦數量無關，斷言不必靠牆鐘。
+	wireJobDrain *time.Duration
+
+	// wireIdxCache：wire_log_id → 該代的歸屬（或讀不出來的原因）。契約第 3 條的
+	// 「一個 app run 最多重建一次、多個 session 共用」就是這一格。
+	wireIdxMu    sync.Mutex
+	wireIdxCache map[string]wireGenAttr
+
+	// hookWireIndexLoad／hookWireFrameResolved：測試注入（barrier 與完成訊號）。
+	// production 恆為 nil。前者是**唯一**真的碰磁碟的點，因此也是「只讀一次」的計數點。
+	hookWireIndexLoad     func(wireLogID string)
+	hookWireFrameResolved func(viewID, status string)
 
 	// wireOpenSegs：wire_log_id → 目前在該 generation 上開著 segment 的 host。
 	// 在 wireMu 下讀寫。只服務一件事——判定「這一段期間有沒有別的 session 也在
@@ -2077,6 +2103,13 @@ func (a *App) shutdown(ctx context.Context) {
 	// manager_close 之前——最後一批 Append 發生在步驟 5-7 的 codexTeardown 裡，
 	// 這時已經全部收斂。刻意不另立 shutdownStep：關一個 append-only handle 沒有
 	// 順序契約要守，加一個步驟名只會讓既有的總序斷言多一個無意義的節點。
+	// §3.4.3：歷史歸屬展開的 bounded drain（owner 契約第 6 條）。**排在
+	// wireSegments.Close 之前**——drain 期間 worker 不碰 SegmentSet（job 自帶
+	// segments 快照），但把 handle 關在還可能有 append 的東西之前就是找麻煩。
+	// 不等 worker 退出：未完成的工作留在 job journal，下次啟動補完（見
+	// drainWireFrameJobs 的 doc）。
+	a.drainWireFrameJobs()
+	a.closeWireFrameJobs()
 	if a.wireSegments != nil {
 		if err := a.wireSegments.Close(); err != nil {
 			a.audit("wire_segments_close_error", map[string]any{"error": err.Error()})
@@ -6053,6 +6086,8 @@ func (a *App) openWireSegments() {
 		return
 	}
 	a.wireSegments = s
+	// 歷史歸屬展開的待辦紀錄（契約第 6 條：上次沒做完的在這裡補排進佇列）。
+	a.openWireFrameJobs()
 }
 
 // beginWireSegment：登記 h 在目前 generation 的錄流起點。
@@ -6180,57 +6215,52 @@ func (a *App) closeWireSegment(h *sessionHost) {
 		// 上面那個限定詞只說得出「這個 range 不排他」，說不出「那 range 裡哪幾筆
 		// 才是我的」——後者是 §5.2「錄流 frame 歸屬不串線」真正要的答案，也是
 		// set-level 證據原理上答不出來的一格。
+		//
+		// **同步只做本代**（owner 契約第 1／2 條）：`gen` 的 FrameIndex 就在記憶體
+		// 裡，結算它是 O(歸屬筆數)；先前那幾代要讀磁碟，而 `segs` 會隨這個 WSID 參與
+		// 過的 app run 數無界成長（SegmentSet 是永不裁剪的 journal），放在這裡就是把
+		// 無界 I/O 放進 EndSession（Wails RPC）與 forcedShutdown。歷史那一段改由
+		// 背景 worker 展開（wire_frames.go）。
 		segs := a.wireSegments.For(string(h.wsid))
+		liveFrames := gen.FrameIndex().FramesOf(string(h.wsid))
+		viewID := contract.NewULID(time.Now())
 		rec := map[string]any{
-			"wsid": string(h.wsid), "label": h.recordLabel,
+			"viewId": viewID, "wsid": string(h.wsid), "label": h.recordLabel,
 			"segments": segs, "exclusive": !overlapped,
-			"frames": a.wireFramesOf(string(h.wsid), segs, gen)}
+			"frames": map[string][]int{gen.ID(): liveFrames}}
 		if overlapped {
 			rec["note"] = "本次 range 期間同一 generation 上有並行 session：" +
 				"range 內含他 session 的 frame，不得當作排他證據讀（§3.4.4 已知邊界）；" +
 				"逐 frame 的歸屬見 frames"
 		}
+		// framesStatus（契約第 5 條）：「證據還沒算完」必須是可觀測狀態，不能靠事後
+		// 推測。沒有歷史 generation 要展開時直接 resolved，不排背景工作。
+		pending := pendingWireLogIDs(segs, gen.ID())
+		if len(pending) == 0 {
+			rec["framesStatus"] = "resolved"
+			a.audit("codex_wire_segments", rec)
+			return
+		}
+		rec["framesStatus"] = "pending"
+		rec["pendingWireLogs"] = pending
 		a.audit("codex_wire_segments", rec)
+		a.enqueueWireFrameJob(wireFrameJob{ViewID: viewID, WSID: string(h.wsid),
+			Label: h.recordLabel, Exclusive: !overlapped, LiveGenID: gen.ID(),
+			LiveFrames: liveFrames, Segments: segs})
 	})
 }
 
-// wireFramesOf：wire_log_id → 該份 generation 裡**確實歸屬** wsid 的 frame 編號。
-//
-// 這是 frame-level 歸屬的證據出口，也是「歸屬資料不能只存在記憶體」那一維的
-// production 讀者：live 那一代直接讀它的 FrameIndex，**先前 generation 的則以
-// RebuildFrameIndex 從磁碟重建**（每個 frame 的 wsid 寫在自己那一行）。app 重啟後
-// 同一個 WSID 再收尾一次，這裡就會把重啟前那幾代的歸屬一併讀回來——記憶體裡早已
-// 沒有那些 Generation handle 了。
-//
-// **成本沒有上限保護（review 指出，待 owner 裁決是否處置）**：讀取範圍由該 WSID 自己的
-// []SegmentRef 界定，而 SegmentSet 是 append-only journal——`OpenSegmentSet` 把整份歷史
-// 讀進 byID 且**永不裁剪**，這個 session 每參與一次 app run 就多一段。因此每一次收尾都會把
-// 它歷史上**所有先前 generation** 的 wire log 整份重讀＋重建 index，成長維度是
-// 「這個 session 活過幾次 app run × 各代 wire log 大小」，不是「app-server restart 次數」。
-// 而錄流是 always-on 且目前沒有 GC。呼叫點是 EndSession（Wails RPC，UI 會等）與
-// forcedShutdown（每個 session 各跑一次），**沒有上限、沒有量測、沒有 cache**。
-//
-//
-// 重建失敗不擋收尾但不得無聲：該 generation 記成 nil ＋ 一筆 audit，稽核者看得出
-// 「這一代的 frame 歸屬讀不出來」而不是「這一代沒有我的 frame」。
-func (a *App) wireFramesOf(wsid string, segs []wirelog.SegmentRef, live *wirelog.Generation) map[string][]int {
-	out := map[string][]int{}
+// pendingWireLogIDs：segs 裡除了 live 那一代之外、還需要讀磁碟才知道歸屬的 generation
+// （去重、保持 segs 的順序——證據出口不得有不決定性的順序）。
+func pendingWireLogIDs(segs []wirelog.SegmentRef, liveID string) []string {
+	seen := map[string]bool{liveID: true}
+	var out []string
 	for _, s := range segs {
-		if _, done := out[s.WireLogID]; done {
+		if seen[s.WireLogID] {
 			continue
 		}
-		if live != nil && s.WireLogID == live.ID() {
-			out[s.WireLogID] = live.FrameIndex().FramesOf(wsid)
-			continue
-		}
-		idx, err := wirelog.RebuildFrameIndex(filepath.Join(a.wireLogDir(), s.WireLogID+".jsonl"))
-		if err != nil {
-			a.audit("codex_wire_frames_rebuild_error", map[string]any{
-				"wsid": wsid, "wireLogId": s.WireLogID, "error": err.Error()})
-			out[s.WireLogID] = nil
-			continue
-		}
-		out[s.WireLogID] = idx.FramesOf(wsid)
+		seen[s.WireLogID] = true
+		out = append(out, s.WireLogID)
 	}
 	return out
 }

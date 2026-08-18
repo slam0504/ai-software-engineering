@@ -155,6 +155,19 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 		t.Fatal(err)
 	}
 	a.replayIndex = idx
+	// **跨重啟時 audit sink 必須在 openWireSegments 之前接上**：production 的
+	// startup 正是這個順序（auditF 早於 openWireSegments 一大段），而
+	// openWireSegments 會啟動 frame 歸屬的背景 worker——上一次執行沒做完的待辦在
+	// 那一刻就開始補完，稽核若還沒接上，補完的證據會靜默消失。
+	// 條件是「檔案已存在」＝上一個 App 開過 audit：不影響「newTestApp 預設不開
+	// audit」那條前提（見 enableAudit）。
+	if _, serr := os.Stat(filepath.Join(a.stateDir, "audit.jsonl")); serr == nil {
+		if f, ferr := os.OpenFile(filepath.Join(a.stateDir, "audit.jsonl"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			a.auditF = f
+			t.Cleanup(func() { _ = f.Close() })
+		}
+	}
 	// §3.4.4：走 production 的同一個開檔入口（不是另外組一個 SegmentSet）——
 	// newTestAppIn 以同一組 stateDir 重開時，磁碟上既有的 segment 也就跟著
 	// production 的 replay 路徑回來，跨重啟那一維才驗得到。
