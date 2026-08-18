@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -99,11 +100,12 @@ func noDrain(a *App) {
 
 // frameResult 是背景工作寫出的 codex_wire_segment_frames 記錄。
 type frameResult struct {
-	ViewID       string            `json:"viewId"`
-	WSID         string            `json:"wsid"`
-	FramesStatus string            `json:"framesStatus"`
-	Frames       map[string][]int  `json:"frames"`
-	Errors       map[string]string `json:"errors"`
+	ViewID        string            `json:"viewId"`
+	WSID          string            `json:"wsid"`
+	FramesStatus  string            `json:"framesStatus"`
+	Frames        map[string][]int  `json:"frames"`
+	Errors        map[string]string `json:"errors"`
+	SegmentsError string            `json:"segmentsError"`
 }
 
 func auditFrameResults(t *testing.T, a *App) []frameResult {
@@ -745,7 +747,7 @@ func TestPendingAuditIsWrittenSynchronously(t *testing.T) {
 	for i, st := range stacks {
 		if !strings.Contains(st, "closeWireSegment") {
 			t.Fatalf("第 %d 筆 codex_wire_segments 必須在 closeWireSegment 的 goroutine 上同步寫出，實際 stack：\n%s",
-				i, st)
+				i+1, st)
 		}
 	}
 }
@@ -800,4 +802,186 @@ func TestTruncatedGenerationIsAudited(t *testing.T) {
 	if len(truncated) == 0 {
 		t.Fatalf("由截斷的錄流建出的歸屬是缺一段的答案，必須有稽核出口（狀態仍是 resolved）")
 	}
+
+	// **第二次執行走的是 sidecar 快路徑**，答案一樣缺一段——截斷必須照樣有出口，
+	// 否則「重建那一次吵過了」就變成之後永遠沉默（review 指出的 Minor）。
+	beforeRestart := len(truncated)
+	a.shutdown(a.ctx)
+	b2, _ := newTestAppIn(t, a.workspaceDir, a.stateDir)
+	ctl2 := &framingWire{}
+	bootFramingApp(t, b2, ctl2)
+	noDrain(b2)
+	runFramingSession(t, b2, ctl2, w, "t-trunc", "t-trunc")
+	waitForFrameResult(t, b2, auditSegments(t, b2, w).ViewID)
+	sidecarTruncations := 0
+	for _, d := range auditRecordsOfKind(t, b2, "wire_frame_index_truncated") {
+		if id, _ := d["wireLogId"].(string); id != gen1 {
+			continue
+		}
+		sidecarTruncations++
+		if from, _ := d["fromSidecar"].(bool); from {
+			return // 走 sidecar 而且照樣吵了——這條要的就是這個
+		}
+	}
+	t.Fatalf("經 sidecar 取得的截斷答案也必須留稽核（重建前 %d 筆、目前 %d 筆，皆非 sidecar）",
+		beforeRestart, sidecarTruncations)
+}
+
+// ---- 守門 9：延後 resolve 期間新增的 generation 不得混進更早的 view ----
+
+// TestDelayedResolveDoesNotLeakNewerGenerations：Critical 回歸的守門。
+//
+// resolve 是**延後**發生的，而 worker 會被前一筆工作佔住（重建一份大 wire log——正是
+// sidecar 存在的理由）。這段期間同一個 WSID 若又跨了幾代收尾，resolve 當下的
+// `SegmentSet.For(wsid)` 已經多出後來那幾段。兩層後果：
+//
+//  1. **證據污染**：這個 view 的 frames 會含收尾當下根本不存在的 generation，稽核者拿
+//     同一筆的 pendingWireLogs 去 join 會對不起來（不需要崩潰就會發生）；
+//  2. **為還活著的 generation 寫 sidecar**：正常關機時 Finalize 會覆蓋，不正常退出就
+//     永久固化一份缺後半段的權威快路徑，而且 TruncatedTailBytes=0——連截斷出口都不會響。
+//
+// 斷言寫成 view 級的不變量而不是特定 id：**每個 view 的 frames 鍵集合恰好等於
+// {LiveGenID} ∪ pendingWireLogs**。那正是稽核者 join 得起來的定義。
+//
+// mutation：拿掉 SegCount 的快照還原（resolve 當下用完整的 For(wsid)）→ 紅。
+func TestDelayedResolveDoesNotLeakNewerGenerations(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	bar := newWireLoadBarrier(t, a)
+	noDrain(a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-leak", "") // g1：無歷史，同步 resolved，不排工作
+
+	// g2 收尾 → 第一筆待辦（歷史＝g1）。worker 就此卡在重建 g1 上。
+	var views []segmentView
+	var gens []string
+	for i := 0; i < 3; i++ {
+		if err := a.RestartCodexServerRecorded("b1-leak"); err != nil {
+			t.Fatal(err)
+		}
+		runFramingSession(t, a, ctl, w, "t-leak", "t-leak")
+		views = append(views, auditSegments(t, a, w))
+		gens = append(gens, currentWireLogID(a))
+	}
+	<-bar.entered // 第一筆真的卡在重建點上（不是「還沒開始」就斷言完了）
+
+	liveGen := gens[len(gens)-1]
+	if _, err := os.Stat(filepath.Join(a.wireLogDir(), liveGen+".frames.json")); err == nil {
+		t.Fatalf("還活著（未 finalize）的 generation %s 不得被寫出 sidecar", liveGen)
+	}
+
+	bar.releaseAll()
+	for i, v := range views {
+		if v.FramesStatus != "pending" {
+			t.Fatalf("precondition：第 %d 個 view 必須是 pending：%+v", i+1, v)
+		}
+		res := waitForFrameResult(t, a, v.ViewID)
+		if res.FramesStatus != "resolved" {
+			t.Fatalf("第 %d 個 view 必須 resolved：%+v", i+1, res)
+		}
+		t.Logf("view %d：live=%v pending=%v → resolved frames=%v",
+			i+1, keysOf(v.Frames), v.PendingWireLogs, keysOf(res.Frames))
+		want := map[string]bool{}
+		for _, id := range v.PendingWireLogs {
+			want[id] = true
+		}
+		for id := range v.Frames { // 同步階段已結算的 live 那一代
+			want[id] = true
+		}
+		// 用 Errorf 不用 Fatalf：這個回歸有**兩層後果**（證據污染＋為活著的
+		// generation 寫 sidecar），中斷在第一層會讓第二層永遠觀測不到。
+		for id := range res.Frames {
+			if !want[id] {
+				t.Errorf("第 %d 個 view 的結算含了收尾當下不存在的 generation %s——"+
+					"稽核者拿 pendingWireLogs（%v）join 不起來：%v",
+					i+1, id, v.PendingWireLogs, keysOf(res.Frames))
+			}
+		}
+		if len(res.Frames) != len(want) {
+			t.Errorf("第 %d 個 view 的結算必須恰好涵蓋 {live} ∪ pendingWireLogs：%v（want %v）",
+				i+1, keysOf(res.Frames), keysOf2(want))
+		}
+	}
+
+	// 還活著的那一代仍不得有 sidecar（沒有任何 view 該去讀它）。
+	if _, err := os.Stat(filepath.Join(a.wireLogDir(), liveGen+".frames.json")); err == nil {
+		t.Fatalf("結算完成後，還活著的 generation %s 仍不得有 sidecar", liveGen)
+	}
+}
+
+func keysOf(m map[string][]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func keysOf2(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ---- 守門 10：SegmentSet 掉段時 fail loud，不得靜默算成「歷史只有這一代」----
+
+// TestMissingSegmentsFailLoudNotSilentResolve：job record 改成不內嵌 segments 之後，
+// 正確性就依賴 `wire-segments.jsonl` 在 **resolve 當下**的狀態——而那個檔的尾端截斷是
+// **被容忍的**（`TestOpenSegmentSetTailTruncationTolerated`）。所以「重啟補完時少一段」
+// 現在有路徑，而它的錯誤形狀正是守門 5 拒絕的那一種：把「證據缺了一段」寫成
+// 「歷史真的只有這一代」。
+//
+// mutation：拿掉 `len(segs) < job.SegCount` 的 fail loud → 紅（會靜默 resolved）。
+func TestMissingSegmentsFailLoudNotSilentResolve(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	bar := newWireLoadBarrier(t, a)
+	noDrain(a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-lost", "")
+	if err := a.RestartCodexServerRecorded("b1-lost"); err != nil {
+		t.Fatal(err)
+	}
+	runFramingSession(t, a, ctl, w, "t-lost", "t-lost")
+	view := auditSegments(t, a, w)
+	if view.FramesStatus != "pending" {
+		t.Fatalf("precondition：必須是 pending：%+v", view)
+	}
+	<-bar.entered
+	a.drainWireFrameJobs() // 「當掉」：待辦已落盤、done 從未寫入
+	a.closeWireFrameJobs()
+
+	// 模擬 wire-segments.jsonl 的尾端截斷（journal 容忍：quarantine ＋ truncate）。
+	sp := a.wireSegmentsPath()
+	b, err := os.ReadFile(sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("precondition：至少要有兩段才砍得掉一段：%d", len(lines))
+	}
+	trimmed := strings.Join(lines[:len(lines)-1], "\n") + "\n" + lines[len(lines)-1][:5]
+	if err := os.WriteFile(sp, []byte(trimmed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, _ := newTestAppIn(t, a.workspaceDir, a.stateDir)
+	enableAudit(t, b2)
+	res := waitForFrameResult(t, b2, view.ViewID)
+	if res.FramesStatus != "failed" {
+		t.Fatalf("SegmentSet 掉段必須 fail loud，不得靜默算成「歷史只有這一代」：%+v", res)
+	}
+	if !strings.Contains(res.SegmentsError, "缺段") {
+		t.Fatalf("失敗原因必須指名是段數對不上：%q", res.SegmentsError)
+	}
+	bar.releaseAll()
 }

@@ -173,6 +173,9 @@ func (fi *FrameIndex) Snapshot() FrameIndexSnapshot {
 // 被丟棄的檔尾那一行。這是 §3.4.3「frame index 可重建」對歸屬那一半的意義：歸屬不
 // 是只活在 process 記憶體裡的註記。
 func RebuildFrameIndex(path string) (*FrameIndex, error) {
+	if h := hookRebuild; h != nil {
+		h(path) // 測試探針：這裡就是「整份錄流被讀一遍」的唯一入口（見 hookRebuild）
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

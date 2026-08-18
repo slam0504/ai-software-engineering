@@ -145,3 +145,36 @@ func TestTruncatedTailSurvivesIntoResult(t *testing.T) {
 		t.Fatalf("截斷量必須存活過 sidecar：%d（want %d）", again.TruncatedTailBytes, res.TruncatedTailBytes)
 	}
 }
+
+// TestSidecarHitDoesNotReadWireLog：契約 4 的**效益**那一半——sidecar 存在時必須真的
+// 省掉整份錄流的讀取，不只是「回報說省掉了」。
+//
+// **oracle 不是 FromSidecar**（失效形狀 H）：那是受測對象的自陳。這裡數的是
+// RebuildFrameIndex 實際被呼叫幾次——review 實測過一個「照樣重讀一遍、但仍回
+// FromSidecar:true」的 mutation 可以讓 App 層的稽核式斷言全綠。
+func TestSidecarHitDoesNotReadWireLog(t *testing.T) {
+	dir := t.TempDir()
+	buildGen(t, dir, "g1")
+
+	var reads []string
+	hookRebuild = func(p string) { reads = append(reads, p) }
+	t.Cleanup(func() { hookRebuild = nil })
+
+	if _, err := LoadOrBuildAttribution(dir, "g1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("sidecar 命中時不得讀整份錄流（契約 4 的效益就是這個）：%v", reads)
+	}
+
+	// 對照組：sidecar 拿掉就必須真的讀——否則上面那個 0 是因為根本沒接上探針。
+	if err := os.Remove(AttributionPath(dir, "g1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrBuildAttribution(dir, "g1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 1 {
+		t.Fatalf("precondition：缺 sidecar 必須重讀一次，探針才算真的接上：%v", reads)
+	}
+}

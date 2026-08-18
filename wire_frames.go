@@ -63,14 +63,31 @@ type wireFrameJob struct {
 	// 收尾當下的快照才是這個 view 的正確答案。
 	LiveGenID  string `json:"live_wire_log_id,omitempty"`
 	LiveFrames []int  `json:"live_frames,omitempty"`
+
+	// SegCount：收尾當下 `SegmentSet.For(wsid)` 的段數。
+	//
+	// **不存 segments、但必須存段數**（review 抓到的回歸）：resolve 是**延後**發生的，
+	// 而 worker 可能被前一筆工作佔住（重建一份大 wire log ——正是 sidecar 存在的理由）。
+	// 這段期間同一個 WSID 若又跨了一代收尾，resolve 當下的 `For(wsid)` 已經多出後來
+	// 那幾段，於是：(a) 這個 view 的 frames 會含**收尾當下根本不存在**的 generation，
+	// 稽核者拿 pendingWireLogs 去 join 會對不起來；(b) 那一代**還活著、還沒 finalize**，
+	// 卻被寫出一份 sidecar——不正常退出時就永久固化成一份缺後半段的權威快路徑，而且
+	// TruncatedTailBytes=0，連截斷出口都不會響。
+	//
+	// 一個 int 就精確還原了快照語意，且不改 frames 的語意（仍是「這一代裡我的全部
+	// frame」）。順帶讓「SegmentSet 尾端截斷導致某代靜默消失」變成可偵測：實際段數
+	// 少於快照即 fail loud，而 job record 本身不再自足（正確性依賴 wire-segments.jsonl
+	// 在 resolve 當下的狀態，而該檔的尾端截斷是被容忍的）。
+	SegCount int `json:"seg_count,omitempty"`
 }
 
 // wireGenAttr 是 per-generation cache 的一格：成功的歸屬，或**該代讀不出來的原因**。
 // 錯誤一樣要快取——否則同一份壞掉的 wire log 會被每個 session 各重讀一次，而
 // 契約第 3 條要的是「一個 app run 最多一次」，不是「成功時最多一次」。
 type wireGenAttr struct {
-	byWSID map[string][]int
-	err    error
+	byWSID    map[string][]int
+	err       error
+	truncated int64
 }
 
 func (a *App) wireFrameJobsPath() string { return filepath.Join(a.stateDir, "wire-frame-jobs.jsonl") }
@@ -251,7 +268,21 @@ func (a *App) resolveWireFrameJob(job wireFrameJob) {
 		frames[job.LiveGenID] = job.LiveFrames // 本次那一代已在同步階段結算完
 	}
 	failures := map[string]string{}
+	// 還原收尾當下的快照（見 wireFrameJob.SegCount）。少於快照代表 SegmentSet 掉了段
+	// （尾端截斷被 journal 容忍、或開檔失敗回 nil）——**不得靜默算成「歷史只有這一代」**，
+	// 那與守門 5 拒絕的「讀不出來偽裝成零 frame」是同一個形狀，只是換了入口。
 	segs := a.wireSegmentsFor(job.WSID) // durable 權威；record 不內嵌（見 wireFrameJob）
+	if len(segs) < job.SegCount {
+		a.audit("codex_wire_segment_frames", map[string]any{
+			"viewId": job.ViewID, "wsid": job.WSID, "frames": frames,
+			"framesStatus": "failed",
+			"segmentsError": fmt.Sprintf(
+				"SegmentSet 目前只有 %d 段，收尾當下是 %d 段——歷史錄流證據缺段，無法還原這個 view",
+				len(segs), job.SegCount)})
+		a.markWireFrameJobDone(job.ViewID)
+		return
+	}
+	segs = segs[:job.SegCount]
 	for _, s := range segs {
 		if _, done := frames[s.WireLogID]; done {
 			continue
@@ -284,6 +315,10 @@ func (a *App) wireGenAttribution(wireLogID string) (map[string][]int, error) {
 	a.wireIdxMu.Lock()
 	if got, ok := a.wireIdxCache[wireLogID]; ok {
 		a.wireIdxMu.Unlock()
+		// cache 命中也要再記一次截斷：這是**這個 view 的答案缺了一段**，不是
+		// 「這一代被讀過一次」的事實。只在第一次記的話，同一個 app run 內後續每一個
+		// view 都會靜默（review 指出）。
+		a.auditTruncatedAttribution(wireLogID, got.truncated, true)
 		return got.byWSID, got.err
 	}
 	a.wireIdxMu.Unlock()
@@ -304,20 +339,26 @@ func (a *App) wireGenAttribution(wireLogID string) (map[string][]int, error) {
 	if a.wireIdxCache == nil {
 		a.wireIdxCache = map[string]wireGenAttr{}
 	}
-	a.wireIdxCache[wireLogID] = wireGenAttr{byWSID: res.ByWSID, err: err}
+	a.wireIdxCache[wireLogID] = wireGenAttr{byWSID: res.ByWSID, err: err, truncated: res.TruncatedTailBytes}
 	a.wireIdxMu.Unlock()
 	if err == nil && !res.FromSidecar {
 		a.audit("wire_frame_index_rebuilt", map[string]any{"wireLogId": wireLogID})
 	}
-	// 截斷的出口（review 指出）：由不完整的 wire log 建出的歸屬會經 sidecar 成為
-	// 後續每一次 app run 的快路徑；不讓它有出口就是把證據缺口靜默固化。**每次取得
-	// 都記**（不只重建那次），因為 sidecar 命中時同樣是不完整的答案。
-	if res.TruncatedTailBytes > 0 {
-		a.audit("wire_frame_index_truncated", map[string]any{"wireLogId": wireLogID,
-			"truncatedTailBytes": res.TruncatedTailBytes, "fromSidecar": res.FromSidecar,
-			"note": "此代錄流檔尾不完整，歸屬答案缺一段（§3.4.5 檔尾截斷容忍）"})
-	}
+	a.auditTruncatedAttribution(wireLogID, res.TruncatedTailBytes, res.FromSidecar)
 	return res.ByWSID, err
+}
+
+// auditTruncatedAttribution：截斷的出口（review 指出）。由不完整的 wire log 建出的
+// 歸屬會經 sidecar 成為後續每一次 app run 的快路徑；不讓它有出口就是把證據缺口靜默
+// 固化。**每一次取得都記**——不只重建那一次，也不只 cache miss 那一次：截斷描述的是
+// 「這個 view 的答案缺了一段」，每個 view 都該看得到。
+func (a *App) auditTruncatedAttribution(wireLogID string, n int64, fromSidecar bool) {
+	if n <= 0 {
+		return
+	}
+	a.audit("wire_frame_index_truncated", map[string]any{"wireLogId": wireLogID,
+		"truncatedTailBytes": n, "fromSidecar": fromSidecar,
+		"note": "此代錄流檔尾不完整，歸屬答案缺一段（§3.4.5 檔尾截斷容忍）"})
 }
 
 // wireSegmentsFor：SegmentSet 的取值包裝（SegmentSet 開檔失敗時為 nil）。

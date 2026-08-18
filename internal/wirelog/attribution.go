@@ -28,6 +28,15 @@ type FrameAttribution struct {
 	TruncatedTailBytes int64 `json:"truncated_tail_bytes,omitempty"`
 }
 
+// hookRebuild 是測試專用的探針：`RebuildFrameIndex` **真的把整份錄流讀一遍**時觸發。
+// production 恆為 nil（唯一設值入口是 attribution_test.go）。
+//
+// 為什麼需要它：契約 4 的白紙黑字是「用 O(歸屬筆數) 取代 O(整份錄流)」，而
+// `FromSidecar` 是**受測對象自己的回報**——拿它當 oracle，一個「照樣重讀一遍但仍回報
+// FromSidecar:true」的實作會全綠（失效形狀 H：oracle 是受測對象）。要守住「省掉那段
+// I/O」只能數實際的讀取。
+var hookRebuild func(path string)
+
 // AttributionResult 是一次歸屬取得的完整結果。
 //
 // TruncatedTailBytes 必須跟著結果一路傳出去（不只留在 sidecar 檔裡）：由**截斷**的

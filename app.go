@@ -6251,7 +6251,7 @@ func (a *App) closeWireSegment(h *sessionHost) {
 		rec["pendingWireLogs"] = pending
 		a.audit("codex_wire_segments", rec)
 		a.enqueueWireFrameJob(wireFrameJob{ViewID: viewID, WSID: string(h.wsid),
-			LiveGenID: gen.ID(), LiveFrames: liveFrames})
+			LiveGenID: gen.ID(), LiveFrames: liveFrames, SegCount: len(segs)})
 	})
 }
 
