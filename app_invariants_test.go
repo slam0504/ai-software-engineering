@@ -445,7 +445,7 @@ func TestWireLogCapturesFramesOfEverySession(t *testing.T) {
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
 
-	gen, err := wirelog.NewGeneration(a.wireLogDir(), "wire-e2e")
+	gen, err := wirelog.NewGeneration(a.wireLogDir(), "wire-e2e", a.resolveWireFrameWSID)
 	if err != nil {
 		t.Fatal(err)
 	}

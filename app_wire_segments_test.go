@@ -257,6 +257,10 @@ type segmentView struct {
 	Segments  []wirelog.SegmentRef `json:"segments"`
 	Exclusive bool                 `json:"exclusive"`
 	Note      string               `json:"note"`
+	// Frames（§3.4.3）：wire_log_id → 該代裡確實歸屬本 WSID 的 frame 編號。
+	// range 是窗口、frames 是歸屬——並行時前者必然含他 session 的 frame，
+	// 逐 frame 的答案只在這裡（見 app_wire_frames_test.go）。
+	Frames map[string][]int `json:"frames"`
 }
 
 // auditSegments：稽核可讀出口——codex_wire_segments 記錄的最後一份 view。

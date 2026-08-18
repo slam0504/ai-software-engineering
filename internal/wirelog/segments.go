@@ -31,13 +31,22 @@ type segmentRecord struct {
 // generations (B1 probe, server restart, app restart) even though the
 // connection-wide wire log is one physical file per generation.
 //
-// Per coordinator's Task 10 review: the wire-log frame index's per-frame
-// WSID (Generation.Attribute) is a best-effort, non-durable, in-memory
-// annotation — the recorder sink lives inside codex.Conn and may not be able
-// to resolve a WSID at write time (e.g. during the pending-start window
-// before thread binding is known). SegmentSet's []SegmentRef is therefore
-// the *only* durable session-level wire-log evidence; it must be persistable,
-// not memory-only.
+// Relationship to the frame index's per-frame WSID (§3.4.3, WSIDResolver) —
+// the two answer different questions and neither replaces the other:
+//
+//   - SegmentSet answers "which generations / frame ranges does this WSID span",
+//     which is the only thing that survives without reading the wire logs at all
+//     and the only thing that is ordered across generations.
+//   - The frame index's per-frame WSID answers "inside an overlapping range,
+//     who owns *this* frame". Concurrent sessions share one codex.Conn, so
+//     their ranges necessarily contain each other's frames (see App's
+//     closeWireSegment `exclusive` qualifier) — set-level evidence cannot
+//     answer it.
+//
+// Both are durable: SegmentSet through this journal, the per-frame WSID through
+// the wsid column of each wire-log row (rebuildable via RebuildFrameIndex).
+// This is not a dual source of truth — they have disjoint scopes, and the
+// per-frame column is the *only* writer of frame-level ownership.
 //
 // Ordering: For(wsid) returns segments in Append call order. SegmentSet does
 // not reorder by any other key — frame numbers are only comparable within

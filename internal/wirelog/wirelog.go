@@ -12,10 +12,9 @@
 //     App 經 replaceCodexGeneration 建立／替換。
 //   - SegmentSet（segments.go）：由 App 的 openWireSegments／beginWireSegment／
 //     closeWireSegment 接線，落盤在 <stateDir>/wire-segments.jsonl。
-//   - FrameIndex／RebuildFrameIndex／Generation.Attribute：**仍未接線**。
-//     §3.4.3 只要求 frame index「可重建」這個性質（由本套件測試驗收），
-//     而 §3.4.3 的 frame-level threadID／turnID→WSID 歸屬目前沒有 production
-//     承載者——Line 一律寫 wsid:""，Attribute 零呼叫端。獨立票處理。
+//   - FrameIndex／RebuildFrameIndex／WSIDResolver：由 App 的
+//     newWireGeneration（安裝 resolveWireFrameWSID）與 wireFramesOf（收尾時的
+//     per-frame 證據，跨 generation 時經 RebuildFrameIndex 從磁碟重建）接線。
 package wirelog
 
 import (
@@ -57,14 +56,32 @@ type wireRow struct {
 	Raw   json.RawMessage `json:"raw"`
 }
 
+// WSIDResolver 是 **write-time** 的 frame → WSID 歸屬判定（§3.4.3 的
+// threadID／turnID→WSID 那一半）。由呼叫端（App）提供：本套件不知道 codex 的
+// identity schema，也不持有路由表。
+//
+// 為什麼是 write-time 而不是事後標記：wire log 是 append-only 的 JSONL，歸屬若只
+// 存在記憶體，crash／app 重啟後就整批消失（§3.4.3 要求 frame index「可重建」，而
+// 唯一能重建它的來源就是 wire log 本身）。判定結果寫進該 frame 自己那一行的 wsid
+// 欄位，RebuildFrameIndex 因此讀得回來。
+//
+// 判定不出來時回空字串——該 frame 照樣寫入、wsid 留空（§3.4.5），不得丟棄、也不得
+// 猜一個 session。
+//
+// 呼叫時機：Generation.Line 在取得自己的鎖**之前**呼叫，因此 resolver 可以安全取
+// App 的鎖（不會與 g.mu 形成環）；相對地 resolver 不得反過來呼叫任何會寫錄流的
+// 路徑（那是 Line → resolver → Line 的遞迴）。
+type WSIDResolver func(dir Direction, raw []byte) string
+
 // Generation 是一份 app-server generation 的 always-on 錄流檔＋可重建 frame
 // index。每次 app-server restart（含 B1 受控 restart）開新 generation、新
 // wire_log_id；不對舊 generation 續寫。
 type Generation struct {
-	mu  sync.Mutex
-	id  string
-	dir string
-	f   *os.File
+	mu      sync.Mutex
+	id      string
+	dir     string
+	f       *os.File
+	resolve WSIDResolver
 
 	nextFrame int
 	writeErr  error // latched：首個寫入錯誤，不因後續成功而清除（§3.4.6）
@@ -86,7 +103,12 @@ type Generation struct {
 //
 // 呼叫端應在 handshake 之前就呼叫本函式（always-on，§3.4.1）——不是等發布成功
 // 才建立，也不採 recordCase reference count 啟停。
-func NewGeneration(dir, id string) (*Generation, error) {
+//
+// resolve 刻意作為**建構參數**而不是事後 setter：忘了掛 resolver 的後果是整份錄流
+// 的 wsid 全空，而那個狀態與「真的無法歸屬」在檔案上長得一模一樣——沒有任何斷言分
+// 得出來。放在建構子讓每個呼叫端都必須明確表態；nil 代表「本 generation 不做歸屬」
+// （測試與非 codex 用途）。
+func NewGeneration(dir, id string, resolve WSIDResolver) (*Generation, error) {
 	if id == "" || strings.ContainsAny(id, `/\`) {
 		return nil, fmt.Errorf("wirelog: invalid generation id %q", id)
 	}
@@ -97,7 +119,7 @@ func NewGeneration(dir, id string) (*Generation, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Generation{id: id, dir: dir, f: f, idx: newFrameIndex()}, nil
+	return &Generation{id: id, dir: dir, f: f, resolve: resolve, idx: newFrameIndex()}, nil
 }
 
 // ID 回傳本 generation 的 wire_log_id。
@@ -108,8 +130,13 @@ func (g *Generation) ID() string { return g.id }
 // 整落在同一段鎖內，否則並行呼叫可能讓 frame 編號與檔案內容的順序錯位、甚至讓
 // 兩筆寫入交錯成損毀的 JSONL 行。
 //
-// 無法歸屬（尚未知道 WSID）的 frame 仍照樣寫入、不得丟棄（§3.4.5）；WSID 的歸
-// 屬透過 Attribute 事後標記，寫入當下一律留空。
+// WSID 歸屬在寫入當下由 resolve 判定並寫進該 frame 自己那一行（見 WSIDResolver）。
+// 判定不出來的 frame 仍照樣寫入、wsid 留空、不得丟棄（§3.4.5）。
+//
+// **逐 frame，不是逐 FrameKey**：notification 沒有 request id，同方向的所有
+// notification 會落在同一個 FrameKey bucket 底下；若以 key 為單位標記歸屬，兩個
+// session 交錯的通知會被整批標成最後一次判定的那個 WSID。歸屬因此一律以 frame
+// 編號為單位（idx.setWSID），FrameKey 只當索引鍵用。
 //
 // latch 後的行為（§3.4.6）：Line 進入時**不會**檢查 g.writeErr 做 short-circuit，
 // 每次呼叫都照樣嘗試真實寫入。若底層問題是暫時性的（例如磁碟空間恢復），後續
@@ -120,6 +147,14 @@ func (g *Generation) ID() string { return g.id }
 func (g *Generation) Line(dir Direction, raw []byte) error {
 	if dir != DirClientToServer && dir != DirServerToClient {
 		return fmt.Errorf("wirelog: invalid direction %q", dir)
+	}
+
+	// 歸屬判定刻意在 g.mu **之外**完成：resolver 會去取 App 的路由鎖，若在 g.mu 內
+	// 呼叫就形成 g.mu → a.mu 的鎖序，與 App 既有的「先取 a.mu 再讀 generation」路徑
+	// 互為反向。判定只看 frame 原文與當下路由表，不需要 frame 編號。
+	wsid := ""
+	if g.resolve != nil {
+		wsid = g.resolve(dir, raw)
 	}
 
 	g.mu.Lock()
@@ -134,7 +169,7 @@ func (g *Generation) Line(dir Direction, raw []byte) error {
 		// raw 是否為合法 JSON 而受影響。
 		err = g.forceErr
 	} else {
-		row := wireRow{Frame: frame, Dir: dir, WSID: "", Raw: json.RawMessage(raw)}
+		row := wireRow{Frame: frame, Dir: dir, WSID: wsid, Raw: json.RawMessage(raw)}
 		var b []byte
 		b, err = json.Marshal(row)
 		if err == nil {
@@ -150,25 +185,10 @@ func (g *Generation) Line(dir Direction, raw []byte) error {
 
 	key := FrameKey{WireLogID: g.id, Direction: dir, RequestID: extractRequestID(raw)}
 	g.idx.add(key, frame)
+	if wsid != "" {
+		g.idx.setWSID(frame, wsid)
+	}
 	return nil
-}
-
-// Attribute 事後標記某個 FrameKey 對應的所有已寫入 frame 屬於哪個 WSID
-// （threadID／turnID → WSID 歸屬，§3.4.3）。歸屬判定邏輯（如何從 raw frame 解出
-// threadID／turnID 再查回 WSID）由呼叫端負責，本套件不重放判定過程——僅更新記
-// 憶體內的 FrameIndex，不回頭改寫已落盤的 JSONL 行。
-//
-// 已知限制：RebuildFrameIndex 只讀 wire log 本身，故不會還原 Attribute 標記的
-// 結果；崩潰後重建的 FrameIndex 是「未歸屬」狀態。是否需要 crash-safe 的歸屬持
-// 久化留給接線 Task（12/13）依實際需求評估。
-//
-// 分工（coordinator 裁決）：本欄位僅 best-effort 記憶體註記，**不是** durable
-// 的 session 級錄流證據——錄流 sink 掛在 codex.Conn 內，寫入當下未必解析得出
-// WSID（pending start 窗口內尤其如此，thread 綁定還沒回來）。durable 權威是
-// §3.4.4 的 []SegmentRef（見 SegmentRef 的 doc）；若讓 frame line 的 wsid 欄位
-// 與 SegmentSet 都宣稱是歸屬權威，就是雙來源。
-func (g *Generation) Attribute(key FrameKey, wsid string) {
-	g.idx.attribute(key, wsid)
 }
 
 // Finalize 收尾本 generation：關閉錄流檔、寫入 meta（沿用 recorder.Meta 形

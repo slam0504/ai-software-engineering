@@ -246,6 +246,21 @@ type App struct {
 	// 就是永久的證據缺口。形狀與 internal/evidence／internal/gate 的 journal 同款。
 	wireSegments *wirelog.SegmentSet
 
+	// wireReqMu／wireReqWSID（§3.4.3 frame-level 歸屬）：帶 request id 的 frame 的
+	// 歸屬，供**方向相反的**那筆 response frame 繼承。key 是 "<request 的方向>:<id
+	// 原文>"——c2s 與 s2c 各自獨立配發 request id，同一數值在兩個方向是完全不同的
+	// RPC 交換（FrameKey 要求含 direction 是同一個理由）。
+	//
+	// 為什麼 response 不能靠 identity 判定：response frame 只有 {id, result|error}，
+	// params 裡的 threadId／turnId 都不在裡面。completed-before-response 尤其明顯——
+	// turn/start 的 response 抵達時該 turn 早已 unbind，identity 查回去必然落空。
+	//
+	// 生命週期：每配一個新 generation 就整個清掉（newWireGeneration）——request id
+	// 由 codex.Conn 從 1 起算，換 conn 就換一套編號；沒有回應的請求（逾時、連線死亡）
+	// 的殘留登記也在此一併釋放。
+	wireReqMu   sync.Mutex
+	wireReqWSID map[string]string
+
 	// wireOpenSegs：wire_log_id → 目前在該 generation 上開著 segment 的 host。
 	// 在 wireMu 下讀寫。只服務一件事——判定「這一段期間有沒有別的 session 也在
 	// 同一代上活著」，好在證據出口標明 range 非排他（見 closeWireSegment）。
@@ -6151,15 +6166,58 @@ func (a *App) closeWireSegment(h *sessionHost) {
 		// 它們的 frame 就落在這個窗口內。沒有這個限定詞，稽核者會把 range 當排他
 		// 證據讀——長命 session 的單一 range 甚至會吞掉它之後在同一代起的每一個
 		// session 的全部 frame，實質等於「整代錄流」。
+		//
+		// frames（§3.4.3 frame-level 歸屬）：range 是**窗口**、frames 是**歸屬**。
+		// 上面那個限定詞只說得出「這個 range 不排他」，說不出「那 range 裡哪幾筆
+		// 才是我的」——後者是 §5.2「錄流 frame 歸屬不串線」真正要的答案，也是
+		// set-level 證據原理上答不出來的一格。
+		segs := a.wireSegments.For(string(h.wsid))
 		rec := map[string]any{
 			"wsid": string(h.wsid), "label": h.recordLabel,
-			"segments": a.wireSegments.For(string(h.wsid)), "exclusive": !overlapped}
+			"segments": segs, "exclusive": !overlapped,
+			"frames": a.wireFramesOf(string(h.wsid), segs, gen)}
 		if overlapped {
 			rec["note"] = "本次 range 期間同一 generation 上有並行 session：" +
-				"range 內含他 session 的 frame，不得當作排他證據讀（§3.4.4 已知邊界）"
+				"range 內含他 session 的 frame，不得當作排他證據讀（§3.4.4 已知邊界）；" +
+				"逐 frame 的歸屬見 frames"
 		}
 		a.audit("codex_wire_segments", rec)
 	})
+}
+
+// wireFramesOf：wire_log_id → 該份 generation 裡**確實歸屬** wsid 的 frame 編號。
+//
+// 這是 frame-level 歸屬的證據出口，也是「歸屬資料不能只存在記憶體」那一維的
+// production 讀者：live 那一代直接讀它的 FrameIndex，**先前 generation 的則以
+// RebuildFrameIndex 從磁碟重建**（每個 frame 的 wsid 寫在自己那一行）。app 重啟後
+// 同一個 WSID 再收尾一次，這裡就會把重啟前那幾代的歸屬一併讀回來——記憶體裡早已
+// 沒有那些 Generation handle 了。
+//
+// 讀取範圍由該 WSID 自己的 []SegmentRef 界定（不是掃整個 wire-logs/），所以成本與
+// 這個 session 的歷史成正比，不隨 app 累積的 generation 數成長。
+//
+// 重建失敗不擋收尾但不得無聲：該 generation 記成 nil ＋ 一筆 audit，稽核者看得出
+// 「這一代的 frame 歸屬讀不出來」而不是「這一代沒有我的 frame」。
+func (a *App) wireFramesOf(wsid string, segs []wirelog.SegmentRef, live *wirelog.Generation) map[string][]int {
+	out := map[string][]int{}
+	for _, s := range segs {
+		if _, done := out[s.WireLogID]; done {
+			continue
+		}
+		if live != nil && s.WireLogID == live.ID() {
+			out[s.WireLogID] = live.FrameIndex().FramesOf(wsid)
+			continue
+		}
+		idx, err := wirelog.RebuildFrameIndex(filepath.Join(a.wireLogDir(), s.WireLogID+".jsonl"))
+		if err != nil {
+			a.audit("codex_wire_frames_rebuild_error", map[string]any{
+				"wsid": wsid, "wireLogId": s.WireLogID, "error": err.Error()})
+			out[s.WireLogID] = nil
+			continue
+		}
+		out[s.WireLogID] = idx.FramesOf(wsid)
+	}
+	return out
 }
 
 // wireStep：受控復原／replacement 的步驟探針（測試注入，見 hookWireStep）。
@@ -6189,7 +6247,10 @@ func (a *App) newWireGeneration() (*wirelog.Generation, error) {
 	id := fmt.Sprintf("codex-wire-%s-%s-%03d", time.Now().UTC().Format("20060102T150405"),
 		a.wireRun, a.wireSeq)
 	a.wireMu.Unlock()
-	return wirelog.NewGeneration(a.wireLogDir(), id)
+	// request id 隨新 conn 從 1 重新起算：舊 generation 的殘留登記必須在新 sink
+	// 開始寫之前清掉，否則新連線的 id=1 response 會繼承到上一代某筆請求的歸屬。
+	a.resetWireRequestWSID()
+	return wirelog.NewGeneration(a.wireLogDir(), id, a.resolveWireFrameWSID)
 }
 
 // wireLatched 回報 recorder error latch 是否生效。
@@ -6526,6 +6587,140 @@ func (a *App) codexWSIDFor(threadID, turnID string) (appcore.WSID, bool) {
 		}
 	}
 	return "", false
+}
+
+// ---- §3.4.3 frame-level 歸屬：wire log 每一筆 frame 的 WSID ----
+//
+// SegmentSet（§3.4.4）回答「某 WSID 橫跨哪些 generation 的哪些 range」；並行
+// session 共用同一條 codex.Conn，那些 range 必然互相涵蓋（closeWireSegment 的
+// exclusive 限定詞就是在講這件事）。「重疊 range 裡的**這一個** frame 到底屬於誰」
+// 只有 frame-level 歸屬答得出來，兩者不可互相替代。
+//
+// 判定發生在**寫入當下**（wirelog.WSIDResolver），結果寫進該 frame 自己那一行的
+// wsid 欄位，因此 app 重啟後 RebuildFrameIndex 讀得回來——歸屬不是只活在記憶體裡的
+// 註記。判不出來就留空、frame 照寫（§3.4.5）。
+//
+// 三條判定路徑（依 frame 形狀分流，見 resolveWireFrameWSID）：
+//
+//	response（有 id、無 method）  → 繼承對應 request 的歸屬（wireReqWSID）
+//	request（有 id、有 method）   → identity 判定；判到就登記給未來的 response 繼承
+//	notification（無 id）         → identity 判定
+//
+// identity 判定一律走 dispatcher 的同一支 codexWSIDFor（turnId → threadId →
+// pending start）。**刻意共用而不另寫一份**：兩份查找表在路由規則變動時必然漂移，
+// 而漂移的後果正是「事件送對 session、錄流證據卻歸錯」這種最難察覺的形狀。
+
+// resolveWireFrameWSID 是掛進 wirelog.Generation 的 write-time 歸屬判定。
+//
+// 併發：由 codex.Conn.record 呼叫——c2s 在送訊息的 goroutine 內（Conn.send）、s2c
+// 在 readLoop 內，兩者都不持有 a.mu（repo 既有慣例是「取 a.mu 讀出 conn → 放鎖 →
+// 才 Call」，見 forcedShutdown 與 InterruptTurn），所以這裡取 a.mu 不會與送訊息端
+// 死鎖。wirelog.Line 也刻意在自己的鎖之外呼叫（見 WSIDResolver doc）。
+//
+// s2c 的判定順序天然正確：Conn.readLoop 先 record 再 dispatch，所以 turn/completed
+// 這一筆 frame 是在 unbindCodexTurn **之前**判定的；反過來，turn/start 的 response
+// 是在 unbind 之後才抵達的，那筆靠 wireReqWSID 繼承，不靠 identity。
+func (a *App) resolveWireFrameWSID(dir wirelog.Direction, raw []byte) string {
+	var f struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return "" // 解不開的 frame 照寫、WSID 留空（§3.4.5），不猜、不丟
+	}
+	id := strings.TrimSpace(string(f.ID))
+	if id == "null" {
+		id = ""
+	}
+	switch {
+	case id != "" && f.Method == "":
+		// response：id 是**對方**發的 request 的 id，歸屬繼承自那一筆。
+		return a.takeWireRequestWSID(oppositeWireDir(dir), id)
+	case id != "":
+		// request：c2s 的 thread/turn 呼叫、s2c 的兩種 requestApproval。
+		w := a.wireIdentityWSID(dir, f.Method, f.Params)
+		if w != "" {
+			a.rememberWireRequestWSID(dir, id, w)
+		}
+		return w
+	default:
+		// notification：沒有 request id，只有 thread／turn identity 能區分。
+		return a.wireIdentityWSID(dir, f.Method, f.Params)
+	}
+}
+
+// wireIdentityWSID：以 frame 的 threadId／turnId 判定歸屬。
+//
+// thread/start 的 c2s frame 是唯一「屬於某個 session、卻連 threadId 都還沒有」的
+// 形狀：thread id 是這一筆請求的**回傳值**。thread/resume 帶 threadId、turn/* 帶
+// threadId，都走得到 codexWSIDFor；只有它需要退回 pending start 登記。
+//
+// 這個退路刻意**只認 thread/start**，不是「c2s 沒有 identity 就歸給 pending」：
+// initialize／initialized／account/* 也沒有 identity，它們是連線層的 frame，不屬於
+// 任何 session，落在 pending 窗口內就被吞進某個 session 是假證據。
+func (a *App) wireIdentityWSID(dir wirelog.Direction, method string, params []byte) string {
+	threadID, turnID := codexFrameIdentity(params)
+	if w, ok := a.codexWSIDFor(threadID, turnID); ok {
+		return string(w)
+	}
+	if dir == wirelog.DirClientToServer && method == codex.MethodThreadStart {
+		if w, ok := a.soleCodexPendingStart(); ok {
+			return string(w)
+		}
+	}
+	return ""
+}
+
+// soleCodexPendingStart：恰好一筆 pending start 時回傳它（理由與 codexWSIDFor 的
+// 第三順位相同：codexStartMu 保證至多一筆，出現兩筆代表不變量已破，寧可不歸屬）。
+func (a *App) soleCodexPendingStart() (appcore.WSID, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.codexPendingStarts) != 1 {
+		return "", false
+	}
+	for _, w := range a.codexPendingStarts {
+		return w, true
+	}
+	return "", false
+}
+
+// oppositeWireDir：response 的方向 → 它所回應的那筆 request 的方向。
+func oppositeWireDir(dir wirelog.Direction) wirelog.Direction {
+	if dir == wirelog.DirClientToServer {
+		return wirelog.DirServerToClient
+	}
+	return wirelog.DirClientToServer
+}
+
+func wireReqKey(reqDir wirelog.Direction, id string) string { return string(reqDir) + ":" + id }
+
+// rememberWireRequestWSID：登記某筆 request frame 的歸屬，供其 response 繼承。
+func (a *App) rememberWireRequestWSID(reqDir wirelog.Direction, id, wsid string) {
+	a.wireReqMu.Lock()
+	defer a.wireReqMu.Unlock()
+	if a.wireReqWSID == nil {
+		a.wireReqWSID = map[string]string{}
+	}
+	a.wireReqWSID[wireReqKey(reqDir, id)] = wsid
+}
+
+// takeWireRequestWSID：取出並移除登記（一筆 request 至多一筆 response）。
+func (a *App) takeWireRequestWSID(reqDir wirelog.Direction, id string) string {
+	a.wireReqMu.Lock()
+	defer a.wireReqMu.Unlock()
+	k := wireReqKey(reqDir, id)
+	w := a.wireReqWSID[k]
+	delete(a.wireReqWSID, k)
+	return w
+}
+
+// resetWireRequestWSID：換 generation 時清空（見 wireReqWSID 欄位 doc）。
+func (a *App) resetWireRequestWSID() {
+	a.wireReqMu.Lock()
+	defer a.wireReqMu.Unlock()
+	a.wireReqWSID = map[string]string{}
 }
 
 // beginCodexPendingStart／endCodexPendingStart：pending start 登記（見 codexWSIDFor）。

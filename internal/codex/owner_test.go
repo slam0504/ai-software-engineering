@@ -17,7 +17,7 @@ import (
 
 func newTestGeneration(t *testing.T) *wirelog.Generation {
 	t.Helper()
-	g, err := wirelog.NewGeneration(t.TempDir(), "wire-gen")
+	g, err := wirelog.NewGeneration(t.TempDir(), "wire-gen", nil)
 	if err != nil {
 		t.Fatalf("NewGeneration: %v", err)
 	}

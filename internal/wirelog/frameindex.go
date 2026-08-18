@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -41,14 +42,6 @@ func (fi *FrameIndex) add(key FrameKey, frame int) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
 	fi.byKey[key] = append(fi.byKey[key], frame)
-}
-
-func (fi *FrameIndex) attribute(key FrameKey, wsid string) {
-	fi.mu.Lock()
-	defer fi.mu.Unlock()
-	for _, frame := range fi.byKey[key] {
-		fi.wsid[frame] = wsid
-	}
 }
 
 func (fi *FrameIndex) setWSID(frame int, wsid string) {
@@ -103,6 +96,48 @@ func (fi *FrameIndex) Lookup(key FrameKey) []int {
 	return out
 }
 
+// WSIDOf 回傳某個 frame 編號目前的 WSID 歸屬；未歸屬（含不存在的 frame）回空字串。
+//
+// 這是 §3.4.3 frame-level 歸屬的**逐 frame 查詢入口**：§3.4.4 的 SegmentRef 只回答
+// 「某 WSID 橫跨哪些 generation 的哪些 range」，並行 session 共用一條 codex.Conn
+// 時那些 range 必然互相涵蓋（見 SegmentSet doc 與 App.closeWireSegment 的
+// exclusive 限定詞）；「重疊 range 裡的這一個 frame 到底屬於誰」只有這裡答得出來。
+func (fi *FrameIndex) WSIDOf(frame int) string {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	return fi.wsid[frame]
+}
+
+// FramesOf 回傳歸屬給 wsid 的 frame 編號（遞增）；沒有回 nil。wsid 為空字串一律
+// 回 nil——「未歸屬」不是一個 WSID，不得當成一個集合來查（否則呼叫端會把 broadcast
+// 與解不開的 frame 當成某個 session 的證據）。
+func (fi *FrameIndex) FramesOf(wsid string) []int {
+	if wsid == "" {
+		return nil
+	}
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	var out []int
+	for frame, w := range fi.wsid {
+		if w == wsid {
+			out = append(out, frame)
+		}
+	}
+	sort.Ints(out) // map 迭代順序不定，證據出口必須是決定性的
+	return out
+}
+
+// Totals 回報索引裡的 frame 總數與其中已歸屬的筆數（證據出口用：未歸屬筆數＝
+// total-attributed，§3.4.5 允許它非零，但不得無聲）。
+func (fi *FrameIndex) Totals() (total, attributed int) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	for _, v := range fi.byKey {
+		total += len(v)
+	}
+	return total, len(fi.wsid)
+}
+
 // FrameIndexSnapshot 是 FrameIndex 某一刻的完整內容快照，供 rebuild 相等性比較
 // （TestFrameIndexIsRebuildable）。兩個 map 欄位的相等比較（reflect.DeepEqual）
 // 不受 map 迭代順序影響；決定性來自每個 key 底下 []int 的建構順序恆為寫入順序
@@ -146,8 +181,10 @@ func (fi *FrameIndex) Snapshot() FrameIndexSnapshot {
 //     損毀影響中段區塊），沉默跳過該行會讓後續 frame 編號看起來連續、掩蓋了證據
 //     缺口。
 //
-// 已知限制：只讀 wire log 本身，不會還原 Generation.Attribute 事後標記的 WSID
-// （該標記不落盤，見 Attribute 的 doc）。
+// WSID 歸屬一併重建：每個 frame 的歸屬寫在它自己那一行的 wsid 欄位（write-time
+// 判定，見 WSIDResolver），因此重建出來的 index 與崩潰前的記憶體狀態一致——**除了**
+// 被丟棄的檔尾那一行。這是 §3.4.3「frame index 可重建」對歸屬那一半的意義：歸屬不
+// 是只活在 process 記憶體裡的註記。
 func RebuildFrameIndex(path string) (*FrameIndex, error) {
 	f, err := os.Open(path)
 	if err != nil {

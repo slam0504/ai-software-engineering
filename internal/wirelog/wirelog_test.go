@@ -27,7 +27,7 @@ func (g *Generation) ForceWriteErrForTest(err error) {
 }
 
 func TestFrameKeyNeedsDirection(t *testing.T) {
-	g, _ := NewGeneration(t.TempDir(), "g1")
+	g, _ := NewGeneration(t.TempDir(), "g1", nil)
 	_ = g.Line(DirClientToServer, []byte(`{"id":7,"method":"thread/start"}`))
 	_ = g.Line(DirServerToClient, []byte(`{"id":7,"method":"approval/request"}`))
 	idx := g.FrameIndex()
@@ -40,7 +40,7 @@ func TestFrameKeyNeedsDirection(t *testing.T) {
 
 func TestUnattributedFrameStillWritten(t *testing.T) {
 	dir := t.TempDir()
-	g, _ := NewGeneration(dir, "g1")
+	g, _ := NewGeneration(dir, "g1", nil)
 	_ = g.Line(DirServerToClient, []byte(`{"unknown":"no-thread"}`))
 	_ = g.Finalize(recorder.Meta{Provider: "codex"})
 	b, _ := os.ReadFile(filepath.Join(dir, "g1.jsonl"))
@@ -50,7 +50,7 @@ func TestUnattributedFrameStillWritten(t *testing.T) {
 }
 
 func TestLineErrorLatchesAndStaysLatched(t *testing.T) {
-	g, _ := NewGeneration(t.TempDir(), "g1")
+	g, _ := NewGeneration(t.TempDir(), "g1", nil)
 	g.ForceWriteErrForTest(errors.New("disk full"))
 	if err := g.Line(DirClientToServer, []byte("x")); err == nil {
 		t.Fatal("寫入失敗必須回錯")
@@ -63,7 +63,7 @@ func TestLineErrorLatchesAndStaysLatched(t *testing.T) {
 
 func TestFrameIndexIsRebuildable(t *testing.T) {
 	dir := t.TempDir()
-	g, _ := NewGeneration(dir, "g1")
+	g, _ := NewGeneration(dir, "g1", nil)
 	_ = g.Line(DirClientToServer, []byte(`{"id":1}`))
 	_ = g.Line(DirServerToClient, []byte(`{"id":1}`))
 	_ = g.Finalize(recorder.Meta{Provider: "codex"})
@@ -87,7 +87,7 @@ func TestFrameIndexIsRebuildable(t *testing.T) {
 // 被打破）。
 func TestLineConcurrentSafe(t *testing.T) {
 	dir := t.TempDir()
-	g, err := NewGeneration(dir, "g1")
+	g, err := NewGeneration(dir, "g1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestLineConcurrentSafe(t *testing.T) {
 // meta 覆寫已寫出的 meta 檔。
 func TestFinalizeIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	g, err := NewGeneration(dir, "g1")
+	g, err := NewGeneration(dir, "g1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,5 +237,61 @@ func TestRebuildFrameIndexMidFileCorruptionFailsLoud(t *testing.T) {
 
 	if _, err := RebuildFrameIndex(path); err == nil {
 		t.Fatal("中段損壞（後面還有有效行）必須 fail loud，不得跳過或整份丟棄")
+	}
+}
+
+// TestAttributionIsPerFrameNotPerKey：§3.4.3 的歸屬**必須逐 frame**。
+//
+// notification 沒有 request id，同方向的每一筆都落在 RequestID:"" 這同一個
+// FrameKey bucket 底下。若以 key 為單位標記歸屬（本套件原本的 Attribute 就是這個
+// 形狀），兩個 session 交錯的通知會被整批標成最後一次判定的那個 WSID——正是「錄流
+// frame 歸屬串線」的具體形狀。
+//
+// fixture 刻意不對稱（w-a 三筆、w-b 兩筆、順序交錯）：數量或順序對稱時，整批誤標
+// 與逐筆正確在斷言上可能量不出差異。
+func TestAttributionIsPerFrameNotPerKey(t *testing.T) {
+	dir := t.TempDir()
+	owners := []string{"w-a", "w-b", "w-a", "w-b", "w-a"}
+	i := 0
+	g, err := NewGeneration(dir, "g1", func(Direction, []byte) string {
+		w := owners[i]
+		i++
+		return w
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range owners { // 全部都是無 id 的 notification：FrameKey 完全相同
+		if err := g.Line(DirServerToClient, []byte(`{"method":"agent/message/delta"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx := g.FrameIndex()
+	for frame, want := range owners {
+		if got := idx.WSIDOf(frame); got != want {
+			t.Fatalf("frame %d 歸屬 %q，want %q（同一個 FrameKey 底下被整批標成同一個 WSID？）",
+				frame, got, want)
+		}
+	}
+	if got := idx.FramesOf("w-a"); len(got) != 3 || got[0] != 0 || got[2] != 4 {
+		t.Fatalf("FramesOf(w-a)=%v，want [0 2 4]", got)
+	}
+	if got := idx.FramesOf("w-b"); len(got) != 2 {
+		t.Fatalf("FramesOf(w-b)=%v，want 兩筆", got)
+	}
+	if len(idx.Lookup(FrameKey{WireLogID: "g1", Direction: DirServerToClient})) != len(owners) {
+		t.Fatal("precondition：五筆必須真的落在同一個 FrameKey bucket，否則測不到整批誤標")
+	}
+
+	// 歸屬必須跟著落盤：重建出來的 index 與記憶體一致（§3.4.3「可重建」的歸屬那一半）。
+	if err := g.Finalize(recorder.Meta{Provider: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := RebuildFrameIndex(filepath.Join(dir, "g1.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rebuilt.Snapshot(), idx.Snapshot()) {
+		t.Fatalf("重建後的歸屬必須與記憶體一致：\n got=%+v\nwant=%+v", rebuilt.Snapshot(), idx.Snapshot())
 	}
 }

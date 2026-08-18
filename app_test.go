@@ -1766,7 +1766,7 @@ func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 	a, _ := newTestApp(t)
 	conn, wire := newFakeCodexConn(t)
 	a.wireCodexConn(conn)
-	gen, err := wirelog.NewGeneration(a.wireLogDir(), "codex-resume-rec")
+	gen, err := wirelog.NewGeneration(a.wireLogDir(), "codex-resume-rec", a.resolveWireFrameWSID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1805,6 +1805,10 @@ func TestCodexRecordingCapturesThreadResume(t *testing.T) {
 	if !sawResume.Load() {
 		t.Fatal("precondition: thread/resume must reach the wire")
 	}
+	// turn/completed 是 fake server 在 turn/start response **之後**才推的，dispatch
+	// 落地與否不在 startCodexHost 的回傳保證內；不等它就 EndSession 會撞
+	// 「provider busy」。等的是條件不是時間（repo 慣例，見 waitTurnSettled）。
+	waitTurnSettled(t, a, wsidFor(t, a, contract.ProviderCodex))
 	if err := a.EndSession(wsidStr(t, a, "codex")); err != nil { // 收尾 flush 錄流
 		t.Fatal(err)
 	}

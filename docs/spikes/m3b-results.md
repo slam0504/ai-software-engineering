@@ -84,14 +84,15 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 | 1.4 | Commit 失敗 × rollback persist 失敗 → 不 Abort、名額保留、`session-create-degraded` latch、既有 session 不受影響 | 自動化 | ✅ 綠 | `app_wsid_test.go` `TestCommitAndRollbackBothFailEnterDegraded` |
 | 1.5 | **Reserve × shutdown barrier（拒新 app txn）** | 自動化（**本票新增**） | ✅ 綠 | `app_wsid_test.go` `TestCreateSessionRejectedByShutdownBarrier`（見 §4） |
 
-### §5.2 Codex 多 thread × connection-wide 錄流（12 條）
+### §5.2 Codex 多 thread × connection-wide 錄流（13 條，2.4 拆成 2.4a／2.4b）
 
 | # | 條款 | 驗證方式 | 結果 | 證據 |
 |---|---|---|---|---|
 | 2.1 | 兩 thread 的 notification 不串線 | 自動化 | ✅ 綠 | `app_codex_dispatch_test.go` `TestCodexTwoThreadsDoNotCrossWire` |
 | 2.2 | approval 依 identity 歸屬、不串線 | 自動化 | ✅ 綠 | 同檔 `TestCodexCommandExecutionApprovalRoutesByIdentity`、`TestCodexMissingIdentityApprovalInPendingWindowFailsClosed` |
 | 2.3 | completed-before-response 保證仍成立 | 自動化 | ✅ 綠 | 同檔 `TestCodexCompletedBeforeResponseOnProductionPath`、`TestCodexConcurrentStartsKeepPendingInvariant` |
-| 2.4 | 錄流 frame 歸屬不串線（一份 connection-wide wire log 收兩個 session 的雙向 frame） | 自動化 | ✅ 綠 | `app_invariants_test.go` `TestWireLogCapturesFramesOfEverySession` |
+| 2.4a | 一份 connection-wide wire log 收得到兩個 session 的雙向 frame（**不漏、不分裂成兩份檔**） | 自動化 | ✅ 綠 | `app_invariants_test.go` `TestWireLogCapturesFramesOfEverySession` |
+| 2.4b | **錄流 frame 歸屬不串線**（§3.4.3 frame-level：交錯的兩個 session 逐 frame 各歸各的；六種 frame 形狀＋歸屬不到留空；歸屬跨 app 重啟可從磁碟重建） | 自動化 | ✅ 綠 | `app_wire_frames_test.go` `TestWireFramesAttributeEachInterleavedSessionSeparately`（c2s／s2c／notification／approval／pending-start／completed-before-response ＋廣播留空）、`TestWireFrameOwnersSurviveAppRestart`（跨 process 重建）、`TestWireFrameAttributionUsesSameRouterAsDispatch`、`TestWireFrameRequestIDMapIsScopedToGeneration`；`internal/wirelog/wirelog_test.go` `TestAttributionIsPerFrameNotPerKey` |
 | 2.5 | recorder error latch → 拒新 Codex session，**但不擋受控 restart** | 自動化 | ✅ 綠 | `app_wirelog_latch_test.go` `TestLatchBlocksNewSessionButNotRecovery`、`TestLatchBlocksProviderStart`、`TestLatchAllowsExistingSessionTeardown` |
 | 2.6 | latch 下完整復原路徑（收乾 → terminate → wait → finalize 舊 generation → 配新 `wire_log_id` → 掛 recorder → handshake → 發布）全成功才解除 | 自動化 | ✅ 綠 | 同檔 `TestRecoveryOrderAndFailureKeepsLatch`、`TestRecoveryRewiresConnAndWireLog` |
 | 2.7 | 掛 recorder／handshake 失敗 → dispose 新 server＋latch 保留＋不留未發布 server | 自動化 | ✅ 綠 | `internal/codex/owner_test.go` `TestThreeStageFailuresDisposeAndKeepEvidence`；`app_wirelog_latch_test.go` `TestRecoveryOrderAndFailureKeepsLatch` |
