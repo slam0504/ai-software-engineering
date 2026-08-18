@@ -193,6 +193,15 @@ type App struct {
 	auditF  *os.File
 
 	// mu：sessionHosts registry ＋ codex dispatcher 索引的互斥。
+	//
+	// **規約（§3.4.3 之後升級成 liveness 前提）：mu 底下不得做任何會阻塞的工作**
+	// ——不等 channel、不做 I/O、不呼叫 codex（既有慣例是「取 mu 讀出 conn → 放鎖 →
+	// 才 Call」，見 forcedShutdown 與 InterruptTurn）。理由從「避免長臨界區」變成
+	// 「否則 codex readLoop 會停住」：frame 歸屬判定（resolveWireFrameWSID）是在
+	// codex.Conn 的 readLoop goroutine 上取這把鎖的，鎖一卡住就沒有任何 s2c frame
+	// 進得來，整條連線的所有 session 一起停。
+	//
+	// **這條規約目前只有這段註解，沒有守門測試**（review 掃過所有臨界區確認現況合規）。
 	mu sync.Mutex
 
 	// codexSingle 持有的是 generation ownership 單位（Task 12／13，§3.4.2）：
@@ -6193,8 +6202,14 @@ func (a *App) closeWireSegment(h *sessionHost) {
 // 同一個 WSID 再收尾一次，這裡就會把重啟前那幾代的歸屬一併讀回來——記憶體裡早已
 // 沒有那些 Generation handle 了。
 //
-// 讀取範圍由該 WSID 自己的 []SegmentRef 界定（不是掃整個 wire-logs/），所以成本與
-// 這個 session 的歷史成正比，不隨 app 累積的 generation 數成長。
+// **成本沒有上限保護（review 指出，待 owner 裁決是否處置）**：讀取範圍由該 WSID 自己的
+// []SegmentRef 界定，而 SegmentSet 是 append-only journal——`OpenSegmentSet` 把整份歷史
+// 讀進 byID 且**永不裁剪**，這個 session 每參與一次 app run 就多一段。因此每一次收尾都會把
+// 它歷史上**所有先前 generation** 的 wire log 整份重讀＋重建 index，成長維度是
+// 「這個 session 活過幾次 app run × 各代 wire log 大小」，不是「app-server restart 次數」。
+// 而錄流是 always-on 且目前沒有 GC。呼叫點是 EndSession（Wails RPC，UI 會等）與
+// forcedShutdown（每個 session 各跑一次），**沒有上限、沒有量測、沒有 cache**。
+//
 //
 // 重建失敗不擋收尾但不得無聲：該 generation 記成 nil ＋ 一筆 audit，稽核者看得出
 // 「這一代的 frame 歸屬讀不出來」而不是「這一代沒有我的 frame」。

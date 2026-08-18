@@ -21,7 +21,7 @@ import (
 // 這批測試守的是 SegmentSet（§3.4.4）**原理上答不出來**的那一格。兩者的分工：
 //
 //	SegmentSet.For(w)   → 「w 橫跨哪些 generation 的哪些 frame range」
-//	FrameIndex.WSIDOf(n)→ 「**重疊 range 裡的第 n 筆 frame** 到底屬於誰」
+//	FrameIndex.FramesOf(w)→「**重疊 range 裡哪幾筆 frame** 才是 w 的」
 //
 // 並行 session 共用同一條 codex.Conn，range 必然互相涵蓋（見
 // TestWireSegmentsConcurrentRangeIsNotExclusive：w1 的單一 range 實測吞掉 w2 整
@@ -658,34 +658,5 @@ func TestWireFrameRequestIDMapIsScopedToGeneration(t *testing.T) {
 	a.rememberWireRequestWSID("s2c", "1", string(w))
 	if got := a.takeWireRequestWSID("c2s", "1"); got != "" {
 		t.Fatalf("s2c 的登記不得被 c2s 的 response 取走：%q", got)
-	}
-}
-
-// 保底：wsid 為空的 WSID 不得被當成一個可查詢的集合（否則呼叫端會把 broadcast
-// 與解不開的 frame 當成某個 session 的證據）。
-func TestUnattributedFramesAreNotAQueryableSession(t *testing.T) {
-	a, _ := newTestApp(t)
-	ctl := &framingWire{}
-	bootFramingApp(t, a, ctl)
-	w := mustCreate(t, a, "codex")
-	ctl.setNextThread("t-only")
-	if err := a.StartSession(string(w), "hi", "", "", "task-only", ""); err != nil {
-		t.Fatal(err)
-	}
-	waitTurnSettled(t, a, w)
-	gen := a.wireGen
-	if gen == nil {
-		t.Fatal("precondition：需要一份 live generation")
-	}
-	if got := gen.FrameIndex().FramesOf(""); got != nil {
-		t.Fatalf("空 WSID 不得回傳任何 frame：%v", got)
-	}
-	total, attributed := gen.FrameIndex().Totals()
-	if total == 0 || attributed == 0 || attributed >= total {
-		t.Fatalf("precondition：這一代必須同時有已歸屬與未歸屬的 frame（total=%d attributed=%d）",
-			total, attributed)
-	}
-	if err := a.EndSession(string(w)); err != nil {
-		t.Fatal(err)
 	}
 }

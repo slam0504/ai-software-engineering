@@ -12,7 +12,14 @@
 
 **四個收尾 gate 全綠**（含本里程碑首次執行的 `wails build`）。
 
-**spec §5「production-path barrier 必備清單」35 條**：綠 34、**未覆蓋 1**。
+**spec §5「production-path barrier 必備清單」36 條**：綠 35、**未覆蓋 1**。
+
+> **條數由 35 變 36 的原因**：§5.2 的原 2.4 一條在 frame-attribution 票（2026-08-18）被拆成
+> **2.4a**（一份 wire log 收得到兩個 session 的雙向 frame——不漏、不分裂成兩份檔）與
+> **2.4b**（§3.4.3 frame-level：交錯的兩個 session 逐 frame 各歸各的）。拆的理由是原本那一條
+> 掛的證據（`TestWireLogCapturesFramesOfEverySession`）只證得到前者，把後者一起記綠是高估。
+> 2.4b 的實跑證據來自該票，不是本文件原本那次 session。
+
 **spec §6 實機驗收 10 項**：**無法執行 8、部分執行 1、未實作 1（A5）**——本 session 是非互動
 agent 環境，沒有 GUI 操作能力；Codex 帳號用量限制至 2026-08-20，涉及 Codex live turn 的項目
 另有外部阻塞。**A5 與環境無關**：pane pins 沒有持久化路徑，就算有 GUI 也會失敗（§3.3）。
@@ -20,7 +27,7 @@ agent 環境，沒有 GUI 操作能力；Codex 帳號用量限制至 2026-08-20�
 
 | 類別 | 綠 | 未覆蓋／未實作 | 部分執行 | 無法執行 |
 |---|---|---|---|---|
-| spec §5 條款（35） | 34 | 1 | – | – |
+| spec §5 條款（36） | 35 | 1 | – | – |
 | spec §6 實機驗收（10） | – | 1（A5＝未實作，§3.3） | 1（A10） | 8 |
 | spec §7 待驗證假設（5） | 3（§7.3／§7.4／§7.5，既有測試覆蓋，見 §2.8） | – | 1（§7.1＝A10） | 1（§7.2＝Task 0 probe 重跑） |
 | **本票新發現**的未受保護前提（1） | – | 1 | – | – |
@@ -37,7 +44,8 @@ agent 環境，沒有 GUI 操作能力；Codex 帳號用量限制至 2026-08-20�
 > 未實作，不得記成無法執行**——後者會讓一個實作缺口偽裝成環境問題（A5 原本就記錯，final
 > review 已更正）。
 >
-> **「綠 34」的精確含義**：34 條有**本次實跑通過**的對應測試，**不等於**這 34 條的守門力
+> **「綠 35」的精確含義**：35 條有**實跑通過**的對應測試（2.4b 的實跑在 frame-attribution
+> 票，其餘在本文件原本那次 session），**不等於**這 35 條的守門力
 > 在本票被重新驗證過——後者需要把 Task 0-30 的 60+ 個 mutation 全部重跑（見 §4 末段的方法論說明）。
 > 本票只對新增的那一條做了完整 mutation 交叉矩陣。
 
@@ -92,7 +100,7 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 | 2.2 | approval 依 identity 歸屬、不串線 | 自動化 | ✅ 綠 | 同檔 `TestCodexCommandExecutionApprovalRoutesByIdentity`、`TestCodexMissingIdentityApprovalInPendingWindowFailsClosed` |
 | 2.3 | completed-before-response 保證仍成立 | 自動化 | ✅ 綠 | 同檔 `TestCodexCompletedBeforeResponseOnProductionPath`、`TestCodexConcurrentStartsKeepPendingInvariant` |
 | 2.4a | 一份 connection-wide wire log 收得到兩個 session 的雙向 frame（**不漏、不分裂成兩份檔**） | 自動化 | ✅ 綠 | `app_invariants_test.go` `TestWireLogCapturesFramesOfEverySession` |
-| 2.4b | **錄流 frame 歸屬不串線**（§3.4.3 frame-level：交錯的兩個 session 逐 frame 各歸各的；六種 frame 形狀＋歸屬不到留空；歸屬跨 app 重啟可從磁碟重建） | 自動化 | ✅ 綠 | `app_wire_frames_test.go` `TestWireFramesAttributeEachInterleavedSessionSeparately`（c2s／s2c／notification／approval／pending-start／completed-before-response ＋廣播留空）、`TestWireFrameOwnersSurviveAppRestart`（跨 process 重建）、`TestWireFrameAttributionUsesSameRouterAsDispatch`、`TestWireFrameRequestIDMapIsScopedToGeneration`；`internal/wirelog/wirelog_test.go` `TestAttributionIsPerFrameNotPerKey` |
+| 2.4b | **錄流 frame 歸屬不串線**（§3.4.3 frame-level：交錯的兩個 session 逐 frame 各歸各的；六種 frame 形狀＋歸屬不到留空；歸屬跨 app 重啟可從磁碟重建） | 自動化 | ✅ 綠 | `app_wire_frames_test.go` `TestWireFramesAttributeEachInterleavedSessionSeparately`（c2s／s2c／notification／approval／pending-start／completed-before-response ＋廣播留空）、`TestWireFrameOwnersSurviveAppRestart`（跨 process 重建）、`TestWireFrameAttributionUsesSameRouterAsDispatch`、`TestWireFrameRequestIDMapIsScopedToGeneration`；`internal/wirelog/wirelog_test.go` `TestAttributionIsPerFrameNotPerKey`、`TestEmptyWSIDIsNotAQueryableSession` |
 | 2.5 | recorder error latch → 拒新 Codex session，**但不擋受控 restart** | 自動化 | ✅ 綠 | `app_wirelog_latch_test.go` `TestLatchBlocksNewSessionButNotRecovery`、`TestLatchBlocksProviderStart`、`TestLatchAllowsExistingSessionTeardown` |
 | 2.6 | latch 下完整復原路徑（收乾 → terminate → wait → finalize 舊 generation → 配新 `wire_log_id` → 掛 recorder → handshake → 發布）全成功才解除 | 自動化 | ✅ 綠 | 同檔 `TestRecoveryOrderAndFailureKeepsLatch`、`TestRecoveryRewiresConnAndWireLog` |
 | 2.7 | 掛 recorder／handshake 失敗 → dispose 新 server＋latch 保留＋不留未發布 server | 自動化 | ✅ 綠 | `internal/codex/owner_test.go` `TestThreeStageFailuresDisposeAndKeepEvidence`；`app_wirelog_latch_test.go` `TestRecoveryOrderAndFailureKeepsLatch` |

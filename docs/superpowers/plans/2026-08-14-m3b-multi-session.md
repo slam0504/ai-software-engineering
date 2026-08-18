@@ -1050,6 +1050,13 @@ grep -rn "\.\(BeginSubmit\|BeginEndSession\|AcceptSubmit\|RejectSubmit\|Emit\)WS
 
 **Interfaces:** Produces `Direction`／`SegmentRef`／`FrameKey`／`Generation`（`NewGeneration`／`ID`／`Line`／`Attribute`／`Finalize`／`Finalized`／`FinalMeta`／`Err`／`FrameIndex`）／`RebuildFrameIndex`。
 
+> **後續更正（2026-08-18，frame-attribution 票；本節其餘內容維持歷史原貌不改寫）**：
+> `Generation.Attribute`（事後、逐 `FrameKey`、僅記憶體）**已刪除**，改為 write-time 的
+> `wirelog.WSIDResolver`——歸屬逐 frame 判定並寫進該 frame 那一行的 `wsid` 欄位，
+> `RebuildFrameIndex` 因此連歸屬一起重建。`NewGeneration` 的簽名隨之變成三參數
+> （`NewGeneration(dir, id, resolve)`），本節底下的範例仍是兩參數的舊寫法。
+> 理由與 merge gate 見 `.superpowers/sdd/2026-08-14-m3b-multi-session/frame-attribution-report.md`。
+
 - [ ] **Step 1: 失敗測試**
 
 ```go

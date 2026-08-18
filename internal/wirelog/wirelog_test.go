@@ -267,17 +267,13 @@ func TestAttributionIsPerFrameNotPerKey(t *testing.T) {
 		}
 	}
 	idx := g.FrameIndex()
-	for frame, want := range owners {
-		if got := idx.WSIDOf(frame); got != want {
-			t.Fatalf("frame %d 歸屬 %q，want %q（同一個 FrameKey 底下被整批標成同一個 WSID？）",
-				frame, got, want)
-		}
+	// 兩邊的 frame 編號各自正確才算逐 frame：整批誤標會讓其中一邊變成全部五筆、
+	// 另一邊變成空的。
+	if got := idx.FramesOf("w-a"); !reflect.DeepEqual(got, []int{0, 2, 4}) {
+		t.Fatalf("FramesOf(w-a)=%v，want [0 2 4]（同一個 FrameKey 底下被整批標成同一個 WSID？）", got)
 	}
-	if got := idx.FramesOf("w-a"); len(got) != 3 || got[0] != 0 || got[2] != 4 {
-		t.Fatalf("FramesOf(w-a)=%v，want [0 2 4]", got)
-	}
-	if got := idx.FramesOf("w-b"); len(got) != 2 {
-		t.Fatalf("FramesOf(w-b)=%v，want 兩筆", got)
+	if got := idx.FramesOf("w-b"); !reflect.DeepEqual(got, []int{1, 3}) {
+		t.Fatalf("FramesOf(w-b)=%v，want [1 3]", got)
 	}
 	if len(idx.Lookup(FrameKey{WireLogID: "g1", Direction: DirServerToClient})) != len(owners) {
 		t.Fatal("precondition：五筆必須真的落在同一個 FrameKey bucket，否則測不到整批誤標")
@@ -293,5 +289,20 @@ func TestAttributionIsPerFrameNotPerKey(t *testing.T) {
 	}
 	if !reflect.DeepEqual(rebuilt.Snapshot(), idx.Snapshot()) {
 		t.Fatalf("重建後的歸屬必須與記憶體一致：\n got=%+v\nwant=%+v", rebuilt.Snapshot(), idx.Snapshot())
+	}
+}
+
+// TestEmptyWSIDIsNotAQueryableSession：FramesOf("") 的守衛。
+//
+// 這條刻意**直接對 index 塞一筆空歸屬**再查——寫入面（Line／ingestRow）目前都只在
+// wsid 非空時才呼叫 setWSID，所以走 production 資料的話 fi.wsid 裡永遠不會有空值，
+// 那個守衛在資料上不可能失敗（review 實測：刪掉守衛，八條測試全綠）。守衛守的是
+// 日後有人在寫入面放進空歸屬時，「未歸屬」不得變成一個查得到 frame 的 session。
+func TestEmptyWSIDIsNotAQueryableSession(t *testing.T) {
+	idx := newFrameIndex()
+	idx.add(FrameKey{WireLogID: "g1", Direction: DirServerToClient}, 7)
+	idx.setWSID(7, "") // 未來的寫入面若不小心放進空歸屬
+	if got := idx.FramesOf(""); got != nil {
+		t.Fatalf(`FramesOf("")=%v，未歸屬不是一個可查詢的 session`, got)
 	}
 }

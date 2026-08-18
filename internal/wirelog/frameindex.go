@@ -22,8 +22,8 @@ type FrameKey struct {
 }
 
 // FrameIndex 是可重建的 frame 索引：FrameKey → 該 key 底下的 frame 編號（依寫
-// 入順序），以及每個 frame 編號目前的 WSID 歸屬（Attribute 標記，未標記則不在
-// map 中）。
+// 入順序），以及每個 frame 編號的 WSID 歸屬（write-time 由 WSIDResolver 判定，
+// 判不出來的 frame 不在 wsid map 中）。
 type FrameIndex struct {
 	mu    sync.Mutex
 	byKey map[FrameKey][]int
@@ -96,21 +96,19 @@ func (fi *FrameIndex) Lookup(key FrameKey) []int {
 	return out
 }
 
-// WSIDOf 回傳某個 frame 編號目前的 WSID 歸屬；未歸屬（含不存在的 frame）回空字串。
+// FramesOf 回傳歸屬給 wsid 的 frame 編號（遞增）；沒有回 nil。
 //
-// 這是 §3.4.3 frame-level 歸屬的**逐 frame 查詢入口**：§3.4.4 的 SegmentRef 只回答
-// 「某 WSID 橫跨哪些 generation 的哪些 range」，並行 session 共用一條 codex.Conn
-// 時那些 range 必然互相涵蓋（見 SegmentSet doc 與 App.closeWireSegment 的
-// exclusive 限定詞）；「重疊 range 裡的這一個 frame 到底屬於誰」只有這裡答得出來。
-func (fi *FrameIndex) WSIDOf(frame int) string {
-	fi.mu.Lock()
-	defer fi.mu.Unlock()
-	return fi.wsid[frame]
-}
-
-// FramesOf 回傳歸屬給 wsid 的 frame 編號（遞增）；沒有回 nil。wsid 為空字串一律
-// 回 nil——「未歸屬」不是一個 WSID，不得當成一個集合來查（否則呼叫端會把 broadcast
-// 與解不開的 frame 當成某個 session 的證據）。
+// 這是 §3.4.3 frame-level 歸屬的查詢入口：§3.4.4 的 SegmentRef 只回答「某 WSID 橫跨
+// 哪些 generation 的哪些 range」，並行 session 共用一條 codex.Conn 時那些 range 必然
+// 互相涵蓋（見 SegmentSet doc 與 App.closeWireSegment 的 exclusive 限定詞）；
+// 「重疊 range 裡哪幾筆才是我的」只有這裡答得出來。
+//
+// wsid 為空字串一律回 nil——「未歸屬」不是一個 WSID，不得當成一個集合來查（否則呼叫端
+// 會把 broadcast 與解不開的 frame 當成某個 session 的證據）。這個守衛在**查詢面**，
+// 不是寫入面：目前 Line 與 ingestRow 都只在 `wsid != ""` 時才呼叫 setWSID，所以
+// production 資料上 fi.wsid 裡不會有空值、這條分支不可能被 production 走到。它守的是
+// 「日後有人在寫入面放進空歸屬」，因此由 TestEmptyWSIDIsNotAQueryableSession 直接對
+// index 塞一筆空歸屬來讓它可證偽。
 func (fi *FrameIndex) FramesOf(wsid string) []int {
 	if wsid == "" {
 		return nil
@@ -125,17 +123,6 @@ func (fi *FrameIndex) FramesOf(wsid string) []int {
 	}
 	sort.Ints(out) // map 迭代順序不定，證據出口必須是決定性的
 	return out
-}
-
-// Totals 回報索引裡的 frame 總數與其中已歸屬的筆數（證據出口用：未歸屬筆數＝
-// total-attributed，§3.4.5 允許它非零，但不得無聲）。
-func (fi *FrameIndex) Totals() (total, attributed int) {
-	fi.mu.Lock()
-	defer fi.mu.Unlock()
-	for _, v := range fi.byKey {
-		total += len(v)
-	}
-	return total, len(fi.wsid)
 }
 
 // FrameIndexSnapshot 是 FrameIndex 某一刻的完整內容快照，供 rebuild 相等性比較

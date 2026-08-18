@@ -255,8 +255,8 @@ func (g *Generation) Err() error {
 	return g.writeErr
 }
 
-// FrameIndex 回傳本 generation 目前的 frame index（存活 view，會隨後續 Line／
-// Attribute 呼叫更新）。
+// FrameIndex 回傳本 generation 目前的 frame index（存活 view，會隨後續 Line
+// 呼叫更新）。
 func (g *Generation) FrameIndex() *FrameIndex { return g.idx }
 
 // extractRequestID 盡力從 raw JSON-RPC frame 解出 "id" 欄位的原文字串（number
