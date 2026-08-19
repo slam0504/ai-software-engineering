@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/spec"
 )
@@ -237,6 +238,79 @@ func TestStateBindingConcurrentWithStartupIsRejected(t *testing.T) {
 
 	if _, err := a.EscalationCreate("spec#1", "", "啟動完成後"); err != nil {
 		t.Fatalf("startup 完成後必須放行（否則守門只是永遠拒絕）：%v", err)
+	}
+}
+
+// TestShutdownRetainsLeaseWhileStartupStillRunning
+//
+// reviewer 2026-08-19 的重現情境：startup 已開了一部分 writer、**還沒跑到
+// startupEvidence** 時，shutdown 完整跑完並釋放 lease；放行 startup 之後它繼續
+// 建立 evidence/evidence.jsonl——寫入落在 lease 之外，核心不變量不成立。
+//
+// phase 擋得住新的 binding，擋不住 startup 自己：startup 不是 binding。所以
+// startup 也要有 lifecycle ownership，處理原則沿用背景 worker——**等不到就不
+// 釋放 lease**。
+//
+// 正題斷言：shutdown 回來之後 lease **仍被持有**（同一個 process 重新 Acquire
+// 失敗）。附帶斷言：走的是保留路徑，且稽核指出是 startup 這一維。
+func TestShutdownRetainsLeaseWhileStartupStillRunning(t *testing.T) {
+	a := auditLifecycleApp(t)
+	a.emitUI = func(string, any) {}
+	zero := time.Duration(0) // 收尾不等 startup：確定性地量到「等不到」那條路徑
+	a.startupDrain = &zero
+
+	paused, release := make(chan struct{}), make(chan struct{})
+	a.hookStartupPublish = func() { // startup 停在 startupEvidence 之前
+		close(paused)
+		<-release
+	}
+	startupDone := make(chan struct{})
+	go func() { a.startup(context.Background()); close(startupDone) }()
+	<-paused
+
+	var steps []string
+	a.hookShutdownStep = func(s string) { steps = append(steps, s) }
+	a.shutdown(context.Background())
+
+	if leaseReleased(t, a.stateDir) {
+		t.Fatal("startup 尚未收斂時不得釋放 ownership lease——它隨時會再建出 writer")
+	}
+	if !containsStep(steps, "instance_lease_retained") || containsStep(steps, "instance_lease_release") {
+		t.Fatalf("必須走保留路徑，實得步驟：%v", steps)
+	}
+	line := findAuditLine(t, a, "instance_lease_retained")
+	if !strings.Contains(line, `"startupStopped":false`) {
+		t.Fatalf("稽核必須指出是 startup 這一維沒停，實得：%s", line)
+	}
+
+	close(release)
+	<-startupDone
+	// 損害控制：收尾已經開始之後，startup 不再補建 evidence journal。
+	if _, err := os.Stat(filepath.Join(a.stateDir, "evidence", "evidence.jsonl")); err == nil {
+		t.Fatal("收尾開始之後 startup 不得再建立 evidence journal")
+	}
+}
+
+// TestStartupRefusedAfterShutdown
+//
+// 反向：shutdown 已經跑完之後才被呼叫的 startup，一個 writer 都不得開。
+//
+// 沒有這條的話，「等 startup 收斂」可以用一個永遠不進場的實作通過，而真正的
+// 漏洞（收尾後才開始的 startup）沒有被守到。
+func TestStartupRefusedAfterShutdown(t *testing.T) {
+	a := auditLifecycleApp(t)
+	a.emitUI = func(string, any) {}
+	a.shutdown(context.Background()) // 尚未 startup 就收尾（合法：Wails 可能直接收）
+
+	a.startup(context.Background())
+
+	for _, name := range []string{"audit.jsonl", "sessions.json", "events.jsonl", "evidence"} {
+		if _, err := os.Stat(filepath.Join(a.stateDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("收尾之後的 startup 不得開啟任何 writer，%s stat=%v", name, err)
+		}
+	}
+	if a.manager != nil || a.registry != nil {
+		t.Fatal("收尾之後的 startup 不得接上任何下游物件")
 	}
 }
 

@@ -987,6 +987,15 @@ func TestForgedLeaseIsRejected(t *testing.T) {
 // **型別**是不是 stateLease」——由 go/types 回答，alias 自動解開、省略型別的巢狀
 // literal 也由上下文推得出型別。欄位序不再硬編，改由型別本身查出來。
 
+// stateLeaseReaders：production 裡**唯一**被允許引用 stateLease.testOnly 的地方。
+//
+// 這個 allowlist 就是 Rule C 的全部彈性：capability 的判定式本身要讀它，其餘
+// 任何位置——不論讀或寫、不論用哪種語法——都是違規。要新增一筆必須有人明確
+// 決定，而不是靠掃描剛好沒涵蓋那種語法。
+var stateLeaseReaders = map[string]bool{
+	"(*stateLease).ownsStateDir": true,
+}
+
 // forbiddenFieldWrite：掃描結果的一筆（檔案位置 ＋ 原因）。
 type forbiddenFieldWrite struct {
 	pos token.Position
@@ -1021,7 +1030,7 @@ type forbiddenFieldWrite struct {
 // 所以不會有誤報；真的出現第二個同名欄位時，這條會紅並逼人取一個不同的名字——
 // 那也是對的，capability 的欄位名不該撞名。
 func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
-	target *types.Named, field string) []forbiddenFieldWrite {
+	target *types.Named, field string, allowedReaders map[string]bool) []forbiddenFieldWrite {
 	// fieldIndexIn：field 在這個 struct 裡的位置（-1 ＝ 沒這個欄位）。位置式
 	// literal 要用。
 	fieldIndexIn := func(st *types.Struct) int {
@@ -1032,12 +1041,6 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 		}
 		return -1
 	}
-	// litType：composite literal 的具名型別（`&T{}`／`[]*T{{…}}` 的元素都會落到
-	// 這裡，指標先解開）。省略型別的巢狀 literal 沒有 x.Type，型別由 info 提供。
-	//
-	// **types.Unalias 是必要的，不是保險**：Go 1.23 起 `type l = T` 在型別系統裡
-	// 是獨立的 *types.Alias 節點，不解開的話 alias 那條繞過路徑照樣掃不到——本檔
-	// 的 fixture 測試就是這樣抓到第一版修法仍然漏掉它的。
 	// litStruct：composite literal 的 struct 型別（`&T{}`／`[]*T{{…}}` 的元素、
 	// 匿名 struct、省略型別的巢狀 literal 都會落到這裡）。
 	//
@@ -1060,9 +1063,40 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 	note := func(pos token.Pos, why string) {
 		out = append(out, forbiddenFieldWrite{pos: fset.Position(pos), why: why})
 	}
+	// 目前所在的函式（Rule C 的豁免判定用；top-level 宣告為空字串）。
+	var currentFunc string
 	for _, f := range files {
-		ast.Inspect(f, func(n ast.Node) bool {
+		walk := func(n ast.Node) bool {
 			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				// Rule C：**任何**對 field 的引用，除了唯一被允許的讀取點。
+				//
+				// 前幾版逐一列舉「寫入的語法位置」（composite literal → 賦值 →
+				// 轉型），每一版都被下一種語法繞過；最後一次是 range 的賦值形式
+				//
+				//	for _, l.testOnly = range []bool{true} { break }
+				//
+				// 而位置還有 `&l.testOnly` 之後透過指標寫、IncDec、多重賦值…列舉
+				// 不完（reviewer 2026-08-19 P1）。
+				//
+				// 所以不再問「這是不是寫入」，改問「**憑什麼碰它**」：production
+				// 只有一個地方有理由引用這個欄位（capability 的判定式本身），其餘
+				// 一律違規。讀寫都擋，因為新的讀取點同樣代表這個 capability 的語意
+				// 外洩到別處，該被人看到。
+				if x.Sel.Name != field {
+					return true
+				}
+				if s := info.Selections[x]; s == nil || s.Kind() != types.FieldVal {
+					return true
+				}
+				if allowedReaders[currentFunc] {
+					return true
+				}
+				where := currentFunc
+				if where == "" {
+					where = "套件層宣告"
+				}
+				note(x.Pos(), "在 "+where+" 引用 ."+field+" 欄位（只有 "+readerList(allowedReaders)+" 可以）")
 			case *ast.CompositeLit:
 				st := litStruct(x)
 				if st == nil {
@@ -1120,9 +1154,44 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 				}
 			}
 			return true
-		})
+		}
+		// 逐個 decl 走，才知道每個節點的所在函式（Rule C 要用）。
+		for _, decl := range f.Decls {
+			currentFunc = ""
+			if fd, isFunc := decl.(*ast.FuncDecl); isFunc {
+				currentFunc = funcKey(fd)
+			}
+			ast.Inspect(decl, walk)
+		}
 	}
 	return out
+}
+
+// funcKey：`(*stateLease).ownsStateDir` 這種形狀的函式識別字（沒有 receiver 時
+// 就是函式名）。用來對 allowedReaders 比對。
+func funcKey(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	recv := ""
+	switch rt := fd.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		if id, ok := rt.X.(*ast.Ident); ok {
+			recv = "(*" + id.Name + ")"
+		}
+	case *ast.Ident:
+		recv = rt.Name
+	}
+	return recv + "." + fd.Name.Name
+}
+
+func readerList(readers map[string]bool) string {
+	out := make([]string, 0, len(readers))
+	for k := range readers {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, "／")
 }
 
 // typeCheckProductionPackage：對 **production package main**（所有非 `_test.go`
@@ -1213,7 +1282,8 @@ func namedType(t *testing.T, pkg *types.Package, name string) *types.Named {
 // ——不論用哪種語法。
 func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
-	found := scanFieldWrites(fset, files, info, namedType(t, pkg, "stateLease"), "testOnly")
+	found := scanFieldWrites(fset, files, info, namedType(t, pkg, "stateLease"), "testOnly",
+		stateLeaseReaders)
 	if len(found) == 0 {
 		return
 	}
@@ -1276,6 +1346,23 @@ func assigns() {
 	var l stateLease
 	l.testOnly = true
 }
+
+// 繞過案例 5：range 的賦值形式——不是 AssignStmt，前一版逐節點列舉的規則掃不到。
+func viaRange() *stateLease {
+	l := &stateLease{stateDir: "/d"}
+	for _, l.testOnly = range []bool{true} {
+		break
+	}
+	return l
+}
+
+// 繞過案例 6：取位址之後透過指標寫。
+func viaPointer() *stateLease {
+	l := &stateLease{stateDir: "/d"}
+	p := &l.testOnly
+	*p = true
+	return l
+}
 `
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
@@ -1294,7 +1381,7 @@ func assigns() {
 	target := namedType(t, pkg, "stateLease")
 
 	got := map[int]string{}
-	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly") {
+	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly", nil) {
 		got[o.pos.Line] = o.why
 	}
 	// 每個 want 用 fixture 裡的一段原始碼定位，不寫死行號——行號會隨 fixture 增補
@@ -1317,6 +1404,8 @@ func assigns() {
 		{"var keyed", "keyed literal"},
 		{"var positional", "位置式 literal"},
 		{"l.testOnly = true", "直接賦值"},
+		{"for _, l.testOnly = range", "range 的賦值形式"},
+		{"p := &l.testOnly", "取位址後透過指標寫"},
 	}
 	for _, w := range wants {
 		if line := lineOf(w.needle); got[line] == "" {
@@ -1351,7 +1440,9 @@ func reads() bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := scanFieldWrites(cfset, []*ast.File{cf}, cinfo, namedType(t, cpkg, "stateLease"), "testOnly"); len(n) != 0 {
+	cleanReaders := map[string]bool{"reads": true} // clean fixture 的合法讀取點
+	if n := scanFieldWrites(cfset, []*ast.File{cf}, cinfo, namedType(t, cpkg, "stateLease"), "testOnly",
+		cleanReaders); len(n) != 0 {
 		t.Fatalf("沒有寫入 testOnly 的 package 不得被判違規，實得 %v", n)
 	}
 }
