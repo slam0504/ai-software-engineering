@@ -26,6 +26,7 @@ func newTestAppAt(t *testing.T, stateDir string) *App {
 	a.ctx = context.Background()
 	a.stateDir = stateDir
 	a.lease = newTestStateLease(stateDir)
+	a.setPhase(phaseReady) // 同 newTestAppIn：夾具代表 startup 已完成
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

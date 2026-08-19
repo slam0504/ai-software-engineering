@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/slam0504/sdlc-workbench/internal/spec"
 )
 
 // ---- state binding 的 shutdown／startup lifecycle（reviewer 2026-08-19 P1）----
@@ -71,6 +73,21 @@ func TestStateBindingsRejectedAfterShutdown(t *testing.T) {
 		{"RunEvidence", func() error { _, err := a.RunEvidence("A1", "P1", "T1", "c", "expected_red", ""); return err }},
 		{"EvidenceGet", func() error { _, err := a.EvidenceGet("E1"); return err }},
 		{"EvidenceCommitCandidates", func() error { _, err := a.EvidenceCommitCandidates("P1"); return err }},
+		// 以下九個是 reviewer 2026-08-19 用結構分析找出來的漏網之魚——
+		// RegisterMutation 實測可在 lease 釋放後把 evidence.jsonl 從 0 寫到 209 bytes。
+		{"RegisterMutation", func() error { _, err := a.RegisterMutation("P1/T1", "patch"); return err }},
+		{"ValidateTestCommit", func() error { return a.ValidateTestCommit("P1", "T1", "c") }},
+		{"PreviewSpecCommit", func() error { _, err := a.PreviewSpecCommit(); return err }},
+		{"ConfirmSpecCommit", func() error { return a.ConfirmSpecCommit(spec.CommitToken{}, "m") }},
+		{"PreviewPlanCommit", func() error { _, err := a.PreviewPlanCommit(); return err }},
+		{"ConfirmPlanCommit", func() error { return a.ConfirmPlanCommit(spec.CommitToken{}, "m") }},
+		{"PreviewAnalysisBaseBump", func() error { _, err := a.PreviewAnalysisBaseBump("p.md", ""); return err }},
+		{"ConfirmAnalysisBaseBump", func() error { _, err := a.ConfirmAnalysisBaseBump(BumpToken{}, "p.md", ""); return err }},
+		{"PlanAssist", func() error { _, err := a.PlanAssist("claude", "x"); return err }},
+	}
+	evidenceBefore := ""
+	if _, serr := os.Stat(filepath.Join(a.stateDir, "evidence", "evidence.jsonl")); serr == nil {
+		evidenceBefore = fileDigest(t, filepath.Join(a.stateDir, "evidence", "evidence.jsonl"))
 	}
 	for _, c := range calls {
 		if err := c.run(); err == nil {
@@ -79,6 +96,17 @@ func TestStateBindingsRejectedAfterShutdown(t *testing.T) {
 	}
 	if after := escalationDigest(t, a); after != before {
 		t.Fatal("lease 釋放之後 escalation.jsonl 不得再被改寫")
+	}
+	evidencePath := filepath.Join(a.stateDir, "evidence", "evidence.jsonl")
+	if _, serr := os.Stat(evidencePath); serr == nil {
+		if fileDigest(t, evidencePath) != evidenceBefore {
+			t.Fatal("lease 釋放之後 evidence.jsonl 不得再被改寫")
+		}
+	} else if evidenceBefore != "" {
+		t.Fatal("evidence.jsonl 不該消失")
+	}
+	if _, serr := os.Stat(filepath.Join(a.stateDir, "gate.jsonl")); serr == nil {
+		t.Fatal("lease 釋放之後不得開出 gate.jsonl（ValidateTestCommit 實測會建）")
 	}
 }
 
@@ -153,6 +181,62 @@ func TestShutdownWaitsForInFlightEscalationWrite(t *testing.T) {
 	mu.Unlock()
 	if got != "escalation_write,stop_watchers" {
 		t.Fatalf("shutdown 必須等 in-flight 的 escalation 寫入完成才往下走，實得順序：%s", got)
+	}
+}
+
+// TestStateBindingsRejectedBeforeStartupCompletes
+//
+// startup 還沒跑完（或根本沒跑）時，state binding 一律被拒。
+//
+// 這是 migration blocker 競態的**結構性解法**（reviewer 2026-08-19 P1）：Wails 在
+// macOS 會並行執行 OnStartup 與 bindings，先前用另一把鎖上的 latch 擋，binding 可
+// 能先通過閘門、startup 隨後才發現衝突，寫入照樣落地。改成 lifecycle 之後，
+// 「還沒 ready」本身就是拒絕條件，衝突發現得早或晚都不影響結果。
+//
+// 正題斷言：未 startup 的 app 呼叫 EscalationCreate 被拒，且 escalation.jsonl
+// 根本沒被建出來。
+func TestStateBindingsRejectedBeforeStartupCompletes(t *testing.T) {
+	a := auditLifecycleApp(t) // 只有目錄，沒有 startup
+	if _, err := a.EscalationCreate("spec#1", "", "啟動未完成就寫"); err == nil {
+		t.Fatal("startup 尚未完成時不得受理 state 操作")
+	} else if !strings.Contains(err.Error(), "尚未完成啟動") {
+		t.Fatalf("拒絕原因必須說明是啟動未完成，實得：%v", err)
+	}
+	if got := escalationDigest(t, a); got != "" {
+		t.Fatal("被拒的呼叫不得建立 escalation.jsonl")
+	}
+}
+
+// TestStateBindingConcurrentWithStartupIsRejected
+//
+// 上一條的併發版：startup **正在進行中**（確定性地停在欄位發布那一刻）時，另一
+// 條 goroutine 的 binding 呼叫必須被拒；startup 跑完之後同一個呼叫才放行。
+//
+// 兩段合起來才是完整的守門——只驗「被拒」的話，一個永遠拒絕的實作也會過。
+func TestStateBindingConcurrentWithStartupIsRejected(t *testing.T) {
+	a := auditLifecycleApp(t)
+	a.emitUI = func(string, any) {}
+	paused, release := make(chan struct{}), make(chan struct{})
+	a.hookStartupPublish = func() {
+		close(paused)
+		<-release
+	}
+	done := make(chan struct{})
+	go func() { a.startup(context.Background()); close(done) }()
+	t.Cleanup(func() { a.shutdown(context.Background()) })
+
+	<-paused
+	if _, err := a.EscalationCreate("spec#1", "", "啟動進行中"); err == nil {
+		t.Fatal("startup 進行中不得受理 state 操作")
+	}
+	if got := escalationDigest(t, a); got != "" {
+		t.Fatal("啟動進行中的呼叫不得建立 escalation.jsonl")
+	}
+	close(release)
+	<-done
+
+	if _, err := a.EscalationCreate("spec#1", "", "啟動完成後"); err != nil {
+		t.Fatalf("startup 完成後必須放行（否則守門只是永遠拒絕）：%v", err)
 	}
 }
 

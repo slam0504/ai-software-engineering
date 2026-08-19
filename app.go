@@ -409,9 +409,14 @@ type App struct {
 	// shutdown gate（第四輪 review P1）：shutdown 先拒新 StartSession、等已取得
 	// start ownership 的交易 accept／abort 完成，才 snapshot／teardown／Close／Take——
 	// 堵住「Take() 之後 Ensure() 重新回填 server」的窗口。
-	shutMu       sync.Mutex
-	shuttingDown bool
-	inflight     sync.WaitGroup
+	shutMu sync.Mutex
+	// phase：app 的 lifecycle 狀態（見 appPhase）。**與 inflight 計數共用
+	// shutMu**，所以「檢查 phase ＋ 登記交易」是原子的——binding 不可能在
+	// startup 尚未完成或已被判定 blocked 的情況下擠進來（reviewer 2026-08-19 P1：
+	// Wails 在 macOS 會並行執行 OnStartup 與 bindings，先前的 latch 是另一把鎖，
+	// 於是 binding 通過閘門之後 startup 才發現衝突，寫入照樣落地）。
+	phase    appPhase
+	inflight sync.WaitGroup
 
 	// ---- replay index 的 runtime 重建排程（§3.5.7；rebuild_orchestrator.go）----
 	//
@@ -591,7 +596,7 @@ const assistTimeout = 3 * time.Minute
 func (a *App) beginAppTxn() error {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
-	if a.shuttingDown {
+	if a.phase == phaseShuttingDown {
 		return errors.New("app shutting down")
 	}
 	a.inflight.Add(1)
@@ -1289,7 +1294,21 @@ func (a *App) blockStateBindings(reason string) {
 	}
 }
 
-// stateBlockedErr：state 操作是否被擋下（nil ＝ 沒有）。
+// stateBlockedReason：被擋下的原因文字（沒被擋時回一個仍然 fail closed 的說明
+// ——這個函式只在 phase 已經是 blocked 時被呼叫，回空字串會做出一個沒有訊息的
+// 錯誤）。
+func (a *App) stateBlockedReason() string {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	if a.stateBlocked == "" {
+		return "app 啟動未完成，暫不受理 state 操作"
+	}
+	return a.stateBlocked
+}
+
+// stateBlockedErr：state 操作是否被擋下（nil ＝ 沒有）。惰性初始化路徑
+// （ensureGate／ensureEscalation）用它擋內部呼叫者；exported binding 走
+// beginStateTxn 的 lifecycle 判定。
 func (a *App) stateBlockedErr() error {
 	a.startupMu.Lock()
 	defer a.startupMu.Unlock()
@@ -1299,25 +1318,75 @@ func (a *App) stateBlockedErr() error {
 	return errors.New(a.stateBlocked)
 }
 
+// appPhase：app 的 lifecycle 狀態（見 App.phase）。
+//
+//	initializing → startup 尚未完成（或已失敗）。state binding 一律拒絕：這一刻
+//	               遷移可能還沒跑、writer 可能還沒開，放行等於在未知狀態上寫。
+//	ready        → startup 全部完成。唯一開放 state 操作的狀態。
+//	blocked      → 啟動期發現無法自行判定的資料衝突（目前是舊路徑遷移）。終態，
+//	               只能由人工處理後重新啟動解除。
+//	shuttingDown → 收尾中。
+type appPhase int
+
+const (
+	phaseInitializing appPhase = iota
+	phaseReady
+	phaseBlocked
+	phaseShuttingDown
+)
+
+// setPhase：lifecycle 轉換（規則寫在這裡，不散在呼叫端）。
+//
+//	→ shuttingDown：永遠允許（收尾優先於一切）。
+//	→ blocked：除非已在收尾。
+//	→ ready：**只能從 initializing 來**——blocked 是終態，不得被後續的
+//	  「啟動成功了」蓋掉。
+func (a *App) setPhase(p appPhase) {
+	a.shutMu.Lock()
+	defer a.shutMu.Unlock()
+	switch {
+	case p == phaseShuttingDown:
+	case a.phase == phaseShuttingDown:
+		return
+	case p == phaseReady && a.phase != phaseInitializing:
+		return
+	}
+	a.phase = p
+}
+
 // beginStateTxn：**所有會讀寫 gate／escalation／evidence 狀態的 Wails binding 的
 // 共同入場點**。成功時呼叫端必須 defer endAppTxn()。
 //
-// 兩件事一起做，因為它們要守的是同一個邊界：
+// 「檢查 lifecycle ＋ 登記 in-flight 交易」在**同一個 shutMu 臨界區**內完成，
+// 這是這個函式存在的理由：
 //
-//	(1) 進 shutdown 的 in-flight 交易 → shutdown 的 inflight.Wait() 會等這一筆
-//	    做完才往下走，lease 因此不可能在 escalation.jsonl 還在被寫的時候釋放
-//	    （reviewer 2026-08-19 P1：EscalationCreate 沒被計數，實測 lease 已釋放、
-//	    第二個 process 已可取鎖之後，原 binding 仍寫得進去）。
-//	(2) 檢查 migration blocker → 遷移無法判定權威時，這些入口一律 fail closed。
+//	(1) 交易登記 → shutdown 的 inflight.Wait() 會等這一筆做完才往下走，lease
+//	    因此不可能在 escalation.jsonl 還在被寫的時候釋放（reviewer 2026-08-19：
+//	    實測 lease 已釋放、第二個 process 已可取鎖之後，原 binding 仍寫得進去）。
+//	(2) lifecycle 檢查 → 只有 ready 才放行。Wails 在 macOS 會**並行**執行
+//	    OnStartup 與 bindings，所以「binding 先通過閘門、startup 隨後才發現遷移
+//	    衝突」是真的會發生的順序；用另一把鎖上的 latch 擋不住它，用同一把鎖才行。
 //
 // **只掛在 exported binding 上**，內部呼叫走各自的 unexported 版本（如
 // gateEntries）——巢狀的 begin/end 雖然計數上安全，但會讓「shutdown 剛好落在
 // 內外兩次 begin 之間」變成操作做到一半才失敗，那是新造出來的失敗模式。
+//
+// 涵蓋範圍不靠手寫清單維護：見 app_binding_surface_test.go 的結構守門（從所有
+// Wails export 反向推導哪些碰得到 state）。
 func (a *App) beginStateTxn() error {
-	if err := a.stateBlockedErr(); err != nil {
-		return err
+	a.shutMu.Lock()
+	defer a.shutMu.Unlock()
+	switch a.phase {
+	case phaseReady:
+		a.inflight.Add(1)
+		return nil
+	case phaseBlocked:
+		return errors.New(a.stateBlockedReason())
+	case phaseShuttingDown:
+		return errors.New("app shutting down")
+	default:
+		return errors.New("app 尚未完成啟動：在啟動序列完成之前不受理核可、阻擋事項與證據操作")
 	}
-	return a.beginAppTxn()
 }
 
 // toolsDir／nodePathValue：單一欄位的讀取器（CLI 路徑組裝、childEnv 用）。
@@ -1950,6 +2019,11 @@ func (a *App) startupAfterWriters() {
 	// 解除 journal-degraded 項。只在 gate journal 已存在（workspace 曾用過
 	// gate）時觸發：全新／非 git workspace 不強迫 ensureGate 的 git 依賴在
 	// startup 就 fail loud。
+	// **ready 設在 reconcile 之前**：reconcileGate1NotifyOnly 自己就要開 gate
+	// journal，而惰性初始化只認 blocked latch、不認 phase（內部呼叫者不走
+	// beginStateTxn）。先進 ready 讓兩者的判準一致：走到這裡代表遷移已完成、
+	// writer 已開，state 操作可以放行。
+	a.setPhase(phaseReady)
 	if _, statErr := os.Stat(filepath.Join(a.stateDir, "gate.jsonl")); statErr == nil {
 		a.reconcileGate1NotifyOnly()
 	}
@@ -2020,11 +2094,14 @@ func (a *App) blockLegacyMigration(name, why string) bool {
 	msg := "拒絕啟動：" + name + " 的舊路徑遷移未完成——" + why +
 		"。在遷移完成之前不開放 session，也不開放核可與阻擋事項操作，" +
 		"以免用不完整的記錄繼續執行。"
+	// **latch 與 phase 先設，audit 與橫幅後發**：兩者都要取鎖、寫檔，中間的每
+	// 一微秒都是「binding 還進得來」的窗口（reviewer 2026-08-19）。光是中止啟動
+	// 序列也不夠：Wails binding 仍掛著，UI 一按就會經惰性初始化把新路徑的
+	// journal 開起來（見 stateBlocked 欄位 doc）。
+	a.blockStateBindings(msg)
+	a.setPhase(phaseBlocked)
 	a.audit("legacy_state_migration_blocked", map[string]any{"name": name, "reason": why})
 	a.noteStartupBlocker(msg)
-	// 光是中止啟動序列不夠：Wails binding 仍掛著，UI 一按就會經惰性初始化把新
-	// 路徑的 journal 開起來（見 stateBlocked 欄位 doc）。
-	a.blockStateBindings(msg)
 	return false
 }
 
@@ -2451,7 +2528,7 @@ func (a *App) stopPlanWatch() {
 // shutdown 總時間仍為單一 bounded window」）。
 func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
-	a.shuttingDown = true // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
+	a.phase = phaseShuttingDown // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
 	a.shutMu.Unlock()
 	a.shutdownStep("reject_new_txn")
 
@@ -3465,6 +3542,10 @@ type SpecCommitPreview struct {
 // PreviewSpecCommit 回傳目前納管樹相對 HEAD 的 diff，並附上綁定當下狀態的
 // CommitToken——前端保留此 token，未改動地傳給 ConfirmSpecCommit。
 func (a *App) PreviewSpecCommit() (SpecCommitPreview, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return SpecCommitPreview{}, err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.specRepo（同 SubmitForApproval 路徑）
 		return SpecCommitPreview{}, err
 	}
@@ -3478,6 +3559,10 @@ func (a *App) PreviewSpecCommit() (SpecCommitPreview, error) {
 // ConfirmSpecCommit 以 PreviewSpecCommit 回傳的 token 提交納管樹異動；token
 // 與目前 repo 狀態不符（HEAD 移動或內容變更）回 spec.ErrCommitStale。
 func (a *App) ConfirmSpecCommit(tok spec.CommitToken, message string) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil {
 		return err
 	}
@@ -3969,6 +4054,10 @@ func (a *App) PlanWrite(rel, content, expectedDigest string) (newDigest string, 
 // 讀不到（plan/ 沒有或有多份候選文件）或欄位為空即拒絕（§3.0：lineage 驗證
 // 的起點必須先在 worktree 就確立，Confirm 時再核對是否漂移）。
 func (a *App) PreviewPlanCommit() (SpecCommitPreview, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return SpecCommitPreview{}, err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.planRepo
 		return SpecCommitPreview{}, err
 	}
@@ -3997,6 +4086,10 @@ func (a *App) PreviewPlanCommit() (SpecCommitPreview, error) {
 // （含此時讀不到）視同 token 過期，回 spec.ErrCommitStale——commit 期間
 // analysis_base_commit 被改動，Preview 當下核對過的 lineage 起點已不可信。
 func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil {
 		return err
 	}
@@ -4192,6 +4285,10 @@ func bumpTouchedFiles(g plan.GitRunner, old, head string) (paths []string, allPl
 // caller-supplied one) plus the commit log and touched files for the
 // operator to review before confirming.
 func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return BumpPreview{}, err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil { // 惰性初始化 a.planGit
 		return BumpPreview{}, err
 	}
@@ -4334,6 +4431,10 @@ func replaceAnalysisBaseCommitLine(line, newVal string) (string, bool) {
 // comments and formatting, untouched. Does not write to disk or commit; the
 // caller decides when to land the result.
 func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer string) (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
 	}
@@ -4506,6 +4607,12 @@ func isRiskUnclassifiable(errs []error) bool {
 // 原始 patch bytes）——patch 內容一律經由此登記，落盤與可稽核的紀錄同時成立
 // （鏡射 Task 17 CAS＋Task 20 journal 的既定順序：CAS 先落盤才 append）。
 func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
+	// nil journal 有兩種成因（真的沒初始化／遷移中止讓 startupEvidence 沒跑），
+	// 所以檢查排在交易閘之後——同 RunEvidence。
 	if a.evidenceJournal == nil {
 		return "", errors.New("evidence: not initialized")
 	}
@@ -4629,7 +4736,7 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 	// started event 之前重查 shutdown——已進 shutdown 即零副作用返回，不發
 	// started、不載入 mutation、不建 worktree。
 	a.shutMu.Lock()
-	shuttingDown := a.shuttingDown
+	shuttingDown := a.phase == phaseShuttingDown
 	a.shutMu.Unlock()
 	if shuttingDown {
 		return "", errors.New("app shutting down")
@@ -4668,7 +4775,7 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 		// reclaimEvidenceRuns 的 snapshot 是落在登記之前還是之後），自我
 		// cancel，不指望還會有第二次 reclaim 機會來 cancel 這筆剛登記的 run。
 		a.shutMu.Lock()
-		shuttingDown := a.shuttingDown
+		shuttingDown := a.phase == phaseShuttingDown
 		a.shutMu.Unlock()
 		if shuttingDown {
 			cancel()
@@ -4787,6 +4894,10 @@ type CommitInfo struct {
 // caller-supplied testCommit's own ancestry. Validate only: no worktree, no
 // command execution.
 func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	entries, err := a.gateEntries()
 	if err != nil {
 		return err
@@ -5740,6 +5851,13 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
+	// PlanAssist 會開 gate journal（committed-context 讀取）並在 preflight 失敗時
+	// 寫 escalation，因此走 state 交易閘而不只是 shutdown gate。內層還有一個
+	// beginAppTxn 管 assist 自己的 lifecycle，兩者計數各自成對。
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 
 	if _, err := a.ensureGate(); err != nil {
 		return "", err

@@ -145,6 +145,10 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	// 所有 writer 入口一律拒絕（owner 2026-08-18：production 的空 lease 一律
 	// fail closed，不得恢復成「空值就跳過檢查」）。
 	a.lease = newTestStateLease(stateDir)
+	// 測試夾具代表「startup 已經完成」的 app：state binding 只在 phaseReady 開放
+	// （見 beginStateTxn），夾具不設就等於整組測試都在 initializing 下跑，量到的
+	// 會是「binding 一律被拒」而不是它們的實際行為。
+	a.setPhase(phaseReady)
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "recordings"), 0o755); err != nil {
 		t.Fatal(err)
 	}

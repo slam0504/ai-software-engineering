@@ -993,24 +993,44 @@ type forbiddenFieldWrite struct {
 	why string
 }
 
-// scanFieldWrites：在已型別檢查的 files 裡找出所有「寫入 target 型別的 field 欄位」
-// 的地方——composite literal（keyed／位置式／省略型別的巢狀）與直接賦值都算。
+// scanFieldWrites：在已型別檢查的 files 裡找出所有「把 field 這個欄位設起來」的
+// 地方，以及所有「轉型成 target」的地方。
 //
-// target 是型別物件而不是名字：alias 與同名的別種型別因此天然分得開。
+// # 判準為什麼是欄位名而不是「literal 的型別是不是 stateLease」
+//
+// 前一版把判定綁在 target 型別上，於是這個**完全合法、不含 unsafe／reflect** 的
+// 寫法整條溜過去（reviewer 2026-08-19 P1）：
+//
+//	var forged stateLease = struct {
+//		stateDir string
+//		lock     *singleinstance.Lock
+//		testOnly bool
+//	}{stateDir: "/tmp/forged", testOnly: true}
+//
+// 這是**隱式轉換**——沒有轉型語法、literal 的型別也不是 stateLease，但
+// forged.ownsStateDir() 確實回 true。而且隱式轉換可以出現在 var、賦值、return、
+// 函式引數…追位置追不完。
+//
+// 換個角度就收斂了：Go 的 struct 可賦值／可轉換要求**欄位名與型別完全相同**，
+// 所以任何能流進 stateLease 的值，它自己一定也有一個叫 testOnly 的欄位。因此
+// 「production 不得在任何型別上設定叫 testOnly 的欄位」＋「不得轉型成
+// stateLease」兩條，就涵蓋了語言層可達的全部空間（unsafe／reflect 不在範圍內，
+// 那是另一個層級的問題）。
+//
+// 代價是規則比較寬：任何同名欄位都會被抓。這個 repo 只有一個 testOnly 概念，
+// 所以不會有誤報；真的出現第二個同名欄位時，這條會紅並逼人取一個不同的名字——
+// 那也是對的，capability 的欄位名不該撞名。
 func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 	target *types.Named, field string) []forbiddenFieldWrite {
-	st, ok := target.Underlying().(*types.Struct)
-	if !ok {
-		return nil
-	}
-	fieldIdx := -1
-	for i := range st.NumFields() {
-		if st.Field(i).Name() == field {
-			fieldIdx = i
+	// fieldIndexIn：field 在這個 struct 裡的位置（-1 ＝ 沒這個欄位）。位置式
+	// literal 要用。
+	fieldIndexIn := func(st *types.Struct) int {
+		for i := range st.NumFields() {
+			if st.Field(i).Name() == field {
+				return i
+			}
 		}
-	}
-	if fieldIdx < 0 {
-		return nil
+		return -1
 	}
 	// litType：composite literal 的具名型別（`&T{}`／`[]*T{{…}}` 的元素都會落到
 	// 這裡，指標先解開）。省略型別的巢狀 literal 沒有 x.Type，型別由 info 提供。
@@ -1018,7 +1038,13 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 	// **types.Unalias 是必要的，不是保險**：Go 1.23 起 `type l = T` 在型別系統裡
 	// 是獨立的 *types.Alias 節點，不解開的話 alias 那條繞過路徑照樣掃不到——本檔
 	// 的 fixture 測試就是這樣抓到第一版修法仍然漏掉它的。
-	litType := func(x *ast.CompositeLit) *types.Named {
+	// litStruct：composite literal 的 struct 型別（`&T{}`／`[]*T{{…}}` 的元素、
+	// 匿名 struct、省略型別的巢狀 literal 都會落到這裡）。
+	//
+	// **types.Unalias 是必要的，不是保險**：Go 1.23 起 `type l = T` 在型別系統裡
+	// 是獨立的 *types.Alias 節點，不解開的話 alias 那條繞過路徑照樣掃不到——本檔
+	// 的 fixture 測試就是這樣抓到第一版修法仍然漏掉它的。
+	litStruct := func(x *ast.CompositeLit) *types.Struct {
 		tv, found := info.Types[x]
 		if !found {
 			return nil
@@ -1027,11 +1053,8 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 		if p, isPtr := typ.(*types.Pointer); isPtr {
 			typ = types.Unalias(p.Elem())
 		}
-		n, isNamed := typ.(*types.Named)
-		if !isNamed {
-			return nil
-		}
-		return n
+		st, _ := typ.Underlying().(*types.Struct)
+		return st
 	}
 	var out []forbiddenFieldWrite
 	note := func(pos token.Pos, why string) {
@@ -1041,18 +1064,23 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.CompositeLit:
-				if lt := litType(x); lt == nil || lt.Obj() != target.Obj() {
+				st := litStruct(x)
+				if st == nil {
+					return true
+				}
+				idx := fieldIndexIn(st)
+				if idx < 0 { // 這個 struct 根本沒有那個欄位＝流不進 target
 					return true
 				}
 				for i, el := range x.Elts {
 					if kv, keyed := el.(*ast.KeyValueExpr); keyed {
 						if k, _ := kv.Key.(*ast.Ident); k != nil && k.Name == field {
-							note(kv.Pos(), target.Obj().Name()+" composite literal 設定 "+field+"（keyed）")
+							note(kv.Pos(), "composite literal 設定 "+field+"（keyed）")
 						}
 						continue
 					}
-					if i == fieldIdx {
-						note(el.Pos(), target.Obj().Name()+" composite literal 設定 "+field+"（位置式）")
+					if i == idx {
+						note(el.Pos(), "composite literal 設定 "+field+"（位置式）")
 					}
 				}
 			case *ast.CallExpr:
@@ -1077,17 +1105,18 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 				}
 			case *ast.AssignStmt:
 				// `x.field = ...`（含 := 與各種複合賦值）。用 Selections 確認選到的
-				// 真的是 target 的那個欄位，不是別的型別上剛好同名的欄位。
+				// 真的是一個**欄位**（不是同名的 method 或 package 成員）；至於它屬於
+				// 哪個型別刻意不限縮，理由同 composite literal 那一段。
 				for _, lhs := range x.Lhs {
 					sel, isSel := lhs.(*ast.SelectorExpr)
 					if !isSel || sel.Sel.Name != field {
 						continue
 					}
 					s := info.Selections[sel]
-					if s == nil || s.Obj() != st.Field(fieldIdx) {
+					if s == nil || s.Kind() != types.FieldVal {
 						continue
 					}
-					note(sel.Pos(), "對 "+target.Obj().Name()+"."+field+" 賦值")
+					note(sel.Pos(), "對 ."+field+" 欄位賦值")
 				}
 			}
 			return true
@@ -1140,9 +1169,13 @@ func typeCheckProductionPackage(t *testing.T) (*token.FileSet, []*ast.File, *typ
 	if len(files) == 0 {
 		t.Fatal("掃描前提不成立：找不到任何 production .go 檔")
 	}
+	// Defs／Uses 是呼叫圖分析要的（見 app_binding_surface_test.go）：沒有它們，
+	// info.Defs 查出來一律是 nil，可達性分析會靜默退化成「什麼都掃不到」。
 	info := &types.Info{
 		Types:      map[ast.Expr]types.TypeAndValue{},
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
 	}
 	conf := types.Config{Importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
 		p, found := exports[path]
@@ -1226,6 +1259,15 @@ type lookalike struct {
 
 var viaConversion = stateLease(lookalike{"/d", nil, true})
 
+// 繞過案例 4：**隱式**轉換——沒有轉型語法，literal 的型別也不是 stateLease，
+// 但 Go 的 struct 可賦值規則讓它直接流進去（reviewer 2026-08-19 實測 forged
+// 的 ownsStateDir() 回 true）。
+var viaImplicit stateLease = struct {
+	stateDir string
+	lock     *int
+	testOnly bool
+}{stateDir: "/tmp/forged", testOnly: true}
+
 // 既有兩種寫法（不得回歸）。
 var keyed = stateLease{stateDir: "/d", testOnly: true}
 var positional = &stateLease{"/d", nil, true}
@@ -1270,7 +1312,8 @@ func assigns() {
 		{"var viaSlice", "省略型別的巢狀 literal（slice、位置式）"},
 		{"var viaMap", "省略型別的巢狀 literal（map、指標元素、keyed）"},
 		{"var viaAlias", "type alias"},
-		{"var viaConversion", "欄位相同的別種 struct ＋ 轉型"},
+		{"var viaConversion", "欄位相同的別種 struct ＋ 顯式轉型"},
+		{`"/tmp/forged"`, "匿名 struct 的隱式轉換（沒有轉型語法；定位在 literal 實際設值那一行）"},
 		{"var keyed", "keyed literal"},
 		{"var positional", "位置式 literal"},
 		{"l.testOnly = true", "直接賦值"},

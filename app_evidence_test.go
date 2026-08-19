@@ -355,7 +355,7 @@ func TestRunEvidenceCASBarrierBoundedByShutdown(t *testing.T) {
 	waitFor(t, "shutdown to set shuttingDown", func() bool {
 		a.shutMu.Lock()
 		defer a.shutMu.Unlock()
-		return a.shuttingDown
+		return a.phase == phaseShuttingDown
 	})
 	close(release) // 放行：CAS 比對照樣通過（expected 未變），但 Step 2b 的重查會擋下
 
@@ -582,7 +582,7 @@ func TestShutdownDuringPreUlidWindowStillBoundsRunEvidence(t *testing.T) {
 	waitFor(t, "shutdown to set shuttingDown", func() bool {
 		a.shutMu.Lock()
 		defer a.shutMu.Unlock()
-		return a.shuttingDown
+		return a.phase == phaseShuttingDown
 	})
 	close(release) // 放行 LoadAt：RunEvidence 繼續跑到 ulid callback，自我 cancel
 

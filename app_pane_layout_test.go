@@ -235,7 +235,7 @@ func TestSetPaneLayoutRefusedAfterShutdownBarrier(t *testing.T) {
 	a.wsReg = reg
 
 	a.shutMu.Lock()
-	a.shuttingDown = true
+	a.phase = phaseShuttingDown
 	a.shutMu.Unlock()
 
 	if err := a.SetPaneLayout([]string{"w1", ""}, "w1"); err == nil {
