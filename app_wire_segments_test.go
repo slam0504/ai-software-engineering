@@ -700,7 +700,7 @@ func TestOpenWireSegmentsFailureDegradesLoudly(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.wireSegments = nil
-	a.openWireSegments()
+	a.openWireSegments(a.lease)
 
 	if a.wireSegments != nil {
 		t.Fatal("開檔失敗不得留下半成品的 SegmentSet")

@@ -8,6 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"io/fs"
 	"os"
@@ -74,9 +77,22 @@ const (
 	siModeBareRecheck = "bare-recheck"
 )
 
-// siPauseStep：§3.6.5 shutdown 總序中所有 writer 都還沒關的一個節點
-// （snapshot 在 manager_close／index_flush_close／registry_sync 之前）。
-const siPauseStep = "snapshot"
+// siPauseEnv：helper 停在 shutdown 總序的哪一個節點（由父行程指定）。
+//
+// **必須參數化，不能寫死一個早期節點**（owner 2026-08-19）：只停在 snapshot 時，
+// 「把 lease.release() 從總序最後一步搬到 manager_close 之前」這種提早釋放的
+// mutation 整包 root package 仍然全綠——暫停點在它前面，跨 process 的觀測窗根本
+// 還沒到那一刻（失效形狀 (D)）。所以守門要在**早期與晚期各一個節點**各跑一次。
+const siPauseEnv = "SI_PAUSE_STEP"
+
+const (
+	// siPauseEarly：所有 writer 都還沒關（在 manager_close／index_flush_close／
+	// registry_sync 之前）。守「lease 撐到 writer 開著的時候」。
+	siPauseEarly = "snapshot"
+	// siPauseLate：§3.6.5 總序中最後一個落盤步驟。守「lease 沒有在落盤與釋放
+	// 之間被提早放掉」。
+	siPauseLate = "registry_sync"
+)
 
 const (
 	siMarkerAcquired = "SI-ACQUIRED" // runInstance 取得 lease（hold／entry）
@@ -143,8 +159,12 @@ func siHelperRun(mode string) int {
 func siLifecycle(app *App, mode string) {
 	app.emitUI = func(string, any) {} // 不碰 wails runtime
 	if mode == siModeBarePause {
+		want := os.Getenv(siPauseEnv)
+		if want == "" {
+			want = siPauseEarly
+		}
 		app.hookShutdownStep = func(step string) {
-			if step == siPauseStep {
+			if step == want {
 				siSay(siMarkerPaused)
 				siAwait()
 			}
@@ -193,10 +213,11 @@ type siProc struct {
 // siStart 起一個 helper process。刻意用 os.Pipe 而不是 cmd.StdoutPipe：後者
 // 要求「所有讀取都完成後才能 Wait」，而這裡必須能在還在讀 marker 的同時等待
 // process 退出。
-func siStart(t *testing.T, name, ws, mode string, barrier bool) *siProc {
+func siStart(t *testing.T, name, ws, mode string, barrier bool, extraEnv ...string) *siProc {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessSingleInstance$")
 	cmd.Env = append(os.Environ(), siHelperEnv+"="+mode, "WORKBENCH_WORKSPACE="+ws)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	if barrier {
 		cmd.Env = append(cmd.Env, siBarrierEnv+"=1")
 	}
@@ -642,23 +663,32 @@ func TestThirdInstanceStillBlockedWhileFirstAlive(t *testing.T) {
 // 正題斷言（依序）：暫停期間的 process 沒有進入 writer init（audit startup
 // 筆數不變）＋磁碟快照不變 → 收尾後的 process 拿得到 lease。
 func TestLeaseHeldUntilWritersClosed(t *testing.T) {
+	// 早期與晚期各跑一次（見 siPauseEnv 的 doc）：只停在 snapshot 時，把
+	// lease.release() 搬到 manager_close 之前的 mutation 觀測不到。
+	for _, step := range []string{siPauseEarly, siPauseLate} {
+		t.Run(step, func(t *testing.T) { leaseHeldUntilWritersClosed(t, step) })
+	}
+}
+
+func leaseHeldUntilWritersClosed(t *testing.T, pauseStep string) {
 	ws, stateDir := siWorkspace(t)
-	first := siStart(t, "first", ws, siModeBarePause, false)
+	first := siStart(t, "first", ws, siModeBarePause, false, siPauseEnv+"="+pauseStep)
 	first.awaitMarker(t, siMarkerStarted)
 
 	first.release(t) // 進入 shutdown
 	first.awaitMarker(t, siMarkerPaused)
 
-	// writer 尚未關閉的這一刻：lease 必須還在。
+	// 暫停在 pauseStep 的這一刻：lease 必須還在。
 	beforeCount := siCountAuditKind(t, stateDir, "startup")
 	before := siSnapshot(t, stateDir)
 	blocker := siRunBlockedBare(t, "during-shutdown", ws)
 	if n := siCountAuditKind(t, stateDir, "startup"); n != beforeCount {
-		t.Fatalf("writer 還開著時，第二個 process 不得進入 writer initialization：startup 筆數 %d → %d",
-			beforeCount, n)
+		t.Fatalf("shutdown 停在 %s 時，第二個 process 不得進入 writer initialization：startup 筆數 %d → %d",
+			pauseStep, beforeCount, n)
 	}
 	if diffs := siDiff(before, siSnapshot(t, stateDir)); len(diffs) != 0 {
-		t.Fatalf("writer 還開著時，第二個 process 不得變更磁碟事實：\n%s", strings.Join(diffs, "\n"))
+		t.Fatalf("shutdown 停在 %s 時，第二個 process 不得變更磁碟事實：\n%s",
+			pauseStep, strings.Join(diffs, "\n"))
 	}
 	if !strings.Contains(blocker, "已在執行中") {
 		t.Fatalf("shutdown 中途的橫幅不可辨識：%q", blocker)
@@ -934,13 +964,36 @@ func TestForgedLeaseIsRejected(t *testing.T) {
 // 跨 process 的行為守門（bare 入口、拒絕 UX）一律用真 process ＋ 磁碟證據，
 // 不用文字比對。
 //
-// 正題斷言：所有非 _test.go 的 .go 檔都不得出現 testOnly 的**賦值**。
+// 正題斷言：所有非 `_test.go` 的 .go 檔都不得**建構出帶授權的 stateLease**，也不得
+// 賦值 `testOnly`。
+//
+// **用 go/ast 而不是字串比對**（owner 2026-08-19）：初版掃 `testOnly:` 與
+// `testOnly =`，位置式 composite literal `&stateLease{a.stateDir, nil, true}` 兩者
+// 都不含，掃描綠燈但 app 在別人持鎖時照樣開得出 writer。字串比對守不住語法有多種
+// 寫法的性質——這是失效形狀 (C) 的一個變體：守門本身比它宣稱的弱。
 func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 	root, err := filepath.Abs(".")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// testOnly 在 stateLease 裡的欄位序（位置式 literal 用得到）。跟著結構定義走，
+	// 欄位順序若變動這裡要跟著改——所以順便斷言欄位數，改了會紅。
+	const leaseFields, testOnlyIdx = 3, 2
+	if n := reflect.TypeOf(stateLease{}).NumField(); n != leaseFields {
+		t.Fatalf("stateLease 欄位數變了（%d→%d）：請同步更新本掃描的位置式 literal 判定",
+			leaseFields, n)
+	}
+	if name := reflect.TypeOf(stateLease{}).Field(testOnlyIdx).Name; name != "testOnly" {
+		t.Fatalf("stateLease 第 %d 個欄位不再是 testOnly（實得 %q）：請同步更新本掃描",
+			testOnlyIdx, name)
+	}
+
 	var offenders []string
+	note := func(fset *token.FileSet, pos token.Pos, why string) {
+		p := fset.Position(pos)
+		rel, _ := filepath.Rel(root, p.Filename)
+		offenders = append(offenders, fmt.Sprintf("%s:%d: %s", rel, p.Line, why))
+	}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -954,20 +1007,40 @@ func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		b, rerr := os.ReadFile(path)
-		if rerr != nil {
-			return rerr
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
 		}
-		for i, line := range strings.Split(string(b), "\n") {
-			code := line
-			if idx := strings.Index(code, "//"); idx >= 0 {
-				code = code[:idx] // 註解裡提到 testOnly 是說明，不是建構路徑
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.CompositeLit:
+				// `stateLease{...}` —— keyed 與 positional 兩種寫法都要抓。
+				id, ok := x.Type.(*ast.Ident)
+				if !ok || id.Name != "stateLease" {
+					return true
+				}
+				for i, el := range x.Elts {
+					if kv, keyed := el.(*ast.KeyValueExpr); keyed {
+						if k, _ := kv.Key.(*ast.Ident); k != nil && k.Name == "testOnly" {
+							note(fset, kv.Pos(), "stateLease composite literal 設定 testOnly（keyed）")
+						}
+						continue
+					}
+					if i == testOnlyIdx {
+						note(fset, el.Pos(), "stateLease composite literal 設定 testOnly（位置式）")
+					}
+				}
+			case *ast.AssignStmt:
+				// `x.testOnly = ...`（含 := 與各種複合賦值）。
+				for _, lhs := range x.Lhs {
+					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "testOnly" {
+						note(fset, sel.Pos(), "對 testOnly 欄位賦值")
+					}
+				}
 			}
-			if strings.Contains(code, "testOnly:") || strings.Contains(code, "testOnly =") {
-				rel, _ := filepath.Rel(root, path)
-				offenders = append(offenders, fmt.Sprintf("%s:%d: %s", rel, i+1, strings.TrimSpace(line)))
-			}
-		}
+			return true
+		})
 		return nil
 	})
 	if err != nil {

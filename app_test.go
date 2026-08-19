@@ -186,7 +186,7 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	// §3.4.4：走 production 的同一個開檔入口（不是另外組一個 SegmentSet）——
 	// newTestAppIn 以同一組 stateDir 重開時，磁碟上既有的 segment 也就跟著
 	// production 的 replay 路徑回來，跨重啟那一維才驗得到。
-	a.openWireSegments()
+	a.openWireSegments(a.lease)
 	a.manager = appcore.New(appcore.Config{Sink: sink, Emit: ui.emitEnv, Index: indexOrNil(idx)})
 	rs, err := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
 	if err != nil {

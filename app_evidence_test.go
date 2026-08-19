@@ -31,7 +31,7 @@ func newTestAppEvidence(t *testing.T) (*App, *uiCapture) {
 	runGit(t, a, "config", "user.name", "Test User")
 	runGit(t, a, "config", "user.email", "test@example.com")
 
-	dir := filepath.Join(a.workspaceDir, ".workbench", "evidence")
+	dir := filepath.Join(a.stateDir, "evidence")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestRunEvidenceRejectsStaleGate2Approval(t *testing.T) {
 	if events := ui.findEnvKind("evidence_run"); len(events) != 0 {
 		t.Fatalf("CAS mismatch must not emit any evidence_run event, got %d: %+v", len(events), events)
 	}
-	journalPath := filepath.Join(a.workspaceDir, ".workbench", "evidence", "evidence.jsonl")
+	journalPath := filepath.Join(a.stateDir, "evidence", "evidence.jsonl")
 	data, rerr := os.ReadFile(journalPath)
 	if rerr != nil && !os.IsNotExist(rerr) {
 		t.Fatalf("read evidence journal: %v", rerr)
@@ -481,7 +481,7 @@ func TestShutdownReclaimsInFlightRunEvidence(t *testing.T) {
 	}
 
 	// 無 finalize 半寫入：evidence journal 檔案完全沒有任何一行。
-	journalPath := filepath.Join(a.workspaceDir, ".workbench", "evidence", "evidence.jsonl")
+	journalPath := filepath.Join(a.stateDir, "evidence", "evidence.jsonl")
 	data, rerr := os.ReadFile(journalPath)
 	if rerr != nil && !os.IsNotExist(rerr) {
 		t.Fatalf("read evidence journal: %v", rerr)

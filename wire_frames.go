@@ -385,13 +385,22 @@ func (a *App) wireFrameDrainWindow() time.Duration {
 	return 2 * time.Second
 }
 
-// drainWireFrameJobs：shutdown 的 bounded drain。
+// drainWireFrameJobs：shutdown 的 bounded drain。**回傳 worker 是否確實已經退出。**
 //
-// **刻意不等 worker 退出**：它可能正卡在一份很大的 wire log 上，等它等於把
-// 「收尾時間」重新綁回歷史資料量——正是這次改動要消除的東西。沒做完的工作仍在
-// journal 裡（done 那一筆還沒 append），下次啟動由 openWireFrameJobs 補完。
+// 收尾時間仍然 bounded（不把它綁回歷史資料量），但「等不到」不再是可以忽略的
+// 事：`resolveWireFrameJob` 在執行途中不檢查 stop，它會寫 `audit.jsonl` 也會
+// `WriteAttribution`（截斷式覆寫 sidecar）。若在它還活著時釋放 ownership lease，
+// 第二個實例已經可以進場，而我們的殘留 goroutine 仍在寫同一份 state——單一
+// writer 前提就破了（owner 2026-08-19 判定為 merge blocker）。
 //
-// 逾時或有殘留一律留稽核：被跳過的工作不能無聲。
+// 所以這裡把結果往上傳：
+//
+//	true  → 沒有 worker，或 worker 已在窗口內退出。呼叫端可以關 writer、正常釋放 lease。
+//	false → worker 還活著。呼叫端**不得手動釋放 lease**，讓 process 在仍持鎖的
+//	        狀態下結束，由 OS 同時回收 kernel lock 與 fd（contract §5）。
+//
+// 沒做完的工作仍在 journal 裡（done 那一筆還沒 append），下次啟動由
+// openWireFrameJobs 補完。逾時或有殘留一律留稽核：被跳過的工作不能無聲。
 //
 // **已知事項（review 登記，未處置）**：
 //   - 這裡用 `time.Sleep(10ms)` 輪詢等 idle。它在 production 收尾路徑上（不受測試的
@@ -399,14 +408,15 @@ func (a *App) wireFrameDrainWindow() time.Duration {
 //   - 收工之後 `wireJobSig` **不重置為 nil**，所以之後若還有 enqueue，工作會被排進一個
 //     已經退出的 worker 的佇列（靜默不做，但仍會落盤，下次啟動補完）。production 走不到
 //     ——`shuttingDown` 已擋掉所有會建立 session 的交易——故只登記不改。
-func (a *App) drainWireFrameJobs() {
+func (a *App) drainWireFrameJobs() bool {
 	a.wireJobMu.Lock()
-	stop, running := a.wireJobStop, a.wireJobSig != nil
+	stop, exit, running := a.wireJobStop, a.wireJobExit, a.wireJobSig != nil
 	a.wireJobMu.Unlock()
 	if !running {
-		return
+		return true // 沒有 worker＝沒有殘留 writer
 	}
-	deadline := time.Now().Add(a.wireFrameDrainWindow())
+	window := a.wireFrameDrainWindow()
+	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) && !a.wireFrameJobsIdle() {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -422,6 +432,18 @@ func (a *App) drainWireFrameJobs() {
 		a.audit("wire_frame_jobs_deferred", map[string]any{
 			"queued": left, "inFlight": busy,
 			"note": "未完成的 frame 歸屬展開留在 wire-frame-jobs.jsonl，下次啟動補完"})
+	}
+	// stop 已關，idle 的 worker 會立刻退出；正卡在一筆 job 裡的則要做完那一筆
+	// （resolveWireFrameJob 不可中斷）。等它——但一樣 bounded。等不到就回 false，
+	// 由呼叫端保住 lease，不是靠「它應該很快就好了」放行。
+	select {
+	case <-exit:
+		return true
+	case <-time.After(window):
+		a.audit("wire_frame_worker_still_running", map[string]any{
+			"note": "背景 frame 展開 worker 未在收尾窗口內退出；保留 ownership lease，" +
+				"由 process 結束時交還作業系統"})
+		return false
 	}
 }
 

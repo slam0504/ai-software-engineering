@@ -41,19 +41,23 @@ func run() (retErr error) {
 		return err
 	}
 	stateDir := filepath.Join(root, ".workbench")
-	recDir := filepath.Join(stateDir, "recordings")
-	if err := os.MkdirAll(recDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir recordings: %w", err)
-	}
 	// 這個 probe 是**第三個**會寫進 workbench state directory 的進入點（app 與
 	// mcp-approval 子命令是另外兩個）。下面的 os.Create 帶 O_TRUNC，若 app 正
 	// 開著就會直接截斷它的錄流檔，所以這裡照樣取 single-instance 鎖：跟 app
 	// 同一把、同一個目錄，取不到就拒絕執行（fail closed），不去猜「應該沒關係」。
+	//
+	// **取鎖排在 MkdirAll 之前**：拿不到 ownership 就連目錄骨架都不該動
+	// （review 🟡12）。Acquire 自己會把 stateDir 建出來。
 	lock, err := singleinstance.Acquire(stateDir)
 	if err != nil {
 		return fmt.Errorf("probe 需要獨佔 workspace state（%s）：%w", stateDir, err)
 	}
 	defer func() { _ = lock.Release() }()
+
+	recDir := filepath.Join(stateDir, "recordings")
+	if err := os.MkdirAll(recDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir recordings: %w", err)
+	}
 
 	out, err := os.Create(filepath.Join(recDir, "claude-multiturn.ndjson"))
 	if err != nil {

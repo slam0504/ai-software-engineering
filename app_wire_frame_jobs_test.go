@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
+	"github.com/slam0504/sdlc-workbench/internal/singleinstance"
 )
 
 // ---- §3.4.3 歷史歸屬展開的非阻塞結算（owner 2026-08-18 契約）----
@@ -984,4 +985,115 @@ func TestMissingSegmentsFailLoudNotSilentResolve(t *testing.T) {
 		t.Fatalf("失敗原因必須指名是段數對不上：%q", res.SegmentsError)
 	}
 	bar.releaseAll()
+}
+
+// ---- 守門 8：lease 邊界之後不得再有 state mutation ----
+//
+// 這一組守的是「ownership lease 什麼時候可以放掉」，不是「fd 有沒有 Close」
+// （owner 2026-08-19）。`resolveWireFrameJob` 執行途中不檢查 stop，它會寫
+// audit.jsonl 也會 WriteAttribution（截斷式覆寫 sidecar）；只要在它還活著時
+// 釋放 lease，第二個實例就能進場，而我們的殘留 goroutine 仍在寫同一份 state。
+//
+// **oracle 是 kernel，不是 App 的欄位**：flock 衝突以 open file description 為
+// 單位，所以同一個 process 另開一個 fd 去 Acquire，成功與否完全由 kernel 決定，
+// 跟 a.lease 記了什麼無關。
+
+// swapInRealLease：把測試基盤的 test-only capability 換成**production 取鎖流程**
+// 產生的真 flock。守 lease 生命週期的測試不能用 test-only lease——它的 release()
+// 對 kernel 是 no-op，`Acquire` 這個 oracle 因此永遠成功，什麼都量不到
+// （失效形狀 (E)）。
+func swapInRealLease(t *testing.T, a *App) {
+	t.Helper()
+	a.lease = nil
+	lease, err := a.acquireStateLease()
+	if err != nil {
+		t.Fatalf("取得真實 ownership lease 失敗：%v", err)
+	}
+	t.Cleanup(func() { _ = lease.release() })
+}
+
+// leaseAcquirable：另開一個 fd 問 kernel「這把鎖還被持有嗎」。
+func leaseAcquirable(t *testing.T, stateDir string) bool {
+	t.Helper()
+	l, err := singleinstance.Acquire(stateDir)
+	if err != nil {
+		return false
+	}
+	if rerr := l.Release(); rerr != nil {
+		t.Fatalf("釋放探針鎖失敗：%v", rerr)
+	}
+	return true
+}
+
+// TestShutdownKeepsLeaseWhileWorkerStillRunning
+//
+// 正題斷言：shutdown 返回後，**kernel 說鎖還被持有**（另一個 fd Acquire 失敗）。
+//
+// 預期紅：把 shutdown 第 13 步改回無條件 `a.lease.release()` → Acquire 成功 → 這
+// 一條紅在上面那個斷言，不是紅在 setup。
+func TestShutdownKeepsLeaseWhileWorkerStillRunning(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	bar := newWireLoadBarrier(t, a)
+	noDrain(a)
+	swapInRealLease(t, a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-hold", "")
+	for i := 0; i < 3; i++ {
+		if err := a.RestartCodexServerRecorded("b1-hold"); err != nil {
+			t.Fatal(err)
+		}
+		runFramingSession(t, a, ctl, w, "t-hold", "t-hold")
+	}
+	<-bar.entered // worker 真的卡在重建點上（＝它還活著、還會寫 state）
+
+	a.shutdown(a.ctx)
+
+	if leaseAcquirable(t, a.stateDir) {
+		t.Fatal("背景 worker 還活著時不得釋放 ownership lease——第二個實例會在我們還在寫 state 時進場")
+	}
+	// audit writer 同樣不得被關：關了只會讓殘留 worker 的寫入靜默消失。
+	if kinds := auditRecordsOfKind(t, a, "instance_lease_retained"); len(kinds) != 1 {
+		t.Fatalf("保留 lease 這件事必須留下稽核，實得 %d 筆", len(kinds))
+	}
+
+	bar.releaseAll()
+	exit := a.wireJobExit
+	waitFor(t, "背景 worker 收到收工訊號後退出", func() bool {
+		select {
+		case <-exit:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// TestShutdownReleasesLeaseWhenWorkerStopped（正向對照：好行為沒被誤殺）
+//
+// 沒有殘留 writer 時 lease **必須**放掉，否則上一條改成「永遠不放」也會全綠，
+// 而那會讓使用者關掉 app 之後再也開不起來。
+//
+// worker 是存在且已 idle 的（跑過一輪 session），不是「根本沒有 worker」那條捷徑。
+func TestShutdownReleasesLeaseWhenWorkerStopped(t *testing.T) {
+	a, _ := newTestApp(t)
+	ctl := &framingWire{}
+	bootFramingApp(t, a, ctl)
+	swapInRealLease(t, a)
+
+	w := mustCreate(t, a, "codex")
+	runFramingSession(t, a, ctl, w, "t-idle", "")
+	waitFor(t, "背景工作收斂", func() bool { return a.wireFrameJobsIdle() })
+
+	if leaseAcquirable(t, a.stateDir) {
+		t.Fatal("precondition：shutdown 之前 lease 必須是被持有的")
+	}
+
+	a.shutdown(a.ctx)
+
+	if !leaseAcquirable(t, a.stateDir) {
+		t.Fatal("背景 worker 已停止時，shutdown 必須釋放 ownership lease")
+	}
 }
