@@ -714,7 +714,7 @@ func TestShutdownForcedWaitsForBoth(t *testing.T) {
 	releaseReaper := make(chan struct{})
 	a.hookClaudeReaperBeforeEndFlow = func() { <-releaseReaper }
 
-	if err := a.forcedShutdown(a.snapshotHosts()); err != nil {
+	if _, err := a.forcedShutdown(a.snapshotHosts()); err != nil {
 		t.Fatalf("forced shutdown: %v", err)
 	}
 	close(releaseReaper) // 放行 reaper：BeginEndSession 此刻必為 ErrNoSession（session 已被 forced 收乾），no-op
@@ -771,7 +771,7 @@ func TestShutdownForcedBenignWhenNaturalEndRaces(t *testing.T) {
 	a.hookForcedShutdownClaudeBenign = func() { close(benignHit) }
 
 	fsResult := make(chan error, 1)
-	go func() { fsResult <- a.forcedShutdown(a.snapshotHosts()) }() // sess.Terminate() 先跑，process 死掉喚醒 reaper；隨即卡在 hookForcedShutdownClaudeBeforeFlow
+	go func() { _, err := a.forcedShutdown(a.snapshotHosts()); fsResult <- err }() // sess.Terminate() 先跑，process 死掉喚醒 reaper；隨即卡在 hookForcedShutdownClaudeBeforeFlow
 
 	<-teardownStarted      // reaper 已贏得 BeginEndSession、正卡在真正 teardown 之前
 	close(releaseForced)   // 放行 forced：此刻呼叫 EndSessionFlow 必定撞見 ErrEndInProgress（reaper 尚未 FinishEndSession）
@@ -816,7 +816,7 @@ func TestShutdownJoinsErrors(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(a.stateDir, "recordings"), 0o755) })
 
-	err := a.forcedShutdown(a.snapshotHosts())
+	_, err := a.forcedShutdown(a.snapshotHosts())
 	if err == nil { // claude meta 寫失敗必須以 errors.Join 浮出
 		t.Fatal("claude lease error must surface")
 	}
@@ -856,7 +856,7 @@ func TestShutdownHungProviderIsBounded(t *testing.T) {
 		[]byte(`{"threadId":"t1","turn":{"id":"turn-hang"}}`))
 
 	start := time.Now()
-	_ = a.forcedShutdown(a.snapshotHosts()) // interrupt timeout 屬 best-effort，不影響收尾
+	_, _ = a.forcedShutdown(a.snapshotHosts()) // interrupt timeout 屬 best-effort，不影響收尾
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("forced shutdown must be bounded, took %v", elapsed)
 	}

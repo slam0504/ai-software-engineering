@@ -46,8 +46,14 @@ func run() (retErr error) {
 	// 開著就會直接截斷它的錄流檔，所以這裡照樣取 single-instance 鎖：跟 app
 	// 同一把、同一個目錄，取不到就拒絕執行（fail closed），不去猜「應該沒關係」。
 	//
-	// **取鎖排在 MkdirAll 之前**：拿不到 ownership 就連目錄骨架都不該動
-	// （review 🟡12）。Acquire 自己會把 stateDir 建出來。
+	// **取鎖之前只建空的 state directory，其餘骨架一律排在取得鎖之後**：
+	// singleinstance.Acquire 只 open <stateDir>/instance.lock，**它不會建目錄**，
+	// 全新 workspace 因此連鎖都取不到。建一個空目錄對已存在的路徑是 no-op，也
+	// 不含任何 session 狀態，是取鎖前唯一允許的冪等初始化（owner 2026-08-19；
+	// 同 App.acquireStateLease）。recordings/ 與錄流檔則必須等 ownership 到手。
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir state dir: %w", err)
+	}
 	lock, err := singleinstance.Acquire(stateDir)
 	if err != nil {
 		return fmt.Errorf("probe 需要獨佔 workspace state（%s）：%w", stateDir, err)

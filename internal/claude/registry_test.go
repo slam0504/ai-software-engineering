@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,5 +65,47 @@ func TestRegistryLegacyEntryHasEmptyWSID(t *testing.T) {
 	}
 	if wsid != "" {
 		t.Fatalf("舊記錄的 wsid 必須是空字串（未知），got %q", wsid)
+	}
+}
+
+// TestRegistryClosedRefusesBindAndKeepsFileIntact
+//
+// 收尾關掉 registry 之後，遲到的 Bind 必須**回明確錯誤**而不是靜默丟棄，也不得
+// 再改寫 sessions.json——app 的 shutdown 靠這個保證「lease 釋放之後不再有 state
+// mutation」（owner 2026-08-19 F1）。
+//
+// Lookup 刻意仍然可用：讀取不改磁碟事實，擋它換不到任何單一 writer 的保證。
+func TestRegistryClosedRefusesBindAndKeepsFileIntact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	r, err := OpenRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Bind("s1", "/a/b", "01WSIDA0000000000000000001"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := r.Close(); err != nil { // 冪等
+		t.Fatalf("重複 Close 必須安全：%v", err)
+	}
+	if err := r.Bind("s2", "/c/d", "01WSIDA0000000000000000002"); !errors.Is(err, ErrRegistryClosed) {
+		t.Fatalf("關閉後的 Bind 必須回 ErrRegistryClosed，實得 %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("關閉之後不得再改寫 sessions.json：\nbefore=%s\nafter =%s", before, after)
+	}
+	if cwd, _, ok := r.Lookup("s1"); !ok || cwd != "/a/b" {
+		t.Fatalf("關閉只擋寫入，讀取必須仍然可用：%q %v", cwd, ok)
 	}
 }

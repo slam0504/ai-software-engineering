@@ -191,10 +191,12 @@ func TestAuditWithoutLeaseStaysSilent(t *testing.T) {
 	}
 }
 
-// TestAuditAfterCloseStaysSilent（反向 mutation：closed 態不得被誤殺）
+// TestAuditAfterCloseStaysSilent（反向 mutation：收尾之後不得被誤殺）
 //
-// shutdown 已在釋放 lease 之前收掉 writer，此後丟棄同樣正確。這條同時是
-// `auditClosed` 有 production writer 的證據——`closeAuditWriter` 是唯一設定點。
+// shutdown 已在釋放 lease 之前收掉 writer，此後丟棄同樣正確。closeAuditWriter
+// 把狀態帶回 auditUnavailable 而不是留在 ready，靠的就是這條——留在 ready 的話
+// 每一次收尾後的稽核都會被記成不變量破壞（owner 2026-08-19 F6：刻意不為此另立
+// 第三個狀態，它與 unavailable 的行為完全相同）。
 func TestAuditAfterCloseStaysSilent(t *testing.T) {
 	a := auditLifecycleApp(t)
 	lease := acquireLease(t, a)

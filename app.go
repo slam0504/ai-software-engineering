@@ -59,7 +59,22 @@ type App struct {
 	workspaceDir string
 	stateDir     string
 	workspaceSrc string
-	startupErr   string
+	// startupMu 保護**啟動資訊這一組欄位**：startupErr／startupBlockers／
+	// toolsDirPath／toolsSource／nodePath（owner 2026-08-19）。
+	//
+	// 這不是理論上的競態：這五個欄位在 startup 的 goroutine 上發布，而 CLIInfo()
+	// 是 Wails binding——UI 一開視窗就可能在**另一條 goroutine** 上讀它們，
+	// startupAfterWriters 正在寫 toolsDirPath／nodePath 的同一刻。
+	//
+	// 規約：
+	//   - 一律經本檔的存取器讀寫，不直接碰欄位（測試的單執行緒前置除外）。
+	//   - **鎖內只複製字串，不做 I/O**——node --version／CLI version probe 都要
+	//     先取快照、放鎖之後才 exec（見 startupSnapshot 的呼叫端）。
+	//   - 鎖序：auditMu → startupMu（noteAuditInvariantBrokenLocked 持 auditMu
+	//     時會呼叫 appendStartup）。所以持有 startupMu 期間**不得**呼叫 a.audit()
+	//     或任何會取 auditMu 的東西，否則就是反向鎖序。
+	startupMu  sync.Mutex
+	startupErr string
 	// lease：開啟／持有 state writer 的 ownership capability。
 	//
 	// **nil ＝沒有 capability ＝一律拒絕**，不是「沒設就當作沒問題」。所有
@@ -206,11 +221,13 @@ type App struct {
 	// `auditF != nil` 猜狀態——那個判斷把「還沒取得 lease，本來就不該寫」與
 	// 「已經 ready 卻寫不出去」壓成同一件事，而後者是不變量破壞。
 	//
-	//	auditUnavailable → 尚未取得 lease／啟動被拒。不寫 state audit 是正確行為，
+	//	auditUnavailable → 尚未取得 lease／啟動被拒，**或**收尾已在釋放 lease 之前
+	//	                   收掉 writer。兩者都不該寫 state audit，丟棄是正確行為；
 	//	                   拒絕原因由 startupErr／stderr／UI 呈現，不在這裡重複。
 	//	auditReady       → 已取得 lease 且 writer 開啟成功。此後 auditF 為 nil 是
 	//	                   不變量破壞，必須 fail loud（見 audit）。
-	//	auditClosed      → shutdown 已在釋放 lease 之前收掉 writer。丟棄是正確行為。
+	//
+	// 只有兩態，理由見 auditLifecycle 常數區塊。
 	auditState auditLifecycle
 	// auditBrokenNoted：不變量破壞的橫幅／stderr 已出過一次（去重，見
 	// noteAuditInvariantBrokenLocked）。
@@ -414,6 +431,13 @@ type App struct {
 	hookRebuildEntered func()
 	hookRebuildResult  func(attempt int) error
 
+	// hookStartupPublish：測試注入——startupAfterWriters **正在發布啟動資訊的
+	// 中途**（tools dir 已寫入、node path 還沒），用來把 CLIInfo() 的併發呼叫確定
+	// 性地擠進那個窗口，證明讀寫走同一套同步機制（見 App.startupMu）。刻意不放在
+	// 兩次發布的臨界區內部：那樣只會做出一個必然死鎖的 barrier，量不到任何東西。
+	// production 恆為 nil。
+	hookStartupPublish func()
+
 	emitUI                  func(name string, data any) // 測試注入；nil = wails runtime
 	hookAfterProviderStart  func()                      // 測試注入：provider 啟動與 Accept 之間的 barrier
 	hookDuringReset         func()                      // 測試注入：NewSession 的 teardown 完成與 restore reset 之間
@@ -435,8 +459,9 @@ type App struct {
 	afterFn appcore.After
 
 	// Gate 1（M2 Stage A：spec §3.5／§5.4）——spec.GitRepo ＋ gate.Service，
-	// ensureGate() 惰性初始化，journal 落在 workspace 的 .workbench/gate.jsonl
-	// （gitignored app state；不隨測試覆寫的 stateDir 漂移，永遠綁 workspace 本身）。
+	// ensureGate() 惰性初始化，journal 落在 **a.stateDir** 的 gate.jsonl
+	// （gitignored app state）。綁 stateDir 而不是 workspaceDir/.workbench 的理由、
+	// 以及舊路徑殘留的處置，見 ensureGate 與 migrateLegacyState 的 doc。
 	specRepo            *spec.GitRepo
 	gateSvc             *gate.Service
 	gateJournal         *gate.Journal
@@ -1176,6 +1201,8 @@ func (a *App) noteStartupWarning(msg string) { a.appendStartup(msg, false) }
 func (a *App) noteStartupBlocker(msg string) { a.appendStartup(msg, true) }
 
 func (a *App) appendStartup(msg string, blocker bool) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
 	switch {
 	case a.startupErr == "":
 		a.startupErr = msg
@@ -1188,6 +1215,71 @@ func (a *App) appendStartup(msg string, blocker bool) {
 	if blocker && a.startupBlockers == "" {
 		a.startupBlockers = msg
 	}
+}
+
+// ---- 啟動資訊的存取器（見 App.startupMu 的規約）----
+
+// startupInfo：啟動資訊的一份快照。CLIInfo 與所有會 exec 外部指令的路徑一律
+// 「鎖內複製一次 → 放鎖後才用」，不讓短暫的資料保護變成跨行程呼叫的長臨界區。
+type startupInfo struct {
+	startupErr  string
+	toolsDir    string
+	toolsSource string
+	nodePath    string
+}
+
+func (a *App) startupSnapshot() startupInfo {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	return startupInfo{startupErr: a.startupErr, toolsDir: a.toolsDirPath,
+		toolsSource: a.toolsSource, nodePath: a.nodePath}
+}
+
+// startupErrText：目前的啟動訊息（UI 橫幅與稽核用）。
+func (a *App) startupErrText() string {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	return a.startupErr
+}
+
+// setStartupErrOnce：只記第一則啟動錯誤——沿用 repo 既有的
+// `if a.startupErr == "" { a.startupErr = ... }` 慣例，只是把檢查與賦值收進同一個
+// 臨界區（分開做的話兩條啟動路徑會互相覆蓋）。要**累加**語意的請走
+// noteStartupWarning／noteStartupBlocker。
+func (a *App) setStartupErrOnce(msg string) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	if a.startupErr == "" {
+		a.startupErr = msg
+	}
+}
+
+// publishToolsDir／publishNodePath：startupAfterWriters 的欄位發布點。刻意分成
+// 兩個呼叫（而不是一次寫四個欄位）——兩者的解析各自獨立，中間正是 CLIInfo 可能
+// 插進來的窗口，測試用 hookStartupPublish 停在這裡驗證讀寫走同一套同步機制。
+func (a *App) publishToolsDir(dir, source string) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	a.toolsDirPath, a.toolsSource = dir, source
+}
+
+func (a *App) publishNodePath(p string) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	a.nodePath = p
+}
+
+// toolsDir／nodePathValue：單一欄位的讀取器（CLI 路徑組裝、childEnv 用）。
+func (a *App) toolsDir() string {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	return a.toolsDirPath
+}
+
+func (a *App) nodePathValue() string {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	return a.nodePath
 }
 
 // knownProviders：可建立／可還原 session 的 provider 白名單（同 CreateSession
@@ -1543,7 +1635,7 @@ func (a *App) openUIAndProviders() {
 	a.startupStep("open_ui")
 	a.emit("workbench:ready", map[string]any{
 		"replay_index":  a.replayIndex != nil,
-		"startup_error": a.startupErr,
+		"startup_error": a.startupErrText(),
 	})
 }
 
@@ -1619,6 +1711,18 @@ func (a *App) acquireStateLease() (*stateLease, error) {
 	if a.stateDir == "" {
 		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = resolveWorkspace()
 	}
+	// **建立空的 state directory 是取鎖之前唯一允許的冪等初始化**（owner
+	// 2026-08-19）。singleinstance.Acquire 只 open <stateDir>/instance.lock，
+	// **它不會建目錄**——全新 workspace（`.workbench` 尚未存在）於是連鎖都取不到，
+	// 而那條路徑會被當成「環境有問題」拒絕啟動。
+	//
+	// 這一步不違反「取鎖之前不得動任何 state」：MkdirAll 對已存在的目錄是 no-op
+	// （不改 mtime、不建任何檔案），被擋下的第二個實例因此仍然零磁碟異動；建出
+	// 來的也只是一個空目錄，不含任何 session 狀態。除此之外的任何初始化都必須
+	// 排在取得 lease 之後。
+	if merr := os.MkdirAll(a.stateDir, 0o755); merr != nil {
+		return nil, fmt.Errorf("建立 state directory %s 失敗：%w", a.stateDir, merr)
+	}
 	lock, err := singleinstance.Acquire(a.stateDir)
 	if err != nil {
 		return nil, err
@@ -1647,7 +1751,7 @@ func (a *App) startup(ctx context.Context) {
 	// 會在這裡自我排斥。
 	lease, lerr := a.acquireStateLease()
 	if a.workspaceErr != nil { // fail loud：UI 與 audit 都要看得到
-		a.startupErr = "workspace init failed: " + a.workspaceErr.Error()
+		a.setStartupErrOnce("workspace init failed: " + a.workspaceErr.Error())
 	}
 	if lerr != nil {
 		// **fail closed**：registry／audit／events sink／replay index／wire log
@@ -1699,14 +1803,12 @@ func (a *App) openStateWriters(lease *stateLease) bool {
 	a.auditMu.Unlock()
 	if r, rerr := claude.OpenRegistry(filepath.Join(a.stateDir, "sessions.json")); rerr == nil {
 		a.registry = r
-	} else if a.startupErr == "" {
-		a.startupErr = "registry init failed: " + rerr.Error()
+	} else {
+		a.setStartupErrOnce("registry init failed: " + rerr.Error())
 	}
 	sink, serr := appcore.NewJSONLSink(filepath.Join(a.stateDir, "events.jsonl"))
 	if serr != nil {
-		if a.startupErr == "" {
-			a.startupErr = "event sink init failed: " + serr.Error()
-		}
+		a.setStartupErrOnce("event sink init failed: " + serr.Error())
 		sink = nil
 	}
 	var auditSink appcore.AuditSink = sink
@@ -1751,6 +1853,11 @@ func (a *App) openStateWriters(lease *stateLease) bool {
 // watcher／evidence）。只有 openStateWriters 回 true 才會走到——契約要求
 // migration 也在「取得 lease 之後」。
 func (a *App) startupAfterWriters() {
+	// 舊路徑遷移排在**所有惰性 journal 開啟之前**（見 migrateLegacyState）。
+	// 失敗一律中止啟動：a.wsReg 維持 nil，CreateSession 早退（§3.2.6）。
+	if !a.migrateLegacyState() {
+		return
+	}
 	// M3b §3.2.4 完整凍結序列：載入／遷移 registry → 還原 dormant slots →
 	// 驗證／重建 replay index → 偵測 incomplete turn → emit stream_error →
 	// 才開放 UI 與 provider 啟動。必須在 restore store 開啟之後（legacy 遷移
@@ -1761,11 +1868,16 @@ func (a *App) startupAfterWriters() {
 		a.audit("session_registry_error", map[string]any{"error": lerr.Error()})
 		a.noteStartupBlocker("session registry load failed: " + lerr.Error())
 	}
-	a.toolsDirPath, a.toolsSource = resolveToolsDir(a.workspaceDir)
-	a.nodePath = resolveNodePath()
+	toolsDir, toolsSource := resolveToolsDir(a.workspaceDir)
+	a.publishToolsDir(toolsDir, toolsSource)
+	if h := a.hookStartupPublish; h != nil { // 測試 barrier：欄位發布期間（見欄位 doc）
+		h()
+	}
+	a.publishNodePath(resolveNodePath())
+	si := a.startupSnapshot() // 稽核用同一份快照，不逐欄位各取一次鎖
 	a.audit("startup", map[string]any{"workspace": a.workspaceDir, "workspace_source": a.workspaceSrc,
-		"startup_error": a.startupErr, "node_path": a.nodePath,
-		"tools_dir": a.toolsDirPath, "tools_source": a.toolsSource, "node": a.nodeVersion()})
+		"startup_error": si.startupErr, "node_path": si.nodePath,
+		"tools_dir": si.toolsDir, "tools_source": si.toolsSource, "node": nodeVersionOf(si.nodePath)})
 	a.diagramPath = filepath.Join(a.workspaceDir, "docs", "sample.mmd")
 	a.watchDiagram(a.diagramPath)
 	a.watchSpecTree() // spec §4 通知層：spec/ 遞迴監看，變更 debounce 後觸發 Reconcile()
@@ -1781,6 +1893,74 @@ func (a *App) startupAfterWriters() {
 	}
 }
 
+// legacyStateNames：M3b 之前落在 workspaceDir/.workbench、本次改綁 a.stateDir 的
+// app state。三者都會改變核可結果，所以都要遷移而不是各自重新開一份空的：
+//
+//	gate.jsonl       → 已核可／已 stale 的 gate 記錄。
+//	escalation.jsonl → 阻擋事項收件匣。**未解除的系統管控項目在這裡**——漏掉它
+//	                   等於把原本擋著的核可默默放行。
+//	evidence/        → evidence journal／CAS／worktree registry。TCA policy 直接
+//	                   讀 CAS，看不到就等於證據不存在。
+var legacyStateNames = []string{"gate.jsonl", "escalation.jsonl", "evidence"}
+
+// migrateLegacyState：把舊路徑（workspaceDir/.workbench）上的 app state 搬到受
+// ownership lease 保護的 a.stateDir。回傳 false ＝**啟動必須中止**。
+//
+// 為什麼一定要遷移而不是忽略（owner 2026-08-19）：舊 escalation journal 裡若還有
+// 未解除的系統管控項目，忽略它就是「這一版之後那些阻擋全部消失」，核可結果因此
+// 改變——這不是相容性問題，是資料正確性問題。
+//
+// 位置：**取得 lease 之後、任何新 journal 開啟之前**。前者是因為搬檔本身就是
+// state mutation，沒有 ownership 不得進行；後者是因為 ensureGate／ensureEscalation
+// ／startupEvidence 一旦先開過，目的地就會憑空多出一份空的，遷移從此永遠撞上
+// 「來源與目的地同時存在」。
+//
+// 兩種失敗都中止啟動、都說明原因，**不自行選一份**：
+//
+//	來源與目的地同時存在 → 兩份都可能有唯一的記錄，合併語意（哪一份的 stale
+//	                       marker 有效、同一個 escalation id 以誰為準）沒有定義。
+//	                       猜錯的後果是核可判定用了錯的證據，而且沒有人會發現。
+//	rename 失敗          → 搬到一半的狀態無法自證，繼續啟動只會在錯的資料上跑。
+//
+// 常態（stateDir ＝ workspaceDir/.workbench）直接跳過：同一個路徑沒有東西要搬。
+// 兩者不同值只發生在 resolveWorkspace 的 tmp fallback 與測試自訂 stateDir。
+func (a *App) migrateLegacyState() bool {
+	legacyDir := filepath.Join(a.workspaceDir, ".workbench")
+	if legacyDir == a.stateDir || a.workspaceDir == "" {
+		return true
+	}
+	for _, name := range legacyStateNames {
+		src := filepath.Join(legacyDir, name)
+		if _, serr := os.Lstat(src); serr != nil {
+			if os.IsNotExist(serr) {
+				continue
+			}
+			return a.blockLegacyMigration(name, "無法讀取舊路徑（"+src+"）："+serr.Error())
+		}
+		dst := filepath.Join(a.stateDir, name)
+		if _, derr := os.Lstat(dst); derr == nil {
+			return a.blockLegacyMigration(name, "舊路徑（"+src+"）與新路徑（"+dst+
+				"）同時存在，無法判斷哪一份是權威；請人工確認後保留一份再重新啟動")
+		} else if !os.IsNotExist(derr) {
+			return a.blockLegacyMigration(name, "無法讀取新路徑（"+dst+"）："+derr.Error())
+		}
+		if rerr := os.Rename(src, dst); rerr != nil {
+			return a.blockLegacyMigration(name, "從 "+src+" 搬到 "+dst+" 失敗："+rerr.Error())
+		}
+		a.audit("legacy_state_migrated", map[string]any{"name": name, "from": src, "to": dst})
+	}
+	return true
+}
+
+// blockLegacyMigration：遷移失敗的唯一出口——稽核 ＋ UI 橫幅，回 false 讓
+// startupAfterWriters 原地中止。
+func (a *App) blockLegacyMigration(name, why string) bool {
+	a.audit("legacy_state_migration_blocked", map[string]any{"name": name, "reason": why})
+	a.noteStartupBlocker("拒絕啟動：" + name + " 的舊路徑遷移未完成——" + why +
+		"。在遷移完成之前不開放 session，以免用不完整的核可與阻擋記錄繼續執行。")
+	return false
+}
+
 // startupEvidence（Task 20）：惰性 gate/plan 之外少數在 startup 就建立的狀態——
 // evidence journal／CAS／worktree registry 路徑都落在 .workbench/evidence/
 // 下，且 CleanupOrphans／CleanOrphanTemps 必須在任何 RunEvidence 呼叫之前跑
@@ -1792,26 +1972,25 @@ func (a *App) startupAfterWriters() {
 // 安全地在 ensureGate() 惰性初始化之前無條件執行。
 func (a *App) startupEvidence() {
 	// 綁 a.stateDir（受 ownership lease 保護），不是 workspaceDir/.workbench
-	// ——理由見 ensureGate 的 doc（tmp fallback 下兩者不同值）。
+	// ——理由見 ensureGate 的 doc（tmp fallback 下兩者不同值）。舊路徑上的殘留由
+	// migrateLegacyJournals 在啟動更早的一步處置，這裡不再讀 workspaceDir。
 	dir := filepath.Join(a.stateDir, "evidence")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		if a.startupErr == "" {
-			a.startupErr = "evidence dir init failed: " + err.Error()
-		}
+		a.setStartupErrOnce("evidence dir init failed: " + err.Error())
 		return
 	}
 	a.evidenceCASDir = filepath.Join(dir, "cas")
 	a.evidenceRegistryPath = filepath.Join(dir, "worktrees.jsonl")
-	if j, jerr := evidence.OpenJournal(filepath.Join(dir, "evidence.jsonl")); jerr == nil {
+	if j, jerr := evidence.OpenJournal(filepath.Join(dir, "evidence.jsonl")); jerr != nil {
+		a.setStartupErrOnce("evidence journal init failed: " + jerr.Error())
+	} else {
 		a.evidenceJournal = j
-	} else if a.startupErr == "" {
-		a.startupErr = "evidence journal init failed: " + jerr.Error()
 	}
-	if oerr := evidence.CleanupOrphans(a.workspaceDir, a.evidenceRegistryPath, map[string]bool{}); oerr != nil && a.startupErr == "" {
-		a.startupErr = "evidence orphan worktree cleanup failed: " + oerr.Error()
+	if oerr := evidence.CleanupOrphans(a.workspaceDir, a.evidenceRegistryPath, map[string]bool{}); oerr != nil {
+		a.setStartupErrOnce("evidence orphan worktree cleanup failed: " + oerr.Error())
 	}
-	if _, terr := evidence.CleanOrphanTemps(a.evidenceCASDir); terr != nil && a.startupErr == "" {
-		a.startupErr = "evidence orphan temp cleanup failed: " + terr.Error()
+	if _, terr := evidence.CleanOrphanTemps(a.evidenceCASDir); terr != nil {
+		a.setStartupErrOnce("evidence orphan temp cleanup failed: " + terr.Error())
 	}
 }
 
@@ -2238,9 +2417,11 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 	a.shutdownStep("deny_approvals")
 
-	// 5-7) interrupt／terminate → 並行 teardown → 全部 host 收乾（步驟名由 forcedShutdown 發出）
-	if err := a.forcedShutdown(hosts); err != nil {
-		a.audit("shutdown_forced_error", map[string]any{"error": err.Error()})
+	// 5-7) interrupt／terminate → 並行 teardown → 全部 host 收乾（步驟名由 forcedShutdown 發出）。
+	// pumpsStopped 與 err 是兩種狀態，分開處置（見 forcedShutdown 的 doc 與第 13 步）。
+	pumpsStopped, ferr := a.forcedShutdown(hosts)
+	if ferr != nil {
+		a.audit("shutdown_forced_error", map[string]any{"error": ferr.Error()})
 	}
 
 	// 8-9) 共用 app-server：terminate → wait（Conn.Done）→ finalize wire log。
@@ -2336,23 +2517,32 @@ func (a *App) shutdown(ctx context.Context) {
 	// 與 registry 的 temp/rename 前提就破了。
 	//
 	// **要守的不變量是「lease 釋放之後不得再有任何 state mutation」**，不是 fd
-	// 的開關狀態（owner 2026-08-19）。所以這裡分兩種結局：
+	// 的開關狀態（owner 2026-08-19）。所以釋放 lease 的前提是**兩個背景 writer
+	// 都確定停了**，不是其中一個：
 	//
-	//	workerStopped＝true  → 沒有殘留 writer。關 audit writer，再正常釋放 lease。
-	//	workerStopped＝false → 背景 frame worker 還活著，它會寫 audit.jsonl 也會
-	//	                       覆寫 sidecar。**一律不手動釋放**：process 在仍持鎖
-	//	                       的狀態下結束，OS 同時回收 kernel lock 與 fd，殘留
-	//	                       寫入因此永遠落在「我們仍持有 lease」的期間內。
-	//	                       audit writer 同理不關——關了只會讓它的寫入靜默消失。
+	//	workerStopped → 背景 frame 展開 worker（寫 audit.jsonl、覆寫 sidecar）
+	//	pumpsStopped  → 每個 Claude host 的 pump goroutine（寫 events sink、
+	//	                經 init 綁定改寫 sessions.json）
+	//
+	// 任一為 false 就走保留路徑：**一律不手動釋放**，process 在仍持鎖的狀態下
+	// 結束，OS 同時回收 kernel lock 與 fd，殘留寫入因此永遠落在「我們仍持有
+	// lease」的期間內。這條路徑刻意**不關 registry、也不關 audit writer**——把
+	// 它們關掉只會讓還沒退出的 writer 從「合法寫入」變成「靜默消失」或多一筆
+	// 沒人處理的錯誤，而磁碟事實的正確性靠的是鎖還在，不是 handle 關了。
 	//
 	// contract §5：不得為了滿足 shutdown timeout 而提早釋放 lease。
-	if !workerStopped {
+	if !workerStopped || !pumpsStopped {
 		a.audit("instance_lease_retained", map[string]any{
-			"reason": "背景 frame 展開 worker 未在收尾窗口內退出",
-			"note":   "lease 與 audit writer 一併留到 process 結束，由作業系統回收"})
+			"workerStopped": workerStopped, "pumpsStopped": pumpsStopped,
+			"reason": "背景 writer 未在收尾窗口內退出（frame 展開 worker／Claude pump）",
+			"note":   "lease、session registry 與 audit writer 一併留到 process 結束，由作業系統回收"})
 		a.shutdownStep("instance_lease_retained")
 		return
 	}
+	// 正常收尾順序（owner 2026-08-19）：確認背景工作已結束 → 關 session
+	// registry → 關 audit writer → 釋放 lease。registry 排在 audit 之前，遲到的
+	// Bind 才有地方留下 ErrRegistryClosed 那筆稽核。
+	a.closeSessionRegistry()
 	a.closeAuditWriter()
 	// 釋放之後把 a.lease 設 nil：lease 是 capability，收掉之後任何 writer
 	// 初始化都必須重新取得（Lock.Held() 在 Release 之後為 false，這裡再補一層
@@ -2393,7 +2583,18 @@ func (a *App) shutdown(ctx context.Context) {
 // 訊號（Claude 的 proc.Terminate 非阻塞、Codex 的 interrupt RPC 自帶 5s ctx），
 // 第二段才是會等 quiesce／kill 的 CloseSequence。hosts 由呼叫端在 snapshot 那一步
 // 取得（同一份快照貫穿整段 shutdown），不在這裡重新掃 registry。
-func (a *App) forcedShutdown(hosts []*sessionHost) error {
+//
+// # 兩個回傳值是**兩種不同的狀態**，不可互相代替（owner 2026-08-19）
+//
+//	pumpsStopped → 每個 Claude host 的 pump goroutine 是否都確實結束。
+//	err          → 收尾途中的錯誤（CloseSequence／lease finalize／錄流 meta…）。
+//
+// 檔案收尾失敗與「goroutine 還活著」是兩件事：前者代表這次收尾留下不完整的
+// 證據，後者代表**還有一個 writer 在跑**，lease 因此不得釋放（見 shutdown 第
+// 13 步）。把 err != nil 當成「pump 還活著」會讓每一次 meta 寫入失敗都白白保住
+// lease；反過來拿 err == nil 當成「pump 都停了」則會在真的有殘留 goroutine 時
+// 放行——那正是這次要堵的洞。所以兩者分開回報。
+func (a *App) forcedShutdown(hosts []*sessionHost) (pumpsStopped bool, err error) {
 	var claudeHosts, codexHosts []*sessionHost
 	for _, h := range hosts {
 		switch h.provider {
@@ -2491,7 +2692,36 @@ func (a *App) forcedShutdown(hosts []*sessionHost) error {
 	// 刻意不拆成兩個 WaitGroup 只為讓 Claude 與共用 app-server 收尾重疊那幾秒：多一
 	// 份狀態、換不到 bounded window 的改善（Manager.Close 本來就得等全部 host）。
 	a.shutdownStep("codex_hosts_done")
-	return errors.Join(errs...)
+	return a.claudePumpsStopped(claudeHosts), errors.Join(errs...)
+}
+
+// claudePumpsStopped：每個 Claude host 的 pump goroutine 是否都**確實**已結束。
+//
+// 判準是 host.pumpDone 這個 channel 有沒有關（appcore.Pump 在 event channel 收
+// 乾之後才關它），不是 teardown 的回傳值——CloseSequence 會在 quiesce／kill 逾時
+// 之後仍以 Exit{Exited:false} 盡力 finalize 並回錯，那條路徑上 pump 可能仍卡在
+// 一次 Emit 裡沒退出。
+//
+// 「無法確認」一律當成未結束（fail closed）：pumpDone 為 nil 代表這個 host 沒有
+// 可查證的 pump 收斂訊號，此時宣稱它停了就是在猜。Codex host 不在判定範圍——
+// 它們沒有 per-host pump goroutine（共用同一條 conn 與 dispatcher）。
+func (a *App) claudePumpsStopped(claudeHosts []*sessionHost) bool {
+	stopped := true
+	for _, ch := range claudeHosts {
+		if ch.pumpDone != nil {
+			select {
+			case <-ch.pumpDone:
+				continue
+			default:
+			}
+		}
+		stopped = false
+		a.audit("shutdown_claude_pump_still_running", map[string]any{
+			"wsid":      string(ch.wsid),
+			"confirmed": ch.pumpDone != nil,
+			"note":      "pump goroutine 未在收尾窗口內結束；保留 ownership lease"})
+	}
+	return stopped
 }
 
 // shutdownStep：§3.6.5 凍結總序的探針（同 startupStep／removeStep 慣例）。
@@ -2561,12 +2791,18 @@ func resolveToolsDir(workspace string) (string, string) {
 	return filepath.Join(workspace, "tools"), "dev-repo"
 }
 
-func (a *App) claudeCLIPath() string {
-	return filepath.Join(a.toolsDirPath, "claude-cli", "node_modules", ".bin", "claude")
+func (a *App) claudeCLIPath() string { return claudeCLIPathIn(a.toolsDir()) }
+
+func (a *App) codexCLIPath() string { return codexCLIPathIn(a.toolsDir()) }
+
+// *CLIPathIn：從一份**已經複製出來的** tools dir 組路徑（見 App.startupMu 的
+// 規約：exec 一律在鎖外，用同一份快照）。
+func claudeCLIPathIn(toolsDir string) string {
+	return filepath.Join(toolsDir, "claude-cli", "node_modules", ".bin", "claude")
 }
 
-func (a *App) codexCLIPath() string {
-	return filepath.Join(a.toolsDirPath, "codex-cli", "node_modules", ".bin", "codex")
+func codexCLIPathIn(toolsDir string) string {
+	return filepath.Join(toolsDir, "codex-cli", "node_modules", ".bin", "codex")
 }
 
 // resolveNodePath：GUI app（Finder 啟動）不繼承 shell PATH，node 常在
@@ -2585,18 +2821,24 @@ func resolveNodePath() string {
 }
 
 // childEnv：把 node 所在目錄前置到子程序 PATH（duplicate PATH 以後者為準）。
-func (a *App) childEnv() []string {
-	if a.nodePath == "" {
+func (a *App) childEnv() []string { return childEnvFor(a.nodePathValue()) }
+
+func childEnvFor(nodePath string) []string {
+	if nodePath == "" {
 		return nil
 	}
-	return []string{"PATH=" + filepath.Dir(a.nodePath) + ":" + os.Getenv("PATH")}
+	return []string{"PATH=" + filepath.Dir(nodePath) + ":" + os.Getenv("PATH")}
 }
 
-func (a *App) nodeVersion() string {
-	if a.nodePath == "" {
+func (a *App) nodeVersion() string { return nodeVersionOf(a.nodePathValue()) }
+
+// nodeVersionOf：`node --version`。**參數是路徑而不是 *App**——這個函式會 exec 一
+// 個外部行程，不得在持有 startupMu 的情況下呼叫（見欄位 doc）。
+func nodeVersionOf(nodePath string) string {
+	if nodePath == "" {
 		return "missing (not on app PATH; codex CLI needs node)"
 	}
-	out, err := exec.Command(a.nodePath, "--version").Output()
+	out, err := exec.Command(nodePath, "--version").Output()
 	if err != nil {
 		return "error: " + err.Error()
 	}
@@ -2604,12 +2846,17 @@ func (a *App) nodeVersion() string {
 }
 
 func (a *App) cliVersion(provider string) string {
-	bin := a.claudeCLIPath()
+	return cliVersionFrom(a.startupSnapshot(), provider)
+}
+
+// cliVersionFrom：同 nodeVersionOf——先拿快照、放鎖之後才 exec。
+func cliVersionFrom(si startupInfo, provider string) string {
+	bin := claudeCLIPathIn(si.toolsDir)
 	if provider == "codex" {
-		bin = a.codexCLIPath()
+		bin = codexCLIPathIn(si.toolsDir)
 	}
 	cmd := exec.Command(bin, "--version")
-	cmd.Env = append(os.Environ(), a.childEnv()...) // codex CLI 是 node script
+	cmd.Env = append(os.Environ(), childEnvFor(si.nodePath)...) // codex CLI 是 node script
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -2621,17 +2868,40 @@ func (a *App) cliVersion(provider string) string {
 type auditLifecycle int
 
 const (
-	auditUnavailable auditLifecycle = iota // 尚未取得 lease／啟動被拒
+	auditUnavailable auditLifecycle = iota // 尚未取得 lease／啟動被拒；或收尾已把 writer 收掉
 	auditReady                             // lease 在手且 writer 已開
-	auditClosed                            // shutdown 已在釋放 lease 前收掉 writer
 )
+
+// 刻意只有兩態（owner 2026-08-19）。曾經有第三個 auditClosed，但它與
+// auditUnavailable 的**行為完全相同**——兩者都讓 audit() 靜默丟棄，沒有任何分流
+// 讀得出差別。同名不同義的狀態只是把「湊完整」寫成程式碼。真正需要被分辨的是
+// session registry 那一側：關閉之後 Bind() 從寫磁碟改成回 ErrRegistryClosed，
+// 兩種狀態各自有可觀察的正式行為（見 claude.Registry.Close）。
+//
+// 這裡的取捨是：稽核在 lease 釋放前後都不該再寫，丟棄本來就是對的；registry 的
+// 遲到寫入則必須被呼叫端看見。
+
+// closeSessionRegistry：shutdown 總序的「關 registry」那一步——排在確認背景工作
+// 已結束之後、關 audit writer 之前（見 shutdown 第 13 步）。
+//
+// Close 與 Bind 共用 registry 內部同一把 mutex，所以它回來時「正在寫 sessions.json
+// 的那一筆」必然已經落盤，之後任何遲到的 pump callback 只會拿到 ErrRegistryClosed。
+// a.registry 刻意**不設 nil**：設 nil 會讓遲到的呼叫端走到「registry 不存在」那條
+// 早退路徑，錯誤就靜默了，而我們要的正好相反。
+func (a *App) closeSessionRegistry() {
+	if a.registry == nil {
+		return
+	}
+	if err := a.registry.Close(); err != nil {
+		a.audit("session_registry_close_error", map[string]any{"error": err.Error()})
+	}
+}
 
 // closeAuditWriter：shutdown 總序倒數第二步（contract §5 第 4 步）。**只有在確定
 // 沒有殘留 writer goroutine 時才會被呼叫**——見 shutdown 第 13 步。
 //
-// 轉成 auditClosed 而不是留在 ready：此後的 audit() 丟棄是正確行為，不能報成不
-// 變量破壞。這個狀態現在有真正的 production writer（本函式）與 consumer
-// （audit／auditWriter.Write 的分流），不是為了湊三態而存在。
+// 回到 auditUnavailable：此後的 audit() 丟棄是正確行為，不能報成不變量破壞
+// （lease 即將釋放，本來就不該再有稽核寫入）。
 func (a *App) closeAuditWriter() {
 	a.auditMu.Lock()
 	defer a.auditMu.Unlock()
@@ -2642,7 +2912,7 @@ func (a *App) closeAuditWriter() {
 		fmt.Fprintln(os.Stderr, "sdlc-workbench: 關閉稽核寫入器失敗："+err.Error())
 	}
 	a.auditF = nil
-	a.auditState = auditClosed
+	a.auditState = auditUnavailable
 }
 
 // noteAuditInvariantBrokenLocked：ready 之後卻沒有 writer——這不是「沒開 audit」
@@ -2675,9 +2945,9 @@ func (a *App) audit(kind string, v any) {
 	a.auditMu.Lock()
 	defer a.auditMu.Unlock()
 	if a.auditF == nil {
-		// unavailable：沒有 lease 就不該寫 state audit，丟棄是正確行為（拒絕
-		// 原因由 startupErr／stderr／UI 呈現）。
-		// closed：shutdown 已在釋放 lease 前收尾，丟棄同樣正確。
+		// unavailable：沒有 lease 就不該寫 state audit（拒絕原因由 startupErr／
+		// stderr／UI 呈現）；shutdown 收掉 writer 之後回到同一個狀態，兩者丟棄都
+		// 是正確行為。
 		// ready：writer 不該不見——fail loud（owner 2026-08-18）。
 		if a.auditState == auditReady {
 			a.noteAuditInvariantBrokenLocked(kind)
@@ -2711,12 +2981,18 @@ func clientInfo() codex.ClientInfo {
 }
 
 // CLIInfo 回報 CLI 解析路徑與版本（隔離 smoke 的證據面）。
+//
+// 這是 Wails binding：跑在 UI 的 goroutine 上，與 startup 發布這些欄位的那一刻
+// 併發（owner 2026-08-19 判定為正式執行時可達的資料競爭）。所以**先取一份快照**
+// ——五個欄位一次複製完、放掉 startupMu，之後的 CLI/node 版本探測都用快照裡的
+// 路徑去 exec，不把跨行程呼叫留在臨界區內。
 func (a *App) CLIInfo() map[string]string {
+	si := a.startupSnapshot()
 	return map[string]string{
-		"toolsDir": a.toolsDirPath, "toolsSource": a.toolsSource,
-		"claudeVersion": a.cliVersion("claude"), "codexVersion": a.cliVersion("codex"),
-		"node": a.nodeVersion(), "workspace": a.workspaceDir,
-		"workspaceSource": a.workspaceSrc, "startupError": a.startupErr,
+		"toolsDir": si.toolsDir, "toolsSource": si.toolsSource,
+		"claudeVersion": cliVersionFrom(si, "claude"), "codexVersion": cliVersionFrom(si, "codex"),
+		"node": nodeVersionOf(si.nodePath), "workspace": a.workspaceDir,
+		"workspaceSource": a.workspaceSrc, "startupError": si.startupErr,
 	}
 }
 
@@ -3004,6 +3280,10 @@ func (g gateEmitter) EmitGateEvent(kind string, bindings []gate.Binding, payload
 // 值**。舊寫法會讓 gate journal 落在 lease 保護範圍之外，「同一份 journal 的所有
 // writer 都被同一把鎖排他」這個保證因此不成立。git repo 仍走 workspaceDir
 // （root），只有 journal 路徑跟著受保護的 state root。
+//
+// 舊路徑上既有的 gate.jsonl **不是靜默忽略**：startupAfterWriters 會在任何惰性
+// 初始化之前先把它搬過來，搬不動就中止啟動（見 migrateLegacyState）。所以走到
+// 這裡時，a.stateDir 上的那一份就是唯一權威。
 func (a *App) ensureGate() (*gate.Service, error) {
 	a.gateOnce.Do(func() {
 		root, err := claude.NormalizeCWD(a.workspaceDir)
@@ -4774,6 +5054,9 @@ func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []g
 // ensureEscalation 惰性初始化 escalation.Service，journal 落在 **a.stateDir** 的
 // escalation.jsonl（同 ensureGate 之於 gate.jsonl——一律綁受 ownership lease
 // 保護的 state root，理由見 ensureGate）。
+//
+// 舊路徑的 escalation.jsonl 同樣由 migrateLegacyState 在啟動早期搬過來：那份
+// journal 裡可能還有未解除的系統管控項目，靜默忽略會直接改變核可結果。
 func (a *App) ensureEscalation() (*escalation.Service, error) {
 	a.escOnce.Do(func() {
 		if _, err := claude.NormalizeCWD(a.workspaceDir); err != nil {
@@ -6031,7 +6314,7 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 		return nil, err
 	}
 	if a.registry == nil {
-		return nil, fmt.Errorf("session registry unavailable (startup error: %s)", a.startupErr)
+		return nil, fmt.Errorf("session registry unavailable (startup error: %s)", a.startupErrText())
 	}
 	if resume != "" { // resume mismatch 拒絕：cwd ＋ WSID **兩者都要相符**（§3.3 D1）
 		boundCWD, boundWSID, ok := a.registry.Lookup(resume)
@@ -6160,7 +6443,15 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			}
 		}
 		if info := claude.ParseInit(ev); info != nil {
-			_ = a.registry.Bind(info.SessionID, cwd, string(w)) // §3.3 D1：綁定帶 WSID
+			// §3.3 D1：綁定帶 WSID。回傳值不得丟棄——收尾之後遲到的 init 會拿到
+			// claude.ErrRegistryClosed，那正是「pump 還活著」的證據，必須留下
+			// 稽核而不是靜默通過（owner 2026-08-19）。其餘寫入失敗（磁碟滿、
+			// 權限）同樣要看得到：綁定沒寫成，下次 resume 就對不到這個 WSID。
+			if berr := a.registry.Bind(info.SessionID, cwd, string(w)); berr != nil {
+				a.audit("claude_registry_bind_error", map[string]any{
+					"wsid": string(w), "sessionId": info.SessionID, "error": berr.Error(),
+					"closed": errors.Is(berr, claude.ErrRegistryClosed)})
+			}
 			noteSessionID(info.SessionID)
 		}
 		a.noteWSEmitError("emit", w, a.manager.Emit(w, ev))

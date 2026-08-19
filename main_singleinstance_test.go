@@ -6,11 +6,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io"
 	"io/fs"
 	"os"
@@ -953,7 +956,7 @@ func TestForgedLeaseIsRejected(t *testing.T) {
 	}
 }
 
-// TestTestOnlyCapabilityHasNoProductionConstructionPath
+// ---- test-only capability 的原始碼掃描（型別解析版）----
 //
 // owner 2026-08-18 範圍：「test-only capability 不得存在於 production 建構路徑，
 // 也不能讓 production caller 自行偽造」。
@@ -961,94 +964,308 @@ func TestForgedLeaseIsRejected(t *testing.T) {
 // 這條**刻意**是原始碼掃描，因為要守的性質本身就是原始碼層級的——「production
 // binary 裡沒有任何地方能把 testOnly 打開」。runtime 量不到「不存在的呼叫」；
 // 同 package 的 struct field 在 Go 裡也沒有語言層的可見性可用。與此對照，
-// 跨 process 的行為守門（bare 入口、拒絕 UX）一律用真 process ＋ 磁碟證據，
-// 不用文字比對。
+// 跨 process 的行為守門（bare 入口、拒絕 UX）一律用真 process ＋ 磁碟證據。
 //
-// 正題斷言：所有非 `_test.go` 的 .go 檔都不得**建構出帶授權的 stateLease**，也不得
-// 賦值 `testOnly`。
+// # 為什麼從 go/ast 再進一步到 go/types（owner 2026-08-19）
 //
-// **用 go/ast 而不是字串比對**（owner 2026-08-19）：初版掃 `testOnly:` 與
-// `testOnly =`，位置式 composite literal `&stateLease{a.stateDir, nil, true}` 兩者
-// 都不含，掃描綠燈但 app 在別人持鎖時照樣開得出 writer。字串比對守不住語法有多種
-// 寫法的性質——這是失效形狀 (C) 的一個變體：守門本身比它宣稱的弱。
-func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
-	root, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// testOnly 在 stateLease 裡的欄位序（位置式 literal 用得到）。跟著結構定義走，
-	// 欄位順序若變動這裡要跟著改——所以順便斷言欄位數，改了會紅。
-	const leaseFields, testOnlyIdx = 3, 2
-	if n := reflect.TypeOf(stateLease{}).NumField(); n != leaseFields {
-		t.Fatalf("stateLease 欄位數變了（%d→%d）：請同步更新本掃描的位置式 literal 判定",
-			leaseFields, n)
-	}
-	if name := reflect.TypeOf(stateLease{}).Field(testOnlyIdx).Name; name != "testOnly" {
-		t.Fatalf("stateLease 第 %d 個欄位不再是 testOnly（實得 %q）：請同步更新本掃描",
-			testOnlyIdx, name)
-	}
+// 這個守門被繞過兩次，每次都是「掃描比它宣稱的弱」（失效形狀 (C)）：
+//
+//	初版（字串比對）→ 位置式 literal `&stateLease{dir, nil, true}` 不含 `testOnly:`。
+//	第二版（純語法）→ 只認 `x.Type` 是識別字 `stateLease` 的 literal，於是
+//	                  (1) 省略型別的巢狀 literal `[]stateLease{{…, true}}`（x.Type 為 nil）
+//	                  (2) type alias `type l = stateLease` 之後的 `l{testOnly: true}`
+//	                  兩種寫法都掃不到。
+//
+// 語法有無限多種寫法，型別只有一個。所以判定改成「這個 composite literal 的
+// **型別**是不是 stateLease」——由 go/types 回答，alias 自動解開、省略型別的巢狀
+// literal 也由上下文推得出型別。欄位序不再硬編，改由型別本身查出來。
 
-	var offenders []string
-	note := func(fset *token.FileSet, pos token.Pos, why string) {
-		p := fset.Position(pos)
-		rel, _ := filepath.Rel(root, p.Filename)
-		offenders = append(offenders, fmt.Sprintf("%s:%d: %s", rel, p.Line, why))
+// forbiddenFieldWrite：掃描結果的一筆（檔案位置 ＋ 原因）。
+type forbiddenFieldWrite struct {
+	pos token.Position
+	why string
+}
+
+// scanFieldWrites：在已型別檢查的 files 裡找出所有「寫入 target 型別的 field 欄位」
+// 的地方——composite literal（keyed／位置式／省略型別的巢狀）與直接賦值都算。
+//
+// target 是型別物件而不是名字：alias 與同名的別種型別因此天然分得開。
+func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
+	target *types.Named, field string) []forbiddenFieldWrite {
+	st, ok := target.Underlying().(*types.Struct)
+	if !ok {
+		return nil
 	}
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	fieldIdx := -1
+	for i := range st.NumFields() {
+		if st.Field(i).Name() == field {
+			fieldIdx = i
 		}
-		if d.IsDir() {
-			if name := d.Name(); name == "node_modules" || name == "frontend" || name == ".git" {
-				return fs.SkipDir
-			}
+	}
+	if fieldIdx < 0 {
+		return nil
+	}
+	// litType：composite literal 的具名型別（`&T{}`／`[]*T{{…}}` 的元素都會落到
+	// 這裡，指標先解開）。省略型別的巢狀 literal 沒有 x.Type，型別由 info 提供。
+	//
+	// **types.Unalias 是必要的，不是保險**：Go 1.23 起 `type l = T` 在型別系統裡
+	// 是獨立的 *types.Alias 節點，不解開的話 alias 那條繞過路徑照樣掃不到——本檔
+	// 的 fixture 測試就是這樣抓到第一版修法仍然漏掉它的。
+	litType := func(x *ast.CompositeLit) *types.Named {
+		tv, found := info.Types[x]
+		if !found {
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		typ := types.Unalias(tv.Type)
+		if p, isPtr := typ.(*types.Pointer); isPtr {
+			typ = types.Unalias(p.Elem())
+		}
+		n, isNamed := typ.(*types.Named)
+		if !isNamed {
 			return nil
 		}
-		fset := token.NewFileSet()
-		f, perr := parser.ParseFile(fset, path, nil, 0)
-		if perr != nil {
-			return perr
-		}
+		return n
+	}
+	var out []forbiddenFieldWrite
+	note := func(pos token.Pos, why string) {
+		out = append(out, forbiddenFieldWrite{pos: fset.Position(pos), why: why})
+	}
+	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.CompositeLit:
-				// `stateLease{...}` —— keyed 與 positional 兩種寫法都要抓。
-				id, ok := x.Type.(*ast.Ident)
-				if !ok || id.Name != "stateLease" {
+				if lt := litType(x); lt == nil || lt.Obj() != target.Obj() {
 					return true
 				}
 				for i, el := range x.Elts {
 					if kv, keyed := el.(*ast.KeyValueExpr); keyed {
-						if k, _ := kv.Key.(*ast.Ident); k != nil && k.Name == "testOnly" {
-							note(fset, kv.Pos(), "stateLease composite literal 設定 testOnly（keyed）")
+						if k, _ := kv.Key.(*ast.Ident); k != nil && k.Name == field {
+							note(kv.Pos(), target.Obj().Name()+" composite literal 設定 "+field+"（keyed）")
 						}
 						continue
 					}
-					if i == testOnlyIdx {
-						note(fset, el.Pos(), "stateLease composite literal 設定 testOnly（位置式）")
+					if i == fieldIdx {
+						note(el.Pos(), target.Obj().Name()+" composite literal 設定 "+field+"（位置式）")
 					}
 				}
 			case *ast.AssignStmt:
-				// `x.testOnly = ...`（含 := 與各種複合賦值）。
+				// `x.field = ...`（含 := 與各種複合賦值）。用 Selections 確認選到的
+				// 真的是 target 的那個欄位，不是別的型別上剛好同名的欄位。
 				for _, lhs := range x.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "testOnly" {
-						note(fset, sel.Pos(), "對 testOnly 欄位賦值")
+					sel, isSel := lhs.(*ast.SelectorExpr)
+					if !isSel || sel.Sel.Name != field {
+						continue
 					}
+					s := info.Selections[sel]
+					if s == nil || s.Obj() != st.Field(fieldIdx) {
+						continue
+					}
+					note(sel.Pos(), "對 "+target.Obj().Name()+"."+field+" 賦值")
 				}
 			}
 			return true
 		})
-		return nil
-	})
+	}
+	return out
+}
+
+// typeCheckProductionPackage：對 **production package main**（所有非 `_test.go`
+// 的 .go 檔）做完整型別檢查。
+//
+// 依賴的型別資訊來自 `go list -deps -export` 產生的 gc export data——那份在
+// `go test` 建置本 package 時已經生成，所以這裡只是查快取（實測約 1 秒），不會
+// 重新編譯整棵相依樹。刻意不用 source importer：那會從原始碼重新檢查 wails 等
+// 大型相依，慢上兩個數量級。
+func typeCheckProductionPackage(t *testing.T) (*token.FileSet, []*ast.File, *types.Info, *types.Package) {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-deps", "-export", "-json", ".").Output()
+	if err != nil {
+		t.Fatalf("go list -deps -export：%v", err)
+	}
+	exports := map[string]string{}
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var p struct{ ImportPath, Export string }
+		if derr := dec.Decode(&p); derr != nil {
+			break
+		}
+		if p.Export != "" {
+			exports[p.ImportPath] = p.Export
+		}
+	}
+	ents, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(offenders) != 0 {
-		t.Fatalf("test-only ownership capability 不得有 production 建構路徑，實得：\n%s",
-			strings.Join(offenders, "\n"))
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, perr := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if perr != nil {
+			t.Fatalf("parse %s：%v", name, perr)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatal("掃描前提不成立：找不到任何 production .go 檔")
+	}
+	info := &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+	conf := types.Config{Importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		p, found := exports[path]
+		if !found {
+			return nil, fmt.Errorf("找不到 %s 的 export data", path)
+		}
+		return os.Open(p)
+	})}
+	// 型別檢查必須乾淨通過：帶著錯誤的 info 會有一堆 Invalid 型別，掃描就從
+	// 「型別解析」退化成「碰巧掃到的那些」——那正是這條守門兩次被繞過的形狀。
+	pkg, cerr := conf.Check("github.com/slam0504/sdlc-workbench", fset, files, info)
+	if cerr != nil {
+		t.Fatalf("production package 型別檢查失敗，掃描結果不可信：%v", cerr)
+	}
+	return fset, files, info, pkg
+}
+
+// namedType：從 package scope 取出具名型別（找不到即測試前提不成立）。
+func namedType(t *testing.T, pkg *types.Package, name string) *types.Named {
+	t.Helper()
+	obj := pkg.Scope().Lookup(name)
+	if obj == nil {
+		t.Fatalf("掃描前提不成立：package %s 裡找不到型別 %s", pkg.Name(), name)
+	}
+	n, ok := obj.Type().(*types.Named)
+	if !ok {
+		t.Fatalf("%s 不是具名型別（實得 %T）", name, obj.Type())
+	}
+	return n
+}
+
+// TestTestOnlyCapabilityHasNoProductionConstructionPath
+//
+// 正題斷言：production package main 裡沒有任何地方**寫入** stateLease.testOnly
+// ——不論用哪種語法。
+func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
+	fset, files, info, pkg := typeCheckProductionPackage(t)
+	found := scanFieldWrites(fset, files, info, namedType(t, pkg, "stateLease"), "testOnly")
+	if len(found) == 0 {
+		return
+	}
+	lines := make([]string, 0, len(found))
+	for _, o := range found {
+		lines = append(lines, fmt.Sprintf("%s:%d: %s", filepath.Base(o.pos.Filename), o.pos.Line, o.why))
+	}
+	t.Fatalf("test-only ownership capability 不得有 production 建構路徑，實得：\n%s",
+		strings.Join(lines, "\n"))
+}
+
+// TestFieldWriteScanCatchesKnownBypasses
+//
+// 掃描本身的防回歸測試：把 reviewer 用來繞過前一版掃描的**兩個寫法**餵給它，
+// 必須全部被抓到。沒有這一條的話，「掃描綠燈」只證明掃描沒掃到，不證明沒有洞。
+//
+// 用合成 package 而不是在 production 檔裡放違規程式碼：後者會讓正題那條測試
+// 永遠是紅的。合成 package 不 import 任何東西，所以型別檢查不需要 export data。
+func TestFieldWriteScanCatchesKnownBypasses(t *testing.T) {
+	const src = `package fixture
+
+type stateLease struct {
+	stateDir string
+	lock     *int
+	testOnly bool
+}
+
+// 繞過案例 1：type alias——語法上的型別名字不是 "stateLease"。
+type leaseAlias = stateLease
+
+// 繞過案例 2：省略型別的巢狀 literal——內層 literal 根本沒有 Type 節點。
+var viaSlice = []stateLease{{"/d", nil, true}}
+var viaMap = map[string]*stateLease{"k": {testOnly: true}}
+var viaAlias = leaseAlias{testOnly: true}
+
+// 既有兩種寫法（不得回歸）。
+var keyed = stateLease{stateDir: "/d", testOnly: true}
+var positional = &stateLease{"/d", nil, true}
+
+func assigns() {
+	var l stateLease
+	l.testOnly = true
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+	pkg, err := (&types.Config{}).Check("fixture", fset, []*ast.File{f}, info)
+	if err != nil {
+		t.Fatalf("fixture 型別檢查失敗：%v", err)
+	}
+	files := []*ast.File{f}
+	target := namedType(t, pkg, "stateLease")
+
+	got := map[int]string{}
+	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly") {
+		got[o.pos.Line] = o.why
+	}
+	// 每一個 want 是「該行必須被抓到」——行號寫死是刻意的，這樣改壞掃描時失敗訊息
+	// 直接指出是哪一種寫法漏了。
+	wants := []struct {
+		line int
+		what string
+	}{
+		{13, "省略型別的巢狀 literal（slice、位置式）"},
+		{14, "省略型別的巢狀 literal（map、指標元素、keyed）"},
+		{15, "type alias"},
+		{18, "keyed literal"},
+		{19, "位置式 literal"},
+		{23, "直接賦值"},
+	}
+	for _, w := range wants {
+		if _, ok := got[w.line]; !ok {
+			t.Errorf("掃描漏掉「%s」（fixture.go:%d），實得：%v", w.what, w.line, got)
+		}
+	}
+	// 反向：沒有寫入 testOnly 的 package 必須是乾淨的（掃描不是無條件打紅）。
+	const clean = `package fixture
+
+type stateLease struct {
+	stateDir string
+	testOnly bool
+}
+
+var ok1 = stateLease{stateDir: "/d"}
+
+func reads() bool {
+	l := stateLease{}
+	return l.testOnly
+}
+`
+	cfset := token.NewFileSet()
+	cf, err := parser.ParseFile(cfset, "clean.go", clean, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cinfo := &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+	cpkg, err := (&types.Config{}).Check("fixture", cfset, []*ast.File{cf}, cinfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := scanFieldWrites(cfset, []*ast.File{cf}, cinfo, namedType(t, cpkg, "stateLease"), "testOnly"); len(n) != 0 {
+		t.Fatalf("沒有寫入 testOnly 的 package 不得被判違規，實得 %v", n)
 	}
 }
 

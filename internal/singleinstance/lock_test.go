@@ -132,3 +132,27 @@ func TestAcquireFailsClosedOnUnwritableDir(t *testing.T) {
 		t.Fatalf("權限錯誤不是「已在執行中」：%v", err)
 	}
 }
+
+// TestAcquireRequiresExistingStateDir
+//
+// **Acquire 不建目錄**——它只 open <stateDir>/instance.lock。這條把那個契約釘死：
+// 呼叫端（App.acquireStateLease、cmd/probe-multiturn）必須自己先把空的 state
+// directory 建出來，否則全新 workspace 的第一次啟動會被當成「環境有問題」拒絕。
+//
+// 曾經有一版註解寫成「Acquire 自己會把 stateDir 建出來」，而呼叫端據此把
+// MkdirAll 整個拿掉（owner 2026-08-19 F4）。把 MkdirAll 加進 Acquire 也會讓這條
+// 紅——那同樣是要被討論的變更，不該無聲發生。
+func TestAcquireRequiresExistingStateDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "not-created-yet")
+	l, err := Acquire(missing)
+	if err == nil {
+		_ = l.Release()
+		t.Fatal("Acquire 不負責建立 state directory：目錄不存在時必須回錯誤（呼叫端要先建空目錄）")
+	}
+	if errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("目錄不存在不是「已在執行中」：%v", err)
+	}
+	if _, serr := os.Stat(missing); !os.IsNotExist(serr) {
+		t.Fatalf("失敗的 Acquire 不得留下任何東西，stat=%v", serr)
+	}
+}
