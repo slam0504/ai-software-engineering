@@ -1066,37 +1066,48 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 	// 目前所在的函式（Rule C 的豁免判定用；top-level 宣告為空字串）。
 	var currentFunc string
 	for _, f := range files {
+		var ancestors []ast.Node
 		walk := func(n ast.Node) bool {
+			if n == nil { // ast.Inspect 以 nil 通知離開該節點
+				ancestors = ancestors[:len(ancestors)-1]
+				return true
+			}
+			defer func() { ancestors = append(ancestors, n) }()
 			switch x := n.(type) {
 			case *ast.SelectorExpr:
-				// Rule C：**任何**對 field 的引用，除了唯一被允許的讀取點。
+				// Rule C：**任何**對 field 的引用，除了唯一被允許的那個讀取運算式。
 				//
 				// 前幾版逐一列舉「寫入的語法位置」（composite literal → 賦值 →
-				// 轉型），每一版都被下一種語法繞過；最後一次是 range 的賦值形式
+				// 轉型 → range 賦值），每一版都被下一種語法繞過。所以不再問「這是
+				// 不是寫入」，改問「**憑什麼碰它**」。
 				//
-				//	for _, l.testOnly = range []bool{true} { break }
+				// 而例外的粒度是**運算式**、不是函式（reviewer 2026-08-19）：放行
+				// 整個 ownsStateDir 的話，在它裡面寫
 				//
-				// 而位置還有 `&l.testOnly` 之後透過指標寫、IncDec、多重賦值…列舉
-				// 不完（reviewer 2026-08-19 P1）。
+				//	p := &l.testOnly
+				//	*p = true
 				//
-				// 所以不再問「這是不是寫入」，改問「**憑什麼碰它**」：production
-				// 只有一個地方有理由引用這個欄位（capability 的判定式本身），其餘
-				// 一律違規。讀寫都擋，因為新的讀取點同樣代表這個 capability 的語意
-				// 外洩到別處，該被人看到。
+				// 照樣通過，而且實測能讓沒有 kernel lock 的 lease 過關。所以被允許
+				// 的函式裡也只放行「單純讀取」——取址、賦值、range 賦值、以及任何
+				// 出現在 closure 裡的引用一律違規（closure 會把這個欄位的可寫性帶
+				// 到別的生命週期去）。
 				if x.Sel.Name != field {
 					return true
 				}
 				if s := info.Selections[x]; s == nil || s.Kind() != types.FieldVal {
 					return true
 				}
-				if allowedReaders[currentFunc] {
-					return true
-				}
 				where := currentFunc
 				if where == "" {
 					where = "套件層宣告"
 				}
-				note(x.Pos(), "在 "+where+" 引用 ."+field+" 欄位（只有 "+readerList(allowedReaders)+" 可以）")
+				if !allowedReaders[currentFunc] {
+					note(x.Pos(), "在 "+where+" 引用 ."+field+" 欄位（只有 "+readerList(allowedReaders)+" 的純讀取可以）")
+					return true
+				}
+				if why := impureUse(x, ancestors); why != "" {
+					note(x.Pos(), "在 "+where+" 對 ."+field+" "+why+"（例外只涵蓋單純讀取）")
+				}
 			case *ast.CompositeLit:
 				st := litStruct(x)
 				if st == nil {
@@ -1165,6 +1176,42 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 		}
 	}
 	return out
+}
+
+// impureUse：被允許的讀取點裡，這個引用是不是**超出純讀取**（回傳原因；空字串
+// ＝合格的讀取）。
+//
+// ancestors 由近到遠，最後一個是直接父節點。
+func impureUse(x *ast.SelectorExpr, ancestors []ast.Node) string {
+	for _, n := range ancestors {
+		if _, isLit := n.(*ast.FuncLit); isLit {
+			return "在 closure 內引用"
+		}
+	}
+	if len(ancestors) == 0 {
+		return ""
+	}
+	switch parent := ancestors[len(ancestors)-1].(type) {
+	case *ast.UnaryExpr:
+		if parent.Op == token.AND {
+			return "取位址（之後可透過指標寫入）"
+		}
+	case *ast.AssignStmt:
+		for _, lhs := range parent.Lhs {
+			if lhs == ast.Expr(x) {
+				return "賦值"
+			}
+		}
+	case *ast.RangeStmt:
+		if parent.Key == ast.Expr(x) || parent.Value == ast.Expr(x) {
+			return "range 賦值"
+		}
+	case *ast.IncDecStmt:
+		if parent.X == ast.Expr(x) {
+			return "遞增／遞減"
+		}
+	}
+	return ""
 }
 
 // funcKey：`(*stateLease).ownsStateDir` 這種形狀的函式識別字（沒有 receiver 時
@@ -1282,8 +1329,37 @@ func namedType(t *testing.T, pkg *types.Package, name string) *types.Named {
 // ——不論用哪種語法。
 func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
-	found := scanFieldWrites(fset, files, info, namedType(t, pkg, "stateLease"), "testOnly",
-		stateLeaseReaders)
+	target := namedType(t, pkg, "stateLease")
+
+	// 同名欄位只能有一個。第二個 `testOnly` 欄位會讓 Rule C 的「唯一讀取點」失去
+	// 意義（另一個型別上的同名欄位可以自由寫，再靠可賦值流進 stateLease），也會
+	// 讓錯誤訊息無法分辨是哪一個（reviewer 2026-08-19）。
+	var owners []string
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			ts, isType := n.(*ast.TypeSpec)
+			if !isType {
+				return true
+			}
+			st, isStruct := ts.Type.(*ast.StructType)
+			if !isStruct || st.Fields == nil {
+				return true
+			}
+			for _, fld := range st.Fields.List {
+				for _, nm := range fld.Names {
+					if nm.Name == "testOnly" {
+						owners = append(owners, ts.Name.Name)
+					}
+				}
+			}
+			return true
+		})
+	}
+	if len(owners) != 1 || owners[0] != "stateLease" {
+		t.Fatalf("production 只能有 stateLease 一個 testOnly 欄位，實得：%v", owners)
+	}
+
+	found := scanFieldWrites(fset, files, info, target, "testOnly", stateLeaseReaders)
 	if len(found) == 0 {
 		return
 	}
@@ -1363,6 +1439,22 @@ func viaPointer() *stateLease {
 	*p = true
 	return l
 }
+
+// 繞過案例 7：**在被允許的讀取函式內部**取址再寫——例外若放行整個 method 就會
+// 通過，實測能讓沒有 kernel lock 的 lease 過關。
+func (l *stateLease) ownsStateDir(dir string) bool {
+	if l.testOnly { // 合法：唯一被允許的純讀取
+		return true
+	}
+	p := &l.testOnly // 違規：取址
+	*p = true
+	return false
+}
+
+// 繞過案例 8：closure 捕捉——把可寫性帶到別的生命週期。
+func (l *stateLease) leak() func() {
+	return func() { l.testOnly = true }
+}
 `
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
@@ -1381,7 +1473,8 @@ func viaPointer() *stateLease {
 	target := namedType(t, pkg, "stateLease")
 
 	got := map[int]string{}
-	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly", nil) {
+	fixtureReaders := map[string]bool{"(*stateLease).ownsStateDir": true}
+	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly", fixtureReaders) {
 		got[o.pos.Line] = o.why
 	}
 	// 每個 want 用 fixture 裡的一段原始碼定位，不寫死行號——行號會隨 fixture 增補
@@ -1406,6 +1499,8 @@ func viaPointer() *stateLease {
 		{"l.testOnly = true", "直接賦值"},
 		{"for _, l.testOnly = range", "range 的賦值形式"},
 		{"p := &l.testOnly", "取位址後透過指標寫"},
+		{"p := &l.testOnly // 違規：取址", "被允許的讀取函式內部取址"},
+		{"return func() { l.testOnly = true }", "closure 捕捉"},
 	}
 	for _, w := range wants {
 		if line := lineOf(w.needle); got[line] == "" {

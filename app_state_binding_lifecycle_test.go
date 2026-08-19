@@ -283,12 +283,68 @@ func TestShutdownRetainsLeaseWhileStartupStillRunning(t *testing.T) {
 		t.Fatalf("稽核必須指出是 startup 這一維沒停，實得：%s", line)
 	}
 
+	// retained 結局必須**立刻**發生：不得先把 watcher／manager 收掉再保留 lease，
+	// 否則晚到的 startup 會在一個半收的 app 上把 watcher 重新建起來
+	// （reviewer 2026-08-19 實測 shutdown 返回後 spec=true plan=true）。
+	for _, step := range []string{"stop_watchers", "snapshot", "manager_close", "registry_sync"} {
+		if containsStep(steps, step) {
+			t.Fatalf("startup 未收斂時不得繼續收尾流程，實得走到 %q：%v", step, steps)
+		}
+	}
+	if a.manager != nil && a.manager.Closed() {
+		t.Fatal("retained 結局不得關閉 manager——startup 仍可能用到它")
+	}
+
 	close(release)
 	<-startupDone
 	// 損害控制：收尾已經開始之後，startup 不再補建 evidence journal。
 	if _, err := os.Stat(filepath.Join(a.stateDir, "evidence", "evidence.jsonl")); err == nil {
 		t.Fatal("收尾開始之後 startup 不得再建立 evidence journal")
 	}
+}
+
+// TestSecondStartupIsRefusedNotSilentlyOverwritingOwner
+//
+// startup lifecycle 的 ownership 只能有一個。先前每次進場都重建 startupDone，
+// 兩個並行時先結束的那個會關掉 channel、把 startupRunning 設回 false，於是
+// shutdown 誤判「startup 都停了」而釋放 lease——但另一個可能還在開 writer
+// （reviewer 2026-08-19）。
+//
+// 正題斷言：第一個 startup 還卡在半途時，第二個 startup 被拒（沒有接管
+// ownership），而且此刻 shutdown 仍判定 startup 未收斂 → 保留 lease。
+func TestSecondStartupIsRefusedNotSilentlyOverwritingOwner(t *testing.T) {
+	a := auditLifecycleApp(t)
+	a.emitUI = func(string, any) {}
+	zero := time.Duration(0)
+	a.startupDrain = &zero
+
+	paused, release := make(chan struct{}), make(chan struct{})
+	a.hookStartupPublish = func() {
+		close(paused)
+		<-release
+	}
+	firstDone := make(chan struct{})
+	go func() { a.startup(context.Background()); close(firstDone) }()
+	<-paused
+
+	// 第二個 startup：必須被拒，且**不得**動到 owner 的 lifecycle 狀態。
+	a.startup(context.Background())
+	if !strings.Contains(a.startupErrText(), "已有另一個啟動流程") {
+		t.Fatalf("第二個 startup 必須被明確拒絕並說明原因，實得橫幅：%q", a.startupErrText())
+	}
+
+	var steps []string
+	a.hookShutdownStep = func(s string) { steps = append(steps, s) }
+	a.shutdown(context.Background())
+	if leaseReleased(t, a.stateDir) {
+		t.Fatal("第一個 startup 仍在跑時不得釋放 lease——第二個 startup 不該把 owner 的收斂訊號蓋掉")
+	}
+	if !containsStep(steps, "instance_lease_retained") {
+		t.Fatalf("必須走保留路徑，實得步驟：%v", steps)
+	}
+
+	close(release)
+	<-firstDone
 }
 
 // TestStartupRefusedAfterShutdown

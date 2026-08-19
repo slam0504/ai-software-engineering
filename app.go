@@ -1327,12 +1327,19 @@ func (a *App) stateBlockedErr() error {
 	return errors.New(a.stateBlocked)
 }
 
-// beginStartupLifecycle：startup 進場登記。回 false ＝ 已在收尾，**一個 writer
-// 都不得開**（見 startupRunning 欄位 doc）。
+// beginStartupLifecycle：startup 進場登記。回 false ＝ 不得進場，**一個 writer
+// 都不能開**。兩種情形：
+//
+//	已在收尾    → shutdown 已經開始，這次 startup 什麼都不該做。
+//	已有 owner  → 另一個 startup 正在跑。**明確拒絕，不覆寫 owner**
+//	              （reviewer 2026-08-19）：先前每次進場都重建 startupDone，兩個
+//	              並行時先結束的那個會關掉 channel、把 startupRunning 設回 false，
+//	              於是 shutdown 誤判「startup 都停了」而釋放 lease——但另一個可能
+//	              還在開 writer。owner 只能有一個，channel 只能被建立一次。
 func (a *App) beginStartupLifecycle() bool {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
-	if a.phase == phaseShuttingDown {
+	if a.phase == phaseShuttingDown || a.startupRunning {
 		return false
 	}
 	a.startupRunning = true
@@ -1340,7 +1347,8 @@ func (a *App) beginStartupLifecycle() bool {
 	return true
 }
 
-// endStartupLifecycle：startup 離場（不論成功、被擋或中途失敗）。
+// endStartupLifecycle：startup owner 離場（不論成功、被擋或中途失敗）。只有真正
+// 取得 ownership 的那一次才會呼叫到——被拒的 startup 直接 return，不進這裡。
 func (a *App) endStartupLifecycle() {
 	a.shutMu.Lock()
 	done := a.startupDone
@@ -1435,7 +1443,7 @@ func (a *App) phaseNow() appPhase {
 //	    衝突」是真的會發生的順序；用另一把鎖上的 latch 擋不住它，用同一把鎖才行。
 //
 // **只掛在 exported binding 上**，內部呼叫走各自的 unexported 版本（如
-// gateEntries）——巢狀的 begin/end 雖然計數上安全，但會讓「shutdown 剛好落在
+// gateList）——巢狀的 begin/end 雖然計數上安全，但會讓「shutdown 剛好落在
 // 內外兩次 begin 之間」變成操作做到一半才失敗，那是新造出來的失敗模式。
 //
 // 涵蓋範圍不靠手寫清單維護：見 app_binding_surface_test.go 的結構守門（從所有
@@ -1932,6 +1940,9 @@ func (a *App) startup(ctx context.Context) {
 	// startup 自己也在 lifecycle 之內：收尾已經開始就一個 writer 都不開，而且
 	// shutdown 會等這一段收斂才決定要不要釋放 lease（見 startupRunning 欄位）。
 	if !a.beginStartupLifecycle() {
+		// 被拒：收尾已開始，或已經有另一個 startup owner。兩種都不得開任何
+		// writer；被跳過的步驟不能無聲，所以留一則橫幅（audit 此刻不一定開著）。
+		a.noteStartupBlocker("拒絕啟動：收尾已開始或已有另一個啟動流程在進行，本次不開啟任何 session 狀態。")
 		return
 	}
 	defer a.endStartupLifecycle()
@@ -2612,10 +2623,18 @@ func (a *App) shutdown(ctx context.Context) {
 	// 1a) 等 startup 收斂。startup 不是 binding，phase 擋不住它——它可能正停在
 	// 半途，稍後繼續建立 evidence journal 之類的 writer。等不到就記下來，第 13
 	// 步據此**不釋放 lease**（處理原則同背景 frame worker）。
-	startupStopped := a.awaitStartupStopped(a.startupDrainWindow())
-	if !startupStopped {
-		a.audit("shutdown_startup_still_running", map[string]any{
-			"note": "startup 未在收尾窗口內結束；保留 ownership lease，由 process 結束時交還作業系統"})
+	// **等不到就直接進 retained 結局，不再往下收任何資源**（reviewer 2026-08-19）：
+	// 先前只是記下來繼續跑，於是 watcher 被停、manager／wire 被關，晚到的 startup
+	// 隨後又把 spec／plan watcher 重新建起來——資源狀態比不收更糟。retained 路徑
+	// 的原則是「保留所有 startup 仍可能用到的東西，交由 process exit 一起回收」。
+	if !a.awaitStartupStopped(a.startupDrainWindow()) {
+		a.audit("instance_lease_retained", map[string]any{
+			"startupStopped": false,
+			"reason":         "startup 未在收尾窗口內結束",
+			"note": "lease、session registry、audit writer 與所有 startup 仍可能使用的資源" +
+				"一併留到 process 結束，由作業系統回收"})
+		a.shutdownStep("instance_lease_retained")
+		return
 	}
 
 	a.stopSpecWatch()       // 2) 停 spec/ watcher：先收斂，避免與後續 manager.Close() 競態
@@ -2753,8 +2772,9 @@ func (a *App) shutdown(ctx context.Context) {
 	//	workerStopped → 背景 frame 展開 worker（寫 audit.jsonl、覆寫 sidecar）
 	//	pumpsStopped  → 每個 Claude host 的 pump goroutine（寫 events sink、
 	//	                經 init 綁定改寫 sessions.json）
-	//	startupStopped → startup 本身（還沒跑完的話，evidence journal／gate 之類
-	//	                的 writer 隨時會被它建出來）
+	//
+	// startup 本身也是一種背景 writer，但它在第 1a 步就處理掉了——等不到就直接
+	// 早退，連下面這些收尾都不做。
 	//
 	// 任一為 false 就走保留路徑：**一律不手動釋放**，process 在仍持鎖的狀態下
 	// 結束，OS 同時回收 kernel lock 與 fd，殘留寫入因此永遠落在「我們仍持有
@@ -2763,12 +2783,11 @@ func (a *App) shutdown(ctx context.Context) {
 	// 沒人處理的錯誤，而磁碟事實的正確性靠的是鎖還在，不是 handle 關了。
 	//
 	// contract §5：不得為了滿足 shutdown timeout 而提早釋放 lease。
-	if !workerStopped || !pumpsStopped || !startupStopped {
+	if !workerStopped || !pumpsStopped {
 		a.audit("instance_lease_retained", map[string]any{
 			"workerStopped": workerStopped, "pumpsStopped": pumpsStopped,
-			"startupStopped": startupStopped,
-			"reason":         "背景 writer 未在收尾窗口內退出（frame 展開 worker／Claude pump／startup 本身）",
-			"note":           "lease、session registry 與 audit writer 一併留到 process 結束，由作業系統回收"})
+			"reason": "背景 writer 未在收尾窗口內退出（frame 展開 worker／Claude pump）",
+			"note":   "lease、session registry 與 audit writer 一併留到 process 結束，由作業系統回收"})
 		a.shutdownStep("instance_lease_retained")
 		return
 	}
@@ -4655,7 +4674,7 @@ func (a *App) submitPlanForApproval(planID string) (string, error) {
 		return "", err
 	}
 
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return "", err
 	}
@@ -4872,7 +4891,7 @@ func (a *App) runEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 	}
 
 	a.workflowMu.Lock()
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		a.workflowMu.Unlock()
 		return "", err
@@ -5069,7 +5088,7 @@ func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
 // caller-supplied testCommit's own ancestry. Validate only: no worktree, no
 // command execution.
 func (a *App) validateTestCommit(planID, taskID, testCommit string) error {
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return err
 	}
@@ -5116,7 +5135,7 @@ func (a *App) EvidenceCommitCandidates(planID string) ([]CommitInfo, error) {
 // when the range has no commits, never nil, so the frontend can render it
 // without a null-check.
 func (a *App) evidenceCommitCandidates(planID string) ([]CommitInfo, error) {
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return nil, err
 	}
@@ -5200,7 +5219,7 @@ func (a *App) submitTestContract(planID, taskID, testCommit, expectedRedID, nega
 		return "", errors.New("evidence: not initialized")
 	}
 
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return "", err
 	}
@@ -5296,7 +5315,7 @@ func (a *App) GateDecisionContext(approvalID string) (GateDecisionContextDTO, er
 // worktree：送核後修改 worktree plan 不得改變這裡的回傳值（committed 才是
 // 核可對象），前端不得以目前 worktree plan 推導 minimum／planner。
 func (a *App) gateDecisionContext(approvalID string) (GateDecisionContextDTO, error) {
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return GateDecisionContextDTO{}, err
 	}
@@ -5351,17 +5370,17 @@ type GateEntryDTO struct {
 // degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
 //
 // 這是 Wails binding，所以走 beginStateTxn（shutdown 等待 ＋ migration blocker）；
-// app 內部要同一份 projection 的地方一律呼叫 gateEntries，不重入交易閘。
+// app 內部要同一份 projection 的地方一律呼叫 gateList，不重入交易閘。
 func (a *App) GateList() ([]GateEntryDTO, error) {
 	if err := a.beginStateTxn(); err != nil {
 		return nil, err
 	}
 	defer a.endAppTxn()
-	return a.gateEntries()
+	return a.gateList()
 }
 
-// gateEntries：GateList 的本體（不進交易閘，見 beginStateTxn 的 doc）。
-func (a *App) gateEntries() ([]GateEntryDTO, error) {
+// gateList：GateList 的本體（不進交易閘，見 beginStateTxn 的 doc）。
+func (a *App) gateList() ([]GateEntryDTO, error) {
 	svc, err := a.ensureGate()
 	if err != nil {
 		return nil, err
@@ -6093,7 +6112,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
 	}
-	entries, err := a.gateEntries()
+	entries, err := a.gateList()
 	if err != nil {
 		return "", err
 	}
