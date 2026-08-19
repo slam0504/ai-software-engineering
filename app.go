@@ -75,6 +75,15 @@ type App struct {
 	//     或任何會取 auditMu 的東西，否則就是反向鎖序。
 	startupMu  sync.Mutex
 	startupErr string
+	// stateBlocked：啟動被判定為「不得開放任何 state 操作」的原因（空字串＝沒有
+	// 被擋）。目前唯一的來源是舊路徑遷移無法判定權威（見 migrateLegacyState）。
+	//
+	// 為什麼需要一個 latch 而不是「startupAfterWriters 提早 return 就好」：提早
+	// return 只停掉**啟動序列**，Wails binding 仍然掛在 app 上，使用者一按 UI，
+	// GateList()／EscalationCreate() 就會經惰性初始化把新路徑的 journal 開起來、
+	// 甚至寫進去——那等於 production 自己選了新資料那一份，正是遷移中止要避免的
+	// 結果（reviewer 2026-08-19 P1）。所以中止必須是一個會被每個入口讀到的狀態。
+	stateBlocked string
 	// lease：開啟／持有 state writer 的 ownership capability。
 	//
 	// **nil ＝沒有 capability ＝一律拒絕**，不是「沒設就當作沒問題」。所有
@@ -511,8 +520,8 @@ type App struct {
 	// （evidence_id → cancel func，供 shutdown reclaim，鏡射 assistActive）；
 	// finalize（journal append）與 registry 移除在 RunEvidence 內同一臨界區
 	// 完成，這是「恰一次 finalize」保證的落點。evidenceJournal／
-	// evidenceCASDir／evidenceRegistryPath 於 startup 惰性建立於
-	// .workbench/evidence/ 下（journal＝evidence.jsonl，worktree registry＝
+	// evidenceCASDir／evidenceRegistryPath 於 startup 建立於受 ownership lease
+	// 保護的 <stateDir>/evidence/ 下（journal＝evidence.jsonl，worktree registry＝
 	// worktrees.jsonl，同時做一次 CleanupOrphans／CleanOrphanTemps）。
 	evidenceMu           sync.Mutex
 	evidenceActive       map[string]context.CancelFunc
@@ -1269,6 +1278,48 @@ func (a *App) publishNodePath(p string) {
 	a.nodePath = p
 }
 
+// blockStateBindings：把 app 切到「不得開放任何 state 操作」（見欄位 doc）。
+// 只由 migrateLegacyState 的中止路徑設定，設定後不再解除——解除的正確方式是
+// 人工處理完衝突再重新啟動。
+func (a *App) blockStateBindings(reason string) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	if a.stateBlocked == "" {
+		a.stateBlocked = reason
+	}
+}
+
+// stateBlockedErr：state 操作是否被擋下（nil ＝ 沒有）。
+func (a *App) stateBlockedErr() error {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	if a.stateBlocked == "" {
+		return nil
+	}
+	return errors.New(a.stateBlocked)
+}
+
+// beginStateTxn：**所有會讀寫 gate／escalation／evidence 狀態的 Wails binding 的
+// 共同入場點**。成功時呼叫端必須 defer endAppTxn()。
+//
+// 兩件事一起做，因為它們要守的是同一個邊界：
+//
+//	(1) 進 shutdown 的 in-flight 交易 → shutdown 的 inflight.Wait() 會等這一筆
+//	    做完才往下走，lease 因此不可能在 escalation.jsonl 還在被寫的時候釋放
+//	    （reviewer 2026-08-19 P1：EscalationCreate 沒被計數，實測 lease 已釋放、
+//	    第二個 process 已可取鎖之後，原 binding 仍寫得進去）。
+//	(2) 檢查 migration blocker → 遷移無法判定權威時，這些入口一律 fail closed。
+//
+// **只掛在 exported binding 上**，內部呼叫走各自的 unexported 版本（如
+// gateEntries）——巢狀的 begin/end 雖然計數上安全，但會讓「shutdown 剛好落在
+// 內外兩次 begin 之間」變成操作做到一半才失敗，那是新造出來的失敗模式。
+func (a *App) beginStateTxn() error {
+	if err := a.stateBlockedErr(); err != nil {
+		return err
+	}
+	return a.beginAppTxn()
+}
+
 // toolsDir／nodePathValue：單一欄位的讀取器（CLI 路徑組裝、childEnv 用）。
 func (a *App) toolsDir() string {
 	a.startupMu.Lock()
@@ -1783,6 +1834,17 @@ func (a *App) openStateWriters(lease *stateLease) bool {
 			a.stateDir + "）")
 		return false
 	}
+	// 目錄骨架排在 lease 檢查之後、任何 writer 之前（見 resolveWorkspace 的
+	// doc：取鎖之前只允許建出空的 state directory）。建不出來一律 fail closed
+	// ——recordings/ 不存在時錄流會在每個 session 啟動時才失敗，那是更難診斷的
+	// 晚期失效。
+	for _, d := range stateSubdirs {
+		if merr := os.MkdirAll(filepath.Join(a.stateDir, d), 0o755); merr != nil {
+			a.noteStartupBlocker("拒絕開啟 session 狀態：建立 " + d + " 目錄失敗（" +
+				filepath.Join(a.stateDir, d) + "）：" + merr.Error())
+			return false
+		}
+	}
 	// audit **排在所有 writer 之前**：它開不起來就要 return false，排在後面的話
 	// 前面已經開的 handle（registry）沒有人關——那個 fd 與它建出來的
 	// sessions.json 會一路活到 process 結束（review 🟡6）。
@@ -1955,14 +2017,19 @@ func (a *App) migrateLegacyState() bool {
 // blockLegacyMigration：遷移失敗的唯一出口——稽核 ＋ UI 橫幅，回 false 讓
 // startupAfterWriters 原地中止。
 func (a *App) blockLegacyMigration(name, why string) bool {
+	msg := "拒絕啟動：" + name + " 的舊路徑遷移未完成——" + why +
+		"。在遷移完成之前不開放 session，也不開放核可與阻擋事項操作，" +
+		"以免用不完整的記錄繼續執行。"
 	a.audit("legacy_state_migration_blocked", map[string]any{"name": name, "reason": why})
-	a.noteStartupBlocker("拒絕啟動：" + name + " 的舊路徑遷移未完成——" + why +
-		"。在遷移完成之前不開放 session，以免用不完整的核可與阻擋記錄繼續執行。")
+	a.noteStartupBlocker(msg)
+	// 光是中止啟動序列不夠：Wails binding 仍掛著，UI 一按就會經惰性初始化把新
+	// 路徑的 journal 開起來（見 stateBlocked 欄位 doc）。
+	a.blockStateBindings(msg)
 	return false
 }
 
 // startupEvidence（Task 20）：惰性 gate/plan 之外少數在 startup 就建立的狀態——
-// evidence journal／CAS／worktree registry 路徑都落在 .workbench/evidence/
+// evidence journal／CAS／worktree registry 路徑都落在 <stateDir>/evidence/
 // 下，且 CleanupOrphans／CleanOrphanTemps 必須在任何 RunEvidence 呼叫之前跑
 // 過一次，才能收乾淨上次程序異常結束留下的 worktree／temp 殘留（brief 凍結：
 // 下次啟動兜底逾時 forcedShutdown 未清乾淨的窗口）。liveIDs 傳空 map：啟動當下
@@ -1973,7 +2040,7 @@ func (a *App) blockLegacyMigration(name, why string) bool {
 func (a *App) startupEvidence() {
 	// 綁 a.stateDir（受 ownership lease 保護），不是 workspaceDir/.workbench
 	// ——理由見 ensureGate 的 doc（tmp fallback 下兩者不同值）。舊路徑上的殘留由
-	// migrateLegacyJournals 在啟動更早的一步處置，這裡不再讀 workspaceDir。
+	// migrateLegacyState 在啟動更早的一步處置，這裡不再讀 workspaceDir。
 	dir := filepath.Join(a.stateDir, "evidence")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		a.setStartupErrOnce("evidence dir init failed: " + err.Error())
@@ -2741,7 +2808,16 @@ func (a *App) teardownHook(h func(appcore.WSID), w appcore.WSID) {
 // ---- helpers ----
 
 // resolveWorkspace：env WORKBENCH_WORKSPACE → 可寫的 cwd（Finder 啟動時 cwd 是 "/"，
-// 不可寫）→ home。第一個能建出 .workbench/recordings 的候選勝出。
+// 不可寫）→ home。第一個能建出 `.workbench` 的候選勝出。
+//
+// **只建那個空目錄，不建 recordings/ 與 probe/**（reviewer 2026-08-19 P1）：這個
+// 函式跑在取得 ownership lease **之前**（acquireStateLease 要先知道鎖要綁在哪
+// 裡），所以它建出來的每一個東西都是「取鎖前的 state mutation」。空的 state
+// directory 是唯一允許的例外（見 acquireStateLease）；recordings/ 與 probe/ 是
+// session 狀態的落點，改由 openStateWriters 在**出示 lease 之後**建立。
+//
+// 可寫性的候選判準因此從「建得出 recordings」變成「建得出 .workbench」——同樣
+// 是一次真的 MkdirAll，擋得住唯讀候選，但不留下多餘的目錄。
 func resolveWorkspace() (workspace, state, source string, err error) {
 	type cand struct{ dir, src string }
 	var cands []cand
@@ -2762,20 +2838,26 @@ func resolveWorkspace() (workspace, state, source string, err error) {
 			continue
 		}
 		st := filepath.Join(n, ".workbench")
-		if merr := os.MkdirAll(filepath.Join(st, "recordings"), 0o755); merr != nil {
+		if merr := os.MkdirAll(st, 0o755); merr != nil {
 			lastErr = merr
 			continue
 		}
-		_ = os.MkdirAll(filepath.Join(st, "probe"), 0o755) // A2/A3 探針落點
 		return n, st, c.src, nil
 	}
 	tmp := os.TempDir()
 	st := filepath.Join(tmp, "sdlc-workbench", ".workbench")
-	if merr := os.MkdirAll(filepath.Join(st, "recordings"), 0o755); merr != nil {
+	if merr := os.MkdirAll(st, 0o755); merr != nil {
 		return tmp, st, "tmp", errors.Join(lastErr, merr)
 	}
 	return tmp, st, "tmp", lastErr
 }
+
+// stateSubdirs：session 狀態的目錄骨架。**必須在出示 lease 之後才建立**——
+// 見 resolveWorkspace 的 doc。
+//
+//	recordings/ → 錄流檔（recorder.New 的落點）
+//	probe/      → A2/A3 探針落點
+var stateSubdirs = []string{"recordings", "probe"}
 
 // resolveToolsDir：env WORKBENCH_TOOLS_DIR → bundle Resources/tools → repo tools/（dev fallback）。
 func resolveToolsDir(workspace string) (string, string) {
@@ -3285,6 +3367,13 @@ func (g gateEmitter) EmitGateEvent(kind string, bindings []gate.Binding, payload
 // 初始化之前先把它搬過來，搬不動就中止啟動（見 migrateLegacyState）。所以走到
 // 這裡時，a.stateDir 上的那一份就是唯一權威。
 func (a *App) ensureGate() (*gate.Service, error) {
+	// 遷移中止時連**開檔**都不做：這裡是 gate journal 唯一的開啟點，擋在 once
+	// 之前才擋得住所有內部呼叫者（spec/plan watcher 的 reconcile 也走這裡），
+	// 不只是 exported binding（reviewer 2026-08-19 P1）。刻意不進 gateOnce：
+	// 被擋下的那幾次不得把 once 消耗掉。
+	if err := a.stateBlockedErr(); err != nil {
+		return nil, err
+	}
 	a.gateOnce.Do(func() {
 		root, err := claude.NormalizeCWD(a.workspaceDir)
 		if err != nil {
@@ -3348,6 +3437,10 @@ func gate1Bindings(manifestDigest, baseCommit string) []gate.Binding {
 // SubmitForApproval 以目前 committed spec 快照送出 Gate 1 核可申請。
 // dirty tree／HEAD 位移等錯誤原樣自 spec.BuildCommittedSnapshot 傳回。
 func (a *App) SubmitForApproval() (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureGate()
 	if err != nil {
 		return "", err
@@ -4307,12 +4400,16 @@ func gate2Bindings(specManifest, planManifest, baseCommit, riskPolicyDigest, per
 //  6. lineage 驗證（analysis_base_commit..plan_commit 限 plan/**）
 //  7. 組五筆 bindings → Submit("gate2","plan:"+planID,bindings)
 func (a *App) SubmitPlanForApproval(planID string) (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureGate()
 	if err != nil {
 		return "", err
 	}
 
-	entries, err := a.GateList()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return "", err
 	}
@@ -4485,9 +4582,6 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 	if kind != "expected_red" && kind != "negative_control" {
 		return "", fmt.Errorf("evidence: unknown kind %q", kind)
 	}
-	if a.evidenceJournal == nil {
-		return "", errors.New("evidence: not initialized")
-	}
 	if kind == "negative_control" {
 		if mutationID == "" {
 			return "", errors.New("evidence: negative_control requires a mutation_id")
@@ -4496,17 +4590,25 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 		return "", errors.New("evidence: expected_red must not carry a mutation_id")
 	}
 
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 run
+	// shutdown gate（拒新 run）＋ migration blocker：與其他 state binding 同一個
+	// 入場點，evidence journal／CAS 同樣落在遷移範圍內（見 beginStateTxn）。
+	if err := a.beginStateTxn(); err != nil {
 		return "", err
 	}
 	defer a.endAppTxn()
+	// **排在交易閘之後**：evidenceJournal 為 nil 有兩種成因——真的沒初始化，
+	// 以及遷移中止讓 startupEvidence 根本沒跑。後者要回「遷移未完成」，回
+	// 「not initialized」等於把使用者該處理的事藏起來（reviewer 2026-08-19 P1）。
+	if a.evidenceJournal == nil {
+		return "", errors.New("evidence: not initialized")
+	}
 
 	if h := a.runEvidenceCASHook; h != nil { // 測試 seam：見上方函式 doc
 		h()
 	}
 
 	a.workflowMu.Lock()
-	entries, err := a.GateList()
+	entries, err := a.gateEntries()
 	if err != nil {
 		a.workflowMu.Unlock()
 		return "", err
@@ -4656,6 +4758,10 @@ const evidenceRunEventKind = "evidence_run"
 // EvidenceGet 回傳 journal 內 evidenceID 對應的完整 EvidenceRun（含 journal
 // 重播後重建的紀錄）。
 func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return evidence.EvidenceRun{}, err
+	}
+	defer a.endAppTxn()
 	if a.evidenceJournal == nil {
 		return evidence.EvidenceRun{}, errors.New("evidence: not initialized")
 	}
@@ -4681,7 +4787,7 @@ type CommitInfo struct {
 // caller-supplied testCommit's own ancestry. Validate only: no worktree, no
 // command execution.
 func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
-	entries, err := a.GateList()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return err
 	}
@@ -4717,7 +4823,11 @@ func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
 // when the range has no commits, never nil, so the frontend can render it
 // without a null-check.
 func (a *App) EvidenceCommitCandidates(planID string) ([]CommitInfo, error) {
-	entries, err := a.GateList()
+	if err := a.beginStateTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endAppTxn()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return nil, err
 	}
@@ -4782,6 +4892,10 @@ func tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest strin
 // Submit——bindings 本身是否彼此一致（role/kind、兩筆 passed、descriptor 等）
 // 全交給 TCAPolicy.ValidateRequest／BuildDecision，這裡只負責組裝已有的值。
 func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID string) (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureGate()
 	if err != nil {
 		return "", err
@@ -4790,7 +4904,7 @@ func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, nega
 		return "", errors.New("evidence: not initialized")
 	}
 
-	entries, err := a.GateList()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return "", err
 	}
@@ -4875,7 +4989,11 @@ type GateDecisionContextDTO struct {
 // worktree：送核後修改 worktree plan 不得改變這裡的回傳值（committed 才是
 // 核可對象），前端不得以目前 worktree plan 推導 minimum／planner。
 func (a *App) GateDecisionContext(approvalID string) (GateDecisionContextDTO, error) {
-	entries, err := a.GateList()
+	if err := a.beginStateTxn(); err != nil {
+		return GateDecisionContextDTO{}, err
+	}
+	defer a.endAppTxn()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return GateDecisionContextDTO{}, err
 	}
@@ -4928,7 +5046,19 @@ type GateEntryDTO struct {
 // GateList 回傳 Gate 1 projection。Service.List 內部先 Reconcile 才
 // Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
 // degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
+//
+// 這是 Wails binding，所以走 beginStateTxn（shutdown 等待 ＋ migration blocker）；
+// app 內部要同一份 projection 的地方一律呼叫 gateEntries，不重入交易閘。
 func (a *App) GateList() ([]GateEntryDTO, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endAppTxn()
+	return a.gateEntries()
+}
+
+// gateEntries：GateList 的本體（不進交易閘，見 beginStateTxn 的 doc）。
+func (a *App) gateEntries() ([]GateEntryDTO, error) {
 	svc, err := a.ensureGate()
 	if err != nil {
 		return nil, err
@@ -4998,6 +5128,10 @@ func (a *App) gitIdentity() (name, email string, err error) {
 // → blocking escalation 檢查 → append（CommitDecision）。blocker 只能在
 // workflowMu 之外排隊，不存在「檢查後、append 前」被插入的窗口。
 func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureGate()
 	if err != nil {
 		return err
@@ -5058,6 +5192,9 @@ func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []g
 // 舊路徑的 escalation.jsonl 同樣由 migrateLegacyState 在啟動早期搬過來：那份
 // journal 裡可能還有未解除的系統管控項目，靜默忽略會直接改變核可結果。
 func (a *App) ensureEscalation() (*escalation.Service, error) {
+	if err := a.stateBlockedErr(); err != nil { // 同 ensureGate：擋在 once 之前
+		return nil, err
+	}
 	a.escOnce.Do(func() {
 		if _, err := claude.NormalizeCWD(a.workspaceDir); err != nil {
 			a.escInitErr = err
@@ -5174,12 +5311,12 @@ func (a *App) reconcileLocked(svc *gate.Service) error {
 	}
 	// (8) journal-degraded 補建／修復
 	if a.gateJournal != nil {
-		if err := a.escJournalDegradedLocked("gate", a.gateJournal.Degraded(), ".workbench/gate.jsonl"); err != nil {
+		if err := a.escJournalDegradedLocked("gate", a.gateJournal.Degraded(), filepath.Join(a.stateDir, "gate.jsonl")); err != nil {
 			return err
 		}
 	}
 	if a.evidenceJournal != nil {
-		if err := a.escJournalDegradedLocked("evidence", a.evidenceJournal.Degraded(), ".workbench/evidence/evidence.jsonl"); err != nil {
+		if err := a.escJournalDegradedLocked("evidence", a.evidenceJournal.Degraded(), filepath.Join(a.stateDir, "evidence", "evidence.jsonl")); err != nil {
 			return err
 		}
 	}
@@ -5328,6 +5465,10 @@ func (a *App) escPlannerRuntimeViolationLocked(provider, detail string) (string,
 // EscalationList 回傳收件匣 projection（Wails 綁定）。Project 失敗回錯——
 // 收件匣標不可用，絕不裝空（§3.8）。
 func (a *App) EscalationList() ([]escalation.Entry, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureEscalation()
 	if err != nil {
 		return nil, err
@@ -5340,6 +5481,10 @@ func (a *App) EscalationList() ([]escalation.Entry, error) {
 // EscalationCreate 建立手動 escalation 項（Wails 綁定；sourceRef 必填，
 // blockScope 空字串＝非阻擋資訊項）。
 func (a *App) EscalationCreate(sourceRef, blockScope, summary string) (string, error) {
+	if err := a.beginStateTxn(); err != nil {
+		return "", err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureEscalation()
 	if err != nil {
 		return "", err
@@ -5357,6 +5502,10 @@ func (a *App) EscalationCreate(sourceRef, blockScope, summary string) (string, e
 
 // EscalationAck 標記已認知（不解除 block，§3.8）。
 func (a *App) EscalationAck(id string) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureEscalation()
 	if err != nil {
 		return err
@@ -5369,6 +5518,10 @@ func (a *App) EscalationAck(id string) error {
 // EscalationResolve 手動 resolve（Wails 綁定）。actor 一律取 git identity
 // （同 GateDecide 的 approver 來源）；hard 項由 Service 拒絕（僅系統可 resolve）。
 func (a *App) EscalationResolve(id, resolution, reason string) error {
+	if err := a.beginStateTxn(); err != nil {
+		return err
+	}
+	defer a.endAppTxn()
 	svc, err := a.ensureEscalation()
 	if err != nil {
 		return err
@@ -5591,7 +5744,7 @@ func (a *App) PlanAssist(provider, prompt string) (string, error) {
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
 	}
-	entries, err := a.GateList()
+	entries, err := a.gateEntries()
 	if err != nil {
 		return "", err
 	}

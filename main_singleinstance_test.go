@@ -573,11 +573,18 @@ func TestEntryRejectionUX(t *testing.T) {
 
 // TestNoWriterOpensBeforeLeaseIsAcquired
 //
-// hold 模式的 process 取得 lease 之後就停住、不呼叫 App.startup。所以這一刻
-// state directory 上應該**只有** resolveWorkspace 建的目錄骨架與 instance.lock
-// ——任何多出來的東西都代表有 writer 排在取 lease 之前。
+// hold 模式的 process 取得 lease 之後就停住、不呼叫 App.startup。這個 helper 走
+// **完整的 production resolver**（只給 WORKBENCH_WORKSPACE，路徑由 resolveWorkspace
+// 自己解析、目錄由它自己建），所以這一刻磁碟上的東西就是「取鎖之前 production
+// 真的動過的全部」。
 //
-// 正題斷言：快照路徑集合 == {".", "probe", "recordings", "instance.lock"}。
+// 正題斷言：快照路徑集合 == {".", "instance.lock"}——**空的 state directory 加一
+// 個鎖檔，別的都不行**。
+//
+// 這條原本把 recordings/ 與 probe/ 寫進 want，等於把「取鎖前先建 session 狀態
+// 目錄」這個 bug 當成預期行為記下來（reviewer 2026-08-19 P1）。兩個目錄改由
+// openStateWriters 在出示 lease 之後建立，這裡跟著收緊——取鎖前多建任何一個
+// 目錄都會在這裡紅。
 func TestNoWriterOpensBeforeLeaseIsAcquired(t *testing.T) {
 	ws, stateDir := siWorkspace(t)
 	holder := siStart(t, "holder", ws, siModeHold, false)
@@ -589,10 +596,10 @@ func TestNoWriterOpensBeforeLeaseIsAcquired(t *testing.T) {
 		got = append(got, k)
 	}
 	sort.Strings(got)
-	want := []string{".", "probe", "recordings", singleinstance.LockFileName}
+	want := []string{".", singleinstance.LockFileName}
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("取得 lease 之前不得開啟任何 writer——state directory 應只有目錄骨架與鎖檔\nwant %v\ngot  %v",
+		t.Fatalf("取得 lease 之前只允許存在空的 state directory 與鎖檔\nwant %v\ngot  %v",
 			want, got)
 	}
 
@@ -1048,6 +1055,26 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 						note(el.Pos(), target.Obj().Name()+" composite literal 設定 "+field+"（位置式）")
 					}
 				}
+			case *ast.CallExpr:
+				// **轉型**：`stateLease(v)`——v 可以是任何欄位相同的別種 struct，
+				// 於是 testOnly 從頭到尾沒有在 stateLease 的 literal 或 selector
+				// 上出現過，前一版的兩條規則都掃不到，但轉出來的值照樣讓
+				// ownsStateDir() 回 true（reviewer 2026-08-19 P1）。
+				//
+				// 判準是「有沒有轉型成這個型別」而不是「來源長什麼樣」：來源可以
+				// 是具名 struct、匿名 struct、type alias、指標…列舉不完，而
+				// production 本來就沒有任何理由把別的東西轉成 stateLease。
+				tv, found := info.Types[x.Fun]
+				if !found || !tv.IsType() {
+					return true
+				}
+				ct := types.Unalias(tv.Type)
+				if p, isPtr := ct.(*types.Pointer); isPtr {
+					ct = types.Unalias(p.Elem())
+				}
+				if n, isNamed := ct.(*types.Named); isNamed && n.Obj() == target.Obj() {
+					note(x.Pos(), "轉型成 "+target.Obj().Name()+"（可繞過 literal 與賦值兩種判定）")
+				}
 			case *ast.AssignStmt:
 				// `x.field = ...`（含 := 與各種複合賦值）。用 Selections 確認選到的
 				// 真的是 target 的那個欄位，不是別的型別上剛好同名的欄位。
@@ -1189,6 +1216,16 @@ var viaSlice = []stateLease{{"/d", nil, true}}
 var viaMap = map[string]*stateLease{"k": {testOnly: true}}
 var viaAlias = leaseAlias{testOnly: true}
 
+// 繞過案例 3：欄位相同的另一個具名 struct ＋ 轉型——testOnly 從未出現在
+// stateLease 的 literal 或 selector 上，但轉出來的值一樣帶授權。
+type lookalike struct {
+	stateDir string
+	lock     *int
+	testOnly bool
+}
+
+var viaConversion = stateLease(lookalike{"/d", nil, true})
+
 // 既有兩種寫法（不得回歸）。
 var keyed = stateLease{stateDir: "/d", testOnly: true}
 var positional = &stateLease{"/d", nil, true}
@@ -1218,22 +1255,29 @@ func assigns() {
 	for _, o := range scanFieldWrites(fset, files, info, target, "testOnly") {
 		got[o.pos.Line] = o.why
 	}
-	// 每一個 want 是「該行必須被抓到」——行號寫死是刻意的，這樣改壞掃描時失敗訊息
-	// 直接指出是哪一種寫法漏了。
-	wants := []struct {
-		line int
-		what string
-	}{
-		{13, "省略型別的巢狀 literal（slice、位置式）"},
-		{14, "省略型別的巢狀 literal（map、指標元素、keyed）"},
-		{15, "type alias"},
-		{18, "keyed literal"},
-		{19, "位置式 literal"},
-		{23, "直接賦值"},
+	// 每個 want 用 fixture 裡的一段原始碼定位，不寫死行號——行號會隨 fixture 增補
+	// 而整片平移，寫死只會讓「加一個新的繞過案例」順手改壞既有斷言。
+	lineOf := func(needle string) int {
+		for i, line := range strings.Split(src, "\n") {
+			if strings.Contains(line, needle) {
+				return i + 1
+			}
+		}
+		t.Fatalf("fixture 裡找不到 %q（測試前提不成立）", needle)
+		return 0
+	}
+	wants := []struct{ needle, what string }{
+		{"var viaSlice", "省略型別的巢狀 literal（slice、位置式）"},
+		{"var viaMap", "省略型別的巢狀 literal（map、指標元素、keyed）"},
+		{"var viaAlias", "type alias"},
+		{"var viaConversion", "欄位相同的別種 struct ＋ 轉型"},
+		{"var keyed", "keyed literal"},
+		{"var positional", "位置式 literal"},
+		{"l.testOnly = true", "直接賦值"},
 	}
 	for _, w := range wants {
-		if _, ok := got[w.line]; !ok {
-			t.Errorf("掃描漏掉「%s」（fixture.go:%d），實得：%v", w.what, w.line, got)
+		if line := lineOf(w.needle); got[line] == "" {
+			t.Errorf("掃描漏掉「%s」（fixture.go:%d），實得：%v", w.what, line, got)
 		}
 	}
 	// 反向：沒有寫入 testOnly 的 package 必須是乾淨的（掃描不是無條件打紅）。

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/escalation"
 	"github.com/slam0504/sdlc-workbench/internal/singleinstance"
@@ -187,6 +188,60 @@ func TestLeaseAcquirableOnBrandNewWorkspace(t *testing.T) {
 	want := []string{singleinstance.LockFileName}
 	if len(got) != len(want) || (len(got) == 1 && got[0] != want[0]) {
 		t.Fatalf("取鎖之前只允許建立空的 state directory，實得 %v（want %v）", got, want)
+	}
+}
+
+// TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease
+//
+// **走完整的 production 解析路徑**（`WORKBENCH_WORKSPACE` → `resolveWorkspace`
+// → `acquireStateLease`），不預先指定 stateDir——reviewer 2026-08-19 P1 指出既有
+// 測試都是先設好 a.stateDir，於是正式首次啟動真正走的那條路徑從來沒被量過，而
+// 它會在取鎖之前就把 recordings/ 與 probe/ 建出來。
+//
+// 正題斷言（分成兩段，各自可獨立打紅）：
+//   - 取得 lease 的那一刻，state directory 裡**只有**鎖檔。
+//   - 走完 openStateWriters 之後，recordings/ 與 probe/ 才出現（功能沒有被砍掉，
+//     只是搬到出示 lease 之後）。
+func TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease(t *testing.T) {
+	ws, err := claude.NormalizeCWD(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WORKBENCH_WORKSPACE", ws)
+
+	a := NewApp()
+	a.ctx = context.Background()
+	lease, err := a.acquireStateLease() // 內含 resolveWorkspace（production 路徑）
+	if err != nil {
+		t.Fatalf("acquireStateLease: %v", err)
+	}
+	t.Cleanup(func() { _ = lease.release() })
+	if a.stateDir != filepath.Join(ws, ".workbench") {
+		t.Fatalf("production resolver 應解析到 %s，實得 %s", filepath.Join(ws, ".workbench"), a.stateDir)
+	}
+
+	ents, err := os.ReadDir(a.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range ents {
+		got = append(got, e.Name())
+	}
+	sort.Strings(got)
+	if len(got) != 1 || got[0] != singleinstance.LockFileName {
+		t.Fatalf("取得 lease 的那一刻，state directory 只允許有鎖檔，實得 %v", got)
+	}
+
+	if !a.openStateWriters(lease) {
+		t.Fatalf("openStateWriters 必須成功，startupErr=%q", a.startupErrText())
+	}
+	t.Cleanup(func() { a.shutdown(context.Background()) })
+	for _, d := range stateSubdirs {
+		st, serr := os.Stat(filepath.Join(a.stateDir, d))
+		if serr != nil || !st.IsDir() {
+			t.Fatalf("出示 lease 之後必須把 %s 目錄建出來（骨架只是搬家，不是砍掉），stat=%v", d, serr)
+		}
 	}
 }
 
