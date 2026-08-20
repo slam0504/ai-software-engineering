@@ -145,9 +145,14 @@ func TestShutdownWaitsForAndReclaimsSpecAssist(t *testing.T) {
 	}
 }
 
-// shutdown-during-startup 窗口：assist 已把 gen 入 assistActive、尚未 beginAppTxn
-// 時 shutdown 介入——shutdown 不得被它 stall（此刻無 inflight），事後 beginAppTxn
-// 被 gate 拒、gen rollback。反轉 insert／beginAppTxn 順序後此窗口關閉。
+// shutdown-during-startup 窗口：assist 已把 gen 入 assistActive、尚未取得自己那份
+// 長生命週期交易時 shutdown 介入——事後該交易被 gate 拒、gen rollback、收尾收斂。
+//
+// **語意在 2026-08-20 改過**：SpecAssist 現在是薄包裝（見 beginTxn 的 doc），
+// 這個窗口本身已經落在包裝那一層的交易裡，shutdown 會等它走完才往下——那是預期
+// 行為，不是 stall（窗口在 production 是純記憶體操作、不含 I/O）。所以改成：先
+// 確認 shutdown 已進場（reject_new_txn），再放行窗口，然後驗證原本要守的兩件事
+// 仍然成立——內層交易被拒、rollback 不留 gen。
 func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 	a := newTestAppAssist(t, blockingRunner())
 	entered := make(chan struct{})
@@ -158,17 +163,29 @@ func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 	}
 	errCh := make(chan error, 1)
 	go func() { _, err := a.SpecAssist("claude", "spec_assist", "draft"); errCh <- err }()
-	<-entered // gen 已可見、beginAppTxn 未開始
+	<-entered // gen 已可見、beginTxn 未開始
 	a.hookAssistBeforeTxn = nil
 
+	steps := make(chan string, 32)
+	a.hookShutdownStep = func(s string) { steps <- s }
 	shutDone := make(chan struct{})
 	go func() { a.shutdown(context.Background()); close(shutDone) }()
-	select { // 不得被 startup 窗口內的 assist 卡住（無 inflight 可等）
+	for s := range steps { // 等 shutdown 真的進場（phase 已翻 shuttingDown）
+		if s == "reject_new_txn" {
+			break
+		}
+	}
+	go func() {
+		for range steps {
+		}
+	}()
+
+	close(release) // 放行內層 beginTxn → shuttingDown → 拒絕 → rollback
+	select {
 	case <-shutDone:
 	case <-time.After(30 * time.Second):
-		t.Fatal("shutdown stalled on an assist still in its startup window")
+		t.Fatal("窗口放行之後 shutdown 必須收斂")
 	}
-	close(release) // 放行 beginAppTxn → shuttingDown → 拒絕 → rollback、無 inflight
 	err := <-errCh
 	if err == nil || !strings.Contains(err.Error(), "shutting down") {
 		t.Fatalf("in-window assist must be rejected by the shutdown gate, got %v", err)

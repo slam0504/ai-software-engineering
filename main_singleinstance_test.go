@@ -996,6 +996,22 @@ var stateLeaseReaders = map[string]bool{
 	"(*stateLease).ownsStateDir": true,
 }
 
+// structFieldObject：具名 struct 型別上某個欄位的 types 物件。
+func structFieldObject(t *testing.T, named *types.Named, field string) *types.Var {
+	t.Helper()
+	st, isStruct := named.Underlying().(*types.Struct)
+	if !isStruct {
+		t.Fatalf("%s 不是 struct", named.Obj().Name())
+	}
+	for i := range st.NumFields() {
+		if st.Field(i).Name() == field {
+			return st.Field(i)
+		}
+	}
+	t.Fatalf("%s 上找不到欄位 %s", named.Obj().Name(), field)
+	return nil
+}
+
 // forbiddenFieldWrite：掃描結果的一筆（檔案位置 ＋ 原因）。
 type forbiddenFieldWrite struct {
 	pos token.Position
@@ -1182,11 +1198,26 @@ func scanFieldWrites(fset *token.FileSet, files []*ast.File, info *types.Info,
 // ＝合格的讀取）。
 //
 // ancestors 由近到遠，最後一個是直接父節點。
+//
+// **括號要先剝掉**（reviewer 2026-08-20）：`(l.testOnly) = true` 的直接父節點是
+// ParenExpr 而不是 AssignStmt，只看直接父節點就會放行，而實測那樣造出來的 lease
+// 確實能通過 ownsStateDir()。括號可以無限層，所以是往上剝到第一個非 ParenExpr，
+// 並且用剝完之後的那個節點去比對賦值目標。
 func impureUse(x *ast.SelectorExpr, ancestors []ast.Node) string {
 	for _, n := range ancestors {
 		if _, isLit := n.(*ast.FuncLit); isLit {
 			return "在 closure 內引用"
 		}
+	}
+	// 目前這個運算式在父節點眼中的樣子（剝掉外層括號之後）。
+	self := ast.Expr(x)
+	for len(ancestors) > 0 {
+		paren, isParen := ancestors[len(ancestors)-1].(*ast.ParenExpr)
+		if !isParen {
+			break
+		}
+		self = paren
+		ancestors = ancestors[:len(ancestors)-1]
 	}
 	if len(ancestors) == 0 {
 		return ""
@@ -1198,16 +1229,16 @@ func impureUse(x *ast.SelectorExpr, ancestors []ast.Node) string {
 		}
 	case *ast.AssignStmt:
 		for _, lhs := range parent.Lhs {
-			if lhs == ast.Expr(x) {
+			if lhs == self {
 				return "賦值"
 			}
 		}
 	case *ast.RangeStmt:
-		if parent.Key == ast.Expr(x) || parent.Value == ast.Expr(x) {
+		if parent.Key == self || parent.Value == self {
 			return "range 賦值"
 		}
 	case *ast.IncDecStmt:
-		if parent.X == ast.Expr(x) {
+		if parent.X == self {
 			return "遞增／遞減"
 		}
 	}
@@ -1359,6 +1390,25 @@ func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 		t.Fatalf("production 只能有 stateLease 一個 testOnly 欄位，實得：%v", owners)
 	}
 
+	// **絕對規則**：整包 production 只能有一個指向 stateLease.testOnly 這個 field
+	// object 的 Uses（reviewer 2026-08-20 建議）。這條不看語法脈絡，因此不必追
+	// 「還有哪種寫法算寫入」——括號、range、取址、closure、composite literal 的
+	// key 全都會在 Uses 留下引用，多一個就是多一個。
+	fieldObj := structFieldObject(t, target, "testOnly")
+	var uses []token.Position
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if id, isIdent := n.(*ast.Ident); isIdent && info.Uses[id] == fieldObj {
+				uses = append(uses, fset.Position(id.Pos()))
+			}
+			return true
+		})
+	}
+	if len(uses) != 1 {
+		t.Fatalf("production 只能有一個 stateLease.testOnly 的引用（capability 的判定式本身），實得 %d 個：%v",
+			len(uses), uses)
+	}
+
 	found := scanFieldWrites(fset, files, info, target, "testOnly", stateLeaseReaders)
 	if len(found) == 0 {
 		return
@@ -1448,7 +1498,15 @@ func (l *stateLease) ownsStateDir(dir string) bool {
 	}
 	p := &l.testOnly // 違規：取址
 	*p = true
+	(l.testOnly) = true // 違規：括號包住的賦值（直接父節點是 ParenExpr）
 	return false
+}
+
+// 繞過案例 8a：括號——直接父節點變成 ParenExpr，只看父節點的判定會放行。
+func viaParens() *stateLease {
+	l := &stateLease{stateDir: "/d"}
+	(l.testOnly) = true
+	return l
 }
 
 // 繞過案例 8：closure 捕捉——把可寫性帶到別的生命週期。
@@ -1501,6 +1559,7 @@ func (l *stateLease) leak() func() {
 		{"p := &l.testOnly", "取位址後透過指標寫"},
 		{"p := &l.testOnly // 違規：取址", "被允許的讀取函式內部取址"},
 		{"return func() { l.testOnly = true }", "closure 捕捉"},
+		{"(l.testOnly) = true", "被允許的讀取函式內部、用括號包住的賦值"},
 	}
 	for _, w := range wants {
 		if line := lineOf(w.needle); got[line] == "" {

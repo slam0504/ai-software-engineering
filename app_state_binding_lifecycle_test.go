@@ -329,7 +329,7 @@ func TestSecondStartupIsRefusedNotSilentlyOverwritingOwner(t *testing.T) {
 
 	// 第二個 startup：必須被拒，且**不得**動到 owner 的 lifecycle 狀態。
 	a.startup(context.Background())
-	if !strings.Contains(a.startupErrText(), "已有另一個啟動流程") {
+	if !strings.Contains(a.startupErrText(), "啟動序列只執行一次") {
 		t.Fatalf("第二個 startup 必須被明確拒絕並說明原因，實得橫幅：%q", a.startupErrText())
 	}
 
@@ -367,6 +367,33 @@ func TestStartupRefusedAfterShutdown(t *testing.T) {
 	}
 	if a.manager != nil || a.registry != nil {
 		t.Fatal("收尾之後的 startup 不得接上任何下游物件")
+	}
+}
+
+// TestStartupIsRefusedAfterItAlreadyCompleted
+//
+// startup ownership 只發一次。先前只看「目前是否 running」，於是 begin → end →
+// begin 的第二次呼叫仍然成立，會重新開啟並覆寫 writers、Manager 與 channel
+// （reviewer 2026-08-20）。
+//
+// 正題斷言：第一次**完整跑完**之後再呼叫一次，被拒且不重建 Manager。
+func TestStartupIsRefusedAfterItAlreadyCompleted(t *testing.T) {
+	a := auditLifecycleApp(t)
+	a.emitUI = func(string, any) {}
+	a.startup(context.Background())
+	t.Cleanup(func() { a.shutdown(context.Background()) })
+	if a.manager == nil {
+		t.Fatal("前提：第一次 startup 必須成功")
+	}
+	first := a.manager
+
+	a.startup(context.Background())
+
+	if a.manager != first {
+		t.Fatal("第二次 startup 不得重建 Manager——那會讓既有 session 的事件寫到另一個實例上")
+	}
+	if !strings.Contains(a.startupErrText(), "啟動序列只執行一次") {
+		t.Fatalf("第二次 startup 必須被明確拒絕並說明原因，實得橫幅：%q", a.startupErrText())
 	}
 }
 

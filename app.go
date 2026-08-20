@@ -419,6 +419,11 @@ type App struct {
 	// lease**，讓 process 帶著鎖結束（見 shutdown 第 13 步）。
 	startupRunning bool
 	startupDone    chan struct{}
+	// startupStarted：**曾經**取得過 startup ownership。永久旗標，不隨結束重設
+	// ——ownership 只發一次（reviewer 2026-08-20）：先前只看「目前是否 running」，
+	// 於是 begin → end → begin 的第二次呼叫仍然成立，會重新開啟並覆寫 writers、
+	// Manager 與 channel。startup 是一次性的啟動序列，不是可重入的操作。
+	startupStarted bool
 	// startupDrain：shutdown 等 startup 收斂的窗口（nil＝production 預設）。
 	// 測試設短值即可確定性地量到「等不到就保留 lease」那條路徑。
 	startupDrain *time.Duration
@@ -504,11 +509,11 @@ type App struct {
 	// SpecAssist（Task 11：Stage A §5.1）——per-provider 至多一個 active 隔離
 	// one-shot。assistActive 在 assistMu 下管理獨佔性；每個 generation 的 cancel
 	// 供 shutdown reclaim，once 保證 result／abort／timeout／shutdown 任一先觸發
-	// 即收一次（清 active flag＋endAppTxn＋close done）。
+	// 即收一次（清 active flag＋endTxn＋close done）。
 	assistMu            sync.Mutex
 	assistActive        map[string]*assistGen
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
-	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginAppTxn 未開始
+	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginTxn 未開始
 
 	// PlanAssist provider capability preflight（M3a.1 Task 7：spec §3.4）——
 	// key=binPath+"|"+完整 binary SHA-256 hex（不截斷）；只快取 OK 結果
@@ -547,7 +552,7 @@ type App struct {
 	// evidenceContextLoaderOverride：測試注入，換掉 RunEvidence 傳給
 	// evidence.Run 的 evidence.ContextLoader（production 用 a.planLoader）。
 	// 唯一用途是讓測試能在 LoadAt／LoadOracleAt（ulid mint 之前執行）安插一個
-	// barrier，重現「beginAppTxn 成功到 evidenceActive 登記之間」的 TOCTOU
+	// barrier，重現「beginTxn 成功到 evidenceActive 登記之間」的 TOCTOU
 	// 窗（task-20 review M1）。
 	evidenceContextLoaderOverride evidence.ContextLoader
 
@@ -577,7 +582,7 @@ type App struct {
 	onWorkflowMuAcquired func() // 測試注入：public EscalationCreate 取得 workflowMu 後、寫入前
 
 	// runEvidenceCASHook（M3a.1 T8，§3.3.2）：測試注入，RunEvidence
-	// beginAppTxn 成功後、workflowMu.Lock 前觸發——刻意早於 Lock（而非沿
+	// beginTxn 成功後、workflowMu.Lock 前觸發——刻意早於 Lock（而非沿
 	// decideBarrierHook 落在鎖內的位置），讓 hook 本體可以呼叫 GateDecide 之
 	// 類同樣要取 workflowMu 的操作來模擬「按下與讀取之間換版」而不致死鎖，
 	// 見 RunEvidence 函式 doc。
@@ -598,22 +603,49 @@ var ErrAssistActive = errors.New("assist already active for provider")
 // assistTimeout：單一 one-shot 草擬的上限（timeout 為 once/token 收尾觸發之一）。
 const assistTimeout = 3 * time.Minute
 
-// beginAppTxn：shutdown gate 入場（第五輪 review P1 泛化）——涵蓋**所有**可能
-// 建立／替換 codex server 或啟動 provider 的操作（StartSession、ensureAppServer、
-// B1 probe）。check＋in-flight 登記在同一 shutMu 內原子：TOCTOU 關閉——
-// 若 check 通過，shutdown 的 Wait 必等本交易離場，Take 一定在 Ensure 之後執行，
-// 任何回填的 server 都會被 Take 收走；shuttingDown 之後的新交易一律被拒。
-func (a *App) beginAppTxn() error {
+// beginTxn：**唯一**的交易閘。所有會改動 durable state 的 Wails binding 都從這裡
+// 進場，成功時呼叫端必須 defer endTxn()。
+//
+// 為什麼只有一個閘（reviewer 2026-08-20）：先前分成 beginTxn（只擋
+// shuttingDown）與 beginTxn（擋非 ready），於是
+//
+//   - `NewApp().StartSession()` 在 startup 之前通過 beginTxn，接著因 Manager
+//     尚未初始化而 panic；
+//   - SendMessage／ResolveApproval 這類「不碰 gate 欄位、但會經 Manager 寫
+//     events.jsonl 與 replay index」的操作根本沒有閘，收尾後仍寫得進去。
+//
+// 兩個閘就是兩套判準，而要守的不變量只有一個：**lease 之外不得有 durable
+// 寫入**。所以收斂成一個，phase 判定也只有一份。
+//
+// 「檢查 lifecycle ＋ 登記 in-flight 交易」在同一個 shutMu 臨界區內完成：
+//
+//	(1) 交易登記 → shutdown 的 inflight.Wait() 會等這一筆做完才往下走。
+//	(2) lifecycle → 只有 ready 放行。Wails 在 macOS 會**並行**執行 OnStartup 與
+//	    bindings，用另一把鎖上的 latch 擋不住「binding 先過閘、startup 隨後才發現
+//	    衝突」這個順序。
+//
+// **只掛在 exported binding 上**，內部呼叫走各自的 unexported 版本——巢狀的
+// begin/end 雖然計數上安全，但 phase 可能在內外兩次之間翻成 shuttingDown，於是
+// 操作做到一半才失敗，那是新造出來的失敗模式。
+//
+// 涵蓋範圍不靠手寫清單維護：見 app_binding_surface_test.go 的結構守門。
+func (a *App) beginTxn() error {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
-	if a.phase == phaseShuttingDown {
+	switch a.phase {
+	case phaseReady:
+		a.inflight.Add(1)
+		return nil
+	case phaseBlocked:
+		return errors.New(a.stateBlockedReasonLocked())
+	case phaseShuttingDown:
 		return errors.New("app shutting down")
+	default:
+		return errors.New("app 尚未完成啟動：在啟動序列完成之前不受理任何會改動狀態的操作")
 	}
-	a.inflight.Add(1)
-	return nil
 }
 
-func (a *App) endAppTxn() { a.inflight.Done() }
+func (a *App) endTxn() { a.inflight.Done() }
 
 // ---- workspace session 建立交易（M3b §3.1）----
 
@@ -748,11 +780,22 @@ func (a *App) crToken(p contract.Provider) *sync.Mutex {
 // removeTokenHeldForTest：測試專用（見 removeTokenHeld 欄位 doc）。
 func (a *App) removeTokenHeldForTest() bool { return a.removeTokenHeld.Load() }
 
+// CreateSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) CreateSession(provider, taskLabel string) (string, error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.createSession(provider, taskLabel)
+}
+
 // CreateSession 建立一個新的 workspace session，回傳其 WSID（純新增 binding；
 // 既有 provider-keyed 的 StartSession／SendMessage／EndSession 不受影響）。
 //
-// 編排順序凍結（§3.1）：beginAppTxn → ReserveSession → wsReg.Put ＋ atomic
-// persist → CommitCreate → endAppTxn。registry 先於 CommitCreate 落盤，因為
+// 編排順序凍結（§3.1）：beginTxn → ReserveSession → wsReg.Put ＋ atomic
+// persist → CommitCreate → endTxn。registry 先於 CommitCreate 落盤，因為
 // 「磁碟有、記憶體無」可以在重啟時由 registry 權威還原成 dormant，反之
 // 「記憶體有、磁碟無」重啟即整個 session 消失。
 //
@@ -763,11 +806,7 @@ func (a *App) removeTokenHeldForTest() bool { return a.removeTokenHeld.Load() }
 //     那是「使用者明確移除」的語意。
 //  3. CommitCreate 失敗、DeleteUncommitted 也失敗：**不** AbortCreate、保留
 //     名額、該 provider 進 create-degraded latch（見 setCreateDegraded）。
-func (a *App) CreateSession(provider, taskLabel string) (string, error) {
-	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
-		return "", err
-	}
-	defer a.endAppTxn()
+func (a *App) createSession(provider, taskLabel string) (string, error) {
 	// provider 白名單（同 StartSession／SendMessage／EndSession 的既有 guard）：
 	// 未知 provider 若放行，會被 Put 寫進 durable registry，重啟後 RestoreDormant
 	// 拿到無人能接手的 provider，那筆 entry 永久卡住。
@@ -941,6 +980,17 @@ func (a *App) PaneLayout() (PaneLayout, error) {
 	return out, nil
 }
 
+// SetPaneLayout：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) SetPaneLayout(pins []string, focused string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.setPaneLayout(pins, focused)
+}
+
 // SetPaneLayout：使用者改變釘選或焦點時的 durable 寫入。
 //
 // **寫入頻率與 debounce（本票判斷，見 pane-pins-report.md）**：觸發點是離散的
@@ -956,14 +1006,10 @@ func (a *App) PaneLayout() (PaneLayout, error) {
 // 剛做的釘選——pins 是 UI 偏好，不是 resume correctness，寫不進去的正確降級是
 // 「這次的排列重啟後會遺失」，不是「不准釘選」。
 //
-// 走 beginAppTxn 的理由：§3.6.5 把 `session registry Sync` 凍結為 shutdown 的最後
+// 走 beginTxn 的理由：§3.6.5 把 `session registry Sync` 凍結為 shutdown 的最後
 // 一步，晚於它抵達的寫入不是遺失就是把已 flush 的內容再弄髒。shutdown 柵欄是既有
 // 且唯一的擋法。
-func (a *App) SetPaneLayout(pins []string, focused string) error {
-	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) setPaneLayout(pins []string, focused string) error {
 	if a.wsReg == nil {
 		return errNoSessionRegistry
 	}
@@ -1317,7 +1363,7 @@ func (a *App) stateBlockedReasonLocked() string {
 
 // stateBlockedErr：state 操作是否被擋下（nil ＝ 沒有）。惰性初始化路徑
 // （ensureGate／ensureEscalation）用它擋內部呼叫者；exported binding 走
-// beginStateTxn 的 lifecycle 判定。
+// beginTxn 的 lifecycle 判定。
 func (a *App) stateBlockedErr() error {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
@@ -1331,17 +1377,19 @@ func (a *App) stateBlockedErr() error {
 // 都不能開**。兩種情形：
 //
 //	已在收尾    → shutdown 已經開始，這次 startup 什麼都不該做。
-//	已有 owner  → 另一個 startup 正在跑。**明確拒絕，不覆寫 owner**
+//	已有 owner  → 已經有人取得過 ownership（不論是否已結束）。**明確拒絕**
 //	              （reviewer 2026-08-19）：先前每次進場都重建 startupDone，兩個
 //	              並行時先結束的那個會關掉 channel、把 startupRunning 設回 false，
 //	              於是 shutdown 誤判「startup 都停了」而釋放 lease——但另一個可能
-//	              還在開 writer。owner 只能有一個，channel 只能被建立一次。
+//	              還在開 writer。改用永久旗標之後，連「第一次已經結束、再呼叫一次」
+//	              也一併拒絕：那會重新開啟並覆寫 writers 與 Manager。
 func (a *App) beginStartupLifecycle() bool {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
-	if a.phase == phaseShuttingDown || a.startupRunning {
+	if a.phase == phaseShuttingDown || a.startupStarted {
 		return false
 	}
+	a.startupStarted = true
 	a.startupRunning = true
 	a.startupDone = make(chan struct{})
 	return true
@@ -1422,46 +1470,11 @@ func (a *App) setPhase(p appPhase) {
 }
 
 // phaseNow：目前的 lifecycle 狀態（診斷／損害控制用；不要拿它做「檢查後再動作」
-// 的判斷——那種判斷必須在 shutMu 內一次完成，見 beginStateTxn）。
+// 的判斷——那種判斷必須在 shutMu 內一次完成，見 beginTxn）。
 func (a *App) phaseNow() appPhase {
 	a.shutMu.Lock()
 	defer a.shutMu.Unlock()
 	return a.phase
-}
-
-// beginStateTxn：**所有會讀寫 gate／escalation／evidence 狀態的 Wails binding 的
-// 共同入場點**。成功時呼叫端必須 defer endAppTxn()。
-//
-// 「檢查 lifecycle ＋ 登記 in-flight 交易」在**同一個 shutMu 臨界區**內完成，
-// 這是這個函式存在的理由：
-//
-//	(1) 交易登記 → shutdown 的 inflight.Wait() 會等這一筆做完才往下走，lease
-//	    因此不可能在 escalation.jsonl 還在被寫的時候釋放（reviewer 2026-08-19：
-//	    實測 lease 已釋放、第二個 process 已可取鎖之後，原 binding 仍寫得進去）。
-//	(2) lifecycle 檢查 → 只有 ready 才放行。Wails 在 macOS 會**並行**執行
-//	    OnStartup 與 bindings，所以「binding 先通過閘門、startup 隨後才發現遷移
-//	    衝突」是真的會發生的順序；用另一把鎖上的 latch 擋不住它，用同一把鎖才行。
-//
-// **只掛在 exported binding 上**，內部呼叫走各自的 unexported 版本（如
-// gateList）——巢狀的 begin/end 雖然計數上安全，但會讓「shutdown 剛好落在
-// 內外兩次 begin 之間」變成操作做到一半才失敗，那是新造出來的失敗模式。
-//
-// 涵蓋範圍不靠手寫清單維護：見 app_binding_surface_test.go 的結構守門（從所有
-// Wails export 反向推導哪些碰得到 state）。
-func (a *App) beginStateTxn() error {
-	a.shutMu.Lock()
-	defer a.shutMu.Unlock()
-	switch a.phase {
-	case phaseReady:
-		a.inflight.Add(1)
-		return nil
-	case phaseBlocked:
-		return errors.New(a.stateBlockedReasonLocked())
-	case phaseShuttingDown:
-		return errors.New("app shutting down")
-	default:
-		return errors.New("app 尚未完成啟動：在啟動序列完成之前不受理核可、阻擋事項與證據操作")
-	}
 }
 
 // toolsDir／nodePathValue：單一欄位的讀取器（CLI 路徑組裝、childEnv 用）。
@@ -1824,7 +1837,7 @@ func (a *App) repairIncompleteTurns(entries []wsregistry.Entry) error {
 // 目前的「開放」形式：發一則 workspace 級 UI 訊號。它不是門閂，門閂在結構
 // 上——startup() 是同步的，而 provider 相關入口（CreateSession → StartSession）
 // 全部要求 a.wsReg 已接線，那是本序列成功走完才發生的事。這裡刻意不另外加
-// 一道 beginAppTxn 級的 ready 閘：那會改變所有既有入口的行為，遠超本 task 的
+// 一道 beginTxn 級的 ready 閘：那會改變所有既有入口的行為，遠超本 task 的
 // 範圍，且在同步啟動下買不到額外保證。
 func (a *App) openUIAndProviders() {
 	a.startupStep("open_ui")
@@ -1942,7 +1955,8 @@ func (a *App) startup(ctx context.Context) {
 	if !a.beginStartupLifecycle() {
 		// 被拒：收尾已開始，或已經有另一個 startup owner。兩種都不得開任何
 		// writer；被跳過的步驟不能無聲，所以留一則橫幅（audit 此刻不一定開著）。
-		a.noteStartupBlocker("拒絕啟動：收尾已開始或已有另一個啟動流程在進行，本次不開啟任何 session 狀態。")
+		a.noteStartupBlocker("拒絕啟動：收尾已開始，或這個實例已經啟動過一次——" +
+			"啟動序列只執行一次，本次不開啟任何 session 狀態。")
 		return
 	}
 	defer a.endStartupLifecycle()
@@ -2105,7 +2119,7 @@ func (a *App) startupAfterWriters() {
 	// startup 就 fail loud。
 	// **ready 設在 reconcile 之前**：reconcileGate1NotifyOnly 自己就要開 gate
 	// journal，而惰性初始化只認 blocked latch、不認 phase（內部呼叫者不走
-	// beginStateTxn）。先進 ready 讓兩者的判準一致：走到這裡代表遷移已完成、
+	// beginTxn）。先進 ready 讓兩者的判準一致：走到這裡代表遷移已完成、
 	// writer 已開，state 操作可以放行。
 	a.setPhase(phaseReady)
 	if _, statErr := os.Stat(filepath.Join(a.stateDir, "gate.jsonl")); statErr == nil {
@@ -2642,14 +2656,14 @@ func (a *App) shutdown(ctx context.Context) {
 	a.reclaimAssists()      // 2b) cancel 每個 in-flight SpecAssist（bounded：runner 界限內退出）
 	a.reclaimEvidenceRuns() // 2c) cancel 每個 in-flight RunEvidence（task-20：同上理由，必須早於 inflight.Wait）
 	a.cancelRebuild()       // 2d) 取消 replay index 重建重試迴圈並等它收斂（見其 doc；必須早於 inflight.Wait）
-	a.inflight.Wait()       // 2e) 等已取得 ownership 的交易（含 assist teardown 的 endAppTxn）完成
+	a.inflight.Wait()       // 2e) 等已取得 ownership 的交易（含 assist teardown 的 endTxn）完成
 	a.shutdownStep("stop_watchers")
 
 	// 3) snapshot：host 與 pending approval 各取一份快照，之後的每一步都用這兩份。
 	//
 	// 兩份快照的完整性保證**不同，不要混為一談**：
 	//   - host：先拒新交易（reject_new_txn）再快照，之後不可能有新的 host 進來
-	//     ——建立 host 的入口一律經 beginAppTxn。
+	//     ——建立 host 的入口一律經 beginTxn。
 	//   - approval：**沒有這個保證**。registerApproval 的兩條來源（Claude 的
 	//     pumpApprovals、Codex 的 OnServerRequest → codexApproval）都不經
 	//     shuttingDown 閘門，快照之後仍可能登記新的 approval，那些不會拿到下一步
@@ -3440,6 +3454,17 @@ func deepestExistingAncestor(dir, root string) (string, error) {
 	}
 }
 
+// SpecWrite：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.specWrite(rel, content, expectedDigest)
+}
+
 // SpecWrite 寫納管檔（新檔或既有檔覆寫），atomic rename＋optimistic concurrency。
 //
 // 不能重用 resolveInWorkspace：它對「完整目標路徑」做 EvalSymlinks，新檔尚不
@@ -3451,7 +3476,7 @@ func deepestExistingAncestor(dir, root string) (string, error) {
 // 最深的「已存在」祖先目錄（其下所有路徑段必然尚不存在，不可能是 symlink），
 // 對這個祖先做 EvalSymlinks 確認仍在 root 之內，通過才 MkdirAll——之後新建的
 // 每一段路徑都在已驗證 contained 的祖先之下、且是全新建立（不是 symlink）。
-func (a *App) SpecWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+func (a *App) specWrite(rel, content, expectedDigest string) (newDigest string, err error) {
 	if !spec.InScope(rel) {
 		return "", fmt.Errorf("path %q is not a managed spec file", rel)
 	}
@@ -3623,10 +3648,10 @@ func gate1Bindings(manifestDigest, baseCommit string) []gate.Binding {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) SubmitForApproval() (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.submitForApproval()
 }
 
@@ -3658,10 +3683,10 @@ type SpecCommitPreview struct {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) PreviewSpecCommit() (SpecCommitPreview, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return SpecCommitPreview{}, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.previewSpecCommit()
 }
 
@@ -3682,10 +3707,10 @@ func (a *App) previewSpecCommit() (SpecCommitPreview, error) {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) ConfirmSpecCommit(tok spec.CommitToken, message string) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.confirmSpecCommit(tok, message)
 }
 
@@ -4105,11 +4130,22 @@ func (a *App) PlanRead(rel string) (SpecFile, error) {
 // 是 spec 樹還是 plan 樹撞鎖。
 var ErrPlanWriteConflict = errors.New("plan write conflict: expected_digest does not match current file")
 
+// PlanWrite：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) PlanWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.planWrite(rel, content, expectedDigest)
+}
+
 // PlanWrite 逐字鏡射 SpecWrite（atomic rename＋optimistic concurrency＋
 // symlink-escape containment；完整威脅模型與逐步理由見 SpecWrite 的 doc
 // comment，此處不重複），差異僅：scope 檢查換 spec.PlanScope.Match、衝突錯誤
 // 換 ErrPlanWriteConflict、暫存檔前綴換 ".plan-write-*.tmp"。
-func (a *App) PlanWrite(rel, content, expectedDigest string) (newDigest string, err error) {
+func (a *App) planWrite(rel, content, expectedDigest string) (newDigest string, err error) {
 	if !spec.PlanScope.Match(rel) {
 		return "", fmt.Errorf("path %q is not a managed plan file", rel)
 	}
@@ -4182,10 +4218,10 @@ func (a *App) PlanWrite(rel, content, expectedDigest string) (newDigest string, 
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) PreviewPlanCommit() (SpecCommitPreview, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return SpecCommitPreview{}, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.previewPlanCommit()
 }
 
@@ -4220,10 +4256,10 @@ func (a *App) previewPlanCommit() (SpecCommitPreview, error) {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) ConfirmPlanCommit(tok spec.CommitToken, message string) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.confirmPlanCommit(tok, message)
 }
 
@@ -4422,10 +4458,10 @@ func bumpTouchedFiles(g plan.GitRunner, old, head string) (paths []string, allPl
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) PreviewAnalysisBaseBump(planRel, buffer string) (BumpPreview, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return BumpPreview{}, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.previewAnalysisBaseBump(planRel, buffer)
 }
 
@@ -4565,10 +4601,10 @@ func replaceAnalysisBaseCommitLine(line, newVal string) (string, bool) {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) ConfirmAnalysisBaseBump(tok BumpToken, planRel, currentBuffer string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.confirmAnalysisBaseBump(tok, planRel, currentBuffer)
 }
 
@@ -4651,10 +4687,10 @@ func gate2Bindings(specManifest, planManifest, baseCommit, riskPolicyDigest, per
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) SubmitPlanForApproval(planID string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.submitPlanForApproval(planID)
 }
 
@@ -4769,10 +4805,10 @@ func isRiskUnclassifiable(errs []error) bool {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) RegisterMutation(taskRef, patch string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.registerMutation(taskRef, patch)
 }
 
@@ -4813,10 +4849,10 @@ var ErrStaleGeneration = errors.New("evidence: gate2 approval changed since view
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.runEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID)
 }
 
@@ -4834,13 +4870,13 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 // 下方 Step 2 分段）。
 //
 // Lifecycle ownership（task-20-brief.md 凍結，不依賴 Task 24 的
-// workflowMu）：beginAppTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
+// workflowMu）：beginTxn() 是 shutdown gate 的入場點（沿 app.go:152 慣例，
 // shutdown 後拒新 run）；執行 context 衍生自 a.ctx（app 的 shutdown-scoped
 // context，同 SpecAssist／StartSession 的既定用法），供 reclaimEvidenceRuns
 // 手動 cancel。evidence.Run 內部才會 mint evidence_id（ulid callback），所以
 // active-run registry 的登記時機挪進 ulid callback 本身。
 //
-// beginAppTxn 成功到 ulid callback 執行之間，evidence.Run 已經先跑了
+// beginTxn 成功到 ulid callback 執行之間，evidence.Run 已經先跑了
 // LoadAt／LoadOracleAt／VerifyLineage／OracleDigestAt 這串 git 呼叫——這段
 // 窗口 evidenceActive 還沒有這筆 run 的登記，若 shutdown 的 reclaimEvidenceRuns
 // snapshot 剛好落在這裡，它會拿到空清單、cancel 永遠送不到這個 run（review
@@ -4855,16 +4891,16 @@ func (a *App) RunEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 // canceled"，不是 Go error），也視為未完成、不 finalize——一個被 shutdown
 // 中止的 run 不能被當成有效證據收進 journal。
 //
-// M3a.1 T8（§3.3.2）凍結順序：beginAppTxn → workflowMu.Lock → 讀取並固定
-// 權威 active gate2 approval_id／plan_commit（GateList 挪到 beginAppTxn 之
+// M3a.1 T8（§3.3.2）凍結順序：beginTxn → workflowMu.Lock → 讀取並固定
+// 權威 active gate2 approval_id／plan_commit（GateList 挪到 beginTxn 之
 // 後、workflowMu 下讀——不再信任呼叫前的快照）→ CAS 比對 expected（不符→
-// Unlock→endAppTxn→ErrStaleGeneration）→ workflowMu.Unlock → Step 2b：
+// Unlock→endTxn→ErrStaleGeneration）→ workflowMu.Unlock → Step 2b：
 // shutMu 下重查 shuttingDown（沿 pre-ulid 窗自我 cancel 先例——CAS 通過後到
 // started event 之間若 shutdown 已開始，零副作用返回，不指望 ulid callback
 // 那次複查還來得及，因為這個 run 這時甚至還沒發過 started event）→ started
-// event／mutation 載入／worktree 建立／run → finalize → endAppTxn。
+// event／mutation 載入／worktree 建立／run → finalize → endTxn。
 // runEvidenceCASHook（測試 seam，沿 decideBarrierHook 命名慣例）在
-// beginAppTxn 成功後、workflowMu.Lock 前觸發——特意早於 Lock，讓 hook 內部
+// beginTxn 成功後、workflowMu.Lock 前觸發——特意早於 Lock，讓 hook 內部
 // 可呼叫 GateDecide 之類同樣取 workflowMu 的操作換版，而不會跟本呼叫自己的
 // Lock 死鎖。
 func (a *App) runEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, kind, mutationID string) (string, error) {
@@ -5042,10 +5078,10 @@ const evidenceRunEventKind = "evidence_run"
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EvidenceGet(evidenceID string) (evidence.EvidenceRun, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return evidence.EvidenceRun{}, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.evidenceGet(evidenceID)
 }
 
@@ -5070,10 +5106,10 @@ type CommitInfo struct {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) ValidateTestCommit(planID, taskID, testCommit string) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.validateTestCommit(planID, taskID, testCommit)
 }
 
@@ -5121,10 +5157,10 @@ func (a *App) validateTestCommit(planID, taskID, testCommit string) error {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EvidenceCommitCandidates(planID string) ([]CommitInfo, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return nil, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.evidenceCommitCandidates(planID)
 }
 
@@ -5195,10 +5231,10 @@ func tcaBindings(gate2ApprovalID, gate2RecordDigest, gate2BaseCommitDigest strin
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) SubmitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.submitTestContract(planID, taskID, testCommit, expectedRedID, negativeControlID, mutationID)
 }
 
@@ -5302,10 +5338,10 @@ type GateDecisionContextDTO struct {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) GateDecisionContext(approvalID string) (GateDecisionContextDTO, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return GateDecisionContextDTO{}, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.gateDecisionContext(approvalID)
 }
 
@@ -5369,17 +5405,17 @@ type GateEntryDTO struct {
 // Project——projection 永不信任快取的 active（spec §4 權威層）。journal 進入
 // degraded（append 失敗過）時每筆都標示，供 UI 提示「核可仍可讀但暫不可寫」。
 //
-// 這是 Wails binding，所以走 beginStateTxn（shutdown 等待 ＋ migration blocker）；
+// 這是 Wails binding，所以走 beginTxn（shutdown 等待 ＋ migration blocker）；
 // app 內部要同一份 projection 的地方一律呼叫 gateList，不重入交易閘。
 func (a *App) GateList() ([]GateEntryDTO, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return nil, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.gateList()
 }
 
-// gateList：GateList 的本體（不進交易閘，見 beginStateTxn 的 doc）。
+// gateList：GateList 的本體（不進交易閘，見 beginTxn 的 doc）。
 func (a *App) gateList() ([]GateEntryDTO, error) {
 	svc, err := a.ensureGate()
 	if err != nil {
@@ -5442,10 +5478,10 @@ func (a *App) gitIdentity() (name, email string, err error) {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) GateDecide(approvalID, decision, reason string, riskSelections []gate.RiskSelection) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.gateDecide(approvalID, decision, reason, riskSelections)
 }
 
@@ -5795,10 +5831,10 @@ func (a *App) escPlannerRuntimeViolationLocked(provider, detail string) (string,
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EscalationList() ([]escalation.Entry, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return nil, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.escalationList()
 }
 
@@ -5818,10 +5854,10 @@ func (a *App) escalationList() ([]escalation.Entry, error) {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EscalationCreate(sourceRef, blockScope, summary string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.escalationCreate(sourceRef, blockScope, summary)
 }
 
@@ -5847,10 +5883,10 @@ func (a *App) escalationCreate(sourceRef, blockScope, summary string) (string, e
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EscalationAck(id string) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.escalationAck(id)
 }
 
@@ -5869,10 +5905,10 @@ func (a *App) escalationAck(id string) error {
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) EscalationResolve(id, resolution, reason string) error {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.escalationResolve(id, resolution, reason)
 }
 
@@ -5901,13 +5937,24 @@ func (a *App) escalationResolve(id, resolution, reason string) error {
 
 // ---- SpecAssist（Task 11：隔離 one-shot 草擬＋lifecycle；Stage A §5.1／§8-risk-1）----
 
+// SpecAssist：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.specAssist(provider, purpose, prompt)
+}
+
 // SpecAssist 以隔離的一次性 AI 呼叫草擬 spec 內容，帶 provider 端強制的零 workspace
 // 變更保證（Claude `--tools ""`／Codex readOnly+never，見 internal/assist）。
 //
 // lifecycle 不變量：
 //   - 獨佔性：每個 provider 至多一個 active；第二個併發請求回 ErrAssistActive。
-//   - 交易閘：beginAppTxn 於啟動（shutdown 後拒新），endAppTxn 於收尾一次。
-//   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endAppTxn）
+//   - 交易閘：beginTxn 於啟動（shutdown 後拒新），endTxn 於收尾一次。
+//   - shutdown reclaim：shutdown cancel in-flight one-shot、等其收尾（endTxn）
 //     後才 Manager.Close（reclaimAssists＋inflight.Wait）。
 //   - ownership 隔離：不碰 sessionHosts／a.codexConn（assist runner 為獨立 process）；
 //     晚到舊 generation 事件（correlation 不符）丟棄並發 stream_error（fail loud）。
@@ -5916,7 +5963,7 @@ func (a *App) escalationResolve(id, resolution, reason string) error {
 // 事件經 Manager.EmitAssist 出口（scope=session、provider、correlation_id、
 // purpose="spec_assist"）——保留稽核＋檔案級 event_id，但**不進 provider slot**
 // （前端依 purpose 二次分流，不污染 reducer／Chat／totals）。
-func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
+func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
@@ -5930,7 +5977,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
-	// gen（含 cancel）必須早於 beginAppTxn 進 assistActive——shutdown 的 reclaim
+	// gen（含 cancel）必須早於 beginTxn 進 assistActive——shutdown 的 reclaim
 	// 掃描此結構。若 txn 先登記進 inflight、gen 卻尚不可見，reclaim 會掃到空集合、
 	// cancel 不到，inflight.Wait 卻等到 assistTimeout（~3min stall）。反轉順序後：
 	// 任何會被 inflight.Wait 等到的 assist，其 gen 必已可被 reclaim cancel。
@@ -5946,7 +5993,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil { // 測試 barrier：gen 已可見、txn 未登記
 		h()
 	}
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新請求
+	if err := a.beginTxn(); err != nil { // shutdown gate：拒新請求
 		a.assistMu.Lock() // rollback：未取得交易閘，撤下 gen（reclaim 若已 cancel 亦冪等）
 		if a.assistActive[provider] == gen {
 			delete(a.assistActive, provider)
@@ -5965,7 +6012,7 @@ func (a *App) SpecAssist(provider, purpose, prompt string) (string, error) {
 				delete(a.assistActive, provider)
 			}
 			a.assistMu.Unlock()
-			a.endAppTxn()
+			a.endTxn()
 			close(gen.done)
 		})
 	}
@@ -6081,10 +6128,10 @@ func activeGate1SpecManifestDigest(entries []GateEntryDTO) (digest string, ok bo
 // 這個形狀由 app_binding_surface_test.go 逐一驗證；不得在此處插入任何其他
 // 敘述（含參數驗證），那會讓別的失敗訊息蓋掉 lifecycle 的拒絕原因。
 func (a *App) PlanAssist(provider, prompt string) (string, error) {
-	if err := a.beginStateTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return "", err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	return a.planAssist(provider, prompt)
 }
 
@@ -6171,7 +6218,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
-	// 同 SpecAssist：gen 先入 assistActive 才 beginAppTxn（shutdown reclaim 窗口
+	// 同 SpecAssist：gen 先入 assistActive 才 beginTxn（shutdown reclaim 窗口
 	// 不變量，見 SpecAssist doc）。共用同一張 a.assistActive／同一把 a.assistMu
 	// ——每個 provider 至多一個 active（SpecAssist／PlanAssist 共用同一獨佔性
 	// 與 reclaim 基礎設施，reclaimAssists 無需另行改動即涵蓋兩者）。
@@ -6187,7 +6234,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil {
 		h()
 	}
-	if err := a.beginAppTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		a.assistMu.Lock()
 		if a.assistActive[provider] == gen {
 			delete(a.assistActive, provider)
@@ -6205,7 +6252,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 				delete(a.assistActive, provider)
 			}
 			a.assistMu.Unlock()
-			a.endAppTxn()
+			a.endTxn()
 			close(gen.done)
 		})
 	}
@@ -6311,7 +6358,7 @@ func (a *App) newPlanAssistRunner(provider string) (assist.Runner, error) {
 }
 
 // reclaimAssists：shutdown 對 in-flight SpecAssist 的收束——cancel 每個 active
-// generation（runner 界限內退出 → teardown 清 active＋endAppTxn＋close done）。
+// generation（runner 界限內退出 → teardown 清 active＋endTxn＋close done）。
 // 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
 // （稽核收尾在 sink 關閉前完成）。bounded 由 runner 尊重 ctx（proc TermGrace）保證。
 func (a *App) reclaimAssists() {
@@ -6388,7 +6435,18 @@ func (a *App) pendingByID(id string) *pendingApproval {
 	return a.apprPending[id]
 }
 
+// ResolveApproval：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) ResolveApproval(id string, allow bool, reason string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.resolveApproval(id, allow, reason)
+}
+
+func (a *App) resolveApproval(id string, allow bool, reason string) error {
 	a.apprMu.Lock()
 	p, ok := a.apprPending[id]
 	if ok {
@@ -6444,13 +6502,20 @@ func (a *App) pumpApprovals(w appcore.WSID, provider contract.Provider,
 
 // ---- session 綁定 ----
 
-// StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
-// process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
+// StartSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：拒新 Start
+	if err := a.beginTxn(); err != nil {
 		return err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
+	return a.startSession(wsid, prompt, resume, recordCase, taskLabel, approvalPolicy)
+}
+
+// StartSession：單一 ownership 交易——BeginNewSessionSubmit 先佔（輸家在建立任何
+// process／recorder／pump 之前就失敗）→ provider 同步啟動 → Accept／Reject。
+func (a *App) startSession(wsid, prompt, resume, recordCase, taskLabel, approvalPolicy string) error {
 	// Task 26 原子切換：WSID 直接來自前端（session 由 CreateSession 建立、
 	// ListSessions 列出），不再有 provider → WSID 的解析層。
 	w, prov, err := a.resolveWSID("start session", wsid)
@@ -6517,9 +6582,20 @@ func (a *App) StartSession(wsid, prompt, resume, recordCase, taskLabel, approval
 	}
 }
 
+// SendMessage：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) SendMessage(wsid, prompt string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.sendMessage(wsid, prompt)
+}
+
 // SendMessage：指定 WSID 既有 session 的後續輪（僅該 slot phaseActive 允許；
 // 錯誤原樣回 UI）。多 session 並存：一個 session busy 不影響另一個。
-func (a *App) SendMessage(wsid, prompt string) error {
+func (a *App) sendMessage(wsid, prompt string) error {
 	w, pv, err := a.resolveWSID("send message", wsid)
 	if err != nil {
 		return err
@@ -6557,11 +6633,22 @@ func (a *App) SendMessage(wsid, prompt string) error {
 	return a.manager.AcceptSubmit(w, id, h.runner.ThreadID(), prompt)
 }
 
+// EndSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) EndSession(wsid string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.endSession(wsid)
+}
+
 // EndSession：指定 provider 的收尾編排（appcore.EndSessionFlow）。冪等；
 // ErrProviderBusy 等真實錯誤原樣回 UI。
 //
-// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginAppTxn／
-// endAppTxn，沿 app.go:213 慣例，同 StartSession／ensureAppServer／B1 probe）。
+// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginTxn／
+// endTxn，沿 app.go:213 慣例，同 StartSession／ensureAppServer／B1 probe）。
 // 修前的 gap：EndSession 完全不在 shutdown gate 之內——使用者已呼叫的 EndSession
 // 若跟 shutdown() 同時發生，shutdown 的 inflight.Wait() 不會等它，會直接往下讀
 // 該 session 的 host（M3b 前為 a.claudeSess）進 forcedShutdown；forcedShutdown
@@ -6583,11 +6670,7 @@ func (a *App) SendMessage(wsid, prompt string) error {
 // 是否共用都不會有第二次真正執行——與自然收尾 reaper 競速（跟 shutdown 無關
 // 的既有情境，見 fix/shutdown-end-in-progress report concern 3）因此維持原行為
 // 未變動，殘留面已知、非本輪修復範圍。
-func (a *App) EndSession(wsid string) error {
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：見上方 doc
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) endSession(wsid string) error {
 	w, p, err := a.resolveWSID("end session", wsid)
 	if err != nil {
 		return err
@@ -6636,7 +6719,10 @@ func (a *App) pendingApprovalIDs(match func(*pendingApproval) bool) []string {
 func (a *App) denyApprovals(ids []string, reason string) error {
 	var errs []error
 	for _, id := range ids {
-		if err := a.ResolveApproval(id, false, reason); err != nil {
+		// 走實作而不是 exported binding：收尾路徑本身就在 shutdown 裡，交易閘
+		// 此刻必然拒絕（phase 已是 shuttingDown），呼叫 binding 會讓 fail-closed
+		// 的 deny 一筆都送不出去。
+		if err := a.resolveApproval(id, false, reason); err != nil {
 			errs = append(errs, fmt.Errorf("approval %s: %w", id, err))
 		}
 	}
@@ -6664,6 +6750,17 @@ func (a *App) cleanupRemovedFiles(w appcore.WSID) error {
 		return fmt.Errorf("app: cleanup mcp config %s: %w", path, err)
 	}
 	return nil
+}
+
+// RemoveSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) RemoveSession(wsid string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.removeSession(wsid)
 }
 
 // RemoveSession：使用者明確移除（§3.6.1-3；純新增 binding）——registry 留
@@ -6700,11 +6797,7 @@ func (a *App) cleanupRemovedFiles(w appcore.WSID) error {
 // 今天不可達：exported binding 只在 bindings.ts／bindings.test.ts 有 wiring，
 // 前端沒有任何呼叫路徑會在使用者可觸及的時間點於同一 WSID 上讓 Remove 與
 // StartSession 真正競速。
-func (a *App) RemoveSession(wsid string) error {
-	if err := a.beginAppTxn(); err != nil { // shutdown 柵欄
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) removeSession(wsid string) error {
 	w := appcore.WSID(wsid)
 	p, ok := a.manager.ProviderOf(w)
 	if !ok {
@@ -6780,7 +6873,18 @@ func (a *App) RemoveSession(wsid string) error {
 	return nil
 }
 
+// TerminateSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) TerminateSession(wsid string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.terminateSession(wsid)
+}
+
+func (a *App) terminateSession(wsid string) error {
 	w, p, err := a.resolveWSID("terminate session", wsid)
 	if err != nil {
 		return err
@@ -7082,10 +7186,10 @@ var errCodexNotRunning = errors.New("codex app-server not running")
 func (a *App) ensureAppServer() (codex.ProbeTarget, error) {
 	// server-create 交易：check 與建立對 shutdown 原子（TOCTOU 關閉）——
 	// AuthStatus／StartLogin／Logout 等所有經此入口的路徑一體適用
-	if err := a.beginAppTxn(); err != nil {
+	if err := a.beginTxn(); err != nil {
 		return nil, err
 	}
-	defer a.endAppTxn()
+	defer a.endTxn()
 	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、建立未開始
 		h()
 	}
@@ -7599,6 +7703,17 @@ func (a *App) refuseIfCodexLive() error {
 	return nil
 }
 
+// RecoverCodexRecording：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) RecoverCodexRecording() error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.recoverCodexRecording()
+}
+
 // RecoverCodexRecording 是 §3.4.6 recorder error latch 的 in-process 復原入口，
 // 同時是 §3.4.7 受控 app-server replacement 的最小方案。
 //
@@ -7611,11 +7726,7 @@ func (a *App) refuseIfCodexLive() error {
 // → terminate → wait → finalize 舊 generation → 配置新 wire_log_id → 起新
 // server → 掛 recorder → handshake → 發布；中段由 replaceCodexGeneration 委派
 // 給 RunOwnedHandshake。拒絕不改變 latch 狀態。
-func (a *App) RecoverCodexRecording() error {
-	if err := a.beginAppTxn(); err != nil { // 與 ensureAppServer／B1 probe 同一 shutdown 閘門
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) recoverCodexRecording() error {
 	a.codexServerMu.Lock()
 	defer a.codexServerMu.Unlock()
 	if err := a.refuseIfCodexLive(); err != nil {
@@ -8282,6 +8393,17 @@ func (a *App) emitCodexSessionDone(w appcore.WSID, recorderErr string) {
 		"processStillRunning": true, "stderrTail": stderr, "recorderError": recorderErr})
 }
 
+// RestartCodexServerRecorded：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) RestartCodexServerRecorded(recordCase string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.restartCodexServerRecorded(recordCase)
+}
+
 // RestartCodexServerRecorded：B1 受控重啟 probe。
 //
 // M3b §3.4 之後它與 RecoverCodexRecording 是同一件事的兩個入口，共用
@@ -8289,11 +8411,7 @@ func (a *App) emitCodexSessionDone(w appcore.WSID, recorderErr string) {
 // CloseWith），而是交棒給 connection-level 的 always-on wire log，錄到該 server
 // 終止為止。recordCase 因此**只剩 label**（進 audit），不再控制 recorder attach
 // （§3.4.4）；拒絕條件與復原入口相同（§3.4.7：live host／in-flight turn 一律拒絕）。
-func (a *App) RestartCodexServerRecorded(recordCase string) error {
-	if err := a.beginAppTxn(); err != nil { // probe 直接操作 codexSingle：同樣入 gate
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) restartCodexServerRecorded(recordCase string) error {
 	a.codexServerMu.Lock()
 	defer a.codexServerMu.Unlock()
 	if err := a.refuseIfCodexLive(); err != nil {
@@ -8311,7 +8429,18 @@ func (a *App) RestartCodexServerRecorded(recordCase string) error {
 
 // ---- 官方登入（app 不收密碼、不保管 token）----
 
+// AuthStatus：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) AuthStatus(provider string) (string, error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.authStatus(provider)
+}
+
+func (a *App) authStatus(provider string) (string, error) {
 	switch provider {
 	case "claude":
 		out, err := exec.Command(a.claudeCLIPath(), "auth", "status").CombinedOutput()
@@ -8333,7 +8462,18 @@ func (a *App) AuthStatus(provider string) (string, error) {
 	}
 }
 
+// StartLogin：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) StartLogin(provider string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.startLogin(provider)
+}
+
+func (a *App) startLogin(provider string) error {
 	switch provider {
 	case "codex":
 		srv, err := a.ensureAppServer() // 登入與 session 重用同一長駐 server，登入後不重啟
@@ -8379,8 +8519,19 @@ func (a *App) StartLogin(provider string) error {
 	}
 }
 
-// CancelLogin 取消進行中的 codex 官方登入（account/login/cancel，schema 必填 loginId）。
+// CancelLogin：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) CancelLogin(provider string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.cancelLogin(provider)
+}
+
+// CancelLogin 取消進行中的 codex 官方登入（account/login/cancel，schema 必填 loginId）。
+func (a *App) cancelLogin(provider string) error {
 	if provider != "codex" {
 		return fmt.Errorf("cancel login not supported for %q (claude login runs in the system terminal)", provider)
 	}
@@ -8424,7 +8575,18 @@ func (a *App) pollClaudeAuth() {
 	a.emit("auth:status", map[string]any{"provider": "claude", "event": "login_pending_timeout"})
 }
 
+// Logout：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
 func (a *App) Logout(provider string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.logout(provider)
+}
+
+func (a *App) logout(provider string) error {
 	switch provider {
 	case "claude":
 		out, err := exec.Command(a.claudeCLIPath(), "auth", "logout").CombinedOutput()
@@ -8503,19 +8665,26 @@ func (a *App) RestoreViews() map[string]RestoredView {
 	return out
 }
 
+// NewSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 形狀由 app_binding_surface_test.go 逐項驗證；不得在此插入任何其他敘述
+// （含參數驗證與 provider 分支），那會讓一部分分支落在交易之外。
+func (a *App) NewSession(wsid string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.newSession(wsid)
+}
+
 // NewSession：New 專用原子流程（plan D4）。收尾成功才重設恢復視窗；失敗回錯、
 // UI 不重設；另一 provider 完全不受影響。resetting phase 涵蓋
 // 「teardown → restore reset」整段（期間 Start 回 ErrResetInProgress）。
 //
-// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginAppTxn／
-// endAppTxn）——理由與 EndSession 上方 doc 完全相同（同一類 shutdown race，
+// review P1（fix/lifecycle-app-txn）：整段納入 app transaction（beginTxn／
+// endTxn）——理由與 EndSession 上方 doc 完全相同（同一類 shutdown race，
 // NewSession 也是「BeginEndSession 成功才會呼叫 teardown、失敗就直接回錯」，
 // 沒有 fallback 兜底重跑，故同樣不需要共用 host.teardownFn）。
-func (a *App) NewSession(wsid string) error {
-	if err := a.beginAppTxn(); err != nil { // shutdown gate：見 EndSession doc
-		return err
-	}
-	defer a.endAppTxn()
+func (a *App) newSession(wsid string) error {
 	w, pv, err := a.resolveWSID("new session", wsid)
 	if err != nil {
 		return err
