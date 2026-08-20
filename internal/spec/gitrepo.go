@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,15 +18,30 @@ import (
 type GitRepo struct {
 	root string
 	sc   Scope
+	// ctx：git 子行程的取消來源（nil ＝ 不可取消，僅供不在收尾路徑上的呼叫端）。
+	//
+	// 需要它的理由：這些 git 呼叫發生在 Wails binding 的交易內，shutdown 必須能
+	// 讓它們收斂——一個忽略 TERM 的 git 會讓 inflight.Wait 無限等下去
+	// （reviewer 2026-08-20）。
+	ctx context.Context
 }
 
 func NewGitRepo(root string, sc Scope) *GitRepo {
 	return &GitRepo{root: root, sc: sc}
 }
 
+// NewGitRepoCtx：帶取消來源的版本（app 的 binding 路徑一律用這個）。
+func NewGitRepoCtx(ctx context.Context, root string, sc Scope) *GitRepo {
+	return &GitRepo{root: root, sc: sc, ctx: ctx}
+}
+
 // git runs `git -C root <args>` and returns raw stdout bytes.
 func (g *GitRepo) git(args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", g.root}, args...)...)
+	ctx := g.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", g.root}, args...)...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

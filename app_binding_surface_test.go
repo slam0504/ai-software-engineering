@@ -53,14 +53,6 @@ var startupSafeBindings = map[string]string{
 	"CLIInfo": "啟動診斷：只讀 startupMu 保護的快照（含 workspace 的受鎖副本）",
 }
 
-// startupSafeFields：startup-safe binding 唯一可以碰的 App 欄位——全部由
-// startupMu 保護。
-var startupSafeFields = []string{
-	"startupMu", "startupErr", "startupBlockers",
-	"toolsDirPath", "toolsSource", "nodePath",
-	"workspaceSnap", "workspaceSrcSnap",
-}
-
 // bindingClass：名稱 → 類別（空字串＝必須是薄包裝）。
 func bindingClass(name string) string {
 	if startupSafeBindings[name] != "" {
@@ -84,10 +76,16 @@ func TestEveryBindingIsClassifiedAndHonoursItsShape(t *testing.T) {
 	appType := namedType(t, pkg, "App")
 	methods := appMethodsByName(files, info, appType)
 
+	// **用真正的 method set 枚舉**（reviewer 2026-08-20）：只掃 receiver 直接寫成
+	// App／*App 的 FuncDecl，會漏掉匿名嵌入型別 promote 上來的 exported method
+	// ——`go doc` 看得到、Wails 的 reflection 也會綁它，分類測試卻數不到。
 	var offenders, gated []string
-	for _, name := range sortedMethodNames(methods) {
+	for _, name := range exportedMethodSetNames(t, appType) {
 		fd := methods[name]
-		if !fd.Name.IsExported() {
+		if fd == nil {
+			offenders = append(offenders,
+				name+"：出現在 *App 的 method set 裡（Wails 會綁定它），但不是 App 自己宣告的方法"+
+					"——嵌入型別 promote 上來的 method 無法套用薄包裝契約，請改成 App 上的明確宣告")
 			continue
 		}
 		class := bindingClass(name)
@@ -175,6 +173,63 @@ func TestOnlyThinWrappersAdmit(t *testing.T) {
 	}
 }
 
+// assistImplementations：會做大量前置阻塞工作的 assist 實作。
+var assistImplementations = []string{"specAssist", "planAssist"}
+
+// TestAssistImplementationsTakeRootContextFirst
+//
+// assist 實作**第一個對 App 的呼叫**必須是取得 procRoot（reviewer 2026-08-20）。
+//
+// 為什麼是「第一個」而不是「有取得就好」：ctx 拿得晚，前面那些 gate reconcile／
+// gateList／git status／binary SHA／preflight 就落在不可取消的範圍內，shutdown
+// cancel 根 context 也影響不到它們——實測一個忽略 TERM 的 git 就能讓
+// inflight.Wait 無限等下去。
+func TestAssistImplementationsTakeRootContextFirst(t *testing.T) {
+	fset, files, info, pkg := typeCheckProductionPackage(t)
+	appType := namedType(t, pkg, "App")
+	methods := appMethodsByName(files, info, appType)
+
+	for _, name := range assistImplementations {
+		fd := methods[name]
+		if fd == nil {
+			t.Fatalf("找不到 %s（守門與實作脫節）", name)
+		}
+		first, pos := firstAppCall(fd, info, appType)
+		if first != "procRoot" {
+			t.Errorf("%s 對 App 的第一個呼叫必須是 procRoot（取得可取消的根 context），實得 %s（%s）",
+				name, first, fset.Position(pos).String())
+		}
+	}
+}
+
+// firstAppCall：body 裡第一個「對 a 的方法呼叫」的名稱與位置（沒有回空字串）。
+func firstAppCall(fd *ast.FuncDecl, info *types.Info, appType *types.Named) (string, token.Pos) {
+	name, pos := "", token.NoPos
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if name != "" {
+			return false
+		}
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		sel, isSel := call.Fun.(*ast.SelectorExpr)
+		if !isSel {
+			return true
+		}
+		recv, isIdent := sel.X.(*ast.Ident)
+		if !isIdent || recv.Name != "a" {
+			return true
+		}
+		if fn, _ := info.Uses[sel.Sel].(*types.Func); fn == nil || !isAppMethod(fn, appType) {
+			return true
+		}
+		name, pos = sel.Sel.Name, sel.Pos()
+		return false
+	})
+	return name, pos
+}
+
 // methodSignature：FuncDecl 的型別簽章（拿不到回 nil，此時零值判定退回字面量層級）。
 func methodSignature(info *types.Info, fd *ast.FuncDecl) *types.Signature {
 	fn, _ := info.Defs[fd.Name].(*types.Func)
@@ -183,6 +238,23 @@ func methodSignature(info *types.Info, fd *ast.FuncDecl) *types.Signature {
 	}
 	sig, _ := fn.Type().(*types.Signature)
 	return sig
+}
+
+// exportedMethodSetNames：*App 的**真實** method set 裡所有 exported method 名稱
+// ——與 Wails 綁定看到的是同一份（含嵌入型別 promote 上來的）。
+func exportedMethodSetNames(t *testing.T, appType *types.Named) []string {
+	t.Helper()
+	ms := types.NewMethodSet(types.NewPointer(appType))
+	var out []string
+	for i := range ms.Len() {
+		fn, isFunc := ms.At(i).Obj().(*types.Func)
+		if !isFunc || !fn.Exported() {
+			continue
+		}
+		out = append(out, fn.Name())
+	}
+	sort.Strings(out)
+	return out
 }
 
 // appMethodsByName：*App 的所有方法（含 unexported）。
@@ -539,6 +611,27 @@ var osMutators = map[string]bool{
 	"Remove": true, "RemoveAll": true, "MkdirAll": true, "Mkdir": true,
 }
 
+// protectedImplInternalCallers：允許直接呼叫受保護實作的**具名**內部呼叫端，每筆
+// 附 ownership 理由（reviewer 2026-08-20：先前所有 unexported caller 自動放行，
+// 於是隨便新增一個 helper 呼叫 a.listSessions() 也不會被發現）。
+//
+// key＝實作名稱，value＝允許的呼叫端函式名 → 理由。
+var protectedImplInternalCallers = map[string]map[string]string{
+	"gateList": {
+		"submitPlanForApproval":    "同一交易內的 gate projection 讀取",
+		"runEvidence":              "同上",
+		"evidenceGet":              "同上",
+		"evidenceCommitCandidates": "同上",
+		"submitTestContract":       "同上",
+		"gateDecisionContext":      "同上",
+		"planAssist":               "同上",
+		"validateTestCommit":       "同上",
+	},
+	"resolveApproval": {
+		"denyApprovals": "shutdown ownership 之下的 fail-closed deny（此刻交易閘必然拒絕，不能走 binding）",
+	},
+}
+
 // TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper
 //
 // 受保護的實作（薄包裝指向的 unexported method）必須滿足兩條，用 go/types 的
@@ -560,12 +653,14 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 	appType := namedType(t, pkg, "App")
 	methods := appMethodsByName(files, info, appType)
 
+	exportedNames := map[string]bool{}         // exported binding 的名稱（介面派送比對用）
 	protected := map[types.Object]string{}     // impl object → 它的 wrapper 名稱
 	legitCall := map[types.Object]*ast.Ident{} // impl object → wrapper 裡那個合法引用
 	exported := map[types.Object]bool{}
 	for name, fd := range methods {
 		if obj, _ := info.Defs[fd.Name].(*types.Func); obj != nil && fd.Name.IsExported() {
 			exported[obj] = true
+			exportedNames[fd.Name.Name] = true
 		}
 		if !fd.Name.IsExported() || thinWrapperViolation(fd, methods) != "" {
 			continue
@@ -630,8 +725,30 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 					}
 					if inExported && obj != implOfThisWrapper {
 						note(id.Pos(), "exported binding "+fd.Name.Name+" 直接呼叫別的受保護實作 "+obj.Name())
+						return true
+					}
+					if !inExported && protectedImplInternalCallers[obj.Name()][fd.Name.Name] == "" {
+						note(id.Pos(), "未具名的內部呼叫端 "+fd.Name.Name+" 直接呼叫受保護實作 "+
+							obj.Name()+"（要允許就加進 protectedImplInternalCallers 並寫下 ownership 理由）")
 					}
 					return true
+				}
+				// 介面派送：Uses 指向的是 interface 的 method object，比對具體
+				// object 抓不到（reviewer 2026-08-20）。所以另外看「receiver 是
+				// interface 且方法名撞到 exported binding」——那正是「宣告一個
+				// 剛好長得像 App 的 local interface，再拿 a 去滿足它」的形狀。
+				//
+				// 只在 receiver 是 interface 時才判：具體型別上的同名方法
+				// （spec.GitRepo.PreviewSpecCommit、Manager.RemoveSession）是不同
+				// 的東西，用名稱一律擋會把它們也誤殺。
+				if protected[info.Defs[fd.Name]] != "" && exportedNames[id.Name] && !exported[obj] {
+					if sel, isSel := parents[len(parents)-1].(*ast.SelectorExpr); isSel && sel.Sel == id {
+						if s := info.Selections[sel]; s != nil && types.IsInterface(s.Recv()) {
+							note(id.Pos(), "受保護的實作 "+fd.Name.Name+
+								" 經介面呼叫與 exported binding 同名的 "+id.Name+
+								"（local interface 可以讓 a 滿足它，等於繞過薄包裝）")
+						}
+					}
 				}
 				// 反向：受保護的實作不得**以任何形式**引用 exported binding。
 				// 只擋直接呼叫的話，`_ = a.CreateSession` 這種取值仍然通過，而
@@ -667,125 +784,117 @@ func isDirectCallee(id *ast.Ident, parents []ast.Node) bool {
 	return isCall && call.Fun == ast.Expr(sel)
 }
 
-// TestStartupSafeBindingTouchesOnlyGuardedFields
+// TestStartupSafeBindingHasFixedShape
 //
-// startup-safe 那一個 binding 的契約：它（含它呼叫到的每一層）**只能碰**
-// startupSafeFields 裡的 App 欄位。
+// startup-safe binding 的契約改成**一層固定形狀**（reviewer 2026-08-20）：
 //
-// 這條比「不寫 durable state」強得多，而且是它該有的強度：能在 startup 期間跑，
-// 就代表它讀到的每一個欄位都可能正在被 startup 寫，所以每一個都必須在同一把鎖
-// 底下（reviewer 2026-08-20）。
-func TestStartupSafeBindingTouchesOnlyGuardedFields(t *testing.T) {
+//  1. 對 App 的呼叫只能有一個，而且必須是 startupSnapshot()。
+//  2. 其餘呼叫只能是 package function，且簽章不得含 *App／App。
+//  3. 不得直接讀取任何 App 欄位（只能用 startupSnapshot 回來的那份純資料）。
+//
+// 為什麼不繼續擴充呼叫圖分析：前一版逐層追欄位，但只涵蓋直接呼叫——把不安全的
+// helper 改成 function value（`f := a.cliUnsafeProbe; _ = f()`）就整條溜過去，
+// interface dispatch、callback、method value 也一樣。與其宣稱「能完整分析所有 Go
+// 呼叫形式」，不如把可分析的範圍縮到一層：能碰到的東西被形狀限死，就不需要那個
+// 宣稱。
+func TestStartupSafeBindingHasFixedShape(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
+	_ = files
 	appType := namedType(t, pkg, "App")
-	appStruct, isStruct := appType.Underlying().(*types.Struct)
-	if !isStruct {
-		t.Fatal("App 不是 struct（守門前提不成立）")
-	}
-	allowed := map[*types.Var]bool{}
-	for _, name := range startupSafeFields {
-		found := false
-		for i := range appStruct.NumFields() {
-			if appStruct.Field(i).Name() == name {
-				allowed[appStruct.Field(i)] = true
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("App 上沒有欄位 %q：startupSafeFields 已與實作脫節", name)
-		}
-	}
+	methods := appMethodsByName(files, info, appType)
 
-	bodies := map[*types.Func]*ast.FuncDecl{}
-	for _, f := range files {
-		for _, decl := range f.Decls {
-			if fd, isFunc := decl.(*ast.FuncDecl); isFunc && fd.Body != nil {
-				if obj, _ := info.Defs[fd.Name].(*types.Func); obj != nil {
-					bodies[obj] = fd
-				}
-			}
+	for name := range startupSafeBindings {
+		fd := methods[name]
+		if fd == nil {
+			t.Fatalf("startupSafeBindings 列了不存在的 method %q", name)
 		}
-	}
-	calls := map[*types.Func][]*types.Func{}
-	touched := map[*types.Func]map[*types.Var]token.Pos{}
-	for fn, fd := range bodies {
+		appSelectors := 0
+		var parents []ast.Node
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if n == nil {
+				parents = parents[:len(parents)-1]
+				return true
+			}
+			defer func() { parents = append(parents, n) }()
 			switch x := n.(type) {
-			case *ast.CallExpr:
-				var id *ast.Ident
-				switch fun := x.Fun.(type) {
-				case *ast.Ident:
-					id = fun
-				case *ast.SelectorExpr:
-					id = fun.Sel
-				}
-				if id != nil {
-					if callee, _ := info.Uses[id].(*types.Func); callee != nil {
-						calls[fn] = append(calls[fn], callee)
-					}
-				}
 			case *ast.SelectorExpr:
+				// 規則 1／3：對 App 的**任何**選取（欄位讀取、method value、
+				// method call）都必須是那唯一的 a.startupSnapshot() 呼叫。
+				//
+				// 用「選取」而不是「呼叫」當判準是刻意的：`f := a.probe` 是
+				// method value，沒有 CallExpr，只看呼叫會整條漏掉
+				// （reviewer 2026-08-20）。
 				sel := info.Selections[x]
-				if sel == nil || sel.Kind() != types.FieldVal {
+				if sel == nil || !receiverIsApp(sel.Recv(), appType) {
 					return true
 				}
-				v, isVar := sel.Obj().(*types.Var)
-				if !isVar || allowed[v] {
+				appSelectors++
+				ok := x.Sel.Name == "startupSnapshot" && sel.Kind() == types.MethodVal &&
+					isCalleePosition(x, parents)
+				if !ok {
+					t.Errorf("%s 只能有一個對 App 的存取（直接呼叫 a.startupSnapshot()），實得 %s（%s）",
+						name, x.Sel.Name, fset.Position(x.Pos()).String())
+				}
+			case *ast.CallExpr:
+				// 規則 2：其餘呼叫只能是不碰 App 的 package function。
+				id, isIdent := x.Fun.(*ast.Ident)
+				if !isIdent {
 					return true
 				}
-				// 只管 App 上的欄位；別的型別的欄位不在這條契約範圍內。
-				if named, ok := types.Unalias(sel.Recv()).(*types.Pointer); ok {
-					if n2, ok := types.Unalias(named.Elem()).(*types.Named); !ok || n2.Obj() != appType.Obj() {
-						return true
-					}
-				} else if n2, ok := types.Unalias(sel.Recv()).(*types.Named); !ok || n2.Obj() != appType.Obj() {
-					return true
+				if fn, _ := info.Uses[id].(*types.Func); fn != nil && signatureTouchesApp(fn, appType) {
+					t.Errorf("%s 呼叫了會碰 App 的 package function %s（%s）",
+						name, id.Name, fset.Position(id.Pos()).String())
 				}
-				if touched[fn] == nil {
-					touched[fn] = map[*types.Var]token.Pos{}
-				}
-				touched[fn][v] = x.Pos()
 			}
 			return true
 		})
-	}
-	// 定點迭代：把被呼叫者碰到的欄位往上併。
-	for changed := true; changed; {
-		changed = false
-		for fn := range bodies {
-			for _, callee := range calls[fn] {
-				if _, known := bodies[callee]; !known {
-					continue
-				}
-				for v, pos := range touched[callee] {
-					if touched[fn] == nil {
-						touched[fn] = map[*types.Var]token.Pos{}
-					}
-					if _, seen := touched[fn][v]; !seen {
-						touched[fn][v] = pos
-						changed = true
-					}
-				}
-			}
+		if appSelectors != 1 {
+			t.Errorf("%s 對 App 的存取必須恰好一次（startupSnapshot），實得 %d 次", name, appSelectors)
 		}
 	}
+}
 
-	var offenders []string
-	for fn, fd := range bodies {
-		if fd.Recv == nil || !fd.Name.IsExported() || !isAppMethod(fn, appType) {
-			continue
+// receiverIsApp：選取的 receiver 型別是不是 App／*App。
+func receiverIsApp(recv types.Type, appType *types.Named) bool {
+	t := types.Unalias(recv)
+	if p, isPtr := t.(*types.Pointer); isPtr {
+		t = types.Unalias(p.Elem())
+	}
+	named, isNamed := t.(*types.Named)
+	return isNamed && named.Obj() == appType.Obj()
+}
+
+// isCalleePosition：這個 selector 是不是某個 CallExpr 的 Fun（＝被直接呼叫，
+// 不是被當成值取用）。
+func isCalleePosition(sel *ast.SelectorExpr, parents []ast.Node) bool {
+	if len(parents) == 0 {
+		return false
+	}
+	call, isCall := parents[len(parents)-1].(*ast.CallExpr)
+	return isCall && call.Fun == ast.Expr(sel)
+}
+
+// signatureTouchesApp：函式的 receiver 或任一參數是否是 App／*App。
+func signatureTouchesApp(fn *types.Func, appType *types.Named) bool {
+	sig, isSig := fn.Type().(*types.Signature)
+	if !isSig {
+		return false
+	}
+	isApp := func(t types.Type) bool {
+		t = types.Unalias(t)
+		if p, isPtr := t.(*types.Pointer); isPtr {
+			t = types.Unalias(p.Elem())
 		}
-		if bindingClass(fd.Name.Name) != "startupSafe" {
-			continue
-		}
-		for v, pos := range touched[fn] {
-			offenders = append(offenders, fd.Name.Name+" 碰到未受 startupMu 保護的欄位 "+
-				v.Name()+"（"+fset.Position(pos).String()+"）")
+		named, isNamed := t.(*types.Named)
+		return isNamed && named.Obj() == appType.Obj()
+	}
+	if sig.Recv() != nil && isApp(sig.Recv().Type()) {
+		return true
+	}
+	for i := range sig.Params().Len() {
+		if isApp(sig.Params().At(i).Type()) {
+			return true
 		}
 	}
-	sort.Strings(offenders)
-	if len(offenders) != 0 {
-		t.Fatalf("startup-safe binding 只能碰 startupMu 保護的欄位：\n  %s",
-			strings.Join(offenders, "\n  "))
-	}
+	return false
 }

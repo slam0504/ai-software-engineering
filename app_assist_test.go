@@ -714,3 +714,48 @@ func TestPlanAssistRuntimeBlockerSurvivesGenericFailures(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanAssistPreflightWorkIsCancellable
+//
+// reviewer 2026-08-20：PlanAssist 的 wrapper 已取得交易，但實作要到很後面才拿到
+// root context；中間的 gate reconcile／gateList／git status／binary SHA／
+// preflight／HeadCommit 全都不在可取消範圍內。用忽略 SIGTERM 的假 git 卡住
+// `git status`，shutdown 即使先 cancel 了 root 也影響不到它，於是無限卡在
+// inflight.Wait。
+//
+// 這條驗行為那一半：前置工作用的 ctx 來自 procRoot，cancel 之後**立刻**收斂。
+// 「ctx 取得得夠早」那一半由 app_binding_surface_test.go 的
+// TestAssistImplementationsTakeRootContextFirst 用結構驗。
+//
+// 假 git 用「trap TERM 忽略 ＋ 無限迴圈」而不是 sleep：sleep 會被 TERM 收掉，
+// 量到的就變成「訊號有沒有送到」而不是「工作在不在可取消範圍內」。
+func TestPlanAssistPreflightWorkIsCancellable(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, blockingRunner())
+	binDir := t.TempDir()
+	marker := filepath.Join(binDir, "started")
+	script := "#!/bin/sh\ntrap '' TERM\ntouch " + marker + "\nwhile true; do sleep 0.05; done\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.nonPlanDirtyPaths(a.procRoot())
+		done <- err
+	}()
+	waitFor(t, "假 git 已啟動", func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	})
+
+	a.cancelProcRoot() // ＝ shutdown 第 1 步做的事
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("被 cancel 的前置工作必須回錯誤")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("前置工作不在可取消範圍內：cancel 根 context 之後仍未收斂")
+	}
+}

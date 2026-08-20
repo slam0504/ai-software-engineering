@@ -32,7 +32,7 @@ func writeFakeVersionBin(t *testing.T, dir, name, versionLine string) string {
 
 func TestPreflightClaudeOKOnPinAndFrozenArgv(t *testing.T) {
 	bin := writeFakeVersionBin(t, t.TempDir(), "claude", "2.1.223 (Claude Code)")
-	res, err := PreflightClaude(bin, ClaudePlannerArgs())
+	res, err := PreflightClaude(context.Background(), bin, ClaudePlannerArgs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestPreflightClaudeOKOnPinAndFrozenArgv(t *testing.T) {
 
 func TestPreflightClaudeRejectsWrongVersion(t *testing.T) {
 	bin := writeFakeVersionBin(t, t.TempDir(), "claude", "2.1.222 (Claude Code)")
-	res, err := PreflightClaude(bin, ClaudePlannerArgs())
+	res, err := PreflightClaude(context.Background(), bin, ClaudePlannerArgs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestPreflightClaudeRejectsArgvDrift(t *testing.T) {
 		"widened tool whitelist":  {"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--setting-sources", "", "--tools", "Read,Glob,Grep,Write"},
 		"missing setting-sources": {"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--tools", "Read,Glob,Grep"},
 	} {
-		res, err := PreflightClaude(bin, args)
+		res, err := PreflightClaude(context.Background(), bin, args)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -98,7 +98,7 @@ func TestClaudePlannerArgsMatchesFrozenBaseline(t *testing.T) {
 func TestPreflightCodexVersionPin(t *testing.T) {
 	dir := t.TempDir()
 	ok := writeFakeVersionBin(t, dir, "codex-ok", "codex-cli 0.146.1")
-	res, err := PreflightCodex(ok)
+	res, err := PreflightCodex(context.Background(), ok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestPreflightCodexVersionPin(t *testing.T) {
 		t.Fatalf("codex BinaryDigest must be full sha256 hex, got %q", res.BinaryDigest)
 	}
 	bad := writeFakeVersionBin(t, dir, "codex-bad", "codex-cli 0.150.0")
-	res, err = PreflightCodex(bad)
+	res, err = PreflightCodex(context.Background(), bad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,10 +119,10 @@ func TestPreflightCodexVersionPin(t *testing.T) {
 }
 
 func TestPreflightMissingBinaryErrors(t *testing.T) {
-	if _, err := PreflightClaude(filepath.Join(t.TempDir(), "absent"), ClaudePlannerArgs()); err == nil {
+	if _, err := PreflightClaude(context.Background(), filepath.Join(t.TempDir(), "absent"), ClaudePlannerArgs()); err == nil {
 		t.Fatal("missing claude binary must surface an error")
 	}
-	if _, err := PreflightCodex(filepath.Join(t.TempDir(), "absent")); err == nil {
+	if _, err := PreflightCodex(context.Background(), filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("missing codex binary must surface an error")
 	}
 }

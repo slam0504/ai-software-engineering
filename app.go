@@ -521,7 +521,7 @@ type App struct {
 	// 即收一次（清 active flag＋endTxn＋close done）。
 	assistMu     sync.Mutex
 	assistActive map[string]*assistGen
-	// assistRootCtx／assistRootCancel：所有 assist 執行的**根 context**，由
+	// procRootCtx／procRootCancel：所有 assist 執行的**根 context**，由
 	// shutdown 在第 1 步 cancel（見 reclaimAssists）。
 	//
 	// 為什麼需要它（reviewer 2026-08-20）：assist 的實作原本自己開一筆交易，而且
@@ -534,8 +534,8 @@ type App struct {
 	// 「shutting down」拒絕，操作做到一半才失敗），不如把 liveness 從 registry
 	// 掃描改成 context 樹：shutdown 一 cancel 根 context，**不論登記到哪一步**，
 	// 進行中的 assist 都會立刻收斂。registry 掃描退為補強。
-	assistRootCtx       context.Context
-	assistRootCancel    context.CancelFunc
+	procRootCtx         context.Context
+	procRootCancel      context.CancelFunc
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginTxn 未開始
 
@@ -2701,8 +2701,8 @@ func (a *App) shutdown(ctx context.Context) {
 	a.phase = phaseShuttingDown // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
 	a.shutMu.Unlock()
 	// 立刻 cancel assist 根 context：**排在 reclaimAssists 之前**，因為 reclaim
-	// 掃的 registry 可能還沒收到剛進場那一筆（見 assistRootCtx 的 doc）。
-	a.cancelAssistRoot()
+	// 掃的 registry 可能還沒收到剛進場那一筆（見 procRootCtx 的 doc）。
+	a.cancelProcRoot()
 	a.shutdownStep("reject_new_txn")
 
 	// 1a) 等 startup 收斂。startup 不是 binding，phase 擋不住它——它可能正停在
@@ -3715,9 +3715,9 @@ func (a *App) ensureGate() (*gate.Service, error) {
 			a.gateInitErr = jerr
 			return
 		}
-		a.specRepo = spec.NewGitRepo(root, spec.SpecScope)
-		a.planRepo = spec.NewGitRepo(root, spec.PlanScope)
-		a.planGit = appGitRunner{root: root}
+		a.specRepo = spec.NewGitRepoCtx(a.procRoot(), root, spec.SpecScope)
+		a.planRepo = spec.NewGitRepoCtx(a.procRoot(), root, spec.PlanScope)
+		a.planGit = appGitRunner{root: root, ctx: a.procRoot()}
 		a.planLoader = appPlanLoader{git: a.planGit}
 		a.gateJournal = j
 		currentSpecManifest := func() (string, error) { return spec.BuildCurrentManifest(a.specRepo) }
@@ -3733,7 +3733,7 @@ func (a *App) ensureGate() (*gate.Service, error) {
 		// BuildCurrentManifestScoped 的既定用法，scope 換成 decl.Scope()（每次呼叫
 		// 依 decl 動態決定，不像 Spec／PlanScope 是套件層級常數）。
 		currentOracleDigest := func(decl evidence.OracleDecl) (string, error) {
-			return spec.BuildCurrentManifestScoped(spec.NewGitRepo(root, decl.Scope()), decl.Scope())
+			return spec.BuildCurrentManifestScoped(spec.NewGitRepoCtx(a.procRoot(), root, decl.Scope()), decl.Scope())
 		}
 		ulidFn := func() string { return contract.NewULID(time.Now()) }
 		nowFn := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -3855,10 +3855,20 @@ func (a *App) confirmSpecCommit(tok spec.CommitToken, message string) error {
 // gatepolicy.Gate2Policy.ReconcileBindings（rev-parse --verify 的 exit 1 vs
 // exit 128 判斷）都仰賴 *exec.ExitError 留在 error chain 內，所以這裡刻意
 // 不重用 spec.GitRepo 的私有 git()。
-type appGitRunner struct{ root string }
+// appGitRunner：gate／plan 的 git 讀取。**帶 ctx**——這些呼叫全部發生在 binding
+// 的交易內，shutdown 一 cancel procRoot 就必須跟著收斂，否則一個卡住的 git 會讓
+// inflight.Wait 無限等下去（reviewer 2026-08-20）。
+type appGitRunner struct {
+	root string
+	ctx  context.Context
+}
 
 func (r appGitRunner) Git(args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", r.root}, args...)...)
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", r.root}, args...)...)
 	return cmd.Output()
 }
 
@@ -6111,7 +6121,8 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	// assist (scope=session) events into the provider slot — restore.go's
 	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
 	purpose = "spec_assist"
-	ctx, cancel := context.WithTimeout(a.assistRoot(), assistTimeout)
+	// root context 在任何會阻塞的工作之前取得（同 planAssist 的理由）。
+	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// gen（含 cancel）必須早於 beginTxn 進 assistActive——shutdown 的 reclaim
@@ -6130,7 +6141,7 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil { // 測試 barrier：gen 已可見、txn 未登記
 		h()
 	}
-	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 assistRootCtx 的
+	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 procRootCtx 的
 	// doc）。內外兩層各自 admission 會讓操作做到一半才失敗。
 
 	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
@@ -6202,8 +6213,8 @@ func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
 // 空回傳表示除 plan/** 外整棵樹乾淨——PlannerAssist 唯讀分析的前置條件。
 // .workbench/ 是 app state（gate journal 等），不屬受管 code，比照
 // assertWorkspaceUnchanged（app_assist_test.go）同一慣例排除，不計入 dirty。
-func (a *App) nonPlanDirtyPaths() ([]string, error) {
-	out, err := exec.Command("git", "-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all").Output()
+func (a *App) nonPlanDirtyPaths(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all").Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(string(ee.Stderr)))
@@ -6284,6 +6295,13 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
+	// **root context 必須在任何會阻塞的前置工作之前取得**（reviewer 2026-08-20）：
+	// 下面的 gate reconcile、gateList、git status、binary SHA、preflight（最多
+	// 30s）、escalation journal、HeadCommit 全都會 spawn 子行程或寫檔。先前 ctx
+	// 到最後才建立，於是一個忽略 TERM 的 git 就能讓 shutdown 卡在 inflight.Wait
+	// ——cancel 根 context 也影響不到還沒拿到它的工作。
+	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
+	defer cancel() // 下面成功走到 run 時會把 cancel 交給 gen，這裡的 defer 冪等
 
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
@@ -6297,7 +6315,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 		return "", errors.New("assist: 無生效規格核可——先完成 Gate 1")
 	}
 
-	dirty, err := a.nonPlanDirtyPaths()
+	dirty, err := a.nonPlanDirtyPaths(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -6310,7 +6328,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	// hard preflight 項並回明確錯誤；escalation 寫入失敗仍不啟動且錯誤含
 	// journal 失敗。重新通過 → 系統解除 preflight key（僅此 key——runtime
 	// blocker 的修復條件是一次完整成功 run，見 plannerRuntimeKey doc）。
-	pf, pferr := a.planPreflight(provider)
+	pf, pferr := a.planPreflight(ctx, provider)
 	if pferr != nil || !pf.OK {
 		reason := pf.Reason
 		if pferr != nil {
@@ -6344,7 +6362,6 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 		headOID, specManifestDigest, prompt)
 
 	const purpose = "plan_draft"
-	ctx, cancel := context.WithTimeout(a.assistRoot(), assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// 同 SpecAssist：gen 先入 assistActive 才 beginTxn（shutdown reclaim 窗口
@@ -6363,7 +6380,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil {
 		h()
 	}
-	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 assistRootCtx 的
+	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 procRootCtx 的
 	// doc）。內外兩層各自 admission 會讓操作做到一半才失敗。
 
 	teardown := func() {
@@ -6428,7 +6445,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 // planPreflight（§3.4）：provider 的 PlanAssist spawn 前 capability preflight，
 // 帶 digest-keyed 快取（見 preflightCache 欄位 doc）。cache miss 時 hash 會在
 // Preflight* 內重算一次——只發生在 miss，維持單一實作比省一次 hash 值得。
-func (a *App) planPreflight(provider string) (assist.PreflightResult, error) {
+func (a *App) planPreflight(ctx context.Context, provider string) (assist.PreflightResult, error) {
 	bin := a.claudeCLIPath()
 	if provider == "codex" {
 		bin = a.codexCLIPath()
@@ -6446,9 +6463,9 @@ func (a *App) planPreflight(provider string) (assist.PreflightResult, error) {
 	}
 	var res assist.PreflightResult
 	if provider == "claude" {
-		res, err = assist.PreflightClaude(bin, assist.ClaudePlannerArgs())
+		res, err = assist.PreflightClaude(ctx, bin, assist.ClaudePlannerArgs())
 	} else {
-		res, err = assist.PreflightCodex(bin)
+		res, err = assist.PreflightCodex(ctx, bin)
 	}
 	if err == nil && res.OK { // 只快取 OK：失敗每次重驗（恢復即刻可見）
 		// key 用 res.BinaryDigest（Preflight* 驗證當下同一次 hash 的結果），
@@ -6482,24 +6499,25 @@ func (a *App) newPlanAssistRunner(provider string) (assist.Runner, error) {
 // generation（runner 界限內退出 → teardown 清 active＋endTxn＋close done）。
 // 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
 // （稽核收尾在 sink 關閉前完成）。bounded 由 runner 尊重 ctx（proc TermGrace）保證。
-// assistRoot：assist 執行的根 context（惰性建立；shutdown 之後回一個已 cancel 的）。
-func (a *App) assistRoot() context.Context {
+// procRoot：**所有可取消子行程工作**的根 context（assist run、gate 的 git 呼叫、
+// preflight 的 --version 探測）。惰性建立；shutdown 之後回一個已 cancel 的。
+func (a *App) procRoot() context.Context {
 	a.assistMu.Lock()
 	defer a.assistMu.Unlock()
-	if a.assistRootCtx == nil {
-		a.assistRootCtx, a.assistRootCancel = context.WithCancel(context.Background())
+	if a.procRootCtx == nil {
+		a.procRootCtx, a.procRootCancel = context.WithCancel(context.Background())
 	}
-	return a.assistRootCtx
+	return a.procRootCtx
 }
 
-// cancelAssistRoot：cancel 根 context，並保證之後建立的 assist 也拿到已 cancel 的
-// 那一份（收尾後才進場的 assist 不得真的跑起來）。
-func (a *App) cancelAssistRoot() {
+// cancelProcRoot：cancel 根 context，並保證之後建立的工作也拿到已 cancel 的那一份
+// （收尾後才進場的子行程不得真的跑起來）。
+func (a *App) cancelProcRoot() {
 	a.assistMu.Lock()
-	if a.assistRootCtx == nil {
-		a.assistRootCtx, a.assistRootCancel = context.WithCancel(context.Background())
+	if a.procRootCtx == nil {
+		a.procRootCtx, a.procRootCancel = context.WithCancel(context.Background())
 	}
-	cancel := a.assistRootCancel
+	cancel := a.procRootCancel
 	a.assistMu.Unlock()
 	cancel()
 }
@@ -6507,7 +6525,7 @@ func (a *App) cancelAssistRoot() {
 // reclaimAssists：cancel 根 context（權威手段）＋ 逐一 cancel 已登記的 gen
 // （補強，讓已在跑的那些立即收到訊號而不必等 ctx 傳播）。
 func (a *App) reclaimAssists() {
-	a.cancelAssistRoot()
+	a.cancelProcRoot()
 	a.assistMu.Lock()
 	gens := make([]*assistGen, 0, len(a.assistActive))
 	for _, g := range a.assistActive {

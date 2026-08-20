@@ -91,8 +91,10 @@ func BinarySHA256(bin string) (string, error) {
 }
 
 // binaryVersionOutput 執行 `<bin> --version` 並回傳 trim 後的 stdout。
-func binaryVersionOutput(bin string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func binaryVersionOutput(parent context.Context, bin string) (string, error) {
+	// 30s 是上界，**不是**唯一的取消來源：parent 由呼叫端傳入，shutdown 一
+	// cancel 就立刻收斂，不必等滿 30 秒（reviewer 2026-08-20）。
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "--version").Output()
 	if err != nil {
@@ -105,14 +107,14 @@ func binaryVersionOutput(bin string) (string, error) {
 // "2.1.223 (Claude Code)"，取第一個 field）；(2) plannerArgs 與凍結 probe 基準
 // probeApprovedClaudeArgs 逐字相等。error 只在環境層失敗（binary 缺失／不可
 // 執行／不可讀）回；檢驗不符走 OK=false＋Reason。兩者在 app 層皆 fail closed。
-func PreflightClaude(bin string, plannerArgs []string) (PreflightResult, error) {
+func PreflightClaude(ctx context.Context, bin string, plannerArgs []string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "claude", BinaryPath: bin}
 	digest, err := BinarySHA256(bin)
 	if err != nil {
 		return res, err
 	}
 	res.BinaryDigest = digest
-	raw, err := binaryVersionOutput(bin)
+	raw, err := binaryVersionOutput(ctx, bin)
 	if err != nil {
 		return res, err
 	}
@@ -137,14 +139,14 @@ func PreflightClaude(bin string, plannerArgs []string) (PreflightResult, error) 
 // "codex-cli 0.146.1"，取最後一個 field）。wire 與 handler 的 enforcement
 // 證明由 production-path 測試提供（oneshot_test.go 的 fake app-server 走真
 // codexAssist.Run），preflight runtime 檢查限版本＋binary digest。
-func PreflightCodex(bin string) (PreflightResult, error) {
+func PreflightCodex(ctx context.Context, bin string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "codex", BinaryPath: bin}
 	digest, err := BinarySHA256(bin)
 	if err != nil {
 		return res, err
 	}
 	res.BinaryDigest = digest
-	raw, err := binaryVersionOutput(bin)
+	raw, err := binaryVersionOutput(ctx, bin)
 	if err != nil {
 		return res, err
 	}
