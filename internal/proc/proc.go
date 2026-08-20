@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -40,6 +41,10 @@ type Proc struct {
 	exit     Exit
 	exitedCh chan struct{} // 子程序本體已退出
 	doneCh   chan struct{} // Exit 已快取（stderr 收完）
+	// canceled：ctx 取消**真的觸發了 Terminate**。用它而不是事後查 ctx.Err()：
+	// 子程序早已正常退出、之後才取消 context 的情形，事後查會錯報成 canceled
+	// （reviewer 2026-08-20）。
+	canceled atomic.Bool
 }
 
 const stderrCap = 64 * 1024
@@ -126,6 +131,7 @@ func Start(ctx context.Context, cfg Config) (*Proc, error) {
 	go func() { // 覆寫 ctx 取消語意：走 Terminate（整組），不是單程序 kill
 		select {
 		case <-ctx.Done():
+			p.canceled.Store(true)
 			_ = p.Terminate()
 		case <-p.exitedCh:
 		}
@@ -139,6 +145,9 @@ func (p *Proc) PGID() int { return p.pgid }
 
 // StderrSnapshot 回傳目前的 stderr tail（v1.6：長駐程序仍在跑時取證用，不等待退出）。
 func (p *Proc) StderrSnapshot() string { return p.stderrTail() }
+
+// CanceledByContext：這次執行是不是**因為 ctx 取消而被終止**（而不是自己跑完）。
+func (p *Proc) CanceledByContext() bool { return p.canceled.Load() }
 
 // Done 在 supervisor 收尾完成（Exit 已快取）後關閉；select-default 即為非阻塞存活判定（v1.7）。
 func (p *Proc) Done() <-chan struct{} { return p.doneCh }
@@ -175,6 +184,11 @@ func (p *Proc) Wait() Exit {
 // 由呼叫端決定要不要當錯誤）。**ctx 取消時 err 會 wrap ctx.Err()**，呼叫端據此
 // 分辨「被收尾取消」與「指令真的失敗」。
 func Output(ctx context.Context, cfg Config) ([]byte, Exit, error) {
+	// **進場 fail fast**：ctx 已取消就連 child 都不該起。先前照樣 Start，實測
+	// `/usr/bin/touch` 真的把檔案建出來了（reviewer 2026-08-20）。
+	if err := ctx.Err(); err != nil {
+		return nil, Exit{}, err
+	}
 	p, err := Start(ctx, cfg)
 	if err != nil {
 		return nil, Exit{}, err
@@ -182,8 +196,10 @@ func Output(ctx context.Context, cfg Config) ([]byte, Exit, error) {
 	_ = p.Stdin.Close() // one-shot：不餵輸入，早關避免對方等 EOF
 	out, rerr := io.ReadAll(p.Stdout)
 	ex := p.Wait()
-	if cerr := ctx.Err(); cerr != nil {
-		return out, ex, cerr
+	// 只有「取消真的觸發了終止」才回 ctx 錯誤。事後查 ctx.Err() 會把「子程序早已
+	// exit 0、之後才取消」也錯報成 canceled（reviewer 2026-08-20）。
+	if p.CanceledByContext() {
+		return out, ex, ctx.Err()
 	}
 	if rerr != nil {
 		return out, ex, rerr

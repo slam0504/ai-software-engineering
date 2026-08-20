@@ -708,8 +708,8 @@ func TestOpenWireSegmentsFailureDegradesLoudly(t *testing.T) {
 	if !auditHasKind(t, a.stateDir, "wire_segments_open_error") {
 		t.Fatal("開檔失敗必須留下稽核")
 	}
-	if !strings.Contains(a.startupErr, "segment") {
-		t.Fatalf("開檔失敗必須進啟動警告（UI 讀得到）：%q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "segment") {
+		t.Fatalf("開檔失敗必須進啟動警告（UI 讀得到）：%q", a.startupErrText())
 	}
 
 	// 降級之後 codex session 仍要起得來、wire log 照錄。

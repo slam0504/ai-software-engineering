@@ -74,8 +74,10 @@ type App struct {
 	//   - 鎖序：auditMu → startupMu（noteAuditInvariantBrokenLocked 持 auditMu
 	//     時會呼叫 appendStartup）。所以持有 startupMu 期間**不得**呼叫 a.audit()
 	//     或任何會取 auditMu 的東西，否則就是反向鎖序。
-	startupMu  sync.Mutex
-	startupErr string
+	// startupData：啟動資訊的**唯一**持有處（見 startupState）。六個欄位與那把鎖
+	// 都封在裡面，App 上不再有散落的 startup 欄位——「有沒有持鎖」因此不再是控制
+	// 流程分析的問題，而是型別可及性的問題（reviewer 2026-08-20）。
+	startupData startupState
 	// workspaceSnap／workspaceSrcSnap：workspaceDir／workspaceSrc 的**受鎖副本**。
 	//
 	// CLIInfo 是唯一容許在 startup 期間執行的 binding（啟動診斷），所以它讀到的
@@ -83,8 +85,6 @@ type App struct {
 	// acquireStateLease 在啟動途中寫入，其餘讀者都是已進交易閘的 binding——那條
 	// 路徑有 shutMu 的 release/acquire 邊，安全；只有 CLIInfo 沒有，所以另外留
 	// 一份快照給它（reviewer 2026-08-20）。
-	workspaceSnap    string
-	workspaceSrcSnap string
 	// lease：開啟／持有 state writer 的 ownership capability。
 	//
 	// **nil ＝沒有 capability ＝一律拒絕**，不是「沒設就當作沒問題」。所有
@@ -103,11 +103,7 @@ type App struct {
 	// 啟動中互斥：registry 載入失敗會直接 return，走不到 backfill），所以刻意
 	// 不為此加一份 blocker／warning 分開累積的資料結構。新增第三個 blocker
 	// 呼叫點時要重新檢查這個前提。
-	startupBlockers string
-	toolsDirPath    string
-	toolsSource     string
-	nodePath        string
-	diagramPath     string
+	diagramPath string
 
 	registry *claude.Registry
 	manager  *appcore.Manager
@@ -1317,29 +1313,15 @@ func (a *App) noteStartupWarning(msg string) { a.appendStartup(msg, false) }
 // registry 載入失敗）。同嚴重度之間仍照時序。
 func (a *App) noteStartupBlocker(msg string) { a.appendStartup(msg, true) }
 
-func (a *App) appendStartup(msg string, blocker bool) {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	switch {
-	case a.startupErr == "":
-		a.startupErr = msg
-	case blocker && a.startupBlockers == "":
-		// 第一則 blocker 插到最前面，既有內容整段往後推。
-		a.startupErr = msg + "；" + a.startupErr
-	default:
-		a.startupErr += "；" + msg
-	}
-	if blocker && a.startupBlockers == "" {
-		a.startupBlockers = msg
-	}
-}
+func (a *App) appendStartup(msg string, blocker bool) { a.startupData.appendMessage(msg, blocker) }
 
-// ---- 啟動資訊的存取器（見 App.startupMu 的規約）----
+// ---- 啟動資訊（見 App.startupData）----
 
 // startupInfo：啟動資訊的一份快照。CLIInfo 與所有會 exec 外部指令的路徑一律
-// 「鎖內複製一次 → 放鎖後才用」，不讓短暫的資料保護變成跨行程呼叫的長臨界區。
+// 「取一次快照 → 之後只用快照」，不讓短暫的資料保護變成跨行程呼叫的長臨界區。
 type startupInfo struct {
 	startupErr  string
+	blockers    string
 	toolsDir    string
 	toolsSource string
 	nodePath    string
@@ -1347,54 +1329,97 @@ type startupInfo struct {
 	workspaceSr string
 }
 
-func (a *App) startupSnapshot() startupInfo {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	return startupInfo{startupErr: a.startupErr, toolsDir: a.toolsDirPath,
-		toolsSource: a.toolsSource, nodePath: a.nodePath,
-		workspace: a.workspaceSnap, workspaceSr: a.workspaceSrcSnap}
+// startupState：startupInfo ＋ 保護它的那把鎖，封成一個型別。
+//
+// # 為什麼封成型別，而不是繼續驗控制流程（reviewer 2026-08-20）
+//
+// 先前六個欄位散在 App 上，「有沒有在鎖內存取」只能靠測試做語彙層級的判斷，於是
+// 這些寫法一律通得過：鎖另一個 App instance 的 mutex、提早 Unlock 之後才讀、
+// writer 在 closure 內 Lock／Unlock 而真正的寫入落在 closure 之外、持鎖執行外部
+// 指令。要把這些全部擋住得寫一個真正的逃逸與別名分析——那不會比它要守的東西可靠。
+//
+// 封裝之後這些問題消失在型別層：info 是 unexported、只有下面幾個方法碰得到；每個
+// 方法都是「Lock → defer Unlock → 純欄位運算」的固定形狀，鎖的範圍與方法的範圍
+// 一致，receiver 就是被鎖的那一個。剩下要驗的只有「這幾個方法的形狀」與「沒有別
+// 的地方碰得到 info」，兩者都能逐字比對（見 TestStartupStateIsTheOnlyAccessPath）。
+type startupState struct {
+	mu   sync.Mutex
+	info startupInfo
 }
 
-// startupErrText：目前的啟動訊息（UI 橫幅與稽核用）。
-func (a *App) startupErrText() string {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	return a.startupErr
+// snapshot：整份複製。**唯一**的讀取出口。
+func (s *startupState) snapshot() startupInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.info
 }
 
-// setStartupErrOnce：只記第一則啟動錯誤——沿用 repo 既有的
-// `if a.startupErr == "" { a.startupErr = ... }` 慣例，只是把檢查與賦值收進同一個
-// 臨界區（分開做的話兩條啟動路徑會互相覆蓋）。要**累加**語意的請走
-// noteStartupWarning／noteStartupBlocker。
-func (a *App) setStartupErrOnce(msg string) {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	if a.startupErr == "" {
-		a.startupErr = msg
+// appendMessage：啟動訊息累加（第一則 blocker 插到最前面，見 noteStartupWarning）。
+func (s *startupState) appendMessage(msg string, blocker bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.info.startupErr == "":
+		s.info.startupErr = msg
+	case blocker && s.info.blockers == "":
+		s.info.startupErr = msg + "；" + s.info.startupErr
+	default:
+		s.info.startupErr += "；" + msg
+	}
+	if blocker && s.info.blockers == "" {
+		s.info.blockers = msg
 	}
 }
 
+// setErrOnce：只記第一則啟動錯誤。
+func (s *startupState) setErrOnce(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.info.startupErr == "" {
+		s.info.startupErr = msg
+	}
+}
+
+func (s *startupState) publishTools(dir, source string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.info.toolsDir, s.info.toolsSource = dir, source
+}
+
+func (s *startupState) publishNode(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.info.nodePath = path
+}
+
+func (s *startupState) publishWorkspace(dir, src string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.info.workspace, s.info.workspaceSr = dir, src
+}
+
+// ---- App 這一側只是轉呼叫（既有呼叫端不必全部改寫）----
+
+func (a *App) startupSnapshot() startupInfo { return a.startupData.snapshot() }
+
+// startupErrText：目前的啟動訊息（UI 橫幅與稽核用）。
+func (a *App) startupErrText() string { return a.startupData.snapshot().startupErr }
+
+// setStartupErrOnce：只記第一則啟動錯誤——沿用 repo 既有的
+// `if a.startupErr == "" { ... }` 慣例。要**累加**語意的請走
+// noteStartupWarning／noteStartupBlocker。
+func (a *App) setStartupErrOnce(msg string) { a.startupData.setErrOnce(msg) }
+
 // publishToolsDir／publishNodePath：startupAfterWriters 的欄位發布點。刻意分成
-// 兩個呼叫（而不是一次寫四個欄位）——兩者的解析各自獨立，中間正是 CLIInfo 可能
-// 插進來的窗口，測試用 hookStartupPublish 停在這裡驗證讀寫走同一套同步機制。
-// publishWorkspace：把 workspace 解析結果複製進受鎖的快照（見 workspaceSnap）。
-func (a *App) publishWorkspace(dir, src string) {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	a.workspaceSnap, a.workspaceSrcSnap = dir, src
-}
+// 兩個呼叫——兩者的解析各自獨立，中間正是 CLIInfo 可能插進來的窗口，測試用
+// hookStartupPublish 停在那裡驗證讀寫走同一套同步機制。
+func (a *App) publishToolsDir(dir, source string) { a.startupData.publishTools(dir, source) }
 
-func (a *App) publishToolsDir(dir, source string) {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	a.toolsDirPath, a.toolsSource = dir, source
-}
+func (a *App) publishNodePath(p string) { a.startupData.publishNode(p) }
 
-func (a *App) publishNodePath(p string) {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	a.nodePath = p
-}
+// publishWorkspace：把 workspace 解析結果複製進受鎖的快照——CLIInfo 是唯一容許在
+// startup 期間執行的 binding，它讀到的每個欄位都必須受同一把鎖保護。
+func (a *App) publishWorkspace(dir, src string) { a.startupData.publishWorkspace(dir, src) }
 
 // blockStateBindings：把 app 切到「不得開放任何 state 操作」——**原因與 phase 在
 // 同一個臨界區內一起設定**（見 stateBlocked 欄位 doc）。設定後不再解除：解除的
@@ -1535,17 +1560,9 @@ func (a *App) phaseNow() appPhase {
 }
 
 // toolsDir／nodePathValue：單一欄位的讀取器（CLI 路徑組裝、childEnv 用）。
-func (a *App) toolsDir() string {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	return a.toolsDirPath
-}
+func (a *App) toolsDir() string { return a.startupData.snapshot().toolsDir }
 
-func (a *App) nodePathValue() string {
-	a.startupMu.Lock()
-	defer a.startupMu.Unlock()
-	return a.nodePath
-}
+func (a *App) nodePathValue() string { return a.startupData.snapshot().nodePath }
 
 // knownProviders：可建立／可還原 session 的 provider 白名單（同 CreateSession
 // 的 guard）。與 legacyProviders 語意不同——後者是「legacy 遷移的來源」，只在
@@ -6126,6 +6143,9 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	if !knownProvider(provider) {
 		return "", fmt.Errorf("unknown provider %q", provider)
 	}
+	// root context 在任何其他敘述之前取得（同 planAssist 的理由；形狀由
+	// TestAssistImplementationsTakeRootContextFirst 驗）。
+	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
 	// Pin the assist purpose at the emit boundary (defense in depth): this is the
 	// isolated assist lane, so every emitted envelope MUST carry
 	// purpose="spec_assist" regardless of the caller-supplied argument. Trusting
@@ -6133,8 +6153,6 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	// assist (scope=session) events into the provider slot — restore.go's
 	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
 	purpose = "spec_assist"
-	// root context 在任何會阻塞的工作之前取得（同 planAssist 的理由）。
-	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// gen（含 cancel）必須早於 beginTxn 進 assistActive——shutdown 的 reclaim
@@ -6233,8 +6251,11 @@ func (a *App) nonPlanDirtyPaths(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("assist: git status: %w", err) // 保留 context.Canceled identity
 	}
-	if ex.Code != 0 || ex.Err != nil {
-		return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(ex.StderrTail))
+	if ex.Err != nil {
+		return nil, fmt.Errorf("assist: git status: %s: %w", strings.TrimSpace(ex.StderrTail), ex.Err) // 保留 typed error
+	}
+	if ex.Code != 0 {
+		return nil, fmt.Errorf("assist: git status: exit %d: %s", ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	var dirty []string
 	for _, line := range strings.Split(string(out), "\n") {

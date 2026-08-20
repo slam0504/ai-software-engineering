@@ -329,3 +329,50 @@ func TestBinarySHA256IsCancellable(t *testing.T) {
 		t.Fatalf("已取消的 context 必須讓 digest 立刻返回 context.Canceled，實得 %v", err)
 	}
 }
+
+// TestBinarySHA256RejectsFileSwappedAfterStat
+//
+// reviewer 2026-08-20：先 Stat 再 Open 是 TOCTOU——兩者之間把 regular file 換成
+// FIFO，open 會卡在等寫入端，deadline 也救不了（open 本身不吃 context）。
+//
+// 這裡直接把「被換掉之後」的狀態餵進去：路徑上就是 FIFO。正題斷言是**立刻返回**
+// ——O_NONBLOCK 開檔 ＋ 對同一個 descriptor 做 Stat 才辦得到；先 Stat 再 Open 的
+// 寫法會卡在這裡。
+func TestBinarySHA256RejectsFileSwappedAfterStat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bin")
+	if err := os.WriteFile(path, []byte("real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 換成 FIFO（模擬 Stat 之後被抽換）。
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("這個平台建不出 FIFO：%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := BinarySHA256(ctx, path); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO 必須被拒絕")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("open 卡住了——必須用 O_NONBLOCK 開檔再對同一個 fd 判型別")
+	}
+}
+
+// TestBinarySHA256AcceptsNilContext：nil context 不得 panic（API 契約）。
+func TestBinarySHA256AcceptsNilContext(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:staticcheck // 刻意傳 nil：驗 API 契約
+	if _, err := BinarySHA256(nil, bin); err != nil {
+		t.Fatalf("nil context 應退化成 Background，實得 %v", err)
+	}
+}

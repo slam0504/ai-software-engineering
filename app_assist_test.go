@@ -298,14 +298,14 @@ func newTestAppGitAssist(t *testing.T, r assist.Runner) (*App, *captureEnvs) {
 // 的乾淨樹前置檢查。回傳 bin 路徑（recovery 測試會原地換內容）。
 func plantPlannerBinScript(t *testing.T, a *App, provider, script string) string {
 	t.Helper()
-	if strings.HasPrefix(a.toolsDirPath, a.workspaceDir) {
-		a.toolsDirPath = filepath.Join(a.stateDir, "tools")
+	if strings.HasPrefix(a.toolsDir(), a.workspaceDir) {
+		a.publishToolsDir(filepath.Join(a.stateDir, "tools"), "test")
 	}
 	name := "claude"
 	if provider == "codex" {
 		name = "codex"
 	}
-	dir := filepath.Join(a.toolsDirPath, provider+"-cli", "node_modules", ".bin")
+	dir := filepath.Join(a.toolsDir(), provider+"-cli", "node_modules", ".bin")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

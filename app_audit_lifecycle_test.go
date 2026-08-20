@@ -74,7 +74,7 @@ func TestStartupWithLeaseOpensAuditWriter(t *testing.T) {
 	lease := acquireLease(t, a)
 
 	if !a.openStateWriters(lease) {
-		t.Fatalf("持有 lease 時 openStateWriters 必須成功，startupErr=%q", a.startupErr)
+		t.Fatalf("持有 lease 時 openStateWriters 必須成功，startupErr=%q", a.startupErrText())
 	}
 	t.Cleanup(func() { a.shutdown(context.Background()) })
 
@@ -87,8 +87,8 @@ func TestStartupWithLeaseOpensAuditWriter(t *testing.T) {
 	if !strings.Contains(string(b), "guard-1") {
 		t.Fatalf("audit() 寫的事件必須真的落到磁碟上的 audit.jsonl，實得：\n%s", b)
 	}
-	if strings.Contains(a.startupErr, "不變量破壞") {
-		t.Fatalf("正常路徑不得回報不變量破壞，實得 %q", a.startupErr)
+	if strings.Contains(a.startupErrText(), "不變量破壞") {
+		t.Fatalf("正常路徑不得回報不變量破壞，實得 %q", a.startupErrText())
 	}
 }
 
@@ -120,8 +120,8 @@ func TestAuditOpenFailureBlocksStartup(t *testing.T) {
 		t.Fatalf("下游 opener 不得被呼叫：registry=%v eventSink=%v manager=%v",
 			a.registry != nil, a.eventSink != nil, a.manager != nil)
 	}
-	if !strings.Contains(a.startupErr, "稽核寫入器開啟失敗") {
-		t.Fatalf("拒絕原因必須是使用者看得懂的訊息，實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "稽核寫入器開啟失敗") {
+		t.Fatalf("拒絕原因必須是使用者看得懂的訊息，實得 %q", a.startupErrText())
 	}
 }
 
@@ -137,7 +137,7 @@ func TestAuditWriterLostAfterReadyFailsLoud(t *testing.T) {
 	a := auditLifecycleApp(t)
 	lease := acquireLease(t, a)
 	if !a.openStateWriters(lease) {
-		t.Fatalf("前提：openStateWriters 必須成功，startupErr=%q", a.startupErr)
+		t.Fatalf("前提：openStateWriters 必須成功，startupErr=%q", a.startupErrText())
 	}
 	t.Cleanup(func() { a.shutdown(context.Background()) })
 
@@ -152,25 +152,25 @@ func TestAuditWriterLostAfterReadyFailsLoud(t *testing.T) {
 
 	a.audit("session_removed", map[string]any{"marker": "guard-2"})
 
-	if !strings.Contains(a.startupErr, "不變量破壞") {
-		t.Fatalf("ready 之後 writer 消失必須產生使用者可見的說明，實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "不變量破壞") {
+		t.Fatalf("ready 之後 writer 消失必須產生使用者可見的說明，實得 %q", a.startupErrText())
 	}
-	if !strings.Contains(a.startupErr, "session_removed") {
-		t.Fatalf("說明必須帶出是哪一類稽核事件遺失，實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "session_removed") {
+		t.Fatalf("說明必須帶出是哪一類稽核事件遺失，實得 %q", a.startupErrText())
 	}
-	if !strings.Contains(a.startupErr, "既有的啟動警告") {
-		t.Fatalf("既有啟動訊息不得被覆蓋（appendStartup 累加語意），實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "既有的啟動警告") {
+		t.Fatalf("既有啟動訊息不得被覆蓋（appendStartup 累加語意），實得 %q", a.startupErrText())
 	}
 
 	// 去重：CLI stderr 的 io.Writer 破掉之後每一行都會走到這條路徑。
-	before := a.startupErr
+	before := a.startupErrText()
 	for range 50 {
 		if _, err := a.auditWriterFor().Write([]byte("x\n")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if a.startupErr != before {
-		t.Fatalf("不變量破壞的說明只能出一次，實得長度 %d → %d", len(before), len(a.startupErr))
+	if a.startupErrText() != before {
+		t.Fatalf("不變量破壞的說明只能出一次，實得長度 %d → %d", len(before), len(a.startupErrText()))
 	}
 }
 
@@ -183,8 +183,8 @@ func TestAuditWithoutLeaseStaysSilent(t *testing.T) {
 
 	a.audit("session_removed", map[string]any{"marker": "no-lease"})
 
-	if a.startupErr != "" {
-		t.Fatalf("尚未取得 lease 時丟棄稽核是正確行為，不得寫橫幅，實得 %q", a.startupErr)
+	if a.startupErrText() != "" {
+		t.Fatalf("尚未取得 lease 時丟棄稽核是正確行為，不得寫橫幅，實得 %q", a.startupErrText())
 	}
 	if _, err := os.Stat(filepath.Join(a.stateDir, "audit.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("沒有 lease 不得建立 audit.jsonl，stat=%v", err)
@@ -201,7 +201,7 @@ func TestAuditAfterCloseStaysSilent(t *testing.T) {
 	a := auditLifecycleApp(t)
 	lease := acquireLease(t, a)
 	if !a.openStateWriters(lease) {
-		t.Fatalf("前提：openStateWriters 必須成功，startupErr=%q", a.startupErr)
+		t.Fatalf("前提：openStateWriters 必須成功，startupErr=%q", a.startupErrText())
 	}
 	t.Cleanup(func() { a.shutdown(context.Background()) })
 	a.noteStartupWarning("既有的啟動警告")
@@ -209,8 +209,8 @@ func TestAuditAfterCloseStaysSilent(t *testing.T) {
 	a.closeAuditWriter()
 	a.audit("session_removed", map[string]any{"marker": "after-close"})
 
-	if strings.Contains(a.startupErr, "不變量破壞") {
-		t.Fatalf("closed 之後丟棄稽核是正確行為，不得回報破壞，實得 %q", a.startupErr)
+	if strings.Contains(a.startupErrText(), "不變量破壞") {
+		t.Fatalf("closed 之後丟棄稽核是正確行為，不得回報破壞，實得 %q", a.startupErrText())
 	}
 }
 
@@ -269,8 +269,8 @@ func TestOpenStateWritersRejectsMismatchedLease(t *testing.T) {
 	if a.auditState != auditUnavailable {
 		t.Fatalf("被拒時不得進入 ready，實得 auditState=%d", a.auditState)
 	}
-	if !strings.Contains(a.startupErr, "ownership lease") {
-		t.Fatalf("拒絕原因必須 fail loud，實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "ownership lease") {
+		t.Fatalf("拒絕原因必須 fail loud，實得 %q", a.startupErrText())
 	}
 }
 
@@ -294,8 +294,8 @@ func TestOpenWireSegmentsRejectsMismatchedLease(t *testing.T) {
 	if a.wireSegments != nil {
 		t.Fatal("被拒時不得建立 SegmentSet")
 	}
-	if !strings.Contains(a.startupErr, "ownership lease") {
-		t.Fatalf("拒絕原因必須 fail loud，實得 %q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "ownership lease") {
+		t.Fatalf("拒絕原因必須 fail loud，實得 %q", a.startupErrText())
 	}
 }
 
@@ -308,7 +308,7 @@ func TestValidLeaseOpensBothWriterLayers(t *testing.T) {
 	lease := acquireLease(t, a)
 
 	if !a.openStateWriters(lease) {
-		t.Fatalf("目錄相符的有效 lease 必須開得起來，startupErr=%q", a.startupErr)
+		t.Fatalf("目錄相符的有效 lease 必須開得起來，startupErr=%q", a.startupErrText())
 	}
 	t.Cleanup(func() { a.shutdown(context.Background()) })
 
@@ -319,7 +319,7 @@ func TestValidLeaseOpensBothWriterLayers(t *testing.T) {
 	if a.wireSegments == nil {
 		t.Fatal("第 2 層（SegmentSet）必須被建立")
 	}
-	if strings.Contains(a.startupErr, "ownership lease") {
-		t.Fatalf("有效 lease 不得產生 ownership 拒絕訊息，實得 %q", a.startupErr)
+	if strings.Contains(a.startupErrText(), "ownership lease") {
+		t.Fatalf("有效 lease 不得產生 ownership 拒絕訊息，實得 %q", a.startupErrText())
 	}
 }

@@ -21,7 +21,7 @@ import (
 // 或新開的 wsregistry.Store 實例來驗。
 
 // bootRegistry：走 production 的啟動序列把真實 registry 接上 App
-//（Open → Migrate → restore dormant → backfill），不是塞一個 stub。
+// （Open → Migrate → restore dormant → backfill），不是塞一個 stub。
 func bootRegistry(t *testing.T, a *App) *wsregistry.Store {
 	t.Helper()
 	if _, err := a.loadSessionRegistry(); err != nil {
@@ -51,7 +51,7 @@ func registerWSID(t *testing.T, a *App, w appcore.WSID, provider string) {
 func restartApp(t *testing.T, a *App) (*App, *uiCapture) {
 	t.Helper()
 	b, ui := newTestAppIn(t, a.workspaceDir, a.stateDir)
-	b.toolsDirPath = a.toolsDirPath
+	b.publishToolsDir(a.toolsDir(), "test")
 	// audit 要早於 bootRegistry：backfill 的稽核軌跡就發在啟動序列裡
 	enableAudit(t, b)
 	bootRegistry(t, b)
@@ -410,7 +410,7 @@ func TestViewBoundaryBlocksUpwardPaging(t *testing.T) {
 // record-level 過濾完全不同的一條 code path，必須單獨守。
 //
 // mutation：把尾端 readEnvelopeRange 的 after 參數改回 "" → 只有這條轉紅
-//（record-level 那幾條仍綠，證明兩者守的不是同一段）。
+// （record-level 那幾條仍綠，證明兩者守的不是同一段）。
 func TestViewBoundaryFiltersOpenTurnTail(t *testing.T) {
 	a, _ := newTestApp(t)
 	bootRegistry(t, a)

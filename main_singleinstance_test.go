@@ -175,8 +175,8 @@ func siLifecycle(app *App, mode string) {
 	}
 	ctx := context.Background()
 	app.startup(ctx)
-	if app.startupErr != "" {
-		siSay(siPrefixBlocker + strings.ReplaceAll(app.startupErr, "\n", " "))
+	if app.startupErrText() != "" {
+		siSay(siPrefixBlocker + strings.ReplaceAll(app.startupErrText(), "\n", " "))
 	}
 	siSay(siMarkerStarted) // 只代表 startup 回來了
 	siAwait()

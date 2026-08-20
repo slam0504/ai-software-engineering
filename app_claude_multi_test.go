@@ -742,4 +742,3 @@ func TestRemoveFailsLoudWhenTombstonePersistFails(t *testing.T) {
 		t.Fatalf("slot 必須保留可重試：%v", serr)
 	}
 }
-

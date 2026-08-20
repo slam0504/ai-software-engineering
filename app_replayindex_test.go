@@ -631,8 +631,8 @@ func TestVerifyFailureMakesWindowFailLoud(t *testing.T) {
 	if _, err := a.restoreSessions(); err != nil {
 		t.Fatalf("index 驗證失敗不得阻擋啟動（它是快取，不是權威）：%v", err)
 	}
-	if !strings.Contains(a.startupErr, "重啟") {
-		t.Fatalf("啟動警告必須給出可操作指引：%q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "重啟") {
+		t.Fatalf("啟動警告必須給出可操作指引：%q", a.startupErrText())
 	}
 	if _, err := a.LoadTurnsBefore("w1", "", turnPageSize); !errors.Is(err, errIndexUnverified) {
 		t.Fatalf("驗證失敗後的視窗載入必須 fail loud，不得靜默回不完整的視窗：%v", err)

@@ -163,7 +163,7 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	if err := os.MkdirAll(filepath.Join(a.stateDir, "recordings"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a.toolsDirPath = filepath.Join(ws, "tools")
+	a.publishToolsDir(filepath.Join(ws, "tools"), "test")
 	reg, err := claude.OpenRegistry(filepath.Join(a.stateDir, "sessions.json"))
 	if err != nil {
 		t.Fatal(err)

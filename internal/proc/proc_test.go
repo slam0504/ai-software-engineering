@@ -3,6 +3,7 @@ package proc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -185,4 +186,78 @@ func TestOutputCancellationKillsGrandchildren(t *testing.T) {
 	}
 	_ = syscall.Kill(pid, syscall.SIGKILL) // 清乾淨再報告
 	t.Fatal("忽略 TERM 的孫行程仍存活——取消必須走 process group（TERM → bounded KILL）")
+}
+
+// TestOutputDoesNotStartWhenContextAlreadyCanceled
+//
+// reviewer 2026-08-20：ctx 在呼叫前就已取消，先前照樣 Start——實測
+// `/usr/bin/touch` 真的把檔案建出來了。取消的語意是「不要做」，不是「做了再殺」。
+func TestOutputDoesNotStartWhenContextAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// 用**不存在的 binary** 當探針：有 fail fast 時根本不會走到 Start，錯誤必然
+	// 是 context.Canceled；沒有 fail fast 就會先撞到 exec 的「檔案不存在」。這個
+	// 判準不依賴訊號送達的時機，因此是確定性的。
+	if _, _, err := Output(ctx, Config{Binary: "/nonexistent/definitely-not-here"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ctx 已取消時必須在 Start 之前就返回 context.Canceled，實得 %v", err)
+	}
+	// 附帶：真的可執行的指令也不得產生副作用。
+	marker := filepath.Join(t.TempDir(), "should-not-exist")
+	if _, _, err := Output(ctx, Config{Binary: "/usr/bin/touch", Args: []string{marker}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("實得 %v", err)
+	}
+	if _, serr := os.Stat(marker); serr == nil {
+		t.Fatal("ctx 已取消時不得啟動子程序（檔案被建出來了）")
+	}
+}
+
+// TestOutputDoesNotReportCancellationAfterCleanExit
+//
+// 子程序早已正常退出、stdout 也收完，**之後**才取消 context——那不是取消造成的
+// 結果，不得錯報成 context canceled（reviewer 2026-08-20：先前在 Wait 之後查
+// ctx.Err() 當下狀態，於是這種時序會回錯）。
+func TestOutputDoesNotReportCancellationAfterCleanExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out, ex, err := Output(ctx, Config{Binary: "/bin/echo", Args: []string{"hi"}})
+	cancel() // 指令早已收工，這一刻才取消
+	if err != nil {
+		t.Fatalf("正常收工的指令不得回錯誤，實得 %v", err)
+	}
+	if ex.Code != 0 || strings.TrimSpace(string(out)) != "hi" {
+		t.Fatalf("輸出／退出碼不符：out=%q code=%d", out, ex.Code)
+	}
+}
+
+// TestCanceledByContextIsFalseAfterCleanExit
+//
+// 判定必須是「取消**真的觸發了終止**」，不是「事後 ctx 當下是不是 done」
+// （reviewer 2026-08-20）。子程序先正常退出、之後才取消——這種時序不得被記成
+// canceled。
+//
+// 驗在 Proc 這一層而不是 Output：Output 回來之後才 cancel 的話，事後查 ctx.Err()
+// 的錯誤實作也會通過，量不到差別。這裡在**子程序已退出、Proc 仍在手上**的時點
+// 取消，兩種實作的結果就分得開了。
+func TestCanceledByContextIsFalseAfterCleanExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p, err := Start(ctx, Config{Binary: "/bin/echo", Args: []string{"hi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Stdin.Close()
+	if _, rerr := io.ReadAll(p.Stdout); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if ex := p.Wait(); ex.Code != 0 {
+		t.Fatalf("前提：指令必須正常收工，實得 code=%d", ex.Code)
+	}
+
+	cancel() // 子程序早已退出，這一刻才取消
+	// watcher goroutine 若會誤設旗標，這裡給它機會跑到。
+	for range 100 {
+		if p.CanceledByContext() {
+			t.Fatal("子程序已正常退出之後才取消，不得被記成 canceled")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

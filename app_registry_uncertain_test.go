@@ -394,16 +394,16 @@ func TestBackfillFailureStillReachesUserAfterEarlierWarning(t *testing.T) {
 	if !auditHas(t, dir, "resume_backfill_failed") {
 		t.Fatal("前提：backfill 必須真的失敗（否則這條測試量的是空集合）")
 	}
-	if !strings.Contains(a.startupErr, "跳過 1 筆") {
-		t.Fatalf("前提：較早的警告要先寫進去：%q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "跳過 1 筆") {
+		t.Fatalf("前提：較早的警告要先寫進去：%q", a.startupErrText())
 	}
-	if !strings.Contains(a.startupErr, "續聊身分升級補寫失敗") {
-		t.Fatalf("後到的警告不得被 first-wins 吃掉（Fail Loud）：%q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "續聊身分升級補寫失敗") {
+		t.Fatalf("後到的警告不得被 first-wins 吃掉（Fail Loud）：%q", a.startupErrText())
 	}
 	// rev3 review I1：`.meta` 是單行 ellipsis，而第一則含完整絕對路徑（>100
 	// 字元）；串在它後面等於在一般視窗寬度下被裁掉。真實路徑上也要驗排序。
-	if strings.Index(a.startupErr, "續聊身分升級補寫失敗") > strings.Index(a.startupErr, "跳過 1 筆") {
-		t.Fatalf("registry 這則必須排在「跳過 N 筆」前面，否則在單行版面上讀不到：%q", a.startupErr)
+	if strings.Index(a.startupErrText(), "續聊身分升級補寫失敗") > strings.Index(a.startupErrText(), "跳過 1 筆") {
+		t.Fatalf("registry 這則必須排在「跳過 N 筆」前面，否則在單行版面上讀不到：%q", a.startupErrText())
 	}
 }
 
@@ -441,15 +441,15 @@ func TestStartupBlockerSortsBeforeBenignWarning(t *testing.T) {
 	a.noteStartupBlocker("session registry: 續聊身分升級補寫失敗")
 	a.noteStartupWarning("replay index 開啟失敗")
 
-	blocker := strings.Index(a.startupErr, "續聊身分升級補寫失敗")
-	benign := strings.Index(a.startupErr, "跳過 1 筆")
+	blocker := strings.Index(a.startupErrText(), "續聊身分升級補寫失敗")
+	benign := strings.Index(a.startupErrText(), "跳過 1 筆")
 	if blocker < 0 || benign < 0 {
-		t.Fatalf("兩則都必須留著（累積，不得丟棄）：%q", a.startupErr)
+		t.Fatalf("兩則都必須留著（累積，不得丟棄）：%q", a.startupErrText())
 	}
 	if blocker > benign {
-		t.Fatalf("blocker 必須排在良性警告前面（.meta 是單行 ellipsis，後面的會被裁掉）：%q", a.startupErr)
+		t.Fatalf("blocker 必須排在良性警告前面（.meta 是單行 ellipsis，後面的會被裁掉）：%q", a.startupErrText())
 	}
-	if !strings.Contains(a.startupErr, "replay index 開啟失敗") {
-		t.Fatalf("後到的良性警告仍不得被丟棄：%q", a.startupErr)
+	if !strings.Contains(a.startupErrText(), "replay index 開啟失敗") {
+		t.Fatalf("後到的良性警告仍不得被丟棄：%q", a.startupErrText())
 	}
 }

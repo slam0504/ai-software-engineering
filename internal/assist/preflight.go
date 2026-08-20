@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/proc"
@@ -88,22 +89,30 @@ type PreflightResult struct {
 //	(2) 讀取期間逐塊檢查 ctx。就算檔案是 regular 但落在一個卡住的網路檔案系統
 //	    上，取消也要能收斂。
 func BinarySHA256(ctx context.Context, bin string) (string, error) {
+	if ctx == nil { // nil context 不 panic：明確退化成 Background（API 契約）
+		ctx = context.Background()
+	}
 	target, err := filepath.EvalSymlinks(bin)
 	if err != nil {
 		return "", fmt.Errorf("assist: 解析 %s: %w", bin, err)
 	}
-	st, err := os.Stat(target)
+	// **O_NONBLOCK 開檔，再對同一個 descriptor 做 Stat**（reviewer 2026-08-20）：
+	// 先 Stat 再 Open 是 TOCTOU——兩者之間把 regular file 換成 FIFO，open 就會
+	// 卡在等寫入端，deadline 也救不了（open 本身不吃 context）。O_NONBLOCK 讓
+	// FIFO 的唯讀 open 立即返回，對 regular file 則是 no-op；拿到 fd 之後用
+	// f.Stat() 判型別，判的就是**實際打開的那個東西**。
+	f, err := os.OpenFile(target, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
 	if !st.Mode().IsRegular() {
 		return "", fmt.Errorf("assist: %s 不是一般檔案（mode=%s）——拒絕對 FIFO／device 計算 digest", target, st.Mode())
 	}
-	f, err := os.Open(target)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
 	h := sha256.New()
 	buf := make([]byte, 64*1024)
 	for {
@@ -124,6 +133,11 @@ func BinarySHA256(ctx context.Context, bin string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// **已知界限**（不宣稱完整 bounded）：取消只在**兩次 read 之間**生效。目標若落在
+// 卡住的遠端檔案系統上，單一次 read syscall 在 Go 裡沒有中斷手段——那要靠掛載層
+// 的 timeout（例如 NFS soft mount）處理，不是這裡能保證的。本地磁碟與 FIFO／
+// device 這兩種可預期的無界等待則已經擋掉。
+
 // binaryVersionOutput 執行 `<bin> --version` 並回傳 trim 後的 stdout。
 func binaryVersionOutput(parent context.Context, bin string) (string, error) {
 	// 30s 是上界，**不是**唯一的取消來源：parent 由呼叫端傳入，shutdown 一
@@ -136,7 +150,12 @@ func binaryVersionOutput(parent context.Context, bin string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("assist: %s --version: %w", bin, err) // 保留 ctx error identity
 	}
-	if ex.Code != 0 || ex.Err != nil {
+	if ex.Err != nil {
+		// %w 保留 *exec.ExitError（同 appGitRunner／spec.GitRepo 的處置）：呼叫端
+		// 現在沒有依 exit type 分流，但攤平成字串會讓之後想分流的人無從下手。
+		return "", fmt.Errorf("assist: %s --version: %s: %w", bin, strings.TrimSpace(ex.StderrTail), ex.Err)
+	}
+	if ex.Code != 0 {
 		return "", fmt.Errorf("assist: %s --version: exit %d: %s", bin, ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	return strings.TrimSpace(string(out)), nil

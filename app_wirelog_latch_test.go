@@ -50,6 +50,7 @@ func (s *fakeCodexServer) StopRecording() error {
 	}
 	return s.stopErr
 }
+
 // hsFn 非 nil 時代替預設的「只記步驟、不真的握手」行為（app_wire_segments_test.go
 // 的 responding wire 需要 conn 真的 initialize，否則後續 Call 會被 rpc 層擋掉）。
 func (s *fakeCodexServer) Handshake(ctx context.Context, ci codex.ClientInfo) error {
@@ -478,7 +479,7 @@ func TestCodexRecordCaseIsLabelOnly(t *testing.T) {
 		t.Fatalf("precondition: connection-wide 錄流必須掛得上：%v", err)
 	}
 
-	w := wsidFor(t, a, contract.ProviderCodex) // startCodexForTest 啟動的就是這個 WSID
+	w := wsidFor(t, a, contract.ProviderCodex)                   // startCodexForTest 啟動的就是這個 WSID
 	startCodexForTest(t, a, wire, conn, "codex-label", "task-x") // 帶 recordCase 仍須成功
 
 	if frames.Load() == 0 {
