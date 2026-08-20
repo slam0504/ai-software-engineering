@@ -160,3 +160,33 @@ func (p *Proc) Wait() Exit {
 	<-p.doneCh
 	return p.exit
 }
+
+// Output 跑一個 one-shot 指令並收完 stdout，語意與 `exec.CommandContext(...).Output()`
+// 對齊，但**收尾走 process group**（reviewer 2026-08-20）。
+//
+// 為什麼不直接用 exec.CommandContext：它在 ctx 取消時只殺直接 child，孫程序照樣
+// 活著；而孫程序若持有 stdout/stderr 的 write end，父程序的 Output／Wait 會繼續
+// 阻塞——取消因此不保證收斂。這裡沿用本套件既有政策：ctx 取消 → group SIGTERM →
+// grace 內未退出 → group SIGKILL；子程序退出後再 group SIGKILL 清殘存孫程序，
+// reader 的 EOF 才有保證。
+//
+// 回傳 (stdout, Exit, err)。err 只在啟動失敗、讀取失敗或 ctx 已取消時非 nil；
+// 指令自身的非零退出碼由 Exit.Code／Exit.Err 表達（同 exec 的 ExitError 慣例，
+// 由呼叫端決定要不要當錯誤）。**ctx 取消時 err 會 wrap ctx.Err()**，呼叫端據此
+// 分辨「被收尾取消」與「指令真的失敗」。
+func Output(ctx context.Context, cfg Config) ([]byte, Exit, error) {
+	p, err := Start(ctx, cfg)
+	if err != nil {
+		return nil, Exit{}, err
+	}
+	_ = p.Stdin.Close() // one-shot：不餵輸入，早關避免對方等 EOF
+	out, rerr := io.ReadAll(p.Stdout)
+	ex := p.Wait()
+	if cerr := ctx.Err(); cerr != nil {
+		return out, ex, cerr
+	}
+	if rerr != nil {
+		return out, ex, rerr
+	}
+	return out, ex, nil
+}

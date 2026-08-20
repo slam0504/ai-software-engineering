@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -124,4 +127,62 @@ func TestCtxCancelKillsWholeGroup(t *testing.T) { // v1.6：獨立 script、不�
 		t.Fatal("group must be dead after ctx cancel")
 	}
 	rd.Wait()
+}
+
+// TestOutputCancellationKillsGrandchildren
+//
+// reviewer 2026-08-20：`exec.CommandContext` 在 ctx 取消時只殺**直接 child**，
+// 孫行程照樣活著；孫行程若持有 stdout 的 write end，父行程的 Output／Wait 還會
+// 繼續阻塞——取消因此不保證收斂。
+//
+// 正題斷言（兩條，分得開）：
+//   - ctx 取消之後 Output **會返回**（不被孫行程持有的 pipe 卡住）。
+//   - 那個忽略 TERM 的孫行程**已經不在**（group KILL 收掉了）。
+func TestOutputCancellationKillsGrandchildren(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "grandchild.pid")
+	// child：spawn 一個忽略 TERM/HUP 的孫行程（繼承 stdout），自己也不退出。
+	script := "#!/bin/sh\n" +
+		"( trap '' TERM HUP; echo $$ > " + pidFile + "; while true; do sleep 0.05; done ) &\n" +
+		"trap '' TERM HUP\n" +
+		"while true; do sleep 0.05; done\n"
+	sh := filepath.Join(dir, "spawn.sh")
+	if err := os.WriteFile(sh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := Output(ctx, Config{Binary: sh, TermGrace: 300 * time.Millisecond})
+		done <- err
+	}()
+	// 等孫行程真的起來（pid 檔案出現）。
+	deadline := time.Now().Add(20 * time.Second)
+	var pid int
+	for time.Now().Before(deadline) && pid == 0 {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("測試前提不成立：孫行程沒有起來")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("取消之後 Output 沒有返回——孫行程持有的 pipe 把它卡住了")
+	}
+	// 孫行程必須已經被 group KILL 收掉（signal 0 ＝ 存活探測）。
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return // 已不存在
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL) // 清乾淨再報告
+	t.Fatal("忽略 TERM 的孫行程仍存活——取消必須走 process group（TERM → bounded KILL）")
 }

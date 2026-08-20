@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -282,5 +283,49 @@ func TestCodexAssistViolationNotMaskedByWireError(t *testing.T) {
 	}
 	if viol.Provider != "codex" || viol.Detail != codex.MethodCmdExecRequestApproval {
 		t.Fatalf("violation must carry provider/method, got: %+v", viol)
+	}
+}
+
+// TestBinarySHA256RejectsNonRegularFile
+//
+// reviewer 2026-08-20：以 FIFO 取代 binary 之後，io.Copy 會無限等寫入端，而
+// preflight 的 30 秒 deadline 只掛在子行程上、管不到讀檔——傳入已取消的 context
+// 也一樣卡住，只有人工寫入 FIFO 才會返回。
+//
+// 正題斷言：對 FIFO 呼叫**立刻**回錯誤（不等任何人寫入）。
+func TestBinarySHA256RejectsNonRegularFile(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fake-binary")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("這個平台建不出 FIFO：%v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := BinarySHA256(context.Background(), fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO 不是一般檔案，必須拒絕")
+		}
+		if !strings.Contains(err.Error(), "不是一般檔案") {
+			t.Fatalf("拒絕原因必須說明是檔案型別，實得 %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("對 FIFO 計算 digest 卡住了——沒有人會來寫入，這條路徑必須直接拒絕")
+	}
+}
+
+// TestBinarySHA256IsCancellable：就算目標是一般檔案（可能落在卡住的網路檔案系統
+// 上），已取消的 context 也必須讓它立刻返回。
+func TestBinarySHA256IsCancellable(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.WriteFile(bin, make([]byte, 1<<20), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := BinarySHA256(ctx, bin); !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消的 context 必須讓 digest 立刻返回 context.Canceled，實得 %v", err)
 	}
 }

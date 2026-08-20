@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -757,5 +758,51 @@ func TestPlanAssistPreflightWorkIsCancellable(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("前置工作不在可取消範圍內：cancel 根 context 之後仍未收斂")
+	}
+}
+
+// TestShutdownCancellationIsNotRecordedAsEnforcementFailure
+//
+// reviewer 2026-08-20：PlanAssist 把**所有** preflight error 都包成
+// ErrEnforcementUnproven 並寫一筆 planner-enforcement-preflight hard escalation。
+// shutdown 取消正在跑的 `claude --version` 之後，journal 因此留下一筆錯誤的硬性
+// 阻擋項——而 hard 項使用者無法自行解除。
+//
+// 走**完整的 PlanAssist**（不是直接呼叫 planPreflight）：escalation 是在那一層
+// 寫的，繞過它的話「沒寫 escalation」這條斷言是恆真的。
+//
+// 正題斷言（兩條，分得開）：
+//   - 回傳的錯誤保留 context.Canceled 的 identity。
+//   - **沒有**開出 planner-enforcement-preflight 項。
+func TestShutdownCancellationIsNotRecordedAsEnforcementFailure(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	approveGate1Spec(t, a)
+	// 假 provider CLI：忽略 TERM 並卡住，讓 preflight 停在 --version 上。
+	plantPlannerBinScript(t, a, "claude", "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 0.05; done\n")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a.PlanAssist("claude", "draft plan")
+		errCh <- err
+	}()
+	waitFor(t, "preflight 已 spawn provider CLI", func() bool {
+		out, _ := exec.Command("pgrep", "-f", a.claudeCLIPath()).Output()
+		return len(strings.TrimSpace(string(out))) > 0
+	})
+
+	a.cancelProcRoot() // ＝ shutdown 第 1 步做的事
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("被收尾取消時必須保留 context.Canceled identity，實得 %v", err)
+		}
+		if errors.Is(err, assist.ErrEnforcementUnproven) {
+			t.Fatalf("收尾取消不是 enforcement failure，實得 %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("PlanAssist 未在取消後收斂")
+	}
+	if e := openItemByKey(t, a, "planner-enforcement-preflight:claude"); e != nil {
+		t.Fatal("收尾取消不得開出 planner-enforcement-preflight 阻擋項（hard 項使用者無法自行解除）")
 	}
 }

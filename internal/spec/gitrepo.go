@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 // GitRepo is the git-backed implementation of Repo. HEAD-tree reads go
@@ -41,13 +42,23 @@ func (g *GitRepo) git(args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", g.root}, args...)...)
-	out, err := cmd.Output()
+	// 走 proc.Output（process group）而不是 exec.CommandContext：後者取消時只殺
+	// 直接 child，孫程序照樣活著、還可能繼續持有 pipe 讓 Output 阻塞
+	// （reviewer 2026-08-20）。
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: "git", Args: append([]string{"-C", g.root}, args...)})
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("git %v: %s", args, strings.TrimSpace(string(ee.Stderr)))
+		return nil, fmt.Errorf("git %v: %w", args, err) // 保留 context.Canceled 等 identity
+	}
+	if ex.Err != nil {
+		// 保留 *exec.ExitError 的鏈（呼叫端以 errors.As 分辨 exit code）；
+		// stderr tail 一併帶出，錯誤訊息才看得懂。
+		if tail := strings.TrimSpace(ex.StderrTail); tail != "" {
+			return nil, fmt.Errorf("git %v: %s: %w", args, tail, ex.Err)
 		}
-		return nil, fmt.Errorf("git %v: %w", args, err)
+		return nil, fmt.Errorf("git %v: %w", args, ex.Err)
+	}
+	if ex.Code != 0 {
+		return nil, fmt.Errorf("git %v: exit %d: %s", args, ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	return out, nil
 }

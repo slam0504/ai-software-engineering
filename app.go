@@ -35,6 +35,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/journal"
 	"github.com/slam0504/sdlc-workbench/internal/plan"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 	"github.com/slam0504/sdlc-workbench/internal/recorder"
 	"github.com/slam0504/sdlc-workbench/internal/replayindex"
 	"github.com/slam0504/sdlc-workbench/internal/singleinstance"
@@ -3868,8 +3869,19 @@ func (r appGitRunner) Git(args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", r.root}, args...)...)
-	return cmd.Output()
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: "git", Args: append([]string{"-C", r.root}, args...)})
+	if err != nil {
+		return nil, err // 保留 context.Canceled／DeadlineExceeded 的 identity
+	}
+	if ex.Err != nil {
+		// **保留 *exec.ExitError 的鏈**：呼叫端用 errors.As 分辨「exit 1＝找不到／
+		// 非祖先」與真正的執行失敗（見 TestAppGitRunnerPreservesExitErrorChain）。
+		return nil, fmt.Errorf("git %v: %w", args, ex.Err)
+	}
+	if ex.Code != 0 {
+		return nil, fmt.Errorf("git %v: exit %d: %s", args, ex.Code, strings.TrimSpace(ex.StderrTail))
+	}
+	return out, nil
 }
 
 // appPlanLoader 實作 gatepolicy.PlanLoader：讀 committed plan／risk policy，
@@ -6214,12 +6226,15 @@ func (a *App) newAssistRunner(provider string) (assist.Runner, error) {
 // .workbench/ 是 app state（gate journal 等），不屬受管 code，比照
 // assertWorkspaceUnchanged（app_assist_test.go）同一慣例排除，不計入 dirty。
 func (a *App) nonPlanDirtyPaths(ctx context.Context) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all").Output()
+	// process group 收尾（見 proc.Output）：CommandContext 只殺直接 child，
+	// 忽略 TERM 的孫程序會讓取消不收斂（reviewer 2026-08-20）。
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: "git",
+		Args: []string{"-C", a.workspaceDir, "status", "--porcelain", "--untracked-files=all"}})
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(string(ee.Stderr)))
-		}
-		return nil, fmt.Errorf("assist: git status: %w", err)
+		return nil, fmt.Errorf("assist: git status: %w", err) // 保留 context.Canceled identity
+	}
+	if ex.Code != 0 || ex.Err != nil {
+		return nil, fmt.Errorf("assist: git status: %s", strings.TrimSpace(ex.StderrTail))
 	}
 	var dirty []string
 	for _, line := range strings.Split(string(out), "\n") {
@@ -6329,6 +6344,18 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	// journal 失敗。重新通過 → 系統解除 preflight key（僅此 key——runtime
 	// blocker 的修復條件是一次完整成功 run，見 plannerRuntimeKey doc）。
 	pf, pferr := a.planPreflight(ctx, provider)
+	// **收尾取消不是 enforcement failure**（reviewer 2026-08-20）：先前把所有
+	// preflight error 都包成 ErrEnforcementUnproven 並寫一筆 hard escalation，
+	// 於是 shutdown 取消正在跑的 `claude --version` 之後，journal 會留下一筆說
+	// 「這個 provider 的 enforcement 前提未證明」的阻擋項——那是錯的，而且是
+	// hard 項，使用者無法自行解除。
+	//
+	// 判準是**根 context**：被 shutdown／使用者取消就原樣回傳（保留
+	// context.Canceled 的 identity），只有 preflight 自己那 30 秒 deadline 或真正
+	// 的驗證失敗才算 enforcement failure。
+	if cerr := ctx.Err(); cerr != nil {
+		return "", cerr
+	}
 	if pferr != nil || !pf.OK {
 		reason := pf.Reason
 		if pferr != nil {
@@ -6450,7 +6477,7 @@ func (a *App) planPreflight(ctx context.Context, provider string) (assist.Prefli
 	if provider == "codex" {
 		bin = a.codexCLIPath()
 	}
-	digest, err := assist.BinarySHA256(bin)
+	digest, err := assist.BinarySHA256(ctx, bin)
 	if err != nil {
 		return assist.PreflightResult{Provider: provider, BinaryPath: bin}, err
 	}

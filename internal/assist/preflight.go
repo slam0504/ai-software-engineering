@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 // provider capability preflight（spec §3.4）：PlanAssist spawn 前驗證「pin 版本
@@ -77,15 +79,47 @@ type PreflightResult struct {
 }
 
 // BinarySHA256 回傳 bin 檔案內容的完整 SHA-256 hex。
-func BinarySHA256(bin string) (string, error) {
-	f, err := os.Open(bin)
+//
+// **兩個防線**（reviewer 2026-08-20）：
+//
+//	(1) 目標必須是 regular file。以 FIFO／device 取代 binary 之後，io.Copy 會
+//	    無限等寫入端，preflight 的 30 秒 deadline 也救不了——因為那個 deadline
+//	    只掛在子行程上，讀檔完全不受它管。symlink 先解析到真正目標再判。
+//	(2) 讀取期間逐塊檢查 ctx。就算檔案是 regular 但落在一個卡住的網路檔案系統
+//	    上，取消也要能收斂。
+func BinarySHA256(ctx context.Context, bin string) (string, error) {
+	target, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return "", fmt.Errorf("assist: 解析 %s: %w", bin, err)
+	}
+	st, err := os.Stat(target)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("assist: %s 不是一般檔案（mode=%s）——拒絕對 FIFO／device 計算 digest", target, st.Mode())
+	}
+	f, err := os.Open(target)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	buf := make([]byte, 64*1024)
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return "", cerr
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -96,9 +130,14 @@ func binaryVersionOutput(parent context.Context, bin string) (string, error) {
 	// cancel 就立刻收斂，不必等滿 30 秒（reviewer 2026-08-20）。
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	// process group 收尾（同 spec.GitRepo 的理由）：CommandContext 只殺直接
+	// child，忽略 TERM 的孫程序會讓取消不收斂（reviewer 2026-08-20）。
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: bin, Args: []string{"--version"}})
 	if err != nil {
-		return "", fmt.Errorf("assist: %s --version: %w", bin, err)
+		return "", fmt.Errorf("assist: %s --version: %w", bin, err) // 保留 ctx error identity
+	}
+	if ex.Code != 0 || ex.Err != nil {
+		return "", fmt.Errorf("assist: %s --version: exit %d: %s", bin, ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -109,7 +148,7 @@ func binaryVersionOutput(parent context.Context, bin string) (string, error) {
 // 執行／不可讀）回；檢驗不符走 OK=false＋Reason。兩者在 app 層皆 fail closed。
 func PreflightClaude(ctx context.Context, bin string, plannerArgs []string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "claude", BinaryPath: bin}
-	digest, err := BinarySHA256(bin)
+	digest, err := BinarySHA256(ctx, bin)
 	if err != nil {
 		return res, err
 	}
@@ -141,7 +180,7 @@ func PreflightClaude(ctx context.Context, bin string, plannerArgs []string) (Pre
 // codexAssist.Run），preflight runtime 檢查限版本＋binary digest。
 func PreflightCodex(ctx context.Context, bin string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "codex", BinaryPath: bin}
-	digest, err := BinarySHA256(bin)
+	digest, err := BinarySHA256(ctx, bin)
 	if err != nil {
 		return res, err
 	}
