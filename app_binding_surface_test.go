@@ -35,41 +35,36 @@ import (
 // 四類而不是三類，是因為有一組 binding 既不走 app 交易也不是唯讀（寫 workspace
 // 檔案、送 turn、終止子行程）——硬塞進唯讀會讓那一類的斷言必須放寬到沒有意義。
 
-// readOnlyBindings：**唯一**不必是薄包裝的類別——只讀，不改動任何 durable state。
+// startupSafeBindings：**唯一**不必是薄包裝的 exported method。
 //
-// 前一版分成 appTxn／readOnly／runtimeMutating 三類，各自套不同契約。複核指出
-// 那樣分仍然漏（reviewer 2026-08-20）：
+// 前一版把 12 個「唯讀」全部放行，複核指出唯讀不等於 startup-safe
+// （reviewer 2026-08-20）：LoadTurnsBefore 與 startup 同時讀寫 a.replayIndex 是
+// 真的 data race；RestoreViews 在 a.restore 尚未初始化時 nil pointer panic；
+// ListSessions／PaneLayout 讀尚未發布的 a.wsReg；ReadDiagram 讀尚未設定的
+// diagramPath。Wails 的 OnStartup 與 bindings 並行，這些都是 production 可達。
 //
-//   - appTxn 的契約只要求「某條路徑可達交易閘」，於是 StartLogin("claude") 直接
-//     開 Terminal、Logout("claude") 直接執行 CLI，兩條 Claude 分支從未進交易，
-//     收尾之後照樣執行外部程式。
-//   - runtimeMutating 的契約只看 gate／escalation／evidence 三組欄位，於是
-//     SendMessage 經 Manager.AcceptSubmit 寫 events.jsonl 與 replay index、
-//     ResolveApproval 經 callback 寫 Manager sink，全都在契約之外。
+// 所以判準不是「寫不寫」，是「**依不依賴 startup 發布的東西**」。依賴的一律進閘
+// （唯讀也一樣，交易只是短暫持有）；只有刻意支援啟動診斷、且自己把讀到的每個
+// 欄位都放進同一把鎖的，才留在這裡。
 //
-// 所以不再按「改的是哪一種狀態」分類，改成一條界線：**會不會改動 durable
-// state**。會的一律是薄包裝（交易閘在任何分支之前），不會的列在這裡。
-//
-// 每一筆的理由必須是「為什麼它完全不寫」，不能是「它有自己的交易」。
-var readOnlyBindings = map[string]string{
-	"CLIInfo":           "回報 CLI／node 解析結果",
-	"ListSessions":      "讀 session registry 快照",
-	"ListWorkspace":     "讀 workspace 檔案樹",
-	"LoadTurnsBefore":   "讀 replay index",
-	"PaneLayout":        "讀 pane pins",
-	"PlanList":          "讀 plan 樹",
-	"PlanRead":          "讀 plan 檔",
-	"ReadDiagram":       "讀 workspace 圖檔",
-	"ReadWorkspaceFile": "讀 workspace 檔案",
-	"RestoreViews":      "讀 restore store 的 view 快照",
-	"SpecList":          "讀 spec 樹",
-	"SpecRead":          "讀 spec 檔",
+// 目前只有一個，而且它的契約由 TestStartupSafeBindingTouchesOnlyGuardedFields
+// 逐欄位驗證——不是靠這句話。
+var startupSafeBindings = map[string]string{
+	"CLIInfo": "啟動診斷：只讀 startupMu 保護的快照（含 workspace 的受鎖副本）",
+}
+
+// startupSafeFields：startup-safe binding 唯一可以碰的 App 欄位——全部由
+// startupMu 保護。
+var startupSafeFields = []string{
+	"startupMu", "startupErr", "startupBlockers",
+	"toolsDirPath", "toolsSource", "nodePath",
+	"workspaceSnap", "workspaceSrcSnap",
 }
 
 // bindingClass：名稱 → 類別（空字串＝必須是薄包裝）。
 func bindingClass(name string) string {
-	if readOnlyBindings[name] != "" {
-		return "readOnly"
+	if startupSafeBindings[name] != "" {
+		return "startupSafe"
 	}
 	return ""
 }
@@ -96,7 +91,7 @@ func TestEveryBindingIsClassifiedAndHonoursItsShape(t *testing.T) {
 			continue
 		}
 		class := bindingClass(name)
-		why := thinWrapperViolation(fd, methods)
+		why := thinWrapperViolationTyped(fd, methods, methodSignature(info, fd))
 		switch {
 		case why == "" && class != "":
 			offenders = append(offenders, name+"：是 state 薄包裝卻又被列在 "+class+" 清單裡（分類必須互斥）")
@@ -113,15 +108,81 @@ func TestEveryBindingIsClassifiedAndHonoursItsShape(t *testing.T) {
 		t.Fatal("沒有任何 state 薄包裝：守門失效")
 	}
 	// 清單不得列出不存在的 method（改名後的殘骸會讓守門靜默變寬）。
-	for _, m := range []map[string]string{readOnlyBindings} {
+	for _, m := range []map[string]string{startupSafeBindings} {
 		for name := range m {
 			if fd := methods[name]; fd == nil || !fd.Name.IsExported() {
 				t.Errorf("分類清單列了不存在的 exported method %q：請同步清理", name)
 			}
 		}
 	}
-	t.Logf("薄包裝 %d 個、唯讀 %d 個（合計 %d）",
-		len(gated), len(readOnlyBindings), len(gated)+len(readOnlyBindings))
+	t.Logf("薄包裝 %d 個、startup-safe %d 個（合計 %d）",
+		len(gated), len(startupSafeBindings), len(gated)+len(startupSafeBindings))
+}
+
+// TestOnlyThinWrappersAdmit
+//
+// `beginTxn` 只能被合格的薄包裝呼叫。
+//
+// 這條擋的是**巢狀 admission**（reviewer 2026-08-20）：外層取得 ownership 之後
+// shutdown 可能切換 phase，內層 admission 隨即以「shutting down」拒絕，操作做到
+// 一半才失敗。SpecAssist／PlanAssist 的內層交易與 ensureAppServer 的自有交易都是
+// 這個形狀，已經移除；這條讓它們回不來。
+//
+// 非 admission 的 phase 查詢（例如 ensureAppServer「收尾後不建新 server」的資源
+// 政策）走 phaseNow()，不在這條規則之內——它不登記交易，也不會否決已被放行的
+// 操作。
+func TestOnlyThinWrappersAdmit(t *testing.T) {
+	fset, files, info, pkg := typeCheckProductionPackage(t)
+	appType := namedType(t, pkg, "App")
+	methods := appMethodsByName(files, info, appType)
+
+	wrapper := map[string]bool{}
+	for name, fd := range methods {
+		if fd.Name.IsExported() && thinWrapperViolationTyped(fd, methods, methodSignature(info, fd)) == "" {
+			wrapper[name] = true
+		}
+	}
+	var offenders []string
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			fd, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				id, isIdent := n.(*ast.Ident)
+				if !isIdent || id.Name != "beginTxn" {
+					return true
+				}
+				if fn, _ := info.Uses[id].(*types.Func); fn == nil || fn.Name() != "beginTxn" {
+					return true
+				}
+				if wrapper[fd.Name.Name] {
+					return true
+				}
+				offenders = append(offenders, fd.Name.Name+" 於 "+fset.Position(id.Pos()).String())
+				return true
+			})
+		}
+	}
+	sort.Strings(offenders)
+	if len(offenders) != 0 {
+		t.Fatalf("只有合格的薄包裝可以呼叫 beginTxn（巢狀 admission 會讓操作做到一半才失敗）：\n  %s",
+			strings.Join(offenders, "\n  "))
+	}
+	if len(wrapper) == 0 {
+		t.Fatal("找不到任何薄包裝：守門失效")
+	}
+}
+
+// methodSignature：FuncDecl 的型別簽章（拿不到回 nil，此時零值判定退回字面量層級）。
+func methodSignature(info *types.Info, fd *ast.FuncDecl) *types.Signature {
+	fn, _ := info.Defs[fd.Name].(*types.Func)
+	if fn == nil {
+		return nil
+	}
+	sig, _ := fn.Type().(*types.Signature)
+	return sig
 }
 
 // appMethodsByName：*App 的所有方法（含 unexported）。
@@ -173,6 +234,12 @@ func isAppMethod(fn *types.Func, appType *types.Named) bool {
 //  4. return a.<unexported>(<原樣轉送的參數>)
 //     —— 實作必須是同名的 unexported method，簽章相同
 func thinWrapperViolation(fd *ast.FuncDecl, methods map[string]*ast.FuncDecl) string {
+	return thinWrapperViolationTyped(fd, methods, nil)
+}
+
+// thinWrapperViolationTyped：同上，但帶型別資訊時另外用**型別語意**判定零值
+// （nilable 只能 nil、struct／array 才能用空 composite literal）。
+func thinWrapperViolationTyped(fd *ast.FuncDecl, methods map[string]*ast.FuncDecl, sig *types.Signature) string {
 	body := fd.Body.List
 	if len(body) != 3 {
 		return "body 有 " + itoa(len(body)) + " 個敘述，薄包裝必須恰好三個"
@@ -190,7 +257,7 @@ func thinWrapperViolation(fd *ast.FuncDecl, methods map[string]*ast.FuncDecl) st
 	}
 	errName := assignedErrName(ifs.Init)
 	if errName == "" {
-		return "beginTxn 的結果必須指派給一個變數再判斷"
+		return "beginTxn 的結果必須以 `:=` 指派給區域變數再判斷（`=` 會共用外層變數，並行時互相覆寫）"
 	}
 	if !isNotNilCheck(ifs.Cond, errName) {
 		return "條件必須是 `" + errName + " != nil`（寫成 == nil 會在成功時直接返回、失敗時反而繼續執行）"
@@ -214,6 +281,12 @@ func thinWrapperViolation(fd *ast.FuncDecl, methods map[string]*ast.FuncDecl) st
 	for i, r := range ret.Results[:len(ret.Results)-1] {
 		if !isZeroLiteral(r) {
 			return "拒絕時第 " + itoa(i+1) + " 個回傳值必須是零值字面量，不得執行任何運算"
+		}
+		if sig == nil || i >= sig.Results().Len() {
+			continue
+		}
+		if why := zeroValueMismatch(r, sig.Results().At(i).Type()); why != "" {
+			return "拒絕時第 " + itoa(i+1) + " 個回傳值" + why
 		}
 	}
 	def, isDefer := body[1].(*ast.DeferStmt)
@@ -269,10 +342,39 @@ func isZeroLiteral(e ast.Expr) bool {
 	return false
 }
 
+// zeroValueMismatch：字面量與型別的零值是否真的相同（空字串＝相同）。
+//
+// `[]GateEntryDTO{}` 是**非 nil** 的空 slice，與 nil 不是同一個值；呼叫端據此
+// 分辨「沒有資料」與「沒查」的話，契約就被改掉了（reviewer 2026-08-20）。
+func zeroValueMismatch(e ast.Expr, typ types.Type) string {
+	switch types.Unalias(typ).Underlying().(type) {
+	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature, *types.Interface:
+		if id, isIdent := e.(*ast.Ident); !isIdent || id.Name != "nil" {
+			return "必須是 nil（這個型別的零值是 nil，空的 composite literal 是另一個值）"
+		}
+	case *types.Basic:
+		if _, isLit := e.(*ast.BasicLit); !isLit {
+			if id, isIdent := e.(*ast.Ident); !isIdent || id.Name != "false" {
+				return "必須是該基本型別的零值常數"
+			}
+		}
+	case *types.Struct, *types.Array:
+		if lit, isLit := e.(*ast.CompositeLit); !isLit || len(lit.Elts) != 0 {
+			return "必須是空的 composite literal"
+		}
+	}
+	return ""
+}
+
 // assignedErrName：`if err := a.f(); …` 裡被指派的變數名（形狀不符回空字串）。
 func assignedErrName(init ast.Stmt) string {
 	as, isAssign := init.(*ast.AssignStmt)
 	if !isAssign || len(as.Lhs) != 1 {
+		return ""
+	}
+	// **必須是 :=**（reviewer 2026-08-20）：改成 `err =` 指到 package-global 就
+	// 會讓所有 binding 共用同一個變數，並行呼叫互相覆寫彼此的 admission 結果。
+	if as.Tok != token.DEFINE {
 		return ""
 	}
 	id, isIdent := as.Lhs[0].(*ast.Ident)
@@ -531,9 +633,16 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 					}
 					return true
 				}
-				// 反向：受保護的實作不得回頭呼叫 exported binding。
-				if exported[obj] && protected[info.Defs[fd.Name]] != "" && isDirectCallee(id, parents) {
-					note(id.Pos(), "受保護的實作 "+fd.Name.Name+" 回頭呼叫 exported binding "+obj.Name())
+				// 反向：受保護的實作不得**以任何形式**引用 exported binding。
+				// 只擋直接呼叫的話，`_ = a.CreateSession` 這種取值仍然通過，而
+				// function value／callback／間接遞迴都是從取值開始的
+				// （reviewer 2026-08-20）。
+				if exported[obj] && protected[info.Defs[fd.Name]] != "" {
+					how := "引用"
+					if isDirectCallee(id, parents) {
+						how = "呼叫"
+					}
+					note(id.Pos(), "受保護的實作 "+fd.Name.Name+" 回頭"+how+" exported binding "+obj.Name())
 				}
 				return true
 			})
@@ -558,34 +667,32 @@ func isDirectCallee(id *ast.Ident, parents []ast.Node) bool {
 	return isCall && call.Fun == ast.Expr(sel)
 }
 
-// TestReadOnlyBindingsWriteNothing
+// TestStartupSafeBindingTouchesOnlyGuardedFields
 //
-// 唯讀那一類的契約：碰不到 gate／escalation／evidence 的 App 欄位、不進交易閘、
-// 不可達 os 的寫入函式，也不可達會寫 durable state 的 Manager 入口。
+// startup-safe 那一個 binding 的契約：它（含它呼叫到的每一層）**只能碰**
+// startupSafeFields 裡的 App 欄位。
 //
-// 最後一項是這一輪補的（reviewer 2026-08-20）：先前只看三組 App 欄位，於是
-// SendMessage 經 Manager.AcceptSubmit 寫 events.jsonl 與 replay index、
-// ResolveApproval 經 callback 寫 Manager sink，兩者都在契約之外。那兩個現在已經
-// 是薄包裝，但這條契約要留著——否則下一個被歸進唯讀的 binding 又會從這裡漏。
-func TestReadOnlyBindingsWriteNothing(t *testing.T) {
+// 這條比「不寫 durable state」強得多，而且是它該有的強度：能在 startup 期間跑，
+// 就代表它讀到的每一個欄位都可能正在被 startup 寫，所以每一個都必須在同一把鎖
+// 底下（reviewer 2026-08-20）。
+func TestStartupSafeBindingTouchesOnlyGuardedFields(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
-	_ = fset
 	appType := namedType(t, pkg, "App")
 	appStruct, isStruct := appType.Underlying().(*types.Struct)
 	if !isStruct {
 		t.Fatal("App 不是 struct（守門前提不成立）")
 	}
-	stateFields := map[*types.Var]bool{}
-	for _, name := range stateFieldNames {
+	allowed := map[*types.Var]bool{}
+	for _, name := range startupSafeFields {
 		found := false
 		for i := range appStruct.NumFields() {
 			if appStruct.Field(i).Name() == name {
-				stateFields[appStruct.Field(i)] = true
+				allowed[appStruct.Field(i)] = true
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("App 上沒有欄位 %q：守門的 state 定義已與實作脫節", name)
+			t.Fatalf("App 上沒有欄位 %q：startupSafeFields 已與實作脫節", name)
 		}
 	}
 
@@ -600,13 +707,7 @@ func TestReadOnlyBindingsWriteNothing(t *testing.T) {
 		}
 	}
 	calls := map[*types.Func][]*types.Func{}
-	marks := map[*types.Func]map[string]bool{}
-	mark := func(fn *types.Func, k string) {
-		if marks[fn] == nil {
-			marks[fn] = map[string]bool{}
-		}
-		marks[fn][k] = true
-	}
+	touched := map[*types.Func]map[*types.Var]token.Pos{}
 	for fn, fd := range bodies {
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
 			switch x := n.(type) {
@@ -618,43 +719,50 @@ func TestReadOnlyBindingsWriteNothing(t *testing.T) {
 				case *ast.SelectorExpr:
 					id = fun.Sel
 				}
-				if id == nil {
-					return true
-				}
-				callee, _ := info.Uses[id].(*types.Func)
-				if callee == nil {
-					return true
-				}
-				if callee.Name() == "beginTxn" {
-					mark(fn, "txn")
-				}
-				if callee.Pkg() != nil && callee.Pkg().Name() == "os" && osMutators[callee.Name()] {
-					mark(fn, "osWrite")
-				}
-				if durableWriters[callee.Name()] {
-					mark(fn, "durableWrite")
-				}
-				calls[fn] = append(calls[fn], callee)
-			case *ast.SelectorExpr:
-				if sel := info.Selections[x]; sel != nil {
-					if v, isVar := sel.Obj().(*types.Var); isVar && stateFields[v] {
-						mark(fn, "stateField")
+				if id != nil {
+					if callee, _ := info.Uses[id].(*types.Func); callee != nil {
+						calls[fn] = append(calls[fn], callee)
 					}
 				}
+			case *ast.SelectorExpr:
+				sel := info.Selections[x]
+				if sel == nil || sel.Kind() != types.FieldVal {
+					return true
+				}
+				v, isVar := sel.Obj().(*types.Var)
+				if !isVar || allowed[v] {
+					return true
+				}
+				// 只管 App 上的欄位；別的型別的欄位不在這條契約範圍內。
+				if named, ok := types.Unalias(sel.Recv()).(*types.Pointer); ok {
+					if n2, ok := types.Unalias(named.Elem()).(*types.Named); !ok || n2.Obj() != appType.Obj() {
+						return true
+					}
+				} else if n2, ok := types.Unalias(sel.Recv()).(*types.Named); !ok || n2.Obj() != appType.Obj() {
+					return true
+				}
+				if touched[fn] == nil {
+					touched[fn] = map[*types.Var]token.Pos{}
+				}
+				touched[fn][v] = x.Pos()
 			}
 			return true
 		})
 	}
-	for changed := true; changed; { // 定點迭代（呼叫圖有環）
+	// 定點迭代：把被呼叫者碰到的欄位往上併。
+	for changed := true; changed; {
 		changed = false
 		for fn := range bodies {
 			for _, callee := range calls[fn] {
 				if _, known := bodies[callee]; !known {
 					continue
 				}
-				for k := range marks[callee] {
-					if !marks[fn][k] {
-						mark(fn, k)
+				for v, pos := range touched[callee] {
+					if touched[fn] == nil {
+						touched[fn] = map[*types.Var]token.Pos{}
+					}
+					if _, seen := touched[fn][v]; !seen {
+						touched[fn][v] = pos
 						changed = true
 					}
 				}
@@ -667,22 +775,17 @@ func TestReadOnlyBindingsWriteNothing(t *testing.T) {
 		if fd.Recv == nil || !fd.Name.IsExported() || !isAppMethod(fn, appType) {
 			continue
 		}
-		if bindingClass(fd.Name.Name) != "readOnly" {
+		if bindingClass(fd.Name.Name) != "startupSafe" {
 			continue
 		}
-		for _, c := range []struct{ key, why string }{
-			{"stateField", "碰得到 gate／escalation／evidence 狀態"},
-			{"txn", "進得了交易閘（那代表它會改動狀態，分類錯了）"},
-			{"osWrite", "可達 os 的寫入函式"},
-			{"durableWrite", "可達會寫 durable state 的入口"},
-		} {
-			if marks[fn][c.key] {
-				offenders = append(offenders, fd.Name.Name+"（readOnly）："+c.why)
-			}
+		for v, pos := range touched[fn] {
+			offenders = append(offenders, fd.Name.Name+" 碰到未受 startupMu 保護的欄位 "+
+				v.Name()+"（"+fset.Position(pos).String()+"）")
 		}
 	}
 	sort.Strings(offenders)
 	if len(offenders) != 0 {
-		t.Fatalf("以下 binding 宣稱唯讀，但它做得到別的事：\n  %s", strings.Join(offenders, "\n  "))
+		t.Fatalf("startup-safe binding 只能碰 startupMu 保護的欄位：\n  %s",
+			strings.Join(offenders, "\n  "))
 	}
 }

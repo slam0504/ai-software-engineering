@@ -75,6 +75,15 @@ type App struct {
 	//     或任何會取 auditMu 的東西，否則就是反向鎖序。
 	startupMu  sync.Mutex
 	startupErr string
+	// workspaceSnap／workspaceSrcSnap：workspaceDir／workspaceSrc 的**受鎖副本**。
+	//
+	// CLIInfo 是唯一容許在 startup 期間執行的 binding（啟動診斷），所以它讀到的
+	// 每一個欄位都必須受同一把鎖保護。原生欄位 a.workspaceDir 由
+	// acquireStateLease 在啟動途中寫入，其餘讀者都是已進交易閘的 binding——那條
+	// 路徑有 shutMu 的 release/acquire 邊，安全；只有 CLIInfo 沒有，所以另外留
+	// 一份快照給它（reviewer 2026-08-20）。
+	workspaceSnap    string
+	workspaceSrcSnap string
 	// lease：開啟／持有 state writer 的 ownership capability。
 	//
 	// **nil ＝沒有 capability ＝一律拒絕**，不是「沒設就當作沒問題」。所有
@@ -510,8 +519,23 @@ type App struct {
 	// one-shot。assistActive 在 assistMu 下管理獨佔性；每個 generation 的 cancel
 	// 供 shutdown reclaim，once 保證 result／abort／timeout／shutdown 任一先觸發
 	// 即收一次（清 active flag＋endTxn＋close done）。
-	assistMu            sync.Mutex
-	assistActive        map[string]*assistGen
+	assistMu     sync.Mutex
+	assistActive map[string]*assistGen
+	// assistRootCtx／assistRootCancel：所有 assist 執行的**根 context**，由
+	// shutdown 在第 1 步 cancel（見 reclaimAssists）。
+	//
+	// 為什麼需要它（reviewer 2026-08-20）：assist 的實作原本自己開一筆交易，而且
+	// 刻意排在 assistActive 登記**之後**——因為 shutdown 的 reclaim 掃的是那個
+	// registry，若交易先登記、gen 還看不見，reclaim 會掃到空集合、cancel 不到，
+	// inflight.Wait 卻要等到 assistTimeout（約 3 分鐘的 stall）。
+	//
+	// 改成薄包裝之後，交易在 binding 進場時就登記了，那個順序前提不再成立。與其
+	// 讓內外兩層交易競逐（外層取得之後 phase 可能翻成 shuttingDown，內層隨即以
+	// 「shutting down」拒絕，操作做到一半才失敗），不如把 liveness 從 registry
+	// 掃描改成 context 樹：shutdown 一 cancel 根 context，**不論登記到哪一步**，
+	// 進行中的 assist 都會立刻收斂。registry 掃描退為補強。
+	assistRootCtx       context.Context
+	assistRootCancel    context.CancelFunc
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginTxn 未開始
 
@@ -898,13 +922,24 @@ type SessionInfo struct {
 	State string `json:"state"`
 }
 
+// ListSessions：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
+func (a *App) ListSessions() ([]SessionInfo, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.listSessions()
+}
+
 // ListSessions：前端 session 清單的來源（唯讀——不建立 slot、不寫 registry）。
 // 排序以 WSID（ULID，建立時間單調）遞增，清單順序因此穩定、不隨 map 迭代漂移。
 //
 // registry 尚未接線（malformed／載入失敗，見 loadSessionRegistry 的 fail loud）
 // 時回 errNoSessionRegistry：此時 CreateSession 也是同一個錯誤，UI 顯示的是
 // 「registry 不可用」而不是「沒有 session」——後者會讓使用者以為 session 沒了。
-func (a *App) ListSessions() ([]SessionInfo, error) {
+func (a *App) listSessions() ([]SessionInfo, error) {
 	if a.wsReg == nil {
 		return nil, errNoSessionRegistry
 	}
@@ -947,6 +982,17 @@ type PaneLayout struct {
 	Focused string   `json:"focused"`
 }
 
+// PaneLayout：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
+func (a *App) PaneLayout() (PaneLayout, error) {
+	if err := a.beginTxn(); err != nil {
+		return PaneLayout{}, err
+	}
+	defer a.endTxn()
+	return a.paneLayout()
+}
+
 // PaneLayout：讀出目前的釘選排列（唯讀——不建立 slot、不寫 registry）。
 //
 // **latch 期間刻意不擋**：errRegistryUncertain 的處置是「mutation 拒絕、讀取一律
@@ -957,7 +1003,7 @@ type PaneLayout struct {
 // 之間本來就可能落差（另一個路徑移除了 session、SetPaneLayout 又剛好失敗）。濾
 // 掉之後 focused 若指向被濾掉的那一格，一併降級成空字串——否則會回傳一個指向空
 // pane 的 focused，前端得再解釋一次同一件事。
-func (a *App) PaneLayout() (PaneLayout, error) {
+func (a *App) paneLayout() (PaneLayout, error) {
 	if a.wsReg == nil {
 		return PaneLayout{}, errNoSessionRegistry
 	}
@@ -1296,13 +1342,16 @@ type startupInfo struct {
 	toolsDir    string
 	toolsSource string
 	nodePath    string
+	workspace   string
+	workspaceSr string
 }
 
 func (a *App) startupSnapshot() startupInfo {
 	a.startupMu.Lock()
 	defer a.startupMu.Unlock()
 	return startupInfo{startupErr: a.startupErr, toolsDir: a.toolsDirPath,
-		toolsSource: a.toolsSource, nodePath: a.nodePath}
+		toolsSource: a.toolsSource, nodePath: a.nodePath,
+		workspace: a.workspaceSnap, workspaceSr: a.workspaceSrcSnap}
 }
 
 // startupErrText：目前的啟動訊息（UI 橫幅與稽核用）。
@@ -1327,6 +1376,13 @@ func (a *App) setStartupErrOnce(msg string) {
 // publishToolsDir／publishNodePath：startupAfterWriters 的欄位發布點。刻意分成
 // 兩個呼叫（而不是一次寫四個欄位）——兩者的解析各自獨立，中間正是 CLIInfo 可能
 // 插進來的窗口，測試用 hookStartupPublish 停在這裡驗證讀寫走同一套同步機制。
+// publishWorkspace：把 workspace 解析結果複製進受鎖的快照（見 workspaceSnap）。
+func (a *App) publishWorkspace(dir, src string) {
+	a.startupMu.Lock()
+	defer a.startupMu.Unlock()
+	a.workspaceSnap, a.workspaceSrcSnap = dir, src
+}
+
 func (a *App) publishToolsDir(dir, source string) {
 	a.startupMu.Lock()
 	defer a.startupMu.Unlock()
@@ -1919,6 +1975,7 @@ func (a *App) acquireStateLease() (*stateLease, error) {
 	if a.stateDir == "" {
 		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = resolveWorkspace()
 	}
+	a.publishWorkspace(a.workspaceDir, a.workspaceSrc)
 	// **建立空的 state directory 是取鎖之前唯一允許的冪等初始化**（owner
 	// 2026-08-19）。singleinstance.Acquire 只 open <stateDir>/instance.lock，
 	// **它不會建目錄**——全新 workspace（`.workbench` 尚未存在）於是連鎖都取不到，
@@ -2249,8 +2306,19 @@ func (s failedSink) Write(contract.Envelope) (appcore.AppendReceipt, error) {
 }
 func (s failedSink) Close() error { return nil }
 
-// ReadDiagram 回傳目前圖檔內容（Mermaid pane 初始載入）。
+// ReadDiagram：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
 func (a *App) ReadDiagram() (string, error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.readDiagram()
+}
+
+// ReadDiagram 回傳目前圖檔內容（Mermaid pane 初始載入）。
+func (a *App) readDiagram() (string, error) {
 	b, err := os.ReadFile(a.diagramPath)
 	if err != nil {
 		return "", err
@@ -2632,6 +2700,9 @@ func (a *App) shutdown(ctx context.Context) {
 	a.shutMu.Lock()
 	a.phase = phaseShuttingDown // 1) 拒新 StartSession／ensureAppServer／SpecAssist／EndSession／NewSession（review P1）
 	a.shutMu.Unlock()
+	// 立刻 cancel assist 根 context：**排在 reclaimAssists 之前**，因為 reclaim
+	// 掃的 registry 可能還沒收到剛進場那一筆（見 assistRootCtx 的 doc）。
+	a.cancelAssistRoot()
 	a.shutdownStep("reject_new_txn")
 
 	// 1a) 等 startup 收斂。startup 不是 binding，phase 擋不住它——它可能正停在
@@ -3272,8 +3343,8 @@ func (a *App) CLIInfo() map[string]string {
 	return map[string]string{
 		"toolsDir": si.toolsDir, "toolsSource": si.toolsSource,
 		"claudeVersion": cliVersionFrom(si, "claude"), "codexVersion": cliVersionFrom(si, "codex"),
-		"node": nodeVersionOf(si.nodePath), "workspace": a.workspaceDir,
-		"workspaceSource": a.workspaceSrc, "startupError": si.startupErr,
+		"node": nodeVersionOf(si.nodePath), "workspace": si.workspace,
+		"workspaceSource": si.workspaceSr, "startupError": si.startupErr,
 	}
 }
 
@@ -3309,7 +3380,18 @@ func (a *App) resolveInWorkspace(rel string) (string, error) {
 	return resolved, nil
 }
 
+// ListWorkspace：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
 func (a *App) ListWorkspace(rel string) ([]FileNode, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.listWorkspace(rel)
+}
+
+func (a *App) listWorkspace(rel string) ([]FileNode, error) {
 	dir, err := a.resolveInWorkspace(rel)
 	if err != nil {
 		return nil, err
@@ -3330,7 +3412,18 @@ func (a *App) ListWorkspace(rel string) ([]FileNode, error) {
 	return out, nil
 }
 
+// ReadWorkspaceFile：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
 func (a *App) ReadWorkspaceFile(rel string) (string, error) {
+	if err := a.beginTxn(); err != nil {
+		return "", err
+	}
+	defer a.endTxn()
+	return a.readWorkspaceFile(rel)
+}
+
+func (a *App) readWorkspaceFile(rel string) (string, error) {
 	p, err := a.resolveInWorkspace(rel)
 	if err != nil {
 		return "", err
@@ -3374,10 +3467,21 @@ func specDigestOf(raw []byte) string { return specDigestPrefix + spec.HashBytes(
 // 同樣回這個錯誤。
 var ErrSpecWriteConflict = errors.New("spec write conflict: expected_digest does not match current file")
 
+// SpecList：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
+func (a *App) SpecList() ([]FileNode, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.specList()
+}
+
 // SpecList 列出納管 spec 樹（spec.InScope 過濾），供前端 spec 瀏覽器初始載入。
 // 沿用 internal/spec.GitRepo.ReadScopedWorktree 的 walk 慣例：spec/ 尚不存在時
 // 回空清單、不是錯誤。
-func (a *App) SpecList() ([]FileNode, error) {
+func (a *App) specList() ([]FileNode, error) {
 	root, err := claude.NormalizeCWD(a.workspaceDir)
 	if err != nil {
 		return nil, err
@@ -3417,9 +3521,20 @@ type SpecFile struct {
 	Digest  string `json:"digest"`
 }
 
+// SpecRead：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
+func (a *App) SpecRead(rel string) (SpecFile, error) {
+	if err := a.beginTxn(); err != nil {
+		return SpecFile{}, err
+	}
+	defer a.endTxn()
+	return a.specRead(rel)
+}
+
 // SpecRead 讀既有納管檔；Digest 為 specDigestOf(raw bytes)，與 SpecWrite 的
 // expected_digest／回傳值同格式。
-func (a *App) SpecRead(rel string) (SpecFile, error) {
+func (a *App) specRead(rel string) (SpecFile, error) {
 	if !spec.InScope(rel) {
 		return SpecFile{}, fmt.Errorf("path %q is not a managed spec file", rel)
 	}
@@ -4077,8 +4192,19 @@ func gate1ScenarioIDs(g plan.GitRunner, gate1HeadOID string) (map[string]bool, e
 	return ids, nil
 }
 
-// PlanList 列出納管 plan 樹（spec.PlanScope.Match 過濾），鏡射 SpecList。
+// PlanList：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
 func (a *App) PlanList() ([]FileNode, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.planList()
+}
+
+// PlanList 列出納管 plan 樹（spec.PlanScope.Match 過濾），鏡射 SpecList。
+func (a *App) planList() ([]FileNode, error) {
 	root, err := claude.NormalizeCWD(a.workspaceDir)
 	if err != nil {
 		return nil, err
@@ -4109,8 +4235,19 @@ func (a *App) PlanList() ([]FileNode, error) {
 	return out, nil
 }
 
-// PlanRead 讀既有納管 plan 檔；Digest 格式同 SpecRead（specDigestOf）。
+// PlanRead：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+// 唯讀也要進閘（reviewer 2026-08-20）：它讀的是 startup 才發布的資源，
+// 而 Wails 的 OnStartup 與 bindings 會並行——啟動期讀到的是半發布的狀態。
 func (a *App) PlanRead(rel string) (SpecFile, error) {
+	if err := a.beginTxn(); err != nil {
+		return SpecFile{}, err
+	}
+	defer a.endTxn()
+	return a.planRead(rel)
+}
+
+// PlanRead 讀既有納管 plan 檔；Digest 格式同 SpecRead（specDigestOf）。
+func (a *App) planRead(rel string) (SpecFile, error) {
 	if !spec.PlanScope.Match(rel) {
 		return SpecFile{}, fmt.Errorf("path %q is not a managed plan file", rel)
 	}
@@ -5974,7 +6111,7 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	// assist (scope=session) events into the provider slot — restore.go's
 	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
 	purpose = "spec_assist"
-	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	ctx, cancel := context.WithTimeout(a.assistRoot(), assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// gen（含 cancel）必須早於 beginTxn 進 assistActive——shutdown 的 reclaim
@@ -5993,15 +6130,8 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil { // 測試 barrier：gen 已可見、txn 未登記
 		h()
 	}
-	if err := a.beginTxn(); err != nil { // shutdown gate：拒新請求
-		a.assistMu.Lock() // rollback：未取得交易閘，撤下 gen（reclaim 若已 cancel 亦冪等）
-		if a.assistActive[provider] == gen {
-			delete(a.assistActive, provider)
-		}
-		a.assistMu.Unlock()
-		cancel()
-		return "", err
-	}
+	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 assistRootCtx 的
+	// doc）。內外兩層各自 admission 會讓操作做到一半才失敗。
 
 	// once/token 收尾：result／abort／timeout／shutdown 任一先觸發，恰好收一次。
 	teardown := func() {
@@ -6012,7 +6142,6 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 				delete(a.assistActive, provider)
 			}
 			a.assistMu.Unlock()
-			a.endTxn()
 			close(gen.done)
 		})
 	}
@@ -6215,7 +6344,7 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 		headOID, specManifestDigest, prompt)
 
 	const purpose = "plan_draft"
-	ctx, cancel := context.WithTimeout(a.ctx, assistTimeout)
+	ctx, cancel := context.WithTimeout(a.assistRoot(), assistTimeout)
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// 同 SpecAssist：gen 先入 assistActive 才 beginTxn（shutdown reclaim 窗口
@@ -6234,15 +6363,8 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	if h := a.hookAssistBeforeTxn; h != nil {
 		h()
 	}
-	if err := a.beginTxn(); err != nil {
-		a.assistMu.Lock()
-		if a.assistActive[provider] == gen {
-			delete(a.assistActive, provider)
-		}
-		a.assistMu.Unlock()
-		cancel()
-		return "", err
-	}
+	// **不再開內層交易**：binding 薄包裝進場時就登記了（見 assistRootCtx 的
+	// doc）。內外兩層各自 admission 會讓操作做到一半才失敗。
 
 	teardown := func() {
 		gen.once.Do(func() {
@@ -6252,7 +6374,6 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 				delete(a.assistActive, provider)
 			}
 			a.assistMu.Unlock()
-			a.endTxn()
 			close(gen.done)
 		})
 	}
@@ -6361,7 +6482,32 @@ func (a *App) newPlanAssistRunner(provider string) (assist.Runner, error) {
 // generation（runner 界限內退出 → teardown 清 active＋endTxn＋close done）。
 // 必須早於 inflight.Wait（assist 持 txn，否則 Wait 死等）與 Manager.Close
 // （稽核收尾在 sink 關閉前完成）。bounded 由 runner 尊重 ctx（proc TermGrace）保證。
+// assistRoot：assist 執行的根 context（惰性建立；shutdown 之後回一個已 cancel 的）。
+func (a *App) assistRoot() context.Context {
+	a.assistMu.Lock()
+	defer a.assistMu.Unlock()
+	if a.assistRootCtx == nil {
+		a.assistRootCtx, a.assistRootCancel = context.WithCancel(context.Background())
+	}
+	return a.assistRootCtx
+}
+
+// cancelAssistRoot：cancel 根 context，並保證之後建立的 assist 也拿到已 cancel 的
+// 那一份（收尾後才進場的 assist 不得真的跑起來）。
+func (a *App) cancelAssistRoot() {
+	a.assistMu.Lock()
+	if a.assistRootCtx == nil {
+		a.assistRootCtx, a.assistRootCancel = context.WithCancel(context.Background())
+	}
+	cancel := a.assistRootCancel
+	a.assistMu.Unlock()
+	cancel()
+}
+
+// reclaimAssists：cancel 根 context（權威手段）＋ 逐一 cancel 已登記的 gen
+// （補強，讓已在跑的那些立即收到訊號而不必等 ctx 傳播）。
 func (a *App) reclaimAssists() {
+	a.cancelAssistRoot()
 	a.assistMu.Lock()
 	gens := make([]*assistGen, 0, len(a.assistActive))
 	for _, g := range a.assistActive {
@@ -7184,12 +7330,11 @@ var errCodexNotRunning = errors.New("codex app-server not running")
 // 鎖序：codexServerMu → Single.mu（RunOwnedHandshake 內部自持），呼叫端不得
 // 再包一層 codexSingle 的鎖。
 func (a *App) ensureAppServer() (codex.ProbeTarget, error) {
-	// server-create 交易：check 與建立對 shutdown 原子（TOCTOU 關閉）——
-	// AuthStatus／StartLogin／Logout 等所有經此入口的路徑一體適用
-	if err := a.beginTxn(); err != nil {
-		return nil, err
-	}
-	defer a.endTxn()
+	// **不自己開交易**（reviewer 2026-08-20）：進得來的路徑都是已經持有交易的
+	// binding 薄包裝（AuthStatus／StartLogin／Logout／StartSession／
+	// RestartCodexServerRecorded／RecoverCodexRecording）。內層再開一次的話，
+	// phase 可能在內外兩次之間翻成 shuttingDown，server 就會建到一半才失敗。
+	// 「check 與建立對 shutdown 原子」這個性質改由外層那一筆交易提供。
 	if h := a.hookInServerTxn; h != nil { // 測試 barrier：交易已登記、建立未開始
 		h()
 	}
@@ -7201,6 +7346,16 @@ func (a *App) ensureAppServer() (codex.ProbeTarget, error) {
 		default:
 			return o.Server, nil
 		}
+	}
+	// 收尾已開始就**不建新 generation**（既有存活的仍照樣沿用，見上面那段）。
+	//
+	// 這是**資源建立政策**，不是第二個 admission：它不登記交易、不會讓已經被放行
+	// 的操作在別的地方被否決一次，擋的只有「收尾之後才生出一個新的子行程」。
+	// 沒有它的話，一筆在 shutdown 之前就進場、之後才走到這裡的 start 交易會真的
+	// spawn 一個 app-server；那個 server 雖然會被 shutdown 的 Take 收走，但期間
+	// 已經動過磁碟與行程表，而且與 watcher 收斂競態。
+	if a.phaseNow() == phaseShuttingDown {
+		return nil, errors.New("app shutting down")
 	}
 	if err := a.replaceCodexGeneration(); err != nil {
 		return nil, err
@@ -8652,7 +8807,21 @@ func (a *App) commitClaudeResume(host *sessionHost, sessionID string) {
 // registry entry），`a.restore.Get(...)` 與 providerResumeFallback 都已不在那條
 // 路徑上（後者已移除）。restore.json 現在只剩 legacy 遷移與升級 backfill 兩個
 // 消費者，本方法可在 M3b 收尾時直接刪除。
-func (a *App) RestoreViews() map[string]RestoredView {
+// RestoreViews：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。
+//
+// **簽章加上 error**（reviewer 2026-08-20）：它讀的是 startup 才發布的
+// a.restore，而 Wails 的 OnStartup 與 bindings 會並行——啟動期呼叫會 nil pointer
+// panic。加了 error 之後，「還沒 ready」才有辦法據實回報；回一個空 map 假裝沒有
+// 待還原的 view 是更糟的謊。
+func (a *App) RestoreViews() (map[string]RestoredView, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.restoreViews()
+}
+
+func (a *App) restoreViews() (map[string]RestoredView, error) {
 	out := map[string]RestoredView{}
 	for _, p := range []string{"claude", "codex"} {
 		e := a.restore.Get(p)
@@ -8662,7 +8831,7 @@ func (a *App) RestoreViews() map[string]RestoredView {
 			TaskID:          e.TaskID,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // NewSession：Wails binding 的固定形狀——開交易 → defer 收尾 → 呼叫實作。

@@ -116,6 +116,17 @@ func newTestStateLease(stateDir string) *stateLease {
 	return &stateLease{stateDir: stateDir, testOnly: true}
 }
 
+// mustRestoreViews：RestoreViews 在 2026-08-20 加上 error（見其 doc）。測試一律
+// 要求成功——失敗代表 app 不在 ready，那是測試前置沒做對。
+func mustRestoreViews(t *testing.T, a *App) map[string]RestoredView {
+	t.Helper()
+	v, err := a.RestoreViews()
+	if err != nil {
+		t.Fatalf("RestoreViews: %v", err)
+	}
+	return v
+}
+
 func newTestApp(t *testing.T) (*App, *uiCapture) {
 	t.Helper()
 	ws, err := claude.NormalizeCWD(t.TempDir())
@@ -497,6 +508,7 @@ func TestWorkspaceReadSecurity(t *testing.T) {
 
 	a := NewApp()
 	a.workspaceDir, _ = claude.NormalizeCWD(root)
+	a.setPhase(phaseReady) // 這些 binding 現在都要進交易閘（見 beginTxn 的 doc）
 
 	if got, err := a.ReadWorkspaceFile("ok.md"); err != nil || got != "# hi" {
 		t.Fatalf("normal read: %v %q", err, got)
@@ -1027,7 +1039,7 @@ func TestRestoreViewWindowReplay(t *testing.T) {
 	_ = m.AcceptSubmit(wsidFor(t, a, contract.ProviderClaude), id2, "sB", "hello two")
 	_ = m.Emit(wsidFor(t, a, contract.ProviderClaude), contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}")})
 
-	views := a.RestoreViews()
+	views := mustRestoreViews(t, a)
 	cl := views["claude"].Envelopes
 	if len(cl) == 0 {
 		t.Fatal("claude view must replay")
@@ -1204,7 +1216,7 @@ func TestFreshRestoreInitializesHighWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.restore = rs
-	if got := a.RestoreViews()["claude"].Envelopes; len(got) != 0 { // 歷史不當 view 重放
+	if got := mustRestoreViews(t, a)["claude"].Envelopes; len(got) != 0 { // 歷史不當 view 重放
 		t.Fatalf("fresh store must not replay history, got %d envelopes", len(got))
 	}
 }
@@ -1317,7 +1329,7 @@ func TestRestoredResumeReachesProvider(t *testing.T) {
 	// registry 需有綁定（resume mismatch 檢查）
 	cwd, _ := claude.NormalizeCWD(a.workspaceDir)
 	_ = a.registry.Bind("resume-id-c", cwd, "")
-	restored := a.RestoreViews()["claude"].ResumeSessionID
+	restored := mustRestoreViews(t, a)["claude"].ResumeSessionID
 	if restored != "resume-id-c" {
 		t.Fatalf("restored resume id = %q", restored)
 	}
@@ -1359,7 +1371,7 @@ func TestRestoredResumeReachesProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := a.manager.BeginNewSessionSubmit(wsidFor(t, a, contract.ProviderCodex), "task-x")
-	rx := a.RestoreViews()["codex"].ResumeSessionID
+	rx := mustRestoreViews(t, a)["codex"].ResumeSessionID
 	threadID, _, err := a.startCodexHost(wsidFor(t, a, contract.ProviderCodex), fakeCodexHost{conn}, "hi", rx, "", "untrusted")
 	if err != nil {
 		t.Fatal(err)
@@ -1409,7 +1421,7 @@ func TestRestoreViewsIsReadOnly(t *testing.T) {
 		return strings.Count(string(b), "\n")
 	}
 	before := countLines()
-	_ = a.RestoreViews()
+	_ = mustRestoreViews(t, a)
 	if countLines() != before { // 不回寫 audit
 		t.Fatal("RestoreViews must not write to the audit stream")
 	}

@@ -996,6 +996,54 @@ var stateLeaseReaders = map[string]bool{
 	"(*stateLease).ownsStateDir": true,
 }
 
+// notTheApprovedReadShape：唯一那個 Use 是不是「`if <sel> { return true }` 的整個
+// 條件」（回傳原因；空字串＝形狀正確）。
+func notTheApprovedReadShape(files []*ast.File, info *types.Info, field *types.Var) string {
+	for _, f := range files {
+		found := ""
+		var parents []ast.Node
+		ast.Inspect(f, func(n ast.Node) bool {
+			if n == nil {
+				parents = parents[:len(parents)-1]
+				return true
+			}
+			defer func() { parents = append(parents, n) }()
+			id, isIdent := n.(*ast.Ident)
+			if !isIdent || info.Uses[id] != field || len(parents) < 2 {
+				return true
+			}
+			sel, isSel := parents[len(parents)-1].(*ast.SelectorExpr)
+			if !isSel || sel.Sel != id {
+				found = "引用不是欄位選取的位置"
+				return true
+			}
+			ifs, isIf := parents[len(parents)-2].(*ast.IfStmt)
+			if !isIf || ifs.Cond != ast.Expr(sel) {
+				found = "引用必須是 if 的**整個**條件（被包成引數、運算元或其他運算式都不行）"
+				return true
+			}
+			if ifs.Init != nil || ifs.Else != nil || len(ifs.Body.List) != 1 {
+				found = "那個 if 必須只有一個敘述、沒有 init 也沒有 else"
+				return true
+			}
+			ret, isReturn := ifs.Body.List[0].(*ast.ReturnStmt)
+			if !isReturn || len(ret.Results) != 1 {
+				found = "if 的 body 必須是單一 return"
+				return true
+			}
+			lit, isIdent2 := ret.Results[0].(*ast.Ident)
+			if !isIdent2 || lit.Name != "true" {
+				found = "if 的 body 必須是 `return true`"
+			}
+			return true
+		})
+		if found != "" {
+			return found
+		}
+	}
+	return ""
+}
+
 // structFieldObject：具名 struct 型別上某個欄位的 types 物件。
 func structFieldObject(t *testing.T, named *types.Named, field string) *types.Var {
 	t.Helper()
@@ -1365,29 +1413,28 @@ func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 	// 同名欄位只能有一個。第二個 `testOnly` 欄位會讓 Rule C 的「唯一讀取點」失去
 	// 意義（另一個型別上的同名欄位可以自由寫，再靠可賦值流進 stateLease），也會
 	// 讓錯誤訊息無法分辨是哪一個（reviewer 2026-08-19）。
+	// **掃所有 StructType，不只具名 TypeSpec**（reviewer 2026-08-20）：匿名
+	// struct 也能宣告同名欄位，再靠可賦值流進 stateLease。
 	var owners []string
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
-			ts, isType := n.(*ast.TypeSpec)
-			if !isType {
-				return true
-			}
-			st, isStruct := ts.Type.(*ast.StructType)
+			st, isStruct := n.(*ast.StructType)
 			if !isStruct || st.Fields == nil {
 				return true
 			}
 			for _, fld := range st.Fields.List {
 				for _, nm := range fld.Names {
 					if nm.Name == "testOnly" {
-						owners = append(owners, ts.Name.Name)
+						owners = append(owners, fset.Position(nm.Pos()).String())
 					}
 				}
 			}
 			return true
 		})
 	}
-	if len(owners) != 1 || owners[0] != "stateLease" {
-		t.Fatalf("production 只能有 stateLease 一個 testOnly 欄位，實得：%v", owners)
+	if len(owners) != 1 {
+		t.Fatalf("production 只能有一個 testOnly 欄位宣告（含匿名 struct），實得 %d 個：%v",
+			len(owners), owners)
 	}
 
 	// **絕對規則**：整包 production 只能有一個指向 stateLease.testOnly 這個 field
@@ -1407,6 +1454,13 @@ func TestTestOnlyCapabilityHasNoProductionConstructionPath(t *testing.T) {
 	if len(uses) != 1 {
 		t.Fatalf("production 只能有一個 stateLease.testOnly 的引用（capability 的判定式本身），實得 %d 個：%v",
 			len(uses), uses)
+	}
+	// **而且那一個必須就是既有的純讀條件**（reviewer 2026-08-20）：只數「有一個
+	// Use」的話，把它改成函式引數再無條件 return true，計數照樣是 1，偽造的 lease
+	// 卻通得過。所以連 AST 形狀一起釘死——`if l.testOnly { return true }`，欄位是
+	// 整個條件、if 的 body 只有一個 return true。
+	if why := notTheApprovedReadShape(files, info, fieldObj); why != "" {
+		t.Fatalf("stateLease.testOnly 的唯一引用必須維持既有的純讀形狀：%s", why)
 	}
 
 	found := scanFieldWrites(fset, files, info, target, "testOnly", stateLeaseReaders)

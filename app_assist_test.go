@@ -180,15 +180,17 @@ func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 		}
 	}()
 
-	close(release) // 放行內層 beginTxn → shuttingDown → 拒絕 → rollback
+	close(release) // 放行：assist 根 context 已被 cancel → run 立即收斂
 	select {
 	case <-shutDone:
 	case <-time.After(30 * time.Second):
 		t.Fatal("窗口放行之後 shutdown 必須收斂")
 	}
 	err := <-errCh
-	if err == nil || !strings.Contains(err.Error(), "shutting down") {
-		t.Fatalf("in-window assist must be rejected by the shutdown gate, got %v", err)
+	// 收斂手段是 context 而不是內層交易閘（見 App.assistRootCtx 的 doc）：不論
+	// 登記到哪一步，shutdown 一 cancel 根 context，進行中的 assist 立刻結束。
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("窗口內的 assist 必須被 shutdown 的根 context 收掉，實得 %v", err)
 	}
 	a.assistMu.Lock()
 	n := len(a.assistActive)

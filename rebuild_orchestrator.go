@@ -276,6 +276,17 @@ const turnPageSize = 20
 // 不逐筆過濾：§3.8 明文不得從 turn 中間截斷。未完成的尾端 turn 沒有 record，
 // 只能逐筆比對 EventID。
 func (a *App) LoadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error) {
+	if err := a.beginTxn(); err != nil {
+		return nil, err
+	}
+	defer a.endTxn()
+	return a.loadTurnsBefore(wsid, beforeEventID, n)
+}
+
+// loadTurnsBefore：LoadTurnsBefore 的實作。交易閘是必要的而不只是形式——它讀
+// a.replayIndex，而那是 startup 才發布的（reviewer 2026-08-20 實測與 startup
+// 並行時是真的 data race）。
+func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Envelope, error) {
 	if a.replayIndex == nil {
 		return nil, errNoReplayIndex
 	}

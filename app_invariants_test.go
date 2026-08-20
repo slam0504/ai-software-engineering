@@ -223,7 +223,7 @@ func TestLegacyJournalWithoutWSIDAttributes(t *testing.T) {
 	}
 	// RestoreViews 是 provider-keyed（見其 doc；plan 草稿寫成 WSID-keyed，
 	// 但 Task 26 之後它已明文標為既有唯讀出口、不隨 WSID 化）。
-	if n := len(a.RestoreViews()[live[0].Provider].Envelopes); n != 3 {
+	if n := len(mustRestoreViews(t, a)[live[0].Provider].Envelopes); n != 3 {
 		t.Fatalf("legacy view window 內的 3 筆事件都應可重放：%d", n)
 	}
 	if a.manager.SlotCount("codex") != 0 {
