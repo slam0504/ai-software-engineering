@@ -92,6 +92,13 @@ func BinarySHA256(ctx context.Context, bin string) (string, error) {
 	if ctx == nil { // nil context 不 panic：明確退化成 Background（API 契約）
 		ctx = context.Background()
 	}
+	// **在任何 filesystem 操作之前先檢查**（reviewer 2026-08-20）：先前第一次檢查
+	// 排在 EvalSymlinks／OpenFile／Stat 之後，於是「context 已取消且路徑不存在」
+	// 會回 lstat … no such file，而不是 context.Canceled——呼叫端據此分辨「被收尾
+	// 取消」與「環境有問題」，回錯了就會把取消記成 enforcement failure。
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	target, err := filepath.EvalSymlinks(bin)
 	if err != nil {
 		return "", fmt.Errorf("assist: 解析 %s: %w", bin, err)
@@ -133,10 +140,11 @@ func BinarySHA256(ctx context.Context, bin string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// **已知界限**（不宣稱完整 bounded）：取消只在**兩次 read 之間**生效。目標若落在
-// 卡住的遠端檔案系統上，單一次 read syscall 在 Go 裡沒有中斷手段——那要靠掛載層
-// 的 timeout（例如 NFS soft mount）處理，不是這裡能保證的。本地磁碟與 FIFO／
-// device 這兩種可預期的無界等待則已經擋掉。
+// **已知界限**（不宣稱完整 bounded）：Go 的 context 中斷不了已經進入核心的
+// filesystem 呼叫——**metadata 操作（EvalSymlinks／Stat）、open、以及單一次 read**
+// 都一樣。目標若落在卡住的遠端掛載上，這三者都可能無界等待，得靠掛載層的 timeout
+// （例如 NFS soft mount）處理。這裡保證的是：進場先檢查取消、每兩次 read 之間再
+// 檢查一次，以及本地可預期的兩種無界等待（FIFO／device）已經擋掉。
 
 // binaryVersionOutput 執行 `<bin> --version` 並回傳 trim 後的 stdout。
 func binaryVersionOutput(parent context.Context, bin string) (string, error) {

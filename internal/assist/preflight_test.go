@@ -376,3 +376,18 @@ func TestBinarySHA256AcceptsNilContext(t *testing.T) {
 		t.Fatalf("nil context 應退化成 Background，實得 %v", err)
 	}
 }
+
+// TestBinarySHA256ChecksContextBeforeFilesystem
+//
+// reviewer 2026-08-20：第一次 context 檢查排在 EvalSymlinks／Open／Stat 之後，
+// 於是「已取消 ＋ 路徑不存在」會回 lstat … no such file，而不是 context.Canceled
+// ——呼叫端據此分辨「被收尾取消」與「環境有問題」，回錯就會把取消記成
+// enforcement failure。
+func TestBinarySHA256ChecksContextBeforeFilesystem(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := BinarySHA256(ctx, filepath.Join(t.TempDir(), "does-not-exist"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消時必須先回 context.Canceled，不得先撞檔案系統錯誤，實得 %v", err)
+	}
+}

@@ -176,16 +176,28 @@ func TestOnlyThinWrappersAdmit(t *testing.T) {
 // assistImplementations：會做大量前置阻塞工作的 assist 實作。
 var assistImplementations = []string{"specAssist", "planAssist"}
 
+// assistRootShape：每個 assist 實作**前兩個敘述**的完整期望形狀。
+//
+// 逐項釘死（reviewer 2026-08-20：先前只驗「是不是 WithTimeout(a.procRoot(), …)」，
+// 於是左值改名、刪掉 purpose pin、在前面插 channel 接收都通得過）。
+var assistRootShape = map[string]struct {
+	lhs      []string // 左值名稱與順序
+	fn       string   // context.WithTimeout／WithCancel
+	timeout  string   // 第二個引數（常數名）
+	purposeV string   // 第二個敘述：purpose pin 的值（空字串＝該實作沒有）
+}{
+	"specAssist": {lhs: []string{"ctx", "cancel"}, fn: "WithTimeout", timeout: "assistTimeout", purposeV: `"spec_assist"`},
+	"planAssist": {lhs: []string{"ctx", "cancel"}, fn: "WithTimeout", timeout: "assistTimeout"},
+}
+
 // TestAssistImplementationsTakeRootContextFirst
 //
-// assist 實作的 body 前兩個敘述必須是固定形狀：
+// assist 實作的前兩個敘述必須完全符合 assistRootShape：root context 的取得排在
+// 最前面（可省略的 knownProvider 純參數驗證除外），左值名稱、package、receiver、
+// procRoot 零參數、timeout 常數、purpose pin 一一比對。
 //
-//	if !knownProvider(<param>) { return … }                       （純參數驗證，可省略）
-//	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
-//
-// 判準是**敘述的完整 AST 形狀**，不是「第一個函式呼叫」（reviewer 2026-08-20）：
-// 後者只看 CallExpr，於是 `<-reviewRootBlock` 這種 channel 接收、送出、賦值等會
-// 阻塞或有副作用的敘述插在前面，測試照樣通過。
+// 判準是**敘述的完整 AST**，不是「第一個函式呼叫」：後者只看 CallExpr，
+// `<-reviewRootBlock` 這種阻塞插在前面照樣通過。
 func TestAssistImplementationsTakeRootContextFirst(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
 	_ = files
@@ -197,6 +209,10 @@ func TestAssistImplementationsTakeRootContextFirst(t *testing.T) {
 		if fd == nil {
 			t.Fatalf("找不到 %s（守門與實作脫節）", name)
 		}
+		want, known := assistRootShape[name]
+		if !known {
+			t.Fatalf("assistRootShape 沒有 %s 的期望形狀", name)
+		}
 		body := fd.Body.List
 		idx := 0
 		if len(body) > 0 && isProviderGuard(body[0]) {
@@ -206,12 +222,92 @@ func TestAssistImplementationsTakeRootContextFirst(t *testing.T) {
 			t.Errorf("%s 的 body 太短，找不到 root context 的取得", name)
 			continue
 		}
-		if !isRootCtxAcquisition(body[idx], info, appType) {
-			t.Errorf("%s 的第 %d 個敘述必須是 `ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)`"+
-				"（%s）——排在它前面的每一個敘述都落在不可取消的範圍內",
-				name, idx+1, fset.Position(body[idx].Pos()).String())
+		if why := rootCtxShapeViolation(body[idx], info, appType, want.lhs, want.fn, want.timeout); why != "" {
+			t.Errorf("%s 的第 %d 個敘述不符合 root context 取得的形狀：%s（%s）",
+				name, idx+1, why, fset.Position(body[idx].Pos()).String())
+			continue
+		}
+		if want.purposeV == "" {
+			continue
+		}
+		if idx+1 >= len(body) || !isPurposePin(body[idx+1], want.purposeV) {
+			t.Errorf("%s 取得 root 之後的下一個敘述必須是 purpose pin（purpose = %s）——"+
+				"那是 emit 邊界的防禦，刪掉會讓 assist 事件漏進 provider slot", name, want.purposeV)
 		}
 	}
+}
+
+// rootCtxShapeViolation：`<lhs...> := context.<fn>(a.procRoot(), <timeout>)` 的
+// 完整比對（回傳原因；空字串＝相符）。
+func rootCtxShapeViolation(stmt ast.Stmt, info *types.Info, appType *types.Named,
+	lhs []string, fn, timeout string) string {
+	as, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign || as.Tok != token.DEFINE {
+		return "必須是 := 的短變數宣告"
+	}
+	if len(as.Lhs) != len(lhs) {
+		return "左值個數必須是 " + itoa(len(lhs))
+	}
+	for i, want := range lhs {
+		id, isIdent := as.Lhs[i].(*ast.Ident)
+		if !isIdent || id.Name != want {
+			return "第 " + itoa(i+1) + " 個左值必須叫 " + want
+		}
+	}
+	if len(as.Rhs) != 1 {
+		return "右值必須恰好一個"
+	}
+	call, isCall := as.Rhs[0].(*ast.CallExpr)
+	if !isCall || len(call.Args) != 2 {
+		return "必須是 context." + fn + "(a.procRoot(), " + timeout + ")"
+	}
+	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	if !isSel || sel.Sel.Name != fn {
+		return "必須呼叫 context." + fn
+	}
+	// package object 要真的是 context，不是同名的區域變數。
+	pkgIdent, isIdent := sel.X.(*ast.Ident)
+	if !isIdent {
+		return "context 必須是 package 限定名"
+	}
+	pkgName, isPkg := info.Uses[pkgIdent].(*types.PkgName)
+	if !isPkg || pkgName.Imported().Path() != "context" {
+		return "必須是標準 context 套件，實得 " + pkgIdent.Name
+	}
+	inner, isInnerCall := call.Args[0].(*ast.CallExpr)
+	if !isInnerCall || len(inner.Args) != 0 {
+		return "第一個引數必須是零參數的 a.procRoot()"
+	}
+	rootSel, isRootSel := inner.Fun.(*ast.SelectorExpr)
+	if !isRootSel || rootSel.Sel.Name != "procRoot" {
+		return "第一個引數必須是 a.procRoot()"
+	}
+	recv, isRecvIdent := rootSel.X.(*ast.Ident)
+	if !isRecvIdent || recv.Name != "a" {
+		return "procRoot 必須以 receiver a 呼叫"
+	}
+	if f, _ := info.Uses[rootSel.Sel].(*types.Func); f == nil || !isAppMethod(f, appType) {
+		return "procRoot 必須是 App 上的方法"
+	}
+	timeoutIdent, isTimeoutIdent := call.Args[1].(*ast.Ident)
+	if !isTimeoutIdent || timeoutIdent.Name != timeout {
+		return "timeout 必須是常數 " + timeout
+	}
+	return ""
+}
+
+// isPurposePin：`purpose = "<value>"`。
+func isPurposePin(stmt ast.Stmt, value string) bool {
+	as, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign || as.Tok != token.ASSIGN || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+		return false
+	}
+	id, isIdent := as.Lhs[0].(*ast.Ident)
+	if !isIdent || id.Name != "purpose" {
+		return false
+	}
+	lit, isLit := as.Rhs[0].(*ast.BasicLit)
+	return isLit && lit.Value == value
 }
 
 // isProviderGuard：`if !knownProvider(x) { return … }`（唯一允許排在 root 之前的
@@ -239,32 +335,6 @@ func isProviderGuard(stmt ast.Stmt) bool {
 func isReturnStmt(stmt ast.Stmt) bool {
 	_, isReturn := stmt.(*ast.ReturnStmt)
 	return isReturn
-}
-
-// isRootCtxAcquisition：`ctx, cancel := context.WithTimeout(a.procRoot(), …)`。
-func isRootCtxAcquisition(stmt ast.Stmt, info *types.Info, appType *types.Named) bool {
-	as, isAssign := stmt.(*ast.AssignStmt)
-	if !isAssign || as.Tok != token.DEFINE || len(as.Rhs) != 1 {
-		return false
-	}
-	call, isCall := as.Rhs[0].(*ast.CallExpr)
-	if !isCall || len(call.Args) == 0 {
-		return false
-	}
-	outer, isSel := call.Fun.(*ast.SelectorExpr)
-	if !isSel || (outer.Sel.Name != "WithTimeout" && outer.Sel.Name != "WithCancel") {
-		return false
-	}
-	inner, isInnerCall := call.Args[0].(*ast.CallExpr)
-	if !isInnerCall {
-		return false
-	}
-	rootSel, isRootSel := inner.Fun.(*ast.SelectorExpr)
-	if !isRootSel || rootSel.Sel.Name != "procRoot" {
-		return false
-	}
-	fn, _ := info.Uses[rootSel.Sel].(*types.Func)
-	return fn != nil && isAppMethod(fn, appType)
 }
 
 // methodSignature：FuncDecl 的型別簽章（拿不到回 nil，此時零值判定退回字面量層級）。
@@ -696,29 +766,11 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 	appType := namedType(t, pkg, "App")
 	methods := appMethodsByName(files, info, appType)
 
-	// 具名白名單解析成物件對（名稱字串比對擋不住同名的 package function）。
-	approvedPairs := map[callerCalleePair]bool{}
-	usedPairs := map[callerCalleePair]bool{}
-	for implName, callers := range protectedImplInternalCallers {
-		implFD := methods[implName]
-		if implFD == nil {
-			t.Fatalf("protectedImplInternalCallers 列了不存在的實作 %q", implName)
-		}
-		implObj := types.Object(info.Defs[implFD.Name])
-		for callerName := range callers {
-			callerFD := methods[callerName]
-			if callerFD == nil {
-				t.Fatalf("protectedImplInternalCallers[%q] 列了不存在的呼叫端 %q", implName, callerName)
-			}
-			callerObj := types.Object(info.Defs[callerFD.Name])
-			approvedPairs[callerCalleePair{caller: callerObj, callee: implObj}] = true
-		}
-	}
-
 	exportedNames := map[string]bool{}         // exported binding 的名稱（介面派送比對用）
 	protectedNames := map[string]bool{}        // 受保護實作的名稱（同上）
 	protected := map[types.Object]string{}     // impl object → 它的 wrapper 名稱
 	legitCall := map[types.Object]*ast.Ident{} // impl object → wrapper 裡那個合法引用
+	implOfWrapper := map[string]types.Object{} // wrapper 名稱 → 它自己的實作
 	exported := map[types.Object]bool{}
 	for name, fd := range methods {
 		if obj, _ := info.Defs[fd.Name].(*types.Func); obj != nil && fd.Name.IsExported() {
@@ -736,110 +788,128 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 		protected[obj] = name
 		protectedNames[obj.Name()] = true
 		legitCall[obj] = sel.Sel
+		implOfWrapper[name] = obj
 	}
 	if len(protected) == 0 {
 		t.Fatal("找不到任何受保護的實作：守門失效")
 	}
 
-	// 逐檔走，維護「目前所在的 exported binding」與父節點鏈。
-	var offenders []string
-	note := func(pos token.Pos, msg string) {
-		offenders = append(offenders, fset.Position(pos).String()+"："+msg)
+	// 具名白名單解析成物件對（名稱字串比對擋不住同名的 package function）。
+	approvedPairs := map[callerCalleePair]bool{}
+	usedPairs := map[callerCalleePair]bool{}
+	for implName, callers := range protectedImplInternalCallers {
+		implFD := methods[implName]
+		if implFD == nil {
+			t.Fatalf("protectedImplInternalCallers 列了不存在的實作 %q", implName)
+		}
+		implObj := types.Object(info.Defs[implFD.Name])
+		for callerName := range callers {
+			callerFD := methods[callerName]
+			if callerFD == nil {
+				t.Fatalf("protectedImplInternalCallers[%q] 列了不存在的呼叫端 %q", implName, callerName)
+			}
+			approvedPairs[callerCalleePair{caller: types.Object(info.Defs[callerFD.Name]), callee: implObj}] = true
+		}
 	}
+
+	// **每個 function literal 都是獨立的 caller**（reviewer 2026-08-20）：package
+	// variable 存一個 literal、再經 local interface 呼叫 gateList，只巡 FuncDecl
+	// 的分析整條看不到。literal 沒有 ownership，一律不得引用受保護實作。
+	type scope struct {
+		name       string
+		inExported bool
+		caller     types.Object // FuncDecl 才有；literal 為 nil（永遠不在白名單裡）
+		impl       types.Object // 這個 scope 若是薄包裝，它自己的實作
+		body       ast.Node
+	}
+	var scopes []scope
 	for _, f := range files {
 		for _, decl := range f.Decls {
 			fd, isFunc := decl.(*ast.FuncDecl)
 			if !isFunc || fd.Body == nil {
+				ast.Inspect(decl, func(n ast.Node) bool {
+					if lit, isLit := n.(*ast.FuncLit); isLit {
+						scopes = append(scopes, scope{name: "套件層 function literal", body: lit.Body})
+					}
+					return true
+				})
 				continue
 			}
-			inExported := fd.Recv != nil && fd.Name.IsExported()
-			implOfThisWrapper := types.Object(nil)
-			if inExported {
-				if obj := info.Defs[fd.Name]; obj != nil {
-					for impl, owner := range protected {
-						if owner == fd.Name.Name {
-							implOfThisWrapper = impl
-						}
-					}
-					_ = obj
-				}
+			scopes = append(scopes, scope{name: fd.Name.Name,
+				inExported: fd.Recv != nil && fd.Name.IsExported(),
+				caller:     info.Defs[fd.Name], impl: implOfWrapper[fd.Name.Name], body: fd.Body})
+		}
+	}
+
+	var offenders []string
+	note := func(pos token.Pos, msg string) {
+		offenders = append(offenders, fset.Position(pos).String()+"："+msg)
+	}
+	for _, sc := range scopes {
+		var parents []ast.Node
+		ast.Inspect(sc.body, func(n ast.Node) bool {
+			if n == nil {
+				parents = parents[:len(parents)-1]
+				return true
 			}
-			var parents []ast.Node
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				if n == nil {
-					parents = parents[:len(parents)-1]
+			defer func() { parents = append(parents, n) }()
+			id, isIdent := n.(*ast.Ident)
+			if !isIdent {
+				return true
+			}
+			obj := info.Uses[id]
+			if obj == nil {
+				return true
+			}
+			if _, isProtected := protected[obj]; isProtected {
+				if id == legitCall[obj] {
+					return true // 自己那個薄包裝的呼叫
+				}
+				if !isDirectCallee(id, parents) {
+					note(id.Pos(), "受保護的實作 "+obj.Name()+" 被當成值取用（function value／method value）")
 					return true
 				}
-				defer func() { parents = append(parents, n) }()
-				id, isIdent := n.(*ast.Ident)
-				if !isIdent {
+				if sc.inExported && obj != sc.impl {
+					note(id.Pos(), "exported binding "+sc.name+" 直接呼叫別的受保護實作 "+obj.Name())
 					return true
 				}
-				obj := info.Uses[id]
-				if obj == nil {
-					return true
-				}
-				if _, isProtected := protected[obj]; isProtected {
-					if id == legitCall[obj] {
-						return true // 自己那個薄包裝的呼叫
-					}
-					if !isDirectCallee(id, parents) {
-						note(id.Pos(), "受保護的實作 "+obj.Name()+" 被當成值取用（function value／method value）")
+				if !sc.inExported {
+					pair := callerCalleePair{caller: sc.caller, callee: obj}
+					if sc.caller == nil || !approvedPairs[pair] {
+						note(id.Pos(), sc.name+" 直接呼叫受保護實作 "+obj.Name()+
+							"（要允許就加進 protectedImplInternalCallers 並寫下 ownership 理由；"+
+							"function literal 一律不得引用）")
 						return true
 					}
-					if inExported && obj != implOfThisWrapper {
-						note(id.Pos(), "exported binding "+fd.Name.Name+" 直接呼叫別的受保護實作 "+obj.Name())
-						return true
+					usedPairs[pair] = true
+					if why := asyncContext(parents); why != "" {
+						note(id.Pos(), sc.name+" 在"+why+"內呼叫受保護實作 "+obj.Name()+
+							"——那會跑在呼叫端的交易之外，ownership 理由不成立")
 					}
-					if !inExported {
-						pair := callerCalleePair{caller: info.Defs[fd.Name], callee: obj}
-						if !approvedPairs[pair] {
-							note(id.Pos(), "未具名的內部呼叫端 "+fd.Name.Name+" 直接呼叫受保護實作 "+
-								obj.Name()+"（要允許就加進 protectedImplInternalCallers 並寫下 ownership 理由）")
-							return true
-						}
-						usedPairs[pair] = true
-						if why := asyncContext(parents); why != "" {
-							note(id.Pos(), fd.Name.Name+" 在"+why+"內呼叫受保護實作 "+obj.Name()+
-								"——那會跑在呼叫端的交易之外，ownership 理由不成立")
-						}
-					}
-					return true
-				}
-				// 介面派送：Uses 指向的是 interface 的 method object，比對具體
-				// object 抓不到（reviewer 2026-08-20）。所以另外看「receiver 是
-				// interface 且方法名撞到 exported binding 或受保護實作」。
-				//
-				// **在所有 caller 裡都判**，不只在受保護實作內：合法 caller 保留
-				// 原本的 direct edge，另外用 defer closure ＋ local
-				// `interface{ gateList() }` 呼叫一次，執行時間就離開原本的
-				// transaction ownership 了。
-				//
-				// 只在 receiver 是 interface 時才判：具體型別上的同名方法
-				// （spec.GitRepo.PreviewSpecCommit、Manager.RemoveSession）是不同
-				// 的東西，用名稱一律擋會把它們也誤殺。
-				if exportedNames[id.Name] || protectedNames[id.Name] {
-					if sel, isSel := parents[len(parents)-1].(*ast.SelectorExpr); isSel && sel.Sel == id {
-						if s := info.Selections[sel]; s != nil && types.IsInterface(s.Recv()) {
-							note(id.Pos(), fd.Name.Name+" 經介面呼叫 "+id.Name+
-								"——local interface 可以讓 a 滿足它，等於繞過薄包裝與交易 ownership")
-						}
-					}
-				}
-				// 反向：受保護的實作不得**以任何形式**引用 exported binding。
-				// 只擋直接呼叫的話，`_ = a.CreateSession` 這種取值仍然通過，而
-				// function value／callback／間接遞迴都是從取值開始的
-				// （reviewer 2026-08-20）。
-				if exported[obj] && protected[info.Defs[fd.Name]] != "" {
-					how := "引用"
-					if isDirectCallee(id, parents) {
-						how = "呼叫"
-					}
-					note(id.Pos(), "受保護的實作 "+fd.Name.Name+" 回頭"+how+" exported binding "+obj.Name())
 				}
 				return true
-			})
-		}
+			}
+			// 介面派送：Uses 指向 interface 的 method object，比對具體 object 抓
+			// 不到。**在所有 caller 裡都判**——合法 caller 保留 direct edge、另外
+			// 用 defer closure ＋ local interface 呼叫一次，執行時間就離開原本的
+			// transaction ownership 了。
+			if exportedNames[id.Name] || protectedNames[id.Name] {
+				if sel, isSel := parents[len(parents)-1].(*ast.SelectorExpr); isSel && sel.Sel == id {
+					if why := interfaceDispatchViolation(info, sel, appType); why != "" {
+						note(id.Pos(), sc.name+" "+why)
+					}
+				}
+			}
+			// 反向：受保護的實作不得**以任何形式**引用 exported binding。
+			if exported[obj] && sc.caller != nil && protected[sc.caller] != "" {
+				how := "引用"
+				if isDirectCallee(id, parents) {
+					how = "呼叫"
+				}
+				note(id.Pos(), "受保護的實作 "+sc.name+" 回頭"+how+" exported binding "+obj.Name())
+			}
+			return true
+		})
 	}
 	// 未被用到的預授權＝放寬了卻沒人知道的洞。
 	for pair := range approvedPairs {
@@ -852,6 +922,27 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 	if len(offenders) != 0 {
 		t.Fatalf("受保護的實作只能經由它自己的薄包裝進入：\n  %s", strings.Join(offenders, "\n  "))
 	}
+}
+
+// interfaceDispatchViolation：經 interface 呼叫、且 *App 真的實作得了那個
+// interface 時才算違規（回傳原因；空字串＝無妨）。
+//
+// **用 types.Implements 而不是名稱比對**（reviewer 2026-08-20 P2）：只看方法名的
+// 話，簽章不同、App 根本不可能滿足的 interface 也會被誤殺。
+func interfaceDispatchViolation(info *types.Info, sel *ast.SelectorExpr, appType *types.Named) string {
+	s := info.Selections[sel]
+	if s == nil || !types.IsInterface(s.Recv()) {
+		return ""
+	}
+	iface, isIface := types.Unalias(s.Recv()).Underlying().(*types.Interface)
+	if !isIface {
+		return ""
+	}
+	if !types.Implements(types.NewPointer(appType), iface) {
+		return "" // *App 滿足不了它，這個派送到不了 App
+	}
+	return "經 interface 呼叫 " + sel.Sel.Name +
+		"——*App 滿足得了那個 interface，等於繞過薄包裝與交易 ownership"
 }
 
 // callerCalleePair：解析後的呼叫關係（物件對，不是名稱）。
@@ -1130,7 +1221,15 @@ func isStartupStateMethod(fd *ast.FuncDecl, info *types.Info, stateType *types.N
 	return isNamed && named.Obj() == stateType.Obj()
 }
 
-// checkStartupAccessorShape：Lock／defer Unlock 的固定形狀 ＋ 鎖內零呼叫。
+// checkStartupAccessorShape：存取器的**完整**形狀。
+//
+// 不再做簡易控制流程推論（reviewer 2026-08-20：先前會放過「鎖 s.mu 卻寫
+// other.info」與「鎖內 channel send」）。改成逐項釘死：
+//
+//  1. 具名 receiver；第一個敘述 <recv>.mu.Lock()、第二個 defer <recv>.mu.Unlock()。
+//  2. body 其餘部分**每一個** info 存取都必須用同一個 receiver。
+//  3. 其餘部分不得有呼叫、go、defer、channel 送收、select——臨界區只能是欄位讀寫
+//     與純字串運算。
 func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDecl, info *types.Info) {
 	t.Helper()
 	recvName := ""
@@ -1155,19 +1254,49 @@ func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDe
 		t.Errorf("%s 第二個敘述必須是 defer %s.mu.Unlock()（提早 Unlock 之後的讀寫就沒有保護）",
 			fd.Name.Name, recvName)
 	}
-	// 鎖內零呼叫：外部指令、I/O、其他方法一律不行。
+	at := func(n ast.Node) string { return fset.Position(n.Pos()).String() }
 	for _, stmt := range body[2:] {
 		ast.Inspect(stmt, func(n ast.Node) bool {
-			call, isCall := n.(*ast.CallExpr)
-			if !isCall {
-				return true
+			switch x := n.(type) {
+			case *ast.CallExpr:
+				t.Errorf("%s 在鎖內呼叫了東西（%s）——臨界區只能有欄位讀寫與純字串運算",
+					fd.Name.Name, at(x))
+				return false
+			case *ast.GoStmt:
+				t.Errorf("%s 在鎖內開 goroutine（%s）", fd.Name.Name, at(x))
+				return false
+			case *ast.DeferStmt:
+				t.Errorf("%s 在鎖內有額外的 defer（%s）", fd.Name.Name, at(x))
+				return false
+			case *ast.SendStmt:
+				t.Errorf("%s 在鎖內做 channel send（%s）——那會在持鎖時阻塞", fd.Name.Name, at(x))
+				return false
+			case *ast.SelectStmt:
+				t.Errorf("%s 在鎖內 select（%s）", fd.Name.Name, at(x))
+				return false
+			case *ast.UnaryExpr:
+				if x.Op == token.ARROW {
+					t.Errorf("%s 在鎖內做 channel receive（%s）", fd.Name.Name, at(x))
+					return false
+				}
+			case *ast.SelectorExpr:
+				// info 的每一次存取都必須用**同一個** receiver：鎖 s.mu 卻寫
+				// other.info 是最容易漏掉的那一種。
+				if x.Sel.Name != "info" {
+					return true
+				}
+				if s := info.Selections[x]; s == nil || s.Kind() != types.FieldVal {
+					return true
+				}
+				id, isIdent := x.X.(*ast.Ident)
+				if !isIdent || id.Name != recvName {
+					t.Errorf("%s 在鎖內存取的不是自己那一個 instance 的 info（%s）",
+						fd.Name.Name, at(x))
+				}
 			}
-			t.Errorf("%s 在鎖內呼叫了東西（%s）——臨界區只能有純欄位運算",
-				fd.Name.Name, fset.Position(call.Pos()).String())
-			return false
+			return true
 		})
 	}
-	_ = info
 }
 
 // isOwnMuCall／isOwnMuCallExpr：`<recv>.mu.<Lock|Unlock>()`——receiver 名字要對得上。

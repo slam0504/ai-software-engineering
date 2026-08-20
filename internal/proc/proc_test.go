@@ -261,3 +261,83 @@ func TestCanceledByContextIsFalseAfterCleanExit(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestCanceledByContextArbitratesByActualExit
+//
+// **判定規則的確定性測試**（reviewer 2026-08-20）：select 在兩個 channel 同時
+// ready 時隨機挑，所以「取消分支被選到」證明不了因果。真正的判定是收尾之後回頭看
+// 實際結局——正常退出就不算被取消，被訊號致死才算。
+//
+// 直接組出四種狀態組合來驗這條規則，不依賴賽跑能不能重現。
+func TestCanceledByContextArbitratesByActualExit(t *testing.T) {
+	cases := []struct {
+		name     string
+		canceled bool
+		ready    bool
+		code     int
+		want     bool
+	}{
+		{"沒取消過", false, true, 0, false},
+		{"取消了但正常 exit 0——取消沒有改變結果", true, true, 0, false},
+		{"取消了但正常 exit 1——同上", true, true, 1, false},
+		{"取消了且被訊號致死（ExitCode 回 -1）", true, true, -1, true},
+		{"取消了、結局尚未記錄——保守判為被取消", true, false, 0, true},
+	}
+	for _, c := range cases {
+		p := &Proc{canceled: c.canceled, exitReady: c.ready, exit: Exit{Code: c.code}}
+		if got := p.CanceledByContext(); got != c.want {
+			t.Errorf("%s：want %v got %v", c.name, c.want, got)
+		}
+	}
+}
+
+// TestLateCancelAfterNaturalExitNeverMarksCanceled
+//
+// reviewer 2026-08-20：supervisor 的 select 在兩個 channel 同時 ready 時是隨機挑
+// 的，取消分支又先無條件設旗標——10,000 次會重現「/usr/bin/true 已自然結束，稍後
+// 的取消仍讓結果變成 context canceled」。
+//
+// 這條是**賽跑證據**（規則本身由上一條確定性地驗）：指令極短、取消與它併發，
+// 重複多次去撞 select 兩邊同時 ready 的窗口。判準是因果——只要那次執行是自然
+// exit 0，CanceledByContext 就不得為 true。
+func TestLateCancelAfterNaturalExitNeverMarksCanceled(t *testing.T) {
+	for i := range 2000 {
+		ctx, cancel := context.WithCancel(context.Background())
+		p, err := Start(ctx, Config{Binary: "/usr/bin/true"})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_ = p.Stdin.Close()
+		go func() { _, _ = io.ReadAll(p.Stdout) }()
+		// **不設 barrier**：取消與子程序結束真正併發，才逼得到 select 兩邊同時
+		// ready 的那個窗口（reviewer 的重現條件）。
+		go cancel()
+		ex := p.Wait()
+		got := p.CanceledByContext()
+		cancel()
+		if ex.Code == 0 && got {
+			t.Fatalf("第 %d 次：自然 exit 0 之後才取消，不得被記成 canceled", i)
+		}
+	}
+}
+
+// TestCancelBeforeExitMarksCanceled：反向對照——取消在子程序結束**之前**發出時，
+// 必須確實記成 canceled（否則上一條可以用「永遠回 false」通過）。
+func TestCancelBeforeExitMarksCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p, err := Start(ctx, Config{Binary: "/bin/sh", Args: []string{"-c", "while true; do sleep 0.05; done"},
+		TermGrace: 200 * time.Millisecond})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	_ = p.Stdin.Close()
+	go func() { _, _ = io.ReadAll(p.Stdout) }()
+
+	cancel() // 子程序還活著
+	p.Wait()
+	if !p.CanceledByContext() {
+		t.Fatal("取消發生在子程序結束之前，必須記成 canceled")
+	}
+}
