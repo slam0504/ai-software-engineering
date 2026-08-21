@@ -13,6 +13,8 @@
 **四個收尾 gate 全綠**（含本里程碑首次執行的 `wails build`）。
 
 **spec §5「production-path barrier 必備清單」43 條**：綠 42、**未覆蓋 1**。
+（**2026-08-21 矩陣重跑補記**：那 1 條〔2.11〕已由 SegmentSet 接線票轉綠，§3 的三個
+未覆蓋／待裁決項全數出貨——見 §10。）
 
 > **條數由 35 變 36 的原因**：§5.2 的原 2.4 一條在 frame-attribution 票（2026-08-18）被拆成
 > **2.4a**（一份 wire log 收得到兩個 session 的雙向 frame——不漏、不分裂成兩份檔）與
@@ -121,7 +123,7 @@ build 會重新產生 Wails binding，跑完 `git status` **仍為 clean**——
 | 2.8 | 發布成功後 recorder **未被 Stop／Close**，錄到 server 終止才 finalize（非 probe-scoped） | 自動化 | ✅ 綠 | `internal/codex/owner_test.go` `TestHandoffKeepsRecorderOpenAndIDBeforeAttach`、`TestNewGenerationOwnerIsTheOnlyPathThatDetaches`、`TestFinalizeWithDetachesOnlyAfterServerExit` |
 | 2.9 | 失敗的 generation 仍保留 `wire_log_id` 與收尾證據 | 自動化 | ✅ 綠 | `internal/codex/owner_test.go` `TestThreeStageFailuresDisposeAndKeepEvidence` |
 | 2.10 | app-server generation restart 開新 `wire_log_id` | 自動化 | ✅ 綠 | `internal/codex/owner_test.go` `TestReplacementFinalizesOldGenerationBeforePublishingNew`、`TestServerDeathAutoFinalizesGeneration`；`app_wirelog_latch_test.go` `TestRecoveryRewiresConnAndWireLog` |
-| **2.11** | **同一 WSID 橫跨兩個 generation 的 `[]WireSegmentRef` 完整且不混入他 session frame** | — | 🚫 **未覆蓋** | 見 §3.1 |
+| **2.11** | **同一 WSID 橫跨兩個 generation 的 `[]WireSegmentRef` 完整且不混入他 session frame** | 自動化（**2026-08-21 矩陣重跑補記**；接線在 SegmentSet 票 1eaa08c／95504ee，原記未覆蓋見 §3.1） | ✅ 綠 | `app_wire_segments_test.go` `TestWireSegmentsSpanControlledRestart`、`TestWireSegmentsSurviveServerDeath`、`TestWireSegmentsSurviveAppRestart`、`TestWireSegmentNotRecordedForForeignConn`、`TestWireSegmentsConcurrentRangeIsNotExclusive`（§10 的 race 跑次包含） |
 | 2.12 | B1 在 live host／in-flight turn 時拒絕執行 | 自動化 | ✅ 綠 | `app_wirelog_latch_test.go` `TestRecoveryRefusedWhileLiveHostOrInFlightTurn` |
 
 ### §5.3 遷移與啟動修復（3 條）
@@ -191,6 +193,9 @@ spec 那句的字面要求是「**舊測試語意遷移不減**」——嚴格�
 
 ### 3.1 §5.2 第 11 條：`[]WireSegmentRef` 跨 generation —— **未接線，不可能綠**
 
+> **2026-08-21 補記**：已由 SegmentSet 接線票（1eaa08c、95504ee）完成 production 接線，
+> 2.11 改記綠（證據見該列與 §10）。以下保留當時的判定原文。
+
 **事實**（本票獨立核對）：
 
 ```
@@ -224,6 +229,11 @@ server 意外死亡）與 session start／end 算出 per-WSID frame range 並 `A
 
 ### 3.2 無 single-instance guard —— **本票新發現的未受保護前提（不在 spec §7 五項之內），待 owner 裁決**
 
+> **2026-08-21 補記**：owner 裁決後已出貨（a810a40：flock 早於任何 writer、撐到 shutdown
+> 收完才放、拒絕 UX＋i18n）。證據：`main_singleinstance_test.go`
+> （`TestBareEntryRaceExactlyOneEntersWriterInit`、`TestNoWriterOpensBeforeLeaseIsAcquired`、
+> `TestLeaseHeldUntilWritersClosed` 等）＋`internal/singleinstance`，均含在 §10 的 race 跑次。
+
 > **這一項不是 spec 列出的待驗證假設**（spec §7 的五項見 §2.8），而是驗收時從
 > `internal/appcore/sink.go` 的 doc 讀出來的**新發現**：doc 寫了一個假設，但 repo 沒有任何機制保證它。
 
@@ -247,6 +257,10 @@ $ grep -rnE "flock|O_EXCL|LOCK_EX|lockfile" --include='*.go' .
 的決策邊界。**本票不自行實作。**
 
 ### 3.3 pane pins 持久化 —— **未接線，A5 不可能通過**（final review 更正，原記為「無法執行(G)」）
+
+> **2026-08-21 補記**：已由 pane pins 票（cb477bb…bce1f20，六輪 review）完成持久化與啟動
+> 重建。證據：`app_pane_layout_test.go`、`internal/wsregistry/layout_test.go`，均含在 §10 的
+> race 跑次。A5 的**實機 GUI 操作**仍屬 §5 實機矩陣、需 owner 實機執行，該表不改。
 
 **事實**（final review 獨立核對）：
 
@@ -436,6 +450,15 @@ FAIL	github.com/slam0504/sdlc-workbench/internal/codex	33.229s
 **操作建議**：三個 gate **必須分開跑**（本次即如此）；`go test ./...` 本身的 package 併行
 無法關閉時，若這三處紅了，先單獨重跑該 package 再判定。**根治要改測試的同步設計，不在 M3b 範圍。**
 
+**具名清單（owner 2026-08-19 逐一確認，共 5 條；2026-08-21 文件整理落地）**——這幾條紅了
+先單獨重跑再判定，不計入回歸；它們的綠燈也**不作為**任何修正的通過證據：
+
+1. `internal/codex` `TestAppServerTerminateKillsGroup`
+2. `internal/assist` `TestClaudeAssistFailsLoudOnOversizedLine`
+3. `internal/claude` `TestMultiTurnSendAndTurnBoundaries`
+4. root package `TestInFlightTurnDoesNotBlockNewSession`
+5. `internal/codex` `TestAppServerMidStreamDeath`
+
 ---
 
 ## 8. 驗收過程打紅的第二條既有測試競態（已修，root cause 已定位）
@@ -482,3 +505,37 @@ FAIL	github.com/slam0504/sdlc-workbench/internal/codex	33.229s
 | `app_claude_multi_test.go` | 一行等待條件修正（§8） |
 
 **production code 一行未改**——本票只動測試與文件。
+
+---
+
+## 10. 矩陣重跑（2026-08-21，最終樹 d35c4ec）
+
+**本節是 2026-08-17 六項 follow-up 清單的第 6 項**（per-WSID design、pane pins、SegmentSet、
+single-instance guard、Remove/Start phase、matrix）。前五項各自出貨並經 review 核可
+（第 5 項的 re-review 鏈於 2026-08-21 APPROVED）後解除凍結，在**最終樹**上重跑四個收尾 gate。
+
+**最終樹相對 §1 基線（2026-08-15）的差異**：pane pins 持久化（cb477bb…bce1f20 六輪）、
+SegmentSet production 接線（1eaa08c、95504ee → 2.11 轉綠）、frame-level 歸屬與非阻塞展開
+（8965948、5aa008e → §5.2 拆出 2.4b-i）、single-instance guard（a810a40）、audit lifecycle
+與 state lease 生命週期（8b81569…fcd0db2）、binding 面四分類＋固定形狀薄包裝
+（34d207f…0a461cb）、proc 收尾與取消因果仲裁（8188014…d35c4ec）。
+
+**四個 gate 依序分開跑（§7 的操作規則），全綠**：
+
+| Gate | 指令 | 結果 |
+|---|---|---|
+| Go | `go build ./... && go vet ./... && go test -race ./... -count=1` | ✅ 全綠一次過（21 行 `ok`；package main 230.6s、`internal/proc` 33.3s；§7 具名 5 條本次皆綠，惟依規則不作為通過證據） |
+| 前端測試 | `npm --prefix frontend run test` | ✅ 38 files / 373 tests passed（34.20s） |
+| 前端 build | `npm --prefix frontend run build` | ✅ built in 13.30s |
+| `wails build` | `wails build` | ✅ Built `build/bin/sdlc-workbench.app`（darwin/amd64，38.62s）；build 後 `git status` 仍 clean——Wails binding 與 Go 簽名同步 |
+
+**證據名冊核對**：§2 各表引用的 **120 個不同 Go 測試名**（含 2.11 本次補記的五項；
+共 124 次引用）逐一以 `grep -rc '^func <name>(' --include='*_test.go'` 核對，
+**全數存在且唯一**——歷輪 hardening 沒有讓任何一列的證據名冊失效。
+
+**方法論邊界（沿用 §4 末段）**：本節驗的是「最終樹上四個 gate 綠＋證據名冊完好」；
+Task 0-30 的 60+ 個 mutation 全域交叉矩陣仍未重跑。基線之後各修正票的 mutation 驗證
+記錄在各自的 commit 與 review 往返（含 2026-08-21 proc／binding 守門的 7 個探針），
+不在本節重複主張。
+
+**§5 實機驗收（A1-A10）維持原狀**：本 session 仍為非互動 agent 環境，該矩陣待 owner 實機。
