@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Milestone](https://img.shields.io/badge/milestone-M3a-blue.svg)
+![Milestone](https://img.shields.io/badge/milestone-M3b-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Wails](https://img.shields.io/badge/wails-2.x-DF0000.svg)
 ![Go](https://img.shields.io/badge/go-1.26+-00ADD8.svg)
@@ -379,7 +379,7 @@ stateDiagram-v2
 | **M2** Stage A 完整流程 | ✅ 已合併 | 規格工作區、Gate 1 主控台、ApprovalRecord／manifest／STALE、SpecAssist 隔離的 one-shot（SC1、SC3） |
 | **i18n** 繁中介面 | ✅ 已合併 | vue-i18n 語系支援，預設繁體中文並提供完整英文語系 |
 | **M3a** 計畫與測試契約完整流程 | ✅ 已合併 | 任務 DAG、Gate 2、測試契約核可（本機測試證據執行器）、阻擋事項收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；同時檢視多個 session 延後至 **M3b**） |
-| **M3b** 多 session 工作區 | ✅ 實作完成 | 每 provider 4 個 session slot、雙 pane 同時檢視與焦點語意、WSID 建立交易與 tombstone 移除、Codex connection-wide wire log、per-WSID replay index 與視窗化載入（pane 釘選的持久化尚未接線，重啟後需重新釘選——見[驗收結果](docs/spikes/m3b-results.md) §3.3；該文另含未覆蓋、未實作與待實機驗收項） |
+| **M3b** 多 session 工作區 | ✅ 已合併 | 每 provider 4 個 session slot、雙 pane 同時檢視與焦點語意（釘選與焦點跨重啟持久化）、WSID 建立交易與 tombstone 移除、single-instance guard、Codex connection-wide wire log 與跨 generation 的 session 級 segment 歸屬、per-WSID replay index 與視窗化載入。四個收尾 gate 與實機驗收 A1–A10 全綠、Task 0 live probe 重跑 GATE GO（[驗收結果](docs/spikes/m3b-results.md)；§10–§11 為最終樹矩陣重跑與實機補跑，三項後續票見 §11 末） |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外） |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（以 OpenCode 作為第一個目標）、保留 Claude／Codex 原生 adapter、能力協商（capability negotiation）（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 
