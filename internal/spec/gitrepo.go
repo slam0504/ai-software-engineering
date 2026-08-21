@@ -1,13 +1,15 @@
 package spec
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 // GitRepo is the git-backed implementation of Repo. HEAD-tree reads go
@@ -17,21 +19,46 @@ import (
 type GitRepo struct {
 	root string
 	sc   Scope
+	// ctx：git 子行程的取消來源（nil ＝ 不可取消，僅供不在收尾路徑上的呼叫端）。
+	//
+	// 需要它的理由：這些 git 呼叫發生在 Wails binding 的交易內，shutdown 必須能
+	// 讓它們收斂——一個忽略 TERM 的 git 會讓 inflight.Wait 無限等下去
+	// （reviewer 2026-08-20）。
+	ctx context.Context
 }
 
 func NewGitRepo(root string, sc Scope) *GitRepo {
 	return &GitRepo{root: root, sc: sc}
 }
 
+// NewGitRepoCtx：帶取消來源的版本（app 的 binding 路徑一律用這個）。
+func NewGitRepoCtx(ctx context.Context, root string, sc Scope) *GitRepo {
+	return &GitRepo{root: root, sc: sc, ctx: ctx}
+}
+
 // git runs `git -C root <args>` and returns raw stdout bytes.
 func (g *GitRepo) git(args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", g.root}, args...)...)
-	out, err := cmd.Output()
+	ctx := g.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 走 proc.Output（process group）而不是 exec.CommandContext：後者取消時只殺
+	// 直接 child，孫程序照樣活著、還可能繼續持有 pipe 讓 Output 阻塞
+	// （reviewer 2026-08-20）。
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: "git", Args: append([]string{"-C", g.root}, args...)})
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("git %v: %s", args, strings.TrimSpace(string(ee.Stderr)))
+		return nil, fmt.Errorf("git %v: %w", args, err) // 保留 context.Canceled 等 identity
+	}
+	if ex.Err != nil {
+		// 保留 *exec.ExitError 的鏈（呼叫端以 errors.As 分辨 exit code）；
+		// stderr tail 一併帶出，錯誤訊息才看得懂。
+		if tail := strings.TrimSpace(ex.StderrTail); tail != "" {
+			return nil, fmt.Errorf("git %v: %s: %w", args, tail, ex.Err)
 		}
-		return nil, fmt.Errorf("git %v: %w", args, err)
+		return nil, fmt.Errorf("git %v: %w", args, ex.Err)
+	}
+	if ex.Code != 0 {
+		return nil, fmt.Errorf("git %v: exit %d: %s", args, ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	return out, nil
 }

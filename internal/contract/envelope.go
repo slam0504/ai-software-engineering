@@ -93,6 +93,11 @@ type Envelope struct {
 	Payload       json.RawMessage `json:"payload,omitempty"`        // 結構化 payload（不塞進 Text）
 	CorrelationID string          `json:"correlation_id,omitempty"` // 跨事件關聯 id（例如 approval_id）
 	Purpose       string          `json:"purpose,omitempty"`        // 事件用途說明
+
+	// M3b 新增（additive；§3.1.5）：host-side 穩定 session identity。
+	// Conversation lane 的每個 Envelope 自 BeginSubmit 起必填；workspace lane
+	// 的 Gate／SpecAssist／PlanAssist one-shot 維持空值、不計入 slot（§3.1.6）。
+	WorkspaceSessionID string `json:"workspace_session_id,omitempty"`
 }
 
 // Wrap：Event → Envelope。role 規則：ev.Role 明確標注優先；否則 Kind==delta →

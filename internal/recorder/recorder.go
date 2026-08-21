@@ -21,6 +21,11 @@ type Meta struct {
 	ProcessStillRunning bool     `json:"process_still_running,omitempty"` // v1.6：長駐 server 回合證據
 	StderrTail          string   `json:"stderr_tail,omitempty"`
 	RecorderError       string   `json:"recorder_error,omitempty"`
+	// FinalizeCause 是「這份錄流為什麼收尾」的原因（M3b §3.4.2：意外死亡／受控
+	// replacement／某階段失敗）。刻意與 stderr_tail 分離——後者必須維持是子程序
+	// stderr 的原文，混入我方敘述會讓前端／診斷顯示出並不存在的 stderr 行；也不能
+	// 借用 recorder_error，那是錄流寫入失敗的欄位，兩者會互相覆寫。
+	FinalizeCause string `json:"finalize_cause,omitempty"`
 }
 
 type Recorder struct {

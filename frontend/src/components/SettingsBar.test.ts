@@ -1,9 +1,10 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-// wailsjs 綁定全部 mock：tab 切換不得觸發任何 backend 呼叫
+// wailsjs 綁定全部 mock：分頁切換不得觸發任何 backend 呼叫
 const mocks = vi.hoisted(() => ({
-  TerminateSession: vi.fn(), EndSession: vi.fn(), AuthStatus: vi.fn(),
+  TerminateSession: vi.fn(), NewSession: vi.fn(),
+  CreateSession: vi.fn(async () => 'w-new'), AuthStatus: vi.fn(),
   StartLogin: vi.fn(), CancelLogin: vi.fn(), Logout: vi.fn(),
   RestartCodexServerRecorded: vi.fn(),
 }))
@@ -13,37 +14,109 @@ import SettingsBar from './SettingsBar.vue'
 import { useSession } from '../stores/session'
 import { mountWithI18n } from '../test/i18n'
 
-describe('SettingsBar provider tabs', () => {
+// two：兩個已註冊 session，w1 釘在 pane 0（focused）、w2 尚未釘選。
+// review round 1（Task 28）：End 改走 s.bindings.EndSession（不再是 wailsjs
+// 原始 import），這裡改用 s.setBindings() 注入同一份 mock，斷言也從
+// mocks.EndSession 改成 s.bindings.EndSession。
+function two() {
+  const s = useSession()
+  s.setBindings({
+    StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), EndSession: vi.fn(async () => {}),
+  })
+  s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+  s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+  s.pin(0, 'w1')
+  s.setFocus(0)
+  return s
+}
+
+describe('SettingsBar session 分頁（Task 26：WSID 定址）', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     for (const fn of Object.values(mocks)) fn.mockClear()
   })
 
-  it('tab click switches active view without backend calls', async () => {
-    const wrapper = mountWithI18n(SettingsBar)
-    const s = useSession()
-    const tabs = wrapper.findAll('.tab')
-    expect(tabs.length).toBe(2)
-    await tabs[1].trigger('click')
-    expect(s.activeProvider).toBe('codex')
-    await tabs[0].trigger('click')
-    expect(s.activeProvider).toBe('claude')
+  it('分頁點擊切換 focused pane 的 session，不觸發任何 backend 呼叫', async () => {
+    const s = two()
+    const w = mountWithI18n(SettingsBar)
+    await w.find('[data-test=session-tab-w2]').trigger('click')
+    expect(s.focusedWsid).toBe('w2')
+    await w.find('[data-test=session-tab-w1]').trigger('click')
+    expect(s.focusedWsid).toBe('w1')
     for (const [name, fn] of Object.entries(mocks)) {
       expect(fn, name).not.toHaveBeenCalled()
     }
   })
 
-  it('shows unread badge and approval flag per tab', async () => {
+  it('per-session unread 徽章與待核可標記', async () => {
+    const s = two()
     const wrapper = mountWithI18n(SettingsBar)
+    s.apply({ event_id: 'e1', ts: 't', provider: 'codex', kind: 'result', workspace_session_id: 'w2' })
+    s.apply({ event_id: 'e2', ts: 't', provider: 'codex', kind: 'state_change',
+      state: 'awaiting_approval', workspace_session_id: 'w2' })
+    await wrapper.vm.$nextTick()
+    const tab = wrapper.find('[data-test=session-tab-w2]')
+    expect(tab.find('.badge').text()).toBe('1')
+    expect(tab.find('.await').exists()).toBe(true)
+    await tab.trigger('click') // 切入歸零
+    await wrapper.vm.$nextTick()
+    expect(tab.find('.badge').exists()).toBe(false)
+  })
+
+  it('lifecycle 操作一律帶 focused pane 的 WSID，不是 provider 名', async () => {
+    const s = two()
+    const w = mountWithI18n(SettingsBar)
+    s.setFocus(0)
+    await w.find('[data-test=end-session]').trigger('click')
+    expect(s.bindings?.EndSession).toHaveBeenCalledWith('w1')
+    await w.find('[data-test=session-tab-w2]').trigger('click')
+    await w.find('[data-test=end-session]').trigger('click')
+    expect(s.bindings?.EndSession).toHaveBeenLastCalledWith('w2')
+    expect(s.bindings?.EndSession).not.toHaveBeenCalledWith('claude')
+    expect(s.bindings?.EndSession).not.toHaveBeenCalledWith('codex')
+  })
+
+  it('建立按鈕登記新 session 並釘進目前 pane', async () => {
     const s = useSession()
-    s.apply({ event_id: 'e1', ts: 't', provider: 'codex', kind: 'result' })
-    s.apply({ event_id: 'e2', ts: 't', provider: 'codex', kind: 'state_change', state: 'awaiting_approval' })
-    await wrapper.vm.$nextTick()
-    const codexTab = wrapper.findAll('.tab')[1]
-    expect(codexTab.find('.badge').text()).toBe('1')
-    expect(codexTab.find('.await').exists()).toBe(true)
-    await codexTab.trigger('click') // 切入歸零
-    await wrapper.vm.$nextTick()
-    expect(codexTab.find('.badge').exists()).toBe(false)
+    const w = mountWithI18n(SettingsBar)
+    await w.find('[data-test=create-claude]').trigger('click')
+    await Promise.resolve()
+    expect(mocks.CreateSession).toHaveBeenCalledWith('claude', '')
+    expect(s.sessions['w-new']).toMatchObject({ provider: 'claude' })
+    expect(s.pins[0]).toBe('w-new')
+  })
+
+  it('registry 有、Manager 無 slot 的 session 在清單上明確標示不可操作', async () => {
+    const s = useSession()
+    s.hydrateSessions([
+      { wsid: 'w1', provider: 'claude', task_label: 'a', resume_session_id: '', created_at: '', available: true, state: 'idle' },
+      { wsid: 'wOrphan', provider: 'codex', task_label: 'b', resume_session_id: '', created_at: '', available: false, state: '' },
+    ])
+    const w = mountWithI18n(SettingsBar)
+    await w.vm.$nextTick()
+    const orphan = w.find('[data-test=session-tab-wOrphan]')
+    expect(orphan.classes()).toContain('unavailable') // 不隱藏、據實呈現
+    expect(orphan.attributes('title')).toContain('wOrphan') // tooltip 說明為什麼
+    expect(w.find('[data-test=session-tab-w1]').classes()).not.toContain('unavailable')
+    void s
+  })
+
+  it('沒有 focused session 時 lifecycle 按鈕停用（避免打空 WSID）', async () => {
+    useSession()
+    const w = mountWithI18n(SettingsBar)
+    expect(w.find('[data-test=end-session]').attributes('disabled')).toBeDefined()
+  })
+
+  it('codex session 的 recordCase 欄位停用並說明只剩 label（§3.4.4）', async () => {
+    two()
+    const w = mountWithI18n(SettingsBar)
+    await w.find('[data-test=session-tab-w2]').trigger('click') // codex
+    await w.vm.$nextTick()
+    const rec = w.findAll('input').find(i => i.attributes('title')?.includes('§3.4.4'))
+    expect(rec, 'codex recordCase 欄位必須帶說明').toBeTruthy()
+    expect(rec!.attributes('disabled')).toBeDefined()
+    await w.find('[data-test=session-tab-w1]').trigger('click') // 切回 claude
+    await w.vm.$nextTick()
+    expect(w.findAll('input').some(i => i.attributes('disabled') !== undefined)).toBe(false)
   })
 })

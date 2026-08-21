@@ -15,6 +15,7 @@ export default {
     },
     timeline: {
       label: 'Timeline',
+      unreadTooltip: 'Unread errors arrived while the timeline was collapsed — expand to read them',
     },
     resize: {
       width: 'Drag to resize width',
@@ -23,6 +24,9 @@ export default {
     startupError: 'startup: {error}',
     goResubmit: {
       integrityError: 'Data integrity error: the resubmit target could not be parsed — navigation cancelled',
+    },
+    paneLayout: {
+      restoreFailed: 'Pinned panes could not be restored — both panes start empty; pin the sessions you want again: {error}',
     },
   },
   settings: {
@@ -38,6 +42,7 @@ export default {
     },
     operationAction: {
       new: 'new session',
+      create: 'create session',
       terminate: 'terminate',
       end: 'end session',
       authStatus: 'auth status query',
@@ -56,6 +61,7 @@ export default {
     },
     recordCase: {
       placeholder: '{provider}-case (recording, optional)',
+      codexLabelOnly: 'codex recording is connection-wide (§3.4.4): this field is an audit label only',
     },
     resumeId: {
       placeholder: 'resume id (optional)',
@@ -65,6 +71,9 @@ export default {
       untrusted: 'untrusted (approve each)',
       onRequest: 'on-request',
       never: 'never (no approval, at your own risk)',
+    },
+    createSession: {
+      tooltip: 'create a new {provider} session and pin it to the focused pane',
     },
     newSession: {
       tooltip: 'End current session, wait for the old provider to wind down, then start a new chat',
@@ -81,6 +90,9 @@ export default {
     action: {
       send: 'Send',
     },
+  },
+  dualPane: {
+    empty: 'No session pinned to this pane yet — pin one from the list on the left',
   },
   gate: {
     action: {
@@ -292,6 +304,7 @@ export default {
       approvalDecision: 'Approval decision: {text}',
       stateChange: 'State → {state}',
       retry: 'provider retry',
+      codexBroadcast: 'codex broadcast: {method}',
       toolResult: 'tool result',
     },
     raw: 'raw',
@@ -299,6 +312,30 @@ export default {
   },
   store: {
     bindingsNotReady: 'bindings not ready',
+    noFocusedSession: 'no session is pinned to the focused pane — create or pin one first',
+    paneLayoutPersistFailed: 'pane pins were not saved, so this arrangement will be lost on restart (the pins themselves still work): {error}',
+    sessionUnavailable: 'session {wsid} is recorded but not addressable (no working slot); restart the app or remove it',
+  },
+  sessionList: {
+    empty: 'No sessions yet — use the create buttons above to start one',
+    action: {
+      create: 'Create',
+      pin: 'Pin',
+      remove: 'Remove',
+    },
+    busyTooltip: 'Waiting on a reply',
+    pin: {
+      blockedByApproval: 'This pane is showing an approval request; you can switch once the approval is completed or dismissed.',
+    },
+    create: {
+      failed: 'Create {provider} session failed: {error}',
+    },
+    remove: {
+      confirmText: 'The session will disappear from this list, but audit events and recordings are retained permanently (not deleted). Remove it?',
+      confirmSubmit: 'Confirm removal',
+      cancel: 'Cancel',
+      failed: 'Remove session {wsid} failed: {error}',
+    },
   },
   escalation: {
     section: {

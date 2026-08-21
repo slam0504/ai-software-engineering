@@ -1,3 +1,112 @@
+export namespace contract {
+	
+	export class Binding {
+	    kind: string;
+	    ref: string;
+	    digest: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Binding(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.ref = source["ref"];
+	        this.digest = source["digest"];
+	    }
+	}
+	export class Usage {
+	    input_tokens: number;
+	    output_tokens: number;
+	    cached_input_tokens?: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Usage(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.input_tokens = source["input_tokens"];
+	        this.output_tokens = source["output_tokens"];
+	        this.cached_input_tokens = source["cached_input_tokens"];
+	    }
+	}
+	export class Envelope {
+	    event_id: string;
+	    ts: string;
+	    provider: string;
+	    session_id?: string;
+	    role?: string;
+	    task_id?: string;
+	    kind: string;
+	    text?: string;
+	    thinking?: string;
+	    is_error?: boolean;
+	    cost_usd?: number;
+	    usage?: Usage;
+	    usage_semantics?: string;
+	    state?: string;
+	    error?: string;
+	    raw?: number[];
+	    scope?: string;
+	    bindings?: Binding[];
+	    payload?: number[];
+	    correlation_id?: string;
+	    purpose?: string;
+	    workspace_session_id?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Envelope(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.event_id = source["event_id"];
+	        this.ts = source["ts"];
+	        this.provider = source["provider"];
+	        this.session_id = source["session_id"];
+	        this.role = source["role"];
+	        this.task_id = source["task_id"];
+	        this.kind = source["kind"];
+	        this.text = source["text"];
+	        this.thinking = source["thinking"];
+	        this.is_error = source["is_error"];
+	        this.cost_usd = source["cost_usd"];
+	        this.usage = this.convertValues(source["usage"], Usage);
+	        this.usage_semantics = source["usage_semantics"];
+	        this.state = source["state"];
+	        this.error = source["error"];
+	        this.raw = source["raw"];
+	        this.scope = source["scope"];
+	        this.bindings = this.convertValues(source["bindings"], Binding);
+	        this.payload = source["payload"];
+	        this.correlation_id = source["correlation_id"];
+	        this.purpose = source["purpose"];
+	        this.workspace_session_id = source["workspace_session_id"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
 export namespace escalation {
 	
 	export class Item {
@@ -381,6 +490,44 @@ export namespace main {
 		    }
 		    return a;
 		}
+	}
+	export class PaneLayout {
+	    pins: string[];
+	    focused: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new PaneLayout(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.pins = source["pins"];
+	        this.focused = source["focused"];
+	    }
+	}
+	export class SessionInfo {
+	    wsid: string;
+	    provider: string;
+	    task_label: string;
+	    resume_session_id: string;
+	    created_at: string;
+	    available: boolean;
+	    state: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SessionInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.wsid = source["wsid"];
+	        this.provider = source["provider"];
+	        this.task_label = source["task_label"];
+	        this.resume_session_id = source["resume_session_id"];
+	        this.created_at = source["created_at"];
+	        this.available = source["available"];
+	        this.state = source["state"];
+	    }
 	}
 	export class SpecCommitPreview {
 	    token: spec.CommitToken;

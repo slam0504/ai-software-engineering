@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func writeFakeVersionBin(t *testing.T, dir, name, versionLine string) string {
 
 func TestPreflightClaudeOKOnPinAndFrozenArgv(t *testing.T) {
 	bin := writeFakeVersionBin(t, t.TempDir(), "claude", "2.1.223 (Claude Code)")
-	res, err := PreflightClaude(bin, ClaudePlannerArgs())
+	res, err := PreflightClaude(context.Background(), bin, ClaudePlannerArgs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestPreflightClaudeOKOnPinAndFrozenArgv(t *testing.T) {
 
 func TestPreflightClaudeRejectsWrongVersion(t *testing.T) {
 	bin := writeFakeVersionBin(t, t.TempDir(), "claude", "2.1.222 (Claude Code)")
-	res, err := PreflightClaude(bin, ClaudePlannerArgs())
+	res, err := PreflightClaude(context.Background(), bin, ClaudePlannerArgs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +75,7 @@ func TestPreflightClaudeRejectsArgvDrift(t *testing.T) {
 		"widened tool whitelist":  {"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--setting-sources", "", "--tools", "Read,Glob,Grep,Write"},
 		"missing setting-sources": {"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--tools", "Read,Glob,Grep"},
 	} {
-		res, err := PreflightClaude(bin, args)
+		res, err := PreflightClaude(context.Background(), bin, args)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -98,7 +99,7 @@ func TestClaudePlannerArgsMatchesFrozenBaseline(t *testing.T) {
 func TestPreflightCodexVersionPin(t *testing.T) {
 	dir := t.TempDir()
 	ok := writeFakeVersionBin(t, dir, "codex-ok", "codex-cli 0.146.1")
-	res, err := PreflightCodex(ok)
+	res, err := PreflightCodex(context.Background(), ok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestPreflightCodexVersionPin(t *testing.T) {
 		t.Fatalf("codex BinaryDigest must be full sha256 hex, got %q", res.BinaryDigest)
 	}
 	bad := writeFakeVersionBin(t, dir, "codex-bad", "codex-cli 0.150.0")
-	res, err = PreflightCodex(bad)
+	res, err = PreflightCodex(context.Background(), bad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,10 +120,10 @@ func TestPreflightCodexVersionPin(t *testing.T) {
 }
 
 func TestPreflightMissingBinaryErrors(t *testing.T) {
-	if _, err := PreflightClaude(filepath.Join(t.TempDir(), "absent"), ClaudePlannerArgs()); err == nil {
+	if _, err := PreflightClaude(context.Background(), filepath.Join(t.TempDir(), "absent"), ClaudePlannerArgs()); err == nil {
 		t.Fatal("missing claude binary must surface an error")
 	}
-	if _, err := PreflightCodex(filepath.Join(t.TempDir(), "absent")); err == nil {
+	if _, err := PreflightCodex(context.Background(), filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("missing codex binary must surface an error")
 	}
 }
@@ -282,5 +283,111 @@ func TestCodexAssistViolationNotMaskedByWireError(t *testing.T) {
 	}
 	if viol.Provider != "codex" || viol.Detail != codex.MethodCmdExecRequestApproval {
 		t.Fatalf("violation must carry provider/method, got: %+v", viol)
+	}
+}
+
+// TestBinarySHA256RejectsNonRegularFile
+//
+// reviewer 2026-08-20：以 FIFO 取代 binary 之後，io.Copy 會無限等寫入端，而
+// preflight 的 30 秒 deadline 只掛在子行程上、管不到讀檔——傳入已取消的 context
+// 也一樣卡住，只有人工寫入 FIFO 才會返回。
+//
+// 正題斷言：對 FIFO 呼叫**立刻**回錯誤（不等任何人寫入）。
+func TestBinarySHA256RejectsNonRegularFile(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fake-binary")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("這個平台建不出 FIFO：%v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := BinarySHA256(context.Background(), fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO 不是一般檔案，必須拒絕")
+		}
+		if !strings.Contains(err.Error(), "不是一般檔案") {
+			t.Fatalf("拒絕原因必須說明是檔案型別，實得 %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("對 FIFO 計算 digest 卡住了——沒有人會來寫入，這條路徑必須直接拒絕")
+	}
+}
+
+// TestBinarySHA256IsCancellable：就算目標是一般檔案（可能落在卡住的網路檔案系統
+// 上），已取消的 context 也必須讓它立刻返回。
+func TestBinarySHA256IsCancellable(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.WriteFile(bin, make([]byte, 1<<20), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := BinarySHA256(ctx, bin); !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消的 context 必須讓 digest 立刻返回 context.Canceled，實得 %v", err)
+	}
+}
+
+// TestBinarySHA256RejectsFileSwappedAfterStat
+//
+// reviewer 2026-08-20：先 Stat 再 Open 是 TOCTOU——兩者之間把 regular file 換成
+// FIFO，open 會卡在等寫入端，deadline 也救不了（open 本身不吃 context）。
+//
+// 這裡直接把「被換掉之後」的狀態餵進去：路徑上就是 FIFO。正題斷言是**立刻返回**
+// ——O_NONBLOCK 開檔 ＋ 對同一個 descriptor 做 Stat 才辦得到；先 Stat 再 Open 的
+// 寫法會卡在這裡。
+func TestBinarySHA256RejectsFileSwappedAfterStat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bin")
+	if err := os.WriteFile(path, []byte("real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 換成 FIFO（模擬 Stat 之後被抽換）。
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("這個平台建不出 FIFO：%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := BinarySHA256(ctx, path); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO 必須被拒絕")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("open 卡住了——必須用 O_NONBLOCK 開檔再對同一個 fd 判型別")
+	}
+}
+
+// TestBinarySHA256AcceptsNilContext：nil context 不得 panic（API 契約）。
+func TestBinarySHA256AcceptsNilContext(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:staticcheck // 刻意傳 nil：驗 API 契約
+	if _, err := BinarySHA256(nil, bin); err != nil {
+		t.Fatalf("nil context 應退化成 Background，實得 %v", err)
+	}
+}
+
+// TestBinarySHA256ChecksContextBeforeFilesystem
+//
+// reviewer 2026-08-20：第一次 context 檢查排在 EvalSymlinks／Open／Stat 之後，
+// 於是「已取消 ＋ 路徑不存在」會回 lstat … no such file，而不是 context.Canceled
+// ——呼叫端據此分辨「被收尾取消」與「環境有問題」，回錯就會把取消記成
+// enforcement failure。
+func TestBinarySHA256ChecksContextBeforeFilesystem(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := BinarySHA256(ctx, filepath.Join(t.TempDir(), "does-not-exist"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消時必須先回 context.Canceled，不得先撞檔案系統錯誤，實得 %v", err)
 	}
 }

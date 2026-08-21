@@ -1,8 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
 
 const h = vi.hoisted(() => ({
-  StartSession: vi.fn(async () => {}),
-  SendMessage: vi.fn(async () => {}),
+  StartSession: vi.fn(async (..._a: string[]) => {}),
+  SendMessage: vi.fn(async (..._a: string[]) => {}),
+  CreateSession: vi.fn(async () => 'wsid-1'),
+  RemoveSession: vi.fn(async () => {}),
+  EndSession: vi.fn(async () => {}),
+  NewSession: vi.fn(async () => {}),
+  TerminateSession: vi.fn(async () => {}),
+  ListSessions: vi.fn(async () => []),
+  RecoverCodexRecording: vi.fn(async () => {}),
+  LoadTurnsBefore: vi.fn(async () => []),
+  PaneLayout: vi.fn(async () => ({ pins: ['', ''], focused: '' })),
+  SetPaneLayout: vi.fn(async () => {}),
   RegisterMutation: vi.fn(async () => 'mutation-id'),
   RunEvidence: vi.fn(async () => 'evidence-id'),
   EvidenceGet: vi.fn(async () => ({})),
@@ -18,20 +28,93 @@ vi.mock('../../wailsjs/go/main/App', () => h)
 
 import { makeBindings } from './bindings'
 
-// P1 迴歸：adapter 必須逐參數轉發——單參數版本會把 provider 名送成訊息內容
+// P1 迴歸：adapter 必須逐參數轉發——單參數版本會把第一參數送成訊息內容
 describe('production bindings adapter', () => {
-  it('forwards both SendMessage arguments positionally', async () => {
+  // M3b Task 26 原子切換：第一參數由 provider 改為 WSID。這條守的是「轉發的
+  // 就是呼叫端給的那個 WSID」，並明確排除誤傳 provider 名稱。
+  it('WSID 取代 provider 作為第一參數——不得誤傳 provider', async () => {
     const b = makeBindings()
-    await b.SendMessage('claude', 'the real message')
-    expect(h.SendMessage).toHaveBeenCalledWith('claude', 'the real message')
-    await b.SendMessage('codex', 'second round')
-    expect(h.SendMessage).toHaveBeenCalledWith('codex', 'second round')
+    await b.SendMessage('01JWSIDABC', 'text')
+    const [first] = vi.mocked(h.SendMessage).mock.calls.at(-1)!
+    expect(first).toBe('01JWSIDABC')
+    expect(['claude', 'codex']).not.toContain(first)
   })
 
-  it('forwards all six StartSession arguments', async () => {
+  it('forwards both SendMessage arguments positionally', async () => {
     const b = makeBindings()
-    await b.StartSession('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
-    expect(h.StartSession).toHaveBeenCalledWith('codex', 'prompt', 'resume-id', 'rec', 'task', 'untrusted')
+    await b.SendMessage('w1', 'the real message')
+    expect(h.SendMessage).toHaveBeenCalledWith('w1', 'the real message')
+    await b.SendMessage('w2', 'second round')
+    expect(h.SendMessage).toHaveBeenCalledWith('w2', 'second round')
+  })
+
+  it('StartSession／EndSession 逐參數轉發且第一參數為 WSID', async () => {
+    const b = makeBindings()
+    await b.StartSession('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+    expect(h.StartSession).toHaveBeenCalledWith('w1', 'prompt', 'resume-id', 'case', 'label', 'untrusted')
+    await b.EndSession('w1')
+    expect(h.EndSession).toHaveBeenCalledWith('w1')
+  })
+
+  it('NewSession／TerminateSession 以 WSID 定址', async () => {
+    const b = makeBindings()
+    await b.NewSession('w1')
+    expect(h.NewSession).toHaveBeenCalledWith('w1')
+    await b.TerminateSession('w2')
+    expect(h.TerminateSession).toHaveBeenCalledWith('w2')
+  })
+
+  it('ListSessions 轉發至 Go 綁定（前端 session 清單的唯一來源）', async () => {
+    const b = makeBindings()
+    await b.ListSessions()
+    expect(h.ListSessions).toHaveBeenCalledWith()
+  })
+
+  // M3b Task 4：CreateSession 是純新增的多參數綁定，同一教訓套用。
+  it('CreateSession 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.CreateSession('claude', 'my-task')
+    expect(h.CreateSession).toHaveBeenCalledWith('claude', 'my-task')
+  })
+
+  // M3b Task 22：RemoveSession 逐參數轉發——purely additive binding。
+  it('RemoveSession 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.RemoveSession('w1')
+    expect(h.RemoveSession).toHaveBeenCalledWith('w1')
+  })
+
+  // M3b Task 13：RecoverCodexRecording 無參數，仍要鎖「adapter 真的打到 Go 綁定」
+  // ——§3.4.6 的 latch 只有這條路徑能解除，adapter 接錯就是永久 degraded。
+  it('RecoverCodexRecording 轉發至 Go 綁定', async () => {
+    const b = makeBindings()
+    await b.RecoverCodexRecording()
+    expect(h.RecoverCodexRecording).toHaveBeenCalledWith()
+  })
+
+  // M3b Task 20：LoadTurnsBefore 是 §3.8 的視窗化載入／向上分頁，三個參數且
+  // 順序（wsid, beforeEventID, n）不能互換——把 cursor 與 wsid 對調會安靜地
+  // 回一個空頁，UI 只會看起來「沒有更舊的訊息」。
+  it('LoadTurnsBefore 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.LoadTurnsBefore('w1', 'e100', 20)
+    expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w1', 'e100', 20)
+    await b.LoadTurnsBefore('w2', '', 20)
+    expect(h.LoadTurnsBefore).toHaveBeenCalledWith('w2', '', 20)
+  })
+
+  // owner review 修正 3（§3.2.1／§3.8）：pane pins 持久化的兩個綁定。
+  // SetPaneLayout 的兩個參數順序不能互換——把 focused 與 pins 對調會讓 Go 端
+  // 的「focused 必須在 pins 之中」直接回錯，釘選從此每次都持久化失敗；而讀取
+  // 端接錯則是重啟後兩個 pane 恆空，正是本票要修的那個缺陷本身。
+  it('PaneLayout／SetPaneLayout 逐參數轉發', async () => {
+    const b = makeBindings()
+    await b.PaneLayout()
+    expect(h.PaneLayout).toHaveBeenCalledWith()
+    await b.SetPaneLayout(['w1', 'w2'], 'w2')
+    expect(h.SetPaneLayout).toHaveBeenCalledWith(['w1', 'w2'], 'w2')
+    await b.SetPaneLayout(['w1', ''], 'w1')
+    expect(h.SetPaneLayout).toHaveBeenCalledWith(['w1', ''], 'w1')
   })
 
   // Task 22：TCA workspace 六個新綁定，逐一鎖參數順序與名稱——Go 測試驗不到

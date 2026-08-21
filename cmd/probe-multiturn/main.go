@@ -17,6 +17,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/claude"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
+	"github.com/slam0504/sdlc-workbench/internal/singleinstance"
 )
 
 type turnInfo struct {
@@ -39,10 +40,31 @@ func run() (retErr error) {
 	if err != nil {
 		return err
 	}
-	recDir := filepath.Join(root, ".workbench", "recordings")
+	stateDir := filepath.Join(root, ".workbench")
+	// 這個 probe 是**第三個**會寫進 workbench state directory 的進入點（app 與
+	// mcp-approval 子命令是另外兩個）。下面的 os.Create 帶 O_TRUNC，若 app 正
+	// 開著就會直接截斷它的錄流檔，所以這裡照樣取 single-instance 鎖：跟 app
+	// 同一把、同一個目錄，取不到就拒絕執行（fail closed），不去猜「應該沒關係」。
+	//
+	// **取鎖之前只建空的 state directory，其餘骨架一律排在取得鎖之後**：
+	// singleinstance.Acquire 只 open <stateDir>/instance.lock，**它不會建目錄**，
+	// 全新 workspace 因此連鎖都取不到。建一個空目錄對已存在的路徑是 no-op，也
+	// 不含任何 session 狀態，是取鎖前唯一允許的冪等初始化（owner 2026-08-19；
+	// 同 App.acquireStateLease）。recordings/ 與錄流檔則必須等 ownership 到手。
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir state dir: %w", err)
+	}
+	lock, err := singleinstance.Acquire(stateDir)
+	if err != nil {
+		return fmt.Errorf("probe 需要獨佔 workspace state（%s）：%w", stateDir, err)
+	}
+	defer func() { _ = lock.Release() }()
+
+	recDir := filepath.Join(stateDir, "recordings")
 	if err := os.MkdirAll(recDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir recordings: %w", err)
 	}
+
 	out, err := os.Create(filepath.Join(recDir, "claude-multiturn.ndjson"))
 	if err != nil {
 		return err

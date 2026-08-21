@@ -5,6 +5,7 @@ import {spec} from '../models';
 import {escalation} from '../models';
 import {evidence} from '../models';
 import {gate} from '../models';
+import {contract} from '../models';
 
 export function AuthStatus(arg1:string):Promise<string>;
 
@@ -17,6 +18,8 @@ export function ConfirmAnalysisBaseBump(arg1:main.BumpToken,arg2:string,arg3:str
 export function ConfirmPlanCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
 
 export function ConfirmSpecCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
+
+export function CreateSession(arg1:string,arg2:string):Promise<string>;
 
 export function EndSession(arg1:string):Promise<void>;
 
@@ -38,11 +41,17 @@ export function GateDecisionContext(arg1:string):Promise<main.GateDecisionContex
 
 export function GateList():Promise<Array<main.GateEntryDTO>>;
 
+export function ListSessions():Promise<Array<main.SessionInfo>>;
+
 export function ListWorkspace(arg1:string):Promise<Array<main.FileNode>>;
+
+export function LoadTurnsBefore(arg1:string,arg2:string,arg3:number):Promise<Array<contract.Envelope>>;
 
 export function Logout(arg1:string):Promise<void>;
 
 export function NewSession(arg1:string):Promise<void>;
+
+export function PaneLayout():Promise<main.PaneLayout>;
 
 export function PlanAssist(arg1:string,arg2:string):Promise<string>;
 
@@ -62,7 +71,11 @@ export function ReadDiagram():Promise<string>;
 
 export function ReadWorkspaceFile(arg1:string):Promise<string>;
 
+export function RecoverCodexRecording():Promise<void>;
+
 export function RegisterMutation(arg1:string,arg2:string):Promise<string>;
+
+export function RemoveSession(arg1:string):Promise<void>;
 
 export function ResolveApproval(arg1:string,arg2:boolean,arg3:string):Promise<void>;
 
@@ -73,6 +86,8 @@ export function RestoreViews():Promise<Record<string, main.RestoredView>>;
 export function RunEvidence(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<string>;
 
 export function SendMessage(arg1:string,arg2:string):Promise<void>;
+
+export function SetPaneLayout(arg1:Array<string>,arg2:string):Promise<void>;
 
 export function SpecAssist(arg1:string,arg2:string,arg3:string):Promise<string>;
 

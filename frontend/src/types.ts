@@ -11,6 +11,9 @@ export interface Envelope {
   // M2 Stage A：scope/purpose 分流用（§3.4c）＋ gate/assist payload 欄位
   scope?: string; bindings?: ApprovalBinding[]; payload?: unknown
   correlation_id?: string; purpose?: string
+  // M3b §3.1.5：conversation lane 的 host-side session identity。session store
+  // 依它路由到 per-WSID lane（workspace lane 的事件維持空值）。
+  workspace_session_id?: string
 }
 // gate.ts 的 projection entry（Task 14 console 消費）
 export interface GateEntry {
@@ -35,10 +38,94 @@ export interface CommitCandidate { oid: string; subject: string }
 // Bindings：session store（stores/session.ts）唯一消費的形狀——只有
 // StartSession／SendMessage，維持原樣不擴大（session.test.ts 的 mock 只給這兩
 // 個欄位，見 EvidenceBindings 的分離理由）。
+//
+// M3b Task 26 原子切換：第一參數由 provider 改為 **WSID**。型別同為 string，
+// 編譯器擋不住傳錯，守門因此在 bindings.test.ts（轉發順序）與 Go 端的
+// TestExportedBindingsAddressByWSID（provider 名稱一律 ErrSessionNotFound）。
 export interface Bindings {
-  StartSession(provider: string, prompt: string, resume: string, recordCase: string,
+  StartSession(wsid: string, prompt: string, resume: string, recordCase: string,
     taskLabel: string, approvalPolicy: string): Promise<void>
-  SendMessage(provider: string, prompt: string): Promise<void>
+  SendMessage(wsid: string, prompt: string): Promise<void>
+  // EndSession：Task 28 新增，**optional**——store 自己的 actions 仍只消費上面兩個
+  // （不擴大既有「唯一消費」的宣稱）。DualPane 的 focused-pane End 控制項需要走
+  // 同一個 s.setBindings() 注入路徑（測試才能只 mock s.bindings、不必另開一份
+  // wailsjs module mock），因此掛在這裡；optional 讓既有 okBindings() 等字面量
+  // 不必補欄位。
+  EndSession?(wsid: string): Promise<void>
+  // LoadTurnsBefore：Task 29 新增，**optional**（同 EndSession 的理由）——
+  // session store 的 pin()／loadOlder() 是本 task 起唯一真正呼叫它的地方
+  // （§3.8 lazy load／向上分頁）。optional 讓既有大量沒帶這個欄位的 bindings
+  // 字面量（okBindings()／mockBindings() 等）不必補；store 端一律用
+  // `this.bindings?.LoadTurnsBefore` 呼叫，沒提供時退回 Task 26 之前的行為
+  // （空殼 view，不拋錯）。簽章逐字鏡射 TurnWindowBindings。
+  LoadTurnsBefore?(wsid: string, beforeEventID: string, n: number): Promise<Envelope[]>
+  // SetPaneLayout：pane pins／focused pane 的 durable 寫入（§3.2.1 白名單）。
+  // **optional**（同 EndSession／LoadTurnsBefore 的理由）——session store 的
+  // persistLayout() 是唯一呼叫端，沒提供時（dev 未 setBindings、既有測試的
+  // bindings 字面量）靜默跳過持久化、其餘釘選行為完全不變。
+  SetPaneLayout?(pins: string[], focused: string): Promise<void>
+}
+// PaneLayoutInfo：PaneLayout() 的結果（逐字鏡射 Go 的 main.PaneLayout json
+// tag）。pins 固定兩格、空字串＝該 pane 沒有釘選；focused 是 pins 其中一個
+// WSID，或空字串＝focused pane 目前是空的。Go 端已濾掉 tombstone／不存在的
+// WSID（見 App.PaneLayout doc），前端不必再判斷 registry 語意。
+export interface PaneLayoutInfo { pins: string[]; focused: string }
+// PaneLayoutBindings：§3.2.1／§3.8 的 pane 釘選持久化——讀（啟動重建兩個釘選
+// pane 的唯一輸入）與寫（使用者釘選／切焦點）。獨立成一個介面，理由同
+// WorkspaceSessionBindings：session store 只從 Bindings 取用 SetPaneLayout，
+// 讀取端在 App.vue 的 onMounted。
+export interface PaneLayoutBindings {
+  PaneLayout(): Promise<PaneLayoutInfo>
+  SetPaneLayout(pins: string[], focused: string): Promise<void>
+}
+// SessionLifecycleBindings：以 WSID 定址的其餘 lifecycle 入口（Task 26 一併
+// 切換）。與 Bindings 分開的理由同 EvidenceBindings：session store 的 mock 只
+// 需要 StartSession／SendMessage 兩個欄位。
+export interface SessionLifecycleBindings {
+  EndSession(wsid: string): Promise<void>
+  NewSession(wsid: string): Promise<void>
+  TerminateSession(wsid: string): Promise<void>
+}
+// SessionInfo：ListSessions 的單筆結果（逐字鏡射 Go 的 main.SessionInfo json
+// tag）。registry 是「有哪些 session」的權威，available 反映 Manager 是否真的
+// 能定址它——false 時 UI 顯示為不可操作，而不是把它藏起來。
+export interface SessionInfo {
+  wsid: string; provider: string; task_label: string
+  resume_session_id: string; created_at: string
+  available: boolean
+  // state：reducer 的 SessionState（idle／waiting／streaming／tool_running／
+  // awaiting_approval／retrying／done／failed），與 conversation lane 的
+  // state_change envelope **同一個 reducer、同一個值域**——不是 Manager 內部的
+  // slot phase（starting／active／ending，沒有對外出口）。同源是 store 可以直接
+  // 覆寫 SessionMeta.state 的理由。
+  state: string
+}
+// WorkspaceSessionBindings：M3b Task 4 純新增的 CreateSession——回傳新 session
+// 的 WSID。獨立於 Bindings（session store 用）之外，理由同 EvidenceBindings：
+// session store 目前只消費 StartSession／SendMessage，其 test mock 也只給這兩個
+// 欄位；WSID 化的 store 切換是 Task 26 的原子改動，這裡不提前擴大 Bindings。
+export interface WorkspaceSessionBindings {
+  CreateSession(provider: string, taskLabel: string): Promise<string>
+  // ListSessions：M3b Task 26——前端 session 清單的唯一來源（registry live
+  // entries ＋ slot 可解析性）。
+  ListSessions(): Promise<SessionInfo[]>
+  // RemoveSession：M3b Task 22 純新增——使用者明確移除（tombstone，§3.6.1），
+  // 與 CreateSession 同一群組。
+  RemoveSession(wsid: string): Promise<void>
+}
+// CodexRecordingBindings：M3b Task 13 純新增的 RecoverCodexRecording——§3.4.6
+// recorder error latch 的 in-process 復原入口（latch 期間新 Codex session 被拒，
+// 這是唯一的解除路徑）。獨立成一個介面，理由同 WorkspaceSessionBindings：
+// session store 不消費它，UI 接線是後續 task 的事，這裡不提前擴大 Bindings。
+export interface CodexRecordingBindings {
+  RecoverCodexRecording(): Promise<void>
+}
+// TurnWindowBindings：M3b Task 20 純新增的 LoadTurnsBefore——§3.8 的視窗化載入
+// 與向上分頁。beforeEventID 為空＝尾端視窗（最近 n 個完整 turn ＋未結束的目前
+// turn）；帶 cursor＝該 turn 之前的 n 個完整 turn。回傳 Envelope[]，但 pane 的
+// lazy load 接線是 Task 29 的事，這裡同樣不提前擴大 Bindings。
+export interface TurnWindowBindings {
+  LoadTurnsBefore(wsid: string, beforeEventID: string, n: number): Promise<Envelope[]>
 }
 // EvidenceBindings：Task 22 TCA workspace 六個多參數 Go 綁定——同 SendMessage
 // 的既定教訓（M1.5 review P1-1），每個 adapter 都逐參數轉發，順序鎖在

@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateDecisionContext, GateList, RestoreViews, SpecList } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateDecisionContext, GateList, ListSessions, SpecList } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
@@ -16,7 +16,8 @@ import { escalationBadge } from './lib/escalationBadge'
 import { resolveResubmitTarget } from './lib/staleNav'
 import type { GateEntry, RiskSelection } from './types'
 import SettingsBar from './components/SettingsBar.vue'
-import ChatPanel from './components/ChatPanel.vue'
+import DualPane from './components/DualPane.vue'
+import SessionList from './components/SessionList.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
 import FileTree from './components/FileTree.vue'
@@ -156,6 +157,45 @@ watch(timelineOpen, v => save('wb.tl.open', v))
 watch(timelineHeight, v => save('wb.tl.height', v))
 watch(gateWidth, v => save('wb.gate.width', v))
 
+// tlUnread：**timeline 收合期間**抵達的錯誤數（Task 2a rev2 review C2）。
+//
+// 為什麼需要：workspace 通知與 lifecycle 拒絕（registry uncertain latch、
+// 建立／移除／開新對話失敗）唯一的使用者出口就是 Timeline，而 Timeline 掛在
+// `v-show="timelineOpen"` 之下，`timelineOpen` 又被寫進 localStorage——使用者
+// 收合過一次就**跨重啟保持收合**。沒有 badge 的話，那個狀態下這條出口的可見度
+// 是零，後端 fail loud 得再大聲也沒用。
+//
+// 這不是第三條通知管道，是讓現有那一條在收合狀態下仍然可靠：只在 toggle 上
+// 顯示一個計數，不搶焦點、不強制展開。展開即歸零（使用者已經看到內容了）。
+// 來源是 store 的**單調** errorSeq，不是 `s.timeline` 的投影（rev3 review）：
+// 那個 getter 只讀 focused view，非 focus pane 的錯誤不會被算到（漏報），而且
+// 切 pane 會讓數字上下跳、把已讀的重新算成未讀（誤報）。
+const tlUnread = ref(0)
+watch(() => s.errorSeq, (now, prev) => {
+  if (!timelineOpen.value) tlUnread.value += now - prev
+})
+watch(timelineOpen, v => { if (v) tlUnread.value = 0 })
+
+// latchForcedOpen：registry uncertain latch 抵達時**強制展開一次**（one-shot）。
+//
+// 為什麼 badge 不夠：latch 的成本不對稱——它是「必須重啟、之後每個 lifecycle
+// 操作都會被拒」的狀態，使用者晚一分鐘看到就是多按 N 次都失敗，跟一般
+// stream_error 不是同一個等級。
+//
+// 這**不是**第三條通知管道：出口仍然是 Timeline 那一條，只是保證它在那一刻是
+// 開的。one-shot flag 讓使用者之後可以自己收合，不會被反覆搶走畫面。
+//
+// **已知副作用**：`timelineOpen` 有一個 watcher 會 save 進 localStorage，所以
+// 強制展開會**改寫使用者記憶的收合偏好**。判斷是可接受——latch 之後使用者本來
+// 就該看 timeline，而他隨時可以再收合（收合同樣會被記住）。
+const latchForcedOpen = ref(false)
+watch(() => s.latchSeq, n => {
+  if (n > 0 && !latchForcedOpen.value) {
+    latchForcedOpen.value = true
+    timelineOpen.value = true
+  }
+})
+
 // Timeline 拖高：resize handle 垂直拖曳
 let dragStartY = 0
 let dragStartH = 0
@@ -190,11 +230,12 @@ function onGateResizeStart(e: MouseEvent) {
   window.addEventListener('mouseup', onGateResizeEnd)
 }
 
-// 快捷鍵：Cmd+1/2 切 provider tab、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
+// 快捷鍵：Cmd+1/2 切 pane 焦點、Cmd+K 聚焦輸入框（Esc 由 ApprovalDialog 處理）
+// ——Task 26 之後 pane 綁 WSID，不再是 provider tab。
 function onGlobalKeydown(e: KeyboardEvent) {
   if (!e.metaKey) return
-  if (e.key === '1') { e.preventDefault(); s.setActiveProvider('claude') }
-  else if (e.key === '2') { e.preventDefault(); s.setActiveProvider('codex') }
+  if (e.key === '1') { e.preventDefault(); s.setFocus(0) }
+  else if (e.key === '2') { e.preventDefault(); s.setFocus(1) }
   else if (e.key === 'k') {
     e.preventDefault()
     document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus()
@@ -211,10 +252,24 @@ onMounted(async () => {
     else if (dst === 'assist') assist.applyAssistEvent(e)
     else if (dst === 'plan') plan.applyAssistEvent(e)
     else if (dst === 'evidence') evidence.applyEvidenceEvent(e)
+    // workspace scope 但非 gate／evidence 的事件（replay index degraded、codex
+    // broadcast、dispatch fail loud）——此前全被丟進 gate store 靜默丟棄。
+    else if (dst === 'notice') s.applyNotice(e)
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
-  try { s.restoreViews(await RestoreViews() as any) } catch { /* dev 無綁定時忽略 */ }
+  // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
+  // Task 29 的 lazy load，這裡只 hydrate metadata。
+  try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
+  // §3.8「啟動只重建兩個釘選 pane」的**輸入**：registry 的 pane pins／focused
+  // pane（§3.2.1 白名單）。必須排在 hydrateSessions 之後——restoreLayout 只釘
+  // 已經有 metadata 的 WSID（見該 action 的說明）。失敗只記錄不擋啟動：拿不到
+  // 排列的降級是「兩個 pane 是空的、使用者自己釘」，不該連 app 都開不起來。
+  try {
+    await s.restoreLayout(await wailsBindings.PaneLayout())
+  } catch (e) {
+    s.pushNotice(t('app.paneLayout.restoreFailed', { error: String(e) }))
+  }
   try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
   await refreshEscalation()
@@ -230,7 +285,10 @@ onMounted(async () => {
       <span v-if="cliInfo.startupError" class="err">{{ t('app.startupError', { error: cliInfo.startupError }) }}</span>
     </div>
     <div class="body">
-      <aside><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></aside>
+      <aside class="side">
+        <div class="side-sessions"><SessionList /></div>
+        <div class="side-files"><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></div>
+      </aside>
       <main>
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
@@ -241,7 +299,7 @@ onMounted(async () => {
           <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
           <button :class="{ active: tab === 'tca' }" @click="tab = 'tca'">{{ t('app.tab.tca') }}</button>
         </nav>
-        <ChatPanel v-show="tab === 'chat'" />
+        <DualPane v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
         <SpecWorkspace v-if="tab === 'spec'" />
         <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" />
@@ -291,6 +349,8 @@ onMounted(async () => {
     <div v-show="timelineOpen" class="tl" :style="{ height: timelineHeight + 'px' }"><Timeline /></div>
     <button class="tl-toggle" @click="timelineOpen = !timelineOpen">
       {{ (timelineOpen ? '▾ ' : '▸ ') + t('app.timeline.label') }}
+      <span v-if="tlUnread > 0" class="tl-badge" data-test="tl-unread"
+        :title="t('app.timeline.unreadTooltip')">{{ tlUnread }}</span>
     </button>
     <StatusBar />
     <ApprovalDialog />
@@ -312,6 +372,9 @@ body { background: var(--bg-app); color: var(--text); font-family: ui-sans-serif
 .meta .err { color: var(--err); margin-left: 8px; }
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; border-right: 1px solid var(--border); overflow-y: auto; }
+.side { display: flex; flex-direction: column; }
+.side-sessions { flex: 0 1 45%; overflow-y: auto; border-bottom: 1px solid var(--border); }
+.side-files { flex: 1; overflow-y: auto; min-height: 0; }
 .gate-panel { border-left: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
 .gate-panel .side-nav { display: flex; gap: 4px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .gate-panel .side-nav button { border: none; background: transparent; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
@@ -334,4 +397,5 @@ main > :not(nav) { flex: 1; min-height: 0; }
 .tl-resize { height: 4px; cursor: row-resize; background: transparent; }
 .tl-resize:hover { background: var(--accent); }
 .tl-toggle { align-self: flex-start; font-size: 11px; background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 2px 10px; }
+.tl-badge { margin-left: 6px; background: var(--err); color: var(--bg-app); border-radius: 8px; padding: 0 5px; font-weight: 600; }
 </style>

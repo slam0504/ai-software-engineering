@@ -21,7 +21,50 @@ var (
 	ErrStaleSession    = errors.New("appcore: stale session token")
 	ErrStaleReset      = errors.New("appcore: stale reset token")
 	ErrClosed          = errors.New("appcore: manager closed")
+
+	// M3b §3.1：per-WSID slot registry ＋三段建立交易的 sentinel。
+	ErrSessionLimit     = errors.New("appcore: session slot limit reached")
+	ErrSessionNotFound  = errors.New("appcore: unknown workspace session")
+	ErrStaleCreate      = errors.New("appcore: stale create token")
+	ErrProviderMismatch = errors.New("appcore: event provider != slot provider")
+
+	// M3b §3.6.2：移除＝釋放名額的最後一步。呼叫端必須先完成 teardown（slot 收
+	// 回 idle），才能呼叫 RemoveSession——非 idle 一律拒絕，不得把「還在收尾」
+	// 的 slot 直接砍掉。
+	ErrSessionNotIdle = errors.New("appcore: session must be idle to remove")
+
+	// M3b §1.1：每 session 至多一個進行中 turn。Codex 端 ThreadRunner 另有
+	// ErrTurnActive 擋在 wire 層，但那是 provider 專屬的；Claude 走 stream-json
+	// stdin，多送一筆不會被 CLI 拒絕。因此不變量統一由本層守（見 turnInFlight）。
+	ErrTurnInFlight = errors.New("appcore: a turn is already in flight for this session")
 )
+
+// turnInFlight：reducer 狀態是否代表「上一輪還沒收尾」。
+//
+// 白名單寫成「terminal 才算閒置」而非「列舉進行中狀態」：新增一個 SessionState
+// 時，未列舉的預設會落在**保守**的那一邊（視為進行中、擋住第二筆），而不是靜默
+// 放行第二個 turn。idle 是 Reset() 之後的起點，done／failed 是 §5.4 的兩個
+// terminal 狀態。
+func turnInFlight(st contract.SessionState) bool {
+	switch st {
+	case contract.StateIdle, contract.StateDone, contract.StateFailed:
+		return false
+	}
+	return true
+}
+
+// MaxSessionsPerProvider：凍結常數——不進 config、不讀環境變數（M3b §3.1.4）。
+const MaxSessionsPerProvider = 4
+
+// WSID：host-side 穩定 workspace session identity（contract.NewULID 產生）。
+type WSID string
+
+// CreateToken：ReserveSession → CommitCreate／AbortCreate 的一次性 ownership token。
+// 已 commit／已 abort 的 token 再次使用一律 ErrStaleCreate。
+type CreateToken struct {
+	wsid WSID
+	seq  uint64
+}
 
 // SubmissionID：coordinator 的唯一 ownership token（per slot）。
 type SubmissionID struct{ gen, seq uint64 }
@@ -33,15 +76,33 @@ type SessionToken struct{ gen, seq uint64 }
 // ResetToken：NewSession 的 reset ownership token（M1.5；plan §5.4）。
 type ResetToken struct{ gen, seq uint64 }
 
+// TurnIndex：replay index 的 Manager 側視角（*replayindex.Index 滿足）。
+// 介面而非具體型別是為了避免 import cycle——replayindex 依賴 appcore 的
+// AppendReceipt，反向依賴不成立。
+//
+// 契約（§3.5.4／§3.5.7）：
+//   - Observe 在 Manager 的序列化 mutex 內、**audit 寫入成功之後**被呼叫，
+//     所以 index 看到的順序與 events.jsonl 的 byte 順序完全一致；
+//   - **Observe 絕不能讓 provider turn 失敗**：實作端自行 latch degraded 並
+//     回 nil，Manager 這側也不因它的回傳值改變任何行為（見 writeAndEmitLocked）。
+type TurnIndex interface {
+	Observe(env contract.Envelope, receipt AppendReceipt) error
+}
+
 type Config struct {
 	Sink                  AuditSink                   // 必填
 	Emit                  func(env contract.Envelope) // 必填：UI 出口
 	ClaudeUsageCumulative bool                        // Task 4 VERDICT=per-turn → false（累加制）
+
+	// Index：replay index（可為 nil——index 只是快取，沒有它 Manager 行為
+	// 完全不變）。Task 20 接線；只有 App 的 production 啟動流程會填。
+	Index TurnIndex
 }
 
 type pendingEntry struct {
 	ev             contract.Event
-	resolveApprove bool // EmitApprovalDecision 的 reducer side effect 隨事件入列
+	resolveApprove bool   // EmitApprovalDecision 的 reducer side effect 隨事件入列
+	correlationID  string // §3.6.4：approval id，供 Envelope.CorrelationID 回填（其他事件留空）
 }
 
 type sessionPhase int
@@ -54,13 +115,20 @@ const (
 	phaseResetting // M1.5：NewSession 的「teardown → restore reset」ownership 區段
 )
 
-// slot：單一 provider 的 session 狀態容器（M1.5 plan §5.3）。不對外暴露——
-// Manager 是唯一 aggregate root，所有操作帶 provider 進同一 mutex。
+// slot：單一 workspace session 的狀態容器（M1.5 plan §5.3；M3b §3.1 改為 per-WSID）。
+// 不對外暴露——Manager 是唯一 aggregate root，所有操作一律帶 WSID 進同一 mutex。
 type slot struct {
 	reducer    *contract.Reducer
 	taskID     string
 	totalCost  float64
 	totalUsage contract.Usage
+
+	// M3b §3.1：slot identity。wsid 供 emit 路徑回填 Envelope.WorkspaceSessionID。
+	// Task 26 之後每個 slot 都由 ReserveSession 建立，wsid 必非空。
+	wsid      WSID
+	provider  contract.Provider
+	committed bool   // false = 只保留名額，尚未 CommitCreate；一律拒絕
+	createSeq uint64 // CreateToken 比對用
 
 	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken／ResetToken 全部失效
 	seq            uint64
@@ -92,29 +160,228 @@ func newSlot() *slot { return &slot{reducer: contract.NewReducer()} }
 // resetting 期間 BeginSubmit／BeginNewSessionSubmit／BeginEndSession／第二個
 // BeginReset 一律 ErrResetInProgress。非法轉移一律 sentinel error；stale token
 // 一律 no-op error。跨 provider：一個 slot 的 pending submit 不阻塞另一個 slot。
+//
+// # Slot registry（M3b §3.1）
+//
+// slot 以 WSID 為 key（同一 provider 最多 MaxSessionsPerProvider 個）。建立走
+// ReserveSession → CommitCreate／AbortCreate 三段交易：reservation 當下即佔名額，
+// 未 commit 的 slot 對新入口不可見。**全部入口一律只讀不建**（Task 9 刪除
+// provider-keyed 簽名、Task 26 刪除最後的 LegacyWSID 惰性建立入口）。
 type Manager struct {
-	mu       sync.Mutex
-	cfg      Config
-	slots    map[contract.Provider]*slot
-	auditErr error
-	closed   bool
+	mu         sync.Mutex
+	cfg        Config
+	slots      map[WSID]*slot
+	reserveSeq uint64
+	auditErr   error
+	closed     bool
 }
 
 func New(cfg Config) *Manager {
-	return &Manager{cfg: cfg, slots: map[contract.Provider]*slot{}}
+	return &Manager{cfg: cfg, slots: map[WSID]*slot{}}
 }
 
-func (m *Manager) slotLocked(p contract.Provider) *slot {
-	sl, ok := m.slots[p]
-	if !ok {
-		sl = newSlot()
-		m.slots[p] = sl
+// countLocked：該 provider 已佔用的名額（含尚未 commit 的 reservation）。
+// Task 26 刪除 legacy slot 之後 slots 裡只剩使用者的 session，每 provider 的
+// 上限因此就是 MaxSessionsPerProvider，無任何豁免項。
+func (m *Manager) countLocked(p contract.Provider) int {
+	n := 0
+	for _, sl := range m.slots {
+		if sl.provider == p {
+			n++
+		}
 	}
-	return sl
+	return n
+}
+
+// ReserveSession：三段建立交易第一段——同一 mutex 內完成「檢查上限 → 產 WSID →
+// 放進 slots」，第 5 個併發建立不可穿透。
+func (m *Manager) ReserveSession(p contract.Provider) (WSID, CreateToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return "", CreateToken{}, ErrClosed
+	}
+	if m.countLocked(p) >= MaxSessionsPerProvider {
+		return "", CreateToken{}, ErrSessionLimit
+	}
+	w := WSID(contract.NewULID(time.Now()))
+	m.reserveSeq++
+	sl := newSlot()
+	sl.wsid, sl.provider, sl.createSeq = w, p, m.reserveSeq
+	m.slots[w] = sl // reservation 當下即佔名額
+	return w, CreateToken{wsid: w, seq: m.reserveSeq}, nil
+}
+
+// pendingCreateLocked：只認尚未 commit／abort 的 reservation；其餘一律 stale。
+func (m *Manager) pendingCreateLocked(tok CreateToken) (*slot, error) {
+	sl, ok := m.slots[tok.wsid]
+	if !ok || sl.committed || tok.seq == 0 || sl.createSeq != tok.seq {
+		return nil, ErrStaleCreate
+	}
+	return sl, nil
+}
+
+// CommitCreate：第二段——正式建立，slot 自此對新入口可見。
+func (m *Manager) CommitCreate(tok CreateToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	sl, err := m.pendingCreateLocked(tok)
+	if err != nil {
+		return err
+	}
+	sl.committed = true
+	return nil
+}
+
+// AbortCreate：第三段——建立失敗退回名額。
+//
+// 與 CommitCreate 不同，**刻意不檢查 m.closed**：shutdown 期間仍必須能退回
+// reservation，否則「CommitCreate 失敗 → 補償 AbortCreate」這條路徑一旦與 Close
+// 競態，該名額就永久洩漏（slot 留在 map 裡且永遠不會被 commit）。本方法只刪
+// map entry，不 emit、不寫 sink，closed 後執行沒有副作用。Task 4 的建立交易
+// 補償直接依賴這個語意。
+func (m *Manager) AbortCreate(tok CreateToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.pendingCreateLocked(tok); err != nil {
+		return err
+	}
+	delete(m.slots, tok.wsid)
+	return nil
+}
+
+// RestoreDormant：把 registry 既存的 dormant session 掛回 slot（已 committed，
+// 不經 reservation）。同 WSID＋同 provider 重複 restore 為 no-op（啟動修復序列在
+// crash 後重跑必須冪等）；provider 不符、或該 WSID 正卡在一筆未完成的 reservation
+// 一律 fail loud——後者若放行，呼叫端會誤判 restore 成功，之後每個 ...WS 呼叫都是
+// ErrSessionNotFound。
+func (m *Manager) RestoreDormant(w WSID, p contract.Provider) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	if w == "" {
+		return ErrSessionNotFound
+	}
+	if sl, ok := m.slots[w]; ok {
+		if sl.provider != p {
+			return ErrProviderMismatch
+		}
+		if !sl.committed { // 撞上進行中的 reservation：不可當作 restore 成功
+			return ErrStaleCreate
+		}
+		return nil
+	}
+	if m.countLocked(p) >= MaxSessionsPerProvider {
+		return ErrSessionLimit
+	}
+	sl := newSlot()
+	sl.wsid, sl.provider, sl.committed = w, p, true
+	m.slots[w] = sl
+	return nil
+}
+
+// RemoveSession：三段建立交易的逆操作（§3.6.2）——刪除 committed slot，釋放該
+// provider 的名額。這是「釋放名額」本身這一步，不做 teardown／registry
+// tombstone：呼叫端（App.RemoveSession）必須先完成 deny approvals／teardown／
+// lease finalize／cleanup／tombstone persist 全部成功，才能呼叫到這裡（§3.6.2
+// 凍結順序：釋放名額必須是最後一步）。
+//
+// 只接受 idle phase：非 idle（starting／active／ending／resetting）代表呼叫端
+// 尚未真的把 session 收尾，直接砍掉 slot 會讓仍在跑的 goroutine（pump／teardown
+// reaper）之後對一個已消失的 WSID 操作，回一堆 ErrSessionNotFound 掩蓋真正的
+// bug——寧可 fail loud。
+func (m *Manager) RemoveSession(w WSID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	if sl.phase != phaseIdle {
+		return ErrSessionNotIdle
+	}
+	delete(m.slots, w)
+	return nil
+}
+
+// Removable：RemoveSession 動手（deny approvals／teardown／cleanup 檔案）之前
+// 的唯讀前置檢查（review round-2 Important）——若 slot 目前正處於
+// starting／ending／resetting，或 active 但有 in-flight submission，這次移除
+// 的 teardown 注定會在 BeginEndSession 撞到同樣的錯誤而失敗；deny_approvals／
+// cleanup_files 不該在那之前先做，否則失敗的移除會對仍存活的 session 留下
+// 「approval 已被 deny、MCP config 已被刪」這種不可逆副作用（§3.6.2「任一步
+// 失敗都保留 slot」的精神是失敗不得留下傷害，不只是不遞減名額）。
+//
+// 仍是 check-then-act：本方法只唯讀、不做任何狀態轉移，呼叫端從這裡回來到
+// 真正呼叫 BeginEndSession 之間，phase 理論上仍可能被其他路徑改變（例如
+// StartSession 開始一筆新 submit）。徹底收斂需要一個獨立的 removing phase
+// （會動到 phase 狀態機，超出本次改動範圍），這裡只把窗口從「整個六步」收窄
+// 到「gate 與 teardown 之間那一小段」——殘餘窗口見 App.RemoveSession doc。
+func (m *Manager) Removable(w WSID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	switch sl.phase {
+	case phaseStarting:
+		return ErrStartInProgress
+	case phaseEnding:
+		return ErrEndInProgress
+	case phaseResetting:
+		return ErrResetInProgress
+	}
+	if sl.submitting != nil {
+		return ErrSubmitActive
+	}
+	return nil
+}
+
+// SlotCount：該 provider 目前佔用的名額（reservation 亦計入）。
+func (m *Manager) SlotCount(p contract.Provider) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.countLocked(p)
+}
+
+// ProviderOf：WSID → provider 的登錄查詢（含尚未 commit 的 reservation）。
+func (m *Manager) ProviderOf(w WSID) (contract.Provider, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.providerOfLocked(w)
+}
+
+// providerOfLocked：唯讀查詢，不建立任何 slot。closed 路徑用它補齊 drop 通知的
+// provider（此時已不能走 committedSlotLocked）。
+func (m *Manager) providerOfLocked(w WSID) (contract.Provider, bool) {
+	sl, ok := m.slots[w]
+	if !ok {
+		return "", false
+	}
+	return sl.provider, true
+}
+
+// committedSlotLocked：新入口唯一的 slot 解析路徑——只讀不建。未 commit 或不存在
+// 一律 ErrSessionNotFound（廢除舊 slotLocked 的「讀取時隱式建立」）。
+func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
+	sl, ok := m.slots[w]
+	if !ok || !sl.committed {
+		return nil, ErrSessionNotFound
+	}
+	return sl, nil
 }
 
 // newSessionLocked：flush 該 slot 殘留 queue（掛舊 task）→ 換代 → 重設。
-func (m *Manager) newSessionLocked(p contract.Provider, sl *slot, taskID string) {
+func (m *Manager) newSessionLocked(sl *slot, taskID string) {
 	m.flushLocked(sl)
 	sl.gen++
 	sl.submitting, sl.fromNewSession = nil, false
@@ -124,20 +391,32 @@ func (m *Manager) newSessionLocked(p contract.Provider, sl *slot, taskID string)
 	sl.totalCost, sl.totalUsage = 0, contract.Usage{}
 }
 
-func (m *Manager) NewSession(p contract.Provider, taskID string) {
+func (m *Manager) NewSession(w WSID, taskID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.newSessionLocked(p, m.slotLocked(p), taskID)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	m.newSessionLocked(sl, taskID)
+	return nil
 }
 
 // BeginNewSessionSubmit：StartSession 的單一 ownership 交易（per slot）。
-func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (SubmissionID, error) {
+func (m *Manager) BeginNewSessionSubmit(w WSID, taskID string) (SubmissionID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SubmissionID{}, err
+	}
+	return m.beginNewSessionSubmitLocked(sl, taskID)
+}
+
+func (m *Manager) beginNewSessionSubmitLocked(sl *slot, taskID string) (SubmissionID, error) {
 	switch sl.phase {
 	case phaseActive, phaseEnding:
 		return SubmissionID{}, ErrSessionActive
@@ -149,7 +428,7 @@ func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (Sub
 	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
 	}
-	m.newSessionLocked(p, sl, taskID)
+	m.newSessionLocked(sl, taskID)
 	sl.seq++
 	id := SubmissionID{gen: sl.gen, seq: sl.seq}
 	sl.submitting, sl.fromNewSession = &id, true
@@ -158,13 +437,20 @@ func (m *Manager) BeginNewSessionSubmit(p contract.Provider, taskID string) (Sub
 }
 
 // BeginEndSession：進入 ending 並取得 token（per slot）。
-func (m *Manager) BeginEndSession(p contract.Provider) (SessionToken, error) {
+func (m *Manager) BeginEndSession(w WSID) (SessionToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SessionToken{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SessionToken{}, err
+	}
+	return m.beginEndSessionLocked(sl)
+}
+
+func (m *Manager) beginEndSessionLocked(sl *slot) (SessionToken, error) {
 	switch sl.phase {
 	case phaseIdle:
 		return SessionToken{}, ErrNoSession
@@ -185,13 +471,28 @@ func (m *Manager) BeginEndSession(p contract.Provider) (SessionToken, error) {
 	return tok, nil
 }
 
-// CancelEndSession：ending → active 復原（teardown 前）；stale token no-op error。
-func (m *Manager) CancelEndSession(p contract.Provider, t SessionToken) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+// endingOwnerLocked：ending 階段的 token 比對（Cancel／Finish／IntoReset 共用）。
+func endingOwnerLocked(sl *slot, t SessionToken) error {
 	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
 		return ErrStaleSession
+	}
+	return nil
+}
+
+// CancelEndSession：ending → active 復原（teardown 前）；stale token no-op error。
+func (m *Manager) CancelEndSession(w WSID, t SessionToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.cancelEndSessionLocked(sl, t)
+}
+
+func (m *Manager) cancelEndSessionLocked(sl *slot, t SessionToken) error {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return err
 	}
 	sl.phase = phaseActive
 	sl.endTok = nil
@@ -199,12 +500,19 @@ func (m *Manager) CancelEndSession(p contract.Provider, t SessionToken) error {
 }
 
 // FinishEndSession：收尾完成；stale token 一律 no-op error。
-func (m *Manager) FinishEndSession(p contract.Provider, t SessionToken) error {
+func (m *Manager) FinishEndSession(w WSID, t SessionToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
-		return ErrStaleSession
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.finishEndSessionLocked(sl, t)
+}
+
+func (m *Manager) finishEndSessionLocked(sl *slot, t SessionToken) error {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return err
 	}
 	sl.phase = phaseIdle
 	sl.endTok = nil
@@ -212,13 +520,20 @@ func (m *Manager) FinishEndSession(p contract.Provider, t SessionToken) error {
 }
 
 // BeginReset：idle → resetting（NewSession 於無 active session 時的入口）。
-func (m *Manager) BeginReset(p contract.Provider) (ResetToken, error) {
+func (m *Manager) BeginReset(w WSID) (ResetToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return ResetToken{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return ResetToken{}, err
+	}
+	return m.beginResetLocked(sl)
+}
+
+func (m *Manager) beginResetLocked(sl *slot) (ResetToken, error) {
 	switch sl.phase {
 	case phaseStarting:
 		return ResetToken{}, ErrStartInProgress
@@ -237,12 +552,19 @@ func (m *Manager) BeginReset(p contract.Provider) (ResetToken, error) {
 
 // FinishEndSessionIntoReset：ending → resetting 原子轉移（無 idle 縫隙）——
 // NewSession 於有 active session 時，收尾完成即直接持有 reset ownership。
-func (m *Manager) FinishEndSessionIntoReset(p contract.Provider, t SessionToken) (ResetToken, error) {
+func (m *Manager) FinishEndSessionIntoReset(w WSID, t SessionToken) (ResetToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	if sl.phase != phaseEnding || sl.endTok == nil || *sl.endTok != t {
-		return ResetToken{}, ErrStaleSession
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return ResetToken{}, err
+	}
+	return m.finishEndSessionIntoResetLocked(sl, t)
+}
+
+func (m *Manager) finishEndSessionIntoResetLocked(sl *slot, t SessionToken) (ResetToken, error) {
+	if err := endingOwnerLocked(sl, t); err != nil {
+		return ResetToken{}, err
 	}
 	sl.endTok = nil
 	return m.enterResetLocked(sl), nil
@@ -257,10 +579,17 @@ func (m *Manager) enterResetLocked(sl *slot) ResetToken {
 }
 
 // FinishReset：resetting → idle；stale token 回 ErrStaleReset no-op。
-func (m *Manager) FinishReset(p contract.Provider, t ResetToken) error {
+func (m *Manager) FinishReset(w WSID, t ResetToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.finishResetLocked(sl, t)
+}
+
+func (m *Manager) finishResetLocked(sl *slot, t ResetToken) error {
 	if sl.phase != phaseResetting || sl.resetTok == nil || *sl.resetTok != t {
 		return ErrStaleReset
 	}
@@ -269,35 +598,64 @@ func (m *Manager) FinishReset(p contract.Provider, t ResetToken) error {
 	return nil
 }
 
-func (m *Manager) SessionActive(p contract.Provider) bool {
+// IsActive：該 workspace session 是否處於 active phase；未 commit／不存在的 WSID
+// 一律 false。
+func (m *Manager) IsActive(w WSID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.slotLocked(p).phase == phaseActive
+	sl, err := m.committedSlotLocked(w)
+	return err == nil && sl.phase == phaseActive
 }
 
-func (m *Manager) Emit(ev contract.Event) {
+// Emit：session-scope 事件的唯一出口——WSID 定址＋provider fail-loud 檢查。
+func (m *Manager) Emit(w WSID, ev contract.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed { // closed 最先——不 queue、不 Apply、不動 totals
-		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider))
+	if m.closed { // closed 最先：單一 UI stream_error、不寫 sink
+		m.emitClosedDroppedLocked(string(ev.Kind), string(ev.Provider), w)
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	if ev.Provider != sl.provider {
+		return ErrProviderMismatch
+	}
+	m.queueOrEmitLocked(sl, pendingEntry{ev: ev})
+	return nil
+}
+
+// queueOrEmitLocked：submitting 中只 queue 該 slot（跨 slot 不互相阻塞），
+// 否則直接送出。所有 session-scope 事件出口（Emit／approval）共用這一段。
+func (m *Manager) queueOrEmitLocked(sl *slot, e pendingEntry) {
+	if sl.submitting != nil {
+		sl.pendingBuf = append(sl.pendingBuf, e)
 		return
 	}
-	sl := m.slotLocked(ev.Provider)
-	if sl.submitting != nil { // 只 queue 該 slot（跨 provider 不互相阻塞）
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
-		return
+	m.emitLocked(sl, e.ev, e.correlationID)
+	if e.resolveApprove {
+		if st, changed := sl.reducer.ResolveApproval(); changed {
+			m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
+		}
 	}
-	m.emitLocked(sl, ev)
 }
 
 // BeginSubmit：既有 session 的後續輪（僅該 slot phaseActive 允許）。
-func (m *Manager) BeginSubmit(p contract.Provider) (SubmissionID, error) {
+func (m *Manager) BeginSubmit(w WSID) (SubmissionID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return SubmissionID{}, ErrClosed
 	}
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return SubmissionID{}, err
+	}
+	return m.beginSubmitLocked(sl)
+}
+
+func (m *Manager) beginSubmitLocked(sl *slot) (SubmissionID, error) {
 	switch sl.phase {
 	case phaseIdle:
 		return SubmissionID{}, ErrNoSession
@@ -310,6 +668,14 @@ func (m *Manager) BeginSubmit(p contract.Provider) (SubmissionID, error) {
 	}
 	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
+	}
+	// §1.1：每 session 至多一個進行中 turn。位置在**取得 ownership 之前**——先
+	// 佔住 sl.submitting 再回錯的話，這個 slot 從此永遠 ErrSubmitActive。
+	//
+	// 只擋 BeginSubmit，不擋 beginNewSessionSubmitLocked：後者是「開新對話」，
+	// newSessionLocked 會先 reducer.Reset()，上一代的殘留狀態依定義不再適用。
+	if turnInFlight(sl.reducer.Current()) {
+		return SubmissionID{}, ErrTurnInFlight
 	}
 	sl.seq++
 	id := SubmissionID{gen: sl.gen, seq: sl.seq}
@@ -328,10 +694,17 @@ func (m *Manager) checkOwnerLocked(sl *slot, id SubmissionID) error {
 }
 
 // AcceptSubmit：canonical user envelope 先行 → 該 slot queue 依序 flush。
-func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, text string) error {
+func (m *Manager) AcceptSubmit(w WSID, id SubmissionID, sessionID, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.acceptSubmitLocked(sl, id, sessionID, text)
+}
+
+func (m *Manager) acceptSubmitLocked(sl *slot, id SubmissionID, sessionID, text string) error {
 	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
@@ -340,17 +713,24 @@ func (m *Manager) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, 
 		sl.sessionGen = id.gen
 	}
 	sl.submitting, sl.fromNewSession = nil, false
-	m.emitLocked(sl, contract.Event{Provider: p, Kind: contract.KindMessage,
+	m.emitLocked(sl, contract.Event{Provider: sl.provider, Kind: contract.KindMessage,
 		Role: "user", SessionID: sessionID, Text: text,
-		Raw: []byte(`{"source":"workbench_user_input"}`)})
+		Raw: []byte(`{"source":"workbench_user_input"}`)}, "")
 	m.flushLocked(sl)
 	return nil
 }
 
-func (m *Manager) RejectSubmit(p contract.Provider, id SubmissionID) error {
+func (m *Manager) RejectSubmit(w WSID, id SubmissionID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	return m.rejectSubmitLocked(sl, id)
+}
+
+func (m *Manager) rejectSubmitLocked(sl *slot, id SubmissionID) error {
 	if err := m.checkOwnerLocked(sl, id); err != nil {
 		return err
 	}
@@ -366,7 +746,7 @@ func (m *Manager) flushLocked(sl *slot) {
 	buf := sl.pendingBuf
 	sl.pendingBuf = nil
 	for _, e := range buf {
-		m.emitLocked(sl, e.ev)
+		m.emitLocked(sl, e.ev, e.correlationID)
 		if e.resolveApprove {
 			if st, changed := sl.reducer.ResolveApproval(); changed {
 				m.emitStateLocked(sl, e.ev.Provider, e.ev.SessionID, st)
@@ -381,7 +761,7 @@ func (m *Manager) EmitWorkspace(kind string, bindings []contract.Binding, payloa
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(kind, "")
+		m.emitClosedDroppedLocked(kind, "", "") // workspace lane 不計入 slot（§3.1.6）
 		return
 	}
 	raw, _ := json.Marshal(payload)
@@ -407,7 +787,7 @@ func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed { // closed 最先——與其他出口一致（單一 UI stream_error、不寫 sink）
-		m.emitClosedDroppedLocked(string(contract.KindStreamError), string(provider))
+		m.emitClosedDroppedLocked(string(contract.KindStreamError), string(provider), "") // assist one-shot 無 slot
 		return
 	}
 	for _, ev := range evs {
@@ -420,45 +800,54 @@ func (m *Manager) EmitAssist(provider contract.Provider, correlationID, purpose 
 	}
 }
 
-func (m *Manager) EmitApprovalRequest(provider contract.Provider, sessionID, toolName string, raw []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(string(contract.KindApproval), string(provider))
-		return
-	}
-	sl := m.slotLocked(provider)
-	ev := contract.Event{Provider: provider, Kind: contract.KindApproval,
-		SessionID: sessionID, Text: toolName, Raw: raw}
-	if sl.submitting != nil { // approval 同樣入該 slot queue
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev})
-		return
-	}
-	m.emitLocked(sl, ev)
+// approvalRequestEvent／approvalDecisionEvent：新舊入口共用的事件組裝。id 是
+// approval id，回填到 pendingEntry.correlationID（§3.6.4：讓 approval 相關
+// Envelope 可用 CorrelationID 精確對應回單一 approval request，而非只靠 WSID
+// ／SessionID——同一 WSID 可能同時有多筆 pending approval）。
+func approvalRequestEvent(p contract.Provider, id, sessionID, toolName string, raw []byte) pendingEntry {
+	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApproval,
+		SessionID: sessionID, Text: toolName, Raw: raw}, correlationID: id}
 }
 
-func (m *Manager) EmitApprovalDecision(provider contract.Provider, sessionID, decision, reason string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed { // closed 最先
-		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(provider))
-		return
-	}
-	sl := m.slotLocked(provider)
-	ev := contract.Event{Provider: provider, Kind: contract.KindApprovalDecision,
+func approvalDecisionEvent(p contract.Provider, id, sessionID, decision, reason string) pendingEntry {
+	return pendingEntry{ev: contract.Event{Provider: p, Kind: contract.KindApprovalDecision,
 		SessionID: sessionID, Text: decision, Thinking: reason,
-		Raw: []byte(`{"decision":"` + decision + `"}`)}
-	if sl.submitting != nil {
-		sl.pendingBuf = append(sl.pendingBuf, pendingEntry{ev: ev, resolveApprove: true})
-		return
-	}
-	m.emitLocked(sl, ev)
-	if st, changed := sl.reducer.ResolveApproval(); changed {
-		m.emitStateLocked(sl, provider, sessionID, st)
-	}
+		Raw: []byte(`{"decision":"` + decision + `"}`)}, resolveApprove: true, correlationID: id}
 }
 
-func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
+func (m *Manager) EmitApprovalRequest(w WSID, id, sessionID, toolName string, raw []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先：drop 通知不因 WSID 是否存在而異
+		p, _ := m.providerOfLocked(w)
+		m.emitClosedDroppedLocked(string(contract.KindApproval), string(p), w)
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	m.queueOrEmitLocked(sl, approvalRequestEvent(sl.provider, id, sessionID, toolName, raw))
+	return nil
+}
+
+func (m *Manager) EmitApprovalDecision(w WSID, id, sessionID, decision, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed { // closed 最先：drop 通知不因 WSID 是否存在而異
+		p, _ := m.providerOfLocked(w)
+		m.emitClosedDroppedLocked(string(contract.KindApprovalDecision), string(p), w)
+		return ErrClosed
+	}
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	m.queueOrEmitLocked(sl, approvalDecisionEvent(sl.provider, id, sessionID, decision, reason))
+	return nil
+}
+
+func (m *Manager) emitLocked(sl *slot, ev contract.Event, correlationID string) {
 	semantics := ""
 	switch {
 	case ev.Kind == contract.KindUsage && ev.Usage != nil: // codex snapshot：覆寫
@@ -479,6 +868,10 @@ func (m *Manager) emitLocked(sl *slot, ev contract.Event) {
 		}
 	}
 	env := contract.Wrap(ev, sl.taskID)
+	env.WorkspaceSessionID = string(sl.wsid) // conversation lane 必填（§3.1.5）
+	if correlationID != "" {
+		env.CorrelationID = correlationID // §3.6.4：approval id 供事件流精確對應
+	}
 	if ev.Kind == contract.KindUsage || ev.Kind == contract.KindResult {
 		snap := sl.totalUsage
 		env.Usage = &snap // 輸出一律該 slot 的累計 snapshot
@@ -494,12 +887,28 @@ func (m *Manager) emitStateLocked(sl *slot, provider contract.Provider, sessionI
 	env := contract.Wrap(contract.Event{Provider: provider, Kind: contract.KindStateChange,
 		SessionID: sessionID, Raw: []byte(`{"state":"` + string(st) + `"}`)}, sl.taskID)
 	env.State = string(st)
+	env.WorkspaceSessionID = string(sl.wsid)
 	m.writeAndEmitLocked(env)
 }
 
 func (m *Manager) writeAndEmitLocked(env contract.Envelope) {
 	// closed 已在所有公開入口最先攔截；emitLocked 不可能於 closed 後執行。
-	sinkErr := m.cfg.Sink.Write(env)
+	receipt, sinkErr := m.cfg.Sink.Write(env)
+	if sinkErr == nil && m.cfg.Index != nil {
+		// §3.5.4 latch-but-not-block（凍結取捨）：index 只是快取，**它壞掉
+		// 絕不能讓 provider turn 失敗**。Observe 的契約是自行 latch degraded
+		// 並回 nil，所以這裡既不看回傳值、也不改變後續任何一步——事件照樣
+		// 出 UI、呼叫端照樣拿到成功。degraded 的可觀測性由 Config.Notify 那
+		// 條路徑負責（呼叫端會據此排程重建），不是靠這裡的錯誤傳播。
+		//
+		// 只在 sinkErr == nil 時餵：receipt 在寫入失敗時是零值，餵給
+		// index 會把 offset 0 當成真實位置，直接汙染 checkpoint。
+		//
+		// 位置固定在「同一個 mutex 內、Sink.Write 之後」：§3.5.7 的重建接回
+		// 要靠「取得這把鎖 = 凍結 audit 進度且 index 不會再前移」才有原子性，
+		// 把 Observe 移到鎖外就沒有那個保證了。
+		_ = m.cfg.Index.Observe(env, receipt)
+	}
 	m.cfg.Emit(env) // 原 envelope 先出（ID 較小），合成事件後出——輸出序嚴格遞增
 	if sinkErr != nil {
 		if m.auditErr == nil {
@@ -508,31 +917,42 @@ func (m *Manager) writeAndEmitLocked(env contract.Envelope) {
 		m.cfg.Emit(contract.Envelope{ // 只走 UI，不回寫 sink（防遞迴）
 			EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
 			Provider: env.Provider, Kind: string(contract.KindStreamError),
-			Error: "audit sink: " + sinkErr.Error(),
+			WorkspaceSessionID: env.WorkspaceSessionID, // §3.1.5：sink 失敗通知要能歸戶
+			Error:              "audit sink: " + sinkErr.Error(),
 		})
 	}
 }
 
 // emitClosedDroppedLocked：close 後的唯一輸出——單一 UI stream_error（不寫 sink）。
-func (m *Manager) emitClosedDroppedLocked(kind, provider string) {
+// wsid 帶上呼叫端已知的 workspace session（§3.1.5），讓前端能把 drop 通知歸戶到
+// 對應的 session tab；workspace／assist lane 無 slot，傳空值。
+func (m *Manager) emitClosedDroppedLocked(kind, provider string, wsid WSID) {
 	m.cfg.Emit(contract.Envelope{
 		EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
 		Provider: provider, Kind: string(contract.KindStreamError),
-		Error: "manager closed: event dropped (kind=" + kind + ")",
+		WorkspaceSessionID: string(wsid),
+		Error:              "manager closed: event dropped (kind=" + kind + ")",
 	})
 }
 
-func (m *Manager) Totals(p contract.Provider) (float64, contract.Usage) {
+func (m *Manager) Totals(w WSID) (float64, contract.Usage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl := m.slotLocked(p)
-	return sl.totalCost, sl.totalUsage
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return 0, contract.Usage{}, err
+	}
+	return sl.totalCost, sl.totalUsage, nil
 }
 
-func (m *Manager) State(p contract.Provider) contract.SessionState {
+func (m *Manager) State(w WSID) (contract.SessionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.slotLocked(p).reducer.Current()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return "", err
+	}
+	return sl.reducer.Current(), nil
 }
 
 func (m *Manager) AuditErr() error {
@@ -540,6 +960,15 @@ func (m *Manager) AuditErr() error {
 	defer m.mu.Unlock()
 	return m.auditErr
 }
+
+// EmitLocker：序列化「audit append ＋ index.Observe」的那一把鎖，供 replay
+// index 的 runtime 重建（§3.5.7 第 3 步）取得——重建的原子接回正是建立在
+// 「持有這把鎖期間不可能有新的 append」之上。
+//
+// 呼叫端契約：持有它時**不得呼叫任何 Manager 方法**（sync.Mutex 不可重入，
+// 當場自我死鎖），也不得跨 goroutine 傳遞 Unlock 的責任。目前唯一呼叫端是
+// App 的 rebuild orchestrator。
+func (m *Manager) EmitLocker() sync.Locker { return &m.mu }
 
 // Closed 回報 Manager 是否已 Close（shutdown 收束序 assert 用）。
 func (m *Manager) Closed() bool {
@@ -556,7 +985,7 @@ func (m *Manager) Close() error {
 	if m.closed {
 		return nil
 	}
-	for p, sl := range m.slots {
+	for _, sl := range m.slots {
 		if sl.submitting != nil || len(sl.pendingBuf) > 0 {
 			n := len(sl.pendingBuf)
 			sl.submitting, sl.fromNewSession = nil, false
@@ -566,8 +995,9 @@ func (m *Manager) Close() error {
 			m.flushLocked(sl) // sink 尚未關：queue 事件全數落 audit + UI
 			m.cfg.Emit(contract.Envelope{
 				EventID: contract.NewULID(time.Now()), TS: time.Now().UTC().Format(time.RFC3339Nano),
-				Provider: string(p), Kind: string(contract.KindStreamError),
-				Error: fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
+				Provider: string(sl.provider), Kind: string(contract.KindStreamError),
+				WorkspaceSessionID: string(sl.wsid),
+				Error:              fmt.Sprintf("manager closing during pending submission: %d queued events flushed without user acceptance", n),
 			})
 		}
 	}

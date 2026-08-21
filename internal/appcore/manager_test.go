@@ -18,18 +18,132 @@ type memSink struct {
 	fail error
 }
 
-func (s *memSink) Write(e contract.Envelope) error {
+func (s *memSink) Write(e contract.Envelope) (AppendReceipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
-		return s.fail
+		return AppendReceipt{}, s.fail
 	}
 	s.rows = append(s.rows, e)
-	return nil
+	return AppendReceipt{EventID: e.EventID}, nil
 }
 func (s *memSink) Close() error { return nil }
 
-func newTestManager(sink *memSink) (*Manager, *[]contract.Envelope, *sync.Mutex) {
+// tm：本檔的 provider → WSID 解析層（M3b Task 9）。
+//
+// Manager 的 provider-keyed 入口已於 Task 9 刪除，但本檔驗的是 coordinator／
+// lifecycle／slot 隔離／event_id 單調性等**語意**，不是定址方式。因此這裡只把
+// 「取得 WSID 的方式」換成正式的 ReserveSession ＋ CommitCreate（每個 provider
+// 一個 committed slot，兩個 provider 即兩個獨立 slot，與遷移前的 legacy slot 對
+// 應關係逐一相同），其餘斷言逐字不動——語意覆蓋不因這次遷移而減少。
+//
+// 兩個 slot 在建構時就 commit（而非首次使用時惰性建立）：本檔有多個測試在
+// Close() 之後仍呼叫 Emit／State／Totals，惰性建立會在 closed 之後撞上
+// ErrClosed，把「驗 closed 行為」變成「驗 slot 建不出來」。
+//
+// Emit 刻意維持 void 簽名：Pump(ch, m.Emit) 需要 func(contract.Event)，而
+// close 後 Emit 回 ErrClosed 的行為由 Manager 自己的 closed-drop 通知覆蓋
+// （見 TestEmitAfterCloseNoStateMutation 對 stream_error 筆數的斷言）。
+type tm struct {
+	*Manager
+	ws map[contract.Provider]WSID
+}
+
+func newTM(t *testing.T, m *Manager) *tm {
+	t.Helper()
+	x := &tm{Manager: m, ws: map[contract.Provider]WSID{}}
+	for _, p := range []contract.Provider{contract.ProviderClaude, contract.ProviderCodex} {
+		w, tok, err := m.ReserveSession(p)
+		if err != nil {
+			t.Fatalf("ReserveSession(%s): %v", p, err)
+		}
+		if err := m.CommitCreate(tok); err != nil {
+			t.Fatalf("CommitCreate(%s): %v", p, err)
+		}
+		x.ws[p] = w
+	}
+	return x
+}
+
+func (x *tm) w(p contract.Provider) WSID { return x.ws[p] }
+
+func (x *tm) Emit(ev contract.Event) { _ = x.Manager.Emit(x.w(ev.Provider), ev) }
+
+func (x *tm) NewSession(p contract.Provider, taskID string) { _ = x.Manager.NewSession(x.w(p), taskID) }
+
+func (x *tm) BeginNewSessionSubmit(p contract.Provider, taskID string) (SubmissionID, error) {
+	return x.Manager.BeginNewSessionSubmit(x.w(p), taskID)
+}
+
+func (x *tm) BeginSubmit(p contract.Provider) (SubmissionID, error) {
+	return x.Manager.BeginSubmit(x.w(p))
+}
+
+func (x *tm) AcceptSubmit(p contract.Provider, id SubmissionID, sessionID, text string) error {
+	return x.Manager.AcceptSubmit(x.w(p), id, sessionID, text)
+}
+
+func (x *tm) RejectSubmit(p contract.Provider, id SubmissionID) error {
+	return x.Manager.RejectSubmit(x.w(p), id)
+}
+
+func (x *tm) BeginEndSession(p contract.Provider) (SessionToken, error) {
+	return x.Manager.BeginEndSession(x.w(p))
+}
+
+func (x *tm) CancelEndSession(p contract.Provider, t SessionToken) error {
+	return x.Manager.CancelEndSession(x.w(p), t)
+}
+
+func (x *tm) FinishEndSession(p contract.Provider, t SessionToken) error {
+	return x.Manager.FinishEndSession(x.w(p), t)
+}
+
+func (x *tm) FinishEndSessionIntoReset(p contract.Provider, t SessionToken) (ResetToken, error) {
+	return x.Manager.FinishEndSessionIntoReset(x.w(p), t)
+}
+
+func (x *tm) BeginReset(p contract.Provider) (ResetToken, error) {
+	return x.Manager.BeginReset(x.w(p))
+}
+
+func (x *tm) FinishReset(p contract.Provider, t ResetToken) error {
+	return x.Manager.FinishReset(x.w(p), t)
+}
+
+func (x *tm) SessionActive(p contract.Provider) bool { return x.Manager.IsActive(x.w(p)) }
+
+func (x *tm) Totals(p contract.Provider) (float64, contract.Usage) {
+	cost, usage, err := x.Manager.Totals(x.w(p))
+	if err != nil {
+		panic("tm.Totals: " + err.Error()) // committed slot 不可能解析不到
+	}
+	return cost, usage
+}
+
+func (x *tm) State(p contract.Provider) contract.SessionState {
+	st, err := x.Manager.State(x.w(p))
+	if err != nil {
+		panic("tm.State: " + err.Error())
+	}
+	return st
+}
+
+func (x *tm) EmitApprovalRequest(p contract.Provider, sessionID, toolName string, raw []byte) {
+	_ = x.Manager.EmitApprovalRequest(x.w(p), "", sessionID, toolName, raw)
+}
+
+func (x *tm) EmitApprovalDecision(p contract.Provider, sessionID, decision, reason string) {
+	_ = x.Manager.EmitApprovalDecision(x.w(p), "", sessionID, decision, reason)
+}
+
+// endFlow：EndSessionFlow 的 provider → WSID 轉接（理由同 tm 型別 doc）。
+func (x *tm) endFlow(p contract.Provider, busy func() bool, teardown func() error) error {
+	return EndSessionFlow(x.Manager, x.w(p), busy, teardown)
+}
+
+func newTestManager(t *testing.T, sink *memSink) (*tm, *[]contract.Envelope, *sync.Mutex) {
+	t.Helper()
 	var got []contract.Envelope
 	var mu sync.Mutex
 	m := New(Config{Sink: sink, Emit: func(e contract.Envelope) {
@@ -37,12 +151,12 @@ func newTestManager(sink *memSink) (*Manager, *[]contract.Envelope, *sync.Mutex)
 		got = append(got, e)
 		mu.Unlock()
 	}})
-	return m, &got, &mu
+	return newTM(t, m), &got, &mu
 }
 
 // startActive：以 StartSession 交易把指定 provider 的 slot 帶到 phaseActive，
 // 並完成 boot turn（Emit result → reducer 進 done）。
-func startActive(t *testing.T, m *Manager, p contract.Provider) {
+func startActive(t *testing.T, m *tm, p contract.Provider) {
 	t.Helper()
 	id, err := m.BeginNewSessionSubmit(p, "task-test")
 	if err != nil {
@@ -66,7 +180,7 @@ func lastOfKind(t *testing.T, rows []contract.Envelope, kind string) contract.En
 }
 
 func TestUsageSemantics(t *testing.T) {
-	m, got, _ := newTestManager(&memSink{})
+	m, got, _ := newTestManager(t, &memSink{})
 	m.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindUsage, Raw: []byte("{}"),
 		Usage: &contract.Usage{InputTokens: 10, OutputTokens: 1}})
 	m.Emit(contract.Event{Provider: contract.ProviderCodex, Kind: contract.KindUsage, Raw: []byte("{}"),
@@ -97,8 +211,8 @@ func TestUsageSemantics(t *testing.T) {
 func TestUsageSemanticsCumulativeOverwrite(t *testing.T) { // ClaudeUsageCumulative=true 分支
 	var got []contract.Envelope
 	var mu sync.Mutex
-	m := New(Config{Sink: &memSink{}, ClaudeUsageCumulative: true,
-		Emit: func(e contract.Envelope) { mu.Lock(); got = append(got, e); mu.Unlock() }})
+	m := newTM(t, New(Config{Sink: &memSink{}, ClaudeUsageCumulative: true,
+		Emit: func(e contract.Envelope) { mu.Lock(); got = append(got, e); mu.Unlock() }}))
 	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}"),
 		Usage: &contract.Usage{InputTokens: 10, OutputTokens: 2}})
 	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}"),
@@ -115,7 +229,7 @@ func TestUsageSemanticsCumulativeOverwrite(t *testing.T) { // ClaudeUsageCumulat
 }
 
 func TestNewSessionResetsAtomically(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	startActive(t, m, contract.ProviderClaude)
 	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}"),
 		CostUSD: 1, Usage: &contract.Usage{InputTokens: 9}})
@@ -134,7 +248,7 @@ func TestNewSessionResetsAtomically(t *testing.T) {
 }
 
 func TestSubmitCoordinatorOrdering(t *testing.T) { // provider 事件先到也不得排在 user 前
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	startActive(t, m, contract.ProviderCodex)
 	mu.Lock()
 	base := len(*got) // boot 事件基準線
@@ -178,7 +292,7 @@ func TestSubmitCoordinatorOrdering(t *testing.T) { // provider 事件先到也�
 
 // M1.5：coordinator flush 的 user → waiting → init 序列中 init 必須中性。
 func TestInitDoesNotRegressState(t *testing.T) {
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	id, err := m.BeginNewSessionSubmit(contract.ProviderCodex, "task-init")
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +319,7 @@ func TestInitDoesNotRegressState(t *testing.T) {
 }
 
 func TestStartSessionOwnershipBarrier(t *testing.T) { // production path 的原子交易
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	var providerStarts atomic.Int32
 	begin := make(chan struct{})
@@ -254,7 +368,7 @@ func TestStartSessionOwnershipBarrier(t *testing.T) { // production path 的原�
 }
 
 func TestEndDuringStartingIsRejected(t *testing.T) { // deterministic 命中 starting
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	providerStarted := make(chan struct{})
 	release := make(chan struct{})
@@ -290,7 +404,7 @@ func TestEndDuringStartingIsRejected(t *testing.T) { // deterministic 命中 sta
 }
 
 func TestCancelEndSessionRestoresActive(t *testing.T) { // ending 復原
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	id, _ := m.BeginNewSessionSubmit(p, "task-A")
 	_ = m.AcceptSubmit(p, id, "s1", "hi")
@@ -320,7 +434,7 @@ func TestCancelEndSessionRestoresActive(t *testing.T) { // ending 復原
 }
 
 func TestStaleEndAfterNewSessionIsNoop(t *testing.T) { // 舊 End 不得清掉新 session
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	idA, _ := m.BeginNewSessionSubmit(p, "task-A")
 	_ = m.AcceptSubmit(p, idA, "sA", "hi")
@@ -345,7 +459,7 @@ func TestStaleEndAfterNewSessionIsNoop(t *testing.T) { // 舊 End 不得清掉�
 }
 
 func TestSendThenEndBarrier(t *testing.T) { // pending submit 期間 End 必拒
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	id, err := m.BeginSubmit(p)
@@ -368,7 +482,7 @@ func TestSendThenEndBarrier(t *testing.T) { // pending submit 期間 End 必拒
 	if err := <-acceptDone; err != nil { // Accept 不受影響、無晚到寫入
 		t.Fatal(err)
 	}
-	if err := EndSessionFlow(m, p, nil, func() error { return nil }); err != nil { // 之後可正常 End
+	if err := m.endFlow(p, nil, func() error { return nil }); err != nil { // 之後可正常 End
 		t.Fatal(err)
 	}
 	if m.SessionActive(p) {
@@ -377,7 +491,7 @@ func TestSendThenEndBarrier(t *testing.T) { // pending submit 期間 End 必拒
 }
 
 func TestEndThenSendRejected(t *testing.T) { // ending 期間 Send 必拒
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	tok, err := m.BeginEndSession(p)
@@ -396,13 +510,13 @@ func TestEndThenSendRejected(t *testing.T) { // ending 期間 Send 必拒
 }
 
 func TestEndSessionFlowBusyThenRetry(t *testing.T) { // busy 不殘留 ending
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderCodex
 	id, _ := m.BeginNewSessionSubmit(p, "task-A")
 	_ = m.AcceptSubmit(p, id, "t1", "hi")
 	busy := true
 	teardowns := 0
-	err := EndSessionFlow(m, p, func() bool { return busy }, func() error { teardowns++; return nil })
+	err := m.endFlow(p, func() bool { return busy }, func() error { teardowns++; return nil })
 	if !errors.Is(err, ErrProviderBusy) {
 		t.Fatalf("busy must surface: %v", err)
 	}
@@ -413,7 +527,7 @@ func TestEndSessionFlowBusyThenRetry(t *testing.T) { // busy 不殘留 ending
 		t.Fatal("busy end must restore active")
 	}
 	busy = false
-	if err := EndSessionFlow(m, p, func() bool { return busy }, func() error { teardowns++; return nil }); err != nil {
+	if err := m.endFlow(p, func() bool { return busy }, func() error { teardowns++; return nil }); err != nil {
 		t.Fatalf("retry end must succeed: %v", err)
 	}
 	if teardowns != 1 || m.SessionActive(p) {
@@ -422,12 +536,12 @@ func TestEndSessionFlowBusyThenRetry(t *testing.T) { // busy 不殘留 ending
 }
 
 func TestEndSessionFlowTeardownErrorStillFinishes(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	id, _ := m.BeginNewSessionSubmit(p, "task-A")
 	_ = m.AcceptSubmit(p, id, "s1", "hi")
 	boom := errors.New("teardown failed")
-	err := EndSessionFlow(m, p, nil, func() error { return boom })
+	err := m.endFlow(p, nil, func() error { return boom })
 	if !errors.Is(err, boom) { // teardown 錯誤保留
 		t.Fatalf("teardown error must surface: %v", err)
 	}
@@ -440,8 +554,8 @@ func TestEndSessionFlowTeardownErrorStillFinishes(t *testing.T) {
 }
 
 func TestEndSessionFlowIdempotentNoSession(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
-	if err := EndSessionFlow(m, contract.ProviderClaude, nil, func() error {
+	m, _, _ := newTestManager(t, &memSink{})
+	if err := m.endFlow(contract.ProviderClaude, nil, func() error {
 		t.Fatal("teardown must not run without session")
 		return nil
 	}); err != nil {
@@ -450,7 +564,7 @@ func TestEndSessionFlowIdempotentNoSession(t *testing.T) {
 }
 
 func TestApprovalDuringSubmitQueued(t *testing.T) { // approval 不繞過 coordinator
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderCodex
 	startActive(t, m, p)
 	mu.Lock()
@@ -490,7 +604,7 @@ func TestApprovalDuringSubmitQueued(t *testing.T) { // approval 不繞過 coordi
 }
 
 func TestApprovalDecisionDuringSubmitQueued(t *testing.T) { // resolveApprove 分支
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderCodex
 	startActive(t, m, p)
 	mu.Lock()
@@ -524,7 +638,7 @@ func TestApprovalDecisionDuringSubmitQueued(t *testing.T) { // resolveApprove �
 }
 
 func TestBeginSubmitExclusiveBarrier(t *testing.T) { // 唯一 ownership
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	begin := make(chan struct{})
@@ -555,7 +669,7 @@ func TestBeginSubmitExclusiveBarrier(t *testing.T) { // 唯一 ownership
 }
 
 func TestStaleAcceptAfterNewSessionIsNoop(t *testing.T) { // generation 失效
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	id, _ := m.BeginSubmit(p)
@@ -576,7 +690,7 @@ func TestStaleAcceptAfterNewSessionIsNoop(t *testing.T) { // generation 失效
 }
 
 func TestRejectSubmitEmitsNoUser(t *testing.T) {
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	mu.Lock()
@@ -600,7 +714,7 @@ func TestRejectSubmitEmitsNoUser(t *testing.T) {
 }
 
 func TestUserMessageEntersWaiting(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	m.Emit(contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")})
@@ -614,7 +728,7 @@ func TestUserMessageEntersWaiting(t *testing.T) {
 }
 
 func TestApprovalFlowThroughEnvelopes(t *testing.T) {
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	m.EmitApprovalRequest(p, "s1", "Bash", []byte(`{"k":"v"}`))
 	if m.State(p) != contract.StateAwaitingApproval {
@@ -638,7 +752,7 @@ func TestApprovalFlowThroughEnvelopes(t *testing.T) {
 
 func TestAuditFailureIsLoud(t *testing.T) {
 	sink := &memSink{fail: errors.New("disk full")}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindDelta, Raw: []byte("{}")})
 	if m.AuditErr() == nil {
 		t.Fatal("audit error must latch")
@@ -663,7 +777,7 @@ func TestAuditFailureIsLoud(t *testing.T) {
 
 func TestConcurrentEmitOrderAndAdjacency(t *testing.T) {
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	begin := make(chan struct{})
 	var wg sync.WaitGroup
 	for range 8 {
@@ -700,7 +814,7 @@ func TestConcurrentEmitOrderAndAdjacency(t *testing.T) {
 
 func TestEmitUserMessage(t *testing.T) { // AcceptSubmit 產生的 user envelope 同源進 UI 與稽核
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	id, err := m.BeginSubmit(p)
@@ -725,7 +839,7 @@ func TestEmitUserMessage(t *testing.T) { // AcceptSubmit 產生的 user envelope
 
 func TestEmitAfterCloseNoStateMutation(t *testing.T) { // closed 最先、內部狀態不變
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	id, _ := m.BeginSubmit(p) // pending 中 Close
@@ -783,7 +897,7 @@ func TestEmitAfterCloseNoStateMutation(t *testing.T) { // closed 最先、內部
 
 func TestCloseDuringPendingFlushesLoudly(t *testing.T) { // close 前入列事件不遺失
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	p := contract.ProviderClaude
 	startActive(t, m, p)
 	id, _ := m.BeginSubmit(p)
@@ -824,7 +938,7 @@ func TestCloseDuringPendingFlushesLoudly(t *testing.T) { // close 前入列事�
 
 func TestCloseEmitBarrier(t *testing.T) { // Close 與 Emit 交錯
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	begin := make(chan struct{})
 	var wg sync.WaitGroup
 	for range 4 {
@@ -864,7 +978,7 @@ func TestCloseEmitBarrier(t *testing.T) { // Close 與 Emit 交錯
 }
 
 func TestPumpQuiesceBeforeNewSession(t *testing.T) { // 晚到事件不進新 task
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 	m.NewSession(p, "old-task")
 	ch := make(chan contract.Event, 8)
@@ -872,7 +986,7 @@ func TestPumpQuiesceBeforeNewSession(t *testing.T) { // 晚到事件不進新 ta
 	ch <- contract.Event{Provider: p, Kind: contract.KindDelta, Raw: []byte("{}")}
 	ch <- contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")}
 	close(ch) // provider 收尾（EndSession 的 Close → EOF）
-	if err := WaitQuiesce(done, 5*time.Second); err != nil {
+	if err := WaitQuiesce(done, 5*time.Second, RealAfter); err != nil {
 		t.Fatal(err)
 	}
 	m.NewSession(p, "new-task") // quiesce 完成後才換代
@@ -891,11 +1005,11 @@ func TestPumpQuiesceBeforeNewSession(t *testing.T) { // 晚到事件不進新 ta
 func TestWaitQuiesceTimeout(t *testing.T) {
 	ch := make(chan contract.Event)
 	done := Pump(ch, func(contract.Event) {})
-	if err := WaitQuiesce(done, 50*time.Millisecond); err == nil { // channel 未關 → 逾時
+	if err := WaitQuiesce(done, 50*time.Millisecond, RealAfter); err == nil { // channel 未關 → 逾時
 		t.Fatal("quiesce must time out when pump still running")
 	}
 	close(ch)
-	if err := WaitQuiesce(done, time.Second); err != nil {
+	if err := WaitQuiesce(done, time.Second, RealAfter); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -922,7 +1036,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	var finExit ports.Exit
 	ex, err := CloseSequence(log("close"), done, time.Second, time.Second, log("terminate"),
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 0} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err != nil || !ex.Exited || ex.Code != 0 || !finExit.Exited || finExit.Code != 0 {
 		t.Fatalf("normal: %v %+v %+v", err, ex, finExit)
 	}
@@ -937,7 +1051,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	ex, err = CloseSequence(log("close"), hung, 30*time.Millisecond, 5*time.Second,
 		func() error { mu.Lock(); calls = append(calls, "terminate"); mu.Unlock(); return nil },
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 143} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "quiesce timeout") { // timeout 不被吞
 		t.Fatalf("quiesce timeout must surface: %v", err)
 	}
@@ -955,7 +1069,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	_, err = CloseSequence(log("close"), stuck, 20*time.Millisecond, 30*time.Millisecond,
 		log("terminate"),
 		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true} },
-		fin(&finExit))
+		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "did not quiesce") {
 		t.Fatalf("stuck path must error: %v", err)
 	}
@@ -974,7 +1088,7 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 // ---- M1.5 新增：slot 隔離與 reset phase ----
 
 func TestSlotsIsolateUsageAndState(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	// 交錯 emit：claude 累加、codex 覆寫
 	m.Emit(contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindResult, Raw: []byte("{}"),
 		CostUSD: 0.5, Usage: &contract.Usage{InputTokens: 3, OutputTokens: 1}})
@@ -1002,7 +1116,7 @@ func TestSlotsIsolateUsageAndState(t *testing.T) {
 }
 
 func TestCrossProviderSubmitDoesNotBlock(t *testing.T) {
-	m, got, mu := newTestManager(&memSink{})
+	m, got, mu := newTestManager(t, &memSink{})
 	a, b := contract.ProviderClaude, contract.ProviderCodex
 	startActive(t, m, a)
 	idA, err := m.BeginSubmit(a) // A pending
@@ -1048,7 +1162,7 @@ func TestCrossProviderSubmitDoesNotBlock(t *testing.T) {
 }
 
 func TestPerSlotGenerationInvalidation(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	a, b := contract.ProviderClaude, contract.ProviderCodex
 	startActive(t, m, a)
 	startActive(t, m, b)
@@ -1065,7 +1179,7 @@ func TestPerSlotGenerationInvalidation(t *testing.T) {
 
 func TestFileLevelEventIDMonotonicAcrossProviders(t *testing.T) {
 	sink := &memSink{}
-	m, _, _ := newTestManager(sink)
+	m, _, _ := newTestManager(t, sink)
 	begin := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range 8 {
@@ -1099,7 +1213,7 @@ func TestFileLevelEventIDMonotonicAcrossProviders(t *testing.T) {
 
 func TestCloseAbortsAllSlots(t *testing.T) {
 	sink := &memSink{}
-	m, got, mu := newTestManager(sink)
+	m, got, mu := newTestManager(t, sink)
 	a, b := contract.ProviderClaude, contract.ProviderCodex
 	startActive(t, m, a)
 	startActive(t, m, b)
@@ -1145,7 +1259,7 @@ func TestCloseAbortsAllSlots(t *testing.T) {
 }
 
 func TestConcurrentDualSessionLifecycle(t *testing.T) { // -race：跨 slot lifecycle 互不干擾
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	a, b := contract.ProviderClaude, contract.ProviderCodex
 	startActive(t, m, b)
 	begin := make(chan struct{})
@@ -1162,7 +1276,7 @@ func TestConcurrentDualSessionLifecycle(t *testing.T) { // -race：跨 slot life
 	}()
 	go func() {
 		<-begin
-		errB <- EndSessionFlow(m, b, nil, func() error { return nil })
+		errB <- m.endFlow(b, nil, func() error { return nil })
 	}()
 	close(begin)
 	if err := <-errA; err != nil {
@@ -1177,7 +1291,7 @@ func TestConcurrentDualSessionLifecycle(t *testing.T) { // -race：跨 slot life
 }
 
 func TestResetPhaseTransitions(t *testing.T) { // M1.5 plan §5.4（第三輪 P1-1）
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	p := contract.ProviderClaude
 
 	// idle → BeginReset → resetting → FinishReset → idle
@@ -1222,7 +1336,7 @@ func TestResetPhaseTransitions(t *testing.T) { // M1.5 plan §5.4（第三輪 P1
 }
 
 func TestResetBlocksAllLifecycleEntries(t *testing.T) {
-	m, _, _ := newTestManager(&memSink{})
+	m, _, _ := newTestManager(t, &memSink{})
 	a, b := contract.ProviderClaude, contract.ProviderCodex
 	tok, err := m.BeginReset(a)
 	if err != nil {

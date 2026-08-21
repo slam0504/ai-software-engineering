@@ -195,6 +195,47 @@ gate3 的核可與 merge queue 驗證是兩件事（v1.2 拆分）：核可綁�
 2. **條件款（僅在未來改變定位時觸發）**：若要對外發布／散佈 Claude 訂閱路徑，**取得 Anthropic 書面核准後才可發布**；未核准的對外版本，Claude 僅提供 API-key 模式（Codex 訂閱路徑不受此限——app-server 本就是官方第三方整合面）。**BAT 能運作不構成發布情境的合規先例**。
 3. enforcement 漂移列為常設風險（§8）：即使自用，未來伺服器端調整仍可能影響行為，M0 結果代表當下 pin 版本。
 
+<a id="gate-decision-consistency"></a>
+
+### 5.6 Gate 決議一致性（v1.13 新增，2026-08-18）
+
+收件匣（escalation inbox）不是核可正確性的唯一來源。若讓 UI 先查 inbox、確認沒有 blocker 後才呼叫核可，「查詢」與「寫入」之間會有 TOCTOU 窗口讓新的 blocker 插進來。因此 `App.GateDecide` 把整段決議凍結成固定順序，並全段放在同一個 workspace-level 的 workflow mutex 底下。
+
+**決議順序（依 `app.go` 目前 production 實作記錄）**
+
+| # | 步驟 | 實作 | 失敗處置 |
+|---|---|---|---|
+| 1 | reconcile bindings | `reconcileLocked`（含 §3.8 的 stale／journal-degraded 補建） | 回傳錯誤，拒絕核可 |
+| 2 | 執行硬性 validator 與 current-binding validation | `gate.Service.PrepareDecision`（gate-specific validator；`approved` 另做 current-binding validation，擋掉待核期間已過期的請求，§5.3） | 回傳錯誤，拒絕核可 |
+| 3 | 核可修正版時，先由系統解除同 subject 的舊 stale blocker | 僅 `decision == "approved"` 執行：以 condition key `stale:<gate>:<subject>` 呼叫 `escResolveByKeyLocked`，resolution 記為 `superseded-by:<approval_id>` | **解除失敗即拒絕核可**（fail closed——escalation journal 寫不進去時 Gate 不得放行） |
+| 4 | 檢查相同 scope 的 blocking 項目 | `escBlockingForLocked(scope)` → `escalation.BlockingFor` | 有 blocking 項目即拒；**projection 本身失敗也拒**（收件匣不可用不得降級成「視為沒有 blocker」） |
+| 5 | append 核可決議 | `gate.Service.CommitDecision` | 回傳錯誤 |
+
+步驟 3 的時點是刻意選定的：current-binding validation（步驟 2）通過，即代表同 subject 的 stale 條件已被這個修正版修復；stale 的 escalation 記錄本身是終態，修復載體是修正版的核可流程，所以解除必須發生在步驟 4 的 blocker 檢查**之前**，否則修正版永遠會被自己要修的那筆 stale blocker 擋住。
+
+步驟 4 檢查的是**所有**尚未 `resolved` 的項目（`open` 與 `acknowledged` 都算——`acknowledged` 不解除阻擋），不分系統自動建立或使用者手動建立；只有 `block_scope == ""` 的純通知項目不阻擋。`block_scope == "workspace"` 覆蓋所有 scope。
+
+**scope 對映**（`scopeForSubject`）：`gate1` → `workspace`；`gate2` 的 `plan:<id>` → `gate2:<id>`；`test_contract_approval` 的 `task:<plan>/<task>` → `tca:<plan>/<task>`。未知 gate 一律映到最寬的 `workspace`（fail closed）。
+
+**workflowMu 範圍**
+
+- 步驟 1–5 全部在同一次 `workflowMu` 持有期間內完成，中途不釋放。因此 blocker 只能在 `workflowMu` 之外排隊，不存在「檢查後、append 前」被插入的窗口。
+- git identity 解析與 `ensureGate` 在取得 `workflowMu` **之前**執行（兩者都不生產 blocking 狀態，不需納入臨界區）。
+- 同一把 `workflowMu` 也序列化了其餘所有 blocking 狀態生產路徑：escalation 收件匣的全部寫入（create／ack／resolve／list）、evidence run finalize 的自動來源接線（`wireEvidenceEscalation`）、以及 workspace watcher 觸發的 reconcile。
+
+**Lock ordering 與重入規約**
+
+- Lock ordering 固定為 `workflowMu` → gate journal（`gate.Service` 內部 mutex）→ escalation journal（`escalation.Service` 內部 mutex），避免兩個 journal 互鎖。
+- `evidenceMu` 與 `workflowMu` **不巢狀**：`RunEvidence` 的 finalize 臨界區（`evidenceMu`）先完整結束，才另取 `workflowMu` 做 §3.8 的自動來源接線。
+- 重入規約：public 的 `EscalationCreate`／`EscalationAck`／`EscalationResolve`／`EscalationList` 自行取 `workflowMu`；已持有 `workflowMu` 的路徑（`GateDecide` 編排、`reconcileLocked`、`wireEvidenceEscalation`）只准呼叫 `esc*Locked` 內部變體，否則同一把 mutex 重入即死鎖。
+
+**與既有文件的關係（本節為 reader-facing 權威）**
+
+`docs/superpowers/specs/2026-08-12-m3a-plan-test-contract-design.md` §3.10 是這段順序的原始設計，但**已落後於實作**，兩處差異以本節為準：
+
+1. §3.10 只有四步，**缺少上表步驟 3**（修正版核可時的系統解除）——該步驟是後續實作補上的。
+2. §3.10 寫「檢查同 scope 的**人工** blocking escalation」，但實作檢查的是所有帶 `block_scope` 的未解除項目，系統自動建立的項目同樣阻擋。
+
 ## 6. 語言與技術選型
 
 ### 6.1 先把制約攤開
@@ -302,6 +343,10 @@ gate3 的核可與 merge queue 驗證是兩件事（v1.2 拆分）：核可綁�
 **仍待決**：CLI ownership 最終形式（待 M0 實測）；forge 選擇（M4 前）。（原「Anthropic 核准申請」行動項因自用定位撤下，僅在未來改變定位時重新浮出。）
 
 ## 10. 修訂記錄
+
+### v1.13（2026-08-18）— 新增 §5.6 Gate 決議一致性（承接 README 移出的實作流程）
+
+README 語言審查（owner 2026-08-18）判定 `GateDecide` 的判定順序屬實作流程，不該留在功能說明；本版以 additive 小節承接，並依 `app.go` 目前 production 實作記錄完整五步順序、`workflowMu` 覆蓋範圍、lock ordering 與重入規約。同時更正原始設計 `docs/superpowers/specs/2026-08-12-m3a-plan-test-contract-design.md` §3.10 的兩處落後：缺少「修正版核可時系統解除同 subject 舊 stale blocker」該步，以及誤寫成只檢查「人工」blocking escalation。README 改為保留一行行為摘要並連至本節 anchor。其餘章節零變更；SHA256SUMS 同步更新本檔 hash。
 
 ### v1.12（2026-08-13）— 新增 §7.1 主線後候選里程碑（ACP／多 Agent Runtime）
 

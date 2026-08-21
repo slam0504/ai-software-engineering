@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,9 +146,14 @@ func TestShutdownWaitsForAndReclaimsSpecAssist(t *testing.T) {
 	}
 }
 
-// shutdown-during-startup 窗口：assist 已把 gen 入 assistActive、尚未 beginAppTxn
-// 時 shutdown 介入——shutdown 不得被它 stall（此刻無 inflight），事後 beginAppTxn
-// 被 gate 拒、gen rollback。反轉 insert／beginAppTxn 順序後此窗口關閉。
+// shutdown-during-startup 窗口：assist 已把 gen 入 assistActive、尚未取得自己那份
+// 長生命週期交易時 shutdown 介入——事後該交易被 gate 拒、gen rollback、收尾收斂。
+//
+// **語意在 2026-08-20 改過**：SpecAssist 現在是薄包裝（見 beginTxn 的 doc），
+// 這個窗口本身已經落在包裝那一層的交易裡，shutdown 會等它走完才往下——那是預期
+// 行為，不是 stall（窗口在 production 是純記憶體操作、不含 I/O）。所以改成：先
+// 確認 shutdown 已進場（reject_new_txn），再放行窗口，然後驗證原本要守的兩件事
+// 仍然成立——內層交易被拒、rollback 不留 gen。
 func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 	a := newTestAppAssist(t, blockingRunner())
 	entered := make(chan struct{})
@@ -158,20 +164,34 @@ func TestShutdownReclaimClosesAssistStartupWindow(t *testing.T) {
 	}
 	errCh := make(chan error, 1)
 	go func() { _, err := a.SpecAssist("claude", "spec_assist", "draft"); errCh <- err }()
-	<-entered // gen 已可見、beginAppTxn 未開始
+	<-entered // gen 已可見、beginTxn 未開始
 	a.hookAssistBeforeTxn = nil
 
+	steps := make(chan string, 32)
+	a.hookShutdownStep = func(s string) { steps <- s }
 	shutDone := make(chan struct{})
 	go func() { a.shutdown(context.Background()); close(shutDone) }()
-	select { // 不得被 startup 窗口內的 assist 卡住（無 inflight 可等）
+	for s := range steps { // 等 shutdown 真的進場（phase 已翻 shuttingDown）
+		if s == "reject_new_txn" {
+			break
+		}
+	}
+	go func() {
+		for range steps {
+		}
+	}()
+
+	close(release) // 放行：assist 根 context 已被 cancel → run 立即收斂
+	select {
 	case <-shutDone:
 	case <-time.After(30 * time.Second):
-		t.Fatal("shutdown stalled on an assist still in its startup window")
+		t.Fatal("窗口放行之後 shutdown 必須收斂")
 	}
-	close(release) // 放行 beginAppTxn → shuttingDown → 拒絕 → rollback、無 inflight
 	err := <-errCh
-	if err == nil || !strings.Contains(err.Error(), "shutting down") {
-		t.Fatalf("in-window assist must be rejected by the shutdown gate, got %v", err)
+	// 收斂手段是 context 而不是內層交易閘（見 App.assistRootCtx 的 doc）：不論
+	// 登記到哪一步，shutdown 一 cancel 根 context，進行中的 assist 立刻結束。
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("窗口內的 assist 必須被 shutdown 的根 context 收掉，實得 %v", err)
 	}
 	a.assistMu.Lock()
 	n := len(a.assistActive)
@@ -201,11 +221,14 @@ func TestCodexAssistCannotEscalateOrMutateSessionView(t *testing.T) {
 
 	// 稽核仍完整：assist 事件經 Manager.EmitAssist 出口，帶 purpose=spec_assist、
 	// scope=session、correlation_id，但不進 provider slot（totals 不受污染）。
-	if cost, usage := a.manager.Totals(contract.ProviderCodex); cost != 0 || usage.OutputTokens != 0 {
-		t.Fatalf("assist must not pollute provider totals: cost=%v usage=%+v", cost, usage)
+	w := wsidFor(t, a, contract.ProviderCodex)
+	cost, usage, terr := a.manager.Totals(w)
+	if terr != nil || cost != 0 || usage.OutputTokens != 0 {
+		t.Fatalf("assist must not pollute provider totals: cost=%v usage=%+v err=%v", cost, usage, terr)
 	}
-	if st := a.manager.State(contract.ProviderCodex); st != "" && st != contract.StateIdle {
-		t.Fatalf("assist must not drive provider reducer, got state=%q", st)
+	st, serr := a.manager.State(w)
+	if serr != nil || (st != "" && st != contract.StateIdle) {
+		t.Fatalf("assist must not drive provider reducer, got state=%q err=%v", st, serr)
 	}
 }
 
@@ -246,8 +269,10 @@ func (c *captureEnvs) add(env contract.Envelope) { c.envs = append(c.envs, env) 
 
 type nullSink struct{}
 
-func (nullSink) Write(contract.Envelope) error { return nil }
-func (nullSink) Close() error                  { return nil }
+func (nullSink) Write(contract.Envelope) (appcore.AppendReceipt, error) {
+	return appcore.AppendReceipt{}, nil
+}
+func (nullSink) Close() error { return nil }
 
 // ---- PlanAssist（Task 11：PlannerAssist 唯讀探索 one-shot）測試 ----
 
@@ -273,14 +298,14 @@ func newTestAppGitAssist(t *testing.T, r assist.Runner) (*App, *captureEnvs) {
 // 的乾淨樹前置檢查。回傳 bin 路徑（recovery 測試會原地換內容）。
 func plantPlannerBinScript(t *testing.T, a *App, provider, script string) string {
 	t.Helper()
-	if strings.HasPrefix(a.toolsDirPath, a.workspaceDir) {
-		a.toolsDirPath = filepath.Join(a.stateDir, "tools")
+	if strings.HasPrefix(a.toolsDir(), a.workspaceDir) {
+		a.publishToolsDir(filepath.Join(a.stateDir, "tools"), "test")
 	}
 	name := "claude"
 	if provider == "codex" {
 		name = "codex"
 	}
-	dir := filepath.Join(a.toolsDirPath, provider+"-cli", "node_modules", ".bin")
+	dir := filepath.Join(a.toolsDir(), provider+"-cli", "node_modules", ".bin")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -688,5 +713,96 @@ func TestPlanAssistRuntimeBlockerSurvivesGenericFailures(t *testing.T) {
 		if openItemByKey(t, a, "planner-enforcement-runtime:codex") == nil {
 			t.Fatalf("%s: a failed run must NOT release the runtime blocker", name)
 		}
+	}
+}
+
+// TestPlanAssistPreflightWorkIsCancellable
+//
+// reviewer 2026-08-20：PlanAssist 的 wrapper 已取得交易，但實作要到很後面才拿到
+// root context；中間的 gate reconcile／gateList／git status／binary SHA／
+// preflight／HeadCommit 全都不在可取消範圍內。用忽略 SIGTERM 的假 git 卡住
+// `git status`，shutdown 即使先 cancel 了 root 也影響不到它，於是無限卡在
+// inflight.Wait。
+//
+// 這條驗行為那一半：前置工作用的 ctx 來自 procRoot，cancel 之後**立刻**收斂。
+// 「ctx 取得得夠早」那一半由 app_binding_surface_test.go 的
+// TestAssistImplementationsTakeRootContextFirst 用結構驗。
+//
+// 假 git 用「trap TERM 忽略 ＋ 無限迴圈」而不是 sleep：sleep 會被 TERM 收掉，
+// 量到的就變成「訊號有沒有送到」而不是「工作在不在可取消範圍內」。
+func TestPlanAssistPreflightWorkIsCancellable(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, blockingRunner())
+	binDir := t.TempDir()
+	marker := filepath.Join(binDir, "started")
+	script := "#!/bin/sh\ntrap '' TERM\ntouch " + marker + "\nwhile true; do sleep 0.05; done\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.nonPlanDirtyPaths(a.procRoot())
+		done <- err
+	}()
+	waitFor(t, "假 git 已啟動", func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	})
+
+	a.cancelProcRoot() // ＝ shutdown 第 1 步做的事
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("被 cancel 的前置工作必須回錯誤")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("前置工作不在可取消範圍內：cancel 根 context 之後仍未收斂")
+	}
+}
+
+// TestShutdownCancellationIsNotRecordedAsEnforcementFailure
+//
+// reviewer 2026-08-20：PlanAssist 把**所有** preflight error 都包成
+// ErrEnforcementUnproven 並寫一筆 planner-enforcement-preflight hard escalation。
+// shutdown 取消正在跑的 `claude --version` 之後，journal 因此留下一筆錯誤的硬性
+// 阻擋項——而 hard 項使用者無法自行解除。
+//
+// 走**完整的 PlanAssist**（不是直接呼叫 planPreflight）：escalation 是在那一層
+// 寫的，繞過它的話「沒寫 escalation」這條斷言是恆真的。
+//
+// 正題斷言（兩條，分得開）：
+//   - 回傳的錯誤保留 context.Canceled 的 identity。
+//   - **沒有**開出 planner-enforcement-preflight 項。
+func TestShutdownCancellationIsNotRecordedAsEnforcementFailure(t *testing.T) {
+	a, _ := newTestAppGitAssist(t, runnerMustNotBeCalled(t))
+	approveGate1Spec(t, a)
+	// 假 provider CLI：忽略 TERM 並卡住，讓 preflight 停在 --version 上。
+	plantPlannerBinScript(t, a, "claude", "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 0.05; done\n")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a.PlanAssist("claude", "draft plan")
+		errCh <- err
+	}()
+	waitFor(t, "preflight 已 spawn provider CLI", func() bool {
+		out, _ := exec.Command("pgrep", "-f", a.claudeCLIPath()).Output()
+		return len(strings.TrimSpace(string(out))) > 0
+	})
+
+	a.cancelProcRoot() // ＝ shutdown 第 1 步做的事
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("被收尾取消時必須保留 context.Canceled identity，實得 %v", err)
+		}
+		if errors.Is(err, assist.ErrEnforcementUnproven) {
+			t.Fatalf("收尾取消不是 enforcement failure，實得 %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("PlanAssist 未在取消後收斂")
+	}
+	if e := openItemByKey(t, a, "planner-enforcement-preflight:claude"); e != nil {
+		t.Fatal("收尾取消不得開出 planner-enforcement-preflight 阻擋項（hard 項使用者無法自行解除）")
 	}
 }

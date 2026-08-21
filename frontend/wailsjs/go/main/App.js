@@ -26,6 +26,10 @@ export function ConfirmSpecCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
 }
 
+export function CreateSession(arg1, arg2) {
+  return window['go']['main']['App']['CreateSession'](arg1, arg2);
+}
+
 export function EndSession(arg1) {
   return window['go']['main']['App']['EndSession'](arg1);
 }
@@ -66,8 +70,16 @@ export function GateList() {
   return window['go']['main']['App']['GateList']();
 }
 
+export function ListSessions() {
+  return window['go']['main']['App']['ListSessions']();
+}
+
 export function ListWorkspace(arg1) {
   return window['go']['main']['App']['ListWorkspace'](arg1);
+}
+
+export function LoadTurnsBefore(arg1, arg2, arg3) {
+  return window['go']['main']['App']['LoadTurnsBefore'](arg1, arg2, arg3);
 }
 
 export function Logout(arg1) {
@@ -76,6 +88,10 @@ export function Logout(arg1) {
 
 export function NewSession(arg1) {
   return window['go']['main']['App']['NewSession'](arg1);
+}
+
+export function PaneLayout() {
+  return window['go']['main']['App']['PaneLayout']();
 }
 
 export function PlanAssist(arg1, arg2) {
@@ -114,8 +130,16 @@ export function ReadWorkspaceFile(arg1) {
   return window['go']['main']['App']['ReadWorkspaceFile'](arg1);
 }
 
+export function RecoverCodexRecording() {
+  return window['go']['main']['App']['RecoverCodexRecording']();
+}
+
 export function RegisterMutation(arg1, arg2) {
   return window['go']['main']['App']['RegisterMutation'](arg1, arg2);
+}
+
+export function RemoveSession(arg1) {
+  return window['go']['main']['App']['RemoveSession'](arg1);
 }
 
 export function ResolveApproval(arg1, arg2, arg3) {
@@ -136,6 +160,10 @@ export function RunEvidence(arg1, arg2, arg3, arg4, arg5, arg6) {
 
 export function SendMessage(arg1, arg2) {
   return window['go']['main']['App']['SendMessage'](arg1, arg2);
+}
+
+export function SetPaneLayout(arg1, arg2) {
+  return window['go']['main']['App']['SetPaneLayout'](arg1, arg2);
 }
 
 export function SpecAssist(arg1, arg2, arg3) {

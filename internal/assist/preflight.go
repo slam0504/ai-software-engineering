@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 // provider capability preflight（spec §3.4）：PlanAssist spawn 前驗證「pin 版本
@@ -77,26 +80,91 @@ type PreflightResult struct {
 }
 
 // BinarySHA256 回傳 bin 檔案內容的完整 SHA-256 hex。
-func BinarySHA256(bin string) (string, error) {
-	f, err := os.Open(bin)
+//
+// **兩個防線**（reviewer 2026-08-20）：
+//
+//	(1) 目標必須是 regular file。以 FIFO／device 取代 binary 之後，io.Copy 會
+//	    無限等寫入端，preflight 的 30 秒 deadline 也救不了——因為那個 deadline
+//	    只掛在子行程上，讀檔完全不受它管。symlink 先解析到真正目標再判。
+//	(2) 讀取期間逐塊檢查 ctx。就算檔案是 regular 但落在一個卡住的網路檔案系統
+//	    上，取消也要能收斂。
+func BinarySHA256(ctx context.Context, bin string) (string, error) {
+	if ctx == nil { // nil context 不 panic：明確退化成 Background（API 契約）
+		ctx = context.Background()
+	}
+	// **在任何 filesystem 操作之前先檢查**（reviewer 2026-08-20）：先前第一次檢查
+	// 排在 EvalSymlinks／OpenFile／Stat 之後，於是「context 已取消且路徑不存在」
+	// 會回 lstat … no such file，而不是 context.Canceled——呼叫端據此分辨「被收尾
+	// 取消」與「環境有問題」，回錯了就會把取消記成 enforcement failure。
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	target, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return "", fmt.Errorf("assist: 解析 %s: %w", bin, err)
+	}
+	// **O_NONBLOCK 開檔，再對同一個 descriptor 做 Stat**（reviewer 2026-08-20）：
+	// 先 Stat 再 Open 是 TOCTOU——兩者之間把 regular file 換成 FIFO，open 就會
+	// 卡在等寫入端，deadline 也救不了（open 本身不吃 context）。O_NONBLOCK 讓
+	// FIFO 的唯讀 open 立即返回，對 regular file 則是 no-op；拿到 fd 之後用
+	// f.Stat() 判型別，判的就是**實際打開的那個東西**。
+	f, err := os.OpenFile(target, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	st, err := f.Stat()
+	if err != nil {
 		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("assist: %s 不是一般檔案（mode=%s）——拒絕對 FIFO／device 計算 digest", target, st.Mode())
+	}
+	h := sha256.New()
+	buf := make([]byte, 64*1024)
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return "", cerr
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// **已知界限**（不宣稱完整 bounded）：Go 的 context 中斷不了已經進入核心的
+// filesystem 呼叫——**metadata 操作（EvalSymlinks／Stat）、open、以及單一次 read**
+// 都一樣。目標若落在卡住的遠端掛載上，這三者都可能無界等待，得靠掛載層的 timeout
+// （例如 NFS soft mount）處理。這裡保證的是：進場先檢查取消、每兩次 read 之間再
+// 檢查一次，以及本地可預期的兩種無界等待（FIFO／device）已經擋掉。
+
 // binaryVersionOutput 執行 `<bin> --version` 並回傳 trim 後的 stdout。
-func binaryVersionOutput(bin string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func binaryVersionOutput(parent context.Context, bin string) (string, error) {
+	// 30s 是上界，**不是**唯一的取消來源：parent 由呼叫端傳入，shutdown 一
+	// cancel 就立刻收斂，不必等滿 30 秒（reviewer 2026-08-20）。
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	// process group 收尾（同 spec.GitRepo 的理由）：CommandContext 只殺直接
+	// child，忽略 TERM 的孫程序會讓取消不收斂（reviewer 2026-08-20）。
+	out, ex, err := proc.Output(ctx, proc.Config{Binary: bin, Args: []string{"--version"}})
 	if err != nil {
-		return "", fmt.Errorf("assist: %s --version: %w", bin, err)
+		return "", fmt.Errorf("assist: %s --version: %w", bin, err) // 保留 ctx error identity
+	}
+	if ex.Err != nil {
+		// %w 保留 *exec.ExitError（同 appGitRunner／spec.GitRepo 的處置）：呼叫端
+		// 現在沒有依 exit type 分流，但攤平成字串會讓之後想分流的人無從下手。
+		return "", fmt.Errorf("assist: %s --version: %s: %w", bin, strings.TrimSpace(ex.StderrTail), ex.Err)
+	}
+	if ex.Code != 0 {
+		return "", fmt.Errorf("assist: %s --version: exit %d: %s", bin, ex.Code, strings.TrimSpace(ex.StderrTail))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -105,14 +173,14 @@ func binaryVersionOutput(bin string) (string, error) {
 // "2.1.223 (Claude Code)"，取第一個 field）；(2) plannerArgs 與凍結 probe 基準
 // probeApprovedClaudeArgs 逐字相等。error 只在環境層失敗（binary 缺失／不可
 // 執行／不可讀）回；檢驗不符走 OK=false＋Reason。兩者在 app 層皆 fail closed。
-func PreflightClaude(bin string, plannerArgs []string) (PreflightResult, error) {
+func PreflightClaude(ctx context.Context, bin string, plannerArgs []string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "claude", BinaryPath: bin}
-	digest, err := BinarySHA256(bin)
+	digest, err := BinarySHA256(ctx, bin)
 	if err != nil {
 		return res, err
 	}
 	res.BinaryDigest = digest
-	raw, err := binaryVersionOutput(bin)
+	raw, err := binaryVersionOutput(ctx, bin)
 	if err != nil {
 		return res, err
 	}
@@ -137,14 +205,14 @@ func PreflightClaude(bin string, plannerArgs []string) (PreflightResult, error) 
 // "codex-cli 0.146.1"，取最後一個 field）。wire 與 handler 的 enforcement
 // 證明由 production-path 測試提供（oneshot_test.go 的 fake app-server 走真
 // codexAssist.Run），preflight runtime 檢查限版本＋binary digest。
-func PreflightCodex(bin string) (PreflightResult, error) {
+func PreflightCodex(ctx context.Context, bin string) (PreflightResult, error) {
 	res := PreflightResult{Provider: "codex", BinaryPath: bin}
-	digest, err := BinarySHA256(bin)
+	digest, err := BinarySHA256(ctx, bin)
 	if err != nil {
 		return res, err
 	}
 	res.BinaryDigest = digest
-	raw, err := binaryVersionOutput(bin)
+	raw, err := binaryVersionOutput(ctx, bin)
 	if err != nil {
 		return res, err
 	}

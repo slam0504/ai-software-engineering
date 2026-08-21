@@ -184,7 +184,7 @@ type codexAssist struct {
 
 // NewCodexAssist 回傳以獨立 ephemeral Codex thread 草擬的 Runner。為求隔離與
 // fail-closed，它啟動**自己的** app-server process（獨立 conn／handler），
-// 不發布到 App 的 a.runner／a.codexConn。turn wire 帶 readOnly sandbox ＋
+// 不發布到 App 的 sessionHosts／a.codexConn。turn wire 帶 readOnly sandbox ＋
 // approvalPolicy=never；任何 escalation／approval request 一律 fail closed。
 func NewCodexAssist(bin, cwd string, env []string) Runner {
 	return &codexAssist{bin: bin, cwd: cwd, env: env}

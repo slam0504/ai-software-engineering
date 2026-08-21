@@ -2,18 +2,49 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { PROVIDERS, useSession } from '../stores/session'
+import type { ProviderKey } from '../stores/session'
 import {
-  TerminateSession, EndSession, NewSession, AuthStatus, StartLogin, CancelLogin, Logout,
-  RestartCodexServerRecorded,
+  TerminateSession, NewSession, CreateSession, AuthStatus, StartLogin, CancelLogin,
+  Logout, RestartCodexServerRecorded,
 } from '../../wailsjs/go/main/App'
 
 const { t } = useI18n()
 const s = useSession()
 
+// Task 26：session 分頁取代原本的 provider 分頁——lifecycle binding 已改為 WSID
+// 定址，「目前操作哪一個 session」因此必須是明確的 WSID 而非 provider。
+// 正式的 SessionList（§4）與雙 pane 是 Task 27／28，這裡維持既有 SettingsBar
+// 形狀做最小接線：點分頁＝把該 session 釘進 focused pane。
+const wsid = computed(() => s.focusedWsid)
+
+function selectSession(w: string) {
+  const at = s.pins.indexOf(w)
+  if (at === 0 || at === 1) s.setFocus(at)
+  else s.pin(s.focused, w)
+}
+
+async function createSession(p: ProviderKey) {
+  await call(async () => {
+    const w = await CreateSession(p, s.taskLabel)
+    s.registerSession({ wsid: w, provider: p, taskLabel: s.taskLabel })
+    s.pin(s.focused, w)
+    return w
+  }, 'create')
+}
+
 // per-view 輸入欄位的 v-model 包裝（store getter 唯讀，寫入走 action）
 const resumeInput = computed({ get: () => s.resumeInput, set: (v: string) => s.setResumeInput(v) })
 const taskLabel = computed({ get: () => s.taskLabel, set: (v: string) => s.setTaskLabel(v) })
 const recordCase = computed({ get: () => s.recordCase, set: (v: string) => s.setRecordCase(v) })
+
+// endSession：Task 28 review round 1——走 s.bindings.EndSession 而非原始
+// wailsjs import，理由：DualPane 需要 End 是 focused-pane 專屬控制項且測試
+// 只 mock s.bindings（不另開 vi.mock wailsjs module）；PaneView 原本自帶一份
+// 等價按鈕會造成「同一畫面兩顆結束」，裁決收斂到這裡、刪掉 PaneView 那份。
+async function endSession() {
+  if (!s.bindings?.EndSession) throw new Error(t('store.bindingsNotReady'))
+  await s.bindings.EndSession(wsid.value)
+}
 
 // opKey ∈ settings.operationAction 的 key（new/terminate/end/authStatus/login/cancelLogin/logout/b1Probe）
 async function call(fn: () => Promise<unknown>, opKey: string) {
@@ -34,14 +65,18 @@ async function call(fn: () => Promise<unknown>, opKey: string) {
 <template>
   <div class="settings">
     <nav class="tabs" role="tablist">
-      <button v-for="p in PROVIDERS" :key="p" role="tab"
-        :class="['tab', { active: s.activeProvider === p }]"
-        :aria-selected="s.activeProvider === p"
-        @click="s.setActiveProvider(p)">
-        {{ p }}
-        <span v-if="s.unreadOf(p) > 0" class="badge">{{ s.unreadOf(p) }}</span>
-        <span v-if="s.awaitingOf(p)" class="await" :title="t('settings.awaitingApproval.tooltip')">⚠</span>
+      <button v-for="m in s.sessionList" :key="m.wsid" role="tab"
+        :class="['tab', { active: m.wsid === wsid, unavailable: !m.available }]"
+        :aria-selected="m.wsid === wsid" :data-test="'session-tab-' + m.wsid"
+        :title="m.available ? m.wsid : t('store.sessionUnavailable', { wsid: m.wsid })"
+        @click="selectSession(m.wsid)">
+        {{ m.provider }}{{ m.taskLabel ? ' · ' + m.taskLabel : '' }}
+        <span v-if="s.unreadOf(m.wsid) > 0" class="badge">{{ s.unreadOf(m.wsid) }}</span>
+        <span v-if="s.awaitingOf(m.wsid)" class="await" :title="t('settings.awaitingApproval.tooltip')">⚠</span>
       </button>
+      <button v-for="p in PROVIDERS" :key="'new-' + p" class="tab create"
+        :data-test="'create-' + p" :title="t('settings.createSession.tooltip', { provider: p })"
+        @click="createSession(p)">+{{ p }}</button>
     </nav>
     <input v-model="taskLabel" class="w-160" :placeholder="t('settings.taskId.placeholder')" />
     <select v-if="s.provider === 'codex'" v-model="s.approvalPolicy" :title="t('settings.approvalPolicy.tooltip')">
@@ -49,14 +84,21 @@ async function call(fn: () => Promise<unknown>, opKey: string) {
       <option value="on-request">{{ t('settings.approvalPolicy.onRequest') }}</option>
       <option value="never" class="danger">{{ t('settings.approvalPolicy.never') }}</option>
     </select>
-    <input v-model="recordCase" class="w-160" :placeholder="t('settings.recordCase.placeholder', { provider: s.provider })" />
+    <!-- recordCase：§3.4.4 之後 codex 的錄流是 connection-wide（一個 Conn 一份
+         wire log），這個欄位對 codex 只剩 audit label、不再控制任何錄製行為，
+         因此在 codex session 上停用並說明，避免使用者以為填了就會錄。 -->
+    <input v-model="recordCase" class="w-160" :disabled="s.provider === 'codex'"
+      :title="s.provider === 'codex' ? t('settings.recordCase.codexLabelOnly') : ''"
+      :placeholder="s.provider === 'codex' ? t('settings.recordCase.codexLabelOnly')
+        : t('settings.recordCase.placeholder', { provider: s.provider })" />
     <input v-model="resumeInput" class="w-200" :placeholder="t('settings.resumeId.placeholder')" />
     <button :title="t('settings.newSession.tooltip')"
-      @click="call(async () => { await NewSession(s.provider); s.reset() }, 'new')">{{ t('settings.action.new') }}</button>
+      :disabled="!wsid"
+      @click="call(async () => { await NewSession(wsid); s.reset() }, 'new')">{{ t('settings.action.new') }}</button>
     <!-- NewSession 原子流程（收尾＋恢復視窗重設）；失敗由 call() 顯示且不 reset -->
 
-    <button @click="call(() => TerminateSession(s.provider), 'terminate')">{{ t('settings.action.terminate') }}</button>
-    <button @click="call(() => EndSession(s.provider), 'end')">{{ t('settings.action.end') }}</button>
+    <button :disabled="!wsid" @click="call(() => TerminateSession(wsid), 'terminate')">{{ t('settings.action.terminate') }}</button>
+    <button :disabled="!wsid" data-test="end-session" @click="call(endSession, 'end')">{{ t('settings.action.end') }}</button>
     <span class="spacer" />
     <button @click="call(() => AuthStatus(s.provider), 'authStatus')">{{ t('settings.action.authStatus') }}</button>
     <button @click="call(() => StartLogin(s.provider), 'login')">{{ t('settings.action.login') }}</button>
@@ -71,6 +113,8 @@ async function call(fn: () => Promise<unknown>, opKey: string) {
 .tabs { display: flex; gap: 2px; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
 .tab { background: var(--bg-inset); color: var(--text-muted); border: none; padding: var(--space-1) var(--space-3); font-size: var(--fs-m); cursor: pointer; display: flex; align-items: center; gap: var(--space-1); }
 .tab.active { background: var(--bg-bubble-user); color: var(--text); }
+.tab.unavailable { color: var(--err); text-decoration: line-through; }
+.tab.create { color: var(--text-faint); }
 .tab .await { color: var(--warn); }
 .w-160 { width: 160px; }
 .w-200 { width: 200px; }

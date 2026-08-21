@@ -15,6 +15,7 @@ export default {
     },
     timeline: {
       label: '執行時間軸',
+      unreadTooltip: '時間軸收合期間有未讀錯誤——展開查看（含 registry 停用等需要重啟的狀況）',
     },
     resize: {
       width: '拖曳調整寬度',
@@ -23,6 +24,9 @@ export default {
     startupError: '啟動：{error}',
     goResubmit: {
       integrityError: '資料完整性錯誤：無法解析重新送核目標——已取消導航',
+    },
+    paneLayout: {
+      restoreFailed: '無法還原釘選的 pane——兩個 pane 以空白啟動，請重新釘選需要的 session：{error}',
     },
   },
   settings: {
@@ -38,6 +42,7 @@ export default {
     },
     operationAction: {
       new: '開新對話',
+      create: '建立 session',
       terminate: '強制終止',
       end: '結束對話',
       authStatus: '查詢登入狀態',
@@ -56,6 +61,7 @@ export default {
     },
     recordCase: {
       placeholder: '{provider}-case（錄流，可空）',
+      codexLabelOnly: 'codex 錄流已是 connection-wide（§3.4.4）：本欄僅作為稽核標籤，不控制錄製',
     },
     resumeId: {
       placeholder: 'resume id（可空）',
@@ -65,6 +71,9 @@ export default {
       untrusted: 'untrusted（每次核可）',
       onRequest: 'on-request',
       never: 'never（不核可，風險自負）',
+    },
+    createSession: {
+      tooltip: '建立新的 {provider} session 並釘到目前的 pane',
     },
     newSession: {
       tooltip: '結束目前 session，等待舊 provider 收尾後開新對話',
@@ -81,6 +90,9 @@ export default {
     action: {
       send: '送出',
     },
+  },
+  dualPane: {
+    empty: '這個 pane 還沒有釘選任何 session——從左側清單釘選一個',
   },
   gate: {
     action: {
@@ -292,6 +304,7 @@ export default {
       approvalDecision: '核可決定：{text}',
       stateChange: '狀態 → {state}',
       retry: 'provider 重試',
+      codexBroadcast: 'codex 廣播：{method}',
       toolResult: '工具結果',
     },
     raw: '原始資料',
@@ -299,6 +312,30 @@ export default {
   },
   store: {
     bindingsNotReady: '綁定尚未就緒',
+    noFocusedSession: '焦點 pane 沒有釘選任何 session——請先建立或釘選一個',
+    paneLayoutPersistFailed: 'pane 釘選沒有存檔，這次的排列重啟後會遺失（釘選本身仍然有效）：{error}',
+    sessionUnavailable: 'session {wsid} 有紀錄但目前無法操作（沒有對應的 working slot）；請重啟 app 或將它移除',
+  },
+  sessionList: {
+    empty: '目前沒有任何 session——用上方的建立按鈕開一個',
+    action: {
+      create: '建立',
+      pin: '釘選',
+      remove: '移除',
+    },
+    busyTooltip: '等待回覆中',
+    pin: {
+      blockedByApproval: '此窗格正在顯示待核准操作；完成或離開核准流程後即可切換。',
+    },
+    create: {
+      failed: '建立 {provider} session 失敗：{error}',
+    },
+    remove: {
+      confirmText: '移除後這個 session 會從清單消失，但稽核事件與錄流會永久保留（不會被刪除）。確定要移除嗎？',
+      confirmSubmit: '確認移除',
+      cancel: '取消',
+      failed: '移除 session {wsid} 失敗：{error}',
+    },
   },
   escalation: {
     section: {

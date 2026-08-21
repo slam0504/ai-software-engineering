@@ -10,8 +10,8 @@ import (
 // nopSink：EmitWorkspace 測試用的最小 AuditSink 實作（Write 一律成功）。
 type nopSink struct{}
 
-func (nopSink) Write(contract.Envelope) error { return nil }
-func (nopSink) Close() error                  { return nil }
+func (nopSink) Write(contract.Envelope) (AppendReceipt, error) { return AppendReceipt{}, nil }
+func (nopSink) Close() error                                   { return nil }
 
 func TestEmitWorkspaceScopedAndNoSlot(t *testing.T) {
 	var got []contract.Envelope

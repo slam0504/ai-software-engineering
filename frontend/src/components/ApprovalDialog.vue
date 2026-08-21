@@ -5,7 +5,9 @@ import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { ResolveApproval } from '../../wailsjs/go/main/App'
 import { useSession } from '../stores/session'
 
-interface Req { id: string; provider: string; toolName: string; inputJson: string }
+// Req：後端 a.emit("approval:request", …) 的 payload。Task 26 加入 wsid——
+// 多 session 之後 provider 不足以定位來源 session（§3.6.4 的 pane 路由）。
+interface Req { id: string; wsid: string; provider: string; toolName: string; inputJson: string }
 
 const { t } = useI18n()
 const s = useSession()
@@ -16,9 +18,11 @@ const error = ref('')
 
 const current = computed<Req | null>(() => queue.value[0] ?? null)
 
-function focusProvider(r: Req | undefined) {
-  if (!r) return
-  s.setActiveProvider(r.provider === 'codex' ? 'codex' : 'claude') // 彈出／promotion 時自動切 tab
+// present：把來源 session 帶到使用者眼前（§3.6.4）——已釘選就切 focus，未釘選
+// 則由 store 做 transient secondary presentation。
+function present(r: Req | undefined) {
+  if (!r?.wsid) return
+  s.routeApproval(r.wsid)
 }
 
 function removeById(id: string) {
@@ -26,11 +30,13 @@ function removeById(id: string) {
   if (idx === -1) return
   const wasCurrent = idx === 0
   queue.value.splice(idx, 1)
-  if (wasCurrent) {
-    reason.value = ''
-    error.value = ''
-    focusProvider(queue.value[0]) // promotion：輪到顯示才切 tab
-  }
+  if (!wasCurrent) return
+  reason.value = ''
+  error.value = ''
+  // 先恢復原釘選，再讓下一筆（若有）重新路由——順序反過來的話，第二筆的
+  // transient 會被緊接著的恢復動作立刻撤掉。
+  s.resolveApprovalPresentation()
+  present(queue.value[0]) // promotion：輪到顯示才切 pane
 }
 
 EventsOn('approval:request', (r: Req) => {
@@ -38,10 +44,13 @@ EventsOn('approval:request', (r: Req) => {
   if (queue.value.length === 1) { // 立即顯示的第一筆
     reason.value = ''
     error.value = ''
-    focusProvider(r)
+    present(r)
   }
 })
-EventsOn('approval:dismiss', (d: { id: string }) => removeById(d.id)) // timeout／resolved：按 ID 移除正確項目
+// timeout／resolved：按 ID 移除正確項目。§3.6.4 六種觸發（allow／deny／timeout／
+// dismiss／remove／shutdown）的**恢復行為完全相同**，前端因此不區分——後端
+// approval:dismiss 仍帶 cause／reason，那是給 audit 與事後對帳用的。
+EventsOn('approval:dismiss', (d: { id: string }) => removeById(d.id))
 
 async function decide(allow: boolean, why?: string) {
   const r = current.value

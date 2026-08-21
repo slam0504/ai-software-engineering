@@ -481,7 +481,9 @@ func TestEscalationUnavailableFailsClosed(t *testing.T) {
 	a, _ := newTestAppEvidence(t)
 	// 預埋 schema 違規行（合法 JSON、未知 _type）——ensureEscalation 首次開啟
 	// 就載入它，之後任何 Project 必失敗。
-	writeFile(t, filepath.Join(a.workspaceDir, ".workbench", "escalation.jsonl"), `{"_type":"bogus"}`+"\n")
+	// escalation journal 綁受 ownership lease 保護的 a.stateDir（見 ensureGate 的
+	// doc）——不是 workspaceDir/.workbench，兩者在 tmp fallback 下不同值。
+	writeFile(t, filepath.Join(a.stateDir, "escalation.jsonl"), `{"_type":"bogus"}`+"\n")
 
 	writeFile(t, filepath.Join(a.workspaceDir, "spec", "glossary.md"), "term v1")
 	runGit(t, a, "add", "-A")
