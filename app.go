@@ -8500,6 +8500,12 @@ func (a *App) startCodexHost(w appcore.WSID, host codexHost, prompt, resume, rec
 		approvalPolicy = "untrusted"
 	}
 	runner := codex.NewThreadRunner(conn)
+	// B1（owner 2026-08-21）：每一輪 turn/start 帶 workspace-write sandbox，否則
+	// codex 預設 read-only、approval 的 accept 也放寬不了 sandbox → workspace 內
+	// 寫入必然 EPERM（見 docs/spikes/codex-approval-eperm.md）。untrusted 下寫入
+	// **仍會出 approval**；workspace 外與網路仍受 sandbox 邊界。thread/start 帶此
+	// 欄無效（被靜默忽略），故設在 runner、由每輪 StartTurn 帶出。
+	runner.SetTurnSandbox(codex.SandboxWorkspaceWrite)
 	if recordCase != "" { // label-only：留下可觀測軌跡，不影響任何錄流行為
 		a.audit("codex_record_label", map[string]any{"wsid": string(w), "label": recordCase})
 	}

@@ -47,6 +47,12 @@ const (
 	MethodRemoteControlStatusChanged = "remoteControl/status/changed"
 )
 
+// SandboxWorkspaceWrite：turn/start sandboxPolicy 的 tagged enum type 值——允許
+// **工作目錄內**寫入，workspace 外與網路仍受 sandbox 限制。B1（owner 2026-08-21，
+// 見 docs/spikes/codex-approval-eperm.md）。合法變體另有 readOnly／dangerFullAccess／
+// externalSandbox；本專案只用這一個（read-only 是不帶時的預設，無須明列）。
+const SandboxWorkspaceWrite = "workspaceWrite"
+
 // ClientMethods 是 M0 會送出的 c2s 方法集（replay 的 c2s 驗證依據）。
 var ClientMethods = map[string]bool{
 	MethodInitialize:         true,

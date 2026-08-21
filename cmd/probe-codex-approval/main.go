@@ -12,6 +12,13 @@
 //   - **fail loud**：任一組 Err／timeout → 退出碼 1。
 //   - **原始證據**：每組結果以 JSON 落到 -out 目錄，附 binary 版本與 sha256。
 //
+// rev3（reviewer 2026-08-21 二輪）：
+//   - 記錄 **turn_start_params**（G7 收錯證據正是因為只存了 thread 層參數）。
+//   - approval 改 **approval_events[] 逐事件**＋approvals_turn1/turn2 計數——
+//     G8「第二輪跳過核可」由 approvals_turn2==0 直接證明。
+//   - sha256 拆成 launcher_sha256（node wrapper）與 **native_sha256**（vendor
+//     native binary，版本身分的真正載體）。
+//
 // 組別：
 //
 //	G1: 預設 sandbox ＋ 回 "accept"
@@ -22,6 +29,10 @@
 //	G6: 不帶 protocol 參數，改在隔離 home 寫 config.toml `sandbox_mode = "workspace-write"`
 //	G7: sandboxPolicy 掛在 **turn/start**（TurnStartParams 也有此欄）
 //	G8: 同 G2 後，同 home 同指令**再跑第二輪**——驗證 persisted rule 是否自動放行並於 sandbox 外執行
+//	G9: workspace-write ＋ **file-change 寫入路徑**（apply_patch，對照 command-execution）
+//
+// -approval 旗標控制 approvalPolicy（untrusted｜on-request｜never）；配合 G7/G9
+// 可跑「三 policy × 兩寫入路徑」矩陣（B1 驗收）。
 //
 // **本 probe 不改 production 安全模型**；只在隔離環境做行為對照。
 // 退出碼：0 = 全部組別完成且無 probe 自身錯誤；1 = 任一組失敗／timeout／環境錯誤。
@@ -39,6 +50,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/codex"
@@ -53,28 +65,35 @@ var (
 	// {"type":"read-only"} kebab）；G3-G5 用這個旗標逐一對照。
 	sandboxForm = flag.String("sandbox", "workspaceWrite",
 		`G3-G5 的 sandboxPolicy 值：字串（如 workspaceWrite / workspace-write）或 JSON（如 {"type":"workspaceWrite"}）`)
+	approval = flag.String("approval", "untrusted", "approvalPolicy：untrusted | on-request | never")
 )
 
 const groupTimeout = 120 * time.Second
 
 type groupResult struct {
-	Group             string `json:"group"`
-	BinaryVersion     string `json:"binary_version"`
-	BinarySHA256      string `json:"binary_sha256"`
-	ThreadStartParams string `json:"thread_start_params"`
-	ThreadStartResp   string `json:"thread_start_response_raw"`
-	RulesBefore       string `json:"rules_digest_before"`
-	RulesAfter        string `json:"rules_digest_after"`
-	RulesContentAfter string `json:"rules_content_after,omitempty"`
-	ApprovalMethod    string `json:"approval_method"`
-	ApprovalRaw       string `json:"approval_params_raw,omitempty"`
-	DecisionSent      string `json:"decision_sent"`
-	TurnOutcome       string `json:"turn_outcome"`
-	MarkerPath        string `json:"marker_path"`
-	MarkerCreated     bool   `json:"marker_created"`
-	TurnContext       string `json:"rollout_turn_context"`
-	AgentTail         string `json:"agent_tail"`
-	Err               string `json:"err,omitempty"`
+	Group             string   `json:"group"`
+	BinaryVersion     string   `json:"binary_version"`
+	LauncherSHA256    string   `json:"launcher_sha256"` // -codex-bin 解析後實體檔（node wrapper 時是 wrapper 的 hash）
+	NativeSHA256      string   `json:"native_sha256"`   // wrapper 之下實際的 vendor native binary
+	NativePath        string   `json:"native_path"`
+	ThreadStartParams string   `json:"thread_start_params"`
+	TurnStartParams   string   `json:"turn_start_params"`
+	ThreadStartResp   string   `json:"thread_start_response_raw"`
+	RulesBefore       string   `json:"rules_digest_before"`
+	RulesAfter        string   `json:"rules_digest_after"`
+	RulesContentAfter string   `json:"rules_content_after,omitempty"`
+	ApprovalMethod    string   `json:"approval_method"` // 首個 approval（向後相容）
+	ApprovalEvents    []string `json:"approval_events"` // 逐事件：method→decision（依序）
+	ApprovalsTurn1    int      `json:"approvals_turn1"`
+	ApprovalsTurn2    int      `json:"approvals_turn2"` // 僅 G8 有意義
+	ApprovalRaw       string   `json:"approval_params_raw,omitempty"`
+	DecisionSent      string   `json:"decision_sent"`
+	TurnOutcome       string   `json:"turn_outcome"`
+	MarkerPath        string   `json:"marker_path"`
+	MarkerCreated     bool     `json:"marker_created"`
+	TurnContext       string   `json:"rollout_turn_context"`
+	AgentTail         string   `json:"agent_tail"`
+	Err               string   `json:"err,omitempty"`
 }
 
 func main() {
@@ -90,15 +109,16 @@ func main() {
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		fatal("mkdir out: %v", err)
 	}
-	ver, sha := binaryIdentity(bin)
-	fmt.Printf("binary: %s\nversion: %s\nsha256: %s\n\n", bin, ver, sha)
+	ver, launcherSHA, nativeSHA, nativePath := binaryIdentity(bin)
+	fmt.Printf("binary: %s\nversion: %s\nlauncher_sha256: %s\nnative: %s\nnative_sha256: %s\n\n",
+		bin, ver, launcherSHA, nativePath, nativeSHA)
 
 	failed := false
 	var summaries []string
 	for _, g := range strings.Split(*groups, ",") {
 		g = strings.TrimSpace(g)
 		r := runGroup(bin, g)
-		r.BinaryVersion, r.BinarySHA256 = ver, sha
+		r.BinaryVersion, r.LauncherSHA256, r.NativeSHA256, r.NativePath = ver, launcherSHA, nativeSHA, nativePath
 		raw, _ := json.MarshalIndent(r, "", "  ")
 		outPath := filepath.Join(*outDir, fmt.Sprintf("g%s.json", g))
 		if werr := os.WriteFile(outPath, raw, 0o644); werr != nil {
@@ -175,6 +195,13 @@ func runGroup(bin, g string) (res groupResult) {
 	case "5":
 		res.MarkerPath = "(network)"
 		prompt = "請執行 curl --max-time 8 -sS https://example.com -o /dev/null -w '%{http_code}' 並回報輸出。無論成功、失敗或需要核可，都請簡短回報結果，不要嘗試其他替代作法。"
+	case "9":
+		// file-change 寫入路徑（apply_patch），對照 command-execution。先放一個
+		// 種子檔讓 codex 有東西可改。
+		seed := filepath.Join(cwd, "edit-target.txt")
+		_ = os.WriteFile(seed, []byte("original\n"), 0o644)
+		res.MarkerPath = seed
+		prompt = "請把工作目錄裡 edit-target.txt 的內容改成 CHANGED（用檔案編輯，不要用 shell 指令）。無論成功、失敗或需要核可，都請簡短回報結果。"
 	default:
 		res.MarkerPath = filepath.Join(cwd, marker)
 		prompt = fmt.Sprintf("請執行 touch %s 建立檔案。無論成功或失敗，都請簡短回報結果，不要嘗試其他替代作法。", marker)
@@ -216,12 +243,11 @@ func runGroup(bin, g string) (res groupResult) {
 			}
 		}
 	})
+	var apprMu sync.Mutex
 	conn.OnServerRequest(func(method string, params json.RawMessage) (any, error) {
 		if !strings.Contains(method, "requestApproval") {
 			return nil, fmt.Errorf("probe: unexpected server request %s", method)
 		}
-		res.ApprovalMethod = method
-		res.ApprovalRaw = compact(params)
 		var p struct {
 			ProposedExecpolicyAmendment []string `json:"proposedExecpolicyAmendment"`
 		}
@@ -232,7 +258,14 @@ func runGroup(bin, g string) (res groupResult) {
 				"execpolicy_amendment": p.ProposedExecpolicyAmendment}}
 		}
 		b, _ := json.Marshal(decision)
-		res.DecisionSent = string(b)
+		apprMu.Lock()
+		if res.ApprovalMethod == "" { // 首個（向後相容欄位）
+			res.ApprovalMethod = method
+			res.ApprovalRaw = compact(params)
+			res.DecisionSent = string(b)
+		}
+		res.ApprovalEvents = append(res.ApprovalEvents, method+"→"+string(b))
+		apprMu.Unlock()
 		return map[string]any{"decision": decision}, nil
 	})
 
@@ -241,7 +274,7 @@ func runGroup(bin, g string) (res groupResult) {
 		return
 	}
 
-	startParams := map[string]any{"approvalPolicy": "untrusted"}
+	startParams := map[string]any{"approvalPolicy": *approval}
 	if g == "3" { // 只有 G3 留在 thread/start（實測：被靜默忽略——這本身是 finding）
 		v, perr := parseSandboxForm(*sandboxForm)
 		if perr != nil {
@@ -272,9 +305,9 @@ func runGroup(bin, g string) (res groupResult) {
 		"threadId": tr.Thread.ID,
 		"input":    []map[string]any{{"type": "text", "text": prompt}},
 	}
-	if g == "4" || g == "5" || g == "7" {
+	if g == "4" || g == "5" || g == "7" || g == "9" {
 		// turn/start 才是 protocol 上有效的 sandbox 入口（G7 主證；G4/G5 在有效的
-		// workspace-write context 下驗 workspace 外寫入與網路邊界）。
+		// workspace-write context 下驗 workspace 外寫入與網路邊界；G9 file-change）。
 		v, perr := parseSandboxForm(*sandboxForm)
 		if perr != nil {
 			res.Err = perr.Error()
@@ -282,6 +315,8 @@ func runGroup(bin, g string) (res groupResult) {
 		}
 		turnParams["sandboxPolicy"] = v
 	}
+	tb, _ := json.Marshal(turnParams)
+	res.TurnStartParams = string(tb)
 	if _, err := conn.Call(ctx, "turn/start", turnParams); err != nil {
 		res.Err = "turn/start: " + err.Error()
 		return
@@ -291,8 +326,12 @@ func runGroup(bin, g string) (res groupResult) {
 	case <-ctx.Done():
 		res.TurnOutcome = "timeout"
 	}
-	// G8：不對稱性證明——第一輪 amendment 落規則後，同 home 同指令再跑第二輪，
-	// 觀察是否因既存規則自動放行且在 sandbox 之外執行（marker 落地）。
+	apprMu.Lock()
+	res.ApprovalsTurn1 = len(res.ApprovalEvents)
+	apprMu.Unlock()
+	// G8：不對稱性證明——第一輪 amendment 落規則後，同 home 同指令再跑第二輪。
+	// 「第二輪跳過核可」由 approvals_turn2 == 0 直接證明（reviewer 2026-08-21：
+	// 單一 approval_method 欄位無法分辨第二輪有沒有再問）。
 	if g == "8" && res.TurnOutcome == "completed" {
 		if _, err := conn.Call(ctx, "turn/start", map[string]any{
 			"threadId": tr.Thread.ID,
@@ -307,8 +346,17 @@ func runGroup(bin, g string) (res groupResult) {
 		case <-ctx.Done():
 			res.TurnOutcome = "completed;second=timeout"
 		}
+		apprMu.Lock()
+		res.ApprovalsTurn2 = len(res.ApprovalEvents) - res.ApprovalsTurn1
+		apprMu.Unlock()
 	}
-	if g != "5" {
+	switch g {
+	case "5": // 網路：無 marker 檔
+	case "9": // file-change：看內容是否真的被改（種子檔一開始就存在）
+		if b, rerr := os.ReadFile(res.MarkerPath); rerr == nil && strings.Contains(string(b), "CHANGED") {
+			res.MarkerCreated = true
+		}
+	default:
 		if _, serr := os.Stat(res.MarkerPath); serr == nil {
 			res.MarkerCreated = true
 		}
@@ -374,23 +422,53 @@ func rulesContent(home string) string {
 	return string(b)
 }
 
-func binaryIdentity(bin string) (version, sha string) {
+func binaryIdentity(bin string) (version, launcherSHA, nativeSHA, nativePath string) {
 	out, err := exec.Command(bin, "--version").Output()
 	if err != nil {
 		version = "(version err: " + err.Error() + ")"
 	} else {
 		version = strings.TrimSpace(string(out))
 	}
-	// sha 對 resolve 後的實體檔（.bin/codex 是 node wrapper 時就記 wrapper 的 target）
 	real, err := filepath.EvalSymlinks(bin)
 	if err != nil {
 		real = bin
 	}
-	b, err := os.ReadFile(real)
-	if err != nil {
-		return version, "(read err)"
+	launcherSHA = fileSHA(real)
+	// node wrapper（bin/codex.js）之下的 vendor native binary 才是版本身分的
+	// 真正載體（reviewer 2026-08-21：兩版 wrapper JS 內容相同、hash 相同，
+	// 誤稱 binary 身分）。從 wrapper 所在的 node_modules 找 @openai/codex-*/
+	// vendor/**/bin/codex。
+	nativeSHA, nativePath = "(not found)", "(not found)"
+	nm := real
+	for i := 0; i < 8 && nm != "/"; i++ {
+		nm = filepath.Dir(nm)
+		if filepath.Base(nm) == "node_modules" {
+			break
+		}
 	}
-	return version, fmt.Sprintf("%x", sha256.Sum256(b))
+	matches, _ := filepath.Glob(filepath.Join(nm, "@openai", "codex-*", "vendor", "*", "bin", "codex"))
+	switch len(matches) {
+	case 1:
+		nativePath = matches[0]
+		nativeSHA = fileSHA(matches[0])
+	case 0:
+		// -codex-bin 直接指向 Mach-O native binary（非 node wrapper）：native
+		// identity 就是 launcher 本身（reviewer 2026-08-21）。
+		nativePath = real
+		nativeSHA = launcherSHA
+	default:
+		nativePath = strings.Join(matches, ";")
+		nativeSHA = "(ambiguous)"
+	}
+	return
+}
+
+func fileSHA(p string) string {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "(read err)"
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
 // parseSandboxForm：-sandbox 旗標值——`{` 開頭視為 JSON（tagged enum），否則原樣字串。

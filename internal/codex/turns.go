@@ -26,10 +26,23 @@ type ThreadRunner struct {
 	activeTurnID string
 	pending      bool
 	earlyEnded   map[string]bool
+	// turnSandbox：非空時每一輪 turn/start 都帶 sandboxPolicy={"type":<value>}
+	// （B1，owner 2026-08-21）。空＝完全不帶，保留舊 read-only 預設——assist 的
+	// oneshot 不經 ThreadRunner，因此不受影響。thread/start 帶此欄會被 codex
+	// 靜默忽略（見 docs/spikes/codex-approval-eperm.md），唯一有效入口是 turn/start。
+	turnSandbox string
 }
 
 func NewThreadRunner(conn *Conn) *ThreadRunner {
 	return &ThreadRunner{conn: conn, earlyEnded: map[string]bool{}}
+}
+
+// SetTurnSandbox 設定每輪 turn/start 帶的 sandbox（tagged enum 的 type 值，如
+// "workspaceWrite"）。空字串＝不帶。須在第一輪 StartTurn 之前設定。
+func (t *ThreadRunner) SetTurnSandbox(v string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.turnSandbox = v
 }
 
 func (t *ThreadRunner) ThreadID() string {
@@ -87,12 +100,17 @@ func (t *ThreadRunner) StartTurn(ctx context.Context, prompt string) (string, bo
 	}
 	t.pending = true // 送 wire 前佔位：barrier 下只有一個贏家
 	threadID := t.threadID
+	sandbox := t.turnSandbox
 	t.mu.Unlock()
 
-	res, err := t.conn.Call(ctx, MethodTurnStart, map[string]any{
+	params := map[string]any{
 		"threadId": threadID,
 		"input":    []map[string]any{{"type": "text", "text": prompt}},
-	})
+	}
+	if sandbox != "" {
+		params["sandboxPolicy"] = map[string]any{"type": sandbox}
+	}
+	res, err := t.conn.Call(ctx, MethodTurnStart, params)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pending = false

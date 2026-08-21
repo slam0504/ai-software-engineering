@@ -27,11 +27,12 @@ import (
 // 依序發出 threadIDs 裡的 id，turn id 以 "<threadID>-turn-N" 產生，讓斷言能從
 // turn id 反推它屬於哪個 thread。
 type codexScript struct {
-	wire      *fakeCodexWire
-	mu        sync.Mutex
-	threadIDs []string
-	nextStart int
-	turnSeq   map[string]int
+	wire        *fakeCodexWire
+	mu          sync.Mutex
+	threadIDs   []string
+	nextStart   int
+	turnSeq     map[string]int
+	turnSandbox []string // 每筆 turn/start 的 sandboxPolicy 原文（依序）
 	// beforeStartResponse：thread/start response 送出**之前**執行（收到的 threadID
 	// 已決定但 client 還不知道）——pending start 窗口的注入點。
 	beforeStartResponse func(threadID string)
@@ -60,10 +61,12 @@ func newCodexScript(t *testing.T, wire *fakeCodexWire, threadIDs ...string) *cod
 				"result": map[string]any{"thread": map[string]any{"id": th}}})
 		case codex.MethodTurnStart:
 			var p struct {
-				ThreadID string `json:"threadId"`
+				ThreadID      string          `json:"threadId"`
+				SandboxPolicy json.RawMessage `json:"sandboxPolicy"`
 			}
 			_ = json.Unmarshal(f.Params, &p)
 			s.mu.Lock()
+			s.turnSandbox = append(s.turnSandbox, string(p.SandboxPolicy))
 			s.turnSeq[p.ThreadID]++
 			turnID := fmt.Sprintf("%s-turn-%d", p.ThreadID, s.turnSeq[p.ThreadID])
 			hook := s.beforeTurnResponse
@@ -230,6 +233,42 @@ func TestCodexCommandExecutionApprovalRoutesByIdentity(t *testing.T) {
 	}
 	if !containsKind(envsForWSID(ui, w2), string(contract.KindApproval)) {
 		t.Fatal("approval envelope 必須落在 w2")
+	}
+}
+
+// B1（owner 2026-08-21）：codex session 的 turn/start 必須每一輪帶
+// sandboxPolicy={"type":"workspaceWrite"}——否則 codex 預設 read-only、approval
+// 的 accept 放寬不了 sandbox → workspace 內寫入 EPERM（見
+// docs/spikes/codex-approval-eperm.md）。首輪（StartSession）與後續輪（SendMessage）
+// 走同一條 StartTurn，都必須帶。
+func TestCodexTurnStartCarriesWorkspaceWriteSandbox(t *testing.T) {
+	a, _ := newTestApp(t)
+	conn, wire := newFakeCodexConn(t)
+	a.wireCodexConn(conn)
+	script := newCodexScript(t, wire, "th-sb")
+	handshakeFake(t, conn)
+	a.codexHostOverride = fakeCodexHost{conn}
+
+	w := mustCreate(t, a, "codex")
+	if err := a.StartSession(string(w), "首輪", "", "", "task-sb", "untrusted"); err != nil {
+		t.Fatal(err)
+	}
+	h := a.hostFor(w)
+	if h == nil || h.runner == nil {
+		t.Fatalf("codex host 必須掛在 %s 上", w)
+	}
+	// 後續輪（SendMessage 的核心就是 h.runner.StartTurn，見 app.go）——先解首輪
+	// 的 busy，再經同一 runner 送第二輪，證明每輪都帶（同 app_test.go 第二輪慣例）。
+	h.runner.NoteTurnEnded(h.threadID + "-turn-1")
+	if _, _, err := h.runner.StartTurn(context.Background(), "第二輪"); err != nil {
+		t.Fatalf("第二輪：%v", err)
+	}
+	script.mu.Lock()
+	defer script.mu.Unlock()
+	for i, raw := range script.turnSandbox {
+		if raw != `{"type":"workspaceWrite"}` {
+			t.Errorf("第 %d 輪 turn/start 的 sandboxPolicy = %q，want {\"type\":\"workspaceWrite\"}", i+1, raw)
+		}
 	}
 }
 

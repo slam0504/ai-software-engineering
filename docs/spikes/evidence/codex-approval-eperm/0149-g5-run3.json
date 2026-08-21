@@ -1,0 +1,25 @@
+{
+  "group": "5",
+  "binary_version": "codex-cli 0.149.0",
+  "launcher_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "native_sha256": "c646bd178240bb50efd81c2f9919dd9124b126c815911f6c1b6db400786c5ccd",
+  "native_path": "$TMP",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "turn_start_params": "{\"input\":[{\"text\":\"請執行 curl --max-time 8 -sS https://example.com -o /dev/null -w '%{http_code}' 並回報輸出。無論成功、失敗或需要核可，都請簡短回報結果，不要嘗試其他替代作法。\",\"type\":\"text\"}],\"sandboxPolicy\":{\"type\":\"workspaceWrite\"},\"threadId\":\"00000000-0000-0000-0000-000000000035\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000035\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000035\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787307958,\"updatedAt\":1787307958,\"recencyAt\":1787307958,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.149.0\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "item/commandExecution/requestApproval",
+  "approval_events": [
+    "item/commandExecution/requestApproval→\"accept\""
+  ],
+  "approvals_turn1": 1,
+  "approvals_turn2": 0,
+  "approval_params_raw": "{\"threadId\":\"00000000-0000-0000-0000-000000000035\",\"turnId\":\"00000000-0000-0000-0000-000000000036\",\"itemId\":\"exec-00000000-0000-0000-0000-000000000037\",\"startedAtMs\":1787307969489,\"environmentId\":\"local\",\"command\":\"/bin/zsh -lc \\\"curl --max-time 8 -sS https://example.com -o /dev/null -w '%{http_code}'\\\"\",\"cwd\":\"$TMP\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"curl --max-time 8 -sS https://example.com -o /dev/null -w '%{http_code}'\"}],\"proposedExecpolicyAmendment\":[\"curl\",\"--max-time\",\"8\",\"-sS\",\"https://example.com\",\"-o\",\"/dev/null\",\"-w\",\"%{http_code}\"],\"availableDecisions\":[\"accept\",{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"curl\",\"--max-time\",\"8\",\"-sS\",\"https://example.com\",\"-o\",\"/dev/null\",\"-w\",\"%{http_code}\"]}},\"cancel\"]}",
+  "decision_sent": "\"accept\"",
+  "turn_outcome": "completed",
+  "marker_path": "(network)",
+  "marker_created": false,
+  "rollout_turn_context": "sandbox={\"type\":\"workspace-write\",\"network_access\":false,\"exclude_tmpdir_env_var\":false,\"exclude_slash_tmp\":false} approval=\"untrusted\"",
+  "agent_tail": "我會只執行你指定的指令，並簡短回報其結果。執行失敗，輸出：  ```text curl: (6) Could not resolve host: example.com 000 ```  結束碼：`6`。"
+}

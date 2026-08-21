@@ -1,0 +1,25 @@
+{
+  "group": "9",
+  "binary_version": "codex-cli 0.146.1",
+  "launcher_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "native_sha256": "0538c29a25b617107c0ce47af38b5a8411f1ce101730d87c03a0d83350cb46d4",
+  "native_path": "$HOME/playground/project/ai-software-engineering/tools/codex-cli/node_modules/@openai/codex-darwin-x64/vendor/x86_64-apple-darwin/bin/codex",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "turn_start_params": "{\"input\":[{\"text\":\"請把工作目錄裡 edit-target.txt 的內容改成 CHANGED（用檔案編輯，不要用 shell 指令）。無論成功、失敗或需要核可，都請簡短回報結果。\",\"type\":\"text\"}],\"sandboxPolicy\":{\"type\":\"workspaceWrite\"},\"threadId\":\"00000000-0000-0000-0000-000000000006\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000006\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000006\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"isPinned\":false,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787305455,\"updatedAt\":1787305455,\"recencyAt\":1787305455,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.146.1\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "item/fileChange/requestApproval",
+  "approval_events": [
+    "item/fileChange/requestApproval→\"accept\""
+  ],
+  "approvals_turn1": 1,
+  "approvals_turn2": 0,
+  "approval_params_raw": "{\"threadId\":\"00000000-0000-0000-0000-000000000006\",\"turnId\":\"00000000-0000-0000-0000-000000000007\",\"itemId\":\"exec-00000000-0000-0000-0000-000000000008\",\"startedAtMs\":1787305469051,\"reason\":null,\"grantRoot\":null}",
+  "decision_sent": "\"accept\"",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": true,
+  "rollout_turn_context": "sandbox={\"type\":\"workspace-write\",\"network_access\":false,\"exclude_tmpdir_env_var\":false,\"exclude_slash_tmp\":false} approval=\"untrusted\"",
+  "agent_tail": "具修改 `edit-target.txt`，接著簡短回報。原內容不是預期值；我會改用完整檔案替換，目標仍是只留下 `CHANGED`。成功：`edit-target.txt` 內容已改為 `CHANGED`。"
+}

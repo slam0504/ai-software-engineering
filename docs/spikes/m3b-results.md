@@ -612,13 +612,17 @@ server 在 TERM 後 3 秒內全數收斂（§5.4 bounded window 的實機佐證�
    readOnly＋acceptWithExecpolicyAmendment、thread/start 明確指定 workspace-write
    sandbox、更新 Codex 版本後重跑。**結果出來前不得直接把整個 thread 改成可寫**
    （那會改變安全模型）。A3 維持綠。
-   → **調查完成（2026-08-21，rev2）**：八組對照見
-   [`docs/spikes/codex-approval-eperm.md`](codex-approval-eperm.md)——**與版本無關**
-   （rev1 的「0.149.0 已修」係 execpolicy 污染假象，已撤回）；read-only 下任何
-   approval decision 都不放寬 sandbox，有效控制面是 turn/start 的 tagged
-   `sandboxPolicy` 或 config.toml 的 `sandbox_mode`；`acceptWithExecpolicyAmendment`
-   會持久化規則並讓後續指令**於 sandbox 外執行**（不得引入）。選項 B1／B2／C 待
-   owner 裁決，production 未動。
+   → **調查完成（2026-08-21，rev4）**：九組對照見
+   [`docs/spikes/codex-approval-eperm.md`](codex-approval-eperm.md)——**檔案寫入與
+   sandbox 結論兩版一致**（rev1 的「0.149.0 已修」係 execpolicy 污染假象，已撤回）；
+   **唯一版本差異是 G4**（workspace 外寫入：0.146.1 拒絕、0.149.0 執行間非確定可寫，
+   升版前需重評）。read-only 下任何 approval decision 都不放寬 sandbox，有效控制面
+   是 turn/start 的 tagged `sandboxPolicy` 或 config.toml 的 `sandbox_mode`；
+   `acceptWithExecpolicyAmendment` 會持久化規則並讓後續指令**於 sandbox 外執行**
+   （不得引入）。**owner 裁決 B1 並已實作**：每輪 turn/start 帶
+   `sandboxPolicy:{"type":"workspaceWrite"}`（`internal/codex` ThreadRunner＋app 層
+   守門測試），approval-policy × 寫入路徑矩陣實測完成——untrusted 下逐指令核可保留
+   且 accept 後生效。
 2. **P1｜M3b 補強：legacy transcript 接入首次 hydrate**：`RestoreViews`（app.go 已明載
    零前端呼叫端）不刪除，把 legacy view window 接入遷移後 WSID 的首次 hydrate；既有
    測試契約把「舊歷史整段消失」視為錯誤。完成前 A8 的綠限定於已驗的三項窄條件。

@@ -245,3 +245,62 @@ func TestRecordingSpansMultipleTurns(t *testing.T) { // session-scoped 錄流：
 		t.Fatalf("recording must span both turns: starts=%d completes=%d", starts, completes)
 	}
 }
+
+// TestStartTurnCarriesSandboxPolicyEveryTurn：SetTurnSandbox 設定後，**每一輪**
+// turn/start 都帶 tagged sandboxPolicy（B1：首輪與 SendMessage 後續輪一致）；
+// 未設定時完全不帶（保留舊行為，assist 的 readOnly 路徑不受影響）。
+func TestStartTurnCarriesSandboxPolicyEveryTurn(t *testing.T) {
+	check := func(t *testing.T, sandbox string, wantPresent bool) {
+		p := newFakePair(t)
+		var mu sync.Mutex
+		var sawSandbox []string
+		p.fake.onReq = func(fr Frame) {
+			switch fr.Method {
+			case MethodThreadStart:
+				p.fake.send(map[string]any{"id": *fr.ID, "result": map[string]any{"thread": map[string]any{"id": "t1"}}})
+			case MethodTurnStart:
+				var got struct {
+					SandboxPolicy json.RawMessage `json:"sandboxPolicy"`
+				}
+				_ = json.Unmarshal(fr.Params, &got)
+				mu.Lock()
+				sawSandbox = append(sawSandbox, string(got.SandboxPolicy))
+				mu.Unlock()
+				p.fake.send(map[string]any{"id": *fr.ID, "result": map[string]any{
+					"turn": map[string]any{"id": fmt.Sprintf("turn-%d", len(sawSandbox)), "status": "inProgress"}}})
+			}
+		}
+		doHandshake(t, p.conn)
+		r := NewThreadRunner(p.conn)
+		if sandbox != "" {
+			r.SetTurnSandbox(sandbox)
+		}
+		ctx := context.Background()
+		if _, err := r.EnsureThread(ctx, "", "untrusted"); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ { // 首輪 + 後續輪（SendMessage 走同一 StartTurn）
+			id, _, err := r.StartTurn(ctx, "prompt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.NoteTurnEnded(id)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(sawSandbox) != 2 {
+			t.Fatalf("需要兩輪 turn/start，實得 %d", len(sawSandbox))
+		}
+		for turn, raw := range sawSandbox {
+			if wantPresent {
+				if raw != `{"type":"`+sandbox+`"}` {
+					t.Errorf("第 %d 輪 sandboxPolicy = %q，want tagged %q", turn+1, raw, sandbox)
+				}
+			} else if raw != "" {
+				t.Errorf("第 %d 輪不應帶 sandboxPolicy，實得 %q", turn+1, raw)
+			}
+		}
+	}
+	t.Run("set→每輪都帶", func(t *testing.T) { check(t, "workspaceWrite", true) })
+	t.Run("未設→完全不帶", func(t *testing.T) { check(t, "", false) })
+}

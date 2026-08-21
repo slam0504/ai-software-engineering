@@ -1,0 +1,22 @@
+{
+  "group": "1",
+  "binary_version": "codex-cli 0.146.1",
+  "launcher_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "native_sha256": "0538c29a25b617107c0ce47af38b5a8411f1ce101730d87c03a0d83350cb46d4",
+  "native_path": "$HOME/playground/project/ai-software-engineering/tools/codex-cli/node_modules/@openai/codex-darwin-x64/vendor/x86_64-apple-darwin/bin/codex",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "turn_start_params": "{\"input\":[{\"text\":\"請執行 touch marker-g1-76070.txt 建立檔案。無論成功或失敗，都請簡短回報結果，不要嘗試其他替代作法。\",\"type\":\"text\"}],\"threadId\":\"00000000-0000-0000-0000-000000000019\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000019\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000019\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"isPinned\":false,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787304437,\"updatedAt\":1787304437,\"recencyAt\":1787304437,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.146.1\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "",
+  "approval_events": null,
+  "approvals_turn1": 0,
+  "approvals_turn2": 0,
+  "decision_sent": "",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": false,
+  "rollout_turn_context": "sandbox={\"type\":\"read-only\"} approval=\"untrusted\"",
+  "agent_tail": "我會只執行你指定的 `touch marker-g1-76070.txt`，不採用替代作法。失敗：權限政策拒絕執行 `touch marker-g1-76070.txt`，檔案未建立。"
+}

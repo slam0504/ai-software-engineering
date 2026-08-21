@@ -1,0 +1,25 @@
+{
+  "group": "3",
+  "binary_version": "codex-cli 0.149.0",
+  "launcher_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "native_sha256": "c646bd178240bb50efd81c2f9919dd9124b126c815911f6c1b6db400786c5ccd",
+  "native_path": "$TMP",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\",\"sandboxPolicy\":{\"type\":\"workspaceWrite\"}}",
+  "turn_start_params": "{\"input\":[{\"text\":\"請執行 touch marker-g3-92514.txt 建立檔案。無論成功或失敗，都請簡短回報結果，不要嘗試其他替代作法。\",\"type\":\"text\"}],\"threadId\":\"00000000-0000-0000-0000-000000000051\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000051\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000051\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787304790,\"updatedAt\":1787304790,\"recencyAt\":1787304790,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.149.0\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "item/commandExecution/requestApproval",
+  "approval_events": [
+    "item/commandExecution/requestApproval→\"accept\""
+  ],
+  "approvals_turn1": 1,
+  "approvals_turn2": 0,
+  "approval_params_raw": "{\"threadId\":\"00000000-0000-0000-0000-000000000051\",\"turnId\":\"00000000-0000-0000-0000-000000000052\",\"itemId\":\"exec-00000000-0000-0000-0000-000000000053\",\"startedAtMs\":1787304799421,\"environmentId\":\"local\",\"command\":\"/bin/zsh -lc 'touch marker-g3-92514.txt'\",\"cwd\":\"$TMP\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"touch marker-g3-92514.txt\"}],\"proposedExecpolicyAmendment\":[\"touch\",\"marker-g3-92514.txt\"],\"availableDecisions\":[\"accept\",{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"touch\",\"marker-g3-92514.txt\"]}},\"cancel\"]}",
+  "decision_sent": "\"accept\"",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": false,
+  "rollout_turn_context": "sandbox={\"type\":\"read-only\"} approval=\"untrusted\"",
+  "agent_tail": "我會只執行你指定的 `touch` 指令，然後簡短回報。建立失敗：`Operation not permitted`。"
+}
