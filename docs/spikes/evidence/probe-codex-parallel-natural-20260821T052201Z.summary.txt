@@ -1,0 +1,15 @@
+# probe-codex-parallel natural run 20260821T052201Z — 最小化結果摘要
+# 來源：probe 標準輸出（完整原始輸出與完整錄流留在本機）。ID 與伴隨的
+# probe-codex-parallel-natural-20260821T052201Z.jsonl 使用同一套一致性假名化。
+
+RUN mode=natural run_id=20260821T052201Z
+
+VERDICT_B notifications=134 with_threadId=129 with_turnId=109 missing_both=5 broadcast_fallback=false
+  notif_missing_identity_methods=[account/rateLimits/updated remoteControl/status/changed]
+VERDICT_B approvals=1 missing_identity=0
+  APPROVAL at=05:22:11.684 method=item/fileChange/requestApproval threadId="00000000-0000-0000-0000-000000000001" turnId="00000000-0000-0000-0000-000000000002" itemId="exec-00000000-0000-0000-0000-000000000004" decision=decline
+
+SHUTDOWN mode=natural ran=true bounded=true done_after_first_terminate=24ms record_err=<nil> last_frame_seq=151 last_frame_at=05:22:22.672
+exit_code=0
+
+GATE GO

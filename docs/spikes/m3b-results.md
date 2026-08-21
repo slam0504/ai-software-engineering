@@ -14,7 +14,8 @@
 
 **spec §5「production-path barrier 必備清單」43 條**：綠 42、**未覆蓋 1**。
 （**2026-08-21 矩陣重跑補記**：那 1 條〔2.11〕已由 SegmentSet 接線票轉綠，§3 的三個
-未覆蓋／待裁決項全數出貨——見 §10。）
+未覆蓋／待裁決項全數出貨——見 §10。**同日實機驗收補跑**：A1-A10 全數以 agent 驅動
+瀏覽器端 UI 實跑，10 項皆綠（A5 由未實作轉綠）；Task 0 live probe 重跑 GATE GO——見 §11。）
 
 > **條數由 35 變 36 的原因**：§5.2 的原 2.4 一條在 frame-attribution 票（2026-08-18）被拆成
 > **2.4a**（一份 wire log 收得到兩個 session 的雙向 frame——不漏、不分裂成兩份檔）與
@@ -332,6 +333,10 @@ mutation 已還原：`grep -rn MUTATION --include='*.go' .` 為空，`git diff` 
 
 ## 5. spec §6 實機驗收矩陣（A1-A10）
 
+> **2026-08-21 補記**：本節的 (G)(Q) 阻塞已解除——agent 以 `wails dev`＋Playwright 驅動
+> 瀏覽器端 UI（同一個 Go backend 與 binding）完成 A1-A10 實跑，Codex 帳號限制也已過期。
+> **重跑結果：10 項全綠（A5 由未實作轉綠）**，逐項記錄與證據見 §11；本節保留當時的判定原文。
+
 **8 項無法執行、1 項部分執行、1 項未實作。** 阻塞原因分兩類，逐項標明：
 
 - **(G) 無 GUI 操作能力**：本 session 是非互動 agent 環境，`wails build` 產出的 `.app` 可以建置
@@ -367,6 +372,27 @@ mutation 已還原：`grep -rn MUTATION --include='*.go' .` 為空，`git diff` 
 | 影響 | GO 判定不因此撤回（證據已在 rev3 文件與兩份完整 wire log 中），但**driver 進 CI gate 前必須補跑一次 natural run**——這筆待辦仍開著 |
 
 **不把這一項略過、也不記綠**：本次沒有跑，就是沒有跑。
+
+> **2026-08-21 補記：已重跑，GATE GO**（帳號限制 2026-08-20 到期後首跑）。natural run
+> `20260821T052201Z`：VERDICT_B notifications=134、identity 缺失僅
+> `account/rateLimits/updated`／`remoteControl/status/changed` 兩個已知無 identity 的廣播
+> 方法（missing_both=5）、`broadcast_fallback=false`；approval frame 帶完整
+> threadId／turnId（decision=decline 路徑）；natural shutdown bounded
+> （done_after_first_terminate=24ms）、exit 0。證據以**最小化形式**收入
+> `docs/spikes/evidence/`，兩份分工：
+>
+> - `…20260821T052201Z.jsonl`：錄流節選——證明 **identity 與並行交錯**
+>   （initialize、3×thread/start 含 `approvalPolicy:"untrusted"`、雙 thread turn
+>   邊界與交錯 item 事件、requestApproval＋decision 回覆）。
+> - `…20260821T052201Z.summary.txt`：probe 結果摘要——證明 **verdict 統計、
+>   bounded shutdown（24ms）與 exit code**（錄流節選本身不含 terminate 之後的
+>   frame，shutdown 證明以此摘要為準）。
+>
+> 隱私處理（兩份與截圖同一套規則）：路徑 $HOME／$TMP 化、
+> session/thread/turn/item/msg/rs ID 一致性假名化、移除
+> `account/rateLimits/updated`／`remoteControl/status/changed` 廣播與每 turn
+> 第 3 筆起的 delta。完整原始錄流與 probe 輸出留在本機。
+> **「driver 進 CI gate 前補跑 natural run」的 Task 0 ledger 待辦就此關閉。**
 
 ### 5.1 A10 部分實測：4 個常駐 idle Claude 子行程
 
@@ -538,4 +564,62 @@ Task 0-30 的 60+ 個 mutation 全域交叉矩陣仍未重跑。基線之後各�
 記錄在各自的 commit 與 review 往返（含 2026-08-21 proc／binding 守門的 7 個探針），
 不在本節重複主張。
 
-**§5 實機驗收（A1-A10）維持原狀**：本 session 仍為非互動 agent 環境，該矩陣待 owner 實機。
+**§5 實機驗收（A1-A10）**：於同日稍後由 agent 補跑完成，見 §11。
+
+---
+
+## 11. 實機驗收補跑（2026-08-21，agent 驅動瀏覽器 UI）
+
+**執行方式**：`wails dev`（`WORKBENCH_WORKSPACE` 指向獨立驗收 workspace）＋ Playwright
+驅動 `http://localhost:34115` 的瀏覽器端 UI——與 native window 共用**同一個 Go backend、
+同一組 Wails binding**，因此 §5 的 (G) 阻塞解除；(Q) 的 Codex 帳號限制已於 2026-08-20
+到期（live turn 實測可用）。判定規則不變：實際跑過並看到輸出才記綠。
+
+**Fixtures**：`~/playground/wb-accept-m3b`（全新 workspace，git repo＋兩個檔案）；
+`~/playground/wb-accept-legacy`（M3a 形狀 fixture：無 WSID 的 events.jsonl、provider-keyed
+restore.json、無 wsid 欄位的 sessions.json、無 workspace-sessions.json——resume 目標
+是先以 pinned claude CLI 從該 cwd 真實產生的 session）。
+
+**誠實邊界**：GUI 由 agent 經瀏覽器驅動，不是人手操作 native window（native window 同時
+開著、共用 backend，但其渲染未逐項驗證）；A10 未量 turn 進行中的瞬時峰值（claude 串流
+期間 CPU 以等待為主）。
+
+**截圖隱私處理**：所有 `m3b-*.png` 已依與 JSONL 同一套規則遮蔽——`$HOME` 路徑列、
+session id 欄位與底部 status bar、codex 核可 dialog 的 thread/turn/item id 與 cwd
+（該區塊標示指向 JSONL 的假名化版本）；遮蔽不影響各列引用的判定畫面。
+
+| # | 結果 | 實跑證據（截圖在 `docs/spikes/evidence/m3b-*.png`） |
+|---|---|---|
+| A1 | ✅ 綠 | claude「回覆中」串流時切 codex pane 送出，session 清單同時顯示兩 provider in-flight、互不阻塞；兩 pane transcript 各歸各的（`m3b-a1-dual-provider-concurrent`）。claude 真讀了 workspace 檔案作答；codex 真執行 `ls -la` 列出實際目錄 |
+| A2 | ✅ 綠 | 雙 pane 並看＋焦點切換（composer 與 tab 選取跟隨焦點，`m3b-a2-dual-pane-focus`）；unread 對**未釘選** session 的背景完成累積 badge=1、重新釘選歸零（`m3b-a2-unread-badge`；unread 依 store 契約只對未釘選累積，session.ts:555） |
+| A3 | ✅ 綠 | claude Bash approval 完整鏈：dialog（`m3b-a3-claude-approval-dialog`）→允許→`a3-probe.txt` 實際落地→turn 完成。codex `requestApproval` 於**未釘選** session 觸發 transient secondary presentation（pane-0 暫顯 codex2、persistent pin 不被改寫、resolve 後恢復原釘選，`m3b-a3-codex-transient-approval`）；wire log frame 159/160：request→`{"decision":"accept"}` 回覆、audit `approval_decision=allow` 正確歸 WSID。**觀察（歸屬待釐清）**：Codex 0.146.1 與 workbench 整合下可重現「accept 後仍以唯讀 sandbox 重跑 → EPERM」，transcript 有 fail-loud 揭露。正式路徑只送 `approvalPolicy:"untrusted"`、未指定 sandbox，而 0.146.1 schema 允許 client 在 thread/start 指定 sandbox——不能斷言純屬 provider 端，已開相容性調查票（§11 末） |
+| A4 | ✅ 綠 | 8/8（claude 4＋codex 4）；穩態上限：兩個「建立」按鈕 disabled（`m3b-a4-8of8-full`）＋後端拒絕 `appcore: session slot limit reached`（兩 provider 皆以 direct binding 實測）；`n / 4` 顯示逐步正確；移除（確認 dialog、文案含「稽核與錄流永久保留」）→ 3/4、按鈕恢復 → 補建回 4/4 |
+| A5 | ✅ 綠（**原記未實作，pane pins 票出貨後轉綠**） | 22 turn 的 session 重啟後：pins／focused／task label 全部恢復、transcript 只載**最後 20 輪（3–22）**；向上捲動觸發 `LoadTurnsBefore` 載回 1–2（`m3b-a5-restored-window-paging`）；未釘選 session 僅 metadata（清單列有狀態、無 transcript 載入） |
+| A6 | ✅ 綠 | 三個子情境：(a) 行邊界 checkpoint 回退 → **靜默補掃**（offset 888399→908187、零新 quarantine、零通知）；(b) 中段注入損壞 → **quarantine（原檔保留）＋全量重建＋通知**（audit `replay_index_degraded`：「turn index 中段損壞，已 quarantine 並全量重建（§3.5.6）」）；(c) checkpoint 截在行中央 → 保守 quarantine＋全量重建（§3.5.6「整份視為不可信快取」分級）。重建後 restore 視窗正常 |
+| A7 | ✅ 綠 | delta 串流中 SIGKILL app → 重啟後 audit 恰增兩筆：`stream_error`「app restart: interrupted turn」（source `app_restart_repair`、正確歸 WSID）＋`state_change: failed`；UI 顯示「失敗」、busy 解除、composer 可再送（`m3b-a7-interrupted-turn-failed`）。對照組：turn 已完成才 kill → 重啟無修復動作（正確不誤修） |
+| A8 | ✅ 綠（**限定於右列三項窄條件**） | legacy fixture 啟動 → 恰一枚 WSID（resume／task_label／view_start 帶入、`migrated:true`）；重啟後**同一枚** WSID（冪等）；resume 實測：新 turn 正確回出 pre-migration 的暗號 `LEGACY-OK`（`m3b-a8-legacy-resume-codeword`）。途中並實證 resume 綁定 fail-closed：sessions.json 缺綁定時 UI 顯示 `resume refused: session … bound to ""`。**已知缺口（已開補強票，§11 末）**：pre-migration transcript 不在 UI 顯示——`LoadTurnsBefore` 走 turn index、index 依 §3.5.9 凍結排除無 WSID 事件；`RestoreViews` binding 可重放 legacy 視窗（本次實測可回）但 frontend 零呼叫端。**在補強票完成或規格明確修訂前，本列的綠不代表整個 legacy 使用者體驗已關閉** |
+| A9 | ✅ 綠（抽驗） | SpecAssist「產生驗收情境草稿」live 完成→套用；送核被 `spec: scoped tree dirty` fail-loud 擋下→commit（空訊息 fail-loud→帶訊息成功）→送核取得 approval_id；GateDecide 被升級項目**擋下**（「blocked by 1 escalation item(s)」——M3a 判定順序實證，`m3b-a9-gate1-pending`）；收件匣建立（source_ref 正確指回 approval）→知悉→解除（fixed＋理由）→核可→**已生效**；gate.jsonl：`gate_request`＋`approval_record approved`、escalation.jsonl：item＋transition。PlanWorkspace／任務相依圖／TCA 渲染正常（TCA 空狀態「無已生效 Gate 2 計畫」正確）。**未抽驗**：Gate 2 全流程、stale 重新送核導航 |
+| A10 | ✅ 綠 | 4 claude host 各跑過 turn 後 idle 兩時點：t0＝360.2／341.4／345.9／208.7 MB、t+60s＝363.3／331.4／336.7／214.0 MB，CPU 0.0–0.3%；**單一共用 codex app-server 24.8 MB 服務全部 4 個 codex session**（單 server 架構實證）。RSS 相加仍為上界（共享頁重複計）；與 §5.1 的無對話 idle（~385 MB）相比，跑過小 turn 後未見顯著成長。量測只記自己記下的 PID，未用 pattern kill（§5.1 教訓） |
+
+**其他觀察（非阻擋）**：瀏覽器端晚於 startup 連線時，頂列 meta 資訊初始為空，重新載入／
+重新掛載後正常——`App.vue` 只在 onMounted 呼叫一次 `CLIInfo()`，沒有事件恢復機制，晚連線
+者的自動恢復路徑**尚未確認**（已開顯示問題票，見下）。shutdown 實測 4 claude host＋codex
+server 在 TERM 後 3 秒內全數收斂（§5.4 bounded window 的實機佐證）。
+
+**開票記錄（owner 2026-08-21 裁決）**：
+
+1. **P1｜Codex accept 後仍 EPERM 的相容性調查**：至少四組對照——readOnly＋accept、
+   readOnly＋acceptWithExecpolicyAmendment、thread/start 明確指定 workspace-write
+   sandbox、更新 Codex 版本後重跑。**結果出來前不得直接把整個 thread 改成可寫**
+   （那會改變安全模型）。A3 維持綠。
+2. **P1｜M3b 補強：legacy transcript 接入首次 hydrate**：`RestoreViews`（app.go 已明載
+   零前端呼叫端）不刪除，把 legacy view window 接入遷移後 WSID 的首次 hydrate；既有
+   測試契約把「舊歷史整段消失」視為錯誤。完成前 A8 的綠限定於已驗的三項窄條件。
+3. **P2｜頂列 meta 晚連線空白**：native Wails 同樣可能發生（OnStartup 與 binding 本就
+   並行）。修法應提供可判斷的 ready 狀態並重新讀取 `CLIInfo`；只靠一次性事件仍會漏掉
+   晚連線者。
+
+（A10 長對話峰值屬容量量測、A9 未抽驗的 Gate 2／stale 流程屬驗收範圍限制，均不開缺陷票。）
+
+**§7.1 的回答狀態**：負載後 idle 維度已補（上表）；「多輪長對話＋高頻工具使用」的峰值
+量測仍留給 owner 視需要執行，不作為本次結論的一部分。
