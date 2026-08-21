@@ -812,32 +812,43 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 		}
 	}
 
-	// **每個 function literal 都是獨立的 caller**（reviewer 2026-08-20）：package
-	// variable 存一個 literal、再經 local interface 呼叫 gateList，只巡 FuncDecl
-	// 的分析整條看不到。literal 沒有 ownership，一律不得引用受保護實作。
+	// **每個 function literal 都是獨立的 caller**（reviewer 2026-08-20／2026-08-21）：
+	// package variable 存一個 literal、再經 local interface 呼叫 gateList，只巡
+	// FuncDecl 的分析整條看不到。literal 沒有 ownership，一律不得引用受保護實作。
+	//
+	// 「獨立」包含 **FuncDecl 內的巢狀 literal**：先前只有非 FuncDecl 的 decl 會收
+	// literal，`defer func() { a.createSession(...) }()` 這種寫在 wrapper／approved
+	// caller 裡的 closure 會繼承外層的 caller 與 ownership——但 defer LIFO 讓它可能
+	// 在交易收掉之後才執行。每個 literal 一律另立 scope、default deny；外層 scope
+	// 的掃描遇到 literal 就跳過（它有自己的一筆）。
 	type scope struct {
 		name       string
-		inExported bool
+		inExported bool         // FuncDecl 且為 exported App method；literal 一律 false
 		caller     types.Object // FuncDecl 才有；literal 為 nil（永遠不在白名單裡）
+		host       types.Object // 宿主 FuncDecl 的物件（反向檢查用）；套件層 literal 為 nil
 		impl       types.Object // 這個 scope 若是薄包裝，它自己的實作
 		body       ast.Node
 	}
 	var scopes []scope
 	for _, f := range files {
 		for _, decl := range f.Decls {
-			fd, isFunc := decl.(*ast.FuncDecl)
-			if !isFunc || fd.Body == nil {
-				ast.Inspect(decl, func(n ast.Node) bool {
-					if lit, isLit := n.(*ast.FuncLit); isLit {
-						scopes = append(scopes, scope{name: "套件層 function literal", body: lit.Body})
-					}
-					return true
-				})
-				continue
+			var declCaller types.Object
+			hostName := "套件層"
+			if fd, isFunc := decl.(*ast.FuncDecl); isFunc && fd.Body != nil {
+				declCaller = info.Defs[fd.Name]
+				hostName = fd.Name.Name + " 內的"
+				scopes = append(scopes, scope{name: fd.Name.Name,
+					inExported: fd.Recv != nil && fd.Name.IsExported(),
+					caller:     declCaller, host: declCaller,
+					impl: implOfWrapper[fd.Name.Name], body: fd.Body})
 			}
-			scopes = append(scopes, scope{name: fd.Name.Name,
-				inExported: fd.Recv != nil && fd.Name.IsExported(),
-				caller:     info.Defs[fd.Name], impl: implOfWrapper[fd.Name.Name], body: fd.Body})
+			ast.Inspect(decl, func(n ast.Node) bool {
+				if lit, isLit := n.(*ast.FuncLit); isLit {
+					scopes = append(scopes, scope{name: hostName + " function literal",
+						host: declCaller, body: lit.Body})
+				}
+				return true
+			})
 		}
 	}
 
@@ -851,6 +862,9 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 			if n == nil {
 				parents = parents[:len(parents)-1]
 				return true
+			}
+			if _, isLit := n.(*ast.FuncLit); isLit {
+				return false // 巢狀 literal 是獨立 scope（上面另有一筆），不在這裡掃
 			}
 			defer func() { parents = append(parents, n) }()
 			id, isIdent := n.(*ast.Ident)
@@ -900,8 +914,10 @@ func TestProtectedImplementationsAreOnlyReachedThroughTheirWrapper(t *testing.T)
 					}
 				}
 			}
-			// 反向：受保護的實作不得**以任何形式**引用 exported binding。
-			if exported[obj] && sc.caller != nil && protected[sc.caller] != "" {
+			// 反向：受保護的實作不得**以任何形式**引用 exported binding——含它
+			// body 內的 literal（host 指回宿主 FuncDecl，literal 不因獨立 scope
+			// 而漏掉這條）。
+			if exported[obj] && sc.host != nil && protected[sc.host] != "" {
 				how := "引用"
 				if isDirectCallee(id, parents) {
 					how = "呼叫"
@@ -1120,27 +1136,60 @@ func signatureTouchesApp(fn *types.Func, appType *types.Named) bool {
 	return false
 }
 
-// startupStateAccessors：startupState 上允許存在的方法。每一個都必須是「Lock →
-// defer Unlock → 純欄位運算」的固定形狀。
-var startupStateAccessors = map[string]bool{
-	"snapshot": true, "appendMessage": true, "setErrOnce": true,
-	"publishTools": true, "publishNode": true, "publishWorkspace": true,
+// startupAccessorContract：startupState 上允許存在的方法，以及**每一個**允許碰的
+// 欄位與操作（reviewer 2026-08-21：先前只驗形狀不驗內容，在 snapshot 鎖內加一行
+// `s.info.nodePath = ""` 照樣全綠）。每一個方法都必須是「Lock → defer Unlock →
+// 純欄位運算」的固定形狀。
+//
+// wholeRead：允許把整份 info 複製出來（唯一的讀取出口 snapshot）。其餘方法只能碰
+// reads／writes 列出的欄位；不在表上的欄位或操作一律紅。
+var startupAccessorContract = map[string]struct {
+	wholeRead bool
+	reads     map[string]bool
+	writes    map[string]bool
+}{
+	"snapshot":         {wholeRead: true},
+	"appendMessage":    {reads: fieldSet("startupErr", "blockers"), writes: fieldSet("startupErr", "blockers")},
+	"setErrOnce":       {reads: fieldSet("startupErr"), writes: fieldSet("startupErr")},
+	"publishTools":     {writes: fieldSet("toolsDir", "toolsSource")},
+	"publishNode":      {writes: fieldSet("nodePath")},
+	"publishWorkspace": {writes: fieldSet("workspace", "workspaceSr")},
+}
+
+func fieldSet(names ...string) map[string]bool {
+	m := map[string]bool{}
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// startupInfoFields：startupInfo 的欄位全集，由測試逐一枚舉釘死（reviewer
+// 2026-08-21：先前 doc 宣稱「六個欄位」、實際七個，欄位面從未被枚舉——新增欄位
+// 而不更新這裡與 contract 就會紅）。
+var startupInfoFields = []string{
+	"startupErr", "blockers", "toolsDir", "toolsSource", "nodePath", "workspace", "workspaceSr",
 }
 
 // TestStartupStateIsTheOnlyAccessPath
 //
-// 啟動資訊的六個欄位與那把鎖封在 startupState 裡（見它的 doc）。這條驗封裝真的
-// 成立，而不是靠控制流程分析去猜：
+// 啟動資訊的欄位（startupInfoFields 逐一枚舉）與那把鎖封在 startupState 裡（見它
+// 的 doc）。這條驗封裝真的成立，而不是靠控制流程分析去猜：
 //
-//	(1) startupState.info 只有 startupState 自己的方法碰得到。
-//	(2) 那些方法都是固定形狀：第一個敘述 s.mu.Lock()、第二個 defer s.mu.Unlock()，
+//	(1) startupState.info 在**整個套件的任何位置**都只有 contract 裡的存取器碰得
+//	    到——掃描涵蓋所有 decl，含 GenDecl 裡的 package-level function literal
+//	    （reviewer 2026-08-21：先前只巡 FuncDecl，`var leak = func(s *startupState)
+//	    { s.info.nodePath = "" }` 可完全繞過 mutex、重新引入 data race）。
+//	(2) 存取器都是固定形狀：第一個敘述 s.mu.Lock()、第二個 defer s.mu.Unlock()，
 //	    receiver 就是被鎖的那一個（s.mu，不是別的 instance）。
-//	(3) 鎖內不得有任何呼叫——外部指令、I/O、其他方法一律不行。
+//	(3) 鎖內不得有任何呼叫、goroutine、defer、channel 操作、function literal、
+//	    取址——臨界區只能是欄位讀寫與純運算。
+//	(4) 每個存取器只能做 startupAccessorContract 宣告的欄位操作（讀／寫分開驗）。
+//	(5) startupState 與 startupInfo 的欄位集合逐一枚舉，與 contract 對得上。
 //
-// 為什麼改成這樣（reviewer 2026-08-20）：先前六個欄位散在 App 上，測試只能做語彙
-// 判斷，於是「鎖另一個 instance」「提早 Unlock 再讀」「writer 在 closure 內鎖、
-// 寫入落在 closure 外」「持鎖跑外部指令」全部通得過。封裝之後這些問題消失在型別
-// 層，剩下的只有可以逐字比對的形狀。
+// 歷史：欄位原先散在 App 上、只能做語彙判斷（鎖別的 instance、提早 Unlock、
+// closure 假鎖全都通得過），reviewer 2026-08-20 封裝成型別後改逐字比對形狀；
+// 2026-08-21 再收緊到欄位／操作級 exact contract 與全套件掃描。
 func TestStartupStateIsTheOnlyAccessPath(t *testing.T) {
 	fset, files, info, pkg := typeCheckProductionPackage(t)
 	stateType := namedType(t, pkg, "startupState")
@@ -1148,55 +1197,106 @@ func TestStartupStateIsTheOnlyAccessPath(t *testing.T) {
 	if !isStruct {
 		t.Fatal("startupState 不是 struct")
 	}
+	// (5) 欄位面枚舉：startupState 恰好 {mu, info}；startupInfo 恰好
+	// startupInfoFields；contract 不得指到不存在的欄位。
 	var infoField *types.Var
+	stateFields := map[string]bool{}
 	for i := range stateStruct.NumFields() {
-		if stateStruct.Field(i).Name() == "info" {
-			infoField = stateStruct.Field(i)
+		f := stateStruct.Field(i)
+		stateFields[f.Name()] = true
+		if f.Name() == "info" {
+			infoField = f
 		}
 	}
 	if infoField == nil {
 		t.Fatal("startupState 上找不到 info 欄位")
 	}
+	if len(stateFields) != 2 || !stateFields["mu"] {
+		t.Errorf("startupState 的欄位必須恰好是 {mu, info}——多出來的欄位不在這條守門的視野裡")
+	}
+	infoType := namedType(t, pkg, "startupInfo")
+	infoStruct, isInfoStruct := infoType.Underlying().(*types.Struct)
+	if !isInfoStruct {
+		t.Fatal("startupInfo 不是 struct")
+	}
+	fieldUniverse := map[string]bool{}
+	for _, n := range startupInfoFields {
+		fieldUniverse[n] = true
+	}
+	actualFields := map[string]bool{}
+	for i := range infoStruct.NumFields() {
+		name := infoStruct.Field(i).Name()
+		actualFields[name] = true
+		if !fieldUniverse[name] {
+			t.Errorf("startupInfo 多了欄位 %s——請同步更新 startupInfoFields 與 startupAccessorContract", name)
+		}
+	}
+	for _, n := range startupInfoFields {
+		if !actualFields[n] {
+			t.Errorf("startupInfoFields 列了不存在的欄位 %q", n)
+		}
+	}
+	for name, c := range startupAccessorContract {
+		for f := range c.reads {
+			if !fieldUniverse[f] {
+				t.Errorf("startupAccessorContract[%q].reads 列了不存在的欄位 %q", name, f)
+			}
+		}
+		for f := range c.writes {
+			if !fieldUniverse[f] {
+				t.Errorf("startupAccessorContract[%q].writes 列了不存在的欄位 %q", name, f)
+			}
+		}
+	}
 
+	// (2)(3)(4) 存取器逐一驗形狀與存取契約，並記下 body 範圍給全套件掃描用。
 	seen := map[string]bool{}
+	type posRange struct{ start, end token.Pos }
+	var accessorRanges []posRange
 	for _, f := range files {
 		for _, decl := range f.Decls {
 			fd, isFunc := decl.(*ast.FuncDecl)
-			if !isFunc || fd.Body == nil {
+			if !isFunc || fd.Body == nil || !isStartupStateMethod(fd, info, stateType) {
 				continue
 			}
-			onState := isStartupStateMethod(fd, info, stateType)
-			if onState {
-				seen[fd.Name.Name] = true
-				if !startupStateAccessors[fd.Name.Name] {
-					t.Errorf("startupState 上多了一個方法 %s——每個都必須是固定形狀的存取器，"+
-						"新增前請先確認它守得住鎖的契約", fd.Name.Name)
-					continue
-				}
-				checkStartupAccessorShape(t, fset, fd, info)
+			seen[fd.Name.Name] = true
+			if _, allowed := startupAccessorContract[fd.Name.Name]; !allowed {
+				t.Errorf("startupState 上多了一個方法 %s——每個都必須是固定形狀的存取器，"+
+					"新增前請先在 startupAccessorContract 寫下它能碰的欄位與操作", fd.Name.Name)
+				continue
 			}
-			// (1) 只有 startupState 的方法碰得到 info。
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				sel, isSel := n.(*ast.SelectorExpr)
-				if !isSel {
-					return true
-				}
-				s := info.Selections[sel]
-				if s == nil || s.Obj() != infoField {
-					return true
-				}
-				if !onState {
-					t.Errorf("%s 直接碰 startupState.info（%s）——只有 startupState 自己的存取器可以",
-						fd.Name.Name, fset.Position(sel.Pos()).String())
-				}
-				return true
-			})
+			checkStartupAccessorShape(t, fset, fd, info, infoField)
+			accessorRanges = append(accessorRanges, posRange{fd.Body.Pos(), fd.Body.End()})
 		}
 	}
-	for name := range startupStateAccessors {
+	for name := range startupAccessorContract {
 		if !seen[name] {
-			t.Errorf("startupStateAccessors 列了不存在的方法 %q", name)
+			t.Errorf("startupAccessorContract 列了不存在的方法 %q", name)
 		}
+	}
+
+	// (1) 全套件掃描：info 只能在（形狀已驗過的）存取器 body 內被觸碰。掃 file
+	// 而不是逐 FuncDecl——GenDecl 的 package-level literal、任何未來的 decl 形式
+	// 都在視野裡。
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, isSel := n.(*ast.SelectorExpr)
+			if !isSel {
+				return true
+			}
+			s := info.Selections[sel]
+			if s == nil || s.Obj() != infoField {
+				return true
+			}
+			for _, r := range accessorRanges {
+				if sel.Pos() >= r.start && sel.End() <= r.end {
+					return true
+				}
+			}
+			t.Errorf("startupState.info 在存取器之外被觸碰（%s）——只有 contract 裡的存取器可以",
+				fset.Position(sel.Pos()).String())
+			return true
+		})
 	}
 }
 
@@ -1221,17 +1321,25 @@ func isStartupStateMethod(fd *ast.FuncDecl, info *types.Info, stateType *types.N
 	return isNamed && named.Obj() == stateType.Obj()
 }
 
-// checkStartupAccessorShape：存取器的**完整**形狀。
+// checkStartupAccessorShape：存取器的**完整**形狀與存取契約。
 //
-// 不再做簡易控制流程推論（reviewer 2026-08-20：先前會放過「鎖 s.mu 卻寫
-// other.info」與「鎖內 channel send」）。改成逐項釘死：
+// 不做簡易控制流程推論（reviewer 2026-08-20：先前會放過「鎖 s.mu 卻寫
+// other.info」與「鎖內 channel send」；2026-08-21：也不再只驗形狀不驗內容）。
+// 逐項釘死：
 //
 //  1. 具名 receiver；第一個敘述 <recv>.mu.Lock()、第二個 defer <recv>.mu.Unlock()。
+//     語意等價的括號寫法（`(s.mu).Lock()`）不誤殺——比對前先 ast.Unparen
+//     （reviewer 2026-08-21 的 false positive）。
 //  2. body 其餘部分**每一個** info 存取都必須用同一個 receiver。
-//  3. 其餘部分不得有呼叫、go、defer、channel 送收、select——臨界區只能是欄位讀寫
-//     與純字串運算。
-func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDecl, info *types.Info) {
+//  3. 其餘部分不得有呼叫、go、defer、channel 送收、select、function literal
+//     （closure 可以把 info 存取夾帶到鎖外執行）、對 info 取址（指標別名逃出鎖）。
+//  4. info 的存取逐筆分類成「整份讀」「欄位讀」「欄位寫」，與
+//     startupAccessorContract **雙向**比對：做了沒宣告的操作紅；宣告了卻沒做的
+//     也紅（reviewer 2026-08-21 第二輪：publishNode 唯一的寫入被刪成空操作，
+//     單向檢查照樣全綠）。
+func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDecl, info *types.Info, infoField *types.Var) {
 	t.Helper()
+	contract := startupAccessorContract[fd.Name.Name]
 	recvName := ""
 	if len(fd.Recv.List[0].Names) > 0 {
 		recvName = fd.Recv.List[0].Names[0].Name
@@ -1255,11 +1363,39 @@ func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDe
 			fd.Name.Name, recvName)
 	}
 	at := func(n ast.Node) string { return fset.Position(n.Pos()).String() }
+
+	// (4) 先收集寫入目標：assignment 的 LHS（compound assign 同時算讀）與 ++/--。
+	writeTok := map[ast.Expr]token.Token{}
+	for _, stmt := range body[2:] {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range x.Lhs {
+					writeTok[ast.Unparen(lhs)] = x.Tok
+				}
+			case *ast.IncDecStmt:
+				writeTok[ast.Unparen(x.X)] = x.Tok
+			}
+			return true
+		})
+	}
+	// isInfoSel：這個 expression 是不是解析到 startupState.info 欄位的 selector。
+	isInfoSel := func(e ast.Expr) (*ast.SelectorExpr, bool) {
+		sel, isSel := ast.Unparen(e).(*ast.SelectorExpr)
+		if !isSel {
+			return nil, false
+		}
+		s := info.Selections[sel]
+		return sel, s != nil && s.Obj() == infoField
+	}
+	actualReads := map[string]bool{}
+	actualWrites := map[string]bool{}
+	actualWholeRead := false
 	for _, stmt := range body[2:] {
 		ast.Inspect(stmt, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.CallExpr:
-				t.Errorf("%s 在鎖內呼叫了東西（%s）——臨界區只能有欄位讀寫與純字串運算",
+				t.Errorf("%s 在鎖內呼叫了東西（%s）——臨界區只能有欄位讀寫與純運算",
 					fd.Name.Name, at(x))
 				return false
 			case *ast.GoStmt:
@@ -1274,38 +1410,104 @@ func checkStartupAccessorShape(t *testing.T, fset *token.FileSet, fd *ast.FuncDe
 			case *ast.SelectStmt:
 				t.Errorf("%s 在鎖內 select（%s）", fd.Name.Name, at(x))
 				return false
+			case *ast.FuncLit:
+				t.Errorf("%s 在鎖內建立 function literal（%s）——closure 可以把 info 的存取夾帶到鎖外執行",
+					fd.Name.Name, at(x))
+				return false
 			case *ast.UnaryExpr:
 				if x.Op == token.ARROW {
 					t.Errorf("%s 在鎖內做 channel receive（%s）", fd.Name.Name, at(x))
 					return false
 				}
+				if x.Op == token.AND {
+					if _, isInfo := isInfoSel(x.X); isInfo {
+						t.Errorf("%s 對 info 取址（%s）——指標別名會讓存取逃出鎖", fd.Name.Name, at(x))
+						return false
+					}
+					if sel, isSel := ast.Unparen(x.X).(*ast.SelectorExpr); isSel {
+						if _, isInfo := isInfoSel(sel.X); isInfo {
+							t.Errorf("%s 對 info 的欄位取址（%s）——指標別名會讓存取逃出鎖", fd.Name.Name, at(x))
+							return false
+						}
+					}
+				}
 			case *ast.SelectorExpr:
-				// info 的每一次存取都必須用**同一個** receiver：鎖 s.mu 卻寫
-				// other.info 是最容易漏掉的那一種。
-				if x.Sel.Name != "info" {
-					return true
+				// <recv>.info.<field>：欄位級存取，分類讀／寫並對照 contract。
+				if inner, isInfo := isInfoSel(x.X); isInfo {
+					id, isIdent := ast.Unparen(inner.X).(*ast.Ident)
+					if !isIdent || id.Name != recvName {
+						t.Errorf("%s 在鎖內存取的不是自己那一個 instance 的 info（%s）",
+							fd.Name.Name, at(x))
+						return false
+					}
+					fieldName := x.Sel.Name
+					tok, isWrite := writeTok[x]
+					compound := isWrite && tok != token.ASSIGN && tok != token.DEFINE
+					if isWrite {
+						actualWrites[fieldName] = true
+						if !contract.writes[fieldName] {
+							t.Errorf("%s 寫入了 contract 沒允許的欄位 %s（%s）", fd.Name.Name, fieldName, at(x))
+						}
+					}
+					if !isWrite || compound {
+						actualReads[fieldName] = true
+						if !contract.reads[fieldName] {
+							t.Errorf("%s 讀取了 contract 沒允許的欄位 %s（%s）", fd.Name.Name, fieldName, at(x))
+						}
+					}
+					return false
 				}
-				if s := info.Selections[x]; s == nil || s.Kind() != types.FieldVal {
-					return true
-				}
-				id, isIdent := x.X.(*ast.Ident)
-				if !isIdent || id.Name != recvName {
-					t.Errorf("%s 在鎖內存取的不是自己那一個 instance 的 info（%s）",
-						fd.Name.Name, at(x))
+				// <recv>.info 整份存取（沒被外層欄位選取消化掉——上面對欄位存取
+				// return false，走到這裡的就是真的整份取用）。
+				if s := info.Selections[x]; s != nil && s.Obj() == infoField {
+					id, isIdent := ast.Unparen(x.X).(*ast.Ident)
+					if !isIdent || id.Name != recvName {
+						t.Errorf("%s 在鎖內存取的不是自己那一個 instance 的 info（%s）",
+							fd.Name.Name, at(x))
+						return false
+					}
+					if _, isWrite := writeTok[x]; isWrite {
+						t.Errorf("%s 對 info 整份覆寫（%s）——欄位級操作才在 contract 的視野裡",
+							fd.Name.Name, at(x))
+					} else {
+						actualWholeRead = true
+						if !contract.wholeRead {
+							t.Errorf("%s 把整份 info 讀出（%s）——contract 只允許 snapshot 這麼做",
+								fd.Name.Name, at(x))
+						}
+					}
+					return false
 				}
 			}
 			return true
 		})
 	}
+	// (4) 反向：contract 宣告的每一個操作都必須真的存在——publishNode 的唯一寫入
+	// 被刪掉、變成空操作，也要紅（reviewer 2026-08-21 第二輪的 overlay 實測）。
+	for f := range contract.reads {
+		if !actualReads[f] {
+			t.Errorf("%s 的 contract 宣告會讀取 %s，實作卻沒有——空操作或欄位改名了", fd.Name.Name, f)
+		}
+	}
+	for f := range contract.writes {
+		if !actualWrites[f] {
+			t.Errorf("%s 的 contract 宣告會寫入 %s，實作卻沒有——空操作或欄位改名了", fd.Name.Name, f)
+		}
+	}
+	if contract.wholeRead && !actualWholeRead {
+		t.Errorf("%s 的 contract 宣告會把整份 info 讀出，實作卻沒有", fd.Name.Name)
+	}
 }
 
-// isOwnMuCall／isOwnMuCallExpr：`<recv>.mu.<Lock|Unlock>()`——receiver 名字要對得上。
+// isOwnMuCall／isOwnMuCallExpr：`<recv>.mu.<Lock|Unlock>()`——receiver 名字要對
+// 得上。各層先 ast.Unparen：`(s.mu).Lock()` 與 `s.mu.Lock()` 語意相同，不誤殺
+// （reviewer 2026-08-21）。
 func isOwnMuCall(stmt ast.Stmt, recv, method string) bool {
 	es, isExpr := stmt.(*ast.ExprStmt)
 	if !isExpr {
 		return false
 	}
-	call, isCall := es.X.(*ast.CallExpr)
+	call, isCall := ast.Unparen(es.X).(*ast.CallExpr)
 	return isCall && isOwnMuCallExpr(call, recv, method)
 }
 
@@ -1313,14 +1515,14 @@ func isOwnMuCallExpr(call *ast.CallExpr, recv, method string) bool {
 	if call == nil {
 		return false
 	}
-	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	sel, isSel := ast.Unparen(call.Fun).(*ast.SelectorExpr)
 	if !isSel || sel.Sel.Name != method {
 		return false
 	}
-	inner, isInner := sel.X.(*ast.SelectorExpr)
+	inner, isInner := ast.Unparen(sel.X).(*ast.SelectorExpr)
 	if !isInner || inner.Sel.Name != "mu" {
 		return false
 	}
-	id, isIdent := inner.X.(*ast.Ident)
+	id, isIdent := ast.Unparen(inner.X).(*ast.Ident)
 	return isIdent && id.Name == recv
 }

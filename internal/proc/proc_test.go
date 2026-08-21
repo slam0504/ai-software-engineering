@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -264,30 +265,150 @@ func TestCanceledByContextIsFalseAfterCleanExit(t *testing.T) {
 
 // TestCanceledByContextArbitratesByActualExit
 //
-// **判定規則的確定性測試**（reviewer 2026-08-20）：select 在兩個 channel 同時
-// ready 時隨機挑，所以「取消分支被選到」證明不了因果。真正的判定是收尾之後回頭看
-// 實際結局——正常退出就不算被取消，被訊號致死才算。
+// **判定規則的確定性測試**（reviewer 2026-08-20／2026-08-21）：select 在兩個
+// channel 同時 ready 時隨機挑，所以「取消分支被選到」證明不了因果。真正的判定是
+// 收尾之後回頭看實際結局——正常退出就不算被取消；被訊號致死時還要比對死因：只有
+// 死於我們真的送出過的訊號（TERM／升級 KILL）才算被取消，子程序自己 kill -KILL
+// 或 SIGSEGV 的自然 crash 不得記到取消頭上。
 //
-// 直接組出四種狀態組合來驗這條規則，不依賴賽跑能不能重現。
+// 直接組出狀態組合來驗這條規則，不依賴賽跑能不能重現。
 func TestCanceledByContextArbitratesByActualExit(t *testing.T) {
 	cases := []struct {
 		name     string
 		canceled bool
 		ready    bool
 		code     int
+		fatalSig syscall.Signal
+		termSent bool
+		killSent bool
 		want     bool
 	}{
-		{"沒取消過", false, true, 0, false},
-		{"取消了但正常 exit 0——取消沒有改變結果", true, true, 0, false},
-		{"取消了但正常 exit 1——同上", true, true, 1, false},
-		{"取消了且被訊號致死（ExitCode 回 -1）", true, true, -1, true},
-		{"取消了、結局尚未記錄——保守判為被取消", true, false, 0, true},
+		{"沒取消過", false, true, 0, 0, false, false, false},
+		{"取消了但正常 exit 0——取消沒有改變結果", true, true, 0, 0, true, false, false},
+		{"取消了但正常 exit 1——同上", true, true, 1, 0, true, false, false},
+		{"取消了、死於我們送的 TERM", true, true, -1, syscall.SIGTERM, true, false, true},
+		{"取消了、死於我們升級送的 KILL", true, true, -1, syscall.SIGKILL, true, true, true},
+		{"取消了、死於 KILL 但我們沒送過 KILL——自然 self-KILL", true, true, -1, syscall.SIGKILL, true, false, false},
+		{"取消了、死於 SIGSEGV——自然 crash，不是我們送的", true, true, -1, syscall.SIGSEGV, true, false, false},
+		{"取消了、死於 TERM 但我們沒送過任何訊號——不是我們幹的", true, true, -1, syscall.SIGTERM, false, false, false},
+		{"取消了、結局尚未記錄——保守判為被取消", true, false, 0, 0, true, false, true},
 	}
 	for _, c := range cases {
-		p := &Proc{canceled: c.canceled, exitReady: c.ready, exit: Exit{Code: c.code}}
+		p := &Proc{canceled: c.canceled, exitReady: c.ready, exit: Exit{Code: c.code},
+			fatalSig: c.fatalSig, termSent: c.termSent, killSent: c.killSent}
 		if got := p.CanceledByContext(); got != c.want {
 			t.Errorf("%s：want %v got %v", c.name, c.want, got)
 		}
+	}
+}
+
+// TestNaturalSignalDeathDuringCancelIsNotCancellation
+//
+// reviewer 2026-08-21 的重現條件：子程序自己 `kill -KILL $$`、取消恰落在
+// 「cmd.Wait 已返回、supervisor 尚未記錄 exited」的窗口——先前 199/200 次被錯分
+// 類成 context cancellation（ExitCode()==-1 分不出訊號是誰送的）。
+//
+// 判準是死因訊號：死於 KILL 而我們從未送出 KILL（grace 預設 5s，遠未到）→ 不得
+// 記成取消。我們送的 TERM 若真的先收掉了子程序（死因是 TERM），那次分類成取消是
+// 正確的，不列入反例。
+func TestNaturalSignalDeathDuringCancelIsNotCancellation(t *testing.T) {
+	for i := range 200 {
+		ctx, cancel := context.WithCancel(context.Background())
+		p, err := Start(ctx, Config{Binary: "/bin/sh", Args: []string{"-c", "echo ready; kill -KILL $$"}})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_ = p.Stdin.Close()
+		buf := make([]byte, 8)
+		_, _ = p.Stdout.Read(buf) // 等 ready：self-KILL 即將發生，取消與它賽跑
+		go func() { _, _ = io.ReadAll(p.Stdout) }()
+		cancel()
+		ex := p.Wait()
+		got := p.CanceledByContext()
+		var ee *exec.ExitError
+		if errors.As(ex.Err, &ee) {
+			if ws, isWS := ee.Sys().(syscall.WaitStatus); isWS && ws.Signaled() &&
+				ws.Signal() == syscall.SIGKILL && got {
+				t.Fatalf("第 %d 次：子程序自己 KILL 收場（我們沒送過 KILL），不得分類成 context cancellation", i)
+			}
+		}
+	}
+}
+
+// TestCancelRequestedAfterRecordedExitIsANoOp
+//
+// 第一層防禦（退出已記錄 → 取消什麼都不做）的**確定性 oracle**（reviewer
+// 2026-08-21：先前這段內嵌在 watcher 裡，把 `terminate := !p.exited` mutation 成
+// 永遠 terminate，四條正題測試仍全綠——沒有任何守門）。抽成具名方法後直接呼叫，
+// 不經過 select 的隨機性。
+func TestCancelRequestedAfterRecordedExitIsANoOp(t *testing.T) {
+	p, err := Start(context.Background(), Config{Binary: "/usr/bin/true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Stdin.Close()
+	_, _ = io.ReadAll(p.Stdout)
+	p.Wait() // exited 已被記錄
+
+	p.cancelRequested()
+	p.mu.Lock()
+	canceled, termSent := p.canceled, p.termSent
+	p.mu.Unlock()
+	if canceled {
+		t.Fatal("退出已記錄之後的取消請求不得標記 canceled")
+	}
+	if termSent {
+		t.Fatal("退出已記錄之後不得再對 group 送 TERM（pgid 可能已被重用）")
+	}
+}
+
+// TestTerminateDoesNotRecordUnsentSignal
+//
+// reviewer 2026-08-21 第二輪：termSent 若在 SignalGroup **成功前**就記錄，送失敗
+// （group 已消失）也會留下「送過 TERM」的假事實，同名的自然 signal death 就可能
+// 被誤判成取消。用一個已收割（reaped）的 process 的 pid 當 pgid 實測：那個 pid
+// 從來不是 group leader，送必然 ESRCH，termSent 必須維持 false、錯誤必須回傳。
+func TestTerminateDoesNotRecordUnsentSignal(t *testing.T) {
+	probe := exec.Command("/usr/bin/true")
+	if err := probe.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Wait(); err != nil { // 已收割：此 pid 不是任何現存 group 的 pgid
+		t.Fatal(err)
+	}
+	p := &Proc{pgid: probe.Process.Pid, grace: time.Second, exitedCh: make(chan struct{})}
+	err := p.Terminate()
+	p.mu.Lock()
+	termSent := p.termSent
+	p.mu.Unlock()
+	if err == nil {
+		t.Fatal("對已消失的 process group 送 TERM 必須回報錯誤")
+	}
+	if termSent {
+		t.Fatal("SignalGroup 失敗時不得記錄 termSent——那會讓自然 TERM death 被誤判成取消")
+	}
+}
+
+// TestStartFailsFastWhenContextAlreadyCanceled
+//
+// reviewer 2026-08-21：fail fast 先前只在 Output——internal/claude、codex、assist
+// 直接走 Start，已取消的請求照樣啟動有副作用的子程序、再由 watcher 事後終止。
+// 判準同 Output 那條：不存在的 binary 當探針，錯誤必須是 context.Canceled 而不是
+// exec 的「檔案不存在」；真的可執行的指令不得產生副作用。
+func TestStartFailsFastWhenContextAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := Start(ctx, Config{Binary: "/nonexistent/definitely-not-here"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ctx 已取消時 Start 必須在建 pipe／exec 之前返回 context.Canceled，實得 %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "should-not-exist")
+	if _, err := Start(ctx, Config{Binary: "/usr/bin/touch", Args: []string{marker}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("實得 %v", err)
+	}
+	if _, serr := os.Stat(marker); serr == nil {
+		t.Fatal("ctx 已取消時 Start 不得啟動子程序（檔案被建出來了）")
 	}
 }
 
