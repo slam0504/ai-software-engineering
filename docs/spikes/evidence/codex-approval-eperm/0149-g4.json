@@ -1,0 +1,16 @@
+{
+  "group": "4",
+  "binary_version": "codex-cli 0.149.0",
+  "binary_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000028\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000028\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787302912,\"updatedAt\":1787302912,\"recencyAt\":1787302912,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.149.0\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "",
+  "decision_sent": "",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": false,
+  "rollout_turn_context": "sandbox={\"type\":\"workspace-write\",\"network_access\":false,\"exclude_tmpdir_env_var\":false,\"exclude_slash_tmp\":false} approval=\"untrusted\"",
+  "agent_tail": "我會只執行你指定的 `touch`，不採用替代作法。失敗：目前核可政策不允許請求提升權限，因此未建立檔案。未嘗試其他作法。"
+}

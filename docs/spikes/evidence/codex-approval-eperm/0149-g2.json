@@ -1,0 +1,18 @@
+{
+  "group": "2",
+  "binary_version": "codex-cli 0.149.0",
+  "binary_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000022\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000022\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787302478,\"updatedAt\":1787302478,\"recencyAt\":1787302478,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.149.0\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "03d54c6016e6a4fd",
+  "rules_content_after": "prefix_rule(pattern=[\"touch\", \"marker-g2-80367.txt\"], decision=\"allow\")\n",
+  "approval_method": "item/commandExecution/requestApproval",
+  "approval_params_raw": "{\"threadId\":\"00000000-0000-0000-0000-000000000022\",\"turnId\":\"00000000-0000-0000-0000-000000000023\",\"itemId\":\"exec-00000000-0000-0000-0000-000000000024\",\"startedAtMs\":1787302494614,\"environmentId\":\"local\",\"command\":\"/bin/zsh -lc 'touch marker-g2-80367.txt'\",\"cwd\":\"$TMP\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"touch marker-g2-80367.txt\"}],\"proposedExecpolicyAmendment\":[\"touch\",\"marker-g2-80367.txt\"],\"availableDecisions\":[\"accept\",{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"touch\",\"marker-g2-80367.txt\"]}},\"cancel\"]}",
+  "decision_sent": "{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"touch\",\"marker-g2-80367.txt\"]}}",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": false,
+  "rollout_turn_context": "sandbox={\"type\":\"read-only\"} approval=\"untrusted\"",
+  "agent_tail": "我會只執行你指定的 `touch` 指令，接著簡短回報結果。失敗：`touch: marker-g2-80367.txt: Operation not permitted`。"
+}

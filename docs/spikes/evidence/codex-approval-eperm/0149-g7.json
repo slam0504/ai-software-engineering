@@ -1,0 +1,17 @@
+{
+  "group": "7",
+  "binary_version": "codex-cli 0.149.0",
+  "binary_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "thread_start_params": "{\"approvalPolicy\":\"untrusted\"}",
+  "thread_start_response_raw": "{\"thread\":{\"id\":\"00000000-0000-0000-0000-000000000033\",\"extra\":null,\"sessionId\":\"00000000-0000-0000-0000-000000000033\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"legacy\",\"modelProvider\":\"openai\",\"createdAt\":1787302783,\"updatedAt\":1787302783,\"recencyAt\":1787302783,\"status\":{\"type\":\"idle\"},\"path\":\"$TMP\",\"cwd\":\"$TMP\",\"cliVersion\":\"0.149.0\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":null,\"cwd\":\"$TMP\",\"runtimeWorkspaceRoots\":[\"$TMP\"],\"instructionSources\":[],\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"activePermissionProfile\":{\"id\":\":read-only\",\"extends\":null},\"reasoningEffort\":null,\"multiAgentMode\":\"explicitRequestOnly\"}",
+  "rules_digest_before": "absent",
+  "rules_digest_after": "absent",
+  "approval_method": "item/commandExecution/requestApproval",
+  "approval_params_raw": "{\"threadId\":\"00000000-0000-0000-0000-000000000033\",\"turnId\":\"00000000-0000-0000-0000-000000000034\",\"itemId\":\"exec-00000000-0000-0000-0000-000000000035\",\"startedAtMs\":1787302792347,\"environmentId\":\"local\",\"command\":\"/bin/zsh -lc 'touch marker-g7-97205.txt'\",\"cwd\":\"$TMP\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"touch marker-g7-97205.txt\"}],\"proposedExecpolicyAmendment\":[\"touch\",\"marker-g7-97205.txt\"],\"availableDecisions\":[\"accept\",{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"touch\",\"marker-g7-97205.txt\"]}},\"cancel\"]}",
+  "decision_sent": "\"accept\"",
+  "turn_outcome": "completed",
+  "marker_path": "$TMP",
+  "marker_created": true,
+  "rollout_turn_context": "sandbox={\"type\":\"workspace-write\",\"network_access\":false,\"exclude_tmpdir_env_var\":false,\"exclude_slash_tmp\":false} approval=\"untrusted\"",
+  "agent_tail": "我會只執行指定的 `touch`，不採取其他替代作法。成功建立 `marker-g7-97205.txt`。"
+}
