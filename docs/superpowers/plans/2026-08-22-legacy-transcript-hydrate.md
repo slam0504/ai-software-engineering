@@ -10,6 +10,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md`（commit d330c9d）
 
+**Plan 修訂記錄：**
+- rev2（2026-08-22，plan review 4 P1）：Task 7 測試改用 `registryOnDisk` 取 Store（`newTestAppAt` 不接 `a.wsReg`，原寫法會 nil panic）；Task 6 改用真正 transcript-only fixture、經 `loadSessionRegistry` 驗證掃描錯誤不落 migrated marker＋修復後可重試；Task 4／7 補齊 spec §4／§8 凍結分支測試（零候選 marker、ViewStart 不精確相等、tombstone／provider 不算候選、scanner 錯誤不落 marker、已 backfilled 不重跑、persist 失敗全回滾、uncertain latch 枚舉表）；Task 8 納入 root package 的 `TurnsBefore` callers（`rebuild_orchestrator.go:302`、`app_replayindex_test.go:413`）避免 commit 後 build 壞掉；Task 10 fixture 改 pre-fix 形狀、經 `restoreSessions` 驗證 backfill 接線（同時涵蓋 startup wiring）。
+
 ## Global Constraints
 
 - schema 變更一律 additive、不升 `schema_version`：舊檔缺欄位即 `false`（沿用 `ResumeBackfilled` 慣例，store.go:86 doc）。
@@ -220,7 +223,7 @@ git commit -m "feat(wsregistry): ResetView 前移 boundary 同交易清 LegacyTr
 
 **Files:**
 - Modify: `internal/wsregistry/store.go`（緊鄰 `BackfillResume`）
-- Test: `internal/wsregistry/store_test.go`
+- Test: `internal/wsregistry/store_test.go`、`internal/wsregistry/fsync_test.go`（uncertain latch 的 `writes` 枚舉表 fsync_test.go:254 加入 `BackfillLegacyTranscript`）
 
 **Interfaces:**
 - Consumes: `Entry.LegacyTranscript`、`fileFormat.LegacyTranscriptBackfilled`（Task 1）。
@@ -259,12 +262,119 @@ func TestBackfillLegacyTranscriptAtomic(t *testing.T) {
 		t.Fatal("entry 標記未持久化")
 	}
 }
+
+// spec §4 凍結分支：零候選（掃描成功、確定無待補）仍落 marker——「已檢查過」
+// 的語意，下次啟動不再重跑。
+func TestBackfillLegacyTranscriptZeroCandidateStillSetsMarker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ws.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("零候選仍應落 marker（代表已檢查過）")
+	}
+	s2, _ := Open(path)
+	if !s2.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 未持久化")
+	}
+}
+
+// spec §4 凍結分支：tombstone 不算候選——wsids 內已 Remove 的 entry 跳過、
+// 不標記，marker 照常落盤。
+func TestBackfillLegacyTranscriptSkipsTombstone(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"},
+		"codex":  {ResumeSessionID: "y"},
+	}, func() string { n++; return fmt.Sprintf("w%d", n) }); err != nil {
+		t.Fatal(err)
+	}
+	var removed, kept string
+	for _, e := range s.Live() {
+		if e.Provider == "codex" {
+			removed = e.WSID
+		} else {
+			kept = e.WSID
+		}
+	}
+	if err := s.Remove(removed, "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript([]string{kept, removed}); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Get(kept)
+	if !e.LegacyTranscript {
+		t.Fatal("live 候選應被標記")
+	}
+	de, _ := s.Get(removed)
+	if de.LegacyTranscript {
+		t.Fatal("tombstone entry 不得被標記")
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 應落盤")
+	}
+}
+
+// spec §4 凍結分支（不可逆錯誤防護的核心）：persist 失敗時 entry 標記與 marker
+// **同時**回滾——marker 單獨留下會讓下次啟動不再重試、標記永久缺失。
+// 注入手法沿用 TestPersistFailureRollsBackMemory（chmod 父目錄唯讀）。
+func TestBackfillLegacyTranscriptPersistFailureRollsBackBoth(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Skip("平台不支援權限測試")
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := s.BackfillLegacyTranscript([]string{"w1"}); err == nil {
+		t.Fatal("persist 失敗必須回錯")
+	}
+	if s.LegacyTranscriptBackfilled() {
+		t.Fatal("persist 失敗後 marker 必須回滾（否則永不重試）")
+	}
+	if e, _ := s.Get("w1"); e.LegacyTranscript {
+		t.Fatal("persist 失敗後 entry 標記必須回滾")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript([]string{"w1"}); err != nil {
+		t.Fatalf("修復後重試必須成功：%v", err)
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("重試後 marker 應落盤")
+	}
+}
+```
+
+另外在 `internal/wsregistry/fsync_test.go:254` 的 uncertain latch `writes` 枚舉表加一行（`BackfillLegacyTranscript` 是新的 mutator，latch 後必須一律拒絕）：
+
+```go
+"BackfillLegacyTranscript": func() error { return s.BackfillLegacyTranscript([]string{"w1"}) },
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/wsregistry/ -run TestBackfillLegacyTranscriptAtomic -v`
-Expected: FAIL — `s.BackfillLegacyTranscript undefined`
+Run: `go test ./internal/wsregistry/ -run 'TestBackfillLegacyTranscript' -v`
+Expected: FAIL — `s.BackfillLegacyTranscript undefined`（含 fsync_test.go 的枚舉表新行，編譯失敗）
 
 - [ ] **Step 3: Write minimal implementation**（仿 `BackfillResume` 的 `persistOrRollback` 模式）
 
@@ -272,13 +382,13 @@ Expected: FAIL — `s.BackfillLegacyTranscript undefined`
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/wsregistry/ -run TestBackfillLegacyTranscriptAtomic -v`
-Expected: PASS
+Run: `go test ./internal/wsregistry/ -count=1`
+Expected: PASS（含四個新測試與 fsync latch 枚舉表）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/wsregistry/store.go internal/wsregistry/store_test.go
+git add internal/wsregistry/store.go internal/wsregistry/store_test.go internal/wsregistry/fsync_test.go
 git commit -m "feat(wsregistry): BackfillLegacyTranscript——候選標記＋marker 原子回滾"
 ```
 
@@ -355,43 +465,105 @@ git commit -m "feat: scanLegacyWindow——error-returning、只取無 WSID 的 
 
 **Interfaces:**
 - Consumes: `scanLegacyWindow`（Task 5）、`LegacyEntry.HasLegacyTranscript`（Task 2）。
-- Produces: `legacyEntries()` 用 `scanLegacyWindow` 判斷 window、填 `HasLegacyTranscript`；掃描錯誤時回 error（呼叫端 loadSessionRegistry:1613 已 return，故 Migrate 不執行、marker 不落盤）。
+- Produces: `legacyEntries()` 用 `scanLegacyWindow` 判斷 window、填 `HasLegacyTranscript`；掃描錯誤時回 error（呼叫端 loadSessionRegistry:1613 已 return，故 Migrate 不執行、marker 不落盤）。測試經 `restoreSessions()` → `loadSessionRegistry` 驗證「不遷移、可重試」的完整語意，不只驗 `legacyEntries()` 回錯。
 
-- [ ] **Step 1: Write the failing test**（transcript-only migration＋scan error 阻止遷移）
+- [ ] **Step 1: Write the failing test**（rev2：真正 transcript-only fixture＋經 loadSessionRegistry 驗證 open error 與 Scanner.Err() 都不凍結 migration）
+
+`seedLegacyJournalFixture`（app_invariants_test.go:171）**不是** transcript-only——restore.json 帶 `sess-legacy`／`task-legacy`，掃描失敗時 entry 仍會因 resume/task 非空被遷移，測不到 spec §3 的核心風險「transcript-only 使用者被永久遷成空 entries」。另建 fixture：
 
 ```go
-func TestLegacyEntriesScanErrorAbortsMigration(t *testing.T) {
-	dir := seedLegacyJournalFixture(t)
-	a := newTestAppAt(t, dir)
+// seedTranscriptOnlyLegacyFixture：M3a 形狀、但 claude 只有 legacy window——
+// 無 resume identity、無 task。這是 spec §3 的高風險族群：掃描錯誤若被吞，
+// 該 provider 三者皆空 → 跳過遷移 → migrated=true 空 entries → 舊歷史永久遺失。
+func seedTranscriptOnlyLegacyFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: "ev-0"},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
+	dir := seedTranscriptOnlyLegacyFixture(t)
+	a := newTestAppAt(t, dir) // 先建 App（sink 要開得了原始 events.jsonl）再破壞檔案
 	events := filepath.Join(dir, "events.jsonl")
-	backup := events + ".bak"
-	if err := os.Rename(events, backup); err != nil {
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNotMigrated := func(phase string) {
+		t.Helper()
+		reg := registryOnDisk(t, dir)
+		if reg.Migrated() {
+			t.Fatalf("%s：掃描失敗不得落 migrated marker（永不重試＝舊歷史永久遺失）", phase)
+		}
+		if n := len(reg.Live()); n != 0 {
+			t.Fatalf("%s：掃描失敗不得寫入 entries：%d", phase, n)
+		}
+	}
+	// (1) open error：events.jsonl 換成目錄。
+	if err := os.Remove(events); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(events, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.legacyEntries(); err == nil {
-		t.Fatal("scanLegacyWindow 失敗時 legacyEntries 必須回 error（不得靜默空 map）")
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("open error 時 loadSessionRegistry 必須回錯（不得靜默跳過遷移）")
 	}
-	os.Remove(events)
-	if err := os.Rename(backup, events); err != nil {
+	assertNotMigrated("open error")
+	// (2) scan error：單行超過 scanner buffer 上限（16MiB）→ Scanner.Err()=ErrTooLong。
+	if err := os.Remove(events); err != nil {
 		t.Fatal(err)
 	}
-	le, err := a.legacyEntries()
+	huge := append(append([]byte{}, orig...), []byte(strings.Repeat("x", 17*1024*1024))...)
+	if err := os.WriteFile(events, huge, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("Scanner.Err() 非 nil 時必須回錯（不得把讀到一半當完整 window）")
+	}
+	assertNotMigrated("scan error")
+	// (3) 修復後重試：正常遷移、transcript-only entry 帶 LegacyTranscript=true。
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live, err := a.restoreSessions()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("修復後重試必須成功：%v", err)
 	}
-	if !le["claude"].HasLegacyTranscript {
-		t.Fatal("transcript-only fixture 應判定 HasLegacyTranscript=true")
+	if len(live) != 1 || live[0].Provider != "claude" {
+		t.Fatalf("transcript-only 應恰遷移出一個 claude entry：%+v", live)
+	}
+	reg := registryOnDisk(t, dir)
+	e, ok := reg.Get(live[0].WSID)
+	if !ok || !e.LegacyTranscript {
+		t.Fatalf("transcript-only entry 必須帶 LegacyTranscript=true：%+v ok=%v", e, ok)
+	}
+	if !reg.Migrated() {
+		t.Fatal("重試成功後 migrated marker 應落盤")
 	}
 }
 ```
 
+（同一個 App 連續呼叫 `restoreSessions` 模擬「下次啟動重試」是安全的簡化：失敗發生在 `legacyEntries` 階段、`Migrate` 與 `RestoreDormant` 都未執行，且 `loadSessionRegistry` 每次呼叫都重新 `wsregistry.Open` 讀磁碟。）
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test . -run TestLegacyEntriesScanErrorAbortsMigration -v`
-Expected: FAIL — 目前用 `replayViewWindow` 吞錯回空，不回 error
+Run: `go test . -run TestTranscriptOnlyMigrationScanErrorDoesNotFreeze -v`
+Expected: FAIL — 目前 `legacyEntries` 用 `replayViewWindow` 吞錯回空，(1)(2) 不回錯且 claude 三者皆空被跳過、`Migrate` 落 marker（正是 spec §3 描述的永久遺失路徑）
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -399,8 +571,8 @@ Expected: FAIL — 目前用 `replayViewWindow` 吞錯回空，不回 error
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test . -run TestLegacyEntriesScanErrorAbortsMigration -v`
-Expected: PASS
+Run: `go test . -run 'TestTranscriptOnlyMigrationScanErrorDoesNotFreeze|TestLegacyJournalWithoutWSIDAttributes' -v`
+Expected: PASS（既有 seedLegacyJournalFixture 路徑〔resume＋task＋window〕同時不破）
 
 - [ ] **Step 5: Commit**
 
@@ -415,53 +587,147 @@ git commit -m "fix(app): legacyEntries 改用 scanLegacyWindow——掃描失敗
 
 **Files:**
 - Modify: `app.go`（新增 `backfillLegacyTranscript`，緊鄰 `backfillResumeFromLegacy` app.go:1713）、`loadSessionRegistry`（接線，`backfillResumeFromLegacy(store)` 呼叫點之後）
-- Test: `app_restore_dormant_test.go`；測試存取器 `wsRegForTest`（app_test.go 或既有 helper 檔）
+- Test: `app_restore_dormant_test.go`
 
 **Interfaces:**
 - Consumes: `scanLegacyWindow`（Task 5）、`Store.BackfillLegacyTranscript`（Task 4）、`Store.LegacyTranscriptBackfilled`（Task 1）、`Store.Live()`、`a.restore.Get`。
-- Produces: `backfillLegacyTranscript(store *wsregistry.Store) error`——`!LegacyTranscriptBackfilled` 時，以 restore.json 快照對每 provider 精確比對五條件找恰一候選；零候選略過、多候選 fail loud（marker 不落盤）、scan error fail loud；成功則 `store.BackfillLegacyTranscript(候選)`。在 `loadSessionRegistry` 的 `backfillResumeFromLegacy(store)` 之後呼叫。`wsRegForTest() *wsregistry.Store` 測試存取器。
+- Produces: `backfillLegacyTranscript(store *wsregistry.Store) error`——`!LegacyTranscriptBackfilled` 時，以 restore.json 快照對每 provider 精確比對五條件找恰一候選；零候選略過、多候選 fail loud（marker 不落盤）、scan error fail loud；成功則 `store.BackfillLegacyTranscript(候選)`。在 `loadSessionRegistry` 的 `backfillResumeFromLegacy(store)` 之後呼叫。
 
-- [ ] **Step 1: Write the failing test**（多候選 fail loud、marker 不落盤；恰一候選成功）
+**測試取 Store 的方式（rev2）**：`newTestAppAt` 不接 `a.wsReg`（app_restore_dormant_test.go:23——它只裝 restore／manager／replay index；`a.wsReg = store` 在 loadSessionRegistry app.go:1688 才發生），direct unit test 一律用既有 `registryOnDisk(t, dir)`（app_restore_dormant_test.go:108）自行開 Store 傳入。startup wiring（loadSessionRegistry 是否真的呼叫到）由 Task 10 的 pre-fix 形狀端對端測試覆蓋。
+
+- [ ] **Step 1: Write the failing test**（五條件與各凍結分支：恰一候選、多候選、ViewStart 不精確相等、tombstone／provider 排除、scan error、已 backfilled 不重跑）
 
 ```go
 func TestBackfillLegacyTranscriptMultiCandidateFailsLoud(t *testing.T) {
 	dir := seedMigratedTwoClaudeFixture(t)
 	a := newTestAppAt(t, dir)
-	store := a.wsRegForTest()
+	store := registryOnDisk(t, dir)
 	if err := a.backfillLegacyTranscript(store); err == nil {
 		t.Fatal("多候選必須 fail loud")
 	}
 	if store.LegacyTranscriptBackfilled() {
 		t.Fatal("多候選時 marker 不得落盤（可重試）")
 	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("多候選時任何 entry 都不得被標記")
+		}
+	}
 }
 
 func TestBackfillLegacyTranscriptSingleCandidate(t *testing.T) {
 	dir := seedMigratedLegacyClaudeFixture(t)
 	a := newTestAppAt(t, dir)
-	store := a.wsRegForTest()
+	store := registryOnDisk(t, dir)
 	if err := a.backfillLegacyTranscript(store); err != nil {
 		t.Fatal(err)
 	}
 	if !store.LegacyTranscriptBackfilled() {
 		t.Fatal("成功後 marker 應落盤")
 	}
-	var flagged int
+	var flagged []wsregistry.Entry
 	for _, e := range store.Live() {
 		if e.LegacyTranscript {
-			flagged++
+			flagged = append(flagged, e)
 		}
 	}
-	if flagged != 1 {
-		t.Fatalf("恰一候選應標記一個：%d", flagged)
+	// fixture 內同 ViewStart 的 codex entry 存在但 events.jsonl 無 codex legacy
+	// 事件——恰標記一個且是 claude，同時證明 provider 條件。
+	if len(flagged) != 1 || flagged[0].Provider != "claude" {
+		t.Fatalf("恰一候選應標記一個 claude entry：%+v", flagged)
+	}
+}
+
+// spec §4 凍結分支：ViewStart 不精確相等（差一字元）不算候選 → 零候選 →
+// marker 落盤、entry 不動（安全略過，不是錯誤）。
+func TestBackfillLegacyTranscriptViewStartMismatchIsZeroCandidate(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixtureViewStart(t, "ev-0x") // registry=ev-0x、restore.json=ev-0
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatal(err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("零候選（掃描成功）仍應落 marker")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("ViewStart 不精確相等不得標記")
+		}
+	}
+}
+
+// spec §4 凍結分支：tombstone 不算候選——同 ViewStart 的第二個 claude entry
+// 已 Remove 時不構成多候選，live 那個照常標記。
+func TestBackfillLegacyTranscriptTombstoneNotCandidate(t *testing.T) {
+	dir := seedMigratedTwoClaudeFixture(t)
+	reg := registryOnDisk(t, dir)
+	tomb := reg.Live()[1].WSID
+	if err := reg.Remove(tomb, "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatalf("tombstone 排除後應為恰一候選：%v", err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 應落盤")
+	}
+}
+
+// spec §4 凍結分支：scanner I/O 錯誤 → fail loud、marker 不落盤、entry 不動
+// （不得誤判成零候選——那會固化成永不重試）。
+func TestBackfillLegacyTranscriptScanErrorKeepsMarkerClear(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err == nil {
+		t.Fatal("scan error 必須 fail loud，不得當零候選")
+	}
+	if store.LegacyTranscriptBackfilled() {
+		t.Fatal("scan error 時 marker 不得落盤（可重試）")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("scan error 時 entry 不得被標記")
+		}
+	}
+}
+
+// spec §4 凍結分支：冪等——marker 已落盤後整段跳過（events.jsonl 已破壞仍
+// 不回錯，證明沒有重新掃描）。
+func TestBackfillLegacyTranscriptIdempotentAfterMarker(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	if err := registryOnDisk(t, dir).BackfillLegacyTranscript(nil); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatalf("marker 已落盤應 early return、不重掃：%v", err)
 	}
 }
 ```
 
-fixture helper（Step 3 一併建立，沿用 `seedLegacyJournalFixture` 手法）：
-- `seedMigratedLegacyClaudeFixture`：events.jsonl 有 claude 無 WSID 事件；restore.json claude entry 的 ViewStart=V；workspace-sessions.json migrated=true、一個 claude live entry ViewStart=V、無 legacy_transcript、legacy_transcript_backfilled=false。
-- `seedMigratedTwoClaudeFixture`：同上但兩個 claude live entry 的 ViewStart 都=V（多候選）。
-- `wsRegForTest() *wsregistry.Store { return a.wsReg }`。
+fixture helper（Step 3 一併建立，registry 用 `seedRegistry`／`wsregistry.Open`＋`MarkMigrated` 直接落盤，events／restore.json 沿用 `seedLegacyJournalFixture` 手法）：
+- `seedMigratedLegacyClaudeFixture`：events.jsonl 有 claude 無 WSID 事件（event_id > "ev-0"）；restore.json claude entry 的 ViewStart="ev-0"；workspace-sessions.json migrated=true、一個 claude live entry ViewStart="ev-0"、一個 codex live entry ViewStart="ev-0"（同 ViewStart 但無 codex legacy 事件——provider 條件的反例）、皆無 legacy_transcript、legacy_transcript_backfilled=false。
+- `seedMigratedLegacyClaudeFixtureViewStart(t, vs)`：同上（無 codex entry），但 claude entry 的 ViewStart=vs（與 restore.json 的 "ev-0" 不同）。
+- `seedMigratedTwoClaudeFixture`：同 `seedMigratedLegacyClaudeFixture`（無 codex entry），但兩個 claude live entry 的 ViewStart 都="ev-0"（多候選）。
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -472,7 +738,6 @@ Expected: FAIL — `a.backfillLegacyTranscript undefined`
 
 新增 `backfillLegacyTranscript`：`store.LegacyTranscriptBackfilled() || a.restore == nil` early return nil。對每個 `legacyProviders` 的 p：`re := a.restore.Get(p)`；`window, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)`，`werr != nil` return werr（不落 marker）；`len(window)==0` continue；掃 `store.Live()` 收集 `e.Provider==p && e.ViewStartEventID==re.ViewStartEventID` 的 WSID 到 `match`；`switch len(match)`：0 略過、1 加入 candidates、default `return fmt.Errorf(...多候選不猜...)`。最後 `return store.BackfillLegacyTranscript(candidates)`。
 接線 `loadSessionRegistry`：`backfillResumeFromLegacy(store)` 之後加 `if err := a.backfillLegacyTranscript(store); err != nil { a.noteStartupBlocker("...legacy transcript 標記補寫失敗..." + err.Error()) }`。
-存取器 `wsRegForTest`。
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -482,7 +747,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app.go app_restore_dormant_test.go app_test.go
+git add app.go app_restore_dormant_test.go
 git commit -m "feat(app): backfillLegacyTranscript——restore.json 快照五條件精確比對、多候選 fail loud"
 ```
 
@@ -492,7 +757,10 @@ git commit -m "feat(app): backfillLegacyTranscript——restore.json 快照五�
 
 **Files:**
 - Modify: `internal/replayindex/index.go:453-475`（TurnsBefore）
-- Test: `internal/replayindex/index_test.go`；同套件既有直接呼叫 `TurnsBefore` 的測試改接三回傳值
+- Modify: `rebuild_orchestrator.go:302`（root package caller，本 task 先最小適配 `recs, _, err :=` 保持編譯；hasOlder 的實際使用在 Task 9）
+- Test: `internal/replayindex/index_test.go`（含同套件既有直接呼叫改三回傳值）、`app_replayindex_test.go:413`（root package 測試 caller 改三回傳值）
+
+**Caller 完整性（rev2）**：簽章變更的影響面以 repo-wide `rg '\.TurnsBefore\(' --glob '*.go'` 為準（目前共 5 處：index_test.go:170/179/331、rebuild_orchestrator.go:302、app_replayindex_test.go:413），不得只搜 `internal/replayindex/`——漏掉 root package 會讓本 task 的 commit 直接 build 失敗。
 
 **Interfaces:**
 - Produces: `TurnsBefore(wsid, beforeEventID string, n int) (recs []TurnRecord, hasOlder bool, err error)`——`hasOlder` 表示此頁回傳之後還有更舊的 WSID turn（可分頁總數 > 回傳數）。
@@ -529,17 +797,17 @@ Expected: FAIL — `TurnsBefore` 回兩值、簽章不符（編譯失敗）
 
 - [ ] **Step 3: Write minimal implementation**
 
-`TurnsBefore`（index.go:453）改簽章為 `([]TurnRecord, bool, error)`：`readTurnFileLocked` 錯誤回 `nil, false, err`；`beforeEventID==""` 回 `capTail(all, n), len(all) > n, nil`；找不到 cut（`cut <= 0`）回 `nil, false, nil`；否則回 `capTail(all[:cut], n), cut > n, nil`。同步改同套件既有直接呼叫 `TurnsBefore` 的測試為三回傳值（`grep -n '\.TurnsBefore(' internal/replayindex/`）。
+`TurnsBefore`（index.go:453）改簽章為 `([]TurnRecord, bool, error)`：`readTurnFileLocked` 錯誤回 `nil, false, err`；`beforeEventID==""` 回 `capTail(all, n), len(all) > n, nil`；找不到 cut（`cut <= 0`）回 `nil, false, nil`；否則回 `capTail(all[:cut], n), cut > n, nil`。所有 caller 以 repo-wide `rg '\.TurnsBefore\(' --glob '*.go'` 逐一改接：index_test.go 三處、`app_replayindex_test.go:413` 改三回傳值；`rebuild_orchestrator.go:302` 最小適配 `recs, _, err :=`（hasOlder 留給 Task 9 使用）。
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/replayindex/ -count=1`
-Expected: PASS（含新測試與改過的既有測試）
+Run: `go build ./... && go test ./internal/replayindex/ -count=1 && go test . -run TestIndexDegradedNotifyDoesNotDeadlockAndRecovers -count=1`
+Expected: PASS（root package 編譯通過、新測試與改過的既有測試全綠）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/replayindex/index.go internal/replayindex/index_test.go
+git add internal/replayindex/index.go internal/replayindex/index_test.go rebuild_orchestrator.go app_replayindex_test.go
 git commit -m "feat(replayindex): TurnsBefore 增加 hasOlder 回傳（最舊 turn 頁判定）"
 ```
 
@@ -593,7 +861,7 @@ func TestLoadTurnsBeforeMergesLegacyAtOldestPage(t *testing.T) {
 }
 ```
 
-（helper `seedLegacyPlus25TurnsApp`／`hasLegacyText`／`ascendingByEventID`／`assertAllTurnsPresent` 於此建立。fixture：migrated registry、claude WSID w1、LegacyTranscript=true、ViewStart=V；events.jsonl 有 V 之後的無 WSID legacy 事件，再有 25 個帶 w1 的完整 turn；index 已建 25 turn record。）
+（helper `seedLegacyPlus25TurnsApp`／`hasLegacyText`／`ascendingByEventID`／`assertAllTurnsPresent` 於此建立。fixture：migrated registry、claude WSID w1、LegacyTranscript=true、ViewStart=V；events.jsonl 有 V 之後的無 WSID legacy 事件，再有 25 個帶 w1 的完整 turn；index 已建 25 turn record。**rev2**：`newTestAppAt` 不接 `a.wsReg`，helper 最後必須 `a.wsReg = registryOnDisk(t, dir)`，否則新增的 `a.wsReg.Get` 會 nil panic——與 Task 7 同一類 setup 陷阱。）
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -602,7 +870,7 @@ Expected: FAIL — 目前不合併 legacy，p2 無 legacy 文字
 
 - [ ] **Step 3: Write minimal implementation**
 
-`loadTurnsBefore`（rebuild_orchestrator.go）改寫：`TurnsBefore` 接三回傳值；緊接加 `if beforeEventID != "" && len(recs) == 0 { return nil, nil }`；既有 readEnvelopeRange 迴圈與 open-turn tail 邏輯保留（合成單一出口 `out`）；在最終 return 前加 `if !hasOlder { if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript { legacy, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID); if lerr != nil { return nil, lerr }; out = append(legacy, out...) } }`；最後 `sort.SliceStable(out, func(i,j int) bool { return out[i].EventID < out[j].EventID })`。若既有程式在 `beforeEventID != ""` 分支提早 return，須併入此統一出口以確保排序與早退都經過（`import "sort"`）。
+`loadTurnsBefore`（rebuild_orchestrator.go）改寫：`TurnsBefore` 接三回傳值；緊接加 `if beforeEventID != "" && len(recs) == 0 { return nil, nil }`；既有 readEnvelopeRange 迴圈與 open-turn tail 邏輯保留（合成單一出口 `out`）；在最終 return 前加 `if !hasOlder && a.wsReg != nil { if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript { legacy, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID); if lerr != nil { return nil, lerr }; out = append(legacy, out...) } }`；最後 `sort.SliceStable(out, func(i,j int) bool { return out[i].EventID < out[j].EventID })`。若既有程式在 `beforeEventID != ""` 分支提早 return，須併入此統一出口以確保排序與早退都經過（`import "sort"`）。
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -643,13 +911,32 @@ git commit -m "feat(app): loadTurnsBefore 於最舊 turn 頁前綴 legacy window
 - Test: `app_legacy_transcript_test.go`（接續 Task 9）
 
 **Interfaces:**
-- Consumes: 全鏈（migration flag → backfill → loadTurnsBefore 合併）。
+- Consumes: 全鏈（startup wiring → backfill 標記 → loadTurnsBefore 合併）。
 
-- [ ] **Step 1: Write the failing test**（全鏈已實作，作為迴歸鎖）
+- [ ] **Step 1: Write the failing test**（rev2：fixture 是 **pre-fix 形狀**——已遷移 registry、**無任何** `legacy_transcript` 標記、`legacy_transcript_backfilled=false`，即既有升級使用者重啟當下的磁碟狀態；經 `restoreSessions()` 讓 `loadSessionRegistry` → `backfillLegacyTranscript` 接線真正跑過，才 hydrate。直接預設 `LegacyTranscript=true` 的 fixture 只驗載入合併、驗不到接線）
 
 ```go
 func TestLegacyTranscriptEndToEndHydrate(t *testing.T) {
-	a := seedMigratedLegacyPlusSecondClaude(t)
+	a := seedPreFixMigratedTwoSessionApp(t)
+	live, err := a.restoreSessions() // → loadSessionRegistry → backfillLegacyTranscript
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 2 {
+		t.Fatalf("fixture 應還原兩個 claude session：%+v", live)
+	}
+	// startup wiring 生效的證據：marker 落盤、恰 w1 被標記（w2 ViewStart 不同、
+	// 非候選——五條件比對在真實接線下成立）。
+	reg := registryOnDisk(t, a.stateDir)
+	if !reg.LegacyTranscriptBackfilled() {
+		t.Fatal("loadSessionRegistry 必須接到 backfillLegacyTranscript（marker 未落盤＝沒接線）")
+	}
+	if e, _ := reg.Get("w1"); !e.LegacyTranscript {
+		t.Fatal("backfill 應標記 legacy 的 w1")
+	}
+	if e, _ := reg.Get("w2"); e.LegacyTranscript {
+		t.Fatal("後建的 w2 不得被標記")
+	}
 	p1, err := a.LoadTurnsBefore("w1", "", 20)
 	if err != nil {
 		t.Fatal(err)
@@ -669,7 +956,7 @@ func TestLegacyTranscriptEndToEndHydrate(t *testing.T) {
 }
 ```
 
-（`seedMigratedLegacyPlusSecondClaude`：w1 為 legacy（LegacyTranscript=true、boundary 後有無 WSID transcript）；w2 為後建 claude（LegacyTranscript=false、ViewStart 為建立時高水位、之後只有 w2 自己的 WSID 事件）。）
+（`seedPreFixMigratedTwoSessionApp`：registry 以 `seedRegistry`〔`MarkMigrated`，天然不帶新欄位＝pre-fix 形狀〕寫入 w1（claude、ViewStart="ev-0"）與 w2（claude、ViewStart 為後建高水位）；restore.json claude entry ViewStart="ev-0"；events.jsonl 依序：無 WSID legacy 事件（> "ev-0"）→ w1 的 WSID turn（≤20 個，讓首載即最舊 turn 頁）→ w2 的 WSID turn；replay index 依 Task 9 helper 手法建好 turn record；回傳 `newTestAppAt` 的 App（尚未 restoreSessions）。）
 
 - [ ] **Step 2: Run test to verify it passes**
 
@@ -702,7 +989,13 @@ git commit -m "test(app): legacy transcript 首次 hydrate 端對端＋同 provi
 - §4 backfill 五條件＋多候選 fail loud＋原子 marker：Task 4＋Task 7 ✓
 - §5 合併＋cursor 早退＋hasOlder 前綴＋排序：Task 8＋Task 9 ✓；§5a scanLegacyWindow：Task 5 ✓
 - §6 ResetView 清標記：Task 3 ✓
-- §8 測試（migration scan error、reverse、跨頁、backfill 多候選、端對端、既有契約）：Task 6/2/9/7/10 ✓
+- §8 測試逐項（rev2 對照）：
+  - transcript-only 正常遷移＋open error／Scanner.Err() 不凍結：Task 6 ✓
+  - Migrate flag 正反向：Task 2 ✓；schema 預設值／round-trip：Task 1 ✓；ResetView 清標記：Task 3 ✓
+  - backfill 凍結分支——零候選落 marker：Task 4＋Task 7（ViewStart mismatch）✓；tombstone／provider 不算候選：Task 4＋Task 7 ✓；多候選 fail loud：Task 7 ✓；scanner 錯誤不落 marker：Task 7 ✓；冪等（marker 後不重跑）：Task 7 ✓；persist 失敗 entry＋marker 全回滾：Task 4 ✓；uncertain latch 枚舉表：Task 4 ✓
+  - 跨頁分頁＋去重＋反向＋cursor 早退：Task 9 ✓
+  - 端對端（pre-fix 形狀、startup wiring 實跑）＋同 provider 第二 session 不誤接：Task 10 ✓
+  - 既有契約迴歸：Task 10 Step 3-4 ✓
 
 **2. Placeholder scan：** 無 TBD／TODO；code 步驟給實際 test code 與明確 impl 指示。fixture helper 於首次使用的 Task 建立、沿用既有 `seedLegacyJournalFixture` 手法。
 
