@@ -127,7 +127,7 @@ if beforeEventID != "" && len(recs) == 0 {
     return nil, nil          // cursor 找不到（含 legacy id）或有效但已最舊——回空、不前綴
 }                            // legacy 只在最舊 turn 頁前綴一次，此處回空讓前端停
 out := envelopes(recs) ++ (若首載) open-turn tail
-if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前綴 legacy
+if !hasOlder && entry.ViewStartEventID != "" {   // 這一頁是最舊 WSID turn 頁，且有可信 boundary → 前綴 legacy
     legacy, err := scanLegacyWindow(eventsPath, provider, entry.ViewStartEventID)  // §5a，只取無 WSID
     if err != nil { return nil, err }         // I/O 錯誤 fail loud，不靜默少給
     out = legacy ++ out
@@ -147,6 +147,16 @@ if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前
   但**該頁 recs 為空且 cursor 不是 WSID turn** → 回空、**不**再前綴（legacy 已於
   最舊 turn 頁給過）。判準：只有「cursor=="" 或 cursor 命中某 WSID turn」的頁才可能
   前綴 legacy；cursor 非 WSID turn（含 legacy id）一律回空、不前綴。
+
+**空 ViewStart 不前綴（integration review 2026-08-23）**：`entry.ViewStartEventID==""`
+時，即使 `LegacyTranscript==true` 也不得前綴 legacy。`Migrate` 可能建出這種
+entry——首啟時 events.jsonl 為空、restore.json 快照的 `ViewStartEventID` 是空字串、
+使用者從未 `ResetView`，但 `ResumeSessionID`／`TaskID` 非空放行 `Migrate` 判準。此時
+`scanLegacyWindow(viewStart="")` 不做 boundary 過濾（§5a：`viewStart != "" && ...`
+才過濾），會把該 provider **整個歷史**一次前綴進最舊頁——違反 m3b §3.2.5「不得把
+該 provider 全部歷史丟入 legacy session」。guard 比照 §4 backfill 的空 boundary
+前例（`backfillLegacyTranscript`：`re.ViewStartEventID == ""` 時直接跳過該
+provider，不猜）：無可信 boundary 來源＝無可信比對證據，寧可少顯示也不前綴。
 
 **replay index 的 hasOlder**：`TurnsBefore` 增加回傳「此頁之後是否還有更舊 turn」
 （實作可由 `len(all[:cut]) > n` 或 `len(all) > n` 判定；plan 定確切簽章）。這是本
@@ -198,7 +208,8 @@ startup:
 hydrate（首次＋向上分頁）:
   frontend pin()/loadOlder → LoadTurnsBefore(wsid, cursor, 20)
                  → loadTurnsBefore：WSID turn index 事件（cursor 分頁）
-                   ＋（若 entry.LegacyTranscript 且此頁為最舊 turn 頁 hasOlder==false）
+                   ＋（若 entry.LegacyTranscript 且 ViewStartEventID!="" 且此頁為
+                      最舊 turn 頁 hasOlder==false）
                      legacy window（無 WSID、boundary 後）前綴、依 event_id 排序
 
 前移 boundary:
@@ -241,6 +252,11 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
   前綴（最舊 turn 頁）；第三頁 cursor=legacy id → 回空、停。驗「turns 1–5 不會遺失」。
 - 去重：post-migration 同 provider 的 WSID 事件不因 legacy window 重複出現。
 - 非 legacy WSID（`LegacyTranscript==false`）：任何頁都不含無 WSID 事件（反向）。
+- **空 ViewStart（integration review 2026-08-23 I1）**：`LegacyTranscript==true` 但
+  `ViewStartEventID==""` 時，任何頁都不得前綴 legacy（無可信 boundary）。
+- **首載即前綴（integration review 2026-08-23 I2，mutation 守門）**：legacy 使用者
+  WSID turn 數 < 20（首載本身就是最舊 turn 頁）時，`beforeEventID==""` 的首載必須
+  直接前綴 legacy——守住「合併分支條件誤加 `beforeEventID != ""`」這類 mutation。
 - scanner I/O 錯誤 → loadTurnsBefore 回 error（不靜默少給 legacy）。
 - view boundary：boundary 之後才回；前移 boundary（清標記）後不再含 legacy。
 - 20-turn：legacy 不佔 turn 額度。

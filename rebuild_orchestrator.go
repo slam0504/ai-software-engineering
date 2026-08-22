@@ -348,8 +348,17 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	// 凍結的合併語意）：非最舊頁若也帶 legacy，使用者上滑會看到同一段歷史
 	// 重複出現。a.wsReg 未接線時沒有可信的 LegacyTranscript／Provider／
 	// ViewStart 來源，寧可少顯示也不要猜（同 viewBoundary 的降級方向）。
+	//
+	// ViewStartEventID=="" 一律不前綴（integration review 2026-08-23 I1）：
+	// Migrate 可能建出空 ViewStart＋LegacyTranscript=true 的 entry（首啟空
+	// events.jsonl、使用者從未 ResetView、resume 非空放行 Migrate）。空字串
+	// 對 scanLegacyWindow 等於「不做 boundary 過濾」，會把該 provider 的
+	// 全部歷史一次前綴進最舊頁——違反 m3b §3.2.5「不得把全部歷史丟進 legacy
+	// session」。guard 比照 backfillLegacyTranscript 的空 boundary 前例
+	// （app.go：re.ViewStartEventID == "" 時直接跳過該 provider）：無可信
+	// boundary 來源＝無可信比對證據，不猜、不前綴。
 	if !hasOlder && a.wsReg != nil {
-		if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript {
+		if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript && e.ViewStartEventID != "" {
 			legacy, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
 			if lerr != nil {
 				return nil, lerr

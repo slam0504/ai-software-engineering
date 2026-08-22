@@ -10,17 +10,17 @@ import (
 
 // seedLegacyTranscriptFixtureApp：legacy window（無 WSID 的 3 筆事件）＋
 // wsid="w1" 的 turnCount 個完整 turn；registry 的 w1 entry 依 legacyTranscript
-// 旗標決定是否可能觸發 legacy 合併。
+// 旗標決定是否可能觸發 legacy 合併，viewStart 直接餵給 entry 的
+// ViewStartEventID（""＝I1 的空 boundary 反例 fixture）。
 //
 // event_id 刻意全部固定為 10 位數字字串（"0000000000".."0000000003"）：
 // crockford ULID 字元集只有 0-9A-Z，真正的 turn event id 一律以目前時間戳的
 // crockford 編碼開頭（現在的年份下恆為 "01" 開頭），比這裡固定的 "00" 開頭
 // 大，藉此保證 legacy 事件在 event_id 遞增排序下恆小於任何真實 turn，
 // 不必依賴檔案內實際寫入順序。
-func seedLegacyTranscriptFixtureApp(t *testing.T, legacyTranscript bool, turnCount int) *App {
+func seedLegacyTranscriptFixtureApp(t *testing.T, legacyTranscript bool, turnCount int, viewStart string) *App {
 	t.Helper()
 	dir := t.TempDir()
-	const viewStart = "0000000000"
 	seedEvents(t, dir,
 		`{"event_id":"0000000001","provider":"claude","kind":"message","role":"user","text":"legacy-hi"}`,
 		`{"event_id":"0000000002","provider":"claude","kind":"delta","role":"assistant","text":"legacy-ok"}`,
@@ -45,7 +45,7 @@ func seedLegacyTranscriptFixtureApp(t *testing.T, legacyTranscript bool, turnCou
 // 跨頁分頁時 legacy window 只在最舊 turn 頁前綴一次。
 func seedLegacyPlus25TurnsApp(t *testing.T) *App {
 	t.Helper()
-	return seedLegacyTranscriptFixtureApp(t, true, 25)
+	return seedLegacyTranscriptFixtureApp(t, true, 25, "0000000000")
 }
 
 // seedNonLegacyApp：events.jsonl 內同樣有無 WSID 的 legacy 事件，但 w1 entry
@@ -53,7 +53,26 @@ func seedLegacyPlus25TurnsApp(t *testing.T) *App {
 // 誤合併進來。
 func seedNonLegacyApp(t *testing.T) *App {
 	t.Helper()
-	return seedLegacyTranscriptFixtureApp(t, false, 5)
+	return seedLegacyTranscriptFixtureApp(t, false, 5, "0000000000")
+}
+
+// seedLegacyFewTurnsApp：legacy window ＋ w1 上 turnCount（<20）個完整
+// turn、ViewStartEventID 非空——I2 的主線案例 fixture：turn 數不到一頁，
+// 首載（beforeEventID==""）本身就是 hasOlder==false 的最舊頁，第一頁就該
+// 前綴 legacy，不必等第二頁才觸發合併分支。
+func seedLegacyFewTurnsApp(t *testing.T, turnCount int) *App {
+	t.Helper()
+	return seedLegacyTranscriptFixtureApp(t, true, turnCount, "0000000000")
+}
+
+// seedLegacyEmptyViewStartApp：LegacyTranscript=true 但 ViewStartEventID==""
+// ——I1 的反例 fixture。Migrate 可能建出這種 entry（首啟空 events.jsonl、
+// 使用者從未 ResetView、resume 非空放行 Migrate），此時 scanLegacyWindow 若
+// 不擋，viewStart=="" 等於不做 boundary 過濾，會把整個 provider 歷史前綴進
+// 最舊頁，違反 m3b §3.2.5。
+func seedLegacyEmptyViewStartApp(t *testing.T, turnCount int) *App {
+	t.Helper()
+	return seedLegacyTranscriptFixtureApp(t, true, turnCount, "")
 }
 
 // hasLegacyText：envs 內是否含至少一筆無 WorkspaceSessionID 的事件——legacy
@@ -133,4 +152,42 @@ func TestLoadTurnsBeforeNonLegacyHasNoWSIDlessEvents(t *testing.T) {
 			t.Fatal("非 legacy WSID 不得含任何無 WSID 事件（反向）")
 		}
 	}
+}
+
+// TestLoadTurnsBeforeEmptyViewStartDoesNotPrefixLegacy：integration review
+// 2026-08-23 I1——entry 的 ViewStartEventID=="" 時，即使 LegacyTranscript=true
+// 也不得前綴 legacy（無可信 boundary＝無可信比對證據，比照 §4 backfill
+// guard；前綴整個 provider 歷史違反 m3b §3.2.5）。
+func TestLoadTurnsBeforeEmptyViewStartDoesNotPrefixLegacy(t *testing.T) {
+	a := seedLegacyEmptyViewStartApp(t, 5)
+	got, err := a.LoadTurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyText(got) {
+		t.Fatal("ViewStartEventID 為空時不得前綴 legacy（無可信 boundary）")
+	}
+}
+
+// TestLoadTurnsBeforeFirstLoadPrefixesLegacyWhenFewTurns：spec §5／§8 主線
+// 案例——legacy 使用者 turn 數不到一頁（<20）時，首載（beforeEventID==""）
+// 本身就是最舊頁，必須直接前綴 legacy，不必等第二頁才觸發合併分支
+// （守住「分支條件誤寫成 beforeEventID != "" && !hasOlder && ...」這類
+// mutation：那樣首載永遠跳過合併，這個測試會紅）。
+func TestLoadTurnsBeforeFirstLoadPrefixesLegacyWhenFewTurns(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 5)
+	got, err := a.LoadTurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLegacyText(got) {
+		t.Fatal("turn 數不到一頁時首載必須前綴 legacy")
+	}
+	if !ascendingByEventID(got) {
+		t.Fatal("合併後必須 event_id 遞增")
+	}
+	if got[0].WorkspaceSessionID != "" {
+		t.Fatal("legacy（無 WSID）應排在最前")
+	}
+	assertAllTurnsPresent(t, got, 5)
 }
