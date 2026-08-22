@@ -200,4 +200,54 @@ func replayViewWindow(eventsPath, provider, viewStart string) []contract.Envelop
 	return out
 }
 
+// scanLegacyWindow 讀取 events.jsonl，篩選無 WorkspaceSessionID 的 provider 事件。
+// 與 replayViewWindow 差異：(1) 回傳 error；(2) 檔案不存在 → (nil,nil)；
+// (3) 只保留 WorkspaceSessionID == ""；(4) Scanner.Err() 檢查。
+func scanLegacyWindow(eventsPath, provider, viewStart string) ([]contract.Envelope, error) {
+	f, err := os.Open(eventsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open events file: %w", err)
+	}
+	defer f.Close()
+	var out []contract.Envelope
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		var e contract.Envelope
+		if json.Unmarshal(sc.Bytes(), &e) != nil {
+			continue // malformed 行跳過
+		}
+		if e.Provider != provider || e.EventID == "" {
+			continue
+		}
+		// Only genuine provider-session events belong in a provider view window.
+		// Provider session events go through contract.Wrap, which leaves Scope
+		// empty; only EmitWorkspace sets scope="workspace" and EmitAssist sets
+		// scope="session"+purpose="spec_assist". So exclude workspace/gate
+		// envelopes (defensive — they also carry no provider) and, critically,
+		// isolated SpecAssist events: those share the provider but must never be
+		// replayed through session.apply, or their delta/message would leak into
+		// the provider Chat and inflate totals (frozen §5.1).
+		if e.Scope == "workspace" || e.Purpose == "spec_assist" {
+			continue
+		}
+		if viewStart != "" && e.EventID <= viewStart {
+			continue
+		}
+		// Legacy window 只保留無 WorkspaceSessionID 的事件（post-WSID 事件已在
+		// 新 provider session 內）。
+		if e.WorkspaceSessionID != "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan events file: %w", err)
+	}
+	return out, nil
+}
+
 func (a *App) eventsPath() string { return filepath.Join(a.stateDir, "events.jsonl") }

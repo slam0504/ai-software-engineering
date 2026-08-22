@@ -617,3 +617,48 @@ func TestLegacyViewWindowWithEventsMigrated(t *testing.T) {
 		t.Fatalf("window 內有事件的 provider 必須遷移（且只有它）：%+v", live)
 	}
 }
+
+func TestScanLegacyWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	lines := []string{
+		`{"event_id":"e1","provider":"claude","kind":"message","text":"legacy-old"}`,
+		`{"event_id":"e2","provider":"claude","kind":"message","text":"legacy-in","workspace_session_id":""}`,
+		`{"event_id":"e3","provider":"claude","kind":"message","text":"post","workspace_session_id":"w1"}`,
+		`{"event_id":"e4","provider":"codex","kind":"message","text":"other"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := scanLegacyWindow(path, "claude", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].EventID != "e1" || got[1].EventID != "e2" {
+		t.Fatalf("只應取無 WSID 的 claude 事件：%+v", got)
+	}
+	if envs, err := scanLegacyWindow(filepath.Join(dir, "nope.jsonl"), "claude", ""); err != nil || envs != nil {
+		t.Fatalf("檔案不存在應回 (nil,nil)：%v %v", envs, err)
+	}
+	// scan error：darwin 上 os.Open(目錄) 會成功，錯誤在讀取時才出現
+	// （Scanner.Err()="is a directory"）——這條打的是 Scanner.Err() 分支。
+	if _, err := scanLegacyWindow(dir, "claude", ""); err == nil {
+		t.Fatal("目錄讀取失敗必須回 error，不得靜默回 nil")
+	}
+	// 真 open error（EACCES，非 NotExist）：spec §5a 凍結「開檔失敗→回 error」。
+	// 沒有這條的話，把 open 錯誤全當 NotExist 吞掉的 mutation 在整份測試存活——
+	// 而那正是 transcript-only 使用者被永久遷成空 entries 的路徑。subtest 內才
+	// skip：root 只失去這一段，不會把整個 TestScanLegacyWindow 標成 skipped。
+	t.Run("open_error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root 會繞過檔案權限，無法重現 open error")
+		}
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+		if _, err := scanLegacyWindow(path, "claude", ""); err == nil {
+			t.Fatal("open error（非 NotExist）必須回 error，不得當 NotExist 吞掉")
+		}
+	})
+}
