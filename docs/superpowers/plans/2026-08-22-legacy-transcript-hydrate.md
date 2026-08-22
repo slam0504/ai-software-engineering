@@ -11,6 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md`（commit d330c9d）
 
 **Plan 修訂記錄：**
+- rev3（2026-08-22，plan gate 新 P1）：darwin 上 `os.Open(目錄)` 會成功、錯誤到讀取才出現——原標成「open error」的目錄注入實際全走 `Scanner.Err()` 分支，真 open error（非 NotExist）無測試打到。Task 5／Task 6 改用 `chmod 0o000`（euid==0 skip，沿用 app_restore_dormant_test.go:190 前例）覆蓋 open 分支，三處註解措辭改與實際注入路徑相符；P2：Task 7 接線保留 `noteStartupBlocker` 並註明與 spec「warning」措辭的取捨；Self-Review 行號修正。
 - rev2（2026-08-22，plan review 4 P1）：Task 7 測試改用 `registryOnDisk` 取 Store（`newTestAppAt` 不接 `a.wsReg`，原寫法會 nil panic）；Task 6 改用真正 transcript-only fixture、經 `loadSessionRegistry` 驗證掃描錯誤不落 migrated marker＋修復後可重試；Task 4／7 補齊 spec §4／§8 凍結分支測試（零候選 marker、ViewStart 不精確相等、tombstone／provider 不算候選、scanner 錯誤不落 marker、已 backfilled 不重跑、persist 失敗全回滾、uncertain latch 枚舉表）；Task 8 納入 root package 的 `TurnsBefore` callers（`rebuild_orchestrator.go:302`、`app_replayindex_test.go:413`）避免 commit 後 build 壞掉；Task 10 fixture 改 pre-fix 形狀、經 `restoreSessions` 驗證 backfill 接線（同時涵蓋 startup wiring）。
 
 ## Global Constraints
@@ -428,8 +429,23 @@ func TestScanLegacyWindow(t *testing.T) {
 	if envs, err := scanLegacyWindow(filepath.Join(dir, "nope.jsonl"), "claude", ""); err != nil || envs != nil {
 		t.Fatalf("檔案不存在應回 (nil,nil)：%v %v", envs, err)
 	}
+	// scan error：darwin 上 os.Open(目錄) 會成功，錯誤在讀取時才出現
+	// （Scanner.Err()="is a directory"）——這條打的是 Scanner.Err() 分支。
 	if _, err := scanLegacyWindow(dir, "claude", ""); err == nil {
-		t.Fatal("開檔失敗必須回 error，不得靜默回 nil")
+		t.Fatal("目錄讀取失敗必須回 error，不得靜默回 nil")
+	}
+	// 真 open error（EACCES，非 NotExist）：spec §5a 凍結「開檔失敗→回 error」。
+	// 沒有這條的話，把 open 錯誤全當 NotExist 吞掉的 mutation 在整份測試存活——
+	// 而那正是 transcript-only 使用者被永久遷成空 entries 的路徑。
+	if os.Geteuid() == 0 {
+		t.Skip("root 會繞過檔案權限，無法重現 open error")
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	if _, err := scanLegacyWindow(path, "claude", ""); err == nil {
+		t.Fatal("open error（非 NotExist）必須回 error，不得當 NotExist 吞掉")
 	}
 }
 ```
@@ -496,6 +512,9 @@ func seedTranscriptOnlyLegacyFixture(t *testing.T) string {
 }
 
 func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 會繞過檔案權限，無法重現 open error")
+	}
 	dir := seedTranscriptOnlyLegacyFixture(t)
 	a := newTestAppAt(t, dir) // 先建 App（sink 要開得了原始 events.jsonl）再破壞檔案
 	events := filepath.Join(dir, "events.jsonl")
@@ -513,11 +532,9 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 			t.Fatalf("%s：掃描失敗不得寫入 entries：%d", phase, n)
 		}
 	}
-	// (1) open error：events.jsonl 換成目錄。
-	if err := os.Remove(events); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(events, 0o755); err != nil {
+	// (1) 真 open error（EACCES，非 NotExist）：darwin 上 os.Open(目錄) 會成功、
+	// 錯誤到讀取才出現，換目錄注入打不到 open 分支——用 chmod 0o000 才是 open error。
+	if err := os.Chmod(events, 0o000); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.restoreSessions(); err == nil {
@@ -525,6 +542,9 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 	}
 	assertNotMigrated("open error")
 	// (2) scan error：單行超過 scanner buffer 上限（16MiB）→ Scanner.Err()=ErrTooLong。
+	if err := os.Chmod(events, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(events); err != nil {
 		t.Fatal(err)
 	}
@@ -677,7 +697,9 @@ func TestBackfillLegacyTranscriptTombstoneNotCandidate(t *testing.T) {
 }
 
 // spec §4 凍結分支：scanner I/O 錯誤 → fail loud、marker 不落盤、entry 不動
-// （不得誤判成零候選——那會固化成永不重試）。
+// （不得誤判成零候選——那會固化成永不重試）。注入是目錄讀取失敗（走
+// Scanner.Err() 分支）；open error 分支由 Task 5／Task 6 的 chmod 0o000 覆蓋，
+// 兩者在 backfillLegacyTranscript 是同一條 error return。
 func TestBackfillLegacyTranscriptScanErrorKeepsMarkerClear(t *testing.T) {
 	dir := seedMigratedLegacyClaudeFixture(t)
 	a := newTestAppAt(t, dir)
@@ -737,7 +759,7 @@ Expected: FAIL — `a.backfillLegacyTranscript undefined`
 - [ ] **Step 3: Write minimal implementation**
 
 新增 `backfillLegacyTranscript`：`store.LegacyTranscriptBackfilled() || a.restore == nil` early return nil。對每個 `legacyProviders` 的 p：`re := a.restore.Get(p)`；`window, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)`，`werr != nil` return werr（不落 marker）；`len(window)==0` continue；掃 `store.Live()` 收集 `e.Provider==p && e.ViewStartEventID==re.ViewStartEventID` 的 WSID 到 `match`；`switch len(match)`：0 略過、1 加入 candidates、default `return fmt.Errorf(...多候選不猜...)`。最後 `return store.BackfillLegacyTranscript(candidates)`。
-接線 `loadSessionRegistry`：`backfillResumeFromLegacy(store)` 之後加 `if err := a.backfillLegacyTranscript(store); err != nil { a.noteStartupBlocker("...legacy transcript 標記補寫失敗..." + err.Error()) }`。
+接線 `loadSessionRegistry`：`backfillResumeFromLegacy(store)` 之後加 `if err := a.backfillLegacyTranscript(store); err != nil { a.noteStartupBlocker("...legacy transcript 標記補寫失敗..." + err.Error()) }`。（spec §4 寫「startup warning」；這裡沿用同類前例 `backfillResumeFromLegacy` 失敗的 `noteStartupBlocker`（app.go:1736）——blocker 只影響訊息排序、不阻擋啟動（app.go:1294-1316），spec 的「不阻擋啟動」語意不變，取排序優先讓使用者先看到。）
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1006,6 +1028,6 @@ git commit -m "test(app): legacy transcript 首次 hydrate 端對端＋同 provi
 - `Entry.LegacyTranscript`／`fileFormat.LegacyTranscriptBackfilled`／`Store.LegacyTranscriptBackfilled()`：Task 1 定義，Task 2/3/4/7/9 消費一致。
 - `LegacyEntry.HasLegacyTranscript`：Task 2 定義、Task 6 填入一致。
 
-**待實作時確認的既有型別**（不阻擋 plan）：`Entry.Provider` 為 `string`（store.go:69），Task 9 傳 `e.Provider` 不需轉型；`a.wsReg.Get(wsid)` 回 `(Entry, bool)`（app.go:1169）。
+**待實作時確認的既有型別**（不阻擋 plan）：`Entry.Provider` 為 `string`（store.go:69），Task 9 傳 `e.Provider` 不需轉型；`a.wsReg.Get(wsid)` 回 `(Entry, bool)`（`a.wsReg` 欄位 app.go:151、sessionRegistry interface app.go:676 起）。
 
 **整合審查點（owner 指定）**：Task 4–7 完成後做一次整合審查（schema→migrate→scanner→backfill→接線）；Task 8–9 完成後再做一次（hasOlder→合併→排序→cursor 早退）。
