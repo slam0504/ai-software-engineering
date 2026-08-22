@@ -961,3 +961,53 @@ func TestBackfillLegacyTranscriptIdempotentAfterMarker(t *testing.T) {
 		t.Fatalf("marker 已落盤應 early return、不重掃：%v", err)
 	}
 }
+
+// seedMigratedEmptyViewStartTwoClaudeFixture：restore.json 的 claude 快照
+// ViewStartEventID=""（首次啟動、events.jsonl 尚無內容時 freshEntries 的初始
+// 值——見 restore.go:56、137-141），events.jsonl 另有無 WSID 的 claude legacy
+// 事件；registry 已 migrated，兩個 claude live entry 的 ViewStartEventID 都
+// 是 ""——若不擋空字串比對，會被誤判成「同一個 boundary 有兩個候選」而卡死
+// （owner 否決的失效模式），本 fixture 用來重現那個形狀。
+func seedMigratedEmptyViewStartTwoClaudeFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: ""},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1", ViewStartEventID: ""},
+		wsregistry.Entry{WSID: "w2", Provider: "claude", CreatedAt: "t2", ViewStartEventID: ""})
+	return dir
+}
+
+// integration review 2026-08-22 Critical：條件 3 曾把空字串 ViewStart 當有效
+// 比對值，導致快照為 "" 的已遷移使用者永遠多候選 fail loud、marker 永不落
+// 盤（不會自癒）。guard（ViewStartEventID=="" 時該 provider 直接略過比對）
+// 修好後，這條必須回 nil、marker 落盤、兩個 entry 都不被標記。
+func TestBackfillLegacyTranscriptEmptyViewStartSkipsProvider(t *testing.T) {
+	dir := seedMigratedEmptyViewStartTwoClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatalf("空字串 ViewStart 無可信比對證據，必須略過（等同零候選），不得 fail loud：%v", err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("略過（零候選語意）仍應落 marker")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("空字串 ViewStart 不得被當成候選標記")
+		}
+	}
+}

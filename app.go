@@ -1779,6 +1779,19 @@ func (a *App) backfillResumeFromLegacy(store *wsregistry.Store) {
 // 空——沒有事件就沒有 transcript 好接，不構成候選）、(5) 每個 provider 恰有
 // 一個候選——0 個安全略過，2 個以上不猜、fail loud。
 //
+// 快照 ViewStartEventID 為空字串時，該 provider 直接略過比對（等同零候選，
+// 不落入五條件判定、也不掃描 events.jsonl）——空字串在這個系統代表「沒有
+// boundary」，不是一個可信的比對值：CreateSession 建 entry 時不設
+// ViewStartEventID（唯一寫入者是 ResetView），而首次啟動時若 events.jsonl
+// 為空，restore.json 快照會被 freshEntries(auditHighWatermark) 初始化成 ""
+// （restore.go:56、137-141）。放行空字串比對會讓「該 provider 目前沒有可信
+// boundary」被誤判成「找到了」：同快照為 "" 的多個 entry 會被誤判成多候選，
+// 使 marker 永遠卡在未落盤、每次啟動都重新 fail loud；若當下恰好只剩一筆
+// ViewStart="" 的 entry，則會把整段 pre-migration 歷史誤標給它——owner 已否
+// 決的失效模式。略過＝零候選是 §4 已接受的降級語意：無可信比對證據就不猜，
+// 該 provider 這次拿不到 legacy 標記，但不阻擋 marker 落盤（其他 provider
+// 仍照常判定）。
+//
 // 零候選（掃描成功、但沒有 entry 對得上任一 provider）仍視為「已完成一次檢
 // 查」，marker 照樣落盤：不落的話每次啟動都要重新掃一次 events.jsonl。
 //
@@ -1795,6 +1808,9 @@ func (a *App) backfillLegacyTranscript(store *wsregistry.Store) error {
 	var candidates []string
 	for _, p := range legacyProviders {
 		re := a.restore.Get(p)
+		if re.ViewStartEventID == "" {
+			continue // 無可信 boundary，不猜（見上方 doc）——guard 放在掃描之前，省一次全檔掃描
+		}
 		window, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
 		if werr != nil {
 			return werr

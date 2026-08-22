@@ -80,6 +80,19 @@ entry，尋找候選 WSID entry，**五條件同時成立**才算候選：
    **WorkspaceSessionID==""** 的事件至少一筆）；
 5. 每個 provider **恰好一個候選**。
 
+**guard（integration review 2026-08-22 Critical）**：restore entry 的
+`ViewStartEventID` 為空字串時，該 provider **直接略過**條件 3 的比對（等同零
+候選，不進入掃描與判定）——空字串在這個系統代表「沒有 boundary」，不是一個
+可信的比對值：`CreateSession` 建 entry 時不設 `ViewStartEventID`（唯一寫入者
+是 `ResetView`），而首次啟動時若 `events.jsonl` 為空，restore.json 快照會被
+`freshEntries(auditHighWatermark)` 初始化成 `""`（`restore.go:56、137-141`）。
+放行空字串比對，會把「該 provider 目前沒有可信 boundary」誤判成「找到了」：
+同快照為 `""` 的多個 entry 會被誤判成多候選，導致 marker 永遠卡在未落盤、每
+次啟動都重新 fail loud（不會自癒）；若當下恰好只剩一筆 `ViewStartEventID=""`
+的 entry，則會把整段 pre-migration 歷史誤標給它——owner 已否決的失效模式。
+略過＝零候選是本節已定義的降級語意：無可信比對證據就不猜，該 provider 這次
+拿不到 legacy 標記，其他 provider 與 marker 落盤不受影響。
+
 處置：
 - **恰一候選** → 標記該 entry `LegacyTranscript=true`。
 - **零候選** → 該 provider 無待補（已 NewSession 前移 boundary／已移除／本就無
