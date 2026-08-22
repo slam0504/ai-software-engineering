@@ -43,8 +43,17 @@ provider 歷史），與 post-migration 的新 turn 正確合併、排序、去�
 - file-level `LegacyTranscriptBackfilled bool`（json `legacy_transcript_backfilled`）：
   §4 的一次性 backfill 是否已完成（與 `ResumeBackfilled` 並列）。
 
-`Migrate`（migrate.go）：產生 legacy entry 時設 `LegacyTranscript=true`（三者皆空
-不遷移的既有語意不變）。
+`Migrate`（migrate.go）：**只依 App 掃描得到的 `HasLegacyTranscript` 設 flag**，
+不是「非空 entry 一律設 true」（reviewer 2026-08-22 P2）。`LegacyEntry` 增加
+`HasLegacyTranscript bool` 欄位，由 App 的 `legacyEntries()` 填入（它本就已用
+legacy window 是否非空判斷要不要遷移，見 app.go:1282，資訊現成）。`Migrate` 對
+每個遷移的 entry 設 `LegacyTranscript = le.HasLegacyTranscript`。
+
+**理由**：`LegacyTranscript=true` 的語意是「此 entry 確實擁有可顯示的舊 transcript」。
+migration 允許只有 resume identity／task label、**沒有 legacy window** 的 entry
+（migrate.go:67 只排除三者皆空）——那種 entry 不該設 flag，否則首載會對空 window
+觸發合併邏輯、語意不符。reverse 測試：resume-only／task-only entry 的
+`LegacyTranscript==false`。
 
 ## 4. 一次性 backfill（app startup，沿用 `backfillResumeFromLegacy` 附近）
 
@@ -69,35 +78,74 @@ entry，尋找候選 WSID entry，**五條件同時成立**才算候選：
 - **多候選** → **不猜、fail loud、marker 不落盤**（回錯，啟動期記 startup warning，
   不阻擋啟動其餘部分；下次啟動可重試）。
 
+**I/O 錯誤不得誤判成零候選**（reviewer 2026-08-22 P1）：條件 4 的 legacy window
+掃描**不得**用 `replayViewWindow`——它開檔失敗回 nil、且不檢查 `Scanner.Err()`
+（restore.go:167），暫時性讀取錯誤會被固化成「零候選 → 落 marker → 永不重試」。
+凍結一個 **error-returning legacy scanner**（見 §5a）：開檔失敗／scan 錯誤 → 回
+error、**不改任何 entry、不落 marker、fail loud**；只有掃描成功、確定零候選才
+落 marker。
+
 所有 entry 標記 + file-level `LegacyTranscriptBackfilled=true` **同一次持久化交易**
 寫入（沿用 `MarkResumeBackfilled` 的原子＋回滾模式）；persist 失敗則全部回滾、
 marker 不落盤。
 
 ## 5. 合併載入（`loadTurnsBefore`，rebuild_orchestrator.go）
 
-僅在**首次 hydrate**（`beforeEventID==""`，尾端視窗）合併 legacy window：
+**legacy window 只在「最舊 WSID turn 所在的那一頁」前綴**（reviewer 2026-08-22
+P1）——不論那頁是首載還是向上分頁。原設計「首載就前綴」有致命 bug：前端以
+timeline 第一筆（會是 legacy event）當下一頁 cursor（session.ts:450），replay index
+查不到 legacy cursor 會回空（index.go 的 `cut<=0`），導致比 20 更舊的 post-migration
+turn 永遠載不到。
+
+規則（`entry.LegacyTranscript==true` 時）：
 
 ```
-if entry.LegacyTranscript && beforeEventID == "" {
-    legacy := replayViewWindow(eventsPath, provider, entry.ViewStartEventID)
-             |> filter WorkspaceSessionID == ""   // 只取 pre-migration 無 WSID 事件
-    out = legacy ++ out    // legacy 較舊、排在 WSID turn 事件之前
+recs, hasOlder := replayIndex.TurnsBefore(wsid, beforeEventID, n)   // hasOlder：此頁之後還有更舊 WSID turn 嗎
+out := envelopes(recs) ++ (若首載) open-turn tail
+if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前綴 legacy
+    legacy, err := scanLegacyWindow(eventsPath, provider, entry.ViewStartEventID)  // §5a，只取無 WSID
+    if err != nil { return nil, err }         // I/O 錯誤 fail loud，不靜默少給
+    out = legacy ++ out
 }
 ```
 
+- `beforeEventID==""` 且 `hasOlder==false`（WSID turn 不滿 n）→ 首載即前綴 legacy。
+- `beforeEventID==""` 且 `hasOlder==true`（WSID turn 超過 n）→ 首載**不**前綴；正常
+  分頁到最舊 turn 頁時（`hasOlder==false`）才前綴。
+- `beforeEventID` 是 legacy event id → `TurnsBefore` `cut<=0` 回空、`hasOlder==false`
+  但**該頁 recs 為空且 cursor 不是 WSID turn** → 回空、**不**再前綴（legacy 已於
+  最舊 turn 頁給過）。判準：只有「cursor=="" 或 cursor 命中某 WSID turn」的頁才可能
+  前綴 legacy；cursor 非 WSID turn（含 legacy id）一律回空、不前綴。
+
+**replay index 的 hasOlder**：`TurnsBefore` 增加回傳「此頁之後是否還有更舊 turn」
+（實作可由 `len(all[:cut]) > n` 或 `len(all) > n` 判定；plan 定確切簽章）。這是本
+設計對 index 的唯一介面新增。
+
 **資料正確性**：
-- **去重**：legacy window 只取 `WorkspaceSessionID==""`。`replayViewWindow` 按
-  provider 過濾、不看 WSID——若不濾，post-migration 的同 provider WSID 事件會被
-  抓到、與 turn index 結果重複。濾掉有 WSID 的即可，因為那些已由 turn index 涵蓋。
-- **排序**：legacy 事件 event_id 遞增、且全部早於任何 post-migration turn（migration
-  之後才產生帶 WSID 的事件），故 `legacy ++ out` 維持全域 event 順序。
-- **view boundary**：legacy window 用 `entry.ViewStartEventID` 過濾（boundary 之後）；
-  與 WSID turn 的 boundary 過濾（`loadTurnsBefore` 既有 `viewStart` 邏輯）一致。
-- **20-turn 契約**：20 指 WSID turn record 數（既有語意不變）；legacy 是額外的一次性
-  前綴，不佔 20 個 turn 額度、不分頁。
-- **cursor 分頁**：`beforeEventID != ""` 時**不回** legacy（legacy 只在首載出現一次）；
-  cursor 到 WSID 最舊 turn 後回空，不跨進 legacy。前端 `loadOlder` 的 event_id 去重
-  仍是第二道防線。
+- **去重**：legacy window 只取 `WorkspaceSessionID==""`（§5a）。post-migration 的
+  同 provider WSID 事件已由 turn index 涵蓋，濾掉避免重複。
+- **排序（正式保證，非假設）**：合併後**依 event_id 遞增排序**作為最終保證。legacy
+  事件 event_id 皆早於任何 post-migration turn（migration 一次性、之後才寫 WSID
+  事件），`legacy ++ out` 已維持順序；排序是防禦性最終保證，不純依賴此時序假設。
+- **view boundary**：legacy window 用 `entry.ViewStartEventID` 過濾（boundary 之後），
+  與 WSID turn 的既有 `viewStart` 過濾一致。
+- **20-turn 契約**：20 指 WSID turn record 數（既有語意不變）；legacy 是最舊 turn 頁的
+  一次性前綴，不佔 turn 額度、自身不做 turn-level 分頁。
+- **前端停止條件**：最舊 turn 頁前綴 legacy 後，前端下次 loadOlder 以 legacy id 當
+  cursor → 回空 → 停（session.ts loadOlder 對空結果 return）。
+
+## 5a. error-returning legacy scanner（`scanLegacyWindow`）
+
+新增 `scanLegacyWindow(eventsPath, provider, viewStart) ([]contract.Envelope, error)`，
+供 §4 backfill 與 §5 合併載入**共用**（兩處都必須正確處理 I/O 錯誤）：
+
+- 語意同 `replayViewWindow`（provider 相符、event_id > viewStart、排除 workspace／
+  spec_assist scope），**額外只保留 `WorkspaceSessionID==""`**（pre-migration）。
+- 開檔失敗（非 `os.IsNotExist`）→ 回 error。檔案不存在 → 回 `(nil, nil)`（全新
+  workspace，非錯誤）。
+- 掃描結束檢查 `Scanner.Err()`，非 nil → 回 error（修 restore.go:167 既有缺口的
+  同類問題；`replayViewWindow` 本身保留不動，僅 RestoreViews 用）。
+- malformed 單行跳過不中斷（同既有語意）。
 
 ## 6. 標記清除（前移 boundary 的同一交易）
 
@@ -114,10 +162,11 @@ startup:
                       → backfillResumeFromLegacy（既有）
                       → backfillLegacyTranscript（§4，新增；restore.json 快照精確比對）
 
-hydrate（首次）:
-  frontend pin() → LoadTurnsBefore(wsid,"",20)
-                 → loadTurnsBefore：WSID turn index 事件
-                   ＋（若 entry.LegacyTranscript）legacy window（無 WSID、boundary 後）前綴
+hydrate（首次＋向上分頁）:
+  frontend pin()/loadOlder → LoadTurnsBefore(wsid, cursor, 20)
+                 → loadTurnsBefore：WSID turn index 事件（cursor 分頁）
+                   ＋（若 entry.LegacyTranscript 且此頁為最舊 turn 頁 hasOlder==false）
+                     legacy window（無 WSID、boundary 後）前綴、依 event_id 排序
 
 前移 boundary:
   NewSession/ResetView → ResetView(wsid, 高水位) 同交易清 LegacyTranscript
@@ -128,8 +177,8 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 ## 8. 測試策略（TDD）
 
 **wsregistry（unit）**：
-- `Migrate` 對 legacy entry 設 `LegacyTranscript=true`；三者皆空的 provider 不建、
-  不設標記。
+- `Migrate` 依 `LegacyEntry.HasLegacyTranscript` 設 flag：有 legacy window → true；
+  **resume-only／task-only（無 window）→ false**（反向）；三者皆空不建。
 - schema：舊檔（無 `legacy_transcript`／`legacy_transcript_backfilled`）載入預設
   false；round-trip 保留。
 - `ResetView` 清除 `LegacyTranscript`（同一寫入）。
@@ -137,18 +186,23 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 **backfill（app，in-process）**：
 - 五條件精確比對：ViewStart 精確相等（差一字元不算候選）、boundary 後有無 WSID
   legacy window 才算、tombstone 不算、provider 對應。
-- 零候選 → marker 落盤、entry 不動。
+- 零候選（掃描成功）→ marker 落盤、entry 不動。
 - 多候選 → fail loud、marker **不**落盤、entry 不動、可重試。
+- **scanner I/O 錯誤（open error／scan error）→ fail loud、marker 不落盤、entry
+  不動、可重試**（不得誤判成零候選）。
 - 冪等：`LegacyTranscriptBackfilled==true` 後不再跑。
 - 同交易原子性：persist 失敗 → entry 標記與 marker 全回滾。
 
 **loadTurnsBefore（app）**：
-- legacy WSID 首載：回「legacy window（無 WSID、boundary 後）＋ WSID turn」，順序
-  正確、無重複。
+- legacy WSID 首載（WSID turn ≤ 20）：回「legacy window（無 WSID、boundary 後）＋
+  WSID turn」，依 event_id 排序、無重複。
+- **跨頁分頁（legacy + 25 turns，reviewer 2026-08-22 P1）**：首載回最新 20 turn
+  （**不**含 legacy，因 hasOlder）；第二頁 cursor=turn6 → 回 turns 1–5 ＋ legacy
+  前綴（最舊 turn 頁）；第三頁 cursor=legacy id → 回空、停。驗「turns 1–5 不會遺失」。
 - 去重：post-migration 同 provider 的 WSID 事件不因 legacy window 重複出現。
-- 非 legacy WSID（`LegacyTranscript==false`）：首載不含任何無 WSID 事件（反向）。
-- cursor 分頁（`beforeEventID!=""`）不回 legacy。
-- view boundary：boundary 之後才回；前移 boundary（清標記）後首載不再含 legacy。
+- 非 legacy WSID（`LegacyTranscript==false`）：任何頁都不含無 WSID 事件（反向）。
+- scanner I/O 錯誤 → loadTurnsBefore 回 error（不靜默少給 legacy）。
+- view boundary：boundary 之後才回；前移 boundary（清標記）後不再含 legacy。
 - 20-turn：legacy 不佔 turn 額度。
 
 **既有契約不破**：
@@ -168,9 +222,8 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 - **legacy window 的量**：受 `ViewStartEventID` boundary 限制（通常是最後一次開新
   對話後的一段），非整個 provider 歷史；首載一次全給可接受。若某使用者 boundary
   極早導致 window 巨大，首載會偏重——列為已知邊界，不在本票處理分頁。
-- **event 順序假設**：所有 legacy（無 WSID）事件 event_id 皆早於任何 post-migration
-  （有 WSID）事件。migration 是一次性、在所有 legacy 事件之後才開始寫 WSID 事件，
-  故成立；實作以 event_id 遞增排序為最終保證，不純依賴此假設。
+- （event 順序不再列為待驗證假設——§5 已把「合併後依 event_id 遞增排序」定為正式
+  演算法保證，不依賴時序假設。）
 
 ## 10. 風險與相容性
 
