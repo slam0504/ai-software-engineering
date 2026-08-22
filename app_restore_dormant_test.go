@@ -754,3 +754,210 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 		t.Fatal("重試成功後 migrated marker 應落盤")
 	}
 }
+
+// seedMigratedLegacyClaudeFixture：已遷移的 stateDir——events.jsonl 有
+// claude 無 WSID 事件（event_id > restore.json 的 ViewStartEventID="ev-0"）；
+// workspace-sessions.json 已 migrated、一個 claude live entry
+// ViewStartEventID="ev-0"（唯一候選）、一個 codex live entry 同樣
+// ViewStartEventID="ev-0"（但 events.jsonl 無 codex legacy 事件——provider
+// 條件的反例：ViewStart 相同也不構成候選），兩者皆無 legacy_transcript、
+// legacy_transcript_backfilled=false。
+func seedMigratedLegacyClaudeFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: "ev-0"},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1", ViewStartEventID: "ev-0"},
+		wsregistry.Entry{WSID: "w2", Provider: "codex", CreatedAt: "t2", ViewStartEventID: "ev-0"})
+	return dir
+}
+
+// seedMigratedLegacyClaudeFixtureViewStart：同 seedMigratedLegacyClaudeFixture
+// （無 codex entry），但 claude entry 的 ViewStartEventID=vs——與 restore.json
+// 快照的 "ev-0" 不同，驗證 ViewStart 必須精確相等（差一字元即不算候選）。
+func seedMigratedLegacyClaudeFixtureViewStart(t *testing.T, vs string) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: "ev-0"},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1", ViewStartEventID: vs})
+	return dir
+}
+
+// seedMigratedTwoClaudeFixture：同 seedMigratedLegacyClaudeFixture（無 codex
+// entry），但兩個 claude live entry 的 ViewStartEventID 都="ev-0"——多候選。
+func seedMigratedTwoClaudeFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: "ev-0"},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1", ViewStartEventID: "ev-0"},
+		wsregistry.Entry{WSID: "w2", Provider: "claude", CreatedAt: "t2", ViewStartEventID: "ev-0"})
+	return dir
+}
+
+func TestBackfillLegacyTranscriptMultiCandidateFailsLoud(t *testing.T) {
+	dir := seedMigratedTwoClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err == nil {
+		t.Fatal("多候選必須 fail loud")
+	}
+	if store.LegacyTranscriptBackfilled() {
+		t.Fatal("多候選時 marker 不得落盤（可重試）")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("多候選時任何 entry 都不得被標記")
+		}
+	}
+}
+
+func TestBackfillLegacyTranscriptSingleCandidate(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatal(err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("成功後 marker 應落盤")
+	}
+	var flagged []wsregistry.Entry
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			flagged = append(flagged, e)
+		}
+	}
+	// fixture 內同 ViewStart 的 codex entry 存在但 events.jsonl 無 codex legacy
+	// 事件——恰標記一個且是 claude，同時證明 provider 條件。
+	if len(flagged) != 1 || flagged[0].Provider != "claude" {
+		t.Fatalf("恰一候選應標記一個 claude entry：%+v", flagged)
+	}
+}
+
+// spec §4 凍結分支：ViewStart 不精確相等（差一字元）不算候選 → 零候選 →
+// marker 落盤、entry 不動（安全略過，不是錯誤）。
+func TestBackfillLegacyTranscriptViewStartMismatchIsZeroCandidate(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixtureViewStart(t, "ev-0x") // registry=ev-0x、restore.json=ev-0
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatal(err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("零候選（掃描成功）仍應落 marker")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("ViewStart 不精確相等不得標記")
+		}
+	}
+}
+
+// spec §4 凍結分支：tombstone 不算候選——同 ViewStart 的第二個 claude entry
+// 已 Remove 時不構成多候選，live 那個照常標記。
+func TestBackfillLegacyTranscriptTombstoneNotCandidate(t *testing.T) {
+	dir := seedMigratedTwoClaudeFixture(t)
+	reg := registryOnDisk(t, dir)
+	tomb := reg.Live()[1].WSID
+	if err := reg.Remove(tomb, "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppAt(t, dir)
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatalf("tombstone 排除後應為恰一候選：%v", err)
+	}
+	if !store.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 應落盤")
+	}
+}
+
+// spec §4 凍結分支：scanner I/O 錯誤 → fail loud、marker 不落盤、entry 不動
+// （不得誤判成零候選——那會固化成永不重試）。注入是目錄讀取失敗（走
+// Scanner.Err() 分支）；open error 分支由 Task 5／Task 6 的 chmod 0o000 覆蓋，
+// 兩者在 backfillLegacyTranscript 是同一條 error return。
+func TestBackfillLegacyTranscriptScanErrorKeepsMarkerClear(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err == nil {
+		t.Fatal("scan error 必須 fail loud，不得當零候選")
+	}
+	if store.LegacyTranscriptBackfilled() {
+		t.Fatal("scan error 時 marker 不得落盤（可重試）")
+	}
+	for _, e := range store.Live() {
+		if e.LegacyTranscript {
+			t.Fatal("scan error 時 entry 不得被標記")
+		}
+	}
+}
+
+// spec §4 凍結分支：冪等——marker 已落盤後整段跳過（events.jsonl 已破壞仍
+// 不回錯，證明沒有重新掃描）。
+func TestBackfillLegacyTranscriptIdempotentAfterMarker(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	if err := registryOnDisk(t, dir).BackfillLegacyTranscript(nil); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := registryOnDisk(t, dir)
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		t.Fatalf("marker 已落盤應 early return、不重掃：%v", err)
+	}
+}

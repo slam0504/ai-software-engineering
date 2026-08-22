@@ -1697,6 +1697,13 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	// Manager slot 與 registry live entry，兩邊此刻才都就位（Pass 2 剛還原完）。
 	// 它本身不是「載入序列的一部分」，失敗不阻擋啟動——見函式 doc。
 	a.backfillResumeFromLegacy(store)
+	// legacy transcript 補寫同理不阻擋啟動：找不到唯一候選只代表使用者捲到底
+	// 看不到 legacy 對話那段，不是資料完整性問題（events.jsonl 稽核歷史不受
+	// 影響）。noteStartupBlocker 沿用 backfillResumeFromLegacy 失敗的前例——
+	// blocker 只影響訊息排序，不阻擋啟動（見 noteStartupBlocker doc）。
+	if err := a.backfillLegacyTranscript(store); err != nil {
+		a.noteStartupBlocker("session registry: legacy transcript 標記補寫失敗（部分舊對話捲動到底時可能看不到更早的歷史訊息）：" + err.Error())
+	}
 	return restorable, nil
 }
 
@@ -1759,6 +1766,59 @@ func (a *App) backfillResumeFromLegacy(store *wsregistry.Store) {
 			a.audit("restore_clear_failed", map[string]any{"provider": p, "error": err.Error()})
 		}
 	}
+}
+
+// backfillLegacyTranscript：legacy transcript 的一次性補寫——用 restore.json
+// 快照對每個 legacy provider 精確比對五條件，找出恰好一個候選 WSID 後標記
+// LegacyTranscript=true（讓 hydrate 之後知道哪個 entry 要接 legacy 對話）。
+//
+// 五條件：(1) live（tombstone 不算候選——Live() 本身已排除）、(2) provider
+// 與掃描的 provider 相同、(3) entry 的 ViewStartEventID 與 restore.json 該
+// provider 的快照**精確相等**（差一字元即不算，不做前綴／模糊比對）、(4) 該
+// provider 在此 boundary 之後確有無 WSID 的 legacy 事件（scanLegacyWindow 非
+// 空——沒有事件就沒有 transcript 好接，不構成候選）、(5) 每個 provider 恰有
+// 一個候選——0 個安全略過，2 個以上不猜、fail loud。
+//
+// 零候選（掃描成功、但沒有 entry 對得上任一 provider）仍視為「已完成一次檢
+// 查」，marker 照樣落盤：不落的話每次啟動都要重新掃一次 events.jsonl。
+//
+// scan error 與多候選都必須 fail loud、marker 不落盤（可重試、不占用單向
+// marker 的唯一一次機會）——兩者都不能被誤判成「零候選」，那會把「這次讀
+// 不到」或「猜不出來」固化成「永遠沒有」。
+//
+// 冪等：LegacyTranscriptBackfilled() 為 true 時 early return，不重掃
+// events.jsonl（見 TestBackfillLegacyTranscriptIdempotentAfterMarker）。
+func (a *App) backfillLegacyTranscript(store *wsregistry.Store) error {
+	if store.LegacyTranscriptBackfilled() || a.restore == nil {
+		return nil
+	}
+	var candidates []string
+	for _, p := range legacyProviders {
+		re := a.restore.Get(p)
+		window, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
+		if werr != nil {
+			return werr
+		}
+		if len(window) == 0 {
+			continue
+		}
+		var match []string
+		for _, e := range store.Live() {
+			if e.Provider == p && e.ViewStartEventID == re.ViewStartEventID {
+				match = append(match, e.WSID)
+			}
+		}
+		switch len(match) {
+		case 0:
+			continue
+		case 1:
+			candidates = append(candidates, match[0])
+		default:
+			return fmt.Errorf("legacy transcript backfill: provider %s 有 %d 個候選 entry "+
+				"view_start_event_id=%q，不猜：%v", p, len(match), re.ViewStartEventID, match)
+		}
+	}
+	return store.BackfillLegacyTranscript(candidates)
 }
 
 // markIndexUnverified：把 replay index 切到 unverified latch（寫入端停手，見
