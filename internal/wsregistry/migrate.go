@@ -9,9 +9,10 @@ import (
 // Migrate。轉換（讀 restore.json → map[string]LegacyEntry）由呼叫端負責
 // （Task 6），本檔不碰檔案。
 type LegacyEntry struct {
-	ViewStartEventID string
-	ResumeSessionID  string
-	TaskID           string
+	ViewStartEventID    string
+	ResumeSessionID     string
+	TaskID              string
+	HasLegacyTranscript bool
 }
 
 // providerMigrationOrder：決定性走訪順序（spec §3.2.5）——map 迭代順序不
@@ -73,6 +74,7 @@ func Migrate(s *Store, legacy map[string]LegacyEntry, newWSID func() string) ([]
 			ResumeSessionID:  le.ResumeSessionID,
 			TaskLabel:        le.TaskID,
 			ViewStartEventID: le.ViewStartEventID,
+			LegacyTranscript: le.HasLegacyTranscript,
 			CreatedAt:        now,
 		})
 	}

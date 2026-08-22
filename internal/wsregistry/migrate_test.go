@@ -108,7 +108,7 @@ func TestMigrateRefusesWhenLiveEntriesExistWithoutMarker(t *testing.T) {
 
 // TestMigrateRefusesWhenOnlyTombstonesExistWithoutMarker：guard 用
 // entryCount()（含 tombstone）而非 Live()（排除 tombstone）的原因
-//（coordinator 追加裁決）。registry 只剩 tombstone、沒有 live entry 時，
+// （coordinator 追加裁決）。registry 只剩 tombstone、沒有 live entry 時，
 // Live() 回空——若 guard 只看 Live()，這個狀態會被誤判成「registry 是空
 // 的」而放行遷移，MarkMigrated 的整批取代就會把 tombstone 無聲丟棄，等於
 // 打開 §3.6.1 tombstone 機制要防的「已移除 session 復活」的洞。
@@ -169,5 +169,32 @@ func TestMigrateDeterministicOrderAcrossProviders(t *testing.T) {
 	}
 	if out[1].Provider != "codex" || out[1].WSID != "w-b" {
 		t.Fatalf("第二筆必須是 codex／w-b（決定性順序）：%+v", out[1])
+	}
+}
+
+func TestMigrateSetsLegacyTranscriptFlag(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+		"codex":  {ResumeSessionID: "sess-x", HasLegacyTranscript: false},
+	}
+	n := 0
+	out, err := Migrate(s, legacy, func() string { n++; return fmt.Sprintf("w%d", n) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	byProv := map[string]Entry{}
+	for _, e := range out {
+		byProv[e.Provider] = e
+	}
+	if !byProv["claude"].LegacyTranscript {
+		t.Fatal("有 legacy window 的 entry 應設 LegacyTranscript=true")
+	}
+	if byProv["codex"].LegacyTranscript {
+		t.Fatal("resume-only（無 window）的 entry 不得設 LegacyTranscript")
 	}
 }
