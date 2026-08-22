@@ -286,7 +286,7 @@ func TestPutAndDeleteUncommittedRefuseTombstonedEntry(t *testing.T) {
 
 // TestOpenRejectsUnsupportedSchemaVersionButAcceptsMissing（review round 3，
 // I-3 NOT ADDRESSED 修正）：非目前 schemaVersion 的檔案必須拒絕載入
-//（防的是靜默資料遺失——不擋的話下次任何寫入會把 version 蓋回目前值並
+// （防的是靜默資料遺失——不擋的話下次任何寫入會把 version 蓋回目前值並
 // 落盤）；schema_version 缺欄位（值為 0）視為舊檔，必須維持既有接受行為，
 // 否則之後有人「順手」把 != 0 的判斷拿掉不會被任何測試發現。
 func TestOpenRejectsUnsupportedSchemaVersionButAcceptsMissing(t *testing.T) {
@@ -364,5 +364,25 @@ func TestLiveIsSortedByCreatedAtThenWSID(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("Live() 順序錯誤：got %v want %v", got, want)
 		}
+	}
+}
+
+func TestLegacyTranscriptSchemaRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workspace-sessions.json")
+	old := `{"schema_version":2,"entries":{"w1":{"wsid":"w1","provider":"claude"}},"migrated":true}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.LegacyTranscriptBackfilled() {
+		t.Fatal("舊檔缺 marker 應預設 false")
+	}
+	e, _ := s.Get("w1")
+	if e.LegacyTranscript {
+		t.Fatal("舊 entry 缺欄位應預設 false")
 	}
 }

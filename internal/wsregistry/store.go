@@ -70,6 +70,7 @@ type Entry struct {
 	ResumeSessionID  string `json:"resume_session_id"`
 	TaskLabel        string `json:"task_label"`
 	ViewStartEventID string `json:"view_start_event_id"`
+	LegacyTranscript bool   `json:"legacy_transcript"`
 	CreatedAt        string `json:"created_at"`
 	RemovedAt        string `json:"removed_at"`
 	RemoveReason     string `json:"remove_reason"`
@@ -87,11 +88,12 @@ type Layout struct {
 // false，正是「還沒 backfill 過」的正確語意；舊 build 讀新檔會忽略它，最壞情況
 // 是再跑一次 backfill，而 BackfillResume 只填空值，重跑無副作用。
 type fileFormat struct {
-	SchemaVersion    int              `json:"schema_version"`
-	Entries          map[string]Entry `json:"entries"`
-	Layout           Layout           `json:"layout"`
-	Migrated         bool             `json:"migrated"`
-	ResumeBackfilled bool             `json:"resume_backfilled"`
+	SchemaVersion              int              `json:"schema_version"`
+	Entries                    map[string]Entry `json:"entries"`
+	Layout                     Layout           `json:"layout"`
+	Migrated                   bool             `json:"migrated"`
+	ResumeBackfilled           bool             `json:"resume_backfilled"`
+	LegacyTranscriptBackfilled bool             `json:"legacy_transcript_backfilled"`
 }
 
 // Store：workspace-sessions.json 的唯一 ownership（單一 mutex；temp file +
@@ -414,6 +416,13 @@ func (s *Store) ResumeBackfilled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.file.ResumeBackfilled
+}
+
+// LegacyTranscriptBackfilled：是否已完成 legacy transcript 的一次性補寫。
+func (s *Store) LegacyTranscriptBackfilled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.file.LegacyTranscriptBackfilled
 }
 
 // BackfillResume：升級補寫（D2）——把既有 build 留在 provider-keyed restore.json
