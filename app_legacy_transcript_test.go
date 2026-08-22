@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
@@ -190,4 +193,196 @@ func TestLoadTurnsBeforeFirstLoadPrefixesLegacyWhenFewTurns(t *testing.T) {
 		t.Fatal("legacy（無 WSID）應排在最前")
 	}
 	assertAllTurnsPresent(t, got, 5)
+}
+
+// seedPreFixMigratedTwoSessionApp：Task 10 端對端 fixture——**pre-fix 形狀**：
+// registry 以 seedRegistry（MarkMigrated）寫入，天然不帶任何 legacy_transcript
+// 標記／marker，模擬既有升級使用者重啟當下的磁碟狀態（migration 早已在舊 build
+// 跑過，這個 build 才新增 backfill 這一段）。events.jsonl 依序：無 WSID 的
+// legacy window → w1 的 WSID turn（5 個，< 20，讓首載即最舊 turn 頁）→ w2 的
+// WSID turn。
+//
+// boundary 沿用 Task 9 helper 的手法（見 seedLegacyTranscriptFixtureApp 上方
+// 註解）：固定用 "00" 開頭的字串而非任意標籤（如 "ev-0"）——crockford 字元集
+// 無小寫，年份 2026 下 emitCompleteTurn 產生的真實 ULID 恆以 "01" 開頭，"00"
+// 前綴保證字典序小於任何真實 turn 事件 id，view boundary 過濾（
+// rec.FirstEventID <= viewStart）才不會誤傷真實 turn。
+//
+// w1 的 ViewStartEventID 與 restore.json 的 claude 快照精確相等（backfill 五
+// 條件的候選）；w2 的 ViewStartEventID 是「後建高水位」——建立 w2 之前那一刻
+// 的 events.jsonl 高水位（真實 ULID，必然不等於快照），因此 w2 不成候選，backfill
+// 只會標記 w1（同 provider 第二個 session 不誤接）。
+func seedPreFixMigratedTwoSessionApp(t *testing.T) *App {
+	t.Helper()
+	dir := t.TempDir()
+	const viewStart = "0000000000"
+
+	seedEvents(t, dir,
+		`{"event_id":"0000000001","provider":"claude","kind":"message","role":"user","text":"legacy-hi"}`,
+		`{"event_id":"0000000002","provider":"claude","kind":"delta","role":"assistant","text":"legacy-ok"}`,
+		`{"event_id":"0000000003","provider":"claude","kind":"result"}`)
+
+	restoreJSON, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: viewStart},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), restoreJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestAppAt(t, dir)
+	w1 := dormantWSID(t, a, "w1", contract.ProviderClaude)
+	for i := 0; i < 5; i++ {
+		emitCompleteTurn(t, a, w1, fmt.Sprintf("w1-turn-%02d", i))
+	}
+	w2ViewStart := auditHighWatermark(a.eventsPath())
+	w2 := dormantWSID(t, a, "w2", contract.ProviderClaude)
+	emitCompleteTurn(t, a, w2, "w2-turn")
+
+	seedRegistry(t, dir,
+		wsregistry.Entry{WSID: "w1", Provider: "claude", CreatedAt: "t1", ViewStartEventID: viewStart},
+		wsregistry.Entry{WSID: "w2", Provider: "claude", CreatedAt: "t2", ViewStartEventID: w2ViewStart},
+	)
+	return a
+}
+
+// TestLegacyTranscriptEndToEndHydrate：spec §8 端對端案例——pre-fix 形狀的
+// fixture 經 restoreSessions() 讓 loadSessionRegistry → backfillLegacyTranscript
+// 真正接線跑過，才驗證 hydrate 可見＋同 provider 第二個 session 不誤接。
+func TestLegacyTranscriptEndToEndHydrate(t *testing.T) {
+	a := seedPreFixMigratedTwoSessionApp(t)
+	live, err := a.restoreSessions() // → loadSessionRegistry → backfillLegacyTranscript
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 2 {
+		t.Fatalf("fixture 應還原兩個 claude session：%+v", live)
+	}
+	// startup wiring 生效的證據：marker 落盤、恰 w1 被標記（w2 ViewStart 不同、
+	// 非候選——五條件比對在真實接線下成立）。
+	reg := registryOnDisk(t, a.stateDir)
+	if !reg.LegacyTranscriptBackfilled() {
+		t.Fatal("loadSessionRegistry 必須接到 backfillLegacyTranscript（marker 未落盤＝沒接線）")
+	}
+	if e, _ := reg.Get("w1"); !e.LegacyTranscript {
+		t.Fatal("backfill 應標記 legacy 的 w1")
+	}
+	if e, _ := reg.Get("w2"); e.LegacyTranscript {
+		t.Fatal("後建的 w2 不得被標記")
+	}
+	p1, err := a.LoadTurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLegacyText(p1) {
+		t.Fatal("legacy WSID 首次 hydrate 必須顯示舊 transcript")
+	}
+	p2, err := a.LoadTurnsBefore("w2", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range p2 {
+		if e.WorkspaceSessionID == "" {
+			t.Fatal("同 provider 的第二個 session 不得誤接 legacy 舊歷史（owner 否決推導的核心風險）")
+		}
+	}
+}
+
+// TestLoadTurnsBeforeScanErrorPropagates：integration review 2026-08-22 擴充
+// ——scanLegacyWindow 的 scan error（events.jsonl 換成同名目錄，Scanner.Read
+// 回 EISDIR）必須經 loadTurnsBefore 的 legacy 分支原樣傳播，不得被靜默吞掉、
+// 少給合併結果（見 rebuild_orchestrator.go: `if lerr != nil { return nil, lerr }`）。
+//
+// 用目錄取代 chmod 0o000：0o000 在部分環境（root／euid 特例）讀取仍會成功，
+// 换成同名目錄則兩個平台（Linux／Darwin）都保證 os.Open 成功、Scanner.Scan()
+// 讀取時回 "is a directory" 錯誤，不必依 euid 條件式跳過。
+func TestLoadTurnsBeforeScanErrorPropagates(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 5) // LegacyTranscript=true、ViewStart 非空、5 turn（首載即最舊頁）
+	eventsPath := a.eventsPath()
+	if err := os.Remove(eventsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(eventsPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.LoadTurnsBefore("w1", "", 20); err == nil {
+		t.Fatal("events.jsonl 換成目錄後 scanLegacyWindow 的 scan error 必須傳播，不得靜默少給 legacy")
+	}
+}
+
+// TestLoadTurnsBeforeLegacyRespectsViewBoundary：integration review 2026-08-22
+// 擴充——events.jsonl 內同時有 boundary **之前**（event_id <= ViewStart）與
+// **之後**的無 WSID 事件時，首載只能前綴 boundary 之後那段（scanLegacyWindow
+// 的 `e.EventID <= viewStart` 過濾要真的接進 loadTurnsBefore 的合併路徑，不是
+// 只在 scanLegacyWindow 自己的單元測試綠燈）。
+func TestLoadTurnsBeforeLegacyRespectsViewBoundary(t *testing.T) {
+	dir := t.TempDir()
+	const boundary = "0000000005"
+	seedEvents(t, dir,
+		`{"event_id":"0000000003","provider":"claude","kind":"message","role":"user","text":"before-a"}`,
+		`{"event_id":"0000000004","provider":"claude","kind":"delta","role":"assistant","text":"before-b"}`,
+		`{"event_id":"0000000005","provider":"claude","kind":"result","text":"before-eq"}`,
+		`{"event_id":"0000000006","provider":"claude","kind":"message","role":"user","text":"after-a"}`,
+		`{"event_id":"0000000007","provider":"claude","kind":"result","text":"after-b"}`)
+	seedRegistry(t, dir, wsregistry.Entry{
+		WSID: "w1", Provider: "claude", CreatedAt: "t1",
+		ViewStartEventID: boundary, LegacyTranscript: true,
+	})
+	a := newTestAppAt(t, dir)
+	w := dormantWSID(t, a, "w1", contract.ProviderClaude)
+	emitCompleteTurn(t, a, w, "turn-00")
+	a.wsReg = registryOnDisk(t, dir)
+
+	got, err := a.LoadTurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyIDs []string
+	for _, e := range got {
+		if e.WorkspaceSessionID == "" {
+			legacyIDs = append(legacyIDs, e.EventID)
+		}
+	}
+	if len(legacyIDs) != 2 || legacyIDs[0] != "0000000006" || legacyIDs[1] != "0000000007" {
+		t.Fatalf("首載只應含 boundary（%s）之後的 legacy 事件，實得：%v", boundary, legacyIDs)
+	}
+}
+
+// TestLoadTurnsBeforeAfterResetViewNoLegacy：integration review 2026-08-22
+// 擴充——ResetView 清 LegacyTranscript（Task 3）之後，loadTurnsBefore 的合併
+// 分支必須真的因此不再觸發（不是只驗 ResetView 自己寫對欄位）。boundary 刻意
+// 傳回**同一個值**（"0000000000"，未前移）：若改傳更大的值，scanLegacyWindow
+// 自己的 boundary 過濾就會讓 legacy window 變空，即使 ResetView 沒清
+// LegacyTranscript 測試也會誤判綠燈（mutation 驗證過：把 ResetView 的
+// `e.LegacyTranscript = false` 拿掉、boundary 前移版本仍然通過，同值版本才會
+// 抓到）。同值一樣是合法呼叫——只驗證旗標清除這一個變因，25 個 turn 全數
+// 保留可同時確認 boundary 過濾沒有誤傷任何真實 turn。
+func TestLoadTurnsBeforeAfterResetViewNoLegacy(t *testing.T) {
+	a := seedLegacyPlus25TurnsApp(t) // legacy window + w1 25 turn，LegacyTranscript=true、ViewStart="0000000000"
+
+	store := registryOnDisk(t, a.stateDir)
+	if err := store.ResetView("w1", "0000000000"); err != nil {
+		t.Fatal(err)
+	}
+	a.wsReg = store // 依既有測試手法重新接線（同 Task 9 fixture 尾段）
+
+	p1, err := a.LoadTurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyText(p1) {
+		t.Fatal("ResetView 之後首載不得含 legacy（無 WSID）事件")
+	}
+	cursor := p1[0].EventID
+	p2, err := a.LoadTurnsBefore("w1", cursor, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyText(p2) {
+		t.Fatal("ResetView 之後最舊 turn 頁也不得含 legacy（無 WSID）事件")
+	}
+	assertAllTurnsPresent(t, append(append([]contract.Envelope{}, p1...), p2...), 25)
 }
