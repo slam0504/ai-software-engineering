@@ -248,7 +248,7 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
   marker 落盤、舊歷史仍不可見（可接受的降級，非資料損毀）。
 - **legacy window 的量**：受 `ViewStartEventID` boundary 限制（通常是最後一次開新
   對話後的一段），非整個 provider 歷史；抵達最舊 WSID turn 頁時一次全給可接受。若某使用者 boundary
-  極早導致 window 巨大，首載會偏重——列為已知邊界，不在本票處理分頁。
+  極早導致 window 巨大，最舊 WSID turn 頁會偏重——列為已知邊界，不在本票處理分頁。
 - （event 順序不再列為待驗證假設——§5 已把「合併後依 event_id 遞增排序」定為正式
   演算法保證，不依賴時序假設。）
 
