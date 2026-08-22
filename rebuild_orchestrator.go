@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
@@ -299,9 +300,15 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	if n <= 0 {
 		n = turnPageSize
 	}
-	recs, _, err := a.replayIndex.TurnsBefore(wsid, beforeEventID, n)
+	recs, hasOlder, err := a.replayIndex.TurnsBefore(wsid, beforeEventID, n)
 	if err != nil {
 		return nil, err
+	}
+	if beforeEventID != "" && len(recs) == 0 {
+		// cursor 指向 index 查無的 turn——分頁到底的訊號（legacy window 沒有
+		// turn record，回到它自己的 event id 一定落在這裡）。回空、非錯誤，
+		// 不當成全新 workspace 靜默重來。
+		return nil, nil
 	}
 	viewStart := a.viewBoundary(wsid)
 
@@ -325,20 +332,33 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 		}
 		out = append(out, envs...)
 	}
-	if beforeEventID != "" {
-		return out, nil
+	if beforeEventID == "" {
+		// §3.5.8：未完成 turn 不入 index，直接從 open_turn_start_offset 之後的
+		// audit suffix 取得。較舊的分頁（beforeEventID!=""）永遠不含尾端未結束
+		// turn，那只可能出現在最新頁。
+		if start, open := a.replayIndex.OpenTurnStart(wsid); open {
+			tail, terr := readEnvelopeRange(f, wsid, viewStart, start, -1)
+			if terr != nil {
+				return nil, terr
+			}
+			out = append(out, tail...)
+		}
 	}
-	// §3.5.8：未完成 turn 不入 index，直接從 open_turn_start_offset 之後的
-	// audit suffix 取得。
-	start, open := a.replayIndex.OpenTurnStart(wsid)
-	if !open {
-		return out, nil
+	// legacy window 只在最舊 turn 頁（hasOlder==false）前綴一次（spec §5
+	// 凍結的合併語意）：非最舊頁若也帶 legacy，使用者上滑會看到同一段歷史
+	// 重複出現。a.wsReg 未接線時沒有可信的 LegacyTranscript／Provider／
+	// ViewStart 來源，寧可少顯示也不要猜（同 viewBoundary 的降級方向）。
+	if !hasOlder && a.wsReg != nil {
+		if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript {
+			legacy, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
+			if lerr != nil {
+				return nil, lerr
+			}
+			out = append(legacy, out...)
+		}
 	}
-	tail, err := readEnvelopeRange(f, wsid, viewStart, start, -1)
-	if err != nil {
-		return nil, err
-	}
-	return append(out, tail...), nil
+	sort.SliceStable(out, func(i, j int) bool { return out[i].EventID < out[j].EventID })
+	return out, nil
 }
 
 // viewBoundary：該 WSID 目前的 view 起點（registry 的 durable ViewStartEventID）。
