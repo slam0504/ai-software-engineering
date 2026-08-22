@@ -8,7 +8,7 @@
 ![Go](https://img.shields.io/badge/go-1.26+-00ADD8.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-**一套整合 Claude Code 與 Codex 的桌面 AI 開發工作台——讓 AI 產出的每個關鍵節點都經過人類核可，並留下完整稽核紀錄**
+**一套整合 Claude Code 與 Codex 的桌面 AI 開發工作台——可將規格、計畫與測試證據納入人類核可，全程留下稽核紀錄**
 
 </div>
 
@@ -54,14 +54,14 @@ Workbench 有兩層，各自獨立可用：
 核可工具呼叫、重啟後自動恢復。不需要走任何流程關卡就能使用。
 
 **SDLC 流程關卡**——把「規格 → 計畫 → 測試契約」的每一步變成明確的核可節點。
-AI 只負責草擬，決定權與紀錄都在人這邊：
+AI 協助草擬與實作，核可決定由人作成、並留有紀錄：
 
 ```mermaid
 flowchart LR
   spec["撰寫規格<br/>spec/（Gherkin）"] --> g1["Gate 1<br/>規格核可"]
-  g1 --> plan["撰寫計畫<br/>plan/（任務 DAG）"]
-  plan --> g2["Gate 2<br/>逐項任務風險決議"]
-  g2 --> tc["宣告測試契約<br/>＋產生測試證據"]
+  g1 --> plan["撰寫計畫 plan/（任務 DAG）<br/>＋宣告測試契約"]
+  plan --> g2["Gate 2<br/>逐項任務風險決議<br/>（測試契約隨 plan 一併核可）"]
+  g2 --> tc["依核可的測試契約<br/>產生測試證據"]
   tc --> tca["TCA<br/>測試契約核可"]
   tca --> impl["帶著核可的規格與計畫<br/>與 AI 對話實作"]
 ```
@@ -77,8 +77,70 @@ flowchart LR
 - **阻擋事項收件匣**——風險無法分類、綁定失效、證據執行異常等情況會自動建立阻擋項目，
   未解決前擋下對應的核可。
 
-所有核可、狀態轉移與 AI 對話事件都寫入只允許附加的稽核檔（workspace 的 `.workbench/`），
-目前狀態一律由既有紀錄重新計算（projection）——系統裡沒有可直接修改的「目前狀態」欄位。
+所有核可、狀態轉移與 AI 對話事件都寫入只允許附加的稽核檔（workspace 的 `.workbench/`）；
+Gate、TCA 與阻擋事項的目前狀態一律由既有紀錄重新計算（projection），
+這三類紀錄沒有可直接修改的「目前狀態」欄位。
+
+---
+
+## 快速開始
+
+### 從原始碼建置
+
+需求：macOS、Go 1.26+、Node.js、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)
+
+```bash
+git clone https://github.com/slam0504/ai-software-engineering.git
+cd ai-software-engineering
+
+# 開發模式（原生視窗 + http://localhost:34115 瀏覽器開發伺服器）
+wails dev
+
+# 建置 .app
+wails build                  # → build/bin/sdlc-workbench.app
+./scripts/bundle-clis.sh     # 把固定版本的 CLI 封裝至 .app 的 Resources/tools/
+```
+
+> **固定 CLI 版本**：claude `2.1.223`、codex `0.146.1`。CLI 的通訊行為以此版本實測凍結，
+> 請勿隨意升級；升級版本需重跑實際 CLI 連線探測（live probe）與驗收矩陣。Codex CLI 是 node script，
+> 執行期需要 node（GUI 啟動時會自動偵測 `/usr/local/bin`、`/opt/homebrew/bin`）。
+
+### 第一次使用
+
+1. **啟動 app 並確認 workspace**——workspace 決定 AI 操作與稽核紀錄的落點
+   （執行期狀態都寫在 workspace 的 `.workbench/` 內），依啟動方式而不同：
+   - `wails dev`：repo 目錄就是 workspace。
+   - **從 Finder 開啟 .app：通常會退回使用者家目錄**（Finder 啟動時工作目錄是 `/`，不可寫）。
+   - 指定專案目錄啟動：
+     `WORKBENCH_WORKSPACE=/path/to/project ./build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench`
+     （開發模式則是 `export WORKBENCH_WORKSPACE=/path/to/project && wails dev`）。
+
+   第一次送出訊息前，先確認畫面頂端的 `ws: <source> @ <path>` 是你要的目錄——
+   否則 AI 會在家目錄而不是你的專案內操作。
+2. **登入 provider**——在設定列操作：Claude 會開啟系統終端機執行 `claude auth login`；
+   Codex 走瀏覽器 OAuth。App 不接收密碼、不保管 token。
+3. **建立第一個 session**——左欄 SessionList 選擇 provider 建立 session，在輸入框送出第一句訊息，
+   即可看到串流回覆、Timeline 事件與狀態列的 token 統計。
+4. **核可第一個工具呼叫**——AI 要求執行工具（改檔案、跑指令）時會跳出核可對話框，
+   核可或拒絕都會寫入稽核紀錄；逾時預設拒絕（fail-closed）。
+5. **重啟驗證**——直接關掉 app 再開：未按「開新對話」的 session 會還原對話內容，下一輪自動接續前文。
+
+流程關卡（規格／計畫／測試契約）的入口是介面中的 Spec、Plan、TCA 工作區與 Gate 主控台，
+整體順序見上方[運作流程](#運作流程)。
+
+### 測試
+
+```bash
+go vet ./...
+go test -race ./... -count=1     # 所有 package，含 production path 的同步與競態測試
+npm --prefix frontend run test   # vitest（store／scroll／sanitizer／i18n／元件）
+npm --prefix frontend run build  # vue-tsc typecheck + vite build
+```
+
+> **這三個 package 要分開跑，不要併跑**：`internal/codex`（`TestAppServerTerminateKillsGroup`）、
+> `internal/assist`、`internal/claude` 有三處**以實際經過時間（wall clock）判定**的既有測試，
+> 機器負載高時會出現偽陽性（實測：單獨跑 0.02s、負載下 30s 逾時）。這三處紅了先單獨重跑該 package 再判定，
+> 詳見 [`docs/spikes/m3b-results.md`](docs/spikes/m3b-results.md) §7。
 
 ---
 
@@ -238,59 +300,6 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 - App 不接收密碼、不保管 token
 - Claude：開啟系統終端機並執行 `claude auth login`，並在背景輪詢登入狀態
 - Codex：app-server `account/login/start` 開瀏覽器 OAuth，可取消
-
----
-
-## 快速開始
-
-### 從原始碼建置
-
-需求：macOS、Go 1.26+、Node.js、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)
-
-```bash
-git clone https://github.com/slam0504/ai-software-engineering.git
-cd ai-software-engineering
-
-# 開發模式（原生視窗 + http://localhost:34115 瀏覽器開發伺服器）
-wails dev
-
-# 建置 .app
-wails build                  # → build/bin/sdlc-workbench.app
-./scripts/bundle-clis.sh     # 把固定版本的 CLI 封裝至 .app 的 Resources/tools/
-```
-
-> **固定 CLI 版本**：claude `2.1.223`、codex `0.146.1`。CLI 的通訊行為以此版本實測凍結，
-> 請勿隨意升級；升級版本需重跑實際 CLI 連線探測（live probe）與驗收矩陣。Codex CLI 是 node script，
-> 執行期需要 node（GUI 啟動時會自動偵測 `/usr/local/bin`、`/opt/homebrew/bin`）。
-
-### 第一次使用
-
-1. **啟動 app**——workspace 預設為目前工作目錄（可用 `WORKBENCH_WORKSPACE` 覆寫），
-   所有執行期狀態都寫在 workspace 的 `.workbench/` 目錄內。
-2. **登入 provider**——在設定列操作：Claude 會開啟系統終端機執行 `claude auth login`；
-   Codex 走瀏覽器 OAuth。App 不接收密碼、不保管 token。
-3. **建立第一個 session**——左欄 SessionList 選擇 provider 建立 session，在輸入框送出第一句訊息，
-   即可看到串流回覆、Timeline 事件與狀態列的 token 統計。
-4. **核可第一個工具呼叫**——AI 要求執行工具（改檔案、跑指令）時會跳出核可對話框，
-   核可或拒絕都會寫入稽核紀錄；逾時預設拒絕（fail-closed）。
-5. **重啟驗證**——直接關掉 app 再開：未按「開新對話」的 session 會還原對話內容，下一輪自動接續前文。
-
-流程關卡（規格／計畫／測試契約）的入口是介面中的 Spec、Plan、TCA 工作區與 Gate 主控台，
-整體順序見上方[運作流程](#運作流程)。
-
-### 測試
-
-```bash
-go vet ./...
-go test -race ./... -count=1     # 所有 package，含 production path 的同步與競態測試
-npm --prefix frontend run test   # vitest（store／scroll／sanitizer／i18n／元件）
-npm --prefix frontend run build  # vue-tsc typecheck + vite build
-```
-
-> **這三個 package 要分開跑，不要併跑**：`internal/codex`（`TestAppServerTerminateKillsGroup`）、
-> `internal/assist`、`internal/claude` 有三處**以實際經過時間（wall clock）判定**的既有測試，
-> 機器負載高時會出現偽陽性（實測：單獨跑 0.02s、負載下 30s 逾時）。這三處紅了先單獨重跑該 package 再判定，
-> 詳見 [`docs/spikes/m3b-results.md`](docs/spikes/m3b-results.md) §7。
 
 ---
 
