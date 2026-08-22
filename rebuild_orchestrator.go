@@ -299,7 +299,7 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	if n <= 0 {
 		n = turnPageSize
 	}
-	recs, err := a.replayIndex.TurnsBefore(wsid, beforeEventID, n)
+	recs, _, err := a.replayIndex.TurnsBefore(wsid, beforeEventID, n)
 	if err != nil {
 		return nil, err
 	}

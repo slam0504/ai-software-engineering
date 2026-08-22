@@ -410,7 +410,7 @@ func TestIndexDegradedNotifyDoesNotDeadlockAndRecovers(t *testing.T) {
 	emitCompleteTurn(t, a, w, "after recovery")
 	// TurnsBefore(cursor="") ＝ 尾端視窗，即 production LoadTurnsBefore 首次載入
 	// 走的那條路（§3.8）。
-	recs, err := a.replayIndex.TurnsBefore("w1", "", 10)
+	recs, _, err := a.replayIndex.TurnsBefore("w1", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

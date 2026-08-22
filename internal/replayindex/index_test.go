@@ -167,7 +167,7 @@ func TestTurnsBeforePagination(t *testing.T) {
 	if len(recent) != 2 {
 		t.Fatalf("recentTurns(2)：%+v", recent)
 	}
-	before, err := i.TurnsBefore("w1", recent[0].FirstEventID, 5)
+	before, _, err := i.TurnsBefore("w1", recent[0].FirstEventID, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,12 +176,48 @@ func TestTurnsBeforePagination(t *testing.T) {
 	}
 
 	// 空字串 cursor 等同尾端視窗（首次載入無 cursor）。
-	first, err := i.TurnsBefore("w1", "", 2)
+	first, _, err := i.TurnsBefore("w1", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first) != 2 || first[0].StartOffset != recent[0].StartOffset {
 		t.Fatalf("空 cursor 應等同尾端視窗：%+v", first)
+	}
+}
+
+// newTestIndexWithTurns：開一個 Index、灌入 wsid 的 n 個完整 turn，供
+// TurnsBefore 分頁／hasOlder 測試使用。
+func newTestIndexWithTurns(t *testing.T, wsid string, n int) *Index {
+	t.Helper()
+	i, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k := 0; k < n; k++ {
+		feedCompleteTurn(t, i, wsid, int64(k*40))
+	}
+	return i
+}
+
+// TestTurnsBeforeReportsHasOlder：hasOlder 表示此頁回傳之後還有更舊的 turn
+// （可分頁總數 > 回傳數）。25 個 turn 首載 20 個應 hasOlder=true；剩下 5 個
+// 全部回傳後應 hasOlder=false。
+func TestTurnsBeforeReportsHasOlder(t *testing.T) {
+	idx := newTestIndexWithTurns(t, "w1", 25)
+	recs, hasOlder, err := idx.TurnsBefore("w1", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 20 || !hasOlder {
+		t.Fatalf("25 turn 首載 20 個、應 hasOlder=true：n=%d older=%v", len(recs), hasOlder)
+	}
+	oldestFirst := recs[0].FirstEventID
+	recs2, hasOlder2, err := idx.TurnsBefore("w1", oldestFirst, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs2) != 5 || hasOlder2 {
+		t.Fatalf("剩 5 turn、應 hasOlder=false：n=%d older=%v", len(recs2), hasOlder2)
 	}
 }
 
@@ -328,7 +364,8 @@ func TestOpenTurnStartSurvivesReopen(t *testing.T) {
 // recentTurns：wsid 最近（檔尾）至多 n 筆完整 turn，時間遞增排列。
 // 等同 TurnsBefore(wsid, "", n)，測試用的簡寫。
 func (idx *Index) recentTurns(wsid string, n int) ([]TurnRecord, error) {
-	return idx.TurnsBefore(wsid, "", n)
+	recs, _, err := idx.TurnsBefore(wsid, "", n)
+	return recs, err
 }
 
 // checkpoint：目前已索引的 audit byte offset 與最後一筆處理過的 event id。

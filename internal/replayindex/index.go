@@ -450,15 +450,15 @@ func isTerminalStateChange(env contract.Envelope) bool {
 // 反向讀取器是為了還沒發生的問題增加複雜度。觸發改寫的條件：若實測某 WSID 的
 // turns.jsonl 成長到單次全讀有感（例如同一 WSID 累積數萬筆以上、或量到 I/O
 // 延遲影響 UI 捲動），才值得換成真正的 tail read。
-func (idx *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, error) {
+func (idx *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, bool, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	all, err := idx.readTurnFileLocked(wsid)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if beforeEventID == "" {
-		return capTail(all, n), nil
+		return capTail(all, n), len(all) > n, nil
 	}
 	cut := -1
 	for i, rec := range all {
@@ -468,9 +468,9 @@ func (idx *Index) TurnsBefore(wsid, beforeEventID string, n int) ([]TurnRecord, 
 		}
 	}
 	if cut <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
-	return capTail(all[:cut], n), nil
+	return capTail(all[:cut], n), cut > n, nil
 }
 
 // OpenTurnStart：wsid 目前未結束 turn 的起始 offset（若有）。對應
