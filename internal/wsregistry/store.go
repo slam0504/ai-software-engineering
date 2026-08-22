@@ -465,6 +465,40 @@ func (s *Store) BackfillResume(fill map[string]string) error {
 	})
 }
 
+// BackfillLegacyTranscript：legacy transcript 的一次性補寫——把 wsids 內存在
+// 且未 tombstone 的 entry 標記 LegacyTranscript=true，並設下不可重跑的 marker。
+//
+// 語意與 BackfillResume 對稱：
+//   - marker 與 entries 標記必須同生共死——同一筆 persist，失敗全回滾。marker
+//     單獨留下會讓下次啟動不再重試、那些 entry 的標記永遠補不回來；entries
+//     單獨留下則是半套寫入，違反「記憶體與磁碟不分裂」的不變量。
+//   - 沒有候選（wsids 為空、或全部跳過）時**仍然**設 marker：代表「已經檢查
+//     過、確定沒有東西要補」，不設的話每次啟動都要重新掃一次。
+//   - 跳過不存在的 wsid 與 tombstone（RemovedAt 非空）——呼叫端的候選集合可能
+//     是上一輪的快照，且已移除的 session 不該被復活式地補標記。
+func (s *Store) BackfillLegacyTranscript(wsids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldEntries := make(map[string]Entry, len(wsids))
+	for _, wsid := range wsids {
+		e, ok := s.file.Entries[wsid]
+		if !ok || e.RemovedAt != "" {
+			continue
+		}
+		oldEntries[wsid] = e
+		e.LegacyTranscript = true
+		s.file.Entries[wsid] = e
+	}
+	oldMarker := s.file.LegacyTranscriptBackfilled
+	s.file.LegacyTranscriptBackfilled = true
+	return s.persistOrRollback(func() {
+		for wsid, e := range oldEntries {
+			s.file.Entries[wsid] = e
+		}
+		s.file.LegacyTranscriptBackfilled = oldMarker
+	})
+}
+
 // entryCount：registry 目前持久化的 entry 總數，含 tombstone（未 export，
 // package 內部用；目前只給 migrate.go 的第二層防禦判斷「registry 是否應
 // 視為全新」——tombstone 也算數，因為丟掉它就等於把 §3.6.1 tombstone 要防

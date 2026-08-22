@@ -252,16 +252,17 @@ func TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites(t *testing.T) {
 
 	// (3) 所有寫入入口一律拒絕。
 	writes := map[string]func() error{
-		"Put":               func() error { return s.Put(Entry{WSID: "w2", Provider: "codex", CreatedAt: "t"}) },
-		"Remove":            func() error { return s.Remove("w1", "user_removed") },
-		"DeleteUncommitted": func() error { return s.DeleteUncommitted("w1") },
-		"CommitResume":      func() error { return s.CommitResume("w1", "x", "lbl") },
-		"SetResume":         func() error { return s.SetResume("w1", "y") },
-		"ResetView":         func() error { return s.ResetView("w1", "evt") },
-		"SetLayout":         func() error { return s.SetLayout(Layout{Pins: []string{"w1"}}) },
-		"BackfillResume":    func() error { return s.BackfillResume(map[string]string{"w1": "z"}) },
-		"MarkMigrated":      func() error { return s.MarkMigrated([]Entry{{WSID: "w9"}}) },
-		"Sync":              func() error { return s.Sync() },
+		"Put":                      func() error { return s.Put(Entry{WSID: "w2", Provider: "codex", CreatedAt: "t"}) },
+		"Remove":                   func() error { return s.Remove("w1", "user_removed") },
+		"DeleteUncommitted":        func() error { return s.DeleteUncommitted("w1") },
+		"CommitResume":             func() error { return s.CommitResume("w1", "x", "lbl") },
+		"SetResume":                func() error { return s.SetResume("w1", "y") },
+		"ResetView":                func() error { return s.ResetView("w1", "evt") },
+		"SetLayout":                func() error { return s.SetLayout(Layout{Pins: []string{"w1"}}) },
+		"BackfillResume":           func() error { return s.BackfillResume(map[string]string{"w1": "z"}) },
+		"BackfillLegacyTranscript": func() error { return s.BackfillLegacyTranscript([]string{"w1"}) },
+		"MarkMigrated":             func() error { return s.MarkMigrated([]Entry{{WSID: "w9"}}) },
+		"Sync":                     func() error { return s.Sync() },
 	}
 	for name, fn := range writes {
 		if werr := fn(); !errors.Is(werr, ErrRegistryUncertain) {

@@ -1,6 +1,7 @@
 package wsregistry
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -407,5 +408,137 @@ func TestResetViewClearsLegacyTranscript(t *testing.T) {
 	}
 	if e.ViewStartEventID != "hiwater" {
 		t.Fatalf("boundary 應前移：%q", e.ViewStartEventID)
+	}
+}
+
+func TestBackfillLegacyTranscriptAtomic(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript([]string{"w1"}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 應落盤")
+	}
+	e, _ := s.Get("w1")
+	if !e.LegacyTranscript {
+		t.Fatal("候選 entry 應被標記")
+	}
+	s2, _ := Open(filepath.Join(dir, "ws.json"))
+	if !s2.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 未持久化")
+	}
+	e2, _ := s2.Get("w1")
+	if !e2.LegacyTranscript {
+		t.Fatal("entry 標記未持久化")
+	}
+}
+
+// spec §4 凍結分支：零候選（掃描成功、確定無待補）仍落 marker——「已檢查過」
+// 的語意，下次啟動不再重跑。
+func TestBackfillLegacyTranscriptZeroCandidateStillSetsMarker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ws.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("零候選仍應落 marker（代表已檢查過）")
+	}
+	s2, _ := Open(path)
+	if !s2.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 未持久化")
+	}
+}
+
+// spec §4 凍結分支：tombstone 不算候選——wsids 內已 Remove 的 entry 跳過、
+// 不標記，marker 照常落盤。
+func TestBackfillLegacyTranscriptSkipsTombstone(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"},
+		"codex":  {ResumeSessionID: "y"},
+	}, func() string { n++; return fmt.Sprintf("w%d", n) }); err != nil {
+		t.Fatal(err)
+	}
+	var removed, kept string
+	for _, e := range s.Live() {
+		if e.Provider == "codex" {
+			removed = e.WSID
+		} else {
+			kept = e.WSID
+		}
+	}
+	if err := s.Remove(removed, "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript([]string{kept, removed}); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Get(kept)
+	if !e.LegacyTranscript {
+		t.Fatal("live 候選應被標記")
+	}
+	de, _ := s.Get(removed)
+	if de.LegacyTranscript {
+		t.Fatal("tombstone entry 不得被標記")
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("marker 應落盤")
+	}
+}
+
+// spec §4 凍結分支（不可逆錯誤防護的核心）：persist 失敗時 entry 標記與 marker
+// **同時**回滾——marker 單獨留下會讓下次啟動不再重試、標記永久缺失。
+// 注入手法沿用 TestPersistFailureRollsBackMemory（chmod 父目錄唯讀）。
+func TestBackfillLegacyTranscriptPersistFailureRollsBackBoth(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Skip("平台不支援權限測試")
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := s.BackfillLegacyTranscript([]string{"w1"}); err == nil {
+		t.Fatal("persist 失敗必須回錯")
+	}
+	if s.LegacyTranscriptBackfilled() {
+		t.Fatal("persist 失敗後 marker 必須回滾（否則永不重試）")
+	}
+	if e, _ := s.Get("w1"); e.LegacyTranscript {
+		t.Fatal("persist 失敗後 entry 標記必須回滾")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackfillLegacyTranscript([]string{"w1"}); err != nil {
+		t.Fatalf("修復後重試必須成功：%v", err)
+	}
+	if !s.LegacyTranscriptBackfilled() {
+		t.Fatal("重試後 marker 應落盤")
 	}
 }
