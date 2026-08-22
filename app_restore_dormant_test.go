@@ -662,3 +662,95 @@ func TestScanLegacyWindow(t *testing.T) {
 		}
 	})
 }
+
+// seedTranscriptOnlyLegacyFixture：M3a 形狀、但 claude 只有 legacy window——
+// 無 resume identity、無 task。這是 spec §3 的高風險族群：掃描錯誤若被吞，
+// 該 provider 三者皆空 → 跳過遷移 → migrated=true 空 entries → 舊歷史永久遺失。
+func seedTranscriptOnlyLegacyFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message","role":"user","text":"hi"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta","role":"assistant","text":"ok"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+	b, err := json.Marshal(map[string]restoreEntry{
+		"claude": {ViewStartEventID: "ev-0"},
+		"codex":  {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
+	dir := seedTranscriptOnlyLegacyFixture(t)
+	a := newTestAppAt(t, dir) // 先建 App（sink 要開得了原始 events.jsonl）再破壞檔案
+	events := filepath.Join(dir, "events.jsonl")
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNotMigrated := func(t *testing.T, phase string) {
+		t.Helper()
+		reg := registryOnDisk(t, dir)
+		if reg.Migrated() {
+			t.Fatalf("%s：掃描失敗不得落 migrated marker（永不重試＝舊歷史永久遺失）", phase)
+		}
+		if n := len(reg.Live()); n != 0 {
+			t.Fatalf("%s：掃描失敗不得寫入 entries：%d", phase, n)
+		}
+	}
+	// (1) 真 open error（EACCES，非 NotExist）：darwin 上 os.Open(目錄) 會成功、
+	// 錯誤到讀取才出現，換目錄注入打不到 open 分支——用 chmod 0o000 才是 open error。
+	// subtest 內才 skip：root 下 chmod 與 restoreSessions 都不執行、狀態未動，
+	// (2)(3) 的前提不受影響——Scanner.Err()／marker 斷言／修復重試在 root 仍照跑。
+	t.Run("open_error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root 會繞過檔案權限，無法重現 open error")
+		}
+		if err := os.Chmod(events, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(events, 0o644) })
+		if _, err := a.restoreSessions(); err == nil {
+			t.Fatal("open error 時 loadSessionRegistry 必須回錯（不得靜默跳過遷移）")
+		}
+		assertNotMigrated(t, "open error")
+	})
+	// (2) scan error：單行超過 scanner buffer 上限（16MiB）→ Scanner.Err()=ErrTooLong。
+	// 與權限無關，root 也照跑。
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	huge := append(append([]byte{}, orig...), []byte(strings.Repeat("x", 17*1024*1024))...)
+	if err := os.WriteFile(events, huge, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("Scanner.Err() 非 nil 時必須回錯（不得把讀到一半當完整 window）")
+	}
+	assertNotMigrated(t, "scan error")
+	// (3) 修復後重試：正常遷移、transcript-only entry 帶 LegacyTranscript=true。
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live, err := a.restoreSessions()
+	if err != nil {
+		t.Fatalf("修復後重試必須成功：%v", err)
+	}
+	if len(live) != 1 || live[0].Provider != "claude" {
+		t.Fatalf("transcript-only 應恰遷移出一個 claude entry：%+v", live)
+	}
+	reg := registryOnDisk(t, dir)
+	e, ok := reg.Get(live[0].WSID)
+	if !ok || !e.LegacyTranscript {
+		t.Fatalf("transcript-only entry 必須帶 LegacyTranscript=true：%+v ok=%v", e, ok)
+	}
+	if !reg.Migrated() {
+		t.Fatal("重試成功後 migrated marker 應落盤")
+	}
+}

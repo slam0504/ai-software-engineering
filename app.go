@@ -1253,8 +1253,10 @@ var legacyProviders = []string{"claude", "codex"}
 // openRestoreStore 會用 audit high-watermark 幫**兩個** provider 都補齊 entry
 // （restore.go:42-56），那種 entry 的 ViewStartEventID 非空但 window 內必然
 // 零事件。只看欄位非空的話，只用過 claude 的使用者升級後會憑空多出一個
-// codex session 並吃掉一個名額。window 判定直接重用 replayViewWindow，因為
-// 「view window 裡有沒有事件」的定義就該和實際重放的視窗完全一致。
+// codex session 並吃掉一個名額。window 判定改用 scanLegacyWindow（非
+// replayViewWindow）：掃描失敗（開檔或 Scanner.Err()）必須讓本函式回 error，
+// 不能把「讀不到」誤判成「window 內沒有事件」而靜默跳過遷移——那正是
+// transcript-only 使用者被永久遷成空 entries 的路徑。
 //
 // 與 wsregistry.Migrate 判準的一格分歧（owner 2026-08-15 裁決：接受為已知
 // 行為，兩邊都不改）——「window 內有事件、但 ViewStartEventID 為空且無
@@ -1278,14 +1280,19 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 	out := make(map[string]wsregistry.LegacyEntry, len(legacyProviders))
 	for _, p := range legacyProviders {
 		e := a.restore.Get(p)
-		if e.ResumeSessionID == "" && e.TaskID == "" &&
-			len(replayViewWindow(a.eventsPath(), p, e.ViewStartEventID)) == 0 {
+		window, werr := scanLegacyWindow(a.eventsPath(), p, e.ViewStartEventID)
+		if werr != nil {
+			return nil, werr
+		}
+		hasTranscript := len(window) > 0
+		if e.ResumeSessionID == "" && e.TaskID == "" && !hasTranscript {
 			continue
 		}
 		out[p] = wsregistry.LegacyEntry{
-			ViewStartEventID: e.ViewStartEventID,
-			ResumeSessionID:  e.ResumeSessionID,
-			TaskID:           e.TaskID,
+			ViewStartEventID:    e.ViewStartEventID,
+			ResumeSessionID:     e.ResumeSessionID,
+			TaskID:              e.TaskID,
+			HasLegacyTranscript: hasTranscript,
 		}
 	}
 	return out, nil
