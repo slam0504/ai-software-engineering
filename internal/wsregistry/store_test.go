@@ -386,3 +386,26 @@ func TestLegacyTranscriptSchemaRoundTrip(t *testing.T) {
 		t.Fatal("舊 entry 缺欄位應預設 false")
 	}
 }
+
+func TestResetViewClearsLegacyTranscript(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetView("w1", "hiwater"); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Get("w1")
+	if e.LegacyTranscript {
+		t.Fatal("前移 boundary 後 LegacyTranscript 必須清除（新 view 世代不含 legacy）")
+	}
+	if e.ViewStartEventID != "hiwater" {
+		t.Fatalf("boundary 應前移：%q", e.ViewStartEventID)
+	}
+}

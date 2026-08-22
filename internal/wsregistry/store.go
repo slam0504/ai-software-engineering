@@ -403,10 +403,13 @@ func (s *Store) SetResume(wsid, resumeSessionID string) error {
 //
 // 兩者必須同一筆：boundary 前移代表「舊 turn 不再屬於這個 view」，若 resume 還
 // 留著，下一次 StartSession 會接回那段已經看不到的對話。TaskLabel **不清**——
-// 它是 session 的名字，不是這一段對話的身分。
+// 它是 session 的名字，不是這一段對話的身分。LegacyTranscript 同筆清除：它
+// 標記的是舊 boundary 之前那段 legacy transcript，boundary 前移後新的 view
+// 世代已不含那段內容，留著會讓 hydrate 誤以為新世代也要接 legacy transcript。
 func (s *Store) ResetView(wsid, viewStartEventID string) error {
 	return s.mutate(wsid, func(e *Entry) {
 		e.ViewStartEventID, e.ResumeSessionID = viewStartEventID, ""
+		e.LegacyTranscript = false
 	})
 }
 
