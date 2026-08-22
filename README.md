@@ -8,13 +8,21 @@
 ![Go](https://img.shields.io/badge/go-1.26+-00ADD8.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-**一套整合 Claude Code 與 Codex 的桌面 AI 開發工作台**
-
-SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CLI，支援多輪對話、統一的工具核可（approval）流程、
-即時 session 狀態、完整稽核事件與 wire log（原始通訊紀錄）。本專案以 Go、Wails v2、Vue 3 與 TypeScript 實作，
-固定 CLI 版本並凍結事件契約，且依里程碑完成自動化測試與實機驗收。
+**一套整合 Claude Code 與 Codex 的桌面 AI 開發工作台——讓 AI 產出的每個關鍵節點都經過人類核可，並留下完整稽核紀錄**
 
 </div>
+
+AI 寫程式碼很快，但「規格理解對不對、計畫的風險誰承擔、測試證據可不可信」仍需要人把關。
+SDLC Workbench 把這些把關點做成明確的關卡（gate）：AI 負責草擬，人類審核後核可，每個決定都寫入
+只允許附加的稽核紀錄——從撰寫規格、核可計畫、驗證測試證據，到與 AI 多輪對話實作，
+全部在同一個桌面 app 內完成。
+
+適合想把 Claude Code／Codex 納入有紀律開發流程的工程師：既要 AI 的速度，也要每一步可追溯、可稽核。
+也可以只把它當成雙 provider 的 AI 對話工作台使用——多輪對話、統一的工具核可（approval）流程、
+即時 session 狀態、完整稽核事件與 wire log（原始通訊紀錄），不必走流程關卡。
+
+本專案以 Go、Wails v2、Vue 3 與 TypeScript 實作，固定 CLI 版本並凍結事件契約，
+且依里程碑完成自動化測試與實機驗收。
 
 ---
 
@@ -38,9 +46,48 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 
 ---
 
+## 運作流程
+
+Workbench 有兩層，各自獨立可用：
+
+**對話工作台（隨開即用）**——雙 provider、多 session 的 AI 對話環境：送訊息、看串流輸出、
+核可工具呼叫、重啟後自動恢復。不需要走任何流程關卡就能使用。
+
+**SDLC 流程關卡**——把「規格 → 計畫 → 測試契約」的每一步變成明確的核可節點。
+AI 只負責草擬，決定權與紀錄都在人這邊：
+
+```mermaid
+flowchart LR
+  spec["撰寫規格<br/>spec/（Gherkin）"] --> g1["Gate 1<br/>規格核可"]
+  g1 --> plan["撰寫計畫<br/>plan/（任務 DAG）"]
+  plan --> g2["Gate 2<br/>逐項任務風險決議"]
+  g2 --> tc["宣告測試契約<br/>＋產生測試證據"]
+  tc --> tca["TCA<br/>測試契約核可"]
+  tca --> impl["帶著核可的規格與計畫<br/>與 AI 對話實作"]
+```
+
+每個關卡各擋一類問題：
+
+- **Gate 1（規格核可）**——規格內容經人確認才生效；核可後規格一有變更，狀態立即轉為
+  **STALE**（失效，需重新送核），避免「核可的是舊版、實作的是新版」。
+- **Gate 2（計畫風險決議）**——計畫先通過確定性驗證（schema、依賴、無循環），再由人逐項任務決定風險等級；
+  選得比規劃器建議低就必須填寫理由，低於政策底線一律拒絕。
+- **TCA（測試契約核可）**——測試證據要同時通過兩類驗證：預期失敗特徵相符（expected-red），
+  以及刻意植入的錯誤能被同一組測試偵測（negative-control）——證明這組測試確實能偵測目標行為被破壞，證據才算數。
+- **阻擋事項收件匣**——風險無法分類、綁定失效、證據執行異常等情況會自動建立阻擋項目，
+  未解決前擋下對應的核可。
+
+所有核可、狀態轉移與 AI 對話事件都寫入只允許附加的稽核檔（workspace 的 `.workbench/`），
+目前狀態一律由既有紀錄重新計算（projection）——系統裡沒有可直接修改的「目前狀態」欄位。
+
+---
+
 ## 功能
 
 ### 雙 provider session（可並存）
+
+在同一個視窗操作兩個 AI CLI，各自獨立對話、互不干擾。
+
 - **Claude Code**（固定版本 `2.1.223`）— `claude -p` stream-json 多輪子行程：stdin 保持開啟、逐輪送出訊息，
   自然結束時回傳 exit code 0；session id 綁定 workspace，app 重啟後可恢復既有 session（cwd 不一致時拒絕恢復）
 - **Codex**（固定版本 `0.146.1`）— 長駐 `codex app-server` JSON-RPC：thread／turn 模型、
@@ -51,6 +98,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
   （先讓舊 session 停止接受新工作並完成收尾，等待事件處理完成並關閉 wire log，再開啟新的 session）
 
 ### 多 session 工作區（M3b）
+
+同時保留多個進行中的對話、雙 pane 並排檢視；重啟後內容不會遺失，載入成本不隨歷史事件量增加。
+
 - **每個 provider 最多 4 個 session slot**（共 8）——同時保留並可並行執行，每個 session 至多一個進行中的 turn；
   超出上限時明確拒絕並回報錯誤（fail loud），左欄 SessionList 顯示 `n / 4`，不會自動終止任何 session
 - **workspace session id（WSID）** 是 Workbench 端的穩定身分，provider 自己的 session／thread id 只是附掛資訊；
@@ -71,6 +121,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - 不新增第二種持久化格式；稽核事件流即是恢復來源
 
 ### 工具核可（approval）
+
+AI 要求變更檔案或執行指令之前，由你決定是否放行，核可與拒絕都留有紀錄。
+
 - 兩個 provider 共用同一個 ApprovalDialog，核可結果與理由都會寫入稽核紀錄
 - **Claude** — 經 MCP permission-prompt-tool（app 內建 `mcp-approval` 子命令 + unix socket broker）
 - **Codex** — 經 app-server `requestApproval`；`approvalPolicy` 可選 `untrusted`（每次都要核可）/
@@ -78,6 +131,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - 採 fail-closed（逾時或異常時預設拒絕），逾時會自動拒絕核可請求；已失效的核可對話框會自動關閉，多個視窗也會同步移除
 
 ### 規格工作區與 Gate 1（M2 Stage A）
+
+在 app 內撰寫行為規格（Gherkin），AI 只協助草擬；經人核可後，規格才成為後續計畫與測試的依據。
+
 - **規格工作區** — 在 app 內編輯 `spec/`（CodeMirror 6，Gherkin 語法標示）；三個 AI 輔助按鈕（草擬 Gherkin、
   歧義偵測、oracle 覆蓋檢查）輸出至草稿區，由使用者確認後才寫入檔案
 - **限定變更範圍的兩階段 commit** — 先預覽 diff、確認後才 commit，且保證「確認的內容就是實際 commit 的內容」，
@@ -89,6 +145,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - **呈現層** — 瀏覽／監看 `spec/context-map/*.mmd`，檔案變更後自動重新渲染（重用 mermaid strict 設定）
 
 ### 計畫工作區與 Gate 2（M3a Stage B）
+
+把實作拆成任務 DAG，先過確定性驗證，再由人逐項任務決定風險等級後才放行。
+
 - **Plan Workspace** — 結構化 plan YAML 編輯（CodeMirror 6），PlannerAssist 以唯讀的 one-shot 產生草稿至草稿區、
   由使用者確認後才寫入檔案；沿用 SpecWorkspace 的兩階段（預覽／確認）限定範圍 commit
   （產生 `plan_commit`，工作樹有未提交變更時拒絕核可）
@@ -103,6 +162,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - **STALE** — spec、plan、risk policy 或權限清單一有變更即失效；`base_commit` 是歷史錨點，後續新增 commit 不會使核可失效
 
 ### 測試契約核可（Test Contract Approval，本機測試證據執行器）
+
+用兩類證據證明這組測試確實能偵測目標行為被破壞，證據經人核可才算數；判定條件先核可、後執行，不接受事後補上的臨時條件。
+
 - **測試判準涵蓋範圍（oracle surface）宣告** — 路徑模式與每項任務的測試契約描述（執行指令與結果比對規則）
   在 Stage B、Gate 2 送核前完成宣告，隨 plan 一併核可
 - **測試證據執行器（evidence runner）** — 每次執行都建立獨立的 detached worktree（位於系統暫存目錄）、
@@ -118,6 +180,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
   不限制測試程式的網路與檔案系統能力
 
 ### 阻擋事項收件匣
+
+系統偵測到的問題（風險無法分類、綁定失效、證據異常）未解決前，對應的核可會被擋下，不會靜默放行。
+
 - **三種處理狀態** — `open → acknowledged → resolved`，狀態轉移只允許附加寫入，目前狀態由既有紀錄重新計算；
   標記為 `resolved` 時必須填寫 resolution、理由與處理人
 - **系統自動建立** — 系統會在風險無法分類、binding 缺漏、Gate 2／TCA 綁定轉為 STALE、
@@ -160,6 +225,9 @@ SDLC Workbench 可在同一個桌面介面中操作 Claude Code CLI 與 Codex CL
 - `.mmd` 檔案存檔後 1 秒內自動重新渲染（fsnotify 監看）
 
 ### 稽核與通訊紀錄
+
+你在 UI 看到的一切都有對應的持久化事件，可回放、可稽核；UI 所見即所錄。
+
 - 所有事件都會以 **Envelope v1** 格式寫入 `events.jsonl`：event_id（ULID）嚴格遞增，
   且每一輪的使用者訊息一定先於 provider 事件寫入（由 submission coordinator 負責排列使用者訊息與 provider 事件的寫入順序）；
   稽核寫入失敗時立即在 UI 顯示錯誤
@@ -194,6 +262,21 @@ wails build                  # → build/bin/sdlc-workbench.app
 > **固定 CLI 版本**：claude `2.1.223`、codex `0.146.1`。CLI 的通訊行為以此版本實測凍結，
 > 請勿隨意升級；升級版本需重跑實際 CLI 連線探測（live probe）與驗收矩陣。Codex CLI 是 node script，
 > 執行期需要 node（GUI 啟動時會自動偵測 `/usr/local/bin`、`/opt/homebrew/bin`）。
+
+### 第一次使用
+
+1. **啟動 app**——workspace 預設為目前工作目錄（可用 `WORKBENCH_WORKSPACE` 覆寫），
+   所有執行期狀態都寫在 workspace 的 `.workbench/` 目錄內。
+2. **登入 provider**——在設定列操作：Claude 會開啟系統終端機執行 `claude auth login`；
+   Codex 走瀏覽器 OAuth。App 不接收密碼、不保管 token。
+3. **建立第一個 session**——左欄 SessionList 選擇 provider 建立 session，在輸入框送出第一句訊息，
+   即可看到串流回覆、Timeline 事件與狀態列的 token 統計。
+4. **核可第一個工具呼叫**——AI 要求執行工具（改檔案、跑指令）時會跳出核可對話框，
+   核可或拒絕都會寫入稽核紀錄；逾時預設拒絕（fail-closed）。
+5. **重啟驗證**——直接關掉 app 再開：未按「開新對話」的 session 會還原對話內容，下一輪自動接續前文。
+
+流程關卡（規格／計畫／測試契約）的入口是介面中的 Spec、Plan、TCA 工作區與 Gate 主控台，
+整體順序見上方[運作流程](#運作流程)。
 
 ### 測試
 
