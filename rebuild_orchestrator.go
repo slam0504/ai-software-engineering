@@ -366,6 +366,8 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 			out = append(legacy, out...)
 		}
 	}
+	// 所有頁（含無 legacy 前綴者）皆排序：防禦性保證。ULID 單調遞增時為 no-op，
+	// 時鐘回撥造成非單調時仍保證輸出依 event_id 遞增。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].EventID < out[j].EventID })
 	return out, nil
 }

@@ -761,7 +761,9 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 // ViewStartEventID="ev-0"（唯一候選）、一個 codex live entry 同樣
 // ViewStartEventID="ev-0"（但 events.jsonl 無 codex legacy 事件——provider
 // 條件的反例：ViewStart 相同也不構成候選），兩者皆無 legacy_transcript、
-// legacy_transcript_backfilled=false。
+// legacy_transcript_backfilled=false。本系列 "ev-*" fixture 不得加入真實
+// ULID turn：字典序大於 ULID 首碼 "01"，共存會破壞排序假設，需要 turn 共存
+// 時改用 app_legacy_transcript_test.go 的 "00" 前綴慣例。
 func seedMigratedLegacyClaudeFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

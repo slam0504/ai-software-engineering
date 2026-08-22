@@ -76,8 +76,8 @@ func TestTurnBoundaryDefinition(t *testing.T) {
 			t.Fatalf("Observe: %v", err)
 		}
 	}
-	obs("init", "system", "", "e1", 0)              // 無 canonical user message → 不成 turn
-	obs("message", "user", "", "e2", 10)             // turn 起
+	obs("init", "system", "", "e1", 0)   // 無 canonical user message → 不成 turn
+	obs("message", "user", "", "e2", 10) // turn 起
 	obs("delta", "assistant", "", "e3", 20)
 	obs("result", "system", "", "e4", 30)
 	obs("state_change", "system", "done", "e5", 40) // terminal：turn 止
