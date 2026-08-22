@@ -19,7 +19,8 @@ provider 歷史），與 post-migration 的新 turn 正確合併、排序、去�
 **非目標**：
 - 不改 `RestoreViews`（保留為既有 Go 測試出口）、不新增 frontend 對它的呼叫。
 - 不改 turn index 的 §3.5.9 語意（無 WSID 事件不入 index，維持凍結）。
-- legacy 舊歷史不做 turn-level 分頁（它無 turn 邊界）；一次性升級資料，首載全給。
+- legacy 舊歷史不做 turn-level 分頁（它無 turn 邊界）；一次性升級資料，抵達最舊
+  WSID turn 頁時一次全給。
 
 ## 2. owner 裁決（兩輪，凍結為設計約束）
 
@@ -45,9 +46,17 @@ provider 歷史），與 post-migration 的新 turn 正確合併、排序、去�
 
 `Migrate`（migrate.go）：**只依 App 掃描得到的 `HasLegacyTranscript` 設 flag**，
 不是「非空 entry 一律設 true」（reviewer 2026-08-22 P2）。`LegacyEntry` 增加
-`HasLegacyTranscript bool` 欄位，由 App 的 `legacyEntries()` 填入（它本就已用
-legacy window 是否非空判斷要不要遷移，見 app.go:1282，資訊現成）。`Migrate` 對
+`HasLegacyTranscript bool` 欄位，由 App 的 `legacyEntries()` 填入。`Migrate` 對
 每個遷移的 entry 設 `LegacyTranscript = le.HasLegacyTranscript`。
+
+**`legacyEntries()` 改用 error-returning `scanLegacyWindow`**（reviewer 2026-08-22
+P1）：現行它以會吞 I/O 錯誤的 `replayViewWindow` 判斷 window（app.go:1282）。
+**transcript-only 使用者**（只有舊對話、無 resume／task）最脆弱——掃描暫時失敗會
+讓該 provider 被判成「window 空、三者皆空」而**跳過遷移**，接著 `Migrate` 寫
+`migrated=true` ＋空 entries，下次啟動不再 migration、也沒有 entry 可 backfill，
+舊歷史**永久遺失**。修正：`legacyEntries()` 用 `scanLegacyWindow`，掃描失敗**回 error**；
+呼叫端（`loadSessionRegistry`）據此**不呼叫 Migrate、marker 不落盤**，下次啟動可重試。
+`HasLegacyTranscript = len(scanLegacyWindow(...)) > 0`（掃描成功時）。
 
 **理由**：`LegacyTranscript=true` 的語意是「此 entry 確實擁有可顯示的舊 transcript」。
 migration 允許只有 resume identity／task label、**沒有 legacy window** 的 entry
@@ -101,6 +110,9 @@ turn 永遠載不到。
 
 ```
 recs, hasOlder := replayIndex.TurnsBefore(wsid, beforeEventID, n)   // hasOlder：此頁之後還有更舊 WSID turn 嗎
+if beforeEventID != "" && len(recs) == 0 {
+    return nil, nil          // cursor 找不到（含 legacy id）或有效但已最舊——回空、不前綴
+}                            // legacy 只在最舊 turn 頁前綴一次，此處回空讓前端停
 out := envelopes(recs) ++ (若首載) open-turn tail
 if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前綴 legacy
     legacy, err := scanLegacyWindow(eventsPath, provider, entry.ViewStartEventID)  // §5a，只取無 WSID
@@ -108,6 +120,12 @@ if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前
     out = legacy ++ out
 }
 ```
+
+`if beforeEventID != "" && len(recs) == 0 { return nil, nil }` 是正式演算法的一部分
+（reviewer 2026-08-22 P2）：legacy cursor（`cut<=0`）與「有效但已是最舊 turn」的 cursor
+都是 `recs==[]、hasOlder==false`，若不早退就會再掃描前綴整段 legacy、與「回空不前綴」
+矛盾。正常序列中 legacy 已在**前一頁**（最舊 turn 頁）回過，故此處回空正確；由 §8
+「第三頁 cursor=legacy id → 回空」測試守住。
 
 - `beforeEventID==""` 且 `hasOlder==false`（WSID turn 不滿 n）→ 首載即前綴 legacy。
 - `beforeEventID==""` 且 `hasOlder==true`（WSID turn 超過 n）→ 首載**不**前綴；正常
@@ -137,7 +155,8 @@ if !hasOlder {                       // 這一頁是最舊 WSID turn 頁 → 前
 ## 5a. error-returning legacy scanner（`scanLegacyWindow`）
 
 新增 `scanLegacyWindow(eventsPath, provider, viewStart) ([]contract.Envelope, error)`，
-供 §4 backfill 與 §5 合併載入**共用**（兩處都必須正確處理 I/O 錯誤）：
+供**三條路徑共用**——§3 migration 的 `legacyEntries()`、§4 backfill、§5 合併載入
+（三處都必須正確處理 I/O 錯誤；reviewer 2026-08-22 P1）：
 
 - 語意同 `replayViewWindow`（provider 相符、event_id > viewStart、排除 workspace／
   spec_assist scope），**額外只保留 `WorkspaceSessionID==""`**（pre-migration）。
@@ -158,7 +177,8 @@ legacy 歷史不再屬於目前 view。實作：`ResetView` 一併清標記（�
 
 ```
 startup:
-  loadSessionRegistry → Migrate（新遷移設 LegacyTranscript）
+  loadSessionRegistry → legacyEntries()（scanLegacyWindow，掃描失敗回錯→不 Migrate、marker 不落盤）
+                      → Migrate（依 HasLegacyTranscript 設 LegacyTranscript）
                       → backfillResumeFromLegacy（既有）
                       → backfillLegacyTranscript（§4，新增；restore.json 快照精確比對）
 
@@ -175,6 +195,13 @@ hydrate（首次＋向上分頁）:
 frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益）。
 
 ## 8. 測試策略（TDD）
+
+**migration 掃描（app，in-process）**：
+- transcript-only fixture（有 legacy window、無 resume／task）：正常遷移、
+  `LegacyTranscript==true`。
+- transcript-only ＋ scanLegacyWindow open error／scan error → `legacyEntries()`
+  回錯、**不呼叫 Migrate、migrated marker 與 entries 皆不落盤**；重試成功後正常遷移。
+  （守住「暫時性 I/O 錯誤不得把 transcript-only 使用者永久遷成空 entries」。）
 
 **wsregistry（unit）**：
 - `Migrate` 依 `LegacyEntry.HasLegacyTranscript` 設 flag：有 legacy window → true；
@@ -220,7 +247,7 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
   provider entry」。若某些升級路徑已清空 restore.json，該使用者落入「零候選」→
   marker 落盤、舊歷史仍不可見（可接受的降級，非資料損毀）。
 - **legacy window 的量**：受 `ViewStartEventID` boundary 限制（通常是最後一次開新
-  對話後的一段），非整個 provider 歷史；首載一次全給可接受。若某使用者 boundary
+  對話後的一段），非整個 provider 歷史；抵達最舊 WSID turn 頁時一次全給可接受。若某使用者 boundary
   極早導致 window 巨大，首載會偏重——列為已知邊界，不在本票處理分頁。
 - （event 順序不再列為待驗證假設——§5 已把「合併後依 event_id 遞增排序」定為正式
   演算法保證，不依賴時序假設。）
