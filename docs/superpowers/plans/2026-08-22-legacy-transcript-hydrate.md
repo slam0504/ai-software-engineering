@@ -11,6 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md`（commit d330c9d）
 
 **Plan 修訂記錄：**
+- rev4（2026-08-22，plan review 新 P1）：rev3 把 euid skip 放在 Task 6 測試最前面，root 環境會連 Scanner.Err()、marker 斷言、修復重試整條略過，與覆蓋聲明不一致。改為 `t.Run("open_error", ...)` subtest 內才 skip（skip 時 chmod 與 restoreSessions 都不執行、狀態未動，後續 phase 前提不壞）；Task 5 的 open error case 同樣拆 subtest，root 不再把整個 TestScanLegacyWindow 標成 skipped；`assertNotMigrated` 改收 subtest 的 `*testing.T`（Fatal 不得跨 goroutine 呼叫外層 t）。
 - rev3（2026-08-22，plan gate 新 P1）：darwin 上 `os.Open(目錄)` 會成功、錯誤到讀取才出現——原標成「open error」的目錄注入實際全走 `Scanner.Err()` 分支，真 open error（非 NotExist）無測試打到。Task 5／Task 6 改用 `chmod 0o000`（euid==0 skip，沿用 app_restore_dormant_test.go:190 前例）覆蓋 open 分支，三處註解措辭改與實際注入路徑相符；P2：Task 7 接線保留 `noteStartupBlocker` 並註明與 spec「warning」措辭的取捨；Self-Review 行號修正。
 - rev2（2026-08-22，plan review 4 P1）：Task 7 測試改用 `registryOnDisk` 取 Store（`newTestAppAt` 不接 `a.wsReg`，原寫法會 nil panic）；Task 6 改用真正 transcript-only fixture、經 `loadSessionRegistry` 驗證掃描錯誤不落 migrated marker＋修復後可重試；Task 4／7 補齊 spec §4／§8 凍結分支測試（零候選 marker、ViewStart 不精確相等、tombstone／provider 不算候選、scanner 錯誤不落 marker、已 backfilled 不重跑、persist 失敗全回滾、uncertain latch 枚舉表）；Task 8 納入 root package 的 `TurnsBefore` callers（`rebuild_orchestrator.go:302`、`app_replayindex_test.go:413`）避免 commit 後 build 壞掉；Task 10 fixture 改 pre-fix 形狀、經 `restoreSessions` 驗證 backfill 接線（同時涵蓋 startup wiring）。
 
@@ -436,17 +437,20 @@ func TestScanLegacyWindow(t *testing.T) {
 	}
 	// 真 open error（EACCES，非 NotExist）：spec §5a 凍結「開檔失敗→回 error」。
 	// 沒有這條的話，把 open 錯誤全當 NotExist 吞掉的 mutation 在整份測試存活——
-	// 而那正是 transcript-only 使用者被永久遷成空 entries 的路徑。
-	if os.Geteuid() == 0 {
-		t.Skip("root 會繞過檔案權限，無法重現 open error")
-	}
-	if err := os.Chmod(path, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-	if _, err := scanLegacyWindow(path, "claude", ""); err == nil {
-		t.Fatal("open error（非 NotExist）必須回 error，不得當 NotExist 吞掉")
-	}
+	// 而那正是 transcript-only 使用者被永久遷成空 entries 的路徑。subtest 內才
+	// skip：root 只失去這一段，不會把整個 TestScanLegacyWindow 標成 skipped。
+	t.Run("open_error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root 會繞過檔案權限，無法重現 open error")
+		}
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+		if _, err := scanLegacyWindow(path, "claude", ""); err == nil {
+			t.Fatal("open error（非 NotExist）必須回 error，不得當 NotExist 吞掉")
+		}
+	})
 }
 ```
 
@@ -512,9 +516,6 @@ func seedTranscriptOnlyLegacyFixture(t *testing.T) string {
 }
 
 func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 會繞過檔案權限，無法重現 open error")
-	}
 	dir := seedTranscriptOnlyLegacyFixture(t)
 	a := newTestAppAt(t, dir) // 先建 App（sink 要開得了原始 events.jsonl）再破壞檔案
 	events := filepath.Join(dir, "events.jsonl")
@@ -522,7 +523,7 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertNotMigrated := func(phase string) {
+	assertNotMigrated := func(t *testing.T, phase string) {
 		t.Helper()
 		reg := registryOnDisk(t, dir)
 		if reg.Migrated() {
@@ -534,17 +535,23 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 	}
 	// (1) 真 open error（EACCES，非 NotExist）：darwin 上 os.Open(目錄) 會成功、
 	// 錯誤到讀取才出現，換目錄注入打不到 open 分支——用 chmod 0o000 才是 open error。
-	if err := os.Chmod(events, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.restoreSessions(); err == nil {
-		t.Fatal("open error 時 loadSessionRegistry 必須回錯（不得靜默跳過遷移）")
-	}
-	assertNotMigrated("open error")
+	// subtest 內才 skip：root 下 chmod 與 restoreSessions 都不執行、狀態未動，
+	// (2)(3) 的前提不受影響——Scanner.Err()／marker 斷言／修復重試在 root 仍照跑。
+	t.Run("open_error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root 會繞過檔案權限，無法重現 open error")
+		}
+		if err := os.Chmod(events, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(events, 0o644) })
+		if _, err := a.restoreSessions(); err == nil {
+			t.Fatal("open error 時 loadSessionRegistry 必須回錯（不得靜默跳過遷移）")
+		}
+		assertNotMigrated(t, "open error")
+	})
 	// (2) scan error：單行超過 scanner buffer 上限（16MiB）→ Scanner.Err()=ErrTooLong。
-	if err := os.Chmod(events, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// 與權限無關，root 也照跑。
 	if err := os.Remove(events); err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +562,7 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 	if _, err := a.restoreSessions(); err == nil {
 		t.Fatal("Scanner.Err() 非 nil 時必須回錯（不得把讀到一半當完整 window）")
 	}
-	assertNotMigrated("scan error")
+	assertNotMigrated(t, "scan error")
 	// (3) 修復後重試：正常遷移、transcript-only entry 帶 LegacyTranscript=true。
 	if err := os.WriteFile(events, orig, 0o644); err != nil {
 		t.Fatal(err)
