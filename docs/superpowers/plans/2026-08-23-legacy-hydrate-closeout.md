@@ -22,8 +22,9 @@
 ### Task 1: wsregistry — ClearLegacyTranscript
 
 **Files:**
-- Modify: `internal/wsregistry/store.go`（緊鄰 `ResetView`）、`internal/wsregistry/fsync_test.go`（latch `writes` 枚舉表加一行）
-- Modify: `app.go`（`sessionRegistry` interface 加 `ClearLegacyTranscript(wsid string) error`，約 :676——`var _ sessionRegistry = (*wsregistry.Store)(nil)` 既有斷言會自動驗證實作）
+- Modify: `internal/wsregistry/store.go`（緊鄰 `ResetView`）、`internal/wsregistry/fsync_test.go`（latch `writes` 枚舉表加一行＋`:232` 的 `Put` 補 `LegacyTranscript: true` 讓新條目是真變更）
+- Modify: `app.go`（`sessionRegistry` interface 加 `ClearLegacyTranscript(wsid string) error`，約 :676——`var _ sessionRegistry = (*wsregistry.Store)(nil)` 既有斷言隨 build 驗證）
+- Modify: `app_wsid_test.go`（**plan gate P1**：`stubRegistry`（:14）實作 `sessionRegistry`、被 30+ 處測試使用——interface 加方法後必須同步補 stub 方法（受既有 `mutateErr` 驅動，對齊其他 mutator stub 的寫法），否則本 task 的 commit 會讓 root package 測試編譯失敗，且 `go build ./...` 抓不到（test 檔要 `go vet ./...` 或 `go test` 才編譯）
 - Test: `internal/wsregistry/store_test.go`
 
 **Interfaces:**
@@ -127,7 +128,7 @@ func TestClearLegacyTranscriptPersistFailureRollsBack(t *testing.T) {
 "ClearLegacyTranscript": func() error { return s.ClearLegacyTranscript("w1") },
 ```
 
-（注意：枚舉表的 "w1" 在該測試中 flag 為 false——冪等路徑刻意排在 latch 檢查之前會讓「拒絕」斷言失效。實作時 latch 檢查必須在冪等比對**之前**：latch 後任何寫入入口一律拒絕，包含冪等 no-op——與 `SetLayout` 在枚舉表內的既有處理一致，動手前先讀 store.go:519-521 那段「冪等比對刻意排在 latch 檢查之前」的 doc 確認 SetLayout 的實際順序，若 SetLayout 是冪等先於 latch，則本方法對齊 SetLayout 的順序並將枚舉表條目改用 flag=true 的 entry——以既有慣例為準，不自創第三種順序。）
+（**順序凍結（plan gate 校正）**：沿用 `SetLayout` 慣例——**冪等比對先於 latch 檢查**（store.go:565-575 doc：「不改變任何可觀測狀態，所以刻意排在 latch 檢查之前」；latch gate 在 `persistOrRollback` :275-278）。因此枚舉表條目必須是**真變更**才會走到 latch 拒絕：把 fsync_test.go:232 的 `Put(Entry{WSID:"w1", ...})` 補 `LegacyTranscript: true`——同表的 `SetLayout` 條目（:261）刻意傳非 no-op 的 Layout，正是「表內條目必須是真變更」的既有慣例。不自創第三種順序。）
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -136,17 +137,17 @@ Expected: FAIL — `s.ClearLegacyTranscript undefined`（編譯失敗，含 fsyn
 
 - [ ] **Step 3: Write minimal implementation**
 
-`Store.ClearLegacyTranscript`：取 mu；哨兵判定（不存在→ErrEntryNotFound、`RemovedAt!=""`→ErrTombstoned）；順序依 Step 1 括號註記對齊 `SetLayout` 慣例處理 latch 與冪等；flag=true 時存舊值、設 false、`persistOrRollback`。`sessionRegistry` interface（app.go:676）加同名方法。doc 說明：§6a 窄寫入、僅清旗標不動 boundary、冪等語意。
+`Store.ClearLegacyTranscript`：取 mu；哨兵判定（不存在→ErrEntryNotFound、`RemovedAt!=""`→ErrTombstoned）；冪等比對先於 latch（Step 1 括號註記）；flag=true 時存舊值、設 false、`persistOrRollback`。`sessionRegistry` interface（app.go:676）加同名方法；`stubRegistry`（app_wsid_test.go:14）補同名方法（受 `mutateErr` 驅動，對齊既有 mutator stub）。doc 說明：§6a 窄寫入、僅清旗標不動 boundary、冪等語意。
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/wsregistry/ -count=1 && go build ./...`
-Expected: PASS（interface 斷言隨 build 驗證）
+Run: `go vet ./... && go test ./internal/wsregistry/ -count=1`
+Expected: PASS——**必須用 `go vet ./...`**：`go build ./...` 不編譯 test 檔，抓不到 stubRegistry 缺方法（plan gate 實測：漏補 stub 時 build 綠、vet 立刻報 `*stubRegistry does not implement sessionRegistry`）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/wsregistry/store.go internal/wsregistry/store_test.go internal/wsregistry/fsync_test.go app.go
+git add internal/wsregistry/store.go internal/wsregistry/store_test.go internal/wsregistry/fsync_test.go app.go app_wsid_test.go
 git commit -m "feat(wsregistry): ClearLegacyTranscript——§6a 窄寫入（冪等、哨兵、回滾、latch 登記）"
 ```
 
@@ -195,8 +196,8 @@ git commit -m "feat: scanLegacyWindow 簽章擴充 scanned——NotExist 與成�
 ### Task 3: loadTurnsBefore — §6a 空 window 清旗標
 
 **Files:**
-- Modify: `rebuild_orchestrator.go`（合併分支）
-- Test: `app_legacy_transcript_test.go`
+- Modify: `rebuild_orchestrator.go`（合併分支＋新增 wsregistry import）
+- Test: `app_legacy_transcript_test.go`、`app_registry_uncertain_test.go`（uncertain 稽核覆蓋表加 legacy_flag_clear 一列）
 
 **Interfaces:**
 - Consumes: `scanned`（Task 2）、`a.wsReg.ClearLegacyTranscript`（Task 1，經 sessionRegistry interface）。
@@ -219,22 +220,35 @@ func TestLoadTurnsBeforeEmptyWindowClearsFlagAndStopsScanning(t *testing.T) {
 	if e, _ := registryOnDisk(t, a.stateDir).Get(w); e.LegacyTranscript {
 		t.Fatal("成功掃描零筆後旗標應清除並持久化")
 	}
-	// 第二次首載行為不變（flag 清除後合併分支被 e.LegacyTranscript gate 掉——
-	// 「不再掃描」是 flag 語意的直接推論，由本斷言＋既有反向測試
-	// TestLoadTurnsBeforeNonLegacyHasNoWSIDlessEvents 共同守住）。
-	// 刻意**不**用「破壞 events.jsonl 後第二次呼叫仍成功」證明不再掃描：
-	// 那個注入依賴 readEnvelopeRange 目前吞讀取錯誤的行為，replay
-	// reliability 票（下一張）修掉吞錯後會誤紅。
+	// 「不再掃描」的確定性 mutation 守門（plan gate 校正——len(p2)==len(p1)
+	// 對任何 mutation 恆真，檔案破壞注入又依賴 readEnvelopeRange 吞錯行為、
+	// replay reliability 票修掉後會誤紅）：追加一筆 boundary 之後的無 WSID
+	// claude 事件。旗標若沒被真的清掉（或合併分支忽略 flag），第二次首載會
+	// 掃到它並前綴 → 打紅；正確實作下分支被 flag gate 掉、不掃、不出現。
+	f, err := os.OpenFile(filepath.Join(a.stateDir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"event_id":"zz-late-legacy","provider":"claude","kind":"message","role":"user","text":"late-legacy"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
 	p2, err := a.LoadTurnsBefore(w, "", 20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p2) != len(p1) {
-		t.Fatalf("旗標清除後首載內容應不變：%d != %d", len(p2), len(p1))
+	if hasLegacyText(p2) {
+		t.Fatal("旗標清除後不得再掃 legacy window（追加的無 WSID 事件不應出現）")
 	}
 }
 
 // NotExist 不清：缺檔不等於成功掃描零筆。
+// 覆蓋說明（plan gate 校正）：loadTurnsBefore 自己會先 os.Open(events.jsonl)，
+// NotExist 在合併分支**之前**就早退（rebuild_orchestrator.go:313-319）——本測試
+// 驗的是「整條路徑對缺檔不清旗標」這個使用者可見契約，不是 scanned 的
+// mutation 守門；scanned==false 的契約由 Task 2 的 unit 測試守。scanned 在
+// 本 caller 的實際作用是「早退 open 與 legacy 掃描之間檔案被移除」的 TOCTOU
+// 防禦窗口——無法以確定性測試打紅，依 spec §6a 凍結保留。
 func TestLoadTurnsBeforeMissingEventsDoesNotClearFlag(t *testing.T) {
 	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5)
 	events := filepath.Join(a.stateDir, "events.jsonl")
@@ -296,6 +310,9 @@ func TestLoadTurnsBeforeClearPersistFailureFailsLoud(t *testing.T) {
 既有 `TestLoadTurnsBeforeEmptyViewStartDoesNotPrefixLegacy` 擴一條斷言：呼叫後
 `registryOnDisk` 讀 flag 仍 true（空 ViewStart 未掃描、不清）。
 
+（主測試追加事件的形狀需與 `hasLegacyText` 的實際判準對齊——動手前先讀該 helper：
+若以「無 WSID」判定則如上即可，若以特定 text 判定則把 text 換成它認得的字樣。）
+
 helper `seedLegacyFewTurnsAppNoLegacyEvents(t, n)`：沿用 `seedLegacyFewTurnsApp` 手法但
 events.jsonl **不放**無 WSID 事件（只有 n 個 WSID turn）；registry entry flag=true、
 ViewStart 非空（"00" 前綴慣例）；`a.wsReg = registryOnDisk(t, dir)` 接線（既有慣例）。
@@ -323,18 +340,27 @@ if !hasOlder && a.wsReg != nil {
 		if len(legacy) > 0 {
 			out = append(legacy, out...)
 		} else if scanned {
-			// §6a：成功掃描確定零筆才清旗標（NotExist 的 scanned==false 不清）。
+			// §6a：成功掃描確定零筆才清旗標（scanned 擋「早退 open 與掃描之間
+			// 檔案被移除」的 TOCTOU 窗口；NotExist 主路徑在本函式開頭已早退）。
 			// persist 失敗 fail loud——registry 寫不進去時掩蓋只會更晚發現。
 			if cerr := a.wsReg.ClearLegacyTranscript(wsid); cerr != nil &&
 				!errors.Is(cerr, wsregistry.ErrEntryNotFound) && !errors.Is(cerr, wsregistry.ErrTombstoned) {
-				return nil, cerr
+				return nil, a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
 			}
 		}
 	}
 }
 ```
 
-doc 註解引 §6a 四分支與 owner 裁決；`import "errors"`／wsregistry 已有。
+doc 註解引 §6a 四分支與 owner 裁決。**新 registry 寫入點依既有慣例接線（plan gate P2）**：
+錯誤經 `a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)`（app.go:734-751 doc
+明定「任一 registry 寫入」的統一稽核，既有七個呼叫點），並在
+`TestRegistryUncertainAuditCoversStubbableWrites`（app_registry_uncertain_test.go）加一列
+（Task 1 補的 stub 方法正好可驅動）、該測試檔的「呼叫點數」說明一併更新。哨兵良性
+跳過是否比照 `noteRegistryWriteResult`（app.go:1191-1197）留 `session_metadata_write_skipped`
+——先讀該 helper 的既有消費者再決定，對齊慣例、不強加。
+`import`：`errors` 已有（rebuild_orchestrator.go:8）；**`wsregistry` 需新增**（現行
+imports 無它——plan gate 校正）。
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -437,7 +463,7 @@ Expected: 全綠（牆鐘不穩定測試依 memory 具名清單，紅則單獨�
 ## Self-Review
 
 **1. Spec coverage（§6a／§4／§5a／§3）：**
-- §6a 四分支：成功零筆清（Task 3 主測試）、空 ViewStart 不清（既有 I1 測試擴斷言）、NotExist 不清（Task 3）、scan error 不清（Task 3）、persist error 不清＋回錯＋重試（Task 3）✓
+- §6a 四分支：成功零筆清＋不再掃描 mutation 守門（Task 3 主測試，追加事件探針）、空 ViewStart 不清（既有 I1 測試擴斷言）、NotExist 不清（**聯合覆蓋**：loadTurnsBefore 層驗整條路徑早退不清（Task 3）＋`scanned==false` 契約由 Task 2 unit 守；scanned 在此 caller 是 TOCTOU 防禦、無確定性打紅手段，plan gate 已審）、scan error 不清（Task 3）、persist error 不清＋回錯＋重試（Task 3）✓
 - §6a 寫入口（冪等／哨兵／回滾／latch 枚舉）：Task 1 ✓；不動 boundary：Task 1 斷言 ✓
 - §5a scanned 簽章＋NotExist 區分＋既有 caller 行為不變：Task 2 ✓
 - §4 失敗軌跡 audit 正反向：Task 4 ✓

@@ -231,7 +231,7 @@ events.jsonl）時，每次首載（`hasOlder==false` 的頁）都會對 events.
 |---|---|
 | `scanned==true` 且零筆（檔案開啟成功、完整掃描、`Scanner.Err()==nil`） | 清除 `LegacyTranscript`（單向、僅清旗標、**不動 boundary**），下次首載不再掃描 |
 | `ViewStartEventID==""`（§5 guard 擋下、未實際掃描） | **不清除**——flag 維持惰性（§3 語意例外） |
-| NotExist（`scanned==false`） | **不清除**——缺檔不等於成功掃描零筆，可能是暫時狀態 |
+| NotExist（`scanned==false`） | **不清除**——缺檔不等於成功掃描零筆，可能是暫時狀態。（實作註記：`loadTurnsBefore` 開頭自己的 `os.Open` 對 NotExist 已早退、通常到不了合併分支——此格的主路徑由早退覆蓋；分支內的 `scanned` 條件擋的是「早退 open 與 legacy 掃描之間檔案被移除」的 TOCTOU 窗口，無確定性測試可打紅，凍結保留） |
 | open／scan error | **不清除**、`loadTurnsBefore` 回錯（既有 §5 語意），下次可重試 |
 
 **寫入口**：新增 `Store.ClearLegacyTranscript(wsid) error`（sessionRegistry interface
@@ -316,8 +316,11 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 
 **§6a 空 window 清旗標（closeout 2026-08-23）**：
 - 成功清除：flag=true、boundary 非空、window 空 → 首載成功回頁、flag 清為 false
-  且持久化；**第二次首載不再掃描**（events.jsonl 破壞後第二次呼叫仍成功——證明
-  真的沒掃，沿用 backfill 冪等測試的注入手法）。
+  且持久化；**第二次首載不再掃描**——探針：清除後往 events.jsonl 追加一筆
+  boundary 之後的無 WSID 事件，第二次首載不得含它（清除失效或分支忽略 flag 的
+  mutation 會把它前綴出來，確定性打紅。刻意不用檔案破壞注入：NotExist 會被
+  loadTurnsBefore 自己的早退擋掉、目錄／權限注入則依賴 readEnvelopeRange 現行
+  吞錯行為，replay reliability 票修掉後會誤紅）。
 - NotExist 不清：events.jsonl 不存在 → 首載成功（無前綴）、flag 仍 true（磁碟）。
 - scan error 不清：回錯、flag 仍 true。
 - persist error 不清：registry 目錄唯讀注入 → 首載回錯、flag 仍 true（磁碟）、
