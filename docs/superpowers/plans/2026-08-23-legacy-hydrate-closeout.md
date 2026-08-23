@@ -323,8 +323,8 @@ Store——斷言一律用**重新開一份** `registryOnDisk(t, dir)` 讀磁碟
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test . -run 'TestLoadTurnsBeforeEmptyWindowClearsFlagAndStopsScanning|TestLoadTurnsBeforeMissingEventsDoesNotClearFlag|TestLoadTurnsBeforeScanErrorDoesNotClearFlag|TestLoadTurnsBeforeClearPersistFailureFailsLoud' -v`
-Expected: FAIL — 目前不清旗標（主測試「不再掃描」段紅）；其餘分支測試在主實作前也紅或編譯錯
+Run: `go test . -run 'TestLoadTurnsBeforeEmptyWindowClearsFlagAndStopsScanning|TestLoadTurnsBeforeMissingEventsDoesNotClearFlag|TestLoadTurnsBeforeScanErrorDoesNotClearFlag|TestLoadTurnsBeforeClearPersistFailureFailsLoud|TestRegistryUncertainAuditCoversStubbableWrites' -v`
+Expected: FAIL — 目前不清旗標（主測試「不再掃描」段紅）；其餘分支測試在主實作前也紅或編譯錯；uncertain 覆蓋表新列在接線前紅
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -356,7 +356,11 @@ doc 註解引 §6a 四分支與 owner 裁決。**新 registry 寫入點依既有
 錯誤經 `a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)`（app.go:734-751 doc
 明定「任一 registry 寫入」的統一稽核，既有七個呼叫點），並在
 `TestRegistryUncertainAuditCoversStubbableWrites`（app_registry_uncertain_test.go）加一列
-（Task 1 補的 stub 方法正好可驅動）、該測試檔的「呼叫點數」說明一併更新。哨兵良性
+（Task 1 補的 stub 方法正好可驅動）、該測試檔的「呼叫點數」說明一併更新。新列的
+fixture 三前提（plan gate 實測確認可落地）：stub entry 的 `LegacyTranscript=true` 且
+`ViewStartEventID` 非空（如 "0000000000"）、events.jsonl 存在（`newTestApp`＋
+`mustCreate` 之後即存在）、window 為空——三者齊備才會走到清旗標呼叫點，缺一列就
+驅動不起來，不得因此默默略過該列。哨兵良性
 跳過是否比照 `noteRegistryWriteResult`（app.go:1191-1197）留 `session_metadata_write_skipped`
 ——先讀該 helper 的既有消費者再決定，對齊慣例、不強加。
 `import`：`errors` 已有（rebuild_orchestrator.go:8）；**`wsregistry` 需新增**（現行
@@ -364,13 +368,13 @@ imports 無它——plan gate 校正）。
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test . -run TestLoadTurnsBefore -count=1 -v`
-Expected: PASS（含既有 7 個與新增 4 個）
+Run: `go test . -run 'TestLoadTurnsBefore|TestRegistryUncertainAuditCoversStubbableWrites' -count=1 -v`
+Expected: PASS（含既有 7 個、新增 4 個、uncertain 覆蓋表新列）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rebuild_orchestrator.go app_legacy_transcript_test.go
+git add rebuild_orchestrator.go app_legacy_transcript_test.go app_registry_uncertain_test.go
 git commit -m "feat(app): loadTurnsBefore 空 window 清旗標——§6a 四分支、persist 失敗 fail loud"
 ```
 
