@@ -64,6 +64,12 @@ migration 允許只有 resume identity／task label、**沒有 legacy window** �
 觸發合併邏輯、語意不符。reverse 測試：resume-only／task-only entry 的
 `LegacyTranscript==false`。
 
+**語意例外（closeout 2026-08-23 對齊實作）**：`ViewStartEventID==""` 的 entry
+其 flag 可能為 true 但**不可顯示**——hydrate 端依 §5 guard 對空 boundary 一律
+不前綴（無可信 boundary＝無可信比對證據）。此時 flag 是惰性的，不觸發任何載入
+行為，也**不**因此被清除（§6a：清除前提是「實際掃描成功且零筆」，空 boundary
+根本沒有掃描）。
+
 ## 4. 一次性 backfill（app startup，沿用 `backfillResumeFromLegacy` 附近）
 
 對「本修正之前已遷移」的既有使用者（`Migrated()==true` 但無任何 `LegacyTranscript`
@@ -97,8 +103,17 @@ entry，尋找候選 WSID entry，**五條件同時成立**才算候選：
 - **恰一候選** → 標記該 entry `LegacyTranscript=true`。
 - **零候選** → 該 provider 無待補（已 NewSession 前移 boundary／已移除／本就無
   legacy transcript），安全略過。
-- **多候選** → **不猜、fail loud、marker 不落盤**（回錯，啟動期記 startup warning，
-  不阻擋啟動其餘部分；下次啟動可重試）。
+- **多候選** → **不猜、fail loud、marker 不落盤**（回錯，啟動期記 startup blocker
+  ——僅影響訊息排序優先度、**不阻擋啟動其餘部分**（closeout 2026-08-23 措辭對齊
+  實作：沿用 `backfillResumeFromLegacy` 失敗的 `noteStartupBlocker` 前例）；
+  下次啟動可重試）。
+
+**失敗軌跡（closeout 2026-08-23 新增）**：backfill 失敗（多候選／scan error／
+persist error）除 startup blocker 外，寫入具名稽核事件
+`legacy_transcript_backfill_failed`（`{"error": ...}`，對齊同檔
+`resume_backfill_failed` 慣例）——startup 訊息是一次性的，audit.jsonl 才是事後
+診斷「為什麼這次啟動沒補標記」的持久軌跡。成功路徑**不**另發 audit：結果已可由
+registry 的 marker 與 entry flag 直接觀測。
 
 **I/O 錯誤不得誤判成零候選**（reviewer 2026-08-22 P1）：條件 4 的 legacy window
 掃描**不得**用 `replayViewWindow`——它開檔失敗回 nil、且不檢查 `Scanner.Err()`
@@ -177,14 +192,21 @@ provider，不猜）：無可信 boundary 來源＝無可信比對證據，寧�
 
 ## 5a. error-returning legacy scanner（`scanLegacyWindow`）
 
-新增 `scanLegacyWindow(eventsPath, provider, viewStart) ([]contract.Envelope, error)`，
+新增 `scanLegacyWindow(eventsPath, provider, viewStart) ([]contract.Envelope, scanned bool, error)`
+（closeout 2026-08-23 簽章擴充：原 `([]contract.Envelope, error)`），
 供**三條路徑共用**——§3 migration 的 `legacyEntries()`、§4 backfill、§5 合併載入
 （三處都必須正確處理 I/O 錯誤；reviewer 2026-08-22 P1）：
 
 - 語意同 `replayViewWindow`（provider 相符、event_id > viewStart、排除 workspace／
   spec_assist scope），**額外只保留 `WorkspaceSessionID==""`**（pre-migration）。
-- 開檔失敗（非 `os.IsNotExist`）→ 回 error。檔案不存在 → 回 `(nil, nil)`（全新
+- 開檔失敗（非 `os.IsNotExist`）→ 回 error。檔案不存在 → 回 `(nil, false, nil)`（全新
   workspace，非錯誤）。
+- **`scanned` 語意（closeout 2026-08-23）**：`true`＝檔案存在、開檔成功、完整掃描到
+  EOF 且 `Scanner.Err()==nil`——「零筆」與「檔案不存在」自此可區分。既有三個呼叫端
+  對 NotExist 的行為**不變**（`legacyEntries` 判 `HasLegacyTranscript=false`、
+  backfill 判零候選、合併載入無可前綴），新增的 §6a 清旗標是唯一依賴 `scanned==true`
+  的消費者：NotExist 不得視為「成功掃描零筆」而清旗標——events.jsonl 缺檔可能是
+  暫時狀態，清了就不可逆。
 - 掃描結束檢查 `Scanner.Err()`，非 nil → 回 error（修 restore.go:167 既有缺口的
   同類問題；`replayViewWindow` 本身保留不動，僅 RestoreViews 用）。
 - malformed 單行跳過不中斷（同既有語意）。
@@ -195,6 +217,37 @@ provider，不猜）：無可信 boundary 來源＝無可信比對證據，寧�
 持久化交易清除 `entry.LegacyTranscript=false`——開新對話＝建立新 view 世代，舊
 legacy 歷史不再屬於目前 view。實作：`ResetView` 一併清標記（單一原子寫入），
 避免「boundary 前移了但標記還在」導致 legacy 歷史在新世代復活。
+
+## 6a. 空 window 首載清旗標（closeout 2026-08-23，owner 裁決語意）
+
+**問題**：`LegacyTranscript=true` 但 boundary 後已無無 WSID 事件（例如使用者手動清過
+events.jsonl）時，每次首載（`hasOlder==false` 的頁）都會對 events.jsonl 做一次完整
+掃描才發現零筆——這是系統中唯一會**重複發生**的全檔掃描（integration review
+2026-08-23 M2）。
+
+**清除條件（四分支，owner 凍結）**——只在 §5 合併分支、`scanLegacyWindow` 回傳後判定：
+
+| 情況 | 處置 |
+|---|---|
+| `scanned==true` 且零筆（檔案開啟成功、完整掃描、`Scanner.Err()==nil`） | 清除 `LegacyTranscript`（單向、僅清旗標、**不動 boundary**），下次首載不再掃描 |
+| `ViewStartEventID==""`（§5 guard 擋下、未實際掃描） | **不清除**——flag 維持惰性（§3 語意例外） |
+| NotExist（`scanned==false`） | **不清除**——缺檔不等於成功掃描零筆，可能是暫時狀態 |
+| open／scan error | **不清除**、`loadTurnsBefore` 回錯（既有 §5 語意），下次可重試 |
+
+**寫入口**：新增 `Store.ClearLegacyTranscript(wsid) error`（sessionRegistry interface
+一併擴充）——mutate closure 內僅設 `LegacyTranscript=false`、沿用 per-WSID durable
+writer 慣例（`ErrEntryNotFound`／`ErrTombstoned` 哨兵，呼叫端視為良性跳過）；
+flag 已為 false 時冪等跳過、不落盤（沿用 `SetLayout` 冪等比對前例）。
+新 mutator 依慣例登記進 uncertain latch 的寫入拒絕枚舉表（fsync_test.go）。
+
+**persist 失敗（含 uncertain latch 拒絕）**：不清除（store 自行回滾記憶體）、
+`loadTurnsBefore` **回錯**（owner 裁決 fail loud、保留重試機會）。取捨：這把一個
+「純優化」的寫入失敗升級成該頁載入失敗——接受，因為 registry 寫入失敗（尤其
+uncertain latch）代表整個 registry 已不可寫，掩蓋它只會讓使用者更晚發現。
+
+**併發**：清除發生在讀路徑（`loadTurnsBefore`）上，是刻意的窄寫入——Store mutex
+序列化所有 registry 寫入；`ResetView` 與本清除都只把 flag 單向清成 false，
+無競態方向風險。
 
 ## 7. 元件邊界與資料流
 
@@ -260,6 +313,25 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 - scanner I/O 錯誤 → loadTurnsBefore 回 error（不靜默少給 legacy）。
 - view boundary：boundary 之後才回；前移 boundary（清標記）後不再含 legacy。
 - 20-turn：legacy 不佔 turn 額度。
+
+**§6a 空 window 清旗標（closeout 2026-08-23）**：
+- 成功清除：flag=true、boundary 非空、window 空 → 首載成功回頁、flag 清為 false
+  且持久化；**第二次首載不再掃描**（events.jsonl 破壞後第二次呼叫仍成功——證明
+  真的沒掃，沿用 backfill 冪等測試的注入手法）。
+- NotExist 不清：events.jsonl 不存在 → 首載成功（無前綴）、flag 仍 true（磁碟）。
+- scan error 不清：回錯、flag 仍 true。
+- persist error 不清：registry 目錄唯讀注入 → 首載回錯、flag 仍 true（磁碟）、
+  修復後重試成功並清除。
+- 空 ViewStart 不清：既有 I1 測試擴斷言——guard 擋下後 flag 仍 true。
+- `scanLegacyWindow` 簽章：NotExist → `scanned==false`；空檔／過濾後零筆 →
+  `scanned==true`（unit）。
+- `ClearLegacyTranscript`（wsregistry unit）：清除持久化 round-trip、
+  `ErrEntryNotFound`／`ErrTombstoned` 哨兵、已 false 冪等不落盤、
+  uncertain latch 枚舉表拒絕。
+
+**§4 失敗軌跡（closeout 2026-08-23）**：
+- backfill 多候選 fixture → audit.jsonl 出現 `legacy_transcript_backfill_failed`
+  且帶 error 內容；成功路徑不發該事件（反向）。
 
 **既有契約不破**：
 - `TestLegacyJournalWithoutWSIDAttributes`（RestoreViews provider-keyed）維持綠。
