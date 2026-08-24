@@ -2239,7 +2239,20 @@ func (a *App) openStateWriters(lease *stateLease) bool {
 		ClaudeUsageCumulative: false,
 		Index:                 indexOrNil(a.replayIndex),
 	})
-	hw, _, _ := auditHighWatermark(a.eventsPath())
+	hw, scanned, werr := auditHighWatermark(a.eventsPath())
+	if werr != nil || !scanned { // §4：讀不到／未能確認高水位——留稽核軌跡＋警告，
+		// 不擋啟動；hw 此時恆為 ""（auditHighWatermark 契約），交給
+		// openRestoreStore 的既有 fallback 消費。
+		errText := ""
+		if werr != nil {
+			errText = werr.Error()
+		} else { // NotExist：函式層回報「未能確認」而非錯誤，這裡補一句可操作的說明
+			errText = "找不到 " + a.eventsPath() + "（events.jsonl 尚未建立，高水位視為未知）"
+		}
+		a.audit("restore_watermark_unavailable", map[string]any{
+			"path": a.eventsPath(), "error": errText})
+		a.noteStartupWarning("稽核高水位掃描失敗（view 起點回退為空字串，不影響本次啟動）：" + errText)
+	}
 	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), hw)
 	a.restore = rs
 	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）

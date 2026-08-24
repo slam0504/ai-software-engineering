@@ -1153,3 +1153,260 @@ func TestBackfillLegacyTranscriptSuccessNoFailureAudit(t *testing.T) {
 		t.Fatal("成功路徑不得發失敗 audit")
 	}
 }
+
+// ---- §4 startup watermark 不可用軌跡 ----
+//
+// 這一段刻意**不用 newTestAppAt**：它自己呼叫 openRestoreStore（見
+// newTestAppAt 內 hw, _, _ := auditHighWatermark(...)），根本不經本檔要驗的
+// openStateWriters（app.go:2242 一帶），而且 events.jsonl 為目錄時它在建
+// sink 那一步就會 t.Fatal——照用會拿到假綠或紅錯地方。改為直接組最小 App，
+// 走 a.openStateWriters(newTestStateLease(stateDir))（同 pattern：
+// app_audit_lifecycle_test.go:76／app_startup_state_test.go:236）。
+//
+// 多段啟動一律「建 App → openStateWriters → 驗證 → shutdown → 修復檔案 →
+// 下一次啟動」，shutdown 當場明確呼叫，不 defer 到測試結束——上一個 App 的
+// writer handle 若還留著，下一次就不是真實重啟。
+
+// startupWatermarkApp：openStateWriters 專用的最小 App。
+func startupWatermarkApp(t *testing.T, stateDir string) *App {
+	t.Helper()
+	a := NewApp()
+	a.ctx = context.Background()
+	a.stateDir = stateDir
+	return a
+}
+
+// auditLine：audit.jsonl 裡第一筆 kind 相符的整行（找不到回傳 ""）。
+func auditLine(t *testing.T, stateDir, kind string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	needle := `"kind":"` + kind + `"`
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.Contains(l, needle) {
+			return l
+		}
+	}
+	return ""
+}
+
+// readRestoreJSON：直接從磁碟讀 restore.json（不經 App），驗證持久化結果。
+func readRestoreJSON(t *testing.T, stateDir string) map[string]restoreEntry {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "restore.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]restoreEntry
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// lastEventIDOnDisk：獨立重算 events.jsonl 最後一筆 event_id——不呼叫
+// auditHighWatermark（受測邏輯的一部分），避免期望值與實作互相佐證。
+func lastEventIDOnDisk(t *testing.T, stateDir string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		var e struct {
+			EventID string `json:"event_id"`
+		}
+		if json.Unmarshal([]byte(line), &e) == nil && e.EventID != "" {
+			last = e.EventID
+		}
+	}
+	if last == "" {
+		t.Fatal("fixture 至少要有一筆帶 event_id 的合法行")
+	}
+	return last
+}
+
+// TestStartupWatermarkUnavailableDegradesWithTrace：restore.json 不存在＋
+// events.jsonl 為目錄（逼 auditHighWatermark 讀不到，不需權限技巧）——
+// openStateWriters 必須完成（不 panic、不擋啟動），且同時留下 audit 與
+// 啟動警告兩份軌跡（§4 凍結：appendMessage 是累加，不是 first-wins，sink
+// 錯誤不會把它蓋掉），fallback 的 "" 必須被消費並持久化到 restore.json。
+func TestStartupWatermarkUnavailableDegradesWithTrace(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "events.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := startupWatermarkApp(t, dir)
+	if !a.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("watermark 讀不到不得阻擋啟動，startupErr=%q", a.startupErrText())
+	}
+	a.shutdown(context.Background())
+
+	line := auditLine(t, dir, "restore_watermark_unavailable")
+	if line == "" {
+		t.Fatal("watermark 不可用必須留下具名 audit 事件")
+	}
+	if !strings.Contains(line, filepath.Join(dir, "events.jsonl")) {
+		t.Fatalf("audit data 必須含實際路徑，實得：%s", line)
+	}
+	if !strings.Contains(line, `"error"`) {
+		t.Fatalf("audit data 必須含 error 說明，實得：%s", line)
+	}
+	if !strings.Contains(a.startupErrText(), "稽核高水位掃描失敗") {
+		t.Fatalf("startupErrText 必須同時帶啟動警告，實得 %q", a.startupErrText())
+	}
+
+	entries := readRestoreJSON(t, dir)
+	if entries["claude"].ViewStartEventID != "" || entries["codex"].ViewStartEventID != "" {
+		t.Fatalf("watermark 不可用時 fallback 必須以空字串持久化，實得 %+v", entries)
+	}
+}
+
+// TestStartupWatermarkUnavailableCompleteRestoreUntouched：restore.json 已
+// 完整存在（兩 provider 皆非空 view_start）＋events.jsonl 為目錄——watermark
+// 不可用是事實，audit 仍要發；但 openRestoreStore 只補缺項（restore.go:63-67），
+// 既有 boundary 不得被 fallback 覆寫。
+func TestStartupWatermarkUnavailableCompleteRestoreUntouched(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "events.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seeded := map[string]restoreEntry{
+		"claude": {ViewStartEventID: "existing-claude"},
+		"codex":  {ViewStartEventID: "existing-codex"},
+	}
+	b, err := json.Marshal(seeded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := startupWatermarkApp(t, dir)
+	if !a.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("watermark 讀不到不得阻擋啟動，startupErr=%q", a.startupErrText())
+	}
+	a.shutdown(context.Background())
+
+	if auditLine(t, dir, "restore_watermark_unavailable") == "" {
+		t.Fatal("watermark 不可用是事實，即使 boundary 不變也必須發 audit")
+	}
+	entries := readRestoreJSON(t, dir)
+	if entries["claude"].ViewStartEventID != "existing-claude" || entries["codex"].ViewStartEventID != "existing-codex" {
+		t.Fatalf("既有 boundary 不得被 fallback 覆寫，實得 %+v", entries)
+	}
+}
+
+// TestStartupWatermarkAvailableNoTrace（反向格）：events.jsonl 正常可讀
+// （含至少一筆事件）→ openStateWriters 後不得發 restore_watermark_unavailable。
+// 防未來把這條 audit 改成無條件發的 mutation。
+func TestStartupWatermarkAvailableNoTrace(t *testing.T) {
+	dir := t.TempDir()
+	seedEvents(t, dir, `{"event_id":"ev-1","provider":"claude","kind":"message"}`)
+
+	a := startupWatermarkApp(t, dir)
+	if !a.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("正常 events.jsonl 不應阻擋啟動，startupErr=%q", a.startupErrText())
+	}
+	a.shutdown(context.Background())
+
+	if auditLine(t, dir, "restore_watermark_unavailable") != "" {
+		t.Fatal("watermark 可正常掃描時不得發 restore_watermark_unavailable")
+	}
+}
+
+// TestStartupWatermarkUnavailableMalformedRestoreRebuilt：restore.json 為壞
+// JSON＋events.jsonl 為目錄——openRestoreStore 的 malformed 分支（§4 fallback
+// 三消費條件之二）以 "" 重建並持久化，openStateWriters 仍要完成。
+func TestStartupWatermarkUnavailableMalformedRestoreRebuilt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "events.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "restore.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := startupWatermarkApp(t, dir)
+	if !a.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("malformed restore.json 不得阻擋啟動，startupErr=%q", a.startupErrText())
+	}
+	a.shutdown(context.Background())
+
+	if auditLine(t, dir, "restore_watermark_unavailable") == "" {
+		t.Fatal("watermark 不可用必須留下具名 audit 事件（與 malformed 重建各自獨立）")
+	}
+	entries := readRestoreJSON(t, dir)
+	if entries["claude"].ViewStartEventID != "" || entries["codex"].ViewStartEventID != "" {
+		t.Fatalf("重建後必須以空字串持久化，實得 %+v", entries)
+	}
+}
+
+// TestStartupWatermarkPersistentDegradeShape：三段啟動各自當場 shutdown——
+// events.jsonl 為目錄 → 修復（回填原始事件內容，但 restore.json 已有 entry，
+// 不會自動修復）→ 刪除 restore.json（唯一修復路徑）→ 第三次啟動快照才等於
+// 檔案上真正的最後一筆 event_id。
+func TestStartupWatermarkPersistentDegradeShape(t *testing.T) {
+	dir := t.TempDir()
+
+	// 第一段：events.jsonl 為目錄 → 降級留軌跡，restore.json 以 "" 落地。
+	if err := os.MkdirAll(filepath.Join(dir, "events.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a1 := startupWatermarkApp(t, dir)
+	if !a1.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("第一段：watermark 讀不到不得阻擋啟動，startupErr=%q", a1.startupErrText())
+	}
+	if auditLine(t, dir, "restore_watermark_unavailable") == "" {
+		t.Fatal("第一段：必須留下 watermark 不可用的稽核軌跡")
+	}
+	entries1 := readRestoreJSON(t, dir)
+	if entries1["claude"].ViewStartEventID != "" || entries1["codex"].ViewStartEventID != "" {
+		t.Fatalf("第一段：fallback 必須以空字串持久化，實得 %+v", entries1)
+	}
+	a1.shutdown(context.Background())
+
+	// 修復 events.jsonl：拿掉目錄、回填原始事件內容。restore.json 沒有動，
+	// 已經有 entry（即使值是 ""），openRestoreStore 只補缺項，不會自動修復。
+	if err := os.RemoveAll(filepath.Join(dir, "events.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	seedEvents(t, dir,
+		`{"event_id":"ev-1","provider":"claude","kind":"message"}`,
+		`{"event_id":"ev-2","provider":"claude","kind":"delta"}`,
+		`{"event_id":"ev-3","provider":"claude","kind":"result"}`)
+
+	a2 := startupWatermarkApp(t, dir)
+	if !a2.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("第二段：openStateWriters 必須成功，startupErr=%q", a2.startupErrText())
+	}
+	entries2 := readRestoreJSON(t, dir)
+	if entries2["claude"].ViewStartEventID != "" || entries2["codex"].ViewStartEventID != "" {
+		t.Fatalf("第二段：修復 events.jsonl 不會回頭改既有 restore.json 快照，實得 %+v", entries2)
+	}
+	a2.shutdown(context.Background())
+
+	// 刪除 restore.json——唯一的修復路徑：openRestoreStore 走 NotExist 分支，
+	// 以此刻真正掃描到的高水位重新 freshEntries。期望值從檔案內容獨立算出。
+	if err := os.Remove(filepath.Join(dir, "restore.json")); err != nil {
+		t.Fatal(err)
+	}
+	want := lastEventIDOnDisk(t, dir)
+
+	a3 := startupWatermarkApp(t, dir)
+	if !a3.openStateWriters(newTestStateLease(dir)) {
+		t.Fatalf("第三段：openStateWriters 必須成功，startupErr=%q", a3.startupErrText())
+	}
+	entries3 := readRestoreJSON(t, dir)
+	if entries3["claude"].ViewStartEventID != want || entries3["codex"].ViewStartEventID != want {
+		t.Fatalf("第三段：刪除 restore.json 後應以檔案上真正的高水位重建，want=%q 實得 %+v", want, entries3)
+	}
+	a3.shutdown(context.Background())
+}
