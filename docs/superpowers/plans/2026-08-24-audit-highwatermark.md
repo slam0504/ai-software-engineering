@@ -22,7 +22,7 @@
 ### Task 1: auditHighWatermark 簽章擴充＋unit 測試
 
 **Files:**
-- Modify: `restore.go:137-155`（auditHighWatermark）；6 個 caller 最小適配（production 兩處 `hw, _, _ :=` 過渡態——語意接線在 Task 2／3；測試四處同式）
+- Modify: `restore.go:137-155`（auditHighWatermark）；6 個 caller 最小適配（**gate 校正：5/6 個 caller 巢狀在別的呼叫引數內**（openRestoreStore 第二引數×4、ResetView 引數×1），須抽成前置語句 `hw, _, _ := auditHighWatermark(...)` 再傳入；唯 app_legacy_transcript_test.go:389 是單值賦值、補兩個 `_` 即可。gate 已實測抽取後 build/vet 乾淨。語意接線在 Task 2／3）
 - Test: `restore_watermark_test.go`（新檔，package main）
 
 **Interfaces:**
@@ -121,16 +121,46 @@ git commit -m "feat(app): auditHighWatermark 簽章擴充 (last, scanned, err)�
 
 - [ ] **Step 1: Write the failing test**
 
-三條（fixture 前提：migration marker 已設——用 `seedRegistry`＋`MarkMigrated` 先落已遷移 registry；events 注入用「events.jsonl 預建成目錄」打 scan error）：
+**測試層級（gate P1 校正——不得用 `newTestAppAt`）**：`newTestAppAt` 自己呼叫
+`openRestoreStore`（app_restore_dormant_test.go:59）、根本不經本 task 要改的
+`openStateWriters`（app.go:2242），且 events.jsonl 為目錄時它會在 sink 建立
+`t.Fatal`（:33-36）——照用會拿到假綠或紅錯地方。**無條件**改為直接呼叫
+`a.openStateWriters(newTestStateLease(stateDir))`（既有 pattern：
+app_audit_lifecycle_test.go:76／app_startup_state_test.go:236；gate 已實測此入口
+在 events.jsonl 為目錄下跑通、auditF 先開、restore.json 落 `""`）。
+**不需要 migration marker fixture**（gate P2：C4a 防護在 restoreSessions 層、
+不在本路徑；佈了無作用，為滿足它升級到完整 startup 反而引入 lease／workspace
+resolve 成本）。
 
-1. `TestStartupWatermarkUnavailableDegradesWithTrace`：marker 已設＋restore.json **不存在**＋events.jsonl 為目錄 → `newTestAppAt`（sink 失敗不 panic——確認 helper 對 sink 失敗的行為，若 helper `t.Fatal` 則改直接呼叫 `openStateWriters` 級別的入口，依實際結構調整、於 report 說明）→ 啟動繼續、audit 逐行含 `restore_watermark_unavailable` 且 data 含 path＋error、restore.json 快照 view_start 為 `""`（fallback 被消費並持久化）。
-2. `TestStartupWatermarkUnavailableCompleteRestoreUntouched`：marker 已設＋restore.json **已完整存在**（兩 provider 皆有非空 view_start）＋events.jsonl 為目錄 → audit 仍發（不可用是事實）、**既有 boundary 不變**（fallback 未被消費——§4「不可用≠被改」）。
-3. `TestStartupWatermarkPersistentDegradeShape`：情境 1 之後修復 events.jsonl → 重啟（同 dir 二次建 App）→ 快照仍 `""`（不自動修復）；刪除 restore.json → 三次建 App → 快照為當時正確高水位（唯一修復路徑）。
+四條測試：
+
+1. `TestStartupWatermarkUnavailableDegradesWithTrace`：restore.json **不存在**＋
+   events.jsonl 為目錄 → `openStateWriters` 完成（不 panic）、audit 逐行含
+   `restore_watermark_unavailable` 且 data 含 path＋error、
+   **`startupErrText()` 含 warning 字樣**（§4 凍結 audit＋warning 兩者；
+   appendMessage 是累加不是 first-wins，sink 錯誤不會吃掉它——gate 核實）、
+   restore.json 快照 view_start 為 `""`（fallback 被消費並持久化）。
+2. `TestStartupWatermarkUnavailableCompleteRestoreUntouched`：restore.json
+   **已完整存在**（兩 provider 皆非空 view_start）＋events.jsonl 為目錄 →
+   audit 仍發（不可用是事實）、**既有 boundary 不變**（fallback 未被消費）。
+3. `TestStartupWatermarkAvailableNoTrace`（gate P2 反向格）：events.jsonl 正常
+   （含至少一筆 event）→ `openStateWriters` 後 **audit 無**
+   `restore_watermark_unavailable`——無條件發事件的 mutation 在此紅。
+4. `TestStartupWatermarkPersistentDegradeShape`：情境 1 之後修復 events.jsonl
+   （回填原始內容）→ 二次 `openStateWriters`（新 App 同 dir）→ 快照仍 `""`
+   （不自動修復）；刪除 restore.json → 三次 → 快照為當時正確高水位（唯一修復
+   路徑；期望值**從檔案內容算**最後一筆 event_id）。
+
+另補一條 malformed 格（§4 fallback 三消費條件的第二條）：
+`TestStartupWatermarkUnavailableMalformedRestoreRebuilt`——restore.json 為壞 JSON
+＋events.jsonl 為目錄 → 重建並持久化 `""`。「缺 provider 條目（僅記憶體）」格
+**不測**：既有 openRestoreStore 行為、本票零改動，且該格在 freshEntries 產出的
+檔案上恆為 no-op——不測理由記入 report。
 
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `go test . -run 'TestStartupWatermark' -v`
-Expected: FAIL——現行無 audit 事件（1、2 紅在 audit 斷言）；3 的修復形狀段依實作前行為記錄
+Expected: FAIL——1／2／5 紅在 audit 斷言（現行無該事件）、1 另紅在 warning 斷言；3 反向格在實作前**綠**（現行本來就無事件——它是防未來 mutation 的反向鎖，RED 意義由 1 的正向紅補足）；4 的修復形狀依實作前行為記錄
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -154,7 +184,7 @@ git commit -m "feat(app): startup watermark 不可用留軌跡——restore_wate
 
 **Files:**
 - Modify: `app.go:9084` 一帶（reset 流程的 ResetView 呼叫前判定）
-- Test: `app_legacy_transcript_test.go` 或 app_restore_dormant_test.go（依 reset 流程既有測試位置，動手前先看 `TestReset`／`New` 相關測試住哪）；audit 四欄位斷言 helper 沿用 `auditHasOp` pattern（app_registry_uncertain_test.go:364）擴一個四欄位版本
+- Test: `app_legacy_transcript_test.go`（gate 校正理由：legacy flag fixture（`seedLegacyTranscriptFixtureApp`）在此檔、實測 `a.NewSession("w1")` 直接可觸發 reset 流程；既有 reset 測試實際住在 app_test.go 的 `TestNewSession*`，但本 task 的斷言依賴 legacy fixture）；audit 四欄位斷言 helper 沿用 `auditHasOp` pattern（app_registry_uncertain_test.go:364）擴一個四欄位版本（`auditHasOp` 只比對 `data["op"]`，新事件無 op 欄）
 
 **Interfaces:**
 - Produces: 呼叫 `a.wsReg.ResetView` 前：`hw, scanned, werr := auditHighWatermark(...)`；`werr != nil || !scanned` → `a.audit("reset_view_watermark_failed", map[string]any{"provider":…, "wsid":…, "path":…, "error":…})`（NotExist 合成錯誤內容）、`rerr = fmt.Errorf(...)`（**不經 noteRegistryUncertainErr**）、跳過 ResetView；FinishReset 照常（結構既有，app.go:9096 在 rerr 判斷前）。
@@ -163,7 +193,9 @@ git commit -m "feat(app): startup watermark 不可用留軌跡——restore_wate
 
 1. `TestResetViewWatermarkFailureStopsWrite`：既有 legacy fixture（flag=true、boundary 非空）→ app 建好後把 events.jsonl 換目錄 → 觸發「開新對話」（依既有測試對 reset 的呼叫方式——先讀既有 reset 測試怎麼呼叫 binding）→ 回錯；registryOnDisk 斷言 boundary 與 LegacyTranscript **皆未變**；audit 逐行定位 `reset_view_watermark_failed` 且同筆 data 四欄位齊（provider／wsid／path／error 皆非空）；lifecycle 回 idle（可再次觸發 reset 不撞 state error）。
 2. 修復 events.jsonl → 重試 → 成功且 boundary 為正確高水位、flag 清除（既有 ResetView 語意）。
+   **修復手法（gate P2 校正）**：換目錄**前**先 `orig, _ := os.ReadFile(ep)` 保存原始內容，修復時回填 `orig`——用空檔「修復」會得到 `("", true, nil)`，寫入的 boundary 仍是 `""`、與失敗態不可判別。期望高水位**從 orig 內容算**最後一筆 event_id（sink 持已 unlink 的舊 inode，之後的 live emission 不會進新檔，不得從 emission 推）。
 3. NotExist 變體：刪 events.jsonl → 同樣停止不寫、error 欄位含合成說明（斷言非空且含「不存在」類字樣）。
+4. **空檔格（gate P2——§3 凍結第三格，漏測會放行打壞全新 workspace 的 naive guard）**：`TestResetViewWatermarkEmptyFileWritesEmpty`——events.jsonl 為**存在的空檔**（truncate）→ `scanned==true` → ResetView 照常寫入 `""`（成功、不回錯、無 watermark audit）；mutation `if werr != nil || !scanned || hw == ""` 在此紅。
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -176,8 +208,8 @@ Expected: FAIL——現行 watermark 失敗回 `""` 照寫，boundary 被改成�
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `go test . -run 'TestResetViewWatermark|TestReset|TestLoadTurnsBefore' -count=1 && go build ./... && go vet ./...`
-Expected: 全綠（既有 reset／hydrate 測試不破）
+Run: `go test . -run 'TestResetViewWatermark|TestNewSession|TestLoadTurnsBefore' -count=1 && go build ./... && go vet ./...`
+Expected: 全綠（gate 校正：repo 無 `TestReset*`——既有 reset 流程測試叫 `TestNewSession*`，app_test.go:1083 起）
 
 - [ ] **Step 5: Commit**
 
@@ -202,4 +234,7 @@ git commit -m "feat(app): ResetView watermark 失敗即停——不寫 boundary�
 - §3 契約：Task 3（停止不寫＋四欄位 audit＋FinishReset 後可重試＋NotExist 合成＋修復重試）✓；不經 noteRegistryUncertainErr 為實作指示 ✓
 - §4 契約：Task 2（降級軌跡＋fallback 消費／不消費兩向＋持久降級與唯一修復路徑重啟形狀）✓；fixture 前提 marker 已設 ✓
 - 簽章一致：`(last string, scanned bool, err error)` Task 1 定義、Task 2/3 消費；6 caller 清單見 Global Constraints。
-- 已知不確定（實作時確認、不阻擋 plan）：Task 2 的 sink 失敗下 `newTestAppAt` 行為（helper 對 sink 開檔失敗是否 t.Fatal）——若不可直接用，依 openStateWriters 實際結構找對等入口，report 說明；Task 3 觸發 reset 的 binding 呼叫方式依既有測試慣例。
+- Task 2 測試層級已由 gate 實測凍結：直接 `a.openStateWriters(newTestStateLease(stateDir))`，不用 `newTestAppAt`（該 helper 不經 :2242 且 sink 失敗即 t.Fatal——假綠陷阱）。
+- Task 3 觸發方式已凍結：`a.NewSession(wsid)`（既有用法 app_test.go:1099）；「回 idle 可重試」斷言沿用 `BeginNewSessionSubmit` 成功即證明的既成手法（app_test.go:1136-1139）。
+- **「不得經 noteRegistryUncertainErr」無可觀測差異、無法以測試守**（gate 補充：該 helper 對非 uncertain 錯誤原樣回傳、不 latch）——僅能靠 code review；task review 與 final review 的 checklist 明列此項，關票時不得宣稱有測試覆蓋。
+- §4 反向格（scanned==true 無軌跡）、§3 空檔格、malformed 格皆已入測試清單；「缺 provider 僅記憶體」格不測（既有行為零改動＋該格在 freshEntries 檔案上恆 no-op），report 記不測理由。
