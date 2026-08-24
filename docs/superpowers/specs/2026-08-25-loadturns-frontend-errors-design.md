@@ -9,6 +9,15 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
    永久 early return。
 
 **修訂記錄**：
+- rev3（2026-08-25，spec gate 2 P1／6 P2）：createdView 凍結寫法改「先寫入再
+  讀回 proxy」（原 snippet 在 Pinia reactive 下比對恆 false——gate 實測 7 紅
+  ／修正版 376 綠；比對與 applyToView 都須用 proxy）；SettingsBar component
+  test 補入＋兩呼叫端判定基準（persistentPins vs pins）與 `at`／不另 setFocus
+  凍結；Go 測試改 stubRegistry 兩條新測試（原 chmod／dirSync 提案不可實作）；
+  wrap 保留 cerr；§3/§5 不可達註解矛盾擇 §3；補反向與缺格測試（view 存在不
+  重 pin、persistentPins 不回退、pin 不向外 reject＋pane 1 仍還原、loadOlder
+  ＋片語→latchSeq、loadOlder 斷言的 focused／busy 前置）；雙 pane 不需測的
+  理由明文。
 - rev2（2026-08-25，owner review 2 P1／1 P2）：呼叫端「零改動」不成立——
   SessionList/SettingsBar 已釘選分支只 setFocus 不再 pin，加「已釘選但無 view
   時重新 pin」；pin 的 view 建立保留實例身分、catch/成功皆比對 `createdView`
@@ -44,8 +53,13 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 
 - `errors.Is(cerr, wsregistry.ErrRegistryUncertain)` 時，回傳前 wrap 成含
   app 層片語的錯誤：`fmt.Errorf("%w（load turns wsid=%s：清 legacy 旗標時
-  發現）", errRegistryUncertain, wsid)`——沿用既有 `errRegistryUncertain`
-  變數（app.go:727-729，前端片語的唯一來源），**不另造第二種片語**。
+  發現：%v）", errRegistryUncertain, wsid, cerr)`——沿用既有
+  `errRegistryUncertain` 變數（app.go:727-729，前端片語的唯一來源），**不另
+  造第二種片語**；**保留 `cerr`**（gate P2：store latch 錯誤裡的原始 dir-sync
+  errno 不得從主錯誤鏈消失）。wrap 後 `errors.Is(err,
+  wsregistry.ErrRegistryUncertain)` 仍成立（errRegistryUncertain 本身以 `%w`
+  包住同一哨兵——gate 核實，既有 uncertain 覆蓋表測試不紅；該 subtest 的
+  「要回同一個錯誤」註解語意會變，plan 順手修）。
 - 非 uncertain 的 cerr（一般 persist 失敗）原樣傳播（前端顯示原因即可，
   不需 latch 判別）。
 - **不**在 `loadTurnsBefore` 入口加 `registryUncertain()` 早退：latch 擋的是
@@ -62,8 +76,8 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 需要 unpin UI 就可達，session.ts:416 的「不可達」註解不成立、一併更新）：
 
 ```ts
-const createdView = newView()
-this.views[wsid] = createdView
+if (isNew) this.views[wsid] = newView()
+const createdView = this.views[wsid]   // ← 先寫入、再從 state 讀回 proxy
 ...
 try {
   const envs = await load(wsid, '', TURN_WINDOW_SIZE)
@@ -75,6 +89,13 @@ try {
 }
 ```
 
+**Proxy 陷阱（spec gate rev2 P1，實測凍結）**：身分比對與 `applyToView` 都
+**必須用「寫入後從 state 讀回」的 proxy**，不得用 `newView()` 的原始回傳值
+——Vue reactive 的 get trap 會把讀回物件包成 proxy，`this.views[wsid] !==
+原始物件` **恆為 true**（gate 逐字套用原 snippet：比對恆早退、envelope 永不
+套用、view 永不刪、既有 7 條測試紅；proxy 讀回版：全套 376 條綠）。對 raw
+物件 push 也不觸發重繪，所以兩處都得用 proxy。
+
 - **實例比對**：catch 僅在 `this.views[wsid] === createdView` 時刪除——
   pin(A) 載入中 → 同 pane 切 B（releaseView 刪 A 的 view）→ 切回 A（建第二個
   view）→ 第一個請求稍後 reject 時，無條件 delete 會誤刪**較新的** view。
@@ -85,11 +106,16 @@ try {
 
 ### 呼叫端調整（owner review rev1 P1——「呼叫端零改動」不成立）
 
-SessionList（SessionList.vue:39）與 SettingsBar（SettingsBar.vue:20）對**已
-釘選**的 session 只 `setFocus`、不再呼叫 `pin()`——view 被清掉後再點同一張
-卡片，真實 UI 仍永久空白。凍結：兩個呼叫端的「已釘選」分支改為
-**已釘選但 `views[wsid]` 不存在時重新呼叫 `pin(idx, wsid)` 觸發載入**（仍
-setFocus；view 存在時行為不變）。重試路徑因此成立於真實 UI，不只 store 層。
+SessionList（SessionList.vue:39-43，判定基準 `persistentPins`）與 SettingsBar
+（SettingsBar.vue:20-24，判定基準 `pins`——兩者基準本就不同、各自維持）對
+**已釘選**的 session 只 `setFocus`、不再呼叫 `pin()`——view 被清掉後再點同
+一張卡片，真實 UI 仍永久空白。凍結：兩個呼叫端的「已釘選」分支改為
+`if (!s.views[wsid]) { void s.pin(at, wsid) } else { s.setFocus(at) }`——
+**`idx` 用已釘選的那一格 `at`**（gate P2：用 `s.focused` 會把卡片搬格並
+releaseView 掉該格原 session）；重新 pin 的分支**不另呼叫 `setFocus`**
+（`pin()` 本身已含 focused／durableFocusPane／persistLayout／unread 歸零，
+再呼叫會多送一次 SetLayout 落盤）。view 存在時行為不變（反向有測試守）。
+重試路徑因此成立於真實 UI，不只 store 層。
 - `pushNotice(t('store.turnsLoadFailed', { wsid, error }))`——app-wide lane、
   不動 busy、不掛錯 pane；錯誤字串含 backend 原文，latch 片語（§2 對齊後）
   經 `applyNotice`→`bumpError` 照常撥 `latchSeq`（要件 3 的前端半邊零新機制、
@@ -118,10 +144,14 @@ reject）。
 
 ## 4. 測試策略
 
-- **Go（§2）**：清旗標 persist 失敗（既有 `TestLoadTurnsBeforeClearPersistFailureFailsLoud`
-  形狀）擴斷言：注入 dirSync 失敗（latch 形）時 `LoadTurnsBefore` 錯誤字串
-  含前端片語（與 `TestErrRegistryUncertainKeepsUIMarker` 同字面）；一般
-  persist 失敗（stepWrite 形）不含片語（不誤標）。
+- **Go（§2；gate P2 改寫——原提案不可實作：chmod 只能造 stepWrite、
+  `ForceStepHookForTest` 跨 package 取不到、latch 單向與既有測試的「修復後
+  重試成功」斷言互斥）**：用 `stubRegistry`（app_wsid_test.go:140 已實作
+  `ClearLegacyTranscript`、`mutateErr` 驅動）比照 app_registry_uncertain_test.go:328
+  的手法，**兩條新測試**：`mutateErr = wsregistry.ErrRegistryUncertain` →
+  `LoadTurnsBefore` 錯誤字串含前端片語（與 `TestErrRegistryUncertainKeepsUIMarker`
+  同字面）且 `errors.Is` 哨兵仍成立；`mutateErr = errors.New(...)` 一般錯誤
+  → 不含片語（不誤標）。既有 chmod 測試不動。
 - **Frontend（vitest，沿用既有 session store 測試手法——registryUncertain.test.ts
   的 binding stub 慣例）**：
   - pin 首載 reject → view 被清（`views[wsid]` 不存在）、notice lane 有錯誤、
@@ -130,13 +160,30 @@ reject）。
     走 notice lane＋errorSeq，唯 busy 副作用可區辨兩者）、`errorSeq` 增；再次
     `pin` 同 wsid → binding 被第二次呼叫（**重試真的發生**——mutation：拿掉
     `delete views[wsid]` 則第二次呼叫不發生、此斷言紅）。
-  - **A→B→A 競態（deferred promise，兩變體）**：pin(A) 的 load 懸置 → 同 pane
-    pin(B)（releaseView 刪 A view）→ pin(A) 第二次（建新實例、第二個 load 懸置）
-    → 讓**第一個** load (a) reject：新實例**不得被刪**（`views[A]` 仍存在且為
-    第二實例）；(b) resolve：舊 envelope **不得**套到新實例。
-  - **Component test（SessionList）**：第一次 pin 失敗（view 已清）→ 再點同一
-    張卡片 → binding 被第二次呼叫（真實 UI 重試路徑——store 直呼 pin 的測試
-    蓋不到「已釘選只 setFocus」分支）。
+  - **A→B→A 競態（deferred promise 手法，前例 PaneView.test.ts:146-164；兩
+    變體）**：pin(A) 的 load 懸置 → 同 pane pin(B)（releaseView 刪 A view）→
+    pin(A) 第二次（建新實例、第二個 load 懸置）→ 讓**第一個** load (a)
+    reject：新實例**不得被刪**（`views[A]` 仍存在且為第二實例）；(b)
+    resolve：舊 envelope **不得**套到新實例。**雙 pane 情境不測**（gate 核
+    實：A 同時釘兩格時 releaseView 早退不刪、第二次 pin 走 `!isNew` 早退，
+    第二實例根本不會產生——競態不存在，補測只會是恆綠案例）。
+  - **pin 不向外 reject**：pane 0 的首載 reject 時，`restoreLayout` 的
+    `await this.pin(...)` 迴圈不得中斷——**pane 1 仍還原**（mutation：catch
+    內重拋 → 此測試紅；這是 catch 存在的結構性證明）。
+  - **persistentPins 不回退**：pin 失敗後 `persistentPins[idx]` 仍為該 wsid
+    （§3 凍結「釘選是使用者選擇」的反向鎖）。
+  - **loadOlder＋latch 片語 → `latchSeq` 增**（§6a 清旗標在向上分頁的最舊頁
+    也會觸發，不只首載）；loadOlder 測試的「既有內容不變」斷言**前置須把該
+    wsid 釘進 focused pane**（gate：`pushError` 寫進 `views[focusedWsid]`，
+    非 focused 時誤用 pushError 斷言仍假綠），busy 前置同樣設 true。
+  - **Component tests（SessionList＋SettingsBar 各一）**：第一次 pin 失敗
+    （view 已清）→ 再點同一張卡片／同一入口 → binding 被第二次呼叫（真實
+    UI 重試——store 直呼 pin 蓋不到「已釘選」分支；兩個呼叫端判定基準不同
+    （persistentPins vs pins），缺一則該入口的重試無守門）。**反向**：view
+    存在時再點只 setFocus、binding **不得**被再次呼叫（gate 實測：拿掉守衛
+    改無條件 pin，現行 49 條測試全綠——此反向是唯一的守門）。SessionList
+    的 mount／stub 慣例沿用 SessionList.test.ts 既有手法（vi.mock wailsjs
+    ＋ `s.setBindings`）。
   - pin 首載 reject 且錯誤含 `REGISTRY_UNCERTAIN_MARK` → `latchSeq` 增。
   - loadOlder reject → 既有 timeline 內容不變、notice 有錯誤、再呼叫 loadOlder
     → binding 再被呼叫（重試）。
@@ -148,6 +195,7 @@ reject）。
 
 - 不加 per-pane 錯誤 UI／重試按鈕（notice lane＋重新點選即重試已滿足四要件；
   更豐富的錯誤 UX 另議）。
-- 不動 `pushError` 語意、不動 unpin 分支的既知不可達註解。
+- 不動 `pushError` 語意。（session.ts:419-423 的「不可達」註解**要**更新——
+  §3 已凍結：A→B→A 不需 unpin UI 即可達；rev2 此處與 §3 矛盾，rev3 擇 §3。）
 - backend 其他錯誤路徑（scan error／turn-read）字串不變——它們不是 latch、
   顯示原因即可。
