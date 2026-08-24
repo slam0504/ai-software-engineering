@@ -8,14 +8,15 @@
 
 **Tech Stack:** Go（internal/wsregistry、restore.go、rebuild_orchestrator.go、app.go），Go testing。
 
-**Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md` §3 語意例外／§4 失敗軌跡（含統一稽核順序）／§5a scanned／§6a（含 persist 失敗三語意表）——最終 snapshot **commit cdf2dbe**（4b993fe 初版→7fe9d2e rev2→cdf2dbe rev3，執行者以 cdf2dbe 為準）
+**Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md` §3 語意例外／§4 失敗軌跡（含統一稽核順序）／§5a scanned／§6a（含 persist 失敗三語意表）——最終 snapshot **commit f25a181**（4b993fe 初版→7fe9d2e rev2→cdf2dbe rev3→f25a181 rev4：owner 解凍 scanned 全消費，三個 caller 的最終語意見 §5a）
 
 ## Global Constraints
 
 - §6a 四分支凍結：`scanned==true && len==0` → 清；`ViewStartEventID==""`（未掃描）→ 不清；NotExist（`scanned==false`）→ 不清；open／scan error → 不清、回錯、可重試。
 - persist 失敗依 §6a **三語意表**（對齊 `persistOrRollback` 既有契約 store.go:262-275）：步驟 1-3 失敗＝回滾（flag 維持 true）可重試；已 latched＝回滾＋`ErrRegistryUncertain` 需重啟；本次 Clear 的 directory-sync 失敗＝**不回滾**（記憶體停在 false）＋latch 需重啟——不得籠統宣稱「旗標仍 true」。三種都回錯。
 - `ClearLegacyTranscript` 僅清旗標、不動 boundary；已 false 冪等跳過不落盤；`ErrEntryNotFound`／`ErrTombstoned` 哨兵；登記 uncertain latch `writes` 枚舉表（fsync_test.go:254 附近）。
-- `scanLegacyWindow` 簽章變更的 caller 以 repo-wide `rg 'scanLegacyWindow\(' -g '*.go'` 為準（目前 8 處：production app.go:1283／app.go:1814／rebuild_orchestrator.go:362、定義 restore.go:206、TestScanLegacyWindow 內 4 處）。漏任何一處 commit 即 build 壞。
+- `scanLegacyWindow` 簽章變更的 caller 以 repo-wide `rg 'scanLegacyWindow\(' -g '*.go'` 為準（實作後共 9 處：定義 restore.go、production 三處、TestScanLegacyWindow 內 5 處——Task 2 新增零筆 case 後由 8 變 9）。漏任何一處 commit 即 build 壞。
+- **最終語意（spec rev4 f25a181，Task 4a 落實）**：三個 production caller 全數消費 `scanned`——legacyEntries `scanned==false` 回錯不 Migrate、backfill 可信 boundary 下 `scanned==false` 回錯不落 marker、loadTurnsBefore 依 §6a 四分支。Task 2 的「`_` 忽略、行為不變」是刻意過渡態，至 Task 4a 收斂。
 - 既有測試不得削弱；gofmt 乾淨（觸碰檔案）；台灣用語書面中文 doc／commit。
 
 ---
@@ -647,7 +648,7 @@ Expected: 全綠（牆鐘不穩定測試依 memory 具名清單，紅則單獨�
 - §3 語意例外／§4 措辭：spec 修訂已入最終 snapshot cdf2dbe，無 code 對應 ✓
 
 **2. Type consistency：**
-- `scanLegacyWindow → ([]contract.Envelope, bool, error)`：Task 2 定義、Task 3 消費一致；Task 2 過渡期三個 production caller 以 `_` 忽略 scanned。
+- `scanLegacyWindow → ([]contract.Envelope, bool, error)`：Task 2 定義、Task 3 消費一致；Task 2 過渡期三個 production caller 以 `_` 忽略 scanned——**過渡態已於 Task 4a 收斂**（legacyEntries／backfill 亦消費，spec rev4 f25a181）。
 - `ClearLegacyTranscript(wsid string) error`：Task 1 定義（Store＋interface）、Task 3 經 `a.wsReg` 消費一致。
 
 **3. 已知風險與邊界：**

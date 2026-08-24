@@ -1112,8 +1112,29 @@ func TestBackfillLegacyTranscriptFailureLeavesAudit(t *testing.T) {
 	if _, err := a.restoreSessions(); err != nil {
 		t.Fatalf("backfill 失敗不阻擋啟動：%v", err)
 	}
-	if !auditHas(t, dir, "legacy_transcript_backfill_failed") {
+	// spec §4：具名事件必須帶非空的 error 內容（本 fixture 為多候選）——只驗
+	// kind 存在的話，把 error 欄位清掉的 mutation 仍會綠（owner review P2）。
+	// 逐行找該 kind 的那一筆，斷言同一行含失敗原因。
+	b, err := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var line string
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.Contains(l, `"kind":"legacy_transcript_backfill_failed"`) {
+			line = l
+			break
+		}
+	}
+	if line == "" {
 		t.Fatal("backfill 失敗必須留下具名 audit 事件")
+	}
+	if !strings.Contains(line, "候選") {
+		t.Fatalf("audit 的 error 內容必須含失敗原因（多候選）：%s", line)
+	}
+	// startup blocker 必須對使用者可見（一次性訊息那一半，audit 是持久那一半）。
+	if !strings.Contains(a.startupErrText(), "legacy transcript 標記補寫失敗") {
+		t.Fatalf("startup blocker 必須可見：%q", a.startupErrText())
 	}
 }
 

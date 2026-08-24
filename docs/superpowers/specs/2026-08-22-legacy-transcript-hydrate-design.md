@@ -150,9 +150,14 @@ if beforeEventID != "" && len(recs) == 0 {
 }                            // legacy 只在最舊 turn 頁前綴一次，此處回空讓前端停
 out := envelopes(recs) ++ (若首載) open-turn tail
 if !hasOlder && entry.ViewStartEventID != "" {   // 這一頁是最舊 WSID turn 頁，且有可信 boundary → 前綴 legacy
-    legacy, err := scanLegacyWindow(eventsPath, provider, entry.ViewStartEventID)  // §5a，只取無 WSID
+    legacy, scanned, err := scanLegacyWindow(eventsPath, provider, entry.ViewStartEventID)  // §5a，只取無 WSID
     if err != nil { return nil, err }         // I/O 錯誤 fail loud，不靜默少給
-    out = legacy ++ out
+    if len(legacy) > 0 {
+        out = legacy ++ out
+    } else if scanned {                       // §6a：成功掃描確定零筆 → 清旗標（下次首載不再掃）
+        err := registry.ClearLegacyTranscript(wsid)   // 哨兵（不存在／tombstone）良性跳過
+        if err != nil && 非哨兵 { return nil, uncertainAudit(err) }  // persist 失敗依 §6a 三語意表，一律回錯
+    }                                         // scanned==false（NotExist／TOCTOU）→ 不清、不前綴
 }
 ```
 
