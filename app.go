@@ -9094,18 +9094,38 @@ func (a *App) newSession(wsid string) error {
 	// 刪掉的下次啟動就長回來（§3.5.10：index 是快取，不是第二份事件格式）。
 	var rerr error
 	if a.wsReg != nil {
-		hw, _, _ := auditHighWatermark(a.eventsPath())
-		err := a.noteRegistryUncertainErr("reset_view", wsid,
-			a.wsReg.ResetView(wsid, hw))
-		switch {
-		case err == nil:
-		case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):
-			// 良性：這個 WSID 已不該有 durable view（已移除／未接線的測試路徑）。
-			// lifecycle 照樣收束回 idle、UI 照樣重設，只留稽核軌跡。
-			a.audit("reset_view_skipped", map[string]any{
-				"provider": provider, "wsid": string(w), "reason": err.Error()})
-		default:
-			rerr = err
+		hw, scanned, werr := auditHighWatermark(a.eventsPath())
+		if werr != nil || !scanned {
+			// §3：讀不到 events.jsonl 就沒有可信的高水位可寫——這裡的失敗不是
+			// registry 寫入不確定（不經 noteRegistryUncertainErr），是讀檔失敗，
+			// 兩者復原路徑不同：uncertain latch 管的是「寫了但不知道有沒有落
+			// 盤」，這裡是「還沒寫、確定沒寫」。session 在 lifecycle 上已經收
+			// 尾（下方 FinishReset 照常執行），但 boundary／LegacyTranscript
+			// 維持原樣，UI 因 rerr 不重設——顯示暫時不一致，換取不把猜的高水
+			// 位當真寫進 boundary（非原子失敗：teardown 已完成、ResetView 未
+			// 執行）。
+			errText := ""
+			if werr != nil {
+				errText = werr.Error()
+			} else { // NotExist：函式層回報「未能確認」而非錯誤，補一句可操作的說明
+				errText = "找不到 " + a.eventsPath() + "（events.jsonl 尚未建立，高水位視為未知）"
+			}
+			a.audit("reset_view_watermark_failed", map[string]any{
+				"provider": provider, "wsid": string(w), "path": a.eventsPath(), "error": errText})
+			rerr = fmt.Errorf("reset view watermark for %s: %s", w, errText)
+		} else {
+			err := a.noteRegistryUncertainErr("reset_view", wsid,
+				a.wsReg.ResetView(wsid, hw))
+			switch {
+			case err == nil:
+			case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):
+				// 良性：這個 WSID 已不該有 durable view（已移除／未接線的測試路徑）。
+				// lifecycle 照樣收束回 idle、UI 照樣重設，只留稽核軌跡。
+				a.audit("reset_view_skipped", map[string]any{
+					"provider": provider, "wsid": string(w), "reason": err.Error()})
+			default:
+				rerr = err
+			}
 		}
 	}
 	finErr := a.manager.FinishReset(w, rtok) // restore 失敗仍 FinishReset 回 idle

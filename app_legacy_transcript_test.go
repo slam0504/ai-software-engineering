@@ -567,3 +567,207 @@ func TestLoadTurnsBeforeAfterResetViewNoLegacy(t *testing.T) {
 	}
 	assertAllTurnsPresent(t, append(append([]contract.Envelope{}, p1...), p2...), 25)
 }
+
+// ---- H3：ResetView 寫入路徑——高水位讀取失敗即停（spec §3）----
+//
+// auditWatermarkFailedData：稽核裡最後一筆 kind=="reset_view_watermark_failed"
+// 的 data map（找不到回 nil）。四欄位版 auditHasOp
+// （app_registry_uncertain_test.go:364）：後者只比對 data["op"]，這裡的新
+// 事件沒有 op 欄，呼叫端要逐一檢查 provider／wsid／path／error 四個欄位，回
+// 完整 data 比回 bool 更適合。
+func auditWatermarkFailedData(t *testing.T, stateDir string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("讀 audit.jsonl：%v", err)
+	}
+	var last map[string]any
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if jerr := json.Unmarshal([]byte(line), &rec); jerr != nil {
+			t.Fatalf("audit 壞行：%v（%s）", jerr, line)
+		}
+		if rec["kind"] != "reset_view_watermark_failed" {
+			continue
+		}
+		if d, ok := rec["data"].(map[string]any); ok {
+			last = d
+		}
+	}
+	return last
+}
+
+// TestResetViewWatermarkFailureStopsWrite：events.jsonl 換成目錄（open 成功、
+// scan 因 EISDIR 失敗）→ NewSession 必須回錯、registry 上的 boundary 與
+// LegacyTranscript 皆維持原樣、留下四欄位齊全的 reset_view_watermark_failed
+// 稽核。
+func TestResetViewWatermarkFailureStopsWrite(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 3) // flag=true、boundary="0000000000"（非空）
+	enableAuditFile(t, a)
+	beforeReg, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("前提：w1 entry 應存在")
+	}
+
+	ep := a.eventsPath()
+	if err := os.Remove(ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ep, 0o755); err != nil { // 換目錄：Open 成功、Scanner 讀出 EISDIR
+		t.Fatal(err)
+	}
+
+	if err := a.NewSession("w1"); err == nil {
+		t.Fatal("watermark 讀取失敗必須回錯，不得靜默寫入")
+	}
+
+	afterReg, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("w1 entry 不應消失")
+	}
+	if afterReg.ViewStartEventID != beforeReg.ViewStartEventID {
+		t.Fatalf("boundary 必須維持不變：before=%q after=%q",
+			beforeReg.ViewStartEventID, afterReg.ViewStartEventID)
+	}
+	if afterReg.LegacyTranscript != beforeReg.LegacyTranscript {
+		t.Fatalf("LegacyTranscript 旗標必須維持不變：before=%v after=%v",
+			beforeReg.LegacyTranscript, afterReg.LegacyTranscript)
+	}
+
+	d := auditWatermarkFailedData(t, a.stateDir)
+	if d == nil {
+		t.Fatal("必須留下 reset_view_watermark_failed 稽核")
+	}
+	for _, k := range []string{"provider", "wsid", "path", "error"} {
+		s, ok := d[k].(string)
+		if !ok || s == "" {
+			t.Fatalf("四欄位皆須非空，%s 缺漏：%+v", k, d)
+		}
+	}
+}
+
+// TestResetViewWatermarkRepairRetrySucceeds：換目錄失敗後，把目錄拆掉、回填
+// 原始檔案內容，重試必須成功——lifecycle 已回 idle 就是「重試成功」本身
+// 證明的（owner review rev2 P1：不另設 idle 探針，探針本身會卡掉
+// BeginNewSessionSubmit 之後的重試前置狀態）。期望高水位從回填的原始內容算
+// 出，不得從之後的 live emission 推（sink 持已 unlink 的舊 inode）。
+func TestResetViewWatermarkRepairRetrySucceeds(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 3)
+	enableAuditFile(t, a)
+	ep := a.eventsPath()
+	orig, err := os.ReadFile(ep) // 換目錄前先保存原始內容
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NewSession("w1"); err == nil {
+		t.Fatal("前提：換目錄後必須先失敗")
+	}
+
+	if err := os.Remove(ep); err != nil { // 拆掉目錄（此時為空目錄）
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ep, orig, 0o600); err != nil { // 回填原始內容——空檔修復無法與失敗態區分
+		t.Fatal(err)
+	}
+	wantHW, scanned, werr := auditHighWatermark(ep)
+	if werr != nil || !scanned {
+		t.Fatalf("前提：回填後的檔案必須可正常掃描：scanned=%v err=%v", scanned, werr)
+	}
+	if wantHW == "" {
+		t.Fatal("前提：fixture 的 legacy window 非空，高水位不應為空字串")
+	}
+
+	if err := a.NewSession("w1"); err != nil {
+		t.Fatalf("修復後重試必須成功：%v", err)
+	}
+
+	got, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("w1 entry 應存在")
+	}
+	if got.ViewStartEventID != wantHW {
+		t.Fatalf("boundary 必須等於從回填內容算出的高水位：want=%q got=%q", wantHW, got.ViewStartEventID)
+	}
+	if got.LegacyTranscript {
+		t.Fatal("成功的 ResetView 必須清除 LegacyTranscript 旗標")
+	}
+}
+
+// TestResetViewWatermarkNotExistStopsWrite：events.jsonl 不存在（NotExist）→
+// 同樣停止寫入、回錯；error 欄位須含合成的可操作說明（「不存在」字樣），
+// 不是裸的 os.PathError。
+func TestResetViewWatermarkNotExistStopsWrite(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 3)
+	enableAuditFile(t, a)
+	beforeReg, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("前提：w1 entry 應存在")
+	}
+	if err := os.Remove(a.eventsPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.NewSession("w1"); err == nil {
+		t.Fatal("events.jsonl 不存在時必須停止寫入、回錯")
+	}
+
+	afterReg, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("w1 entry 不應消失")
+	}
+	if afterReg.ViewStartEventID != beforeReg.ViewStartEventID || afterReg.LegacyTranscript != beforeReg.LegacyTranscript {
+		t.Fatalf("boundary／flag 必須維持不變：before=%+v after=%+v", beforeReg, afterReg)
+	}
+
+	d := auditWatermarkFailedData(t, a.stateDir)
+	if d == nil {
+		t.Fatal("必須留下 reset_view_watermark_failed 稽核")
+	}
+	errText, _ := d["error"].(string)
+	// 沿用 H2（app.go:2242 一帶）startup 路徑既有的合成措辭「找不到...尚未
+	// 建立」，同一種 NotExist 語意兩處不該各造一套文字。
+	if errText == "" || !strings.Contains(errText, "找不到") || !strings.Contains(errText, "尚未建立") {
+		t.Fatalf("error 欄位必須含合成的『尚未建立』說明：%q", errText)
+	}
+}
+
+// TestResetViewWatermarkEmptyFileWritesEmpty：events.jsonl 是存在的空檔
+// （truncate）→ scanned==true、hw==""——照常寫入空字串、成功、不回錯、不留
+// watermark 失敗稽核。這是 gate P2 要守的第三格：naive guard
+// `if werr != nil || !scanned || hw == ""` 會在這裡誤擋，打壞全新
+// workspace 開新對話的既有行為。
+func TestResetViewWatermarkEmptyFileWritesEmpty(t *testing.T) {
+	a := seedLegacyFewTurnsApp(t, 3)
+	enableAuditFile(t, a)
+	if err := os.Truncate(a.eventsPath(), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.NewSession("w1"); err != nil {
+		t.Fatalf("空檔（存在且確定為空）必須照常成功：%v", err)
+	}
+
+	got, ok := registryOnDisk(t, a.stateDir).Get("w1")
+	if !ok {
+		t.Fatal("w1 entry 應存在")
+	}
+	if got.ViewStartEventID != "" {
+		t.Fatalf("空檔的高水位就是空字串，boundary 必須寫成空：got=%q", got.ViewStartEventID)
+	}
+	if got.LegacyTranscript {
+		t.Fatal("成功的 ResetView 必須清除 LegacyTranscript 旗標")
+	}
+	if d := auditWatermarkFailedData(t, a.stateDir); d != nil {
+		t.Fatalf("空檔格不應留下 watermark 失敗稽核：%+v", d)
+	}
+}
