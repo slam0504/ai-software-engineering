@@ -4,6 +4,10 @@ Owner 開票（2026-08-24）：「readEnvelopeRange 吞讀取錯誤是既有的�
 範圍與 legacy hydrate 收尾不同，獨立一張。」本文件為該票的設計 spec。
 
 **修訂記錄**：
+- rev3（2026-08-24，owner review 3 P2）：包裝 EOF fixture（`errors.Is` vs `==` 的可
+  區辨測試——真實檔案只產生裸 EOF）；EIO 測試錯誤脈絡雙斷言（offset＋wsid 缺一必
+  紅）；§3 過渡期措辭校正（backend 不再靜默成功≠完整使用者層 fail loud，後者等
+  UI P1）。
 - rev2（2026-08-24，spec gate 2 P1／4 P2）：EOF 寬容的兜底歸屬改正（`checkpointTrustedLocked`
   啟動期兜底，非 corrupt.go 損壞分級；b/c/e 三格標已知殘餘風險）；新增 legacy scan
   error 分支守門義務（本票會讓既有兩個目錄注入測試短路、原守門失效——index 零 turn
@@ -71,11 +75,13 @@ b／c／e 保留寬容（皆為雙重故障或外部行為者，為此把 UI 打
   legacy 無 WSID 事件、無 open turn）→ `readEnvelopeRange` 根本不被呼叫 → 目錄
   注入時錯誤只可能來自 `scanLegacyWindow`——mutation（吞掉 lerr）必紅。此 fixture
   同時解掉 closeout final review Minor 1（scan error 測試未真驅動 §6a 分支）。
-- **過渡期使用者可見行為（本票落地、UI P1 票未落地期間）**：讀取錯誤會讓該 pane
-  從「顯示殘缺 transcript」變成「完全空白、無任何訊息」（`pin()` 的 load 無
-  try/catch，錯誤成 unhandled rejection，session.ts:409-411）。方向符合 fail loud
-  契約（殘缺內容比空白更會誤導），此過渡態為刻意接受；錯誤顯示與軌跡統一由 UI P1
-  票處理，本票不在 `loadTurnsBefore` 呼叫點另加 audit——避免兩票各做半套。
+- **過渡期使用者可見行為（本票落地、UI P1 票未落地期間；owner review 措辭校正）**：
+  本票讓 **backend 不再靜默成功**（讀取錯誤如實回錯），但 **frontend 仍未向使用者
+  顯示錯誤**——`pin()` 的 load 無 try/catch，錯誤成 unhandled rejection
+  （session.ts:409-411），該 pane 呈現「完全空白、無訊息」。這不是完整的 fail
+  loud：**完整的使用者層 fail-loud 契約須等 UI P1 票完成**。過渡態（空白優於殘缺
+  誤導）為刻意接受；錯誤顯示與軌跡統一由 UI P1 票處理，本票不在 `loadTurnsBefore`
+  呼叫點另加 audit——避免兩票各做半套。
 
 ## 4. 測試策略
 
@@ -86,8 +92,15 @@ b／c／e 保留寬容（皆為雙重故障或外部行為者，為此把 UI 打
 
 - **unit（同 package main，直呼 readEnvelopeRange）**：
   - stub reader 注入「先回 3 行合法 envelope、再回 EIO」→ 回錯且**不得**把已讀的
-    3 行當成功結果回傳（部分成功樣即靜默截頁）。核心 mutation：把非 EOF 分支改回
-    `break` → 本測試紅。
+    3 行當成功結果回傳（部分成功樣即靜默截頁）。**錯誤脈絡雙斷言**（owner review
+    P2）：錯誤訊息必須同時含預期 offset 與 wsid——移除任一脈絡都必須使測試失敗
+    （凍結語意「wrapped，含 offset 與 wsid 脈絡」不能只驗到一半）。核心 mutation：
+    把非 EOF 分支改回 `break` → 本測試紅。
+  - **包裝 EOF fixture**（owner review P2——`errors.Is` 的可區辨測試）：stub reader
+    回傳一行合法、WSID 相符且**無換行**的最後一行，同批回
+    `fmt.Errorf("wrapped: %w", io.EOF)` → 斷言該行被收錄**且不回錯**。mutation：
+    把 `errors.Is(rerr, io.EOF)` 改回 `rerr == io.EOF` → 包裝 EOF 被當成讀取錯誤、
+    本測試紅（真實檔案只會產生裸 io.EOF，沒有這條 fixture 該 mutation 恆綠）。
   - 目錄 FD 注入（首讀 EISDIR）→ 回錯（開檔即壞的形狀）。
   - 正常檔案含 malformed 行 → 跳過、其餘照回（既有慣例迴歸鎖）。
   - 檔尾無換行的最後一行 → 必須被收進 out。fixture 條件寫死（gate A(3)）：該行須
