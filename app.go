@@ -2239,7 +2239,8 @@ func (a *App) openStateWriters(lease *stateLease) bool {
 		ClaudeUsageCumulative: false,
 		Index:                 indexOrNil(a.replayIndex),
 	})
-	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
+	hw, _, _ := auditHighWatermark(a.eventsPath())
+	rs, rserr := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), hw)
 	a.restore = rs
 	if rserr != nil { // malformed 重建等一律 fail loud（不無聲）
 		a.audit("restore_store_warning", map[string]any{"error": rserr.Error()})
@@ -9080,8 +9081,9 @@ func (a *App) newSession(wsid string) error {
 	// 刪掉的下次啟動就長回來（§3.5.10：index 是快取，不是第二份事件格式）。
 	var rerr error
 	if a.wsReg != nil {
+		hw, _, _ := auditHighWatermark(a.eventsPath())
 		err := a.noteRegistryUncertainErr("reset_view", wsid,
-			a.wsReg.ResetView(wsid, auditHighWatermark(a.eventsPath())))
+			a.wsReg.ResetView(wsid, hw))
 		switch {
 		case err == nil:
 		case errors.Is(err, wsregistry.ErrEntryNotFound), errors.Is(err, wsregistry.ErrTombstoned):

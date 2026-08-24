@@ -133,14 +133,28 @@ func (rs *restoreStore) ClearResume(provider string) error {
 	return nil
 }
 
-// auditHighWatermark：events.jsonl 最後一筆 valid envelope 的 event_id（無檔＝""）。
-func auditHighWatermark(eventsPath string) string {
-	f, err := os.Open(eventsPath)
-	if err != nil {
-		return ""
+// auditHighWatermark：events.jsonl 最後一筆 valid envelope 的 event_id
+// （spec 8927a43 §2）。三值語意——`scanned` 分辨「確定為空」與「讀不到」：
+//
+//   - 檔案不存在（NotExist）：`("", false, nil)`——函式層回報「未能確認」，
+//     非錯誤；兩個 production caller 的判定契約見 spec §3（ResetView）／
+//     §4（openRestoreStore snapshot）。
+//   - open 失敗（非 NotExist）：`("", false, err)`，err 含路徑以利定位。
+//   - `Scanner.Err()` 非 nil（例如單行超過 buffer 上限）：`("", false, err)`——
+//     **不回部分值**，避免呼叫端誤用截讀偏舊的高水位。
+//   - 完整掃描：`(last, true, nil)`（空檔回 `("", true, nil)`——存在且確定為空，
+//     `""` 本身就是正確高水位）。
+//
+// malformed 行跳過（既有慣例，不改）。
+func auditHighWatermark(eventsPath string) (last string, scanned bool, err error) {
+	f, openErr := os.Open(eventsPath)
+	if openErr != nil {
+		if os.IsNotExist(openErr) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("auditHighWatermark: open %s: %w", eventsPath, openErr)
 	}
 	defer f.Close()
-	last := ""
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -151,7 +165,10 @@ func auditHighWatermark(eventsPath string) string {
 			last = e.EventID
 		} // malformed 行跳過
 	}
-	return last
+	if scErr := sc.Err(); scErr != nil {
+		return "", false, fmt.Errorf("auditHighWatermark: scan %s: %w", eventsPath, scErr)
+	}
+	return last, true, nil
 }
 
 // RestoredView：RestoreViews binding 的 per-provider 回傳。

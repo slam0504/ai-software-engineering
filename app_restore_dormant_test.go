@@ -56,7 +56,8 @@ func newTestAppAt(t *testing.T, stateDir string) *App {
 	}
 	a.auditF = af
 	t.Cleanup(func() { _ = af.Close() })
-	rs, err := openRestoreStore(filepath.Join(stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
+	hw, _, _ := auditHighWatermark(a.eventsPath())
+	rs, err := openRestoreStore(filepath.Join(stateDir, "restore.json"), hw)
 	if err != nil {
 		t.Fatal(err)
 	}

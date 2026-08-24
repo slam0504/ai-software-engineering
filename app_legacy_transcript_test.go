@@ -386,7 +386,7 @@ func seedPreFixMigratedTwoSessionApp(t *testing.T) *App {
 	for i := 0; i < 5; i++ {
 		emitCompleteTurn(t, a, w1, fmt.Sprintf("w1-turn-%02d", i))
 	}
-	w2ViewStart := auditHighWatermark(a.eventsPath())
+	w2ViewStart, _, _ := auditHighWatermark(a.eventsPath())
 	w2 := dormantWSID(t, a, "w2", contract.ProviderClaude)
 	emitCompleteTurn(t, a, w2, "w2-turn")
 

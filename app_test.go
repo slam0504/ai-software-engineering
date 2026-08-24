@@ -203,7 +203,8 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	// production 的 replay 路徑回來，跨重啟那一維才驗得到。
 	a.openWireSegments(a.lease)
 	a.manager = appcore.New(appcore.Config{Sink: sink, Emit: ui.emitEnv, Index: indexOrNil(idx)})
-	rs, err := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), auditHighWatermark(a.eventsPath()))
+	hw, _, _ := auditHighWatermark(a.eventsPath())
+	rs, err := openRestoreStore(filepath.Join(a.stateDir, "restore.json"), hw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1211,7 +1212,8 @@ func TestFreshRestoreInitializesHighWatermark(t *testing.T) {
 	if err := os.Remove(a.restore.path); err != nil {
 		t.Fatal(err)
 	}
-	rs, err := openRestoreStore(a.restore.path, auditHighWatermark(a.eventsPath()))
+	hw, _, _ := auditHighWatermark(a.eventsPath())
+	rs, err := openRestoreStore(a.restore.path, hw)
 	if err != nil {
 		t.Fatal(err)
 	}
