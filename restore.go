@@ -201,15 +201,21 @@ func replayViewWindow(eventsPath, provider, viewStart string) []contract.Envelop
 }
 
 // scanLegacyWindow 讀取 events.jsonl，篩選無 WorkspaceSessionID 的 provider 事件。
-// 與 replayViewWindow 差異：(1) 回傳 error；(2) 檔案不存在 → (nil,nil)；
+// 與 replayViewWindow 差異：(1) 回傳 error；(2) 檔案不存在 → (nil,false,nil)；
 // (3) 只保留 WorkspaceSessionID == ""；(4) Scanner.Err() 檢查。
-func scanLegacyWindow(eventsPath, provider, viewStart string) ([]contract.Envelope, error) {
+//
+// scanned 三值語意（§5a／§6a 判定前提）：開檔成功＋完整掃描到 EOF＋
+// Scanner.Err()==nil 才回 true；檔案不存在回 false（不是「掃描失敗」，是
+// 「無需掃描」）；任何錯誤路徑（open 或 scan）一律回 false 並帶 err。
+// scanned==true 但零筆比對，與 scanned==false 的 NotExist 必須可區分——
+// 前者代表「掃過了、確實沒有」，後者代表「還沒掃過」。
+func scanLegacyWindow(eventsPath, provider, viewStart string) ([]contract.Envelope, bool, error) {
 	f, err := os.Open(eventsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("open events file: %w", err)
+		return nil, false, fmt.Errorf("open events file: %w", err)
 	}
 	defer f.Close()
 	var out []contract.Envelope
@@ -245,9 +251,9 @@ func scanLegacyWindow(eventsPath, provider, viewStart string) ([]contract.Envelo
 		out = append(out, e)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("scan events file: %w", err)
+		return nil, false, fmt.Errorf("scan events file: %w", err)
 	}
-	return out, nil
+	return out, true, nil
 }
 
 func (a *App) eventsPath() string { return filepath.Join(a.stateDir, "events.jsonl") }

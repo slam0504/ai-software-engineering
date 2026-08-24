@@ -359,7 +359,7 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	// boundary 來源＝無可信比對證據，不猜、不前綴。
 	if !hasOlder && a.wsReg != nil {
 		if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript && e.ViewStartEventID != "" {
-			legacy, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
+			legacy, _, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
 			if lerr != nil {
 				return nil, lerr
 			}

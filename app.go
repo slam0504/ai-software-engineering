@@ -1283,7 +1283,7 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 	out := make(map[string]wsregistry.LegacyEntry, len(legacyProviders))
 	for _, p := range legacyProviders {
 		e := a.restore.Get(p)
-		window, werr := scanLegacyWindow(a.eventsPath(), p, e.ViewStartEventID)
+		window, _, werr := scanLegacyWindow(a.eventsPath(), p, e.ViewStartEventID)
 		if werr != nil {
 			return nil, werr
 		}
@@ -1814,7 +1814,7 @@ func (a *App) backfillLegacyTranscript(store *wsregistry.Store) error {
 		if re.ViewStartEventID == "" {
 			continue // 無可信 boundary，不猜（見上方 doc）——guard 放在掃描之前，省一次全檔掃描
 		}
-		window, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
+		window, _, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
 		if werr != nil {
 			return werr
 		}

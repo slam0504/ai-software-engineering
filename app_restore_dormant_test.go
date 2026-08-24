@@ -630,20 +630,23 @@ func TestScanLegacyWindow(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := scanLegacyWindow(path, "claude", "")
+	got, scanned, err := scanLegacyWindow(path, "claude", "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !scanned {
+		t.Fatal("正常掃描應回 scanned==true")
 	}
 	if len(got) != 2 || got[0].EventID != "e1" || got[1].EventID != "e2" {
 		t.Fatalf("只應取無 WSID 的 claude 事件：%+v", got)
 	}
-	if envs, err := scanLegacyWindow(filepath.Join(dir, "nope.jsonl"), "claude", ""); err != nil || envs != nil {
-		t.Fatalf("檔案不存在應回 (nil,nil)：%v %v", envs, err)
+	if envs, scanned, err := scanLegacyWindow(filepath.Join(dir, "nope.jsonl"), "claude", ""); err != nil || envs != nil || scanned {
+		t.Fatalf("檔案不存在應回 (nil,false,nil)：%v %v %v", envs, scanned, err)
 	}
 	// scan error：darwin 上 os.Open(目錄) 會成功，錯誤在讀取時才出現
 	// （Scanner.Err()="is a directory"）——這條打的是 Scanner.Err() 分支。
-	if _, err := scanLegacyWindow(dir, "claude", ""); err == nil {
-		t.Fatal("目錄讀取失敗必須回 error，不得靜默回 nil")
+	if _, scanned, err := scanLegacyWindow(dir, "claude", ""); err == nil || scanned {
+		t.Fatal("目錄讀取失敗必須回 error 且 scanned==false，不得靜默回 nil")
 	}
 	// 真 open error（EACCES，非 NotExist）：spec §5a 凍結「開檔失敗→回 error」。
 	// 沒有這條的話，把 open 錯誤全當 NotExist 吞掉的 mutation 在整份測試存活——
@@ -657,8 +660,27 @@ func TestScanLegacyWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-		if _, err := scanLegacyWindow(path, "claude", ""); err == nil {
-			t.Fatal("open error（非 NotExist）必須回 error，不得當 NotExist 吞掉")
+		if _, scanned, err := scanLegacyWindow(path, "claude", ""); err == nil || scanned {
+			t.Fatal("open error（非 NotExist）必須回 error 且 scanned==false，不得當 NotExist 吞掉")
+		}
+	})
+	// 檔案存在但過濾後零筆（只放 codex 事件、查 claude）：scanned==true 且
+	// got 為零筆——這是 §6a 清旗標判定「NotExist」與「掃描成功但零筆」的
+	// 唯一區分依據，NotExist 必須回 scanned==false 才能與此案例互斥。
+	t.Run("scanned_true_zero_matches", func(t *testing.T) {
+		zeroPath := filepath.Join(dir, "codex-only.jsonl")
+		if err := os.WriteFile(zeroPath, []byte(`{"event_id":"e9","provider":"codex","kind":"message","text":"only-codex"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, scanned, err := scanLegacyWindow(zeroPath, "claude", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !scanned {
+			t.Fatal("檔案存在、掃描完整但零筆比對應回 scanned==true")
+		}
+		if len(got) != 0 {
+			t.Fatalf("查無相符 provider 事件時 got 應為零筆：%+v", got)
 		}
 	})
 }
