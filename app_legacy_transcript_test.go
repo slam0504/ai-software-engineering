@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
@@ -100,6 +101,14 @@ func seedLegacyFewTurnsAppNoLegacyEvents(t *testing.T, turnCount int) *App {
 	// a.wsReg，loadTurnsBefore 的合併分支要讀 a.wsReg.Get。
 	a.wsReg = registryOnDisk(t, dir)
 	return a
+}
+
+// seedLegacyOnlyNoTurnsApp：index 零 turn record，僅 boundary 後的無 WSID
+// legacy 事件——readEnvelopeRange 根本不會被呼叫，目錄注入時錯誤只可能來自
+// scanLegacyWindow（TestLoadTurnsBeforeLegacyScanErrorStillGuarded 用）。
+func seedLegacyOnlyNoTurnsApp(t *testing.T) *App {
+	t.Helper()
+	return seedLegacyTranscriptFixtureApp(t, true, 0, "0000000000")
 }
 
 // hasLegacyText：envs 內是否含至少一筆無 WorkspaceSessionID 的事件——legacy
@@ -257,8 +266,9 @@ func TestLoadTurnsBeforeMissingEventsDoesNotClearFlag(t *testing.T) {
 	}
 }
 
-// scan error 不清（既有 TestLoadTurnsBeforeScanErrorPropagates 擴斷言即可，若該測試
-// fixture 的 window 非空則另建本測試）：回錯且旗標仍 true。
+// scan error 不清：回錯且旗標仍 true。錯誤來自 turn-read 路徑
+// （readEnvelopeRange fail loud，Task 1）；legacy 分支（scanLegacyWindow）的
+// scan error 守門見 TestLoadTurnsBeforeLegacyScanErrorStillGuarded。
 func TestLoadTurnsBeforeScanErrorDoesNotClearFlag(t *testing.T) {
 	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5)
 	events := filepath.Join(a.stateDir, "events.jsonl")
@@ -268,8 +278,12 @@ func TestLoadTurnsBeforeScanErrorDoesNotClearFlag(t *testing.T) {
 	if err := os.Mkdir(events, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.LoadTurnsBefore("w1", "", 20); err == nil {
+	_, err := a.LoadTurnsBefore("w1", "", 20)
+	if err == nil {
 		t.Fatal("scan error 必須回錯")
+	}
+	if !strings.Contains(err.Error(), "read events.jsonl at") || !strings.Contains(err.Error(), "wsid=") {
+		t.Fatalf("錯誤必須含 turn-read 的 offset 與 wsid 脈絡：%v", err)
 	}
 	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); !e.LegacyTranscript {
 		t.Fatal("scan error 不得清旗標")
@@ -426,9 +440,12 @@ func TestLegacyTranscriptEndToEndHydrate(t *testing.T) {
 }
 
 // TestLoadTurnsBeforeScanErrorPropagates：integration review 2026-08-22 擴充
-// ——scanLegacyWindow 的 scan error（events.jsonl 換成同名目錄，Scanner.Read
-// 回 EISDIR）必須經 loadTurnsBefore 的 legacy 分支原樣傳播，不得被靜默吞掉、
-// 少給合併結果（見 rebuild_orchestrator.go: `if lerr != nil { return nil, lerr }`）。
+// ——events.jsonl 換成同名目錄（Scanner.Read 回 EISDIR）必須讓 LoadTurnsBefore
+// 原樣傳播錯誤，不得被靜默吞掉、少給合併結果。錯誤現在來自 turn-read 路徑
+// （readEnvelopeRange fail loud，Task 1）：本 fixture 有 turn record，
+// turn-read 先於 legacy scan 觸發，短路了原本守 legacy scan error 分支的路徑；
+// legacy 分支（scanLegacyWindow）的 scan error 守門另見
+// TestLoadTurnsBeforeLegacyScanErrorStillGuarded。
 //
 // 用目錄取代 chmod 0o000：0o000 在部分環境（root／euid 特例）讀取仍會成功，
 // 换成同名目錄則兩個平台（Linux／Darwin）都保證 os.Open 成功、Scanner.Scan()
@@ -442,8 +459,35 @@ func TestLoadTurnsBeforeScanErrorPropagates(t *testing.T) {
 	if err := os.Mkdir(eventsPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.LoadTurnsBefore("w1", "", 20); err == nil {
-		t.Fatal("events.jsonl 換成目錄後 scanLegacyWindow 的 scan error 必須傳播，不得靜默少給 legacy")
+	_, err := a.LoadTurnsBefore("w1", "", 20)
+	if err == nil {
+		t.Fatal("events.jsonl 換成目錄後錯誤必須傳播，不得靜默少給 legacy")
+	}
+	if !strings.Contains(err.Error(), "read events.jsonl at") || !strings.Contains(err.Error(), "wsid=") {
+		t.Fatalf("錯誤必須含 turn-read 的 offset 與 wsid 脈絡：%v", err)
+	}
+}
+
+// spec §3 義務：本票讓既有兩個目錄注入測試改由 turn-read 路徑先回錯，原本
+// 守 legacy scan error 分支的測試被短路（spec gate 實測：吞 lerr 全套全綠）。
+// fixture：index 零 turn record、events.jsonl 只有 boundary 後的無 WSID legacy
+// 事件——readEnvelopeRange 根本不被呼叫，目錄注入時錯誤只可能來自
+// scanLegacyWindow。mutation（吞 lerr）→ err==nil → 紅。
+func TestLoadTurnsBeforeLegacyScanErrorStillGuarded(t *testing.T) {
+	a := seedLegacyOnlyNoTurnsApp(t) // flag=true、ViewStart 非空、僅 legacy 事件、無任何 turn
+	events := filepath.Join(a.stateDir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.LoadTurnsBefore("w1", "", 20)
+	if err == nil {
+		t.Fatal("legacy 掃描失敗必須回錯（吞 lerr 的 mutation 在此紅）")
+	}
+	if strings.Contains(err.Error(), "read events.jsonl at") {
+		t.Fatalf("錯誤應來自 scanLegacyWindow 而非 turn-read（fixture 無 turn record）：%v", err)
 	}
 }
 
