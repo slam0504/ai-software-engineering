@@ -240,25 +240,27 @@ func TestShutdownSkipsRegistrySyncWhenUncertain(t *testing.T) {
 // post-mortem 只看得到之後一連串被拒絕的操作，答不出 latch 是何時、被哪一次
 // 寫入設下的。
 //
-// **覆蓋範圍要說清楚（rev3 review Critical；C3 closeout 複查校正計數）**：
-// `noteRegistryUncertainErr` 接了九個呼叫點，這條測試只守得住其中六個——凡是
+// **覆蓋範圍要說清楚（rev3 review Critical；C3 closeout 複查校正計數；C4
+// closeout 加 legacy_transcript_backfill 呼叫點再校正一次）**：
+// `noteRegistryUncertainErr` 接了十個呼叫點，這條測試只守得住其中六個——凡是
 // 經過 `a.wsReg`（sessionRegistry 介面，可換成 stub）**且**這裡實際驅動到的都
 // 守得到：
 //
 //	create_put／create_rollback／reset_view／tombstone_persist／shutdown_sync／
 //	legacy_flag_clear
 //
-// **另外三個 op 標籤目前零守門**，據實記在這裡：
+// **另外四個 op 標籤目前零守門**，據實記在這裡：
 //
-//	resume_backfill／registry_load／set_layout
+//	resume_backfill／registry_load／legacy_transcript_backfill／set_layout
 //
-// resume_backfill／registry_load 直接吃具體型別 `*wsregistry.Store`
-// （`BackfillResume` 不在介面上、`registry_load` 發生在 `a.wsReg` 接線之前），
-// 而讓真實 Store 的步驟 4 失敗需要它 package-private 的注入鉤子，跨 package
-// 取不到。把鉤子 export 進 production API 只為了測試，代價比這兩格的價值
-// 高——登記為已知缺口，不要讀成「已覆蓋」。set_layout（`setPaneLayout`，
-// app.go）雖然經 `a.wsReg`、理論上可用同一張表的手法驅動，但這裡尚未補上
-// 對應列——一併登記為已知缺口，不是本次改動範圍。
+// resume_backfill／registry_load／legacy_transcript_backfill 直接吃具體型別
+// `*wsregistry.Store`（`BackfillResume`／`BackfillLegacyTranscript` 都不在介面
+// 上、`registry_load` 發生在 `a.wsReg` 接線之前），而讓真實 Store 的步驟 4
+// 失敗需要它 package-private 的注入鉤子，跨 package 取不到。把鉤子 export 進
+// production API 只為了測試，代價比這三格的價值高——登記為已知缺口，不要讀成
+// 「已覆蓋」。set_layout（`setPaneLayout`，app.go）雖然經 `a.wsReg`、理論上可
+// 用同一張表的手法驅動，但這裡尚未補上對應列——一併登記為已知缺口，不是本次
+// 改動範圍。
 //
 // mutation（各自只打紅一列）：拿掉表中**任一**入口的 noteRegistryUncertainErr
 // → 紅在該入口那一個 subtest。

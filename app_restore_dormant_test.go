@@ -1103,3 +1103,31 @@ func TestBackfillLegacyTranscriptEmptyViewStartSkipsProvider(t *testing.T) {
 		}
 	}
 }
+
+// §4 失敗軌跡：backfill 失敗除 startup blocker 外要留 audit.jsonl 持久軌跡。
+// fixture 用多候選（確定性觸發 fail loud），經 restoreSessions 走真實接線。
+func TestBackfillLegacyTranscriptFailureLeavesAudit(t *testing.T) {
+	dir := seedMigratedTwoClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatalf("backfill 失敗不阻擋啟動：%v", err)
+	}
+	if !auditHas(t, dir, "legacy_transcript_backfill_failed") {
+		t.Fatal("backfill 失敗必須留下具名 audit 事件")
+	}
+}
+
+// 反向：成功路徑不發該事件。
+func TestBackfillLegacyTranscriptSuccessNoFailureAudit(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t)
+	a := newTestAppAt(t, dir)
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if !registryOnDisk(t, dir).LegacyTranscriptBackfilled() {
+		t.Fatal("前提：backfill 應成功")
+	}
+	if auditHas(t, dir, "legacy_transcript_backfill_failed") {
+		t.Fatal("成功路徑不得發失敗 audit")
+	}
+}

@@ -1708,6 +1708,8 @@ func (a *App) loadSessionRegistry() ([]wsregistry.Entry, error) {
 	// 影響）。noteStartupBlocker 沿用 backfillResumeFromLegacy 失敗的前例——
 	// blocker 只影響訊息排序，不阻擋啟動（見 noteStartupBlocker doc）。
 	if err := a.backfillLegacyTranscript(store); err != nil {
+		err = a.noteRegistryUncertainErr("legacy_transcript_backfill", "", err)
+		a.audit("legacy_transcript_backfill_failed", map[string]any{"error": err.Error()})
 		a.noteStartupBlocker("session registry: legacy transcript 標記補寫失敗（部分舊對話捲動到底時可能看不到更早的歷史訊息）：" + err.Error())
 	}
 	return restorable, nil
