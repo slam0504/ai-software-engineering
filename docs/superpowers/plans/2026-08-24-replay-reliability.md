@@ -47,9 +47,13 @@ func (s *scriptedReadSeeker) Read(p []byte) (int, error) {
 	if s.i >= len(s.chunks) {
 		return 0, io.EOF
 	}
-	c := s.chunks[s.i]
-	s.i++
+	c := &s.chunks[s.i]
 	n := copy(p, c.data)
+	c.data = c.data[n:] // 消耗式：chunk 大於 len(p) 時分次吐完，不靜默截斷（plan gate P2）
+	if len(c.data) > 0 {
+		return n, nil // 尚未吐完，錯誤留到本 chunk 消耗完那次一併回
+	}
+	s.i++
 	return n, c.err
 }
 
@@ -191,10 +195,12 @@ func TestReadEnvelopeRangeDirectoryFDFailsLoud(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails（兩段，各自記錄——plan gate P2：舊簽章下整包 build failed、零測試執行，「兩紅四綠」在單次跑不可能觀察到）**
 
-Run: `go test . -run TestReadEnvelopeRange -v`
-Expected: FAIL——`NonEOFErrorFailsLoud`（簽章不符編譯失敗；改簽章後未實作前則 err==nil 紅）與 `DirectoryFDFailsLoud` 紅；其餘為既有行為迴歸鎖應綠（RED 階段記錄哪幾條紅）
+(a) 舊簽章下：`go test . -run TestReadEnvelopeRange -v`
+Expected: `FAIL [build failed]`（`*scriptedReadSeeker` 不符 `*os.File`）——證明 stub 確實需要簽章放寬。
+(b) **只做簽章放寬**（`io.ReadSeeker`，零行為改動）後重跑同指令：
+Expected: `NonEOFErrorFailsLoud` 紅（err==nil）、`DirectoryFDFailsLoud` 紅；其餘 4 條迴歸鎖綠——「改動前行為」的實測證據在此留存（gate 已實測為此結果）。
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -261,7 +267,7 @@ func TestLoadTurnsBeforeLegacyScanErrorStillGuarded(t *testing.T) {
 }
 ```
 
-helper `seedLegacyOnlyNoTurnsApp`：沿用 `seedLegacyTranscriptFixtureApp` 手法但不 emit 任何 turn（index 無 record、無 open turn），events.jsonl 只放 boundary 之後的無 WSID claude 事件；`a.wsReg = registryOnDisk(t, dir)` 接線。
+helper `seedLegacyOnlyNoTurnsApp`：**一行 wrapper**——`return seedLegacyTranscriptFixtureApp(t, true, 0, "0000000000")`（plan gate 實測：既有參數化 helper 對 n=0 直接產出所需形狀——recs=0／hasOlder=false／open=false／registry flag=true＋ViewStart 非空／events.jsonl 只有 boundary 後無 WSID 事件，含 wsReg 接線）。**不要**複製 helper body 另寫一份（fixture 家族同一參數化 helper 是既有風格，分岔是自找的維護面）。
 
 既有兩測試各補（Task 1 落地後才會綠——來源改為 turn-read）：
 
@@ -285,7 +291,7 @@ Expected: 守門測試綠（legacy 分支現行就 fail loud——它是迴歸�
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test . -run 'TestLoadTurnsBefore' -count=1 -v`
-Expected: 全綠（含既有 11 個與新增 1 個）
+Expected: 全綠（既有 12 個＋新增 1 個＝13——`-run` 前綴同時匹配 app_replayindex_test.go 的 `TestLoadTurnsBeforeWithoutIndexFailsLoud`，plan gate 以 `go test -list` 實測計數）
 
 - [ ] **Step 5: Commit**
 
