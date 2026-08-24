@@ -208,12 +208,19 @@ provider，不猜）：無可信 boundary 來源＝無可信比對證據，寧�
   spec_assist scope），**額外只保留 `WorkspaceSessionID==""`**（pre-migration）。
 - 開檔失敗（非 `os.IsNotExist`）→ 回 error。檔案不存在 → 回 `(nil, false, nil)`（全新
   workspace，非錯誤）。
-- **`scanned` 語意（closeout 2026-08-23）**：`true`＝檔案存在、開檔成功、完整掃描到
-  EOF 且 `Scanner.Err()==nil`——「零筆」與「檔案不存在」自此可區分。既有三個呼叫端
-  對 NotExist 的行為**不變**（`legacyEntries` 判 `HasLegacyTranscript=false`、
-  backfill 判零候選、合併載入無可前綴），新增的 §6a 清旗標是唯一依賴 `scanned==true`
-  的消費者：NotExist 不得視為「成功掃描零筆」而清旗標——events.jsonl 缺檔可能是
-  暫時狀態，清了就不可逆。
+- **`scanned` 語意（closeout 2026-08-23；2026-08-24 owner 解凍擴大消費）**：`true`＝
+  檔案存在、開檔成功、完整掃描到 EOF 且 `Scanner.Err()==nil`——「零筆」與「檔案
+  不存在」自此可區分。三個呼叫端全數消費 `scanned`（原「NotExist 行為不變」的凍結
+  已由 owner 2026-08-24 解凍——degraded startup（events sink 開檔失敗、events.jsonl
+  不存在）下原行為會把兩個一次性 marker 燒掉，影響未遷移與已遷移使用者）：
+  - `legacyEntries`：`scanned==false` → **回錯、不呼叫 Migrate**（migrated marker 與
+    entries 皆不落盤，下次啟動可重試）。正常啟動不受影響：sink 先於
+    loadSessionRegistry 建立 events.jsonl，全新 workspace 掃到的是存在的空檔、
+    `scanned==true`。
+  - `backfillLegacyTranscript`：boundary 可信（非空）但 `scanned==false` → **回錯、
+    不落 marker**（空 boundary 仍先被 §4 guard 以零候選語意跳過，順序不變）。
+  - `loadTurnsBefore`（§6a 清旗標）：NotExist 不得視為「成功掃描零筆」而清旗標——
+    缺檔可能是暫時狀態，清了就不可逆。
 - 掃描結束檢查 `Scanner.Err()`，非 nil → 回 error（修 restore.go:167 既有缺口的
   同類問題；`replayViewWindow` 本身保留不動，僅 RestoreViews 用）。
 - malformed 單行跳過不中斷（同既有語意）。
@@ -354,6 +361,15 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 **§4 失敗軌跡（closeout 2026-08-23）**：
 - backfill 多候選 fixture → audit.jsonl 出現 `legacy_transcript_backfill_failed`
   且帶 error 內容；成功路徑不發該事件（反向）。
+
+**degraded startup 單向 marker 防護（owner 2026-08-24 解凍新增）**：
+- 未遷移 fixture＋events.jsonl 不存在（模擬 sink 開檔失敗的降級啟動）→
+  `restoreSessions` 回錯、`Migrated()==false`、entries 空（migrated marker 不被
+  燒掉）；恢復 events.jsonl 後重試正常遷移。
+- 已遷移 fixture（boundary 非空）＋events.jsonl 不存在 → backfill 回錯、
+  `LegacyTranscriptBackfilled()==false`（marker 不被燒掉）；恢復後重試正常標記。
+- 反向（既有語意不變）：檔案存在且成功掃描零筆 → 照常落 marker（既有零候選測試
+  持續守住）。
 
 **既有契約不破**：
 - `TestLegacyJournalWithoutWSIDAttributes`（RestoreViews provider-keyed）維持綠。
