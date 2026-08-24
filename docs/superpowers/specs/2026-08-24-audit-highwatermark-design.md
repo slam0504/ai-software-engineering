@@ -6,6 +6,12 @@ caller 契約分開**——ResetView 寫入路徑遇 open／scan error 必須停
 boundary；startup snapshot 路徑是否允許降級獨立裁決。
 
 **修訂記錄**：
+- rev4（2026-08-24，owner review 2 P2）：§1 表格同步 rev3 校正（RestoreViews 改標
+  「無 production caller、僅直接呼叫 binding 時的潛在行為」）；§4 拆開「watermark
+  不可用」與「snapshot 被降級寫入」——audit 改名 `restore_watermark_unavailable`
+  （陳述確定事實）、fallback 消費三條件凍結（不存在／malformed 持久化、缺 provider
+  僅記憶體、完整存在不消費）、§5 補完整 restore.json 反向案例＋持久降級 fixture
+  前提明訂。
 - rev3（2026-08-24，spec gate 3 P1／3 P2）：修復路徑更正——ResetView 寫 wsregistry
   非 restore.json（gate 實測），唯一修復＝手動刪除／編輯 restore.json；app 層注入
   改「events.jsonl 建成目錄」打 scan error 分支（ENOTDIR 僅 unit 層）；「不阻擋
@@ -32,7 +38,7 @@ Production caller 恰兩處（replay reliability spec §5 盤點、本票複核�
 
 | Caller | 消費方式 | 失敗時的實際後果 |
 |---|---|---|
-| `openRestoreStore`（app.go:2242，啟動快照） | `freshEntries(hw)`／缺 provider 補齊 | 快照 view_start=`""` → RestoreViews 重放整段歷史；空 boundary 的 hydrate／backfill 效應已由既有 guard 擋住（closeout 票） |
+| `openRestoreStore`（app.go:2242，啟動快照） | `freshEntries(hw)`／缺 provider 補齊 | restore.json 不存在／malformed 時快照 view_start 被持久化為 `""`（缺 provider 補齊僅改記憶體）；殘餘風險＝未遷移狀態的 `legacyEntries` 掃描範圍放寬（§4）；空 boundary 的 hydrate／backfill 效應已由既有 guard 擋住（closeout 票）。`RestoreViews` 為無 production caller 的 legacy binding，僅直接呼叫該 binding 時才有重放全歷史的潛在行為 |
 | `ResetView`（app.go:9084，「開新對話」高水位） | `a.wsReg.ResetView(wsid, hw)` **durable 寫入** | boundary 被寫成 `""`（open 失敗）或偏舊值（截讀）——「開新對話」沒有切乾淨，且是**持久化**的使用者可見歷史錯誤 |
 
 測試 caller 四處（app_test.go:206／:1214、app_restore_dormant_test.go:59、
@@ -89,10 +95,21 @@ FinishEndSessionIntoReset 在 watermark 判定點之前已完成）——UI 因 
 
 - **`err != nil` 或 `scanned == false`（含 NotExist——見 §2 表註：此路徑的 NotExist
   代表 sink 建立失敗或外部刪除，不是全新 workspace）**：發具名 audit
-  `restore_snapshot_degraded`（含 path 與 error／NotExist 說明）＋startup warning，
-  以 `""` 建立 legacy snapshot，**繼續啟動**。不列為 blocker、不停止 app。
+  **`restore_watermark_unavailable`**（含 path 與 error；NotExist 合成可操作說明）
+  ＋startup warning，將 `""` 作為 fallback **傳入** `openRestoreStore`，**繼續啟動**。
+  不列為 blocker、不停止 app。
+  **命名理由（owner review rev3 P2）**：audit 陳述的是「watermark 不可用」這個
+  確定發生的事實，不是「snapshot 被降級寫入」——fallback 是否實際被消費由
+  restore.json 的狀態決定（下段），事件名稱不得宣稱可能不存在的 snapshot 變更。
 - `scanned == true`：以實際高水位（含空檔的 `""`——這才是全新 workspace 的正常格）
-  建立快照，無軌跡。
+  傳入，無軌跡。
+
+**fallback 的消費條件（凍結——watermark 不可用≠snapshot 被改）**：
+`openRestoreStore` 只在三種情況消費 highWatermark 參數——restore.json **不存在**
+（freshEntries **持久化**）、**malformed**（重建並**持久化**）、**缺 provider 條目**
+（補齊**僅改記憶體**，等後續 CommitResume／ClearResume 順帶落盤）。restore.json
+已完整存在時 fallback **不被消費、既有 boundary 不變**——watermark 不可用的那次
+啟動只留軌跡、不改 snapshot。
 
 **持久降級——如實描述（owner review rev1 P1；spec gate rev2 P1 修正修復路徑）**：
 restore.json 不存在或 malformed 時，`freshEntries("")` 會**立即持久化**
@@ -143,9 +160,13 @@ blocker——這是**刻意的複合失效形狀**（marker 防護優先於 snap
 - **snapshot 路徑（§4 裁決 (a)；fixture 前提：migration marker 已設**——未遷移
   workspace 會先被 C4a 防護擋在 legacyEntries，見 §4 複合失效形狀）：
   - 降級啟動（events.jsonl 預建成目錄：sink `OpenFile` 回 EISDIR 順帶覆蓋 sink
-    失敗路徑、watermark 命中 scan error；或刪檔打 NotExist）→ app 繼續啟動、
-    audit 含 `restore_snapshot_degraded`＋startup warning、restore.json 快照
-    view_start 為 `""`。
+    失敗路徑、watermark 命中 scan error；或刪檔打 NotExist）＋**fixture 明訂
+    restore.json 不存在或 malformed**（fallback 才會被消費並持久化）→ app 繼續
+    啟動、audit 含 `restore_watermark_unavailable`＋startup warning、restore.json
+    快照 view_start 為 `""`。
+  - **完整 restore.json 的反向案例**：restore.json 已完整存在＋watermark 不可用
+    → audit 仍發（watermark 不可用是事實）、**既有 boundary 不變**（fallback 未
+    被消費）——鎖住「不可用≠被改」的區分。
   - **持久降級的重啟形狀**：降級啟動後修復 events.jsonl → 再次啟動 → 快照 boundary
     仍為 `""`（不自動修復）；**刪除 restore.json → 再啟動 → boundary 為當時正確
     高水位**（§4 唯一修復路徑的測試，spec gate P1 校正——不再宣稱 ResetView 可修）。
