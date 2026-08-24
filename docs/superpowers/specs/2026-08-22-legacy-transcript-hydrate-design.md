@@ -108,12 +108,19 @@ entry，尋找候選 WSID entry，**五條件同時成立**才算候選：
   實作：沿用 `backfillResumeFromLegacy` 失敗的 `noteStartupBlocker` 前例）；
   下次啟動可重試）。
 
-**失敗軌跡（closeout 2026-08-23 新增）**：backfill 失敗（多候選／scan error／
-persist error）除 startup blocker 外，寫入具名稽核事件
-`legacy_transcript_backfill_failed`（`{"error": ...}`，對齊同檔
-`resume_backfill_failed` 慣例）——startup 訊息是一次性的，audit.jsonl 才是事後
-診斷「為什麼這次啟動沒補標記」的持久軌跡。成功路徑**不**另發 audit：結果已可由
-registry 的 marker 與 entry flag 直接觀測。
+**失敗軌跡（closeout 2026-08-23 新增；2026-08-24 owner review 補統一稽核）**：
+backfill 失敗（多候選／scan error／persist error）的錯誤分支依序：
+1. 先經 `a.noteRegistryUncertainErr("legacy_transcript_backfill", "", err)`——既有
+   契約（app.go:734）要求任何 registry 寫入回 `ErrRegistryUncertain` 都走統一稽核，
+   `BackfillLegacyTranscript` 是 registry 寫入、不得例外；非 uncertain 錯誤原樣通過。
+2. 再寫具名稽核事件 `legacy_transcript_backfill_failed`（`{"error": ...}`，對齊同檔
+   `resume_backfill_failed` 慣例）——startup 訊息是一次性的，audit.jsonl 才是事後
+   診斷「為什麼這次啟動沒補標記」的持久軌跡。
+3. 最後記 startup blocker。
+
+成功路徑**不**另發 audit：結果已可由 registry 的 marker 與 entry flag 直接觀測。
+uncertain 覆蓋測試的「呼叫點數」說明與「具體 Store、尚無跨 package 注入」的已知
+覆蓋缺口註記一併更新。
 
 **I/O 錯誤不得誤判成零候選**（reviewer 2026-08-22 P1）：條件 4 的 legacy window
 掃描**不得**用 `replayViewWindow`——它開檔失敗回 nil、且不檢查 `Scanner.Err()`
@@ -240,8 +247,16 @@ writer 慣例（`ErrEntryNotFound`／`ErrTombstoned` 哨兵，呼叫端視為良
 flag 已為 false 時冪等跳過、不落盤（沿用 `SetLayout` 冪等比對前例）。
 新 mutator 依慣例登記進 uncertain latch 的寫入拒絕枚舉表（fsync_test.go）。
 
-**persist 失敗（含 uncertain latch 拒絕）**：不清除（store 自行回滾記憶體）、
-`loadTurnsBefore` **回錯**（owner 裁決 fail loud、保留重試機會）。取捨：這把一個
+**persist 失敗——三種語意（owner review 2026-08-24 校正，對齊 `persistOrRollback`
+既有契約 store.go:262-275，不得籠統宣稱「旗標維持 true」）**：
+
+| 失敗點 | 語意 |
+|---|---|
+| 步驟 1-3（write／file-sync／rename 前）失敗 | 回滾——記憶體與磁碟旗標皆維持 true，回錯，process 內可重試（下次首載再清） |
+| store 已 latched（先前寫入已 uncertain） | 本次變更回滾（未觸碰檔案系統），回 `ErrRegistryUncertain`，需重啟 |
+| 本次 Clear 的步驟 4（directory-sync）失敗 | **不回滾**——rename 已成功，記憶體停在 false、磁碟很可能也是 false 但 process 內無法確認；latch、回 `ErrRegistryUncertain`、需重啟。此情形**不可宣稱旗標仍為 true** |
+
+三種情形 `loadTurnsBefore` 一律**回錯**（owner 裁決 fail loud）。取捨：這把一個
 「純優化」的寫入失敗升級成該頁載入失敗——接受，因為 registry 寫入失敗（尤其
 uncertain latch）代表整個 registry 已不可寫，掩蓋它只會讓使用者更晚發現。
 
@@ -329,8 +344,12 @@ frontend 零改動（`pin()` 已呼叫 `LoadTurnsBefore("",20)`，自動受益�
 - `scanLegacyWindow` 簽章：NotExist → `scanned==false`；空檔／過濾後零筆 →
   `scanned==true`（unit）。
 - `ClearLegacyTranscript`（wsregistry unit）：清除持久化 round-trip、
-  `ErrEntryNotFound`／`ErrTombstoned` 哨兵、已 false 冪等不落盤、
-  uncertain latch 枚舉表拒絕。
+  `ErrEntryNotFound`／`ErrTombstoned` 哨兵、uncertain latch 枚舉表拒絕；
+  注入一律用既有 step hook（`recordSteps`／`failAt`），**不用 chmod**（root
+  可繞過權限造成假綠）：冪等＝斷言零 persist step；一般 persist 失敗＝
+  `failAt(stepWrite)` 斷言回錯＋回滾；directory-sync 失敗＝
+  `failAt(stepDirSync)` 斷言**不回滾**（記憶體停在 false）＋latch＋後續寫入
+  一律拒絕（§6a 三種語意各有測試）。
 
 **§4 失敗軌跡（closeout 2026-08-23）**：
 - backfill 多候選 fixture → audit.jsonl 出現 `legacy_transcript_backfill_failed`
