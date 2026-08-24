@@ -59,7 +59,7 @@ repo 的 fail loud 契約（暫時性 I/O 錯誤不得偽裝成資料不存在�
 - **app 層**：index 建好後把 events.jsonl 換成同名目錄 → `LoadTurnsBefore` 回錯
   （更正既有兩測試的來源註解即涵蓋，另加一條斷言錯誤訊息含 offset 脈絡）。
 
-## 5. 相鄰缺口（本票非目標，列給 owner 裁決是否另開）
+## 5. 相鄰缺口（owner 已裁決，本票非目標）
 
 - **`auditHighWatermark`（restore.go:137-155）open 失敗靜默回 `""`，且被
   `ResetView`（app.go:9075）直接消費**：open 失敗當下按「開新對話」會把 boundary
@@ -67,6 +67,10 @@ repo 的 fail loud 契約（暫時性 I/O 錯誤不得偽裝成資料不存在�
   backfill 跳過），方向安全，但「新對話的 view 從空 boundary 開始」等於下次重啟
   重放整段歷史。它同時忽略 `Scanner.Err()`（截讀時高水位偏舊——方向安全，多重放
   不漏放）。
+  **Owner 裁決（2026-08-24）：另開 P1，不併入本票**——它涉及 ResetView 的持久化
+  boundary 與使用者可見歷史，不只是 reader 可靠性；該票需先盤點 auditHighWatermark
+  全部 caller，再凍結哪些讀取路徑可寬容、哪些**寫入路徑必須 fail loud 且不得改
+  boundary**。
 - **`replayViewWindow`（restore.go:167）**：維持凍結不動（僅 RestoreViews 消費，
   hydrate 主線 spec 已明文保留）。
 
