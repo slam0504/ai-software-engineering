@@ -8,7 +8,14 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 4. 首次 hydrate 失敗後要有明確的同 process 重試路徑，不能因 view 已存在而
    永久 early return。
 
-本文件 rev1。
+**修訂記錄**：
+- rev2（2026-08-25，owner review 2 P1／1 P2）：呼叫端「零改動」不成立——
+  SessionList/SettingsBar 已釘選分支只 setFocus 不再 pin，加「已釘選但無 view
+  時重新 pin」；pin 的 view 建立保留實例身分、catch/成功皆比對 `createdView`
+  （A→B→A 競態不需 unpin UI 即可達、既有「不可達」註解一併更新）；busy 測試
+  前置設 true（區辨 pushError 誤用）；補 A→B→A deferred 兩變體與 SessionList
+  component test。
+- rev1：初版。
 
 ## 1. 問題與現狀
 
@@ -51,13 +58,38 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 
 ### pin() 首載（要件 1／2／4）
 
-`isNew` 段的 `await load(...)` 包 try/catch。失敗時：
+`isNew` 段建立 view 時**保留實例身分**（owner review rev1 P1——A→B→A 時序不
+需要 unpin UI 就可達，session.ts:416 的「不可達」註解不成立、一併更新）：
 
-- **`delete this.views[wsid]`**（僅刪自己剛建立的那個；若 await 期間已被
-  releaseView 刪除則為 no-op）——回復 `isNew` 前置狀態，**下一次點同一個
-  session 就是完整重試**（SessionList／SettingsBar 的 `s.pin(...)` 呼叫端
-  零改動）。這就是要件 4 的「明確重試路徑」：不靠新 UI 控制項，靠把失敗
-  的 view 清乾淨。
+```ts
+const createdView = newView()
+this.views[wsid] = createdView
+...
+try {
+  const envs = await load(wsid, '', TURN_WINDOW_SIZE)
+  if (this.views[wsid] !== createdView) return   // 舊請求 resolve：不套到新實例
+  for (const e of envs ?? []) applyToView(createdView, e)
+} catch (e) {
+  if (this.views[wsid] === createdView) delete this.views[wsid]  // 僅刪自己建立的
+  this.pushNotice(...)
+}
+```
+
+- **實例比對**：catch 僅在 `this.views[wsid] === createdView` 時刪除——
+  pin(A) 載入中 → 同 pane 切 B（releaseView 刪 A 的 view）→ 切回 A（建第二個
+  view）→ 第一個請求稍後 reject 時，無條件 delete 會誤刪**較新的** view。
+  成功結果同樣只套用到同一實例（舊請求 resolve 不得疊到新 view——順帶關掉
+  既有註解自承的「舊 envelope 不去重疊上去」缺口）。
+- 刪除後回復 `isNew` 前置狀態——重新觸發 pin 載入就是完整重試。
+- notice 照 §3 錯誤出口段。
+
+### 呼叫端調整（owner review rev1 P1——「呼叫端零改動」不成立）
+
+SessionList（SessionList.vue:39）與 SettingsBar（SettingsBar.vue:20）對**已
+釘選**的 session 只 `setFocus`、不再呼叫 `pin()`——view 被清掉後再點同一張
+卡片，真實 UI 仍永久空白。凍結：兩個呼叫端的「已釘選」分支改為
+**已釘選但 `views[wsid]` 不存在時重新呼叫 `pin(idx, wsid)` 觸發載入**（仍
+setFocus；view 存在時行為不變）。重試路徑因此成立於真實 UI，不只 store 層。
 - `pushNotice(t('store.turnsLoadFailed', { wsid, error }))`——app-wide lane、
   不動 busy、不掛錯 pane；錯誤字串含 backend 原文，latch 片語（§2 對齊後）
   經 `applyNotice`→`bumpError` 照常撥 `latchSeq`（要件 3 的前端半邊零新機制、
@@ -72,11 +104,12 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 的 transcript）、`pushNotice(t('store.olderTurnsLoadFailed', {...}))`；重試
 路徑天然存在——使用者再捲到頂就再觸發（cursor 仍在，無早退問題）。
 
-### 呼叫端
+### 其餘呼叫端
 
-`SessionList`／`SettingsBar` 的 `s.pin(...)`、`PaneView` 的 `await s.loadOlder(...)`
-零改動——攔截收斂在 store 層（要件 1），呼叫端不再產生 unhandled rejection
-（`pin` 內 async 錯誤已被吃掉、不再向外 reject）。
+`PaneView` 的 `await s.loadOlder(...)` 零改動；SessionList／SettingsBar 除上段
+「已釘選但無 view 時重新 pin」外亦零改動。攔截收斂在 store 層（要件 1），
+呼叫端不再產生 unhandled rejection（`pin` 內 async 錯誤已被吃掉、不再向外
+reject）。
 
 ### i18n
 
@@ -92,9 +125,18 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
 - **Frontend（vitest，沿用既有 session store 測試手法——registryUncertain.test.ts
   的 binding stub 慣例）**：
   - pin 首載 reject → view 被清（`views[wsid]` 不存在）、notice lane 有錯誤、
-    `busy` 未被動過、`errorSeq` 增；再次 `pin` 同 wsid → binding 被第二次呼叫
-    （**重試真的發生**——mutation：拿掉 `delete views[wsid]` 則第二次呼叫
-    不發生、此斷言紅）。
+    **`busy` 前置設為 `true` 且事後仍為 `true`**（owner review rev1 P2：預設
+    false 時把 pushNotice 誤改成 pushError 仍可能過——view 已刪時 pushError 也
+    走 notice lane＋errorSeq，唯 busy 副作用可區辨兩者）、`errorSeq` 增；再次
+    `pin` 同 wsid → binding 被第二次呼叫（**重試真的發生**——mutation：拿掉
+    `delete views[wsid]` 則第二次呼叫不發生、此斷言紅）。
+  - **A→B→A 競態（deferred promise，兩變體）**：pin(A) 的 load 懸置 → 同 pane
+    pin(B)（releaseView 刪 A view）→ pin(A) 第二次（建新實例、第二個 load 懸置）
+    → 讓**第一個** load (a) reject：新實例**不得被刪**（`views[A]` 仍存在且為
+    第二實例）；(b) resolve：舊 envelope **不得**套到新實例。
+  - **Component test（SessionList）**：第一次 pin 失敗（view 已清）→ 再點同一
+    張卡片 → binding 被第二次呼叫（真實 UI 重試路徑——store 直呼 pin 的測試
+    蓋不到「已釘選只 setFocus」分支）。
   - pin 首載 reject 且錯誤含 `REGISTRY_UNCERTAIN_MARK` → `latchSeq` 增。
   - loadOlder reject → 既有 timeline 內容不變、notice 有錯誤、再呼叫 loadOlder
     → binding 再被呼叫（重試）。
