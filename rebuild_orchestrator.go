@@ -417,8 +417,8 @@ func (a *App) viewBoundary(wsid string) string {
 //
 // 非 EOF 讀取錯誤一律 fail loud：把已讀內容當成功結果回傳等同靜默截頁，呼叫
 // 端與使用者都無法分辨「這段本來就這麼短」與「讀到一半壞掉」。EOF（含被其他
-// error 包裝的 io.EOF）才是正常終點，用 errors.Is 判定；end 早於實際檔尾這種
-// 「EOF 提前發生」的情況仍維持既有寬容——回目前已收集到的部分結果、不回錯
+// error 包裝的 io.EOF）才是正常終點，用 errors.Is 判定；EOF 早於 end（亦即
+// end 超出實際檔尾）的情況仍維持既有寬容——回目前已收集到的部分結果、不回錯
 // （spec §2）：那是呼叫端給的 range 本身過寬，不是讀取失敗，殘餘風險由呼叫端
 // 對 range 來源（如 index 記錄的 offset）負責。
 //
