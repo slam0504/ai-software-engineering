@@ -123,17 +123,27 @@ func TestClearLegacyTranscriptWriteFailureRollsBack(t *testing.T) {
 
 // §6a 三語意之三：directory-sync 失敗 → 不回滾、latch、後續寫入一律拒絕
 // （owner review 2026-08-24 P1：不得宣稱旗標仍 true）。
+//
+// 「latch 後拒絕」的斷言必須用**另一筆 flag=true 的 entry**（w2）：w1 在
+// dirSync 失敗後記憶體已停在 false（不回滾），再 Clear w1 會先撞冪等守衛回
+// nil——那條斷言在正確實作下永遠打不綠，而「把 latch 檢查搬到冪等之前」看似
+// 能打綠、實則推翻本 plan 凍結的 SetLayout 順序（gate 複驗 P1，兩候選皆實測）。
+// 用 w2 同時補上三語意表「已 latched → 回滾」那格的旗標回滾斷言（枚舉表只驗
+// 回錯與其他欄位、沒驗 flag 回滾）。
 func TestClearLegacyTranscriptDirSyncFailureLatches(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "ws.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	n := 0
 	if _, err := Migrate(s, map[string]LegacyEntry{
 		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
-	}, func() string { return "w1" }); err != nil {
+		"codex":  {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { n++; return fmt.Sprintf("w%d", n) }); err != nil {
 		t.Fatal(err)
 	}
+	// Live() 依 CreatedAt→WSID 排序；兩筆 CreatedAt 相同，w1 < w2。
 	failAt(s, stepDirSync, errors.New("dir sync EIO"))
 	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrRegistryUncertain) {
 		t.Fatalf("dirSync 失敗必須回 ErrRegistryUncertain：%v", err)
@@ -145,8 +155,11 @@ func TestClearLegacyTranscriptDirSyncFailureLatches(t *testing.T) {
 		t.Fatal("必須 latch")
 	}
 	s.ForceStepHookForTest(nil)
-	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrRegistryUncertain) {
+	if err := s.ClearLegacyTranscript("w2"); !errors.Is(err, ErrRegistryUncertain) {
 		t.Fatalf("latch 後寫入一律拒絕：%v", err)
+	}
+	if e, _ := s.Get("w2"); !e.LegacyTranscript {
+		t.Fatal("已 latched 的寫入必須回滾（w2 flag 仍 true——三語意表第二格）")
 	}
 }
 ```
@@ -311,8 +324,9 @@ func TestLoadTurnsBeforeScanErrorDoesNotClearFlag(t *testing.T) {
 	}
 }
 
-// persist error（app 層）：chmod stateDir 的注入落在 stepWrite（rename 前，
-// temp file 建不出來）→ §6a 三語意之一的「回滾、flag 維持 true、可重試」。
+// persist error（app 層）：chmod stateDir 的失敗落在步驟 1（暫存檔建立，
+// writeTempLocked 的 os.OpenFile——早於 stepWrite hook 被呼叫）→ §6a 三語意
+// 之一的「回滾、flag 維持 true、可重試」。
 // dirSync 不回滾＋latch 的語意由 Task 1 的 wsregistry unit 覆蓋（step hook 是
 // wsregistry package 內的 test-only 接點，app 層拿不到）。root skip 保留：
 // 此注入依賴權限，root 會繞過（unit 層已有確定性版本，app 層此測驗的是
@@ -418,6 +432,7 @@ git commit -m "feat(app): loadTurnsBefore 空 window 清旗標——§6a 四分�
 
 **Files:**
 - Modify: `app.go`（loadSessionRegistry 的 backfillLegacyTranscript 錯誤分支，約 :1704）
+- Modify: `app_registry_uncertain_test.go`（呼叫點數說明＋「具體 Store、尚無跨 package 注入」覆蓋缺口註記——新呼叫點吃具體 Store 不可 stub，只更新註記、不加表列）
 - Test: `app_restore_dormant_test.go`
 
 **Interfaces:**
@@ -486,7 +501,7 @@ Expected: PASS（含既有 7 個）
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app.go app_restore_dormant_test.go
+git add app.go app_restore_dormant_test.go app_registry_uncertain_test.go
 git commit -m "feat(app): backfill 失敗補具名 audit（legacy_transcript_backfill_failed，§4 失敗軌跡）"
 ```
 
