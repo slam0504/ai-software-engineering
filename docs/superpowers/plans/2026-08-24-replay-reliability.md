@@ -240,7 +240,7 @@ git commit -m "fix(app): readEnvelopeRange 非 EOF 讀取錯誤 fail loud——�
 - Consumes: Task 1 的錯誤格式（`read events.jsonl at`＋`wsid=`）。
 - Produces: 既有兩測試補「錯誤訊息含 `read events.jsonl at` 與 `wsid=`」必要斷言（無此斷言則修前修後皆綠、對本票 mutation 零鑑別力——spec §4）；新測試 `TestLoadTurnsBeforeLegacyScanErrorStillGuarded`（spec §3 義務）。
 
-- [ ] **Step 1: Write the failing test（守門測試）＋補強既有斷言**
+- [ ] **Step 1: Add regression/mutation guard tests and strengthen existing assertions**（本 task 非 RED 起手：三條測試在 Task 1 完成後預期全綠——它們是迴歸／mutation 守門，鑑別力由 gate 的吞 lerr mutation 實測證明，不由自然基線的紅證明）
 
 ```go
 // spec §3 義務：本票讓既有兩個目錄注入測試改由 turn-read 路徑先回錯，原本
@@ -279,10 +279,10 @@ helper `seedLegacyOnlyNoTurnsApp`：**一行 wrapper**——`return seedLegacyTr
 
 並把兩測試的來源註解從「錯誤來自 scanLegacyWindow」更正為「錯誤來自 turn-read 路徑（readEnvelopeRange fail loud）；legacy 分支守門見 TestLoadTurnsBeforeLegacyScanErrorStillGuarded」。
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run baseline and verify guards pass**
 
 Run: `go test . -run 'TestLoadTurnsBeforeLegacyScanErrorStillGuarded|TestLoadTurnsBeforeScanErrorPropagates|TestLoadTurnsBeforeScanErrorDoesNotClearFlag' -v`
-Expected: 守門測試綠（legacy 分支現行就 fail loud——它是迴歸鎖，RED 意義由 spec gate 的 mutation 實測背書）；既有兩測試的新斷言在 Task 1 已落地下綠（若先跑本 task 再跑 Task 1 則紅——本 plan 依序執行，於 report 記錄實際順序與結果）
+Expected: 三條全綠（自然基線不會紅：守門測試守的 legacy 分支現行即 fail loud；既有兩測試的新斷言在 Task 1 已落地下綠。鑑別力證據＝gate 的吞 lerr mutation 實測：只有守門測試紅、其餘全綠）
 
 - [ ] **Step 3: Implementation**
 
