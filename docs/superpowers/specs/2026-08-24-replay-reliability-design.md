@@ -62,7 +62,8 @@ b／c／e 保留寬容（皆為雙重故障或外部行為者，為此把 UI 打
 ## 3. 影響面
 
 - 呼叫端只有 `loadTurnsBefore` 兩處，error 傳播路徑既有（`return nil, err`）。
-- 前端：`LoadTurnsBefore` 回錯目前會被 `pin()` 吞掉——那是已開的 UI P1 票
+- 前端：`LoadTurnsBefore` 的錯誤目前不會被 `pin()` 轉換為使用者可見的錯誤狀態
+  （unhandled rejection）——那是已開的 UI P1 票
   （memory 1b）的範圍，本票不動 frontend；本票完成後，UI P1 票的錯誤顯示自動
   涵蓋本路徑。
 - 既有測試：`TestLoadTurnsBeforeScanErrorPropagates` 與
