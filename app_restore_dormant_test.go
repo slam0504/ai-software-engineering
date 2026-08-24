@@ -777,6 +777,74 @@ func TestTranscriptOnlyMigrationScanErrorDoesNotFreeze(t *testing.T) {
 	}
 }
 
+// spec §8 degraded startup 防護：events.jsonl 不存在（sink 開檔失敗的降級啟動）
+// 不得燒掉 migrated marker——修好環境後重試要能正常遷移。
+func TestDegradedStartupMissingEventsDoesNotBurnMigratedMarker(t *testing.T) {
+	dir := seedTranscriptOnlyLegacyFixture(t)
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("events.jsonl 不存在時 legacyEntries 必須回錯（不得判成確定無 transcript）")
+	}
+	reg := registryOnDisk(t, dir)
+	if reg.Migrated() {
+		t.Fatal("scanned==false 不得落 migrated marker（一次性、燒掉不可重跑）")
+	}
+	if n := len(reg.Live()); n != 0 {
+		t.Fatalf("不得寫入 entries：%d", n)
+	}
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live, err := a.restoreSessions()
+	if err != nil {
+		t.Fatalf("恢復後重試必須成功：%v", err)
+	}
+	reg = registryOnDisk(t, dir)
+	e, ok := reg.Get(live[0].WSID)
+	if len(live) != 1 || !ok || !e.LegacyTranscript {
+		t.Fatalf("重試後應正常遷移並帶 flag：%+v", live)
+	}
+}
+
+// spec §8 degraded startup 防護：已遷移使用者的 backfill 在 events.jsonl 不存在
+// 時不得以空候選燒掉 LegacyTranscriptBackfilled。
+func TestDegradedStartupMissingEventsDoesNotBurnBackfillMarker(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t) // boundary 非空（"ev-0"）
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatalf("backfill 失敗不阻擋啟動：%v", err)
+	}
+	if registryOnDisk(t, dir).LegacyTranscriptBackfilled() {
+		t.Fatal("scanned==false 不得落 backfill marker（一次性、燒掉不可重跑）")
+	}
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	reg := registryOnDisk(t, dir)
+	if !reg.LegacyTranscriptBackfilled() {
+		t.Fatal("恢復後重試應正常落 marker")
+	}
+}
+
 // seedMigratedLegacyClaudeFixture：已遷移的 stateDir——events.jsonl 有
 // claude 無 WSID 事件（event_id > restore.json 的 ViewStartEventID="ev-0"）；
 // workspace-sessions.json 已 migrated、一個 claude live entry

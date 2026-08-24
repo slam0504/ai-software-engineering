@@ -1283,9 +1283,12 @@ func (a *App) legacyEntries() (map[string]wsregistry.LegacyEntry, error) {
 	out := make(map[string]wsregistry.LegacyEntry, len(legacyProviders))
 	for _, p := range legacyProviders {
 		e := a.restore.Get(p)
-		window, _, werr := scanLegacyWindow(a.eventsPath(), p, e.ViewStartEventID)
+		window, scanned, werr := scanLegacyWindow(a.eventsPath(), p, e.ViewStartEventID)
 		if werr != nil {
 			return nil, werr
+		}
+		if !scanned {
+			return nil, fmt.Errorf("app: events.jsonl 無法掃描（scanned=false，可能為降級啟動），不得判定 legacy transcript 存在與否：provider=%s", p)
 		}
 		hasTranscript := len(window) > 0
 		if e.ResumeSessionID == "" && e.TaskID == "" && !hasTranscript {
@@ -1814,9 +1817,12 @@ func (a *App) backfillLegacyTranscript(store *wsregistry.Store) error {
 		if re.ViewStartEventID == "" {
 			continue // 無可信 boundary，不猜（見上方 doc）——guard 放在掃描之前，省一次全檔掃描
 		}
-		window, _, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
+		window, scanned, werr := scanLegacyWindow(a.eventsPath(), p, re.ViewStartEventID)
 		if werr != nil {
 			return werr
+		}
+		if !scanned {
+			return fmt.Errorf("app: legacy transcript backfill: events.jsonl 無法掃描（scanned=false，可能為降級啟動），不落 backfill marker：provider=%s", p)
 		}
 		if len(window) == 0 {
 			continue
