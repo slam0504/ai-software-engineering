@@ -489,6 +489,9 @@ func TestLoadTurnsBeforeLegacyScanErrorStillGuarded(t *testing.T) {
 	if strings.Contains(err.Error(), "read events.jsonl at") {
 		t.Fatalf("錯誤應來自 scanLegacyWindow 而非 turn-read（fixture 無 turn record）：%v", err)
 	}
+	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); !e.LegacyTranscript {
+		t.Fatal("legacy scan error 不得清旗標（§6a 分支 1）")
+	}
 }
 
 // TestLoadTurnsBeforeLegacyRespectsViewBoundary：integration review 2026-08-22
