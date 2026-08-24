@@ -2,6 +2,7 @@ package wsregistry
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,7 +223,7 @@ func TestRenameFailureRollsBackAndLeavesNoTempFile(t *testing.T) {
 //  4. 讀取放行 — mutation：把 latch 檢查加進 Get／Live →「讀取必須放行」那一行紅。
 func TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites(t *testing.T) {
 	s, path := openStore(t)
-	if err := s.Put(Entry{WSID: "w1", Provider: "claude", ResumeSessionID: "old", CreatedAt: "t"}); err != nil {
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", ResumeSessionID: "old", CreatedAt: "t", LegacyTranscript: true}); err != nil {
 		t.Fatal(err)
 	}
 	failAt(s, stepDirSync, errors.New("dir fsync EIO"))
@@ -258,6 +259,7 @@ func TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites(t *testing.T) {
 		"CommitResume":             func() error { return s.CommitResume("w1", "x", "lbl") },
 		"SetResume":                func() error { return s.SetResume("w1", "y") },
 		"ResetView":                func() error { return s.ResetView("w1", "evt") },
+		"ClearLegacyTranscript":    func() error { return s.ClearLegacyTranscript("w1") },
 		"SetLayout":                func() error { return s.SetLayout(Layout{Pins: []string{"w1"}}) },
 		"BackfillResume":           func() error { return s.BackfillResume(map[string]string{"w1": "z"}) },
 		"BackfillLegacyTranscript": func() error { return s.BackfillLegacyTranscript([]string{"w1"}) },
@@ -328,5 +330,93 @@ func TestRestartClearsUncertainAndLoadsDiskContent(t *testing.T) {
 	}
 	if e, _ := diskEntry(t, path, "w1"); e.ResumeSessionID != "after-restart" {
 		t.Fatalf("重啟後的寫入應落盤，got %q", e.ResumeSessionID)
+	}
+}
+
+// 冪等：flag 已 false 時零 persist step（確定性）。
+func TestClearLegacyTranscriptIdempotentNoPersist(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ResumeSessionID: "x"}, // HasLegacyTranscript=false → flag=false
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	seen := recordSteps(s)
+	if err := s.ClearLegacyTranscript("w1"); err != nil {
+		t.Fatalf("flag 已 false 應冪等跳過：%v", err)
+	}
+	if n := len(seen()); n != 0 {
+		t.Fatalf("冪等路徑不得觸碰檔案系統：%d steps", n)
+	}
+}
+
+// §6a 三語意之一：rename 前（stepWrite）失敗 → 回錯＋回滾，process 內可重試。
+func TestClearLegacyTranscriptWriteFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	failAt(s, stepWrite, errors.New("disk full"))
+	if err := s.ClearLegacyTranscript("w1"); err == nil {
+		t.Fatal("persist 失敗必須回錯")
+	}
+	if e, _ := s.Get("w1"); !e.LegacyTranscript {
+		t.Fatal("rename 前失敗必須回滾（flag 仍 true）")
+	}
+	s.ForceStepHookForTest(nil)
+	if err := s.ClearLegacyTranscript("w1"); err != nil {
+		t.Fatalf("解除注入後重試必須成功：%v", err)
+	}
+}
+
+// §6a 三語意之三：directory-sync 失敗 → 不回滾、latch、後續寫入一律拒絕
+// （owner review 2026-08-24 P1：不得宣稱旗標仍 true）。
+//
+// 「latch 後拒絕」的斷言必須用**另一筆 flag=true 的 entry**（w2）：w1 在
+// dirSync 失敗後記憶體已停在 false（不回滾），再 Clear w1 會先撞冪等守衛回
+// nil——那條斷言在正確實作下永遠打不綠，而「把 latch 檢查搬到冪等之前」看似
+// 能打綠、實則推翻本 plan 凍結的 SetLayout 順序（gate 複驗 P1，兩候選皆實測）。
+// 用 w2 同時補上三語意表「已 latched → 回滾」那格的旗標回滾斷言（枚舉表只驗
+// 回錯與其他欄位、沒驗 flag 回滾）。
+func TestClearLegacyTranscriptDirSyncFailureLatches(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+		"codex":  {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { n++; return fmt.Sprintf("w%d", n) }); err != nil {
+		t.Fatal(err)
+	}
+	// Live() 依 CreatedAt→WSID 排序；兩筆 CreatedAt 相同，w1 < w2。
+	failAt(s, stepDirSync, errors.New("dir sync EIO"))
+	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrRegistryUncertain) {
+		t.Fatalf("dirSync 失敗必須回 ErrRegistryUncertain：%v", err)
+	}
+	if e, _ := s.Get("w1"); e.LegacyTranscript {
+		t.Fatal("rename 已成功，記憶體不得退回 true（步驟 4 不回滾）")
+	}
+	if !s.Uncertain() {
+		t.Fatal("必須 latch")
+	}
+	s.ForceStepHookForTest(nil)
+	if err := s.ClearLegacyTranscript("w2"); !errors.Is(err, ErrRegistryUncertain) {
+		t.Fatalf("latch 後寫入一律拒絕：%v", err)
+	}
+	if e, _ := s.Get("w2"); !e.LegacyTranscript {
+		t.Fatal("已 latched 的寫入必須回滾（w2 flag 仍 true——三語意表第二格）")
 	}
 }

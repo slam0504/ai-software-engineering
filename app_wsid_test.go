@@ -137,6 +137,10 @@ func (s *stubRegistry) ResetView(wsid, viewStartEventID string) error {
 	})
 }
 
+func (s *stubRegistry) ClearLegacyTranscript(wsid string) error {
+	return s.mutate(wsid, func(e *wsregistry.Entry) { e.LegacyTranscript = false })
+}
+
 // SetLayout／Layout：鏡射真實 Store 的 pane pins 深拷貝語意（見 store.go
 // SetLayout 的說明）。layoutErr 注入**非 latch** 的一般寫入失敗（磁碟滿、權限、
 // rename 失敗），由 TestSetPaneLayoutReportsPlainWriteFailure 使用——latch 分支

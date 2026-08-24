@@ -1,6 +1,7 @@
 package wsregistry
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -540,5 +541,42 @@ func TestBackfillLegacyTranscriptPersistFailureRollsBackBoth(t *testing.T) {
 	}
 	if !s.LegacyTranscriptBackfilled() {
 		t.Fatal("重試後 marker 應落盤")
+	}
+}
+
+func TestClearLegacyTranscript(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ws.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearLegacyTranscript("w1"); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get("w1"); e.LegacyTranscript {
+		t.Fatal("清除後 flag 應為 false")
+	}
+	s2, _ := Open(path)
+	if e, _ := s2.Get("w1"); e.LegacyTranscript {
+		t.Fatal("清除未持久化")
+	}
+	if e, _ := s2.Get("w1"); e.ViewStartEventID != "v1" {
+		t.Fatalf("清旗標不得動 boundary：%q", e.ViewStartEventID)
+	}
+	// 哨兵：不存在／tombstone 是良性跳過訊號，不是一般錯誤。
+	if err := s.ClearLegacyTranscript("nope"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("不存在應回 ErrEntryNotFound：%v", err)
+	}
+	if err := s.Remove("w1", "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrTombstoned) {
+		t.Fatalf("tombstone 應回 ErrTombstoned：%v", err)
 	}
 }

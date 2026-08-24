@@ -413,6 +413,40 @@ func (s *Store) ResetView(wsid, viewStartEventID string) error {
 	})
 }
 
+// ClearLegacyTranscript：§6a 窄寫入——只清除 LegacyTranscript 旗標本身，不動
+// ViewStartEventID／ResumeSessionID 等其他欄位（ResetView 的「同筆清除」是
+// boundary 前移時的副作用，這裡是唯一入口、獨立一筆交易）。
+//
+// 哨兵先判定（同 mutate 慣例）：wsid 不存在回 ErrEntryNotFound、已 tombstone
+// 回 ErrTombstoned，兩者都是良性跳過訊號。
+//
+// **冪等比對排在哨兵之後、latch 檢查（persistOrRollback 內）之前**——沿用
+// SetLayout 的順序（store.go:565-575 doc）：flag 已是 false 時不改變任何可
+// 觀測狀態，直接回 nil、不進四步落盤；latch 期間真正的旗標變更仍然會被
+// persistOrRollback 拒絕。不像 mutate 那樣一律呼叫 fn 再落盤，因為 mutate
+// 沒有「這次呼叫是不是 no-op」的概念，這裡需要在落盤前就分流。
+//
+// persist 失敗（步驟 1-3）回滾記憶體；directory-sync 失敗（步驟 4）不回滾、
+// latch（見 persistOrRollback 與 ErrRegistryUncertain）。
+func (s *Store) ClearLegacyTranscript(wsid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.file.Entries[wsid]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrEntryNotFound, wsid)
+	}
+	if old.RemovedAt != "" {
+		return fmt.Errorf("%w: %q", ErrTombstoned, wsid)
+	}
+	if !old.LegacyTranscript {
+		return nil
+	}
+	e := old
+	e.LegacyTranscript = false
+	s.file.Entries[wsid] = e
+	return s.persistOrRollback(func() { s.file.Entries[wsid] = old })
+}
+
 // ResumeBackfilled：是否已完成「provider-keyed restore.json → per-WSID entry」的
 // 一次性續聊身分補寫（見 BackfillResume）。
 func (s *Store) ResumeBackfilled() bool {

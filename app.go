@@ -685,6 +685,9 @@ type sessionRegistry interface {
 	CommitResume(wsid, resumeSessionID, taskLabel string) error
 	SetResume(wsid, resumeSessionID string) error
 	ResetView(wsid, viewStartEventID string) error
+	// ClearLegacyTranscript：§6a 窄寫入——只清 LegacyTranscript 旗標，不動
+	// 其他欄位；冪等（flag 已 false 不落盤）。
+	ClearLegacyTranscript(wsid string) error
 	// pane pins／focused pane（§3.2.1 白名單的最後兩項，見 PaneLayout／SetPaneLayout）
 	SetLayout(l wsregistry.Layout) error
 	Layout() wsregistry.Layout
