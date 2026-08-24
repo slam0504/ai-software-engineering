@@ -15,6 +15,7 @@ import (
 	"github.com/slam0504/sdlc-workbench/internal/appcore"
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/replayindex"
+	"github.com/slam0504/sdlc-workbench/internal/wsregistry"
 )
 
 // errNoReplayIndex：這次啟動沒有可用的 replay index（開檔或驗證失敗）。
@@ -357,13 +358,35 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 	// session」。guard 比照 backfillLegacyTranscript 的空 boundary 前例
 	// （app.go：re.ViewStartEventID == "" 時直接跳過該 provider）：無可信
 	// boundary 來源＝無可信比對證據，不猜、不前綴。
+	//
+	// §6a 四分支（closeout C3，owner 裁決）：
+	//   1. scan error（lerr!=nil）：原樣回錯，不清旗標。
+	//   2. len(legacy)>0：照舊前綴，不清旗標（還沒掃到底，可能還有更舊事件）。
+	//   3. len(legacy)==0 且 scanned==true：成功掃描確定零筆，清旗標並持久化；
+	//      往後首載不再進這個合併分支。
+	//   4. len(legacy)==0 且 scanned==false（NotExist）：不清旗標——缺檔不等於
+	//      掃描過。這個分支在本函式開頭 os.Open 就已早退，不會走到這裡；
+	//      scanned 仍保留給「早退 open 與這裡之間檔案被移除」的 TOCTOU 窗口。
+	// 清旗標的 persist 失敗（分支 3 內）比照既有 registry 寫入慣例走
+	// noteRegistryUncertainErr fail loud；哨兵（ErrEntryNotFound／
+	// ErrTombstoned）是良性跳過，不當錯誤回報。
 	if !hasOlder && a.wsReg != nil {
 		if e, ok := a.wsReg.Get(wsid); ok && e.LegacyTranscript && e.ViewStartEventID != "" {
-			legacy, _, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
+			legacy, scanned, lerr := scanLegacyWindow(a.eventsPath(), e.Provider, e.ViewStartEventID)
 			if lerr != nil {
 				return nil, lerr
 			}
-			out = append(legacy, out...)
+			if len(legacy) > 0 {
+				out = append(legacy, out...)
+			} else if scanned {
+				// §6a：成功掃描確定零筆才清旗標（scanned 擋「早退 open 與掃描之間
+				// 檔案被移除」的 TOCTOU 窗口；NotExist 主路徑在本函式開頭已早退）。
+				// persist 失敗 fail loud——registry 寫不進去時掩蓋只會更晚發現。
+				if cerr := a.wsReg.ClearLegacyTranscript(wsid); cerr != nil &&
+					!errors.Is(cerr, wsregistry.ErrEntryNotFound) && !errors.Is(cerr, wsregistry.ErrTombstoned) {
+					return nil, a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
+				}
+			}
 		}
 	}
 	// 所有頁（含無 legacy 前綴者）皆排序：防禦性保證。ULID 單調遞增時為 no-op，

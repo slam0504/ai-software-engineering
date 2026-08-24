@@ -78,6 +78,30 @@ func seedLegacyEmptyViewStartApp(t *testing.T, turnCount int) *App {
 	return seedLegacyTranscriptFixtureApp(t, true, turnCount, "")
 }
 
+// seedLegacyFewTurnsAppNoLegacyEvents：C3（§6a）fixture——與 seedLegacyFewTurnsApp
+// 的差異只在 events.jsonl **不含**任何無 WSID 的 legacy 事件，只有 w1 的
+// turnCount 個完整 turn；registry 的 w1 entry LegacyTranscript=true、
+// ViewStartEventID="0000000000"（非空）。用來驗證「window 確定為空」這個
+// §6a 清旗標的觸發條件——若沿用 seedLegacyFewTurnsApp，window 恆非空，永遠
+// 走不到清旗標分支。
+func seedLegacyFewTurnsAppNoLegacyEvents(t *testing.T, turnCount int) *App {
+	t.Helper()
+	dir := t.TempDir()
+	seedRegistry(t, dir, wsregistry.Entry{
+		WSID: "w1", Provider: "claude", CreatedAt: "t1",
+		ViewStartEventID: "0000000000", LegacyTranscript: true,
+	})
+	a := newTestAppAt(t, dir)
+	w := dormantWSID(t, a, "w1", contract.ProviderClaude)
+	for i := 0; i < turnCount; i++ {
+		emitCompleteTurn(t, a, w, fmt.Sprintf("turn-%02d", i))
+	}
+	// rev2 陷阱（同 seedLegacyTranscriptFixtureApp）：newTestAppAt 不接
+	// a.wsReg，loadTurnsBefore 的合併分支要讀 a.wsReg.Get。
+	a.wsReg = registryOnDisk(t, dir)
+	return a
+}
+
 // hasLegacyText：envs 內是否含至少一筆無 WorkspaceSessionID 的事件——legacy
 // window 的判準（scanLegacyWindow 只保留 WorkspaceSessionID=="" 的事件，見
 // restore.go）。
@@ -169,6 +193,116 @@ func TestLoadTurnsBeforeEmptyViewStartDoesNotPrefixLegacy(t *testing.T) {
 	}
 	if hasLegacyText(got) {
 		t.Fatal("ViewStartEventID 為空時不得前綴 legacy（無可信 boundary）")
+	}
+	// C3（§6a）擴充：空 ViewStart guard 分支不掃描，旗標不清。
+	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); !e.LegacyTranscript {
+		t.Fatal("空 ViewStart 未掃描，不得清旗標")
+	}
+}
+
+// §6a 主測試：window 空時首載成功、旗標清除且持久化、之後不再掃描。
+func TestLoadTurnsBeforeEmptyWindowClearsFlagAndStopsScanning(t *testing.T) {
+	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5) // flag=true、ViewStart 非空、events.jsonl 只有 WSID turn、無無 WSID 事件
+	w := "w1"
+	p1, err := a.LoadTurnsBefore(w, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyText(p1) {
+		t.Fatal("window 空不該有 legacy 前綴")
+	}
+	if e, _ := registryOnDisk(t, a.stateDir).Get(w); e.LegacyTranscript {
+		t.Fatal("成功掃描零筆後旗標應清除並持久化")
+	}
+	// 「不再掃描」的確定性 mutation 守門（plan gate 校正——len(p2)==len(p1)
+	// 對任何 mutation 恆真，檔案破壞注入又依賴 readEnvelopeRange 吞錯行為、
+	// replay reliability 票修掉後會誤紅）：追加一筆 boundary 之後的無 WSID
+	// claude 事件。旗標若沒被真的清掉（或合併分支忽略 flag），第二次首載會
+	// 掃到它並前綴 → 打紅；正確實作下分支被 flag gate 掉、不掃、不出現。
+	f, err := os.OpenFile(filepath.Join(a.stateDir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"event_id":"zz-late-legacy","provider":"claude","kind":"message","role":"user","text":"late-legacy"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	p2, err := a.LoadTurnsBefore(w, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyText(p2) {
+		t.Fatal("旗標清除後不得再掃 legacy window（追加的無 WSID 事件不應出現）")
+	}
+}
+
+// NotExist 不清：缺檔不等於成功掃描零筆。
+// 覆蓋說明（plan gate 校正）：loadTurnsBefore 自己會先 os.Open(events.jsonl)，
+// NotExist 在合併分支**之前**就早退（rebuild_orchestrator.go:313-319）——本測試
+// 驗的是「整條路徑對缺檔不清旗標」這個使用者可見契約，不是 scanned 的
+// mutation 守門；scanned==false 的契約由 Task 2 的 unit 測試守。scanned 在
+// 本 caller 的實際作用是「早退 open 與 legacy 掃描之間檔案被移除」的 TOCTOU
+// 防禦窗口——無法以確定性測試打紅，依 spec §6a 凍結保留。
+func TestLoadTurnsBeforeMissingEventsDoesNotClearFlag(t *testing.T) {
+	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5)
+	events := filepath.Join(a.stateDir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.LoadTurnsBefore("w1", "", 20); err != nil {
+		t.Fatalf("NotExist 非錯誤：%v", err)
+	}
+	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); !e.LegacyTranscript {
+		t.Fatal("NotExist 不得清旗標")
+	}
+}
+
+// scan error 不清（既有 TestLoadTurnsBeforeScanErrorPropagates 擴斷言即可，若該測試
+// fixture 的 window 非空則另建本測試）：回錯且旗標仍 true。
+func TestLoadTurnsBeforeScanErrorDoesNotClearFlag(t *testing.T) {
+	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5)
+	events := filepath.Join(a.stateDir, "events.jsonl")
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.LoadTurnsBefore("w1", "", 20); err == nil {
+		t.Fatal("scan error 必須回錯")
+	}
+	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); !e.LegacyTranscript {
+		t.Fatal("scan error 不得清旗標")
+	}
+}
+
+// persist error（app 層）：chmod stateDir 的失敗落在步驟 1（暫存檔建立，
+// writeTempLocked 的 os.OpenFile——早於 stepWrite hook 被呼叫）→ §6a 三語意
+// 之一的「回滾、flag 維持 true、可重試」。
+// dirSync 不回滾＋latch 的語意由 Task 1 的 wsregistry unit 覆蓋（step hook 是
+// wsregistry package 內的 test-only 接點，app 層拿不到）。root skip 保留：
+// 此注入依賴權限，root 會繞過（unit 層已有確定性版本，app 層此測驗的是
+// 錯誤傳播到 loadTurnsBefore 回傳值這一段）。
+func TestLoadTurnsBeforeClearPersistFailureFailsLoud(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 會繞過目錄權限，無法重現 persist 失敗")
+	}
+	a := seedLegacyFewTurnsAppNoLegacyEvents(t, 5)
+	if err := os.Chmod(a.stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(a.stateDir, 0o700) })
+	if _, err := a.LoadTurnsBefore("w1", "", 20); err == nil {
+		t.Fatal("清旗標 persist 失敗必須回錯（fail loud）")
+	}
+	if err := os.Chmod(a.stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.LoadTurnsBefore("w1", "", 20); err != nil {
+		t.Fatalf("修復後重試必須成功：%v", err)
+	}
+	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); e.LegacyTranscript {
+		t.Fatal("重試成功後旗標應清除")
 	}
 }
 
