@@ -539,7 +539,7 @@ Expected: 全綠（牆鐘不穩定測試依 memory 具名清單，紅則單獨�
 - `ClearLegacyTranscript(wsid string) error`：Task 1 定義（Store＋interface）、Task 3 經 `a.wsReg` 消費一致。
 
 **3. 已知風險與邊界：**
-- fsync latch 枚舉表的順序問題（latch vs 冪等）已在 Task 1 Step 1 明文指示以 `SetLayout` 既有慣例為準，不自創順序——實作者需先讀 store.go:519-521 確認。
+- fsync latch 枚舉表的順序問題（latch vs 冪等）已在 Task 1 Step 1 明文指示以 `SetLayout` 既有慣例為準（冪等先於 latch，store.go:565-575），不自創順序。
 - Task 3 的清除發生在讀路徑：spec §6a 已凍結此取捨（含 persist 失敗 fail loud 的理由）。
 - `seedLegacyFewTurnsAppNoLegacyEvents` 是新 helper：與既有 `seedLegacyFewTurnsApp` 的差異只有「不放無 WSID 事件」，實作時若能以參數化共用則共用、不強求（fixture 形狀可讀性優先，final review 曾裁決反對過度參數化 seeder）。
 
