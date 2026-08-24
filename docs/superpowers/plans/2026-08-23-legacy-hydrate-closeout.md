@@ -428,6 +428,118 @@ git commit -m "feat(app): loadTurnsBefore 空 window 清旗標——§6a 四分�
 
 ---
 
+### Task 4a: degraded startup 單向 marker 防護（owner 2026-08-24 整合 checkpoint P1）
+
+**Files:**
+- Modify: `app.go`（`legacyEntries` 約 :1286、`backfillLegacyTranscript` 約 :1817——兩處把 `_` 改接 `scanned` 並消費）
+- Test: `app_restore_dormant_test.go`
+
+**Interfaces:**
+- Consumes: `scanned`（Task 2）。
+- Produces（spec §5a 解凍語意，snapshot f25a181）：`legacyEntries` 於 `scanned==false` 回錯（不 Migrate、marker 與 entries 不落盤）；`backfillLegacyTranscript` 於 boundary 非空且 `scanned==false` 回錯（不落 marker；空 boundary 仍先被 guard 以零候選跳過，判定順序不變）。
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+// spec §8 degraded startup 防護：events.jsonl 不存在（sink 開檔失敗的降級啟動）
+// 不得燒掉 migrated marker——修好環境後重試要能正常遷移。
+func TestDegradedStartupMissingEventsDoesNotBurnMigratedMarker(t *testing.T) {
+	dir := seedTranscriptOnlyLegacyFixture(t)
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err == nil {
+		t.Fatal("events.jsonl 不存在時 legacyEntries 必須回錯（不得判成確定無 transcript）")
+	}
+	reg := registryOnDisk(t, dir)
+	if reg.Migrated() {
+		t.Fatal("scanned==false 不得落 migrated marker（一次性、燒掉不可重跑）")
+	}
+	if n := len(reg.Live()); n != 0 {
+		t.Fatalf("不得寫入 entries：%d", n)
+	}
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live, err := a.restoreSessions()
+	if err != nil {
+		t.Fatalf("恢復後重試必須成功：%v", err)
+	}
+	if len(live) != 1 || !mustGet(t, registryOnDisk(t, dir), live[0].WSID).LegacyTranscript {
+		t.Fatalf("重試後應正常遷移並帶 flag：%+v", live)
+	}
+}
+
+// spec §8 degraded startup 防護：已遷移使用者的 backfill 在 events.jsonl 不存在
+// 時不得以空候選燒掉 LegacyTranscriptBackfilled。
+func TestDegradedStartupMissingEventsDoesNotBurnBackfillMarker(t *testing.T) {
+	dir := seedMigratedLegacyClaudeFixture(t) // boundary 非空（"ev-0"）
+	a := newTestAppAt(t, dir)
+	events := filepath.Join(dir, "events.jsonl")
+	orig, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatalf("backfill 失敗不阻擋啟動：%v", err)
+	}
+	if registryOnDisk(t, dir).LegacyTranscriptBackfilled() {
+		t.Fatal("scanned==false 不得落 backfill marker（一次性、燒掉不可重跑）")
+	}
+	if err := os.WriteFile(events, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.restoreSessions(); err != nil {
+		t.Fatal(err)
+	}
+	reg := registryOnDisk(t, dir)
+	if !reg.LegacyTranscriptBackfilled() {
+		t.Fatal("恢復後重試應正常落 marker")
+	}
+}
+```
+
+（helper `mustGet(t, reg, wsid)` 若不存在則以 `reg.Get` ＋ ok 斷言就地展開，不必新建
+helper。反向——「檔案存在且成功掃描零筆照常落 marker」——由既有
+`TestBackfillLegacyTranscriptViewStartMismatchIsZeroCandidate` 等零候選測試持續守住，
+Step 4 一併重跑確認不破。）
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `go test . -run 'TestDegradedStartupMissingEvents' -v`
+Expected: FAIL — 目前兩處以 `_` 忽略 scanned，migration 誤遷、backfill 誤落 marker
+
+- [ ] **Step 3: Write minimal implementation**
+
+`legacyEntries`：`window, scanned, werr := ...`；`werr != nil` 照舊回錯；新增
+`if !scanned { return nil, fmt.Errorf("app: events.jsonl 無法掃描（scanned=false，可能為降級啟動），不得判定 legacy transcript 存在與否：provider=%s", p) }`。
+`backfillLegacyTranscript`：guard（空 boundary continue）之後，`window, scanned, werr := ...`；
+`werr != nil` 照舊；新增 `if !scanned { return fmt.Errorf(...同旨...) }`（不落 marker，
+呼叫端既有錯誤路徑會走 audit＋blocker——Task 4 接上後三步順序自動涵蓋本分支）。
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `go test . -run 'TestDegradedStartupMissingEvents|TestTranscriptOnlyMigrationScanErrorDoesNotFreeze|TestBackfillLegacyTranscript|TestLegacyJournalWithoutWSIDAttributes' -count=1 -v && go build ./... && go vet ./...`
+Expected: 全綠（含既有零候選／scan error 測試不破）
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app.go app_restore_dormant_test.go
+git commit -m "fix(app): degraded startup 不燒單向 marker——legacyEntries/backfill 消費 scanned"
+```
+
+---
+
 ### Task 4: backfill 失敗具名 audit
 
 **Files:**
