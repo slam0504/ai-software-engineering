@@ -8,11 +8,12 @@
 
 **Tech Stack:** Go（internal/wsregistry、restore.go、rebuild_orchestrator.go、app.go），Go testing。
 
-**Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md` §3 語意例外／§4 失敗軌跡／§5a scanned／§6a（commit 4b993fe）
+**Spec:** `docs/superpowers/specs/2026-08-22-legacy-transcript-hydrate-design.md` §3 語意例外／§4 失敗軌跡（含統一稽核順序）／§5a scanned／§6a（含 persist 失敗三語意表）——最終 snapshot **commit cdf2dbe**（4b993fe 初版→7fe9d2e rev2→cdf2dbe rev3，執行者以 cdf2dbe 為準）
 
 ## Global Constraints
 
-- §6a 四分支凍結：`scanned==true && len==0` → 清；`ViewStartEventID==""`（未掃描）→ 不清；NotExist（`scanned==false`）→ 不清；open／scan／persist error → 不清、回錯、可重試。
+- §6a 四分支凍結：`scanned==true && len==0` → 清；`ViewStartEventID==""`（未掃描）→ 不清；NotExist（`scanned==false`）→ 不清；open／scan error → 不清、回錯、可重試。
+- persist 失敗依 §6a **三語意表**（對齊 `persistOrRollback` 既有契約 store.go:262-275）：步驟 1-3 失敗＝回滾（flag 維持 true）可重試；已 latched＝回滾＋`ErrRegistryUncertain` 需重啟；本次 Clear 的 directory-sync 失敗＝**不回滾**（記憶體停在 false）＋latch 需重啟——不得籠統宣稱「旗標仍 true」。三種都回錯。
 - `ClearLegacyTranscript` 僅清旗標、不動 boundary；已 false 冪等跳過不落盤；`ErrEntryNotFound`／`ErrTombstoned` 哨兵；登記 uncertain latch `writes` 枚舉表（fsync_test.go:254 附近）。
 - `scanLegacyWindow` 簽章變更的 caller 以 repo-wide `rg 'scanLegacyWindow\(' -g '*.go'` 為準（目前 8 處：production app.go:1283／app.go:1814／rebuild_orchestrator.go:362、定義 restore.go:206、TestScanLegacyWindow 內 4 處）。漏任何一處 commit 即 build 壞。
 - 既有測試不得削弱；gofmt 乾淨（觸碰檔案）；台灣用語書面中文 doc／commit。
@@ -25,7 +26,7 @@
 - Modify: `internal/wsregistry/store.go`（緊鄰 `ResetView`）、`internal/wsregistry/fsync_test.go`（latch `writes` 枚舉表加一行＋`:232` 的 `Put` 補 `LegacyTranscript: true` 讓新條目是真變更）
 - Modify: `app.go`（`sessionRegistry` interface 加 `ClearLegacyTranscript(wsid string) error`，約 :676——`var _ sessionRegistry = (*wsregistry.Store)(nil)` 既有斷言隨 build 驗證）
 - Modify: `app_wsid_test.go`（**plan gate P1**：`stubRegistry`（:14）實作 `sessionRegistry`、被 30+ 處測試使用——interface 加方法後必須同步補 stub 方法（受既有 `mutateErr` 驅動，對齊其他 mutator stub 的寫法），否則本 task 的 commit 會讓 root package 測試編譯失敗，且 `go build ./...` 抓不到（test 檔要 `go vet ./...` 或 `go test` 才編譯）
-- Test: `internal/wsregistry/store_test.go`
+- Test: `internal/wsregistry/store_test.go`（round-trip＋哨兵）、`internal/wsregistry/fsync_test.go`（三個 step-hook 注入測試＋枚舉表）
 
 **Interfaces:**
 - Produces: `Store.ClearLegacyTranscript(wsid string) error`——entry 不存在回 `ErrEntryNotFound`、tombstone 回 `ErrTombstoned`（per-WSID durable writer 哨兵慣例，見 store.go:32-35 doc）；flag 已 false 冪等 return nil 不落盤（`SetLayout` 冪等前例）；flag 為 true 時 mutate 清 false、persist 失敗回滾。
@@ -70,8 +71,11 @@ func TestClearLegacyTranscript(t *testing.T) {
 	}
 }
 
-// 冪等：flag 已 false 時不落盤——用檔案 mtime 以外的可靠訊號：注入 persist
-// 失敗（唯讀目錄），若冪等路徑真的沒寫盤就不會回錯。
+// 以下三個注入測試放 `internal/wsregistry/fsync_test.go`（recordSteps／failAt／
+// ForceStepHookForTest 同檔、對齊既有 step-hook 測試慣例）。**不用 chmod**：
+// root 可繞過權限，冪等守衛或回滾壞掉時測試照樣綠（owner review 2026-08-24 P1）。
+
+// 冪等：flag 已 false 時零 persist step（確定性）。
 func TestClearLegacyTranscriptIdempotentNoPersist(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "ws.json"))
@@ -83,16 +87,17 @@ func TestClearLegacyTranscriptIdempotentNoPersist(t *testing.T) {
 	}, func() string { return "w1" }); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("平台不支援權限測試")
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	seen := recordSteps(s)
 	if err := s.ClearLegacyTranscript("w1"); err != nil {
-		t.Fatalf("flag 已 false 應冪等跳過、不觸碰檔案系統：%v", err)
+		t.Fatalf("flag 已 false 應冪等跳過：%v", err)
+	}
+	if n := len(seen()); n != 0 {
+		t.Fatalf("冪等路徑不得觸碰檔案系統：%d steps", n)
 	}
 }
 
-func TestClearLegacyTranscriptPersistFailureRollsBack(t *testing.T) {
+// §6a 三語意之一：rename 前（stepWrite）失敗 → 回錯＋回滾，process 內可重試。
+func TestClearLegacyTranscriptWriteFailureRollsBack(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "ws.json"))
 	if err != nil {
@@ -103,21 +108,45 @@ func TestClearLegacyTranscriptPersistFailureRollsBack(t *testing.T) {
 	}, func() string { return "w1" }); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("平台不支援權限測試")
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	failAt(s, stepWrite, errors.New("disk full"))
 	if err := s.ClearLegacyTranscript("w1"); err == nil {
 		t.Fatal("persist 失敗必須回錯")
 	}
 	if e, _ := s.Get("w1"); !e.LegacyTranscript {
-		t.Fatal("persist 失敗後記憶體必須回滾（flag 仍 true）")
+		t.Fatal("rename 前失敗必須回滾（flag 仍 true）")
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	s.ForceStepHookForTest(nil)
+	if err := s.ClearLegacyTranscript("w1"); err != nil {
+		t.Fatalf("解除注入後重試必須成功：%v", err)
+	}
+}
+
+// §6a 三語意之三：directory-sync 失敗 → 不回滾、latch、後續寫入一律拒絕
+// （owner review 2026-08-24 P1：不得宣稱旗標仍 true）。
+func TestClearLegacyTranscriptDirSyncFailureLatches(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "ws.json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ClearLegacyTranscript("w1"); err != nil {
-		t.Fatalf("修復後重試必須成功：%v", err)
+	if _, err := Migrate(s, map[string]LegacyEntry{
+		"claude": {ViewStartEventID: "v1", HasLegacyTranscript: true},
+	}, func() string { return "w1" }); err != nil {
+		t.Fatal(err)
+	}
+	failAt(s, stepDirSync, errors.New("dir sync EIO"))
+	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrRegistryUncertain) {
+		t.Fatalf("dirSync 失敗必須回 ErrRegistryUncertain：%v", err)
+	}
+	if e, _ := s.Get("w1"); e.LegacyTranscript {
+		t.Fatal("rename 已成功，記憶體不得退回 true（步驟 4 不回滾）")
+	}
+	if !s.Uncertain() {
+		t.Fatal("必須 latch")
+	}
+	s.ForceStepHookForTest(nil)
+	if err := s.ClearLegacyTranscript("w1"); !errors.Is(err, ErrRegistryUncertain) {
+		t.Fatalf("latch 後寫入一律拒絕：%v", err)
 	}
 }
 ```
@@ -282,7 +311,12 @@ func TestLoadTurnsBeforeScanErrorDoesNotClearFlag(t *testing.T) {
 	}
 }
 
-// persist error 不清、回錯、修復後重試成功（owner 裁決 fail loud）。
+// persist error（app 層）：chmod stateDir 的注入落在 stepWrite（rename 前，
+// temp file 建不出來）→ §6a 三語意之一的「回滾、flag 維持 true、可重試」。
+// dirSync 不回滾＋latch 的語意由 Task 1 的 wsregistry unit 覆蓋（step hook 是
+// wsregistry package 內的 test-only 接點，app 層拿不到）。root skip 保留：
+// 此注入依賴權限，root 會繞過（unit 層已有確定性版本，app 層此測驗的是
+// 錯誤傳播到 loadTurnsBefore 回傳值這一段）。
 func TestLoadTurnsBeforeClearPersistFailureFailsLoud(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root 會繞過目錄權限，無法重現 persist 失敗")
@@ -387,7 +421,19 @@ git commit -m "feat(app): loadTurnsBefore 空 window 清旗標——§6a 四分�
 - Test: `app_restore_dormant_test.go`
 
 **Interfaces:**
-- Produces: 錯誤分支在 `noteStartupBlocker` 之外加 `a.audit("legacy_transcript_backfill_failed", map[string]any{"error": err.Error()})`（對齊 `resume_backfill_failed` app.go:1749 慣例）。成功路徑不發 audit（§4：結果可由 registry 直接觀測）。
+- Produces: 錯誤分支依 spec §4 順序（owner review 2026-08-24 P2）：(1) 先
+  `err = a.noteRegistryUncertainErr("legacy_transcript_backfill", "", err)`——既有契約
+  （app.go:734）要求任何 registry 寫入回 `ErrRegistryUncertain` 都走統一稽核，非
+  uncertain 錯誤原樣通過；(2) 再 `a.audit("legacy_transcript_backfill_failed", map[string]any{"error": err.Error()})`
+  （對齊 `resume_backfill_failed` app.go:1749 慣例）；(3) 最後 `noteStartupBlocker`。
+  成功路徑不發 audit（§4：結果可由 registry 直接觀測）。
+- 同步更新 `app_registry_uncertain_test.go` 的呼叫點數說明與「具體 Store、尚無跨
+  package 注入」已知覆蓋缺口註記（新增 `legacy_transcript_backfill` 呼叫點）。
+
+**測試 helper 事實（plan gate 查證，防混淆）**：Task 4 測試用的 `newTestAppAt`
+**有**開 audit.jsonl（app_restore_dormant_test.go:50-57 `a.auditF = af`）——「預設不開
+audit、需 `enableAudit`」的是另一個 helper `newTestApp`（見 app_test.go enableAudit
+doc）。本 task 不需要也不得多呼叫 `enableAudit`（會重複開檔）。
 
 - [ ] **Step 1: Write the failing test**
 
@@ -430,7 +476,7 @@ Expected: FAIL — 失敗測試紅（無 audit 事件）；反向測試綠
 
 - [ ] **Step 3: Write minimal implementation**
 
-錯誤分支加一行 `a.audit(...)`（在 noteStartupBlocker 之前，對齊 resume_backfill_failed 的順序）。
+錯誤分支依 Interfaces 的三步順序改寫：`noteRegistryUncertainErr` → 具名 audit → `noteStartupBlocker`；並更新 app_registry_uncertain_test.go 的呼叫點數說明與覆蓋缺口註記。
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -467,11 +513,11 @@ Expected: 全綠（牆鐘不穩定測試依 memory 具名清單，紅則單獨�
 ## Self-Review
 
 **1. Spec coverage（§6a／§4／§5a／§3）：**
-- §6a 四分支：成功零筆清＋不再掃描 mutation 守門（Task 3 主測試，追加事件探針）、空 ViewStart 不清（既有 I1 測試擴斷言）、NotExist 不清（**聯合覆蓋**：loadTurnsBefore 層驗整條路徑早退不清（Task 3）＋`scanned==false` 契約由 Task 2 unit 守；scanned 在此 caller 是 TOCTOU 防禦、無確定性打紅手段，plan gate 已審）、scan error 不清（Task 3）、persist error 不清＋回錯＋重試（Task 3）✓
+- §6a 四分支：成功零筆清＋不再掃描 mutation 守門（Task 3 主測試，追加事件探針）、空 ViewStart 不清（既有 I1 測試擴斷言）、NotExist 不清（**聯合覆蓋**：loadTurnsBefore 層驗整條路徑早退不清（Task 3）＋`scanned==false` 契約由 Task 2 unit 守；scanned 在此 caller 是 TOCTOU 防禦、無確定性打紅手段，plan gate 已審）、scan error 不清（Task 3）、persist 失敗三語意（Task 1 unit：stepWrite 回滾／dirSync 不回滾＋latch／latch 後拒絕；Task 3 app 層：stepWrite 類失敗傳播到 loadTurnsBefore 回錯＋重試）✓
 - §6a 寫入口（冪等／哨兵／回滾／latch 枚舉）：Task 1 ✓；不動 boundary：Task 1 斷言 ✓
 - §5a scanned 簽章＋NotExist 區分＋既有 caller 行為不變：Task 2 ✓
-- §4 失敗軌跡 audit 正反向：Task 4 ✓
-- §3 語意例外／§4 措辭：spec 修訂已入 4b993fe，無 code 對應 ✓
+- §4 失敗軌跡（統一稽核 → 具名 audit → blocker 三步順序）正反向：Task 4 ✓
+- §3 語意例外／§4 措辭：spec 修訂已入最終 snapshot cdf2dbe，無 code 對應 ✓
 
 **2. Type consistency：**
 - `scanLegacyWindow → ([]contract.Envelope, bool, error)`：Task 2 定義、Task 3 消費一致；Task 2 過渡期三個 production caller 以 `_` 忽略 scanned。
