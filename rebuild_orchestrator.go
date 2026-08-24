@@ -414,7 +414,17 @@ func (a *App) viewBoundary(wsid string) string {
 // boundary；只有沒有 turn record 可整筆判定的尾端未完成 turn 需要）。
 // 無法解析的行跳過不中斷（同 replayViewWindow 的既有慣例：稽核匯出走完整檔案，
 // UI 視窗不因單一壞行整段消失）。
-func readEnvelopeRange(f *os.File, wsid, after string, start, end int64) ([]contract.Envelope, error) {
+//
+// 非 EOF 讀取錯誤一律 fail loud：把已讀內容當成功結果回傳等同靜默截頁，呼叫
+// 端與使用者都無法分辨「這段本來就這麼短」與「讀到一半壞掉」。EOF（含被其他
+// error 包裝的 io.EOF）才是正常終點，用 errors.Is 判定；end 早於實際檔尾這種
+// 「EOF 提前發生」的情況仍維持既有寬容——回目前已收集到的部分結果、不回錯
+// （spec §2）：那是呼叫端給的 range 本身過寬，不是讀取失敗，殘餘風險由呼叫端
+// 對 range 來源（如 index 記錄的 offset）負責。
+//
+// 第一參數型別是 io.ReadSeeker 而非 *os.File，純為讓測試能注入「讀到一半才錯」
+// 與「包裝 EOF」這兩種真實檔案系統造不出的形狀；production 呼叫端恆傳 *os.File。
+func readEnvelopeRange(f io.ReadSeeker, wsid, after string, start, end int64) ([]contract.Envelope, error) {
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("app: seek events.jsonl to %d: %w", start, err)
 	}
@@ -434,7 +444,10 @@ func readEnvelopeRange(f *os.File, wsid, after string, start, end int64) ([]cont
 			cur += n
 		}
 		if rerr != nil {
-			break // EOF 或讀取錯誤都代表這段已到終點
+			if !errors.Is(rerr, io.EOF) {
+				return nil, fmt.Errorf("app: read events.jsonl at %d (wsid=%s): %w", cur, wsid, rerr)
+			}
+			break // EOF（含包裝）＝正常終點；同批殘行已在上方處理
 		}
 	}
 	return out, nil
