@@ -75,7 +75,8 @@ type App struct {
 	//   - 鎖序：auditMu → startupMu（noteAuditInvariantBrokenLocked 持 auditMu
 	//     時會呼叫 appendStartup）。所以持有 startupMu 期間**不得**呼叫 a.audit()
 	//     或任何會取 auditMu 的東西，否則就是反向鎖序。
-	// startupData：啟動資訊的**唯一**持有處（見 startupState）。七個欄位與那把鎖
+	// startupData：啟動資訊的**唯一**持有處（見 startupState）。startupInfo 的
+	// 全部欄位（枚舉見測試 startupInfoFields，新增欄位會被它擋下）與那把鎖
 	// 都封在裡面，App 上不再有散落的 startup 欄位——「有沒有持鎖」因此不再是控制
 	// 流程分析的問題，而是型別可及性的問題（reviewer 2026-08-20）。
 	startupData startupState
