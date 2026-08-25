@@ -38,8 +38,13 @@ const s = useSession()
 // 那格），與按鈕字面一致。
 function pin(wsid: string) {
   const at = s.persistentPins.indexOf(wsid)
-  if (at === 0 || at === 1) s.setFocus(at)
-  else s.pin(s.focused, wsid)
+  if (at === 0 || at === 1) {
+    // 已釘選但 view 缺失（F2：首載失敗時 catch 清掉壞掉的 view，讓下一次
+    // pin 重新走 isNew 分支）——這是唯一能重試的入口，否則使用者除了重整
+    // 整個 App 沒有其他方法。view 還在時維持既有語意，只切 focus。
+    if (!s.views[wsid]) void s.pin(at, wsid)
+    else s.setFocus(at)
+  } else s.pin(s.focused, wsid)
 }
 
 // pinTargetPane：按下這顆釘選鈕**實際會作用**的那一格（與 pin() 的兩條分支一一對應）。

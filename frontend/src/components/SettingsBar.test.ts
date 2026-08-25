@@ -1,5 +1,6 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 
 // wailsjs 綁定全部 mock：分頁切換不得觸發任何 backend 呼叫
 const mocks = vi.hoisted(() => ({
@@ -46,6 +47,53 @@ describe('SettingsBar session 分頁（Task 26：WSID 定址）', () => {
     for (const [name, fn] of Object.entries(mocks)) {
       expect(fn, name).not.toHaveBeenCalled()
     }
+  })
+
+  // F3（本票，spec §4）：selectSession() 的「已釘選」分支目前只 setFocus，
+  // 即使 view 因首載失敗被 F2 清掉也不重新載入。這裡鎖住真實 UI 重試路徑：
+  // 已釘選但 view 缺失時再點同一個分頁，必須重新呼叫 binding（不是只切
+  // focus）。
+  it('已釘選但首載失敗清空 view 後再點——binding 被重試呼叫（真實 UI 重試）', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    const load = vi.fn()
+      .mockRejectedValueOnce(new Error('load boom'))
+      .mockResolvedValueOnce([])
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), LoadTurnsBefore: load })
+    const w = mountWithI18n(SettingsBar)
+
+    await w.find('[data-test=session-tab-w1]').trigger('click')
+    await flushPromises()
+    expect(s.views['w1']).toBeUndefined() // F2：reject 後 catch 清掉壞掉的 view
+    expect(s.pins[0]).toBe('w1') // 已釘選——不是「未釘選」分支
+
+    await w.find('[data-test=session-tab-w1]').trigger('click')
+    await flushPromises()
+
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  // 反向（owner review rev2 P1 定案——action spy）：view 存在時再點同一個分頁，
+  // 必須維持既有語意（只切 focus，不重新釘一次），不得因本票的修正誤用成
+  // `pin(at, w)`。行為面快照在無 transient 的 fixture 下無法區辨這兩者，改對
+  // store action 加 spy：`setFocus(at)` 被呼叫且 `pin` 未被呼叫。
+  it('反向守門（action spy）：view 存在時再點只切 focus，不誤用 pin', async () => {
+    const s = useSession()
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), EndSession: vi.fn(async () => {}) })
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    s.pin(0, 'w1')
+    s.pin(1, 'w2')
+    s.setFocus(0)
+    const w = mountWithI18n(SettingsBar)
+    const pinSpy = vi.spyOn(s, 'pin')
+    const focusSpy = vi.spyOn(s, 'setFocus')
+
+    await w.find('[data-test=session-tab-w2]').trigger('click')
+    await flushPromises()
+
+    expect(focusSpy).toHaveBeenCalledWith(1)
+    expect(pinSpy).not.toHaveBeenCalled()
   })
 
   it('per-session unread 徽章與待核可標記', async () => {

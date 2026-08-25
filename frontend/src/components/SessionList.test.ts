@@ -1,5 +1,6 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 
 // wailsjs 綁定全部 mock：清單渲染與計數不得觸發任何 backend 呼叫
 const mocks = vi.hoisted(() => ({
@@ -122,6 +123,53 @@ describe('SessionList（Task 27，spec §4）', () => {
     expect(s.focused).toBe(1)
     expect(s.pins).toEqual(['w1', 'w2']) // 沒有被踢掉重灌
     expect(s.views['w1']).toBe(view1) // w1 的 transcript 容器沒被換掉
+  })
+
+  // F3（本票，spec §4）：pin() 的「已釘選」分支目前只 setFocus，即使 view
+  // 因首載失敗被 F2 清掉也不重新載入——使用者除了重整整個 App 沒有其他方法
+  // 重試。這裡鎖住真實 UI 重試路徑：已釘選但 view 缺失時再點同一顆釘選鈕，
+  // 必須重新呼叫 binding（不是只切 focus）。
+  it('已釘選但首載失敗清空 view 後再點——binding 被重試呼叫（真實 UI 重試）', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    const load = vi.fn()
+      .mockRejectedValueOnce(new Error('load boom'))
+      .mockResolvedValueOnce([])
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), LoadTurnsBefore: load })
+    const w = mountWithI18n(SessionList)
+
+    await w.find('[data-test=pin-w1]').trigger('click')
+    await flushPromises()
+    expect(s.views['w1']).toBeUndefined() // F2：reject 後 catch 清掉壞掉的 view
+    expect(s.persistentPins[0]).toBe('w1') // 已釘選——不是「未釘選」分支
+
+    await w.find('[data-test=pin-w1]').trigger('click')
+    await flushPromises()
+
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  // 反向（owner review rev2 P1 定案——action spy）：view 存在時再點同一顆釘選
+  // 鈕，必須維持既有語意（只切 focus，不重新釘一次），不得因本票的修正誤用
+  // 成 `pin(at, wsid)`。行為面快照（pins／focused／view 實例）在無 transient
+  // 的 fixture 下兩條路徑結果相同、無法區辨這兩者，所以直接對 store action
+  // 加 spy：`setFocus(at)` 被呼叫且 `pin` 未被呼叫。
+  it('反向守門（action spy）：view 存在時再點只切 focus，不誤用 pin', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'claude', taskLabel: 'b' })
+    s.pin(0, 'w1')
+    s.pin(1, 'w2')
+    s.setFocus(0)
+    const w = mountWithI18n(SessionList)
+    const pinSpy = vi.spyOn(s, 'pin')
+    const focusSpy = vi.spyOn(s, 'setFocus')
+
+    await w.find('[data-test=pin-w2]').trigger('click')
+    await flushPromises()
+
+    expect(focusSpy).toHaveBeenCalledWith(1)
+    expect(pinSpy).not.toHaveBeenCalled()
   })
 
   it('建立按鈕呼叫 CreateSession 並登記＋釘選新 session', async () => {
