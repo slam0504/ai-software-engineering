@@ -298,10 +298,10 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 
 - 所有事件都會以 **Envelope v1** 格式寫入 `events.jsonl`：event_id 嚴格遞增，
   且每一輪的使用者訊息一定先於 provider 事件寫入；稽核寫入失敗時立即在 UI 顯示錯誤
-- 可選擇為每個 session 啟用 **wire log**（Claude ndjson／Codex jsonl）與 metadata
-  （argv、cwd、exit code、stderr tail）；收尾保證只執行一次
-- 寫入順序與收尾唯一性的機制（submission coordinator、RecordingLease）見
-  [內部架構文件](docs/architecture/internals.md)
+- **wire log** 依 provider 而不同：Claude 可為每個 session 選擇啟用（ndjson＋metadata：
+  argv、cwd、exit code、stderr tail）；Codex 則是每個 app-server generation 一份 always-on 的
+  connection-wide 紀錄（jsonl），session 以 segment 歸屬對應，紀錄名稱欄位只作為顯示 label
+- 寫入順序與收尾唯一性的機制見[內部架構文件](docs/architecture/internals.md)
 
 ### 官方登入
 - App 不接收密碼、不保管 token

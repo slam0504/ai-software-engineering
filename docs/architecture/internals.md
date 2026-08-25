@@ -58,16 +58,22 @@ internal/
   UI 以 `*` 區分兩者，不把最新值標示為累計值
 - **STALE 判定權威** — Gate 1 的失效以讀取時重算 spec manifest 為準，watcher 只是通知層；
   gate_op journal 只允許附加寫入，狀態一律由既有紀錄重新計算，轉為 STALE 後不會復活
-- **收尾責任歸屬** — 多個來源同時要求收尾時，由 `RecordingLease` 確保只執行一次；
-  Claude 收尾走 `CloseSequence`（關閉 stdin → 等待停止接受新工作並完成收尾 → 必要時終止程序 → 取得 exit 證據），
-  無法確認程序結束狀態時，不會將結果記為 exit 0
+- **收尾責任歸屬** — 多個來源同時要求收尾時，收尾必須恰好執行一次，仲裁者依 provider 而不同：
+  Claude 由 `RecordingLease` 仲裁，收尾走 `CloseSequence`（關閉 stdin → 等待停止接受新工作並完成收尾 →
+  必要時終止程序 → 取得 exit 證據），無法確認程序結束狀態時，不會將結果記為 exit 0；
+  Codex 由 `GenerationOwner.FinalizeWith` 負責該 generation 的一次性收尾（內部凍結
+  drain → detach → finalize 順序），不經 `RecordingLease`
 
 ## 稽核事件流與重啟恢復
 
 - **Envelope v1 寫入順序** — event_id 為 ULID、嚴格遞增；每一輪的使用者訊息一定先於 provider 事件寫入，
   順序由 submission coordinator 負責排列（見上方關鍵設計約束）
-- **wire log 收尾** — per-session 的 wire log（Claude ndjson／Codex jsonl）與 metadata
-  （argv、cwd、exit code、stderr tail）收尾由 `RecordingLease` 確保只執行一次
+- **wire log（兩套生命週期，收尾 owner 不同）** —
+  - Claude：可選的 per-session `.ndjson`＋metadata（argv、cwd、exit code、stderr tail），
+    `recordCase` 非空才建立；收尾由 `RecordingLease` 確保只執行一次
+  - Codex：每個 app-server generation 一份 always-on 的 connection-wide `.jsonl`，
+    session 透過 `WireSegmentRef` 建立歸屬、`recordCase` 只作為 view label；
+    一次性收尾由 `GenerationOwner.FinalizeWith` 負責，不經 `RecordingLease`
 - **replay index 損壞分級** — per-WSID 的 byte-offset turn 索引只是可重建的快取，`events.jsonl` 才是唯一權威來源。
   尾端損壞（torn write）就地截斷修復、不另行通知；中段損壞會隔離全部既有 turn index 檔
   （rename 為 `.quarantine-<timestamp>`，不刪除）、checkpoint 歸零並從 `events.jsonl` 全量重建、
