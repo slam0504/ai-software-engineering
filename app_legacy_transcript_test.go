@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -317,6 +318,73 @@ func TestLoadTurnsBeforeClearPersistFailureFailsLoud(t *testing.T) {
 	}
 	if e, _ := registryOnDisk(t, a.stateDir).Get("w1"); e.LegacyTranscript {
 		t.Fatal("重試成功後旗標應清除")
+	}
+}
+
+// TestLoadTurnsBeforeClearUncertainCarriesUIMarker：spec §2——清 legacy 旗標撞
+// uncertain latch 時，錯誤必須帶前端判別片語（同 TestErrRegistryUncertainKeepsUIMarker
+// 逐字比對的片語）、保留 cerr 診斷文字、哨兵鏈不斷（errors.Is 仍成立）。
+//
+// stub fixture 依既有 legacy_flag_clear 覆蓋列手法
+// （app_registry_uncertain_test.go:328-344）：mustCreate 之後把 entry 標成
+// LegacyTranscript=true＋ViewStartEventID 非空，events.jsonl 未寫入任何無 WSID
+// 事件（window 為空）——三前提缺一不可才會走到清旗標呼叫點。
+//
+// 注入帶探針文字的哨兵（owner review P2：裸哨兵抓不到拿掉 %v 的 mutation——
+// 如果實作漏掉 %v，err.Error() 就不會出現 "dir-sync-probe"）。
+func TestLoadTurnsBeforeClearUncertainCarriesUIMarker(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	w := mustCreate(t, a, "claude")
+	reg.mu.Lock()
+	e := reg.entries[string(w)]
+	e.LegacyTranscript = true
+	e.ViewStartEventID = "0000000000"
+	reg.entries[string(w)] = e
+	reg.mutateErr = fmt.Errorf("%w: dir-sync-probe", wsregistry.ErrRegistryUncertain)
+	reg.mu.Unlock()
+
+	_, err := a.LoadTurnsBefore(string(w), "", 20)
+	if err == nil {
+		t.Fatal("清旗標撞 uncertain latch 必須回錯（fail loud）")
+	}
+	if !strings.Contains(err.Error(), "session registry 上一次寫入的結果不確定") {
+		t.Fatalf("必須帶前端判別片語：%v", err)
+	}
+	if !strings.Contains(err.Error(), "dir-sync-probe") {
+		t.Fatalf("必須保留 cerr 診斷文字：%v", err)
+	}
+	if !errors.Is(err, wsregistry.ErrRegistryUncertain) {
+		t.Fatalf("哨兵鏈不得斷：%v", err)
+	}
+}
+
+// TestLoadTurnsBeforeClearPlainErrorNoUIMarker：反向——一般 persist 錯誤（非
+// uncertain latch）不得誤標前端判別片語，避免前端把一般失敗誤判成 latch 而強制
+// 展開 timeline。
+func TestLoadTurnsBeforeClearPlainErrorNoUIMarker(t *testing.T) {
+	a, _ := newTestApp(t)
+	reg := &stubRegistry{}
+	a.wsReg = reg
+	w := mustCreate(t, a, "claude")
+	reg.mu.Lock()
+	e := reg.entries[string(w)]
+	e.LegacyTranscript = true
+	e.ViewStartEventID = "0000000000"
+	reg.entries[string(w)] = e
+	reg.mutateErr = errors.New("plain-persist-probe")
+	reg.mu.Unlock()
+
+	_, err := a.LoadTurnsBefore(string(w), "", 20)
+	if err == nil {
+		t.Fatal("清旗標 persist 失敗必須回錯（fail loud）")
+	}
+	if !strings.Contains(err.Error(), "plain-persist-probe") {
+		t.Fatalf("必須保留原始診斷文字：%v", err)
+	}
+	if strings.Contains(err.Error(), "session registry 上一次寫入的結果不確定") {
+		t.Fatalf("一般錯誤不得誤標前端判別片語：%v", err)
 	}
 }
 

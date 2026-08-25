@@ -338,8 +338,11 @@ func TestRegistryUncertainAuditCoversStubbableWrites(t *testing.T) {
 			reg.entries[string(w)] = e
 			reg.mutateErr = sentinel
 			reg.mu.Unlock()
+			// F1 之後 loadTurnsBefore 會把哨兵包成帶前端判別片語的 errRegistryUncertain
+			// （見 app_legacy_transcript_test.go 的 TestLoadTurnsBeforeClearUncertainCarriesUIMarker），
+			// 字串不再與 sentinel 逐字相同，但哨兵鏈仍不斷——errors.Is 是這裡要守的前提。
 			if _, err := a.LoadTurnsBefore(string(w), "", 20); !errors.Is(err, sentinel) {
-				t.Fatalf("前提：ClearLegacyTranscript 回哨兵時 loadTurnsBefore 要回同一個錯誤，got %v", err)
+				t.Fatalf("前提：ClearLegacyTranscript 回哨兵時 loadTurnsBefore 要能用 errors.Is 追回同一個哨兵，got %v", err)
 			}
 		}},
 	}

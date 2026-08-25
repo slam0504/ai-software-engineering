@@ -384,7 +384,17 @@ func (a *App) loadTurnsBefore(wsid, beforeEventID string, n int) ([]contract.Env
 				// persist 失敗 fail loud——registry 寫不進去時掩蓋只會更晚發現。
 				if cerr := a.wsReg.ClearLegacyTranscript(wsid); cerr != nil &&
 					!errors.Is(cerr, wsregistry.ErrEntryNotFound) && !errors.Is(cerr, wsregistry.ErrTombstoned) {
-					return nil, a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
+					// wrap 放在 noteRegistryUncertainErr **之後**：稽核（audit）收的
+					// 是 registry 回傳的原始錯誤（含原始 errno／診斷文字），使用者
+					// 可見的回傳值才加前端判別片語——對齊 RemoveSession 的
+					// tombstone_persist 慣例（app.go 附近 removeStep("tombstone_persist")
+					// 那段）。uncertain latch 才加片語；ErrEntryNotFound／ErrTombstoned
+					// 兩個哨兵在上面已被過濾掉，不會走到這裡。
+					uerr := a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
+					if errors.Is(uerr, wsregistry.ErrRegistryUncertain) {
+						uerr = fmt.Errorf("%w（load turns wsid=%s：清 legacy 旗標時發現：%v）", errRegistryUncertain, wsid, uerr)
+					}
+					return nil, uerr
 				}
 			}
 		}
