@@ -148,18 +148,21 @@ describe('pin()：載入失敗攔截（proxy 身分比對、重試前置、notic
 
   // (5) 反向：persistentPins 不因載入失敗回退——這是既有行為（pin() 一開始
   // 就同步寫 persistentPins，早於 `await load(...)`），實作前就該是綠的。
-  // 刻意不直接 `await s.pin(...)`：實作前 pin() 還沒有 try/catch，直接 await
-  // 會讓 rejection 在斷言之前就讓這條測試整條紅掉，驗不到「賦值本來就在
-  // await 之前完成」這件事——這條要驗的正是這個同步時序，跟 catch 有沒有
-  // 接住無關。
+  //
+  // review 教訓：斷言必須等 promise（含 catch continuation）收斂之後再下，
+  // 不能緊跟 `s.pin(...)` 同步斷言——那只重驗了呼叫當下的同步賦值，對「catch
+  // 裡誤清 persistentPins」這種 mutation 零鑑別力（reviewer 實測在 catch 塞一行
+  // `this.persistentPins[idx] = null`，同步斷言版本 11/11 仍綠）。先
+  // `await p.catch(() => {})` 讓 catch 真的跑完，再斷言才測得到 catch 沒有
+  // 動 persistentPins。
   it('pin 失敗後 persistentPins 不回退', async () => {
     const s = useSession()
     s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: '' })
     s.setBindings(bindings(vi.fn(async () => { throw new Error('boom') })))
 
     const p = s.pin(0, 'w1')
+    await p.catch(() => {}) // 消化 rejection，避免 unhandled；也讓 catch continuation 跑完
     expect(s.persistentPins[0]).toBe('w1')
-    await p.catch(() => {}) // 消化 rejection，避免 unhandled（實作後這裡不會拋）
   })
 })
 
