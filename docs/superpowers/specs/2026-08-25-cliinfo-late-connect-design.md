@@ -4,7 +4,7 @@ M3b 開票記錄第 3 張（P2，m3b-results.md §11）：瀏覽器端晚於 sta
 meta 初始為空，重新載入後才正常；native Wails 同樣可能發生（OnStartup 與 binding
 本就並行）。Owner 凍結方向（2026-08-24）：**修法應提供可判斷的 ready 狀態並重新
 讀取 CLIInfo；只靠一次性事件仍會漏掉晚連線者；ready 契約必須同時涵蓋「早連線
-（首次查詢早於 backend 定案）」與「晚連線」兩種時序**。本文件 rev3。
+（首次查詢早於 backend 定案）」與「晚連線」兩種時序**。本文件 rev4。
 
 ## 1. 問題與現狀
 
@@ -31,7 +31,13 @@ meta 初始為空，重新載入後才正常；native Wails 同樣可能發生�
      順序自相矛盾。
 - **ready 不承諾整份快照凍結（rev3 更正）**：ready 保證的是 **meta 欄位**
   （toolsDir／toolsSource／CLI 路徑／nodePath／workspace／workspaceSource）自此
-  不再變動——這些欄位只有 startup owner 寫。`startupError` **不在**保證範圍：
+  不再變動。寫入者（rev4 更正）：toolsDir／toolsSource／nodePath 由 startup
+  owner 寫入；workspace／workspaceSource 由 `acquireStateLease()` 內的
+  `publishWorkspace`（app.go:2083／2090）寫入——production 正常路徑是
+  `runInstance` 的 preflight（main.go:72，開視窗前）先寫，owner 隨後在 startup
+  內的冪等呼叫因 lease 已存在直接返回、不再發布。兩類寫入都在 ready 之前，
+  已核對這些欄位皆無 post-ready 的 production writer。`startupError`
+  **不在**保證範圍：
   ready 之後仍有兩條既有的 fail-loud 追加路徑——
   1. startup 完成後再次呼叫 `startup()`：ownership 被拒後仍寫入「啟動序列只執行
      一次」橫幅（app.go:2127，`TestStartupIsRefusedAfterItAlreadyCompleted`
@@ -144,6 +150,11 @@ ready 判斷；ready 欄位保留給「早連線首查拿到空值」的顯示�
 
 ## 修訂記錄
 
+- rev4（2026-08-25，gate 第二輪 P2 收斂）：
+  - P2：更正 meta 欄位寫入者敘述——workspace／workspaceSource 由
+    `acquireStateLease` 內的 `publishWorkspace` 寫入（production 正常路徑為
+    `runInstance` preflight，main.go:72），非 startup owner；其餘欄位維持
+    owner 寫入。寫入均在 ready 前，ready 契約不受影響。
 - rev3（2026-08-25，implementation gate CHANGES_REQUIRED 收斂）：
   - P1：撤回「owner 終止後快照不再變動」的查核主張——ready 後仍有兩條
     startupError 追加路徑（被拒 startup 橫幅 app.go:2127、audit invariant 橫幅
