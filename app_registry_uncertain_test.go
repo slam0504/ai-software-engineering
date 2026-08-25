@@ -241,26 +241,24 @@ func TestShutdownSkipsRegistrySyncWhenUncertain(t *testing.T) {
 // 寫入設下的。
 //
 // **覆蓋範圍要說清楚（rev3 review Critical；C3 closeout 複查校正計數；C4
-// closeout 加 legacy_transcript_backfill 呼叫點再校正一次）**：
-// `noteRegistryUncertainErr` 接了十個呼叫點，這條測試只守得住其中六個——凡是
-// 經過 `a.wsReg`（sessionRegistry 介面，可換成 stub）**且**這裡實際驅動到的都
-// 守得到：
+// closeout 加 legacy_transcript_backfill 呼叫點再校正一次；1c 票補 set_layout
+// 列）**：`noteRegistryUncertainErr` 接了十個呼叫點，這條測試守得住其中七個
+// ——凡是經過 `a.wsReg`（sessionRegistry 介面，可換成 stub）**且**這裡實際驅動
+// 到的都守得到：
 //
 //	create_put／create_rollback／reset_view／tombstone_persist／shutdown_sync／
-//	legacy_flag_clear
+//	legacy_flag_clear／set_layout
 //
-// **另外四個 op 標籤目前零守門**，據實記在這裡：
+// **另外三個 op 標籤目前零守門**，據實記在這裡：
 //
-//	resume_backfill／registry_load／legacy_transcript_backfill／set_layout
+//	resume_backfill／registry_load／legacy_transcript_backfill
 //
-// resume_backfill／registry_load／legacy_transcript_backfill 直接吃具體型別
+// 這三個直接吃具體型別
 // `*wsregistry.Store`（`BackfillResume`／`BackfillLegacyTranscript` 都不在介面
 // 上、`registry_load` 發生在 `a.wsReg` 接線之前），而讓真實 Store 的步驟 4
 // 失敗需要它 package-private 的注入鉤子，跨 package 取不到。把鉤子 export 進
 // production API 只為了測試，代價比這三格的價值高——登記為已知缺口，不要讀成
-// 「已覆蓋」。set_layout（`setPaneLayout`，app.go）雖然經 `a.wsReg`、理論上可
-// 用同一張表的手法驅動，但這裡尚未補上對應列——一併登記為已知缺口，不是本次
-// 改動範圍。
+// 「已覆蓋」。
 //
 // mutation（各自只打紅一列）：拿掉表中**任一**入口的 noteRegistryUncertainErr
 // → 紅在該入口那一個 subtest。
@@ -343,6 +341,16 @@ func TestRegistryUncertainAuditCoversStubbableWrites(t *testing.T) {
 			// 字串不再與 sentinel 逐字相同，但哨兵鏈仍不斷——errors.Is 是這裡要守的前提。
 			if _, err := a.LoadTurnsBefore(string(w), "", 20); !errors.Is(err, sentinel) {
 				t.Fatalf("前提：ClearLegacyTranscript 回哨兵時 loadTurnsBefore 要能用 errors.Is 追回同一個哨兵，got %v", err)
+			}
+		}},
+		{"SetPaneLayout→SetLayout", "set_layout", func(t *testing.T, a *App, reg *stubRegistry) {
+			// setPaneLayout 不驗 pins 對應的 session 是否存在（pins 是 UI 偏好），
+			// 只驗 focused ∈ pins 與數量上限——不需要 mustCreate。
+			reg.mu.Lock()
+			reg.layoutErr = sentinel
+			reg.mu.Unlock()
+			if err := a.SetPaneLayout([]string{"w-a", ""}, "w-a"); !errors.Is(err, sentinel) {
+				t.Fatalf("前提：SetLayout 回哨兵時 SetPaneLayout 要回同一個錯誤，got %v", err)
 			}
 		}},
 	}
