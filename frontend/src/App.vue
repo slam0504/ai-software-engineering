@@ -241,7 +241,26 @@ function onGlobalKeydown(e: KeyboardEvent) {
     document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus()
   }
 }
-onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown))
+// CLIInfo ready 契約（spec 2026-08-25-cliinfo-late-connect-design.md §3）：
+// request sequencing——每次 refresh 取號，回覆完成時若其後已有更新的 request
+// 發出就整筆丟棄（最新 request 優先）。ready=true 的回覆之間也可能不同
+// （startupError 在 ready 後仍可能被 fail-loud 路徑追加），所以不能只看 ready。
+let cliInfoReq = 0
+let disposeCliReady: (() => void) | undefined
+async function refreshCliInfo() {
+  const token = ++cliInfoReq
+  try {
+    const info = await CLIInfo()
+    if (token === cliInfoReq) cliInfo.value = info
+  } catch { /* dev 無綁定時忽略 */ }
+}
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  // 只清本次新增的 listener：既有 workbench:event／session:done 未清理是
+  // 待清理項，不在本 scope（spec §3）。
+  disposeCliReady?.()
+})
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
@@ -258,6 +277,8 @@ onMounted(async () => {
     else s.apply(e)
   })
   EventsOn('session:done', (d: any) => s.applyDone(d))
+  // 先訂閱後查詢（spec §3）：事件不可能落在「查完之後、訂閱之前」的縫裡。
+  disposeCliReady = EventsOn('workbench:cli-ready', () => { void refreshCliInfo() })
   // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
   // Task 29 的 lazy load，這裡只 hydrate metadata。
   try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
@@ -270,7 +291,7 @@ onMounted(async () => {
   } catch (e) {
     s.pushNotice(t('app.paneLayout.restoreFailed', { error: String(e) }))
   }
-  try { cliInfo.value = await CLIInfo() } catch { /* dev 無綁定時忽略 */ }
+  await refreshCliInfo()
   await refreshGate() // 初始 hydrate：讓 restart 後既有的 pending/active/stale 項目立即可見
   await refreshEscalation()
   await refreshDiagramFiles()
