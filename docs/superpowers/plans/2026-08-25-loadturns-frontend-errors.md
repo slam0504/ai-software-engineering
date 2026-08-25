@@ -56,14 +56,8 @@ Expected: 正向測試紅（現行回 wsregistry 原始字串、無前端片語�
 
 - [ ] **Step 3: Write minimal implementation**
 
-合併分支非哨兵路徑改：
-
-```go
-if errors.Is(cerr, wsregistry.ErrRegistryUncertain) {
-    cerr = fmt.Errorf("%w（load turns wsid=%s：清 legacy 旗標時發現：%v）", errRegistryUncertain, wsid, cerr)
-}
-return nil, a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
-```
+合併分支非哨兵路徑改為下方**唯一版本**（owner review rev2 P1：原本並列的
+wrap-before snippet 已刪除——兩套互斥實作並存會讓執行者採到相反順序）。
 
 **wrap 順序凍結（plan gate 實測校正）**：**wrap 放在 `noteRegistryUncertainErr` 之後**——即稽核收到的是 registry 原始錯誤（含原始 errno），使用者可見訊息才加 app 片語，對齊既有慣例（app.go:7167-7176 的 tombstone_persist 同形）。（gate 實測：wrap-before 會讓 audit error 欄膨脹且多一份 app 片語——「wrap 放後稽核才含原始 cerr」的舊理由方向錯誤，wrap-before 其實是 superset，真正差異是稽核要不要多片語。）實作形：
 
@@ -130,14 +124,14 @@ try {
 6. loadOlder reject（wsid 釘進 **focused** pane、busy 前置 true）→ timeline 內容不變、busy 仍 true、notice 有錯誤；再呼叫 → binding 再被呼叫。
 7. loadOlder reject 且含 MARK → `latchSeq` 增。
 8. 反向：成功路徑無 notice、既有行為不變（既有 pin/loadOlder 測試不破）。
-9. **i18n placeholder 守門**（gate P2：locales.parity 只比 key 路徑不查 placeholder）：`t('store.turnsLoadFailed', { wsid: 'w1', error: 'x' })` 同時含 `w1` 與 `x`（zh-TW 與 en 各斷一次或以現行 locale 斷一次即可）。
+9. **i18n placeholder 守門**（gate P2：locales.parity 只比 key 路徑不查 placeholder；owner rev2 P2：**zh-TW 與 en 各驗一次**，只測現行 locale 會放過另一語系漏 `{wsid}`／`{error}`）：兩個 key × 兩語系，`t(...)` 產出同時含 `w1` 與 `x`。
 
 Binding stub 慣例統一採 `registryUncertain.test.ts:43` 的 `LoadTurnsBefore: vi.fn()` 形（spec 與 plan 原引兩處不同前例，擇此定案）；deferred promise 手法照 PaneView.test.ts:146-164。
 
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `npm --prefix frontend run test -- session.loaderrors`
-Expected: 1-7 紅（現行 unhandled rejection／永久早退）；8 綠
+Expected: **1–4、6–7、9 紅；5、8 綠**（owner rev2 P2 校正：第 5 條 persistentPins 不回退是現況即成立的反向、實作前就綠；第 9 條 i18n key 尚不存在、實作前紅）
 
 - [ ] **Step 3: Implement**（上方凍結 code＋i18n 兩 key＋註解更新）
 
@@ -165,8 +159,18 @@ git commit -m "fix(frontend): pin/loadOlder 載入錯誤 store 層攔截——pr
 
 各檔兩條：
 1. 首載失敗（binding reject 一次）→ view 已清 → 再點同一入口 → binding 被**第二次**呼叫（真實 UI 重試）。
-2. **反向（plan gate P1 校正——「binding 不得再被呼叫」對「拿掉 `!views` 守衛」的 mutation 是恆真斷言：view 存在時 pin() 走 `!isNew` 早退根本不會呼叫 binding）**：view 存在時再點 → **行為面斷言**——`s.pins` 不變（`toEqual` 快照）、`s.focused === at`、`s.views[wsid]` 仍為**同一實例**（`toBe`）。SettingsBar 尤其必須斷 `s.pins` 與 `s.focused`（只斷 focusedWsid 對 MUT-A 假綠——gate 實測）。據實標註：SessionList 側的「整段 at 分支拿掉」mutation 已由既有 SessionList.test.ts:112 守，新反向的增量價值在 SettingsBar 側。
-   **已知缺口（據實登記、不宣稱守門）**：view 存在時 `setFocus` 與 `pin` 的殘餘行為差異（`pin()` 會清 `transientPane`、transient 佔格時 releaseView 並覆寫）本票不加測試——反向斷言守的是 pins／focused／view 實例三項，不含 transient 語意。
+2. **反向（owner review rev2 P1 定案——action spy）**：fixture 建立完成後對
+   store action 加 spy（`const pinSpy = vi.spyOn(s, 'pin'); const focusSpy = vi.spyOn(s, 'setFocus')`）
+   → view 存在時再點同一入口 → 斷言 **`setFocus(at)` 被呼叫且 `pin` 未被呼叫**。
+   兩個 component caller 都覆蓋。這直接區辨 `setFocus(at)` 與誤用 `pin(at, wsid)`
+   ——行為面快照（pins／focused／view 實例）在無 transient 的 fixture 下兩條
+   路徑結果相同、無法區辨（gate P1 的行為面版本不足，owner 裁定改 spy；「守衛
+   目的就是保留 view 已存在時的既有呼叫語意」，不得登記為已知缺口）。
+   （scratch 實測定案，owner 指定的補驗：兩檔 spy 版反向在現行 code 綠（26/26
+   含既有 24）、把已釘選分支 mutate 成 `void s.pin(at, wsid)` 後兩檔各自紅在
+   `focusSpy` 斷言（呼叫次數 0、pinSpy 實收 `[at, wsid]`）——失敗精準對應誤用
+   pin，非無關紅；`vi.spyOn(s, 'pin'/'setFocus')` 在 mount 後、點擊前設下即可
+   攔截，不需 `$onAction` 或重新 mount。）
 
 - [ ] **Step 2: Run to verify it fails**
 
