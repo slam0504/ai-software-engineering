@@ -403,27 +403,28 @@ export const useSession = defineStore('session', {
       }
       const isNew = !this.views[wsid]
       if (isNew) this.views[wsid] = newView()
+      const createdView = this.views[wsid] // proxy 讀回——比對與 applyToView 都用它
       const m = this.sessions[wsid]
       if (m) m.unread = 0
       if (!isNew) return
       const load = this.bindings?.LoadTurnsBefore
       if (!load) return
-      const envs = await load(wsid, '', TURN_WINDOW_SIZE)
-      // await 期間可能已被切走／釋放，重新取一次——這是存在性檢查，不是身分
-      // 檢查（不比對「這個 view 是不是我剛剛建立的那個實例」）。它正確防住的
-      // 是「pin(A) 載入中，同一 pane 被切去 pin(B)」（releaseView(A) 會
-      // delete views[A]，見下方 pin(A)→pin(B) 的測試）與「A 在等待期間被
-      // RemoveSession／markRemoved 刪除」。它**沒有**防住「同一個 wsid 的
-      // view 被刪除後又重建」（unpin → 再 pin 回同一個 wsid，此時 v 存在但是
-      // 新實例，這批舊 envelope 會不去重地疊上去，因為只有 loadOlder() 做
-      // event_id 去重、這裡的尾端載入沒有）。這條分支目前**不可達**：
-      // unpin() 在整個 frontend/src 零 UI 呼叫端（SessionList／SettingsBar／
-      // PaneView 都沒有「解除釘選」控制項）。只要日後任何票加一顆解除釘選
-      // 按鈕，這個分支就會變可達，屆時需要在這裡也比對「view 是不是同一個
-      // 尾端載入啟動時建立的那個實例」（例如帶一個 generation 計數）。
-      const v = this.views[wsid]
-      if (!v || !envs) return
-      for (const e of envs) applyToView(v, e)
+      // 用 createdView 身分（不是存在性）比對：await 期間可能已被切走／釋放，
+      // 也可能同一個 wsid 已經被 releaseView 刪除又重建成新實例——A→B→A
+      // 時序不需要 unpin UI 即可達（pin() 自己在 prev!==wsid 時就會呼叫
+      // releaseView(prev)），所以「同一個 wsid 但不同實例」是目前就走得到的
+      // 分支，不能只看 views[wsid] 是否存在。失敗時把這次建立的 view 清掉
+      // （若它還是目前的那個實例），讓下一次 pin 重新走一次 isNew 分支
+      // （重試前置）；只 pushNotice，不動 busy——lazy load 失敗不是使用者
+      // 當下這個 turn 的錯誤。
+      try {
+        const envs = await load(wsid, '', TURN_WINDOW_SIZE)
+        if (this.views[wsid] !== createdView) return
+        for (const e of envs ?? []) applyToView(createdView, e)
+      } catch (e) {
+        if (this.views[wsid] === createdView) delete this.views[wsid]
+        this.pushNotice(t('store.turnsLoadFailed', { wsid, error: String((e as Error)?.message ?? e) }))
+      }
     },
 
     unpin(idx: 0 | 1) {
@@ -461,7 +462,15 @@ export const useSession = defineStore('session', {
       if (!load || !v) return
       const cursor = v.timeline[0]?.env.event_id ?? ''
       if (!cursor) return // 尚未有任何已載入事件：沒有游標可分頁
-      const envs = await load(wsid, cursor, TURN_WINDOW_SIZE)
+      let envs: Envelope[] | undefined
+      try {
+        envs = await load(wsid, cursor, TURN_WINDOW_SIZE)
+      } catch (e) {
+        // 分頁失敗只 pushNotice：view 與 busy 都不動——這是使用者捲到頂的
+        // 分頁動作，不是進行中的 turn，沒有東西需要復原，重試就是再捲一次。
+        this.pushNotice(t('store.olderTurnsLoadFailed', { wsid, error: String((e as Error)?.message ?? e) }))
+        return
+      }
       if (!envs?.length) return
       const known = new Set(v.timeline.map(i => i.env.event_id))
       const fresh = envs.filter(e => !known.has(e.event_id))

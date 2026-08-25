@@ -315,6 +315,8 @@ export default {
     noFocusedSession: 'no session is pinned to the focused pane — create or pin one first',
     paneLayoutPersistFailed: 'pane pins were not saved, so this arrangement will be lost on restart (the pins themselves still work): {error}',
     sessionUnavailable: 'session {wsid} is recorded but not addressable (no working slot); restart the app or remove it',
+    turnsLoadFailed: 'failed to load transcript history for session {wsid}; retry by pinning it again: {error}',
+    olderTurnsLoadFailed: 'failed to load older turns for session {wsid}; retry is available: {error}',
   },
   sessionList: {
     empty: 'No sessions yet — use the create buttons above to start one',

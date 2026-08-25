@@ -315,6 +315,8 @@ export default {
     noFocusedSession: '焦點 pane 沒有釘選任何 session——請先建立或釘選一個',
     paneLayoutPersistFailed: 'pane 釘選沒有存檔，這次的排列重啟後會遺失（釘選本身仍然有效）：{error}',
     sessionUnavailable: 'session {wsid} 有紀錄但目前無法操作（沒有對應的 working slot）；請重啟 app 或將它移除',
+    turnsLoadFailed: 'session {wsid} 的歷史對話載入失敗，可再試一次（重新釘選）：{error}',
+    olderTurnsLoadFailed: 'session {wsid} 往前分頁載入失敗，可再試一次：{error}',
   },
   sessionList: {
     empty: '目前沒有任何 session——用上方的建立按鈕開一個',
