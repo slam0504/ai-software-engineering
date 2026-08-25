@@ -56,6 +56,11 @@ Workbench 有兩層，各自獨立可用：
 **SDLC 流程關卡**——把「規格 → 計畫 → 測試契約」的每一步變成明確的核可節點。
 AI 協助草擬與實作，核可決定由人作成、並留有紀錄：
 
+> **Enforcement 邊界**——Gate 1、Gate 2 與 TCA 約束的是規格、計畫、測試契約及其證據。
+> 一般 Claude／Codex session **不會**自動取得已核可內容，也不會依 `permissions_ref` 或
+> 計畫範圍限制檔案操作；工具核可只決定單次呼叫是否放行。目前版本尚無
+> implementation-output gate——Gate 3 與平台 enforcement 屬未開始的 M4（見里程碑）。
+
 ```mermaid
 flowchart LR
   spec["撰寫規格<br/>spec/（Gherkin）"] --> g1["Gate 1<br/>規格核可"]
@@ -63,7 +68,7 @@ flowchart LR
   plan --> g2["Gate 2<br/>逐項任務風險決議<br/>（測試契約隨 plan 一併核可）"]
   g2 --> tc["依核可的測試契約<br/>產生測試證據"]
   tc --> tca["TCA<br/>測試契約核可"]
-  tca --> impl["帶著核可的規格與計畫<br/>與 AI 對話實作"]
+  tca --> impl["與 AI 對話實作<br/>（核可內容由人自行帶入，<br/>系統不注入、不限制實作範圍）"]
 ```
 
 每個關卡各擋一類問題：
@@ -174,7 +179,8 @@ npm --prefix frontend run build  # vue-tsc typecheck + vite build
   以暫時檢視顯示在次要 pane，做出決定、逾時或關閉後自動還原原本的釘選
 - **重啟成本與事件量脫鉤**——只有兩個釘選的 pane 會重建對話（各載入最近 20 個完整 turn 與尚未結束的那一輪），
   其餘 session 只載入 metadata；向上捲到頂會以每次 20 個 turn 分頁載入。背後是 per-WSID 的 byte-offset replay index
-  （`events.jsonl` 仍是唯一權威來源，index 只是可重建的快取，損壞時會自動隔離、重建並通知）
+  （`events.jsonl` 仍是唯一權威來源，index 只是可重建的快取；尾端損壞就地截斷修復、
+  不另行通知，中段損壞才隔離受損檔、全量重建並通知）
 - **關閉 session 等於保留稽核紀錄的 tombstone**——不刪除任何事件與 wire log；名額要等收尾與寫檔全部成功後才釋放，
   已關閉的 session 不會在重啟或索引重建後復活
 
