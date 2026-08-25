@@ -170,15 +170,21 @@ describe('CLIInfo ready 契約（頂列 meta 晚連線空白）', () => {
     expect(w.find('.meta').text()).toContain('audit invariant broken')
   })
 
-  // 只斷言**新增的** listener 有清：既有 workbench:event／session:done 未清理
-  // 是待清理項，不在本 scope（spec §3）。
-  it('清理格：unmount 後 cli-ready 的 disposer 被呼叫', async () => {
+  // spec §3 當時把既有 listener 標為待清理、另票處理；該票已執行——App.vue 的
+  // 三個 Wails listener 在 unmount 時都必須清（不清的 handler 會在 HMR／重掛
+  // 後對著舊的 store instance 繼續收事件）。
+  it('清理格：unmount 後三個 Wails listener 的 disposer 都被呼叫', async () => {
     const w = mountApp()
     await flushPromises()
-    const dispose = runtimeMocks.disposers['workbench:cli-ready']
-    expect(dispose, 'App.vue 必須訂閱 workbench:cli-ready').toBeTruthy()
-    expect(dispose!).not.toHaveBeenCalled()
+    const names = ['workbench:event', 'session:done', 'workbench:cli-ready']
+    for (const name of names) {
+      expect(runtimeMocks.disposers[name], `App.vue 必須訂閱 ${name}`).toBeTruthy()
+      expect(runtimeMocks.disposers[name]!).not.toHaveBeenCalled()
+    }
     w.unmount()
-    expect(dispose!).toHaveBeenCalledTimes(1)
+    for (const name of names) {
+      expect(runtimeMocks.disposers[name]!, `${name} 的 disposer 必須在 unmount 時被呼叫`)
+        .toHaveBeenCalledTimes(1)
+    }
   })
 })

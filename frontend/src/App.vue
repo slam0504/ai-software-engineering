@@ -246,7 +246,6 @@ function onGlobalKeydown(e: KeyboardEvent) {
 // 發出就整筆丟棄（最新 request 優先）。ready=true 的回覆之間也可能不同
 // （startupError 在 ready 後仍可能被 fail-loud 路徑追加），所以不能只看 ready。
 let cliInfoReq = 0
-let disposeCliReady: (() => void) | undefined
 async function refreshCliInfo() {
   const token = ++cliInfoReq
   try {
@@ -255,17 +254,19 @@ async function refreshCliInfo() {
   } catch { /* dev 無綁定時忽略 */ }
 }
 
+// wailsDisposers：onMounted 註冊的 Wails listener 全部收在這裡，unmount 一併清
+// ——不清的 handler 會在 HMR／重掛後對著舊的 store instance 繼續收事件。
+// undefined guard：測試 mock 的 EventsOn 可能不回傳 disposer。
+const wailsDisposers: Array<(() => void) | undefined> = []
 onUnmounted(() => {
   window.removeEventListener('keydown', onGlobalKeydown)
-  // 只清本次新增的 listener：既有 workbench:event／session:done 未清理是
-  // 待清理項，不在本 scope（spec §3）。
-  disposeCliReady?.()
+  for (const dispose of wailsDisposers) dispose?.()
 })
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
   s.setBindings(wailsBindings)
-  EventsOn('workbench:event', (e: any) => {
+  wailsDisposers.push(EventsOn('workbench:event', (e: any) => {
     const dst = routeEnvelope(e)
     if (dst === 'gate') gate.applyGateEvent(e)
     else if (dst === 'assist') assist.applyAssistEvent(e)
@@ -275,10 +276,10 @@ onMounted(async () => {
     // broadcast、dispatch fail loud）——此前全被丟進 gate store 靜默丟棄。
     else if (dst === 'notice') s.applyNotice(e)
     else s.apply(e)
-  })
-  EventsOn('session:done', (d: any) => s.applyDone(d))
+  }))
+  wailsDisposers.push(EventsOn('session:done', (d: any) => s.applyDone(d)))
   // 先訂閱後查詢（spec §3）：事件不可能落在「查完之後、訂閱之前」的縫裡。
-  disposeCliReady = EventsOn('workbench:cli-ready', () => { void refreshCliInfo() })
+  wailsDisposers.push(EventsOn('workbench:cli-ready', () => { void refreshCliInfo() }))
   // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
   // Task 29 的 lazy load，這裡只 hydrate metadata。
   try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
