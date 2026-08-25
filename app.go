@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1340,6 +1341,11 @@ type startupInfo struct {
 	nodePath    string
 	workspace   string
 	workspaceSr string
+	// ready：唯一 startup owner 對快照的寫入已全部完成（owner 函式主體已返回）。
+	// 只保證 meta 欄位定案；startupErr 在 ready 後仍可能被 fail-loud 路徑追加
+	// （被拒的 startup 橫幅、audit invariant 橫幅——見 spec
+	// 2026-08-25-cliinfo-late-connect-design.md §2）。
+	ready bool
 }
 
 // startupState：startupInfo ＋ 保護它的那把鎖，封成一個型別。
@@ -1409,6 +1415,12 @@ func (s *startupState) publishWorkspace(dir, src string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.info.workspace, s.info.workspaceSr = dir, src
+}
+
+func (s *startupState) publishReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.info.ready = true
 }
 
 // ---- App 這一側只是轉呼叫（既有呼叫端不必全部改寫）----
@@ -2128,7 +2140,15 @@ func (a *App) startup(ctx context.Context) {
 			"啟動序列只執行一次，本次不開啟任何 session 狀態。")
 		return
 	}
-	defer a.endStartupLifecycle()
+	// 單一 finalizer，順序是契約（spec §2 rev3 凍結）：①同鎖落 ready 旗標 →
+	// ②emit → ③endStartupLifecycle。不得拆成兩個 defer（LIFO 會反轉順序）。
+	// end 放最後：shutdown 等的是 startup lifecycle 收斂，emit 先於收斂訊號，
+	// teardown 就不可能與 ready 發布交錯。
+	defer func() {
+		a.startupData.publishReady()
+		a.emit("workbench:cli-ready", nil)
+		a.endStartupLifecycle()
+	}()
 	a.ctx = ctx
 	// canonical state directory 解析完成後的**第一件事**：取得 ownership lease。
 	//
@@ -3471,6 +3491,7 @@ func (a *App) CLIInfo() map[string]string {
 		"claudeVersion": cliVersionFrom(si, "claude"), "codexVersion": cliVersionFrom(si, "codex"),
 		"node": nodeVersionOf(si.nodePath), "workspace": si.workspace,
 		"workspaceSource": si.workspaceSr, "startupError": si.startupErr,
+		"ready": strconv.FormatBool(si.ready),
 	}
 }
 

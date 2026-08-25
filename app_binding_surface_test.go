@@ -1154,6 +1154,7 @@ var startupAccessorContract = map[string]struct {
 	"publishTools":     {writes: fieldSet("toolsDir", "toolsSource")},
 	"publishNode":      {writes: fieldSet("nodePath")},
 	"publishWorkspace": {writes: fieldSet("workspace", "workspaceSr")},
+	"publishReady":     {writes: fieldSet("ready")},
 }
 
 func fieldSet(names ...string) map[string]bool {
@@ -1169,6 +1170,7 @@ func fieldSet(names ...string) map[string]bool {
 // 而不更新這裡與 contract 就會紅）。
 var startupInfoFields = []string{
 	"startupErr", "blockers", "toolsDir", "toolsSource", "nodePath", "workspace", "workspaceSr",
+	"ready",
 }
 
 // TestStartupStateIsTheOnlyAccessPath
