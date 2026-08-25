@@ -73,6 +73,44 @@ describe('SettingsBar session 分頁（Task 26：WSID 定址）', () => {
     expect(load).toHaveBeenCalledTimes(2)
   })
 
+  // final review（Important）：上面的重試測試是單 session fixture
+  // （at === focused === 0），如果實作把 `s.pin(at, w)` 誤換成
+  // `s.pin(s.focused, w)`，那條測試不會變紅——凍結的危害（用 focused 會把
+  // 分頁搬格並 releaseView 掉該格原本的 session）沒有守門。這裡補雙 pane
+  // fixture：w2 先釘在 pane 1，w1 首載失敗清空 view 後把 focused 切到 1
+  // （與 w1 實際釘選的 pane 0 不同）再點同一個分頁重試，斷言 binding 對 w1
+  // 第二次呼叫，且 pane 1 的 w2 沒被踢掉、pane 0 仍是 w1。
+  it('重試分支用 at 不是 focused——雙 pane 下重試不誤搬 w1 也不踢掉 pane 1 的 w2', async () => {
+    const s = useSession()
+    s.registerSession({ wsid: 'w1', provider: 'claude', taskLabel: 'a' })
+    s.registerSession({ wsid: 'w2', provider: 'codex', taskLabel: 'b' })
+    let w1Calls = 0
+    const load = vi.fn(async (w: string) => {
+      if (w === 'w1') {
+        w1Calls++
+        if (w1Calls === 1) throw new Error('load boom')
+      }
+      return []
+    })
+    s.setBindings({ StartSession: vi.fn(async () => {}), SendMessage: vi.fn(async () => {}), LoadTurnsBefore: load })
+    await s.pin(1, 'w2') // 先把 w2 釘在 pane 1
+    s.setFocus(0) // w1 即將釘進的那格
+    const w = mountWithI18n(SettingsBar)
+
+    await w.find('[data-test=session-tab-w1]').trigger('click') // 首載失敗，清掉 view
+    await flushPromises()
+    expect(s.views['w1']).toBeUndefined()
+    expect(s.pins[0]).toBe('w1')
+
+    s.setFocus(1) // focused 與 w1 實際釘選的 pane（0）不同——踩雷點
+    await w.find('[data-test=session-tab-w1]').trigger('click') // 重試
+    await flushPromises()
+
+    expect(w1Calls).toBe(2)
+    expect(s.pins[0]).toBe('w1')
+    expect(s.pins[1]).toBe('w2') // 沒被踢掉重灌
+  })
+
   // 反向（owner review rev2 P1 定案——action spy）：view 存在時再點同一個分頁，
   // 必須維持既有語意（只切 focus，不重新釘一次），不得因本票的修正誤用成
   // `pin(at, w)`。行為面快照在無 transient 的 fixture 下無法區辨這兩者，改對
