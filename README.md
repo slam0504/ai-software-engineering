@@ -180,7 +180,7 @@ npm --prefix frontend run build  # vue-tsc typecheck + vite build
 - **重啟成本與事件量脫鉤**——只有兩個釘選的 pane 會重建對話（各載入最近 20 個完整 turn 與尚未結束的那一輪），
   其餘 session 只載入 metadata；向上捲到頂會以每次 20 個 turn 分頁載入。背後是 per-WSID 的 byte-offset replay index
   （`events.jsonl` 仍是唯一權威來源，index 只是可重建的快取；尾端損壞就地截斷修復、
-  不另行通知，中段損壞才隔離受損檔、全量重建並通知）
+  不另行通知，中段損壞會隔離全部既有 turn index 檔、從 `events.jsonl` 全量重建並通知）
 - **關閉 session 等於保留稽核紀錄的 tombstone**——不刪除任何事件與 wire log；名額要等收尾與寫檔全部成功後才釋放，
   已關閉的 session 不會在重啟或索引重建後復活
 
