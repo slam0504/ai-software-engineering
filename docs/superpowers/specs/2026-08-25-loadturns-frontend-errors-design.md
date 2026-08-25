@@ -9,6 +9,10 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
    永久 early return。
 
 **修訂記錄**：
+- rev4（2026-08-25，owner review 1 P2）：Go 測試注入改帶探針文字的 uncertain
+  錯誤並斷言 `dir-sync-probe` 留存（守住「cerr 訊息不遺失」契約——裸哨兵注入
+  抓不到拿掉 `%v` 的 mutation）；§2 用語校正——`%v` 保留診斷文字非 error
+  chain，本票需求只到文字層。
 - rev3（2026-08-25，spec gate 2 P1／6 P2）：createdView 凍結寫法改「先寫入再
   讀回 proxy」（原 snippet 在 Pinia reactive 下比對恆 false——gate 實測 7 紅
   ／修正版 376 綠；比對與 applyToView 都須用 proxy）；SettingsBar component
@@ -55,8 +59,10 @@ Owner 開票（2026-08-24，P1；2026-08-25 補充要件：「不只接住 Promi
   app 層片語的錯誤：`fmt.Errorf("%w（load turns wsid=%s：清 legacy 旗標時
   發現：%v）", errRegistryUncertain, wsid, cerr)`——沿用既有
   `errRegistryUncertain` 變數（app.go:727-729，前端片語的唯一來源），**不另
-  造第二種片語**；**保留 `cerr`**（gate P2：store latch 錯誤裡的原始 dir-sync
-  errno 不得從主錯誤鏈消失）。wrap 後 `errors.Is(err,
+  造第二種片語**；**`cerr` 的錯誤訊息不得遺失**（gate P2；owner rev3 校正
+  用語：`%v` 保留的是診斷**文字**進使用者可見錯誤，不是把 `cerr` 留在 Go
+  error chain——本票需求只到文字層；哨兵可追溯性由 `errRegistryUncertain`
+  自身的 `%w` 提供，不需第二個 `%w`）。wrap 後 `errors.Is(err,
   wsregistry.ErrRegistryUncertain)` 仍成立（errRegistryUncertain 本身以 `%w`
   包住同一哨兵——gate 核實，既有 uncertain 覆蓋表測試不紅；該 subtest 的
   「要回同一個錯誤」註解語意會變，plan 順手修）。
@@ -148,10 +154,13 @@ reject）。
   `ForceStepHookForTest` 跨 package 取不到、latch 單向與既有測試的「修復後
   重試成功」斷言互斥）**：用 `stubRegistry`（app_wsid_test.go:140 已實作
   `ClearLegacyTranscript`、`mutateErr` 驅動）比照 app_registry_uncertain_test.go:328
-  的手法，**兩條新測試**：`mutateErr = wsregistry.ErrRegistryUncertain` →
-  `LoadTurnsBefore` 錯誤字串含前端片語（與 `TestErrRegistryUncertainKeepsUIMarker`
-  同字面）且 `errors.Is` 哨兵仍成立；`mutateErr = errors.New(...)` 一般錯誤
-  → 不含片語（不誤標）。既有 chmod 測試不動。
+  的手法，**兩條新測試**：`mutateErr = fmt.Errorf("%w: dir-sync-probe",
+  wsregistry.ErrRegistryUncertain)`（owner rev3 P2——注入裸哨兵時「拿掉格式
+  中的 `%v`」的 mutation 不會被抓）→ `LoadTurnsBefore` 錯誤字串含前端片語
+  （與 `TestErrRegistryUncertainKeepsUIMarker` 同字面）、**含 `dir-sync-probe`**
+  （cerr 訊息不遺失的守門）、且 `errors.Is` 哨兵仍成立；
+  `mutateErr = errors.New(...)` 一般錯誤 → 不含片語（不誤標）。既有 chmod
+  測試不動。
 - **Frontend（vitest，沿用既有 session store 測試手法——registryUncertain.test.ts
   的 binding stub 慣例）**：
   - pin 首載 reject → view 被清（`views[wsid]` 不存在）、notice lane 有錯誤、
