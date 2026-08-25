@@ -65,7 +65,17 @@ if errors.Is(cerr, wsregistry.ErrRegistryUncertain) {
 return nil, a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
 ```
 
-注意順序：wrap 要在 `noteRegistryUncertainErr` **之前或之後皆可**（helper 只對 `errors.Is` 判定、wrap 後哨兵仍成立——實作時擇一並在 doc 註明；稽核記錄若希望含原始 cerr 則 wrap 放後）。app_registry_uncertain_test.go:328 覆蓋列的「要回同一個錯誤」註解語意順手修。
+**wrap 順序凍結（plan gate 實測校正）**：**wrap 放在 `noteRegistryUncertainErr` 之後**——即稽核收到的是 registry 原始錯誤（含原始 errno），使用者可見訊息才加 app 片語，對齊既有慣例（app.go:7167-7176 的 tombstone_persist 同形）。（gate 實測：wrap-before 會讓 audit error 欄膨脹且多一份 app 片語——「wrap 放後稽核才含原始 cerr」的舊理由方向錯誤，wrap-before 其實是 superset，真正差異是稽核要不要多片語。）實作形：
+
+```go
+uerr := a.noteRegistryUncertainErr("legacy_flag_clear", wsid, cerr)
+if errors.Is(uerr, wsregistry.ErrRegistryUncertain) {
+    uerr = fmt.Errorf("%w（load turns wsid=%s：清 legacy 旗標時發現：%v）", errRegistryUncertain, wsid, uerr)
+}
+return nil, uerr
+```
+
+app_registry_uncertain_test.go:328 覆蓋列的「要回同一個錯誤」註解語意順手修。已知登記（gate P2，不改）：wrap 後使用者可見字串會含 wsregistry 那句兩次（errRegistryUncertain 的 `%w`＋`%v`），spec §2 已凍結格式。
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -120,6 +130,9 @@ try {
 6. loadOlder reject（wsid 釘進 **focused** pane、busy 前置 true）→ timeline 內容不變、busy 仍 true、notice 有錯誤；再呼叫 → binding 再被呼叫。
 7. loadOlder reject 且含 MARK → `latchSeq` 增。
 8. 反向：成功路徑無 notice、既有行為不變（既有 pin/loadOlder 測試不破）。
+9. **i18n placeholder 守門**（gate P2：locales.parity 只比 key 路徑不查 placeholder）：`t('store.turnsLoadFailed', { wsid: 'w1', error: 'x' })` 同時含 `w1` 與 `x`（zh-TW 與 en 各斷一次或以現行 locale 斷一次即可）。
+
+Binding stub 慣例統一採 `registryUncertain.test.ts:43` 的 `LoadTurnsBefore: vi.fn()` 形（spec 與 plan 原引兩處不同前例，擇此定案）；deferred promise 手法照 PaneView.test.ts:146-164。
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -152,14 +165,26 @@ git commit -m "fix(frontend): pin/loadOlder 載入錯誤 store 層攔截——pr
 
 各檔兩條：
 1. 首載失敗（binding reject 一次）→ view 已清 → 再點同一入口 → binding 被**第二次**呼叫（真實 UI 重試）。
-2. **反向**：view 存在時再點 → 只 setFocus、binding **不得**再被呼叫（gate 實測：無條件 pin 的 mutation 下現行 49 條全綠——此反向是唯一守門）。
+2. **反向（plan gate P1 校正——「binding 不得再被呼叫」對「拿掉 `!views` 守衛」的 mutation 是恆真斷言：view 存在時 pin() 走 `!isNew` 早退根本不會呼叫 binding）**：view 存在時再點 → **行為面斷言**——`s.pins` 不變（`toEqual` 快照）、`s.focused === at`、`s.views[wsid]` 仍為**同一實例**（`toBe`）。SettingsBar 尤其必須斷 `s.pins` 與 `s.focused`（只斷 focusedWsid 對 MUT-A 假綠——gate 實測）。據實標註：SessionList 側的「整段 at 分支拿掉」mutation 已由既有 SessionList.test.ts:112 守，新反向的增量價值在 SettingsBar 側。
+   **已知缺口（據實登記、不宣稱守門）**：view 存在時 `setFocus` 與 `pin` 的殘餘行為差異（`pin()` 會清 `transientPane`、transient 佔格時 releaseView 並覆寫）本票不加測試——反向斷言守的是 pins／focused／view 實例三項，不含 transient 語意。
 
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `npm --prefix frontend run test -- SessionList SettingsBar`
 Expected: 各檔第 1 條紅（現行已釘選只 setFocus）；第 2 條綠
 
-- [ ] **Step 3: Implement**（兩檔已釘選分支：`if (!s.views[wsid]) { void s.pin(at, wsid) } else { s.setFocus(at) }`——`at`＝該檔各自基準查得的已釘選格；不另呼叫 setFocus）
+- [ ] **Step 3: Implement**——兩檔已釘選分支，**snippet 必須嵌在既有 `if (at === 0 || at === 1)` 內**（gate P2：此處才有 `0 | 1` type narrowing，外提會過不了 vue-tsc）：
+
+```ts
+if (at === 0 || at === 1) {
+  if (!s.views[wsid]) void s.pin(at, wsid)
+  else s.setFocus(at)
+} else {
+  s.pin(s.focused, wsid)   // 未釘選分支不變
+}
+```
+
+`at`＝該檔各自基準查得的已釘選格（SessionList：persistentPins；SettingsBar：pins）；重新 pin 分支不另呼叫 setFocus。
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -187,6 +212,7 @@ git commit -m "fix(frontend): 已釘選但無 view 時重新 pin——真實 UI 
 ## Self-Review
 
 - 四要件對映：攔截（T2 store try/catch＋T1 backend 片語）✓；顯示不動 busy（T2 測試 1/6 busy 前置 true）✓；判別片語（T1 兩條＋T2 測試 2/7 latchSeq）✓；重試（T2 測試 1 store 層＋T3 兩個 component 各含正反向）✓。
-- proxy 凍結寫法：T2 實作段逐字（gate 376 綠版本）。
-- 已知限制：SettingsBar.test.ts 若不存在則新建（動手前確認——SessionList.test.ts 存在已核；SettingsBar 有無既有測試檔待實作時確認，無則沿用同 mount 慣例建檔）。
+- proxy 凍結寫法：T2 實作段逐字（gate scratch 實測版本：374 條既有全綠＋9 條 scratch 綠、build 乾淨）。
+- SettingsBar.test.ts **已存在**（controller 核實）——Task 3 為 modify 非新建，沿用其 `vi.hoisted`＋`mountWithI18n`＋`two()` helper 慣例。
+- **前端 baseline 已知間歇紅（gate 實測，兩條、皆非本票範圍）**：`PlanWorkspace.test.ts` 的 PlanAssist loading 案例與 `SpecWorkspace.test.ts` 的 spec-assist 檔案切換案例——三輪 clean-tree 有一輪紅。Task 2-4 的「Expected: 全綠」允差規則：紅落在此兩條時單獨重跑該檔判定（重跑綠＝不算回歸、report 記錄）；其他紅一律如實回報。此兩條為前端首度登記的間歇名單（Go 側 5 條牆鐘名單之外），關票時提醒 owner 是否入 memory。
 - 「不在讀路徑加 registryUncertain() 早退」為 spec 裁定，實作不得自行加（review checklist 項）。
