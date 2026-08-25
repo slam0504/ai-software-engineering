@@ -142,9 +142,17 @@ func (s *stubRegistry) ClearLegacyTranscript(wsid string) error {
 }
 
 // SetLayout／Layout：鏡射真實 Store 的 pane pins 深拷貝語意（見 store.go
-// SetLayout 的說明）。layoutErr 注入**非 latch** 的一般寫入失敗（磁碟滿、權限、
-// rename 失敗），由 TestSetPaneLayoutReportsPlainWriteFailure 使用——latch 分支
-// 走的是 uncertain 旗標，兩者的處置不同（前者原樣回報、後者早退），要分開驗。
+// SetLayout 的說明）。layoutErr 有兩種注入用途，對應兩種不同時序，都必要、
+// 不要誤刪其一：
+//   - 一般寫入失敗（磁碟滿、權限、rename 失敗）：TestSetPaneLayoutReportsPlainWriteFailure
+//     ——原樣回報，不留 uncertain 稽核。
+//   - ErrRegistryUncertain 哨兵＝「**本次** SetLayout 寫入當下首次設下 latch」：
+//     TestRegistryUncertainAuditCoversStubbableWrites 的 set_layout 列——必須留下
+//     session_registry_uncertain 稽核。
+//
+// 這與 uncertain 旗標（既有 latch 的早退分支，setPaneLayout 開頭的
+// registryUncertain() gate）是不同時序：旗標驗「latch 已存在時拒絕」，
+// layoutErr+哨兵驗「寫入自己產生 latch 時要記稽核」。
 func (s *stubRegistry) SetLayout(l wsregistry.Layout) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
