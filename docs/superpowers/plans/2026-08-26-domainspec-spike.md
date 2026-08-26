@@ -481,13 +481,16 @@ type Bundle struct {
 type CompiledRule struct {
     Rule
     RefVars map[string]bool // checked AST 頂層 fact 變數引用集（missing/not_applicable 判定；載入時決定）
-    // 私有：ast *cel.Ast（Program 於 Evaluate 首次以 runtimeCostLimit 建立並快取）
+    // 私有：ast *cel.Ast——Program **不在載入時建立也不跨 Evaluate 快取**：
+    // cel.CostLimit 是 Program 建構期 option（plan rev4），每次 Evaluate 依當次
+    // runtimeCostLimit 重建（spike 規模可接受；若要快取必須以 limit 為 key）。
 }
 
 type CompiledBundle struct {
-    Digest string // "sha256:" + hex(sha256(canonical YAML→JSON))
-    Rules  []CompiledRule
-    ByID   map[string]*CompiledRule
+    Digest        string // "sha256:" + hex(sha256(canonical YAML→JSON))
+    RequiredKinds []RequiredKind // validated（plan rev4——Evaluate 逐 kind 實體化的輸入；順序保留、kind 唯一、pattern 為合法 regexp）
+    Rules         []CompiledRule
+    ByID          map[string]*CompiledRule
 }
 
 // LoadBundle：strict YAML（KnownFields）→ enum／id 唯一／depends_on 存在且同 phase →
@@ -605,6 +608,32 @@ func TestLoadBundleRejectsUnknownYAMLField(t *testing.T) {
     bad := bytes.Replace(miniBundle(""), []byte("verdict:"), []byte("bogus: x\n    verdict:"), 1)
     if _, err := LoadBundle(bad, 1_000_000); err == nil {
         t.Fatal("unknown YAML field must be rejected")
+    }
+}
+
+func TestLoadBundleRequiredKinds(t *testing.T) {
+    // plan rev4：validated RequiredKinds 必須進 CompiledBundle（Evaluate 的實體化輸入）
+    withKinds := append([]byte(`required_kinds:
+  - kind: spec_manifest
+    pattern: "^sha256:[0-9a-f]{64}$"
+  - kind: base_commit
+    pattern: "^git:(sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})$"
+`), miniBundle("")...)
+    b, err := LoadBundle(withKinds, 1_000_000)
+    if err != nil {
+        t.Fatal(err)
+    }
+    if len(b.RequiredKinds) != 2 || b.RequiredKinds[0].Kind != "spec_manifest" {
+        t.Fatalf("RequiredKinds must be preserved in order: %+v", b.RequiredKinds)
+    }
+    // kind 重複 → 拒；pattern 非法 regexp → 拒
+    dup := bytes.Replace(withKinds, []byte("kind: base_commit"), []byte("kind: spec_manifest"), 1)
+    if _, err := LoadBundle(dup, 1_000_000); err == nil {
+        t.Fatal("duplicate required kind must be rejected")
+    }
+    badRe := bytes.Replace(withKinds, []byte(`"^sha256:[0-9a-f]{64}$"`), []byte(`"["`), 1)
+    if _, err := LoadBundle(badRe, 1_000_000); err == nil {
+        t.Fatal("invalid pattern regexp must be rejected")
     }
 }
 ```
@@ -750,10 +779,25 @@ func TestEvaluateMissingLeafYieldsUnknown(t *testing.T) {
 }
 
 func TestEvaluateNotApplicableIsNotUnknown(t *testing.T) {
-    // plan rev2 P1：not_applicable → not eligible，不得污染 truth 為 unknown
-    b, _ := LoadBundle(miniBundle(""), 1_000_000)
+    // plan rev2 P1／rev4 修測試標的：規則必須**引用** not_applicable 的 fact 群組，
+    // 才真正驗到「not_applicable → not eligible、不影響 truth」（rev3 版的 RA 只引用
+    // decision，測不到本意）。
+    const planRefBundle = `schema_version: 1
+rules:
+  - id: RPLAN
+    phase: decide
+    when: "size(plan.tasks) > 0"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "RPLAN"
+    refs: "test"
+    step_rank: 10
+    stage: none
+`
+    b, _ := LoadBundle([]byte(planRefBundle), 1_000_000)
     s := mustSnapshot(t)
-    // 換成 rejected 形（plan 群組 not_applicable、decision 群組 known）
+    // rejected 形：decision 群組 known、plan 群組 not_applicable
     rej := "rejected"
     reason := "why"
     s.Decision = Fact[string]{Presence: Known, Value: &rej}
@@ -763,9 +807,30 @@ func TestEvaluateNotApplicableIsNotUnknown(t *testing.T) {
     s.Plan = Fact[PlanFacts]{Presence: NotApplicable}
     s.RiskPolicy = Fact[RiskPolicyFacts]{Presence: NotApplicable}
     r, _ := Evaluate(b, s, 100_000)
-    // RA（when: decision=='approved'）評估為 false → not matched；truth=true 且非 unknown
     if r.Truth != "true" || len(r.UnknownLeaves) != 0 {
         t.Fatalf("not_applicable must not leak into unknown: %s %v", r.Truth, r.UnknownLeaves)
+    }
+    var entry *ReasonEntry
+    for i := range r.ReasonGraph {
+        if r.ReasonGraph[i].RuleID == "RPLAN" {
+            entry = &r.ReasonGraph[i]
+        }
+    }
+    if entry == nil || entry.Outcome != "not_eligible" || !strings.Contains(entry.Cause, "not_applicable") {
+        t.Fatalf("rule referencing not_applicable fact must be not_eligible: %+v", entry)
+    }
+}
+
+func TestEvaluateRuntimeCostLimitNotCached(t *testing.T) {
+    // plan rev4：CostLimit 是 Program 建構期 option——同一 bundle 先高 limit 再 0，
+    // 第二次必須 evaluation_error（快取第一次 Program 會誤沿用舊限制）。
+    b, _ := LoadBundle(miniBundle(""), 1_000_000)
+    s := mustSnapshot(t)
+    if r, _ := Evaluate(b, s, 100_000); r.Status != "ok" {
+        t.Fatalf("first eval with high limit must be ok, got %s", r.Status)
+    }
+    if r, _ := Evaluate(b, s, 0); r.Status != "evaluation_error" {
+        t.Fatalf("second eval with limit 0 must error, got %s", r.Status)
     }
 }
 
@@ -844,7 +909,7 @@ func TestEvaluateDeterministicBytes(t *testing.T) {
 ```
 
 - [ ] **Step 2: Run to verify failure**。
-- [ ] **Step 3: Implement**——activation 由 canonical 正規化複本建 `map[string]any`＋`presence` map；拓撲序（同層依 bundle 檔內順序）；per_task 展開；per-target 最高 priority 裁決＋conflict；全域 truth 依序；Program 以 runtimeCostLimit 首次建立後快取於 CompiledRule。
+- [ ] **Step 3: Implement**——activation 由 canonical 正規化複本建 `map[string]any`＋`presence` map；拓撲序（同層依 bundle 檔內順序）；per_task／per_kind 展開；per-target 最高 priority 裁決＋conflict；全域 truth 依序；**Program 每次 Evaluate 依當次 runtimeCostLimit 重建（plan rev4——CostLimit 是 Program 建構期 option，跨 Evaluate 快取會沿用第一次的限制）**。
 - [ ] **Step 4: Run to verify pass**＋gofmt；`go test ./internal/domainspec/ -count=2`。
 - [ ] **Step 5: Commit**——`feat(domainspec): 兩階段聚合 evaluator——missing→unknown／not_applicable→not eligible／傳遞封閉（出口 3、4）`
 
@@ -1053,11 +1118,10 @@ func TestCompareCaseContract(t *testing.T) {
 ### Task 7: Corpus manifest＋Go oracle harness＋coverage 報告（出口 5 主體）
 
 **Files:**
-- Create: `internal/domainspec/corpus.go`（manifest 型別＋重放＋freshness）
-- Create: `internal/domainspec/corpus_oracle_test.go`（oracle adapters——test 檔，import `internal/gatepolicy`／`internal/gate`／`internal/escalation`；domainspec 本體維持零依賴）
-- Create: `domainspec_oracle_freshness_test.go`（**repo root、package main test 檔，plan rev3**——完整 freshness dispatcher 所在：root 可 import `internal/domainspec` 與全部 internal seam，並沿既有 root 測試慣例（app_gate_test.go:22 已證明 App gate seam 可測）直呼 R3 的 approver 檢查路徑。`internal/domainspec` 的測試 package 無法呼叫 root App seam，dispatcher 放 internal 側接不了線——`TestOracleFreshnessAllFresh`／`TestOracleFreshnessDetectsCorruption` 因此都放本檔。**R3 無「改豁免」fallback：R3 屬已核准 shadow 範圍，root 接線若不成立即 NO-GO**（spec §6 精神——範圍做不到就收斂，不降格）
+- Create: `internal/domainspec/corpus.go`（manifest 型別＋union 驗證＋重放＋freshness 純函式）
+- Create: `domainspec_oracle_freshness_test.go`（**repo root、package main test 檔；plan rev4——全部 oracle adapters 都住這裡**：`_test.go` 函式不屬於 package 的可 import surface，internal 側的 adapter root 根本看不到（rev3 只搬 dispatcher 是斷的）；root 可 import `internal/domainspec`／`internal/gatepolicy`／`internal/gate`／`internal/escalation` 與 App seam（app_gate_test.go:22 已證明可測）。本檔含：全 seam adapters、`TestOracleFreshnessAllFresh`、`TestOracleFreshnessDetectsCorruption`。**R3 無「改豁免」fallback：接線不成立即 NO-GO**。corpus JSON 的 verdict 首次固化也由本檔 adapter 以 `-run TestRegenerateCorpusVerdicts`＋`UPDATE_CORPUS=1` 環境變數執行（僅人工觸發，CI 不跑）
 - Create: `internal/domainspec/testdata/corpus/*.json`
-- Test: `internal/domainspec/corpus_test.go`
+- Test: `internal/domainspec/corpus_test.go`（重放／coverage／union 驗證——只讀固化 JSON，不需 adapters）
 
 **Interfaces:**
 - Consumes: Task 1–6 全部。
@@ -1068,12 +1132,26 @@ type CorpusCase struct {
     Name            string         `json:"name"`
     Kind            string         `json:"kind"` // "evaluated" | "acquisition_failed"
     EvaluationPhase string         `json:"evaluation_phase"`
-    OracleSource    string         `json:"oracle_source"` // "gate_service_submit" | "gatepolicy_validate" | "gatepolicy_reconcile" | "gate_service_prepare" | "gatepolicy_build" | "escalation" | "app_gatedecide" | "a9_workspace" | "host_boundary"
-    Snapshot        *FactsSnapshot `json:"snapshot"`
-    GoVerdict       *GoVerdict     `json:"go_verdict"`
-    Reason          string         `json:"reason"`
-    CoversRules     []string       `json:"covers_rules"`
+    // plan rev4：seam 與 provenance 分欄——seam 決定 freshness recompute 走哪個
+    // adapter（A9 案例也必須可重算），provenance 記來源出處（spec §4 五類；spec
+    // manifest 的 oracle_source 欄位對應本處 provenance，分欄依 plan gate 建議）。
+    OracleSeam string `json:"oracle_seam"` // "gate_service_submit" | "gatepolicy_validate" | "gatepolicy_reconcile" | "gate_service_prepare" | "gatepolicy_build" | "escalation" | "app_gatedecide" | "host_boundary"
+    Provenance string `json:"provenance"`  // "gatepolicy_tests" | "gate_service_tests" | "escalation_tests" | "a9_workspace" | "synthetic" | "host_boundary"
+    // digest 契約（plan rev4——spec §4 manifest／出口 7）：
+    FactsDigest  string         `json:"facts_digest"`  // evaluated 必填＝SnapshotDigest(Snapshot)
+    BundleDigest string         `json:"bundle_digest"` // evaluated 必填＝固化當時的 bundle digest
+    Snapshot     *FactsSnapshot `json:"snapshot"`
+    GoVerdict    *GoVerdict     `json:"go_verdict"`
+    Reason       string         `json:"reason"` // acquisition_failed 專用
+    CoversRules  []string       `json:"covers_rules"`
 }
+
+// LoadCorpus：strict decode＋tagged union 結構驗證（plan rev4，fail loud）：
+//   evaluated：Snapshot／GoVerdict／FactsDigest／BundleDigest 必填、Reason 必空；
+//     重算 SnapshotDigest(Snapshot) != FactsDigest → 拒（snapshot 漂移）。
+//   acquisition_failed：Reason 必填；Snapshot／GoVerdict／FactsDigest／BundleDigest
+//     一律必空（明確禁止）。
+func LoadCorpus(dir string) ([]CorpusCase, error)
 
 type CoverageReport struct {
     Consistent, Inconsistent, Exempt int
@@ -1081,6 +1159,9 @@ type CoverageReport struct {
     CoveredRules   map[string]int // per phase-specific id（隔離案例計數）
     UncoveredRules []string       // in-scope 清單減 covered；必須空或對應豁免表
 }
+// ReplayCorpus（plan rev4 補 digest fail loud）：逐案例先驗
+// case.BundleDigest == b.Digest（不符→error，bundle 漂移不得靜默重放）與
+// SnapshotDigest(case.Snapshot) == case.FactsDigest，再 Evaluate＋CompareCase。
 func ReplayCorpus(b *CompiledBundle, cases []CorpusCase, runtimeCostLimit uint64) (*CoverageReport, error)
 
 // VerifyOracleFreshness（plan rev2——出口 6b 的獨立可驗證 guard）：
@@ -1091,7 +1172,7 @@ func ReplayCorpus(b *CompiledBundle, cases []CorpusCase, runtimeCostLimit uint64
 func VerifyOracleFreshness(cases []CorpusCase, recompute func(CorpusCase) (GoVerdict, error)) ([]string, error)
 ```
 
-- **Oracle adapters（plan rev2 依 seam 重列——每個 seam 一個 adapter 函式，phase 歧義由 seam 消除）**：
+- **Oracle adapters（plan rev2 依 seam 重列、rev4 全數移駐 root freshness 檔——每個 seam 一個 adapter 函式，phase 歧義由 seam 消除；freshness dispatcher 依 `OracleSeam` 路由）**：
   - `gate_service_submit`：`gate.Service.Submit`（stub policy／journal，沿 service 既有測試 double）→ **R5.submit**。
   - `gatepolicy_validate`：`Gate2Policy.ValidateRequest`（stub `PlanLoader`／`GitRunner`，沿 gate2_test.go double）→ R6.submit、R7–R9。
   - `gate_service_prepare`：`gate.Service.PrepareDecision`（stub journal 預置 pending entry）→ R1、R2、R4、**R5.decide**。
@@ -1100,9 +1181,9 @@ func VerifyOracleFreshness(cases []CorpusCase, recompute func(CorpusCase) (GoVer
   - `escalation`：`escalation.BlockingFor`（scope 由案例 gate＋subject 對照 production `scopeForSubject` 值固化）→ R16。**hard 對齊警訊的證據建構（plan rev3）**：snapshot facts 沒有 hard 欄位，證據在 oracle 側——以 `escalation.Item{Hard: true, State: "open", BlockScope: ...}` 建 production escalation 呼叫 `BlockingFor` 得 blocked，投影成 facts（不含 hard）後 CEL 亦 blocked——兩側一致即證明「忽略 hard」語意被忠實複製；corpus 案例的 name／covers_rules 記明此建構。
   - `app_gatedecide`：repo root freshness 檔內的 R3 adapter——沿 app_gate_test.go:22 的 App gate seam 慣例，以空 git identity 觸發 approver 拒絕（無 fallback，接不了線即 NO-GO）。
   - 訊息形狀對映：`map[oracleSeam]map[string]string`——**(seam, message pattern) → rule id**；R5／R6 的 submit／decide 由 seam 天然區分（單一全域字串表無法區分同文案，plan rev2 修正）。同 seam 內一筆錯誤命中多 pattern → 測試紅（對映必須唯一）。
-- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例（per_kind 的 R8／R9 至少各一 kind）＋乾淨 pass 案例（submit／decide 各一，approved pass 案例帶 RiskDecisions 逐欄固化）；precedence 案例**六筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 跨 gate step 兩筆：R3+R24→R3、R30+R16→R30；plan rev3 kind occurrence 一筆：spec_manifest digest 錯＋plan kind missing→**R9**）；對齊警訊各一（R16 hard——建構見上、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（Exempt）。
+- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例（per_kind 的 R8／R9 至少各一 kind）＋乾淨 pass 案例（submit／decide 各一，approved pass 案例帶 RiskDecisions 逐欄固化）；precedence 案例**六筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 跨 gate step 兩筆：R3+R24→R3、R30+R16→R30；plan rev3 kind occurrence 一筆：spec_manifest digest 錯＋plan kind missing→**R9**）；對齊警訊各一（R16 hard——建構見上、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（`kind: acquisition_failed`、`provenance: host_boundary`、reason 記 submit 前 dirty worktree——依 union 契約無 snapshot／verdict／digest，計 Exempt）。
 
-- [ ] **Step 1: Write the failing tests**——internal 側：`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）。root 檔（plan rev3）：`TestOracleFreshnessAllFresh`（dispatcher 覆蓋全部 seam 含 R3，recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑）。
+- [ ] **Step 1: Write the failing tests**——internal 側：`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）；`TestCorpusUnionValidation`（plan rev4——evaluated 缺 digest／帶 Reason、acquisition_failed 帶 Snapshot 或 digest，LoadCorpus 必拒）；`TestCorpusDigestDriftFailsLoud`（plan rev4——竄改一筆 Snapshot 欄位不改 FactsDigest → ReplayCorpus 必 error；BundleDigest 不符亦同）。root 檔：`TestOracleFreshnessAllFresh`（dispatcher 依 `OracleSeam` 覆蓋全部 evaluated 案例含 A9 三筆與 R3，recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑）。
 - [ ] **Step 2: Run to verify failure**；**Step 3: Implement**；**Step 4: `go test ./internal/domainspec/ -count=1` 全綠＋root freshness 檔 `go test -run TestOracleFreshness . -count=1`＋gofmt**。
 - [ ] **Step 5: Commit**——`feat(domainspec): corpus manifest＋seam-aware oracle harness＋freshness guard（出口 5 主體）`
 
@@ -1129,11 +1210,11 @@ type FlipRow struct {
 func DiffBundles(baseline, candidate *CompiledBundle, cases []CorpusCase, limit uint64) ([]FlipRow, error)
 ```
 
-- **A9 案例（plan rev2 依 journal 實況修正——gate.jsonl 僅兩筆 approved record；stale 走 escalation、superseded-by 是 resolved reason，無 rejected record）**，三筆真實：
-  1. 初次 approved（pass，含 risk_decisions 固化）。
-  2. **stale blocked**——以 journal＋manifest 記錄的 commit OID 重建「舊 pending 對新 current」時點的 facts（current digest 重算補齊），R11 firing（blocked）。
-  3. 修正版 approved＋override_reason（pass）。
-  「rejected pass」不是 A9 真實事件——如需該形狀，列**合成案例**歸 source (b)（`gatepolicy_build`），不得標 `a9_workspace`。workspace 或 journal 缺 → 該來源標 `acquisition_failed` 豁免並於收斂報告記載，不阻塞其他出口。
+- **A9 案例（plan rev2 依 journal 實況修正——gate.jsonl 僅兩筆 approved record；stale 走 escalation、superseded-by 是 resolved reason，無 rejected record）**，三筆真實，`provenance` 一律 `a9_workspace`、`oracle_seam` 逐筆指定（plan rev4——freshness 必須能重算 A9 案例）：
+  1. 初次 approved（pass，含 risk_decisions 固化）——`oracle_seam: gatepolicy_build`。
+  2. **stale blocked**——以 journal＋manifest 記錄的 commit OID 重建「舊 pending 對新 current」時點的 facts（current digest 重算補齊），R11 firing（blocked）——`oracle_seam: gatepolicy_reconcile`。
+  3. 修正版 approved＋override_reason（pass）——`oracle_seam: gatepolicy_build`。
+  「rejected pass」不是 A9 真實事件——如需該形狀，列合成案例（`provenance: synthetic`、`oracle_seam: gatepolicy_build`），不得標 `a9_workspace`。workspace 或 journal 缺 → 該來源標 `acquisition_failed` 豁免並於收斂報告記載，不阻塞其他出口。
 - [ ] **Step 1: failing test**——`TestDiffBundlesDetectsFlip`：candidate = baseline YAML 對 R31 `when` 拿掉 override 分量（`strings.Replace`）→ FlipRow 必含 R31 隔離案例；baseline==candidate → 空表。
 - [ ] **Step 2: fail**；**Step 3: Implement**；**Step 4: pass＋gofmt**。
 - [ ] **Step 5: Commit**——`feat(domainspec): A9 真實案例（approved／stale blocked／override approved）＋bundle diff 翻轉表`
@@ -1224,4 +1305,24 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
     validRejectedSnapshotJSON／replaceGroup helper）。
   - 補強：R16 hard 對齊警訊明定證據建構——oracle 側以 Hard:true 的 production
     escalation 呼叫 BlockingFor，投影 facts（無 hard 欄位）後兩側皆 blocked。
+- rev4（2026-08-26，plan review gate 第三輪 4 P1＋1 P2 收斂）：
+  - P1：oracle adapters **全數**移 repo root freshness 檔（internal `_test.go` 函式
+    不可被 root import，rev3 只搬 dispatcher 是斷的）；corpus 首次固化由同檔
+    `UPDATE_CORPUS=1` 人工觸發。`oracle_seam`（freshness recompute 路由）與
+    `provenance`（來源出處＝spec 的 oracle_source）分欄——A9 三筆 provenance=
+    a9_workspace、seam 分別 gatepolicy_build／gatepolicy_reconcile／gatepolicy_build，
+    全部 evaluated 案例皆可重算。
+  - P1：CorpusCase 補 `facts_digest`／`bundle_digest`＋LoadCorpus tagged union 結構
+    驗證（evaluated 必帶 digest、acquisition_failed 明確禁止 snapshot／verdict／
+    digest）；ReplayCorpus 重算比對 digest 不符即 error（snapshot／bundle 漂移
+    fail loud，對齊 spec manifest 契約與出口 7）。
+  - P1：`RequiredKinds` 保存進 CompiledBundle（validated：順序保留、kind 唯一、
+    pattern 合法 regexp，補 `TestLoadBundleRequiredKinds`）——Evaluate 才拿得到
+    per_kind 實體化輸入。
+  - P1：Program 改**每次 Evaluate 依當次 runtimeCostLimit 重建**（CostLimit 是
+    Program 建構期 option，跨 Evaluate 快取會沿用第一次限制）；補
+    `TestEvaluateRuntimeCostLimitNotCached`（先高 limit 再 0，第二次必須 error）。
+  - P2：`TestEvaluateNotApplicableIsNotUnknown` 改用引用 plan 的規則
+    （size(plan.tasks)>0），斷言 reason graph not_eligible＋UnknownLeaves 空
+    ——真正驗到 not_applicable 語意。
 - rev1（2026-08-26）：初版。
