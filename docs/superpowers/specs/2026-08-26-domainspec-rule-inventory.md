@@ -3,7 +3,7 @@
 以當日 code 為準（HEAD 4cb19b2）。供 shadow evaluator 逐條對齊；引用時先驗 file:line
 仍成立。
 
-## 1. gateDecide 判定順序（十一步）
+## 1. gateDecide 判定順序（binding wrapper＋內部十一步）
 
 0. `beginTxn`/`endTxn`（binding wrapper）app.go:5786-5792
 1. `ensureGate()`（惰性建 journal＋registry；`stateBlockedErr` 擋在 once 前）app.go:5806、3842-3899
@@ -33,7 +33,9 @@
 - R11 spec_manifest/plan/risk_policy/permission_manifest：bound digest ≠ "" 時必須 == 現值重算（stale cause `<kind> changed`）— gate2.go:215-232
 - R12 base_commit `rev-parse --verify --quiet ^{commit}`：exit1 = stale `base_commit missing`；其餘 fail closed — gate2.go:234-248
 - R13 current* 讀取錯誤一律回錯，不當 stale — gate2.go:224-228、241-245
-- R14 R6-R9＋lineage 只在 ValidateRequest（送核）跑，decide 不重跑 — gate2.go:91-108；service.go:52
+- R14（分支敘述，rev2 更正）lineage 與 R7–R9 只在 ValidateRequest（送核）跑；subject
+  形狀（R6）在 **approved** 的 BuildDecision 會經 `planIDFromSubject` 再驗一次
+  （gate2.go:124-127），**rejected** 才完全跳過 — gate2.go:91-108；service.go:52
 - R15 scope 導出：gate1→workspace；gate2 `plan:<id>`→`gate2:<id>`；tca→`tca:<p>/<t>`；未知→workspace（最寬）— app.go:5895-5912
 - R16 blocking：State != resolved（open/acknowledged 都擋）且 BlockScope!="" 且（=="workspace" 或 ==scope）— escalation/project.go:81-96
 - R17 escalation 讀取失敗一律回錯，不得視為無 blocker — app.go:5949-5958
