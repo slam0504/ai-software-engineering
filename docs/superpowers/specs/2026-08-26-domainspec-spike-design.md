@@ -3,7 +3,7 @@
 Owner 2026-08-21 仲裁凍結的方向（見 auto memory `domainspec-spike-direction`）：**獨立、
 限時**的 spike，切點是 Gate 2 decision eligibility＋risk policy 的 **shadow evaluator**
 ——immutable facts snapshot 評估、現行 Go 實作保持權威、新 kernel 只比對不接管；不重塑
-M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev3。
+M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev4。
 
 ## 1. 範圍：要 shadow 的規則面
 
@@ -47,8 +47,9 @@ fail-closed（讀取錯誤不得當 stale／無 blocker）由 host 層維持，s
 - `plan{tasks[]{id, minimum_risk_tier, planner_risk_tier, impact{contexts,modules}}}`
 - `risk_policy{default_tier, rules[]{match{contexts,modules}, tier}}`
 - `risk_selections[]{task_id, selected_risk_tier, override_reason}`
-- `escalations[]{state, block_scope}`（scope **不入** snapshot——CEL 自行由 gate＋subject
-  導出，見 §1 R15）
+- `escalations[]{escalation_id, state, block_scope}`（`escalation_id` 為 production ULID
+  欄位，rev4 補入 schema 供 canonical 排序；scope **不入** snapshot——CEL 自行由 gate＋
+  subject 導出，見 §1 R15）
 
 **Phase-aware facts acquisition（rev2）**：每個 fact 帶三態 presence——`known`／
 `not_applicable`／`missing`。rejected 分支的 `current.*`／`base_commit_state`／`plan`／
@@ -58,25 +59,42 @@ fail-closed（讀取錯誤不得當 stale／無 blocker）由 host 層維持，s
 `acquisition_failed` 並記錄原因，不產 snapshot、不評估、不計入一致性統計（但計入
 coverage 報告的豁免欄）。`missing` 只用於「本應 known 而缺」，評估時進 `unknown_leaves`。
 
-**Evaluation phase（rev3）**：snapshot 增 `evaluation_phase ∈ {submit, decide}`；每條
-規則帶 `phase` guard——R7–R9（＋lineage，不進 CEL）屬 submit（ValidateRequest），
-R1–R5、R10–R12、R15–R16 與 risk 規則屬 decide。decide 案例不評估 submit 規則、反之
+**Evaluation phase（rev3；rev4 修雙 phase 規則）**：snapshot 增 `evaluation_phase ∈
+{submit, decide}`；每條規則帶單一 `phase` guard。R5（gate 種類）與 R6（subject 形狀）
+在 production 於兩個 phase 各有檢查點，單值 phase 無法表達，改用**穩定的 phase-specific
+Rule ID**分拆（保持「每條規則單一 phase」的代數不變式，coverage 依 phase-specific ID
+分別計算隔離案例）：
+- `R5.submit`——Service.Submit 查 gate registry（service.go:46-48）；`R5.decide`——
+  PrepareDecision 對 pending request 的 gate 再查（service.go:103-105），**approved 與
+  rejected 皆執行**，不帶 decision guard。
+- `R6.submit`——ValidateRequest 查 subject 形狀（gate2.go:92-95）；`R6.decide`——
+  BuildDecision 重查（gate2.go:124-127），**僅 approved**（rejected 早退跳過），`when`
+  帶 `decision == "approved"` guard。
+
+其餘規則維持單 phase：R7–R9（＋lineage，不進 CEL）屬 submit（ValidateRequest）；
+R1–R4、R10–R12、R15–R16 與 risk 規則屬 decide。decide 案例不評估 submit 規則、反之
 亦然；submit corpus 的 decision facts 一律 `not_applicable`。
 
 **Canonical 形式（rev2；rev3 修 plan.tasks）**：snapshot 帶 `schema_version`；presence
 以 pointer／wrapper 表達（nil＝missing，與合法零值區分）；`plan.tasks` **保留 plan
 原始順序並帶 `source_index`**——BuildDecision 依原始順序逐項首錯即回，順序具語意，
 不得改成 id 排序（id 排序只發生在 RiskDecisions 輸出端，R32）；其餘無語意順序的集合
-排序固定——`bindings` 依 (kind,role)、`risk_selections` 依 task_id、`escalations` 依
-escalation_id；canonical 序列化時 nil 集合與空集合一律輸出 `[]`。canonical JSON 取
+排序固定且 sort key 為**全序（rev4 補 tie-break）**——`bindings` 依 (kind, role, ref,
+digest)、`risk_selections` 依 (task_id, selected_risk_tier, override_reason)（重複
+task_id 是 R24 負面案例的合法輸入，tie-break 保證 canonical 形式唯一；R24 比對只到
+rule id，不依賴輸入序）、`escalations` 依 escalation_id（production ULID，projection
+以其為 key 無重複）；完全相同的重複元素視為相等、相鄰輸出，排序仍為全序。canonical
+序列化時 nil 集合與空集合一律輸出 `[]`。canonical JSON 取
 sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 
 ## 3. Rule bundle 與 evaluator 輸出
 
 - **Bundle**：YAML 檔（spike 期間放 `internal/domainspec/testdata/gate2-bundle.yaml`，
   不動 `spec/` scope——manifest ScopePatterns 不含 `spec/rules/**`，擴 scope 是 M4.5 的
-  事）。**最小規則代數（rev2）**——每條規則：`id`（穩定，沿用附錄 A 的 R 編號）、
-  `when`（CEL 布林式）、`phase ∈ {submit, decide}`（rev3）、`effect ∈ {deny, allow}`
+  事）。**最小規則代數（rev2）**——每條規則：`id`（穩定，沿用附錄 A 的 R 編號；
+  雙 phase 檢查點用 phase-specific ID 如 `R6.submit`／`R6.decide`，見 §2 rev4）、
+  `when`（CEL 布林式）、`phase ∈ {submit, decide}`（rev3；每條規則單值）、
+  `effect ∈ {deny, allow}`
   （spike 的 Go 對齊面全部是 deny；allow 保留給 conflict fixture 與代數完整性）、
   `target`（效果作用的判定標的，如 `decision.eligibility`／`risk.T<id>`）、
   `depends_on[]`（引用其他 rule id，SCC 在此圖上驗無環）、`priority`、`verdict` 訊息
@@ -105,30 +123,46 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 
 - **比較契約（rev2，取代 rev1 的「violation 集合完全一致」——production 首錯即回、
   error 無 Rule ID，集合等價會迫使再造一套 Go 判定、自我指涉）**：Go oracle 只取
-  **實際可觀測結果**——(a) accept／reject；(b) reject 時依既有 precedence（gateDecide
-  判定順序＋PrepareDecision／BuildDecision 的首錯即回）產生的 **primary error**（以訊息
-  形狀對映到單一 rule id）；(c) pass 時的 `RiskDecisions` 決定性輸出。oracle outcome
-  用 **pass／blocked**（rev3——避免與輸入 `decision="rejected"` 混淆：駁回成功也是
-  pass）。CEL 端由完整 violation 列表依 **primary precedence（rev3 凍結）**選出
-  primary 再比對：phase rank（判定順序步驟）→ task `source_index`（BuildDecision 依
-  plan 原始順序逐項）→ 該 task 內的 rule check rank（R24→R27→R28→R29→R30→R31 依
-  gate2.go 檢查序）→ post-loop rank（R26 等迴圈後檢查）。完整列表僅作 **explain**，
-  不作等價條件。
+  **實際可觀測結果**——(a) **pass／blocked**（rev3 定名、rev4 全文統一——避免與輸入
+  `decision="rejected"` 混淆：駁回成功也是 pass）；(b) blocked 時依既有 precedence
+  （gateDecide 判定順序＋PrepareDecision／BuildDecision 的首錯即回）產生的 **primary
+  error**（以訊息形狀對映到單一 rule id）；(c) pass 時的 `RiskDecisions` 決定性輸出。
+  CEL 端由完整 violation 列表依 **primary precedence（rev4 精確化）**選出 primary 再
+  比對，四層凍結為：
+  1. **gate step**——phase 與判定順序步驟：submit 規則先於 decide，decide 內依
+     PrepareDecision 檢查序。
+  2. **build stage**——BuildDecision 內 pre-loop → task-loop → post-loop：R24 屬
+     **pre-loop**（selByTask 建表掃完整 RiskSelections，在任何 task 檢查前攔第一個
+     duplicate，gate2.go:134-140）；R26 屬 **post-loop**（gate2.go:183-190）。
+  3. **task `source_index`**——task-loop 依 plan 原始順序逐項。
+  4. **per-task rule check rank**——R25 → R27 → R28(minimum) → R28(planner) → R29 →
+     R28(selected) → R30 → R31（依 gate2.go:144-174 檢查序；R28 的三個 unknown-tier
+     檢查點穿插其中，rank 以檢查點位置為準，不以 rule 編號聚合）。
+
+  完整列表僅作 **explain**，不作等價條件。
 - **Corpus manifest（rev2；rev3 校正）**：案例為 **tagged union**——`evaluated{facts_digest,
   bundle_digest, evaluation_phase, oracle_source, go_verdict}` 或
   `acquisition_failed{reason, oracle_source}`（無 facts_digest，不入一致性統計、計入
-  coverage 豁免欄）。來源明列——(a) `internal/gatepolicy` 測試表（R6–R9、R11–R13、
-  R21–R32）；(b) gate service 測試面（R1–R2、R4–R5、**R10**、R19–R20——R10 的 oracle
-  在 service.go:107-116，非 gatepolicy）；(c) escalation projection 測試面（R15–R16）；
+  coverage 豁免欄）。來源明列——(a) `internal/gatepolicy` 測試表（R6.submit／
+  R6.decide、R7–R9、R11–R13、R21–R32）；(b) gate service 測試面（R1–R2、R4、
+  R5.submit／R5.decide、**R10**、R19–R20——R10 的 oracle 在 service.go:107-116，非
+  gatepolicy）；(c) escalation projection 測試面（R15–R16）；
   (d) A9 驗收 workspace 三個 git commit＋gate journal＋escalation journal 合成的真實
   案例（stale→override→supersede）；(e) **獨立 dirty-tree fixture**——屬 host submit
   boundary（送核在寫 journal 前失敗），歸 submit phase 的 host 邊界案例，**不計入 CEL
   decision 一致性統計**。journal 不保存各時點 current digest，(d) 的 current 值由
   manifest 內記錄的 commit OID 重算補齊。
-- **Coverage**：每條 in-scope 規則以**隔離案例**（單一違規）證明 Rule ID 覆蓋；另備
-  多重違規案例驗 primary-rule precedence——**必含一筆跨 task 案例**（不同 task 各違反
-  不同 Rule ID，如 source_index 前面的 task 違反 R30、後面的違反 R25，primary 必須依
-  source_index 而非 rule 編號或 task id 排序選出）。未覆蓋列表必須為空或明列豁免理由。
+- **Coverage**：每條 in-scope 規則（phase-specific ID 分別計）以**隔離案例**（單一違規）
+  證明 Rule ID 覆蓋；另備多重違規案例驗 primary precedence，**至少三筆（rev4），
+  precedence 每一層各驗證一個邊界**：
+  1. R24 duplicate selection＋任一 task violation——primary 必須是 R24（pre-loop 先於
+     task-loop）。
+  2. source_index 前面的 task 違反 R30、後面的違反 R25——primary 必須是 R30
+     （source_index 先於 rule 編號與 task id 排序）。
+  3. 任一 task-loop violation＋R26 extra selection——primary 必須是該 task-loop
+     violation（task-loop 先於 post-loop）。
+
+  未覆蓋列表必須為空或明列豁免理由。
 - **不接管**：spike 全程不掛 production `gateDecide` 路徑、不加 runtime hook；比對只在
   測試／CLI harness 內發生。
 
@@ -196,4 +230,18 @@ R21–R34 risk 決議與送核路徑豁免項），完整表格與 file:line 見
     conflict 的矛盾；dependency false／unknown ⇒ 下游 not eligible 並記 reason graph。
   - P2：corpus 案例改 evaluated／acquisition_failed tagged union。
   - P2：oracle outcome 改 pass／blocked；R3（approver 非空）明確納入 shadow 範圍。
+- rev4（2026-08-26，design gate 第三輪 2 P1＋2 P2 收斂）：
+  - P1：R5／R6 雙 phase 檢查點改 **phase-specific Rule ID**（R5.submit／R5.decide、
+    R6.submit／R6.decide），保持每條規則單一 phase 的代數不變式；R6.decide 帶
+    `decision == "approved"` guard、R5.decide 不帶（PrepareDecision 的 registry 檢查
+    在 approved-only 區塊之前，兩種 decision 皆執行）；coverage 依 phase-specific ID
+    分別計算。
+  - P1：primary precedence 精確化為 **gate step → build stage（pre-loop／task-loop／
+    post-loop）→ task source_index → per-task rule check rank**；R24 歸 pre-loop、
+    R26 歸 post-loop；task 內 rank 補 R25 並展開 R28 三個檢查點（R25→R27→R28(minimum)→
+    R28(planner)→R29→R28(selected)→R30→R31）；coverage 補三筆逐層 precedence 案例。
+  - P2：§4 比較契約全文統一 pass／blocked 術語（修訂記錄保留 rev2 當時的 accept／
+    reject 措辭為歷史紀錄）。
+  - P2：`escalation_id` 補入 Facts schema；bindings／risk_selections canonical sort
+    key 擴為全序並定義重複 key tie-break。
 - rev1（2026-08-26）：初版。
