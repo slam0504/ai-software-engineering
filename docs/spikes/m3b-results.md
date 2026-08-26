@@ -598,7 +598,7 @@ session id 欄位與底部 status bar、codex 核可 dialog 的 thread/turn/item
 | A6 | ✅ 綠 | 三個子情境：(a) 行邊界 checkpoint 回退 → **靜默補掃**（offset 888399→908187、零新 quarantine、零通知）；(b) 中段注入損壞 → **quarantine（原檔保留）＋全量重建＋通知**（audit `replay_index_degraded`：「turn index 中段損壞，已 quarantine 並全量重建（§3.5.6）」）；(c) checkpoint 截在行中央 → 保守 quarantine＋全量重建（§3.5.6「整份視為不可信快取」分級）。重建後 restore 視窗正常 |
 | A7 | ✅ 綠 | delta 串流中 SIGKILL app → 重啟後 audit 恰增兩筆：`stream_error`「app restart: interrupted turn」（source `app_restart_repair`、正確歸 WSID）＋`state_change: failed`；UI 顯示「失敗」、busy 解除、composer 可再送（`m3b-a7-interrupted-turn-failed`）。對照組：turn 已完成才 kill → 重啟無修復動作（正確不誤修） |
 | A8 | ✅ 綠（**限定於右列三項窄條件**） | legacy fixture 啟動 → 恰一枚 WSID（resume／task_label／view_start 帶入、`migrated:true`）；重啟後**同一枚** WSID（冪等）；resume 實測：新 turn 正確回出 pre-migration 的暗號 `LEGACY-OK`（`m3b-a8-legacy-resume-codeword`）。途中並實證 resume 綁定 fail-closed：sessions.json 缺綁定時 UI 顯示 `resume refused: session … bound to ""`。**已知缺口（已開補強票，§11 末）**：pre-migration transcript 不在 UI 顯示——`LoadTurnsBefore` 走 turn index、index 依 §3.5.9 凍結排除無 WSID 事件；`RestoreViews` binding 可重放 legacy 視窗（本次實測可回）但 frontend 零呼叫端。**在補強票完成或規格明確修訂前，本列的綠不代表整個 legacy 使用者體驗已關閉** |
-| A9 | ✅ 綠（抽驗） | SpecAssist「產生驗收情境草稿」live 完成→套用；送核被 `spec: scoped tree dirty` fail-loud 擋下→commit（空訊息 fail-loud→帶訊息成功）→送核取得 approval_id；GateDecide 被升級項目**擋下**（「blocked by 1 escalation item(s)」——M3a 判定順序實證，`m3b-a9-gate1-pending`）；收件匣建立（source_ref 正確指回 approval）→知悉→解除（fixed＋理由）→核可→**已生效**；gate.jsonl：`gate_request`＋`approval_record approved`、escalation.jsonl：item＋transition。PlanWorkspace／任務相依圖／TCA 渲染正常（TCA 空狀態「無已生效 Gate 2 計畫」正確）。**未抽驗**：Gate 2 全流程、stale 重新送核導航 |
+| A9 | ✅ 綠（抽驗） | SpecAssist「產生驗收情境草稿」live 完成→套用；送核被 `spec: scoped tree dirty` fail-loud 擋下→commit（空訊息 fail-loud→帶訊息成功）→送核取得 approval_id；GateDecide 被升級項目**擋下**（「blocked by 1 escalation item(s)」——M3a 判定順序實證，`m3b-a9-gate1-pending`）；收件匣建立（source_ref 正確指回 approval）→知悉→解除（fixed＋理由）→核可→**已生效**；gate.jsonl：`gate_request`＋`approval_record approved`、escalation.jsonl：item＋transition。PlanWorkspace／任務相依圖／TCA 渲染正常（TCA 空狀態「無已生效 Gate 2 計畫」正確）。**未抽驗**：Gate 2 全流程、stale 重新送核導航——**已於 §12 補抽驗（2026-08-26）** |
 | A10 | ✅ 綠 | 4 claude host 各跑過 turn 後 idle 兩時點：t0＝360.2／341.4／345.9／208.7 MB、t+60s＝363.3／331.4／336.7／214.0 MB，CPU 0.0–0.3%；**單一共用 codex app-server 24.8 MB 服務全部 4 個 codex session**（單 server 架構實證）。RSS 相加仍為上界（共享頁重複計）；與 §5.1 的無對話 idle（~385 MB）相比，跑過小 turn 後未見顯著成長。量測只記自己記下的 PID，未用 pattern kill（§5.1 教訓） |
 
 **其他觀察（非阻擋）**：瀏覽器端晚於 startup 連線時，頂列 meta 資訊初始為空，重新載入／
@@ -630,7 +630,42 @@ server 在 TERM 後 3 秒內全數收斂（§5.4 bounded window 的實機佐證�
    並行）。修法應提供可判斷的 ready 狀態並重新讀取 `CLIInfo`；只靠一次性事件仍會漏掉
    晚連線者。
 
-（A10 長對話峰值屬容量量測、A9 未抽驗的 Gate 2／stale 流程屬驗收範圍限制，均不開缺陷票。）
+（A10 長對話峰值屬容量量測、A9 未抽驗的 Gate 2／stale 流程屬驗收範圍限制，均不開缺陷票；
+後者已於 §12 補抽驗完成，2026-08-26。）
 
 **§7.1 的回答狀態**：負載後 idle 維度已補（上表）；「多輪長對話＋高頻工具使用」的峰值
 量測仍留給 owner 視需要執行，不作為本次結論的一部分。
+
+## 12. A9 補抽驗：Gate 2 全流程與 STALE 重新送核（2026-08-26，agent 驅動瀏覽器 UI）
+
+補上 §11 A9 明載的兩個未抽驗項。**執行方式**同 §11：`wails dev`（`WORKBENCH_WORKSPACE`
+指向獨立驗收 workspace）＋ Playwright 驅動 `http://localhost:34115`，實際跑過並看到輸出
+才記綠。Fixture：`~/playground/wb-accept-a9g2`（全新 git workspace，README＋demo 兩檔）。
+
+**誠實邊界**：spec／plan 檔案**內容**以外部編輯器形狀（shell 寫檔）供給——SpecWorkspace
+的手動編輯本就不落盤（設計上寫檔出口只有建立檔案樣板與套用草稿），內容撰寫 UX 不在本次
+範圍（§11 已抽驗 SpecAssist→套用路徑）；檔案建立（UI 樣板經 PlanWrite）、兩階段 commit、
+送核、風險決議、核可與 STALE 導航全部由 UI 驅動。TCA 證據執行不在範圍（與 §11 A9 相同）。
+
+| 步驟 | 結果（截圖在 `docs/spikes/evidence/m3b-a9-gate2-*.png`，遮蔽同 §11 慣例） |
+|---|---|
+| Gate 1 前置 | `spec/features/a9.feature`（`@a9-g2-1`）→ 預覽 diff → commit `ea648d6` → 送核 → 核可 → 已生效 |
+| dirty tree 送核擋下 | plan 三檔未 commit 直接送核 Gate 2 → `spec: scoped tree dirty — commit before 送核`（fail loud） |
+| Gate 2 送核 | plan commit `84125c6` → 送核成功，五個 binding（spec_manifest／plan／base_commit／risk_policy／permission_manifest）齊列（`m3b-a9-gate2-pending`） |
+| 風險決議下界 | T1 `minimum=medium` 時下拉僅提供中／高——低於最低層級的選項直接不可選 |
+| 核可 → 已生效 | `approval_record` 含 `risk_decisions: [T1 medium/medium/medium]`，TCA 面板由空狀態轉為列出 T1 完整工作流 |
+| STALE | 外部編輯 plan（`planner_risk_tier→high`）→ 卡片轉**已失效**＋「前往重新送核」按鈕（`m3b-a9-gate2-stale`）；TCA 面板同步回到「沒有已生效的 Gate 2 計畫」空狀態 |
+| STALE 自動升級項 | `escalation.jsonl`：`stale:gate2:plan:a9`（hard、`block_scope: gate2:a9`、`source_ref` 指回舊核可）自動建立 |
+| 重新送核導航 | 「前往重新送核」→ 計畫 tab、plan_id 預填 `a9` → commit `bed3640` → 送核 → 新 pending（新 plan digest＋新 base_commit） |
+| override_reason 強制 | T1 `planner=high` 時選 `medium` → 出現「覆寫理由（selected 低於 planner 時必填）」欄位且核可鈕 disabled；填理由後才可核可 |
+| supersede | 新核可**已生效**、舊核可維持已失效（`m3b-a9-gate2-approved` 同框）；`approval_record` 含 `override_reason`；stale 升級項同刻被系統解除（`system_repaired`、`superseded-by:<新 approval_id>`） |
+
+**附帶觀察**：瀏覽器連線落在 startup 定案前（早連線），頂列 meta 首查為空、
+`workbench:cli-ready` 事件後自動補齊——§11 開票 3（頂列 meta 晚連線）的修正
+（CLIInfo ready 契約）之早連線路徑首次在實機得到驗證。
+
+**非阻擋觀察（UI 錯誤生命週期）**：dirty-tree 送核失敗後，舊錯誤訊息在後續**成功**
+送核與核可後仍留在 PlanWorkspace（`m3b-a9-gate2-approved` 左下紅字即是）——成功送核只
+設定 `submitResult`，不清 `plan.errors`（PlanWorkspace.vue submitGate2；`clearErrors`
+目前無呼叫端，plan.ts）。不影響 Gate journal、核可與 supersede 正確性；覆查截圖時勿
+把該紅字誤讀為新送核失敗。另列 UI 錯誤生命週期改善票。
