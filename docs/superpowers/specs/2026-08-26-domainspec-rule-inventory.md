@@ -24,8 +24,13 @@
 - R2 rejected 需 reason 非空（`ErrRejectNeedsReason`）— service.go:89-91
 - R3 approver：git user.name 或 user.email 至少一非空 — app.go:5814-5820
 - R4 projection entry 存在且 Request!=nil 且 Record==nil（pending；`ErrNotPending`）— service.go:98-101
-- R5 req.Gate 必須在 registry（gate1/gate2/test_contract_approval）— service.go:103-106；registry app.go:3888-3894
-- R6 gate2 subject 需 `plan:` 前綴且 id 非空 — gate2.go:124-127、253-259
+- R5（rev5 拆 phase-specific ID，兩個 phase 各有檢查點）：`R5.submit` Submit 時
+  gateName 必須在 registry — service.go:46-48；`R5.decide` PrepareDecision 對 pending
+  request 的 req.Gate 再查（**approved 與 rejected 皆執行**）— service.go:103-106；
+  registry 內容（gate1/gate2/test_contract_approval）app.go:3888-3894
+- R6（rev5 拆 phase-specific ID）：`R6.submit` ValidateRequest 查 gate2 subject 需
+  `plan:` 前綴且 id 非空 — gate2.go:92-95、253-259；`R6.decide` **approved** 的
+  BuildDecision 經 `planIDFromSubject` 重查（rejected 早退跳過）— gate2.go:124-127
 - R7 bindings (kind,role) 不得重複 — gate2.go:284-291
 - R8 必備 5 kind：spec_manifest/plan/base_commit/risk_policy/permission_manifest（role 皆 ""）— gate2.go:42-48、292-305
 - R9 digest 格式：manifest 類 `^sha256:[0-9a-f]{64}$`；base_commit `^git:(sha1:40|sha256:64)$` — gate2.go:28-31、296-299
@@ -34,7 +39,7 @@
 - R12 base_commit `rev-parse --verify --quiet ^{commit}`：exit1 = stale `base_commit missing`；其餘 fail closed — gate2.go:234-248
 - R13 current* 讀取錯誤一律回錯，不當 stale — gate2.go:224-228、241-245
 - R14（分支敘述，rev2 更正）lineage 與 R7–R9 只在 ValidateRequest（送核）跑；subject
-  形狀（R6）在 **approved** 的 BuildDecision 會經 `planIDFromSubject` 再驗一次
+  形狀（R6.decide）在 **approved** 的 BuildDecision 會經 `planIDFromSubject` 再驗一次
   （gate2.go:124-127），**rejected** 才完全跳過 — gate2.go:91-108；service.go:52
 - R15 scope 導出：gate1→workspace；gate2 `plan:<id>`→`gate2:<id>`；tca→`tca:<p>/<t>`；未知→workspace（最寬）— app.go:5895-5912
 - R16 blocking：State != resolved（open/acknowledged 都擋）且 BlockScope!="" 且（=="workspace" 或 ==scope）— escalation/project.go:81-96

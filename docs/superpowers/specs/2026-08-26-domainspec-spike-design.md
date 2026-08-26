@@ -3,7 +3,7 @@
 Owner 2026-08-21 仲裁凍結的方向（見 auto memory `domainspec-spike-direction`）：**獨立、
 限時**的 spike，切點是 Gate 2 decision eligibility＋risk policy 的 **shadow evaluator**
 ——immutable facts snapshot 評估、現行 Go 實作保持權威、新 kernel 只比對不接管；不重塑
-M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev4。
+M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev5。
 
 ## 1. 範圍：要 shadow 的規則面
 
@@ -83,7 +83,12 @@ R1–R4、R10–R12、R15–R16 與 risk 規則屬 decide。decide 案例不評�
 digest)、`risk_selections` 依 (task_id, selected_risk_tier, override_reason)（重複
 task_id 是 R24 負面案例的合法輸入，tie-break 保證 canonical 形式唯一；R24 比對只到
 rule id，不依賴輸入序）、`escalations` 依 escalation_id（production ULID，projection
-以其為 key 無重複）；完全相同的重複元素視為相等、相鄰輸出，排序仍為全序。canonical
+以其為 key 無重複）；`plan.tasks[].impact` 與 `risk_policy.rules[].match` 的
+`contexts`／`modules`（rev5 補）為**集合語意**——`intersects` 建 map 求交集、
+`ComputeMinimum` 對所有命中規則取最高 tier，順序與重複皆無語意
+（riskpolicy.go:4-41）——canonical 依字典序排序；`risk_policy.rules[]` 本身**保留
+來源順序**（max 聚合可交換，順序同樣無語意，但 digest 忠實代表 committed policy
+的來源結構，不重排）。完全相同的重複元素視為相等、相鄰輸出，排序仍為全序。canonical
 序列化時 nil 集合與空集合一律輸出 `[]`。canonical JSON 取
 sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 
@@ -97,12 +102,16 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
   `effect ∈ {deny, allow}`
   （spike 的 Go 對齊面全部是 deny；allow 保留給 conflict fixture 與代數完整性）、
   `target`（效果作用的判定標的，如 `decision.eligibility`／`risk.T<id>`）、
-  `depends_on[]`（引用其他 rule id，SCC 在此圖上驗無環）、`priority`、`verdict` 訊息
-  模板、`refs`（production file:line）。
+  `depends_on[]`（引用其他 rule id——**限同 phase（rev5）**：跨 phase 引用於 bundle
+  載入時直接拒收，納入壞 bundle 測試（§5 出口 2）；SCC 在此圖上驗無環）、`priority`、
+  `verdict` 訊息模板、`refs`（production file:line）。
 - **兩階段聚合演算法（rev3，取代 rev2 的矛盾映射）**：
   1. **Eligibility**：依 `depends_on` 拓撲序評估——某規則的任一 dependency `when`
      為 false 或 unknown，該規則 **not eligible**（不評估、effect 不參與，記入 reason
-     graph）；eligible 者評估 `when`。
+     graph）；eligible 者評估 `when`。載入時的同 phase 限制（rev5）保證每個
+     dependency 都在當前 phase 被實際評估過——不存在「dependency 屬另一 phase、
+     未啟用」的未定義狀態；evaluator 不得將未評估的規則視為 false、unknown 或逕行
+     略過（該歧義正是跨 phase 引用被拒收的原因）。
   2. **Per-target 裁決**：每個 target 上取所有命中（when=true）的 eligible 規則，依
      `priority` 選出有效效果；**同 priority 且效果相反**（allow vs deny）→ 該 target
      `conflict`。
@@ -169,7 +178,8 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 ## 5. 出口條件（驗證計畫，逐項對應 owner 凍結清單）
 
 1. typed facts schema＋未知欄位拒絕——unit test（多餘欄位 decode 必須紅）。
-2. CEL compile／type-check／cost 上限——載入壞 bundle（型別錯、cost 超）必須拒。
+2. CEL compile／type-check／cost 上限——載入壞 bundle（型別錯、cost 超、**跨 phase
+   `depends_on`（rev5）**）必須拒。
 3. truth／status 三分不混用——unknown（缺 fact）、conflict（規則衝突 fixture）、
    evaluation_error 各一條 unit test，互不吞併。
 4. reason graph determinism——同 facts 兩次評估輸出逐字節相等。
@@ -244,4 +254,12 @@ R21–R34 risk 決議與送核路徑豁免項），完整表格與 file:line 見
     reject 措辭為歷史紀錄）。
   - P2：`escalation_id` 補入 Facts schema；bindings／risk_selections canonical sort
     key 擴為全序並定義重複 key tie-break。
+- rev5（2026-08-26，design gate 第四輪 1 P1＋2 P2 收斂）：
+  - P1：`depends_on` **限同 phase**——跨 phase 引用於 bundle 載入時拒收並納入壞
+    bundle 測試（§5 出口 2），消除「dependency 屬另一 phase 未啟用」時 evaluator
+    可能各自解讀為 false／unknown／略過的分歧。
+  - P2：盤點附件 R5／R6 同步拆為 phase-specific ID（R5.submit／R5.decide、
+    R6.submit／R6.decide）各帶獨立 refs，R14 交叉引用改 R6.decide。
+  - P2：canonical 補 `impact` 與 `match` 的 contexts／modules 依字典序排序（集合
+    語意，riskpolicy.go:4-41 佐證）；`risk_policy.rules[]` 保留來源順序。
 - rev1（2026-08-26）：初版。
