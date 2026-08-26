@@ -140,8 +140,17 @@ type FactsSnapshot struct {
 }
 
 // DecodeFactsSnapshot：strict decode（DisallowUnknownFields，含 wrapper 內層）＋
-// wrapper 不變式＋presence matrix 驗證，違反 fail loud（出口 1）。
+// ValidateFactsSnapshot，違反 fail loud（出口 1）。
 func DecodeFactsSnapshot(data []byte) (*FactsSnapshot, error)
+
+// ValidateFactsSnapshot（plan rev6——**單一權威驗證入口，防繞過**）：wrapper 不變式
+// ＋presence matrix＋plan.tasks[i].SourceIndex == i 連續性。呼叫者：
+//   DecodeFactsSnapshot（頂層 decode）；
+//   DecodeCorpusCase（巢狀 snapshot 只觸發 Fact[T].UnmarshalJSON，不會經過頂層
+//     驗證——必須顯式呼叫）；
+//   UPDATE_CORPUS generator（Go constructors 完全不經 JSON decoder）；
+//   ReplayCorpus／DiffBundles 逐案例評估前（最後防線）。
+func ValidateFactsSnapshot(s *FactsSnapshot) error
 ```
 
 - **Presence matrix（plan rev2 凍結；rev3 補 decide/invalid 欄與 R4 request 例外；decode 驗證）**——`known` 欄允許 `missing`（「本應 known 而缺」＝host 給不出，走 unknown 路徑）；`not_applicable` 欄**只**允許 `not_applicable`：
@@ -368,7 +377,7 @@ func TestDecodeFactsSnapshotRejectsBadSourceIndex(t *testing.T) {
 ```
 
 - [ ] **Step 2: Run to verify failure**——`go test ./internal/domainspec/ -run TestDecodeFactsSnapshot -v`，預期 compile error。
-- [ ] **Step 3: Implement**——`Fact[T]` 自訂 `UnmarshalJSON`（內層亦 `DisallowUnknownFields`）；`DecodeFactsSnapshot` 頂層 strict decode → wrapper 不變式 → presence matrix（依上表；submit 亦要求 decision 群組四項全 not_applicable）→ `plan.tasks[i].SourceIndex == i` 連續性驗證（rev5）。
+- [ ] **Step 3: Implement**——`Fact[T]` 自訂 `UnmarshalJSON`（內層亦 `DisallowUnknownFields`）；`DecodeFactsSnapshot` = 頂層 strict decode → `ValidateFactsSnapshot`；`ValidateFactsSnapshot` 集中 wrapper 不變式、presence matrix（依上表；submit 亦要求 decision 群組四項全 not_applicable）、`plan.tasks[i].SourceIndex == i` 連續性（rev5／rev6 抽出為共用入口）。
 - [ ] **Step 4: Run to verify pass**——同指令全綠；`gofmt -l internal/domainspec/` 空輸出。
 - [ ] **Step 5: Commit**——`feat(domainspec): 統一 presence wrapper FactsSnapshot＋presence matrix strict decode（出口 1）`
 
@@ -1153,7 +1162,7 @@ func TestCompareCaseContract(t *testing.T) {
 
 **Files:**
 - Create: `internal/domainspec/corpus.go`（manifest 型別＋union 驗證＋重放＋freshness 純函式）
-- Create: `domainspec_oracle_freshness_test.go`（**repo root、package main test 檔；plan rev4——全部 oracle adapters 都住這裡**：`_test.go` 函式不屬於 package 的可 import surface，internal 側的 adapter root 根本看不到（rev3 只搬 dispatcher 是斷的）；root 可 import `internal/domainspec`／`internal/gatepolicy`／`internal/gate`／`internal/escalation` 與 App seam（app_gate_test.go:22 已證明可測）。本檔含：全 seam adapters、`TestOracleFreshnessAllFresh`、`TestOracleFreshnessDetectsCorruption`。**R3 無「改豁免」fallback：接線不成立即 NO-GO**。corpus JSON 的首次固化由本檔 `-run TestRegenerateCorpusVerdicts`＋`UPDATE_CORPUS=1` 人工觸發（CI 不跑）——**generator 從 Go case constructors 出發（plan rev5）**：每筆案例以 Go code 建 snapshot → 跑對應 seam adapter 得 verdict → `SnapshotDigest`＋bundle digest 計算 → marshal 成完整 evaluated JSON 落檔；**不存在**「無 verdict／digest 的 raw template」與寬鬆 decoder，`DecodeCorpusCase` 全程只有一套 strict 契約
+- Create: `domainspec_oracle_freshness_test.go`（**repo root、package main test 檔；plan rev4——全部 oracle adapters 都住這裡**：`_test.go` 函式不屬於 package 的可 import surface，internal 側的 adapter root 根本看不到（rev3 只搬 dispatcher 是斷的）；root 可 import `internal/domainspec`／`internal/gatepolicy`／`internal/gate`／`internal/escalation` 與 App seam（app_gate_test.go:22 已證明可測）。本檔含：全 seam adapters、`TestOracleFreshnessAllFresh`、`TestOracleFreshnessDetectsCorruption`。**R3 無「改豁免」fallback：接線不成立即 NO-GO**。corpus JSON 的首次固化由本檔 `-run TestRegenerateCorpusVerdicts`＋`UPDATE_CORPUS=1` 人工觸發（CI 不跑）——**generator 從 Go case constructors 出發（plan rev5）**：每筆案例以 Go code 建 snapshot → **`ValidateFactsSnapshot`（plan rev6——constructors 不經 JSON decoder，必須顯式驗）** → 跑對應 seam adapter 得 verdict → `SnapshotDigest`＋bundle digest 計算 → marshal 成完整 evaluated JSON 落檔；**不存在**「無 verdict／digest 的 raw template」與寬鬆 decoder，`DecodeCorpusCase` 全程只有一套 strict 契約
 - Create: `internal/domainspec/testdata/corpus/*.json`
 - Test: `internal/domainspec/corpus_test.go`（重放／coverage／union 驗證——只讀固化 JSON，不需 adapters）
 
@@ -1180,17 +1189,23 @@ type CorpusCase struct {
     // plan rev5：coverage 角色宣告——宣告是「意圖」，計數只認實際證據（見
     // CoverageReport）；isolated 宣告與實際 violations 不符 → ReplayCorpus error。
     Role        string   `json:"role"` // "isolated" | "precedence" | "output" | "alignment" | "none"
-    CoversRules []string `json:"covers_rules"` // isolated：恰一個目標 rule id；precedence：預期 primary 在首位
+    CoversRules []string `json:"covers_rules"` // isolated：恰一個目標 rule id；precedence（rev6）：**完整預期 violation 集合（≥2）**，首位為預期 primary
 }
 
 // 無 I/O 邊界（plan rev5——LoadCorpus(dir) 違反凍結架構，拆兩層）：
 // DecodeCorpusCase：單檔 bytes → strict decode＋tagged union 結構驗證（fail loud）：
 //   evaluated：Snapshot／GoVerdict／FactsDigest／BundleDigest 必填、Reason 必空；
+//     **對 Snapshot 顯式呼叫 ValidateFactsSnapshot（plan rev6——巢狀 unmarshal 不
+//     經頂層驗證，source_index 等權威欄位否則可繞過）**；
 //     重算 SnapshotDigest(Snapshot) != FactsDigest → 拒（snapshot 漂移）。
 //   acquisition_failed：Reason 必填；Snapshot／GoVerdict／FactsDigest／BundleDigest
 //     一律必空（明確禁止）。
 func DecodeCorpusCase(data []byte) (CorpusCase, error)
-// ValidateCorpus：跨案例驗證（name 唯一、role/covers_rules 形狀）。
+// ValidateCorpus：跨案例驗證（plan rev6 擴充）——name 唯一；OracleSeam／Provenance／
+// Role enum 合法；evaluated 案例 `EvaluationPhase == Snapshot.EvaluationPhase`
+// （重複欄位不得分歧）；phase↔seam 合法組合（submit → gate_service_submit／
+// gatepolicy_validate／host_boundary；decide → 其餘 seam）；role↔covers_rules 形狀
+// （isolated 恰一；precedence ≥2 且首位為預期 primary）。
 func ValidateCorpus(cases []CorpusCase) error
 // 目錄走訪與讀檔留在 _test.go helper（host 層）：
 //   func loadCorpus(t *testing.T) []CorpusCase  // testdata/corpus/*.json → DecodeCorpusCase → ValidateCorpus
@@ -1202,17 +1217,22 @@ type CoverageReport struct {
     OutputEvidence int            // R32：pass 案例中 RiskDecisions 非空且逐欄比對成立的筆數
     UncoveredRules []string       // in-scope 清單減 covered；必須空或對應豁免表
 }
-// ReplayCorpus（plan rev4 digest fail loud；rev5 coverage 證據化）：逐案例先驗
-// case.BundleDigest == b.Digest（本函式只收 **baseline** bundle；candidate 走
-// DiffBundles 獨立路徑，見 Task 8）與 SnapshotDigest(case.Snapshot) ==
-// case.FactsDigest，再 Evaluate＋CompareCase。coverage 計數規則（rev5——
-// covers_rules 宣告不可自我轉綠）：
+// ReplayCorpus（plan rev4 digest fail loud；rev5 coverage 證據化；rev6 補繞過
+// 防線與證據強度）：逐案例先驗 case.BundleDigest == b.Digest（本函式只收
+// **baseline** bundle；candidate 走 DiffBundles 獨立路徑，見 Task 8）、
+// SnapshotDigest(case.Snapshot) == case.FactsDigest、**ValidateFactsSnapshot
+// （rev6 最後防線——自洽 digest 包不住非法 snapshot）**，再 Evaluate＋CompareCase。
+// coverage 計數規則（rev5；rev6 強化——covers_rules 宣告不可自我轉綠）：
 //   isolated：實際 Violations 的 distinct rule id 必須**恰等於** {covers_rules[0]}
 //     且 go verdict blocked、primary 一致——才計入 CoveredRules；宣告與實際不符
 //     → 整體 error（fail loud，不是略過）。
-//   precedence：驗 PrimaryViolation == covers_rules[0]（預期 primary）。
-//   output：pass 且 RiskDecisions 非空、逐欄比對成立 → OutputEvidence++（R32 憑
-//     此計數，不憑字串宣告）。
+//   precedence（rev6）：covers_rules 列**完整預期 violation 集合**——實際 distinct
+//     rule id 必須與其完全相等且 **≥2**（單一 violation 不構成「勝過」證據），
+//     再驗 PrimaryViolation == covers_rules[0]。
+//   output（rev6——R32 排序證據）：snapshot 必須 **≥2 個 task 且 plan 來源順序
+//     刻意非 task_id 序**（如 T2 在 T1 前）；pass、雙方 RiskDecisions 逐欄相等
+//     且皆依 task_id 排序 → OutputEvidence++。不滿足前置形狀的 output 宣告
+//     → error。
 func ReplayCorpus(b *CompiledBundle, cases []CorpusCase, runtimeCostLimit uint64) (*CoverageReport, error)
 
 // VerifyOracleFreshness（plan rev2——出口 6b 的獨立可驗證 guard）：
@@ -1232,9 +1252,9 @@ func VerifyOracleFreshness(cases []CorpusCase, recompute func(CorpusCase) (GoVer
   - `escalation`：`escalation.BlockingFor`（scope 由案例 gate＋subject 對照 production `scopeForSubject` 值固化）→ R16。**hard 對齊警訊的證據建構（plan rev3）**：snapshot facts 沒有 hard 欄位，證據在 oracle 側——以 `escalation.Item{Hard: true, State: "open", BlockScope: ...}` 建 production escalation 呼叫 `BlockingFor` 得 blocked，投影成 facts（不含 hard）後 CEL 亦 blocked——兩側一致即證明「忽略 hard」語意被忠實複製；corpus 案例的 name／covers_rules 記明此建構。
   - `app_gatedecide`：repo root freshness 檔內的 R3 adapter——沿 app_gate_test.go:22 的 App gate seam 慣例，以空 git identity 觸發 approver 拒絕（無 fallback，接不了線即 NO-GO）。
   - 訊息形狀對映：`map[oracleSeam]map[string]string`——**(seam, message pattern) → rule id**；R5／R6 的 submit／decide 由 seam 天然區分（單一全域字串表無法區分同文案，plan rev2 修正）。同 seam 內一筆錯誤命中多 pattern → 測試紅（對映必須唯一）。
-- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例（per_kind 的 R8／R9 至少各一 kind）＋乾淨 pass 案例（submit／decide 各一，approved pass 案例帶 RiskDecisions 逐欄固化）；precedence 案例**六筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 跨 gate step 兩筆：R3+R24→R3、R30+R16→R30；plan rev3 kind occurrence 一筆：spec_manifest digest 錯＋plan kind missing→**R9**）；對齊警訊各一（R16 hard——建構見上、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（`kind: acquisition_failed`、`provenance: host_boundary`、reason 記 submit 前 dirty worktree——依 union 契約無 snapshot／verdict／digest，計 Exempt）。
+- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例（per_kind 的 R8／R9 至少各一 kind）＋乾淨 pass 案例（submit／decide 各一；decide 的 approved pass 案例帶 RiskDecisions 逐欄固化，且 **≥2 個 task、plan 來源順序刻意非 task_id 序**（rev6——role=output 的 R32 排序證據形狀，如 T2 在 T1 前））；precedence 案例**六筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 跨 gate step 兩筆：R3+R24→R3、R30+R16→R30；plan rev3 kind occurrence 一筆：spec_manifest digest 錯＋plan kind missing→**R9**）；對齊警訊各一（R16 hard——建構見上、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（`kind: acquisition_failed`、`provenance: host_boundary`、reason 記 submit 前 dirty worktree——依 union 契約無 snapshot／verdict／digest，計 Exempt）。
 
-- [ ] **Step 1: Write the failing tests**——internal 側：`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）；`TestCorpusUnionValidation`（plan rev4——evaluated 缺 digest／帶 Reason、acquisition_failed 帶 Snapshot 或 digest，`DecodeCorpusCase` 必拒）；`TestCorpusDigestDriftFailsLoud`（plan rev4——竄改一筆 Snapshot 欄位不改 FactsDigest → ReplayCorpus 必 error；BundleDigest 不符亦同）；`TestCoverageRejectsMisdeclaredIsolated`（plan rev5——role=isolated 但實際 Violations 多於一個 distinct rule id → ReplayCorpus 必 error，宣告不可自我轉綠）。root 檔：`TestOracleFreshnessAllFresh`（dispatcher 依 `OracleSeam` 覆蓋全部 evaluated 案例含 A9 三筆與 R3，recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑）。
+- [ ] **Step 1: Write the failing tests**——internal 側：`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）；`TestCorpusUnionValidation`（plan rev4——evaluated 缺 digest／帶 Reason、acquisition_failed 帶 Snapshot 或 digest，`DecodeCorpusCase` 必拒）；`TestCorpusDigestDriftFailsLoud`（plan rev4——竄改一筆 Snapshot 欄位不改 FactsDigest → ReplayCorpus 必 error；BundleDigest 不符亦同）；`TestCoverageRejectsMisdeclaredIsolated`（plan rev5——role=isolated 但實際 Violations 多於一個 distinct rule id → ReplayCorpus 必 error，宣告不可自我轉綠）；`TestCorpusRejectsBadSourceIndexEvenWithSelfConsistentDigest`（plan rev6——構造 source_index 錯置的 snapshot 並**重算成自洽 facts_digest**，DecodeCorpusCase 與 ReplayCorpus 仍必須拒——digest 自洽包不住非法 snapshot）；`TestCoverageRejectsSingleViolationPrecedence`（plan rev6——role=precedence 但實際只有一個 distinct violation → error，單一 violation 不構成勝出證據）；`TestOutputEvidenceRequiresMultiTaskNonIDOrder`（plan rev6——role=output 但 snapshot 僅一個 task 或來源順序已是 task_id 序 → error）。root 檔：`TestOracleFreshnessAllFresh`（dispatcher 依 `OracleSeam` 覆蓋全部 evaluated 案例含 A9 三筆與 R3，recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑）。
 - [ ] **Step 2: Run to verify failure**；**Step 3: Implement**；**Step 4: `go test ./internal/domainspec/ -count=1` 全綠＋root freshness 檔 `go test -run TestOracleFreshness . -count=1`＋gofmt**。
 - [ ] **Step 5: Commit**——`feat(domainspec): corpus manifest＋seam-aware oracle harness＋freshness guard（出口 5 主體）`
 
@@ -1261,8 +1281,9 @@ type FlipRow struct {
 // digest 邊界（plan rev5——與 ReplayCorpus 的嚴格檢查解衝突）：corpus 的
 // bundle_digest 只對 **baseline** 驗證（不符→error）；candidate 走**獨立評估
 // 路徑**（直接 Evaluate，不經 ReplayCorpus），candidate.Digest 與案例
-// bundle_digest 必然不同、屬預期；facts_digest 仍逐案例驗。不得為了 diff
-// 關掉 ReplayCorpus 的 fail-loud。
+// bundle_digest 必然不同、屬預期；facts_digest 仍逐案例驗，且評估前逐案例
+// ValidateFactsSnapshot（plan rev6——與 ReplayCorpus 同一道防繞過防線）。
+// 不得為了 diff 關掉 ReplayCorpus 的 fail-loud。
 func DiffBundles(baseline, candidate *CompiledBundle, cases []CorpusCase, limit uint64) ([]FlipRow, error)
 ```
 
@@ -1399,4 +1420,16 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
   - 補強：UPDATE_CORPUS generator 明定從 Go case constructors 產完整案例
     （建 snapshot→跑 adapter→算 digest→marshal），無 raw template、無寬鬆
     decoder。
+- rev6（2026-08-26，plan review gate 第五輪 2 P1＋1 P2 收斂）：
+  - P1：抽出 `ValidateFactsSnapshot` 為單一權威驗證入口（wrapper 不變式＋
+    presence matrix＋source_index 連續性），DecodeFactsSnapshot／
+    DecodeCorpusCase（巢狀 unmarshal 不經頂層驗證）／generator（不經 JSON）／
+    ReplayCorpus／DiffBundles 評估前皆呼叫；補「source_index 錯置＋自洽
+    facts_digest 仍拒」corpus 測試。
+  - P1：precedence 證據強化——covers_rules 列完整預期集合、實際 distinct rule id
+    完全相等且 ≥2、首位為 primary（單一 violation 不構成勝出證據）；R32 output
+    證據要求 ≥2 task 且 plan 來源順序非 task_id 序、雙方輸出皆依 task_id 排序；
+    各補拒絕測試。
+  - P2：ValidateCorpus 擴充——EvaluationPhase 與 Snapshot.EvaluationPhase 相等、
+    OracleSeam／Provenance／Role enum、phase↔seam 合法組合。
 - rev1（2026-08-26）：初版。
