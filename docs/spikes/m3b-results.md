@@ -666,6 +666,6 @@ server 在 TERM 後 3 秒內全數收斂（§5.4 bounded window 的實機佐證�
 
 **非阻擋觀察（UI 錯誤生命週期）**：dirty-tree 送核失敗後，舊錯誤訊息在後續**成功**
 送核與核可後仍留在 PlanWorkspace（`m3b-a9-gate2-approved` 左下紅字即是）——成功送核只
-設定 `submitResult`，不清 `plan.errors`（PlanWorkspace.vue submitGate2；`clearErrors`
-目前無呼叫端，plan.ts）。不影響 Gate journal、核可與 supersede 正確性；覆查截圖時勿
+設定 `submitResult`，不清 `plan.errors`（PlanWorkspace.vue `submitForApproval`；
+`clearErrors` 目前無呼叫端，plan.ts）。不影響 Gate journal、核可與 supersede 正確性；覆查截圖時勿
 把該紅字誤讀為新送核失敗。另列 UI 錯誤生命週期改善票。
