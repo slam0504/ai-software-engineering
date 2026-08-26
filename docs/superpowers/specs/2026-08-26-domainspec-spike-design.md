@@ -3,7 +3,7 @@
 Owner 2026-08-21 仲裁凍結的方向（見 auto memory `domainspec-spike-direction`）：**獨立、
 限時**的 spike，切點是 Gate 2 decision eligibility＋risk policy 的 **shadow evaluator**
 ——immutable facts snapshot 評估、現行 Go 實作保持權威、新 kernel 只比對不接管；不重塑
-M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev5。
+M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev6。
 
 ## 1. 範圍：要 shadow 的規則面
 
@@ -86,10 +86,14 @@ rule id，不依賴輸入序）、`escalations` 依 escalation_id（production U
 以其為 key 無重複）；`plan.tasks[].impact` 與 `risk_policy.rules[].match` 的
 `contexts`／`modules`（rev5 補）為**集合語意**——`intersects` 建 map 求交集、
 `ComputeMinimum` 對所有命中規則取最高 tier，順序與重複皆無語意
-（riskpolicy.go:4-41）——canonical 依字典序排序；`risk_policy.rules[]` 本身**保留
-來源順序**（max 聚合可交換，順序同樣無語意，但 digest 忠實代表 committed policy
-的來源結構，不重排）。完全相同的重複元素視為相等、相鄰輸出，排序仍為全序。canonical
-序列化時 nil 集合與空集合一律輸出 `[]`。canonical JSON 取
+（riskpolicy.go:4-41）——canonical 依字典序**排序後去重（rev6）**：production 無任何
+檢查能觀測其 multiplicity（duplicate 檢查只存在於 bindings R7 與 risk_selections
+R24），保留重複只會讓 `["gate"]` 與 `["gate","gate"]` 產生不同 digest；重排＋含重複
+值的輸入必須得相同 digest（§5 出口 7）。`risk_policy.rules[]` 本身**保留來源順序**
+（max 聚合可交換，順序同樣無語意，但 digest 忠實代表 committed policy 的來源結構，
+不重排）。bindings／risk_selections 的重複元素**不去重**——duplicate 本身是 R7／R24
+的可觀測違規輸入，必須留在 snapshot；完全相同者視為相等、相鄰輸出，排序仍為全序。
+canonical 序列化時 nil 集合與空集合一律輸出 `[]`。canonical JSON 取
 sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 
 ## 3. Rule bundle 與 evaluator 輸出
@@ -106,12 +110,15 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
   載入時直接拒收，納入壞 bundle 測試（§5 出口 2）；SCC 在此圖上驗無環）、`priority`、
   `verdict` 訊息模板、`refs`（production file:line）。
 - **兩階段聚合演算法（rev3，取代 rev2 的矛盾映射）**：
-  1. **Eligibility**：依 `depends_on` 拓撲序評估——某規則的任一 dependency `when`
-     為 false 或 unknown，該規則 **not eligible**（不評估、effect 不參與，記入 reason
-     graph）；eligible 者評估 `when`。載入時的同 phase 限制（rev5）保證每個
-     dependency 都在當前 phase 被實際評估過——不存在「dependency 屬另一 phase、
-     未啟用」的未定義狀態；evaluator 不得將未評估的規則視為 false、unknown 或逕行
-     略過（該歧義正是跨 phase 引用被拒收的原因）。
+  1. **Eligibility（rev6 明定傳遞語意）**：依 `depends_on` 拓撲序評估。規則
+     **eligible ⇔ 所有 dependency 皆 eligible 且其 `when` = true**；dependency 的
+     `when` 為 false、unknown，**或 dependency 本身 not eligible**，下游一律
+     **not eligible**——傳遞封閉：A=false ⇒ B（depends_on A）not eligible 且 when
+     不評估 ⇒ C（depends_on B）亦 not eligible。not eligible 規則不評估 `when`、
+     effect 不參與，連同成因（哪個 dependency、false／unknown／not eligible 哪一種）
+     記入 reason graph；evaluator 不得把 not eligible 的 dependency 視為 false 或
+     unknown。載入時的同 phase 限制（rev5）保證 dependency 屬於當前 phase 的評估
+     集合；是否實際評估由本條傳遞語意決定。三層 DAG fixture 納入 §5 出口 3。
   2. **Per-target 裁決**：每個 target 上取所有命中（when=true）的 eligible 規則，依
      `priority` 選出有效效果；**同 priority 且效果相反**（allow vs deny）→ 該 target
      `conflict`。
@@ -181,7 +188,8 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
 2. CEL compile／type-check／cost 上限——載入壞 bundle（型別錯、cost 超、**跨 phase
    `depends_on`（rev5）**）必須拒。
 3. truth／status 三分不混用——unknown（缺 fact）、conflict（規則衝突 fixture）、
-   evaluation_error 各一條 unit test，互不吞併。
+   evaluation_error 各一條 unit test，互不吞併；另補**三層 DAG fixture（rev6）**：
+   A=false ⇒ B not eligible ⇒ C not eligible 逐層傳遞，reason graph 各層成因可追。
 4. reason graph determinism——同 facts 兩次評估輸出逐字節相等。
 5. corpus 重放：Go 可觀測結果與 CEL primary verdict 逐案例一致（§4 比較契約）＋
    Rule ID coverage 報告（隔離案例）＋primary precedence 多重違規案例；另以
@@ -189,7 +197,8 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
    outcome／unknown／error 三欄的翻轉表。
 6. mutation 鑑別力——(a) 改一條 bundle 規則（如 R31 拿掉 override 檢查）→ diff 必須抓
    到翻轉；(b) 移除比對 harness 的 guard → 對應測試紅。
-7. facts snapshot 與 bundle 皆有 canonical digest，任一筆 corpus 案例可獨立重放。
+7. facts snapshot 與 bundle 皆有 canonical digest，任一筆 corpus 案例可獨立重放；
+   contexts／modules 重排＋含重複值的輸入必須得相同 digest（rev6）。
 8. spike 不接管 production——`gateDecide` 零改動（git diff 佐證）。
 
 ## 6. 非目標與時間盒
@@ -262,4 +271,13 @@ R21–R34 risk 決議與送核路徑豁免項），完整表格與 file:line 見
     R6.submit／R6.decide）各帶獨立 refs，R14 交叉引用改 R6.decide。
   - P2：canonical 補 `impact` 與 `match` 的 contexts／modules 依字典序排序（集合
     語意，riskpolicy.go:4-41 佐證）；`risk_policy.rules[]` 保留來源順序。
+- rev6（2026-08-26，design gate 第五輪 1 P1＋1 P2 收斂）：
+  - P1：eligibility 傳遞語意明定——規則 eligible ⇔ 所有 dependency 皆 eligible 且
+    when=true；dependency false／unknown／**not eligible** 一律使下游 not eligible
+    （傳遞封閉），更正 rev5「每個 dependency 都被實際評估過」的錯誤宣稱（not
+    eligible 規則的 when 不評估）；補三層 DAG fixture 驗傳遞與 reason graph
+    （§5 出口 3）。
+  - P2：contexts／modules canonical 改**排序後去重**（production 無法觀測其
+    multiplicity；bindings／risk_selections 的可觀測 duplicate 仍保留不去重）；
+    補重排＋重複值相同 digest 測試（§5 出口 7）。
 - rev1（2026-08-26）：初版。
