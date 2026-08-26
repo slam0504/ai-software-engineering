@@ -144,17 +144,24 @@ type FactsSnapshot struct {
 func DecodeFactsSnapshot(data []byte) (*FactsSnapshot, error)
 ```
 
-- **Presence matrix（plan rev2 凍結；decode 驗證）**——`known` 欄允許 `missing`（「本應 known 而缺」＝host 給不出，走 unknown 路徑）；`not_applicable` 欄**只**允許 `not_applicable`：
+- **Presence matrix（plan rev2 凍結；rev3 補 decide/invalid 欄與 R4 request 例外；decode 驗證）**——`known` 欄允許 `missing`（「本應 known 而缺」＝host 給不出，走 unknown 路徑）；`not_applicable` 欄**只**允許 `not_applicable`：
 
-| fact 群組 | submit | decide／approved | decide／rejected |
-|---|---|---|---|
-| decision／reason／approver／entry | not_applicable | known | known |
-| **request** | **known**（R5.submit–R9 的輸入，不得 not_applicable） | known | known |
-| current／base_commit_state／plan／risk_policy | not_applicable | known | not_applicable（production rejected 不跑 Reconcile／LoadAt） |
-| risk_selections | not_applicable | known | known（R21 的輸入——rejected 帶 selections 即違規） |
-| escalations | not_applicable | known | known（gateDecide blocking 檢查兩種 decision 都跑） |
+| fact 群組 | submit | decide／approved | decide／rejected | decide／invalid（rev3——R1 隔離輸入，decision 值非 enum） |
+|---|---|---|---|---|
+| decision／reason／approver／entry | not_applicable | known | known | known |
+| **request** | **known**（R5.submit–R9 的輸入） | known※ | known※ | known※ |
+| current／base_commit_state／plan／risk_policy | not_applicable | known | not_applicable（production rejected 不跑 Reconcile／LoadAt） | not_applicable（production 於 enum 檢查即敗，service.go:86-88） |
+| risk_selections | not_applicable | known | known（R21 的輸入） | known |
+| escalations | not_applicable | known | known（gateDecide blocking 兩種 decision 都跑） | known |
 
-  decide 欄依 `Decision.Value` 選；`Decision` 為 missing 時只驗 phase 無關的列（request 等），decision 相依列跳過矩陣檢查（該 snapshot 評估時本就走 unknown）。
+  ※ **entry 非 pending 例外（rev3——R4 路徑）**：decide 且 `entry` 顯示非 pending
+  （`!exists || !has_request || has_record`）時，`request` **與**
+  `current`／`base_commit_state`／`plan`／`risk_policy` 皆允許 `not_applicable`——
+  production 在 `normalizeRequest` 之前就於 pending 檢查失敗（service.go:98-101），
+  host 無從產出後續 facts；此時引用這些群組的規則依 not_applicable 語意 not
+  eligible，與 production 一致。
+  decide 欄依 `Decision.Value` 選：`approved`／`rejected`／其他任何值→invalid 欄。
+  `Decision` 為 missing 時只驗 decision 無關列，相依列跳過矩陣檢查（評估時本就走 unknown）。
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -166,8 +173,12 @@ import (
     "testing"
 )
 
-// wrapper 形式的合法 decide/approved snapshot（各 task 測試共用底稿）
+// wrapper 形式的合法 decide/approved snapshot（各 task 測試共用底稿）。
+// plan rev3：帶齊五種 required binding（R8）且 current 四值與 bound digest 相符
+// （R11）——否則 Task 5 正式 bundle 下不可能得到 truth=true 的 clean 基準。
 func validSnapshotJSON() string {
+    z64 := strings.Repeat("0", 64)
+    a40 := strings.Repeat("a", 40)
     return `{
       "schema_version": 1, "evaluation_phase": "decide",
       "decision": {"presence":"known","value":"approved"},
@@ -175,8 +186,12 @@ func validSnapshotJSON() string {
       "approver": {"presence":"known","value":{"name":"u","email":"u@x"}},
       "entry": {"presence":"known","value":{"exists":true,"has_request":true,"has_record":false}},
       "request": {"presence":"known","value":{"gate":"gate2","subject":"plan:P1","bindings":[
-        {"kind":"base_commit","role":"","ref":"HEAD","digest":"git:sha1:` + strings.Repeat("a", 40) + `"}]}},
-      "current": {"presence":"known","value":{"spec_manifest":"sha256:` + strings.Repeat("0", 64) + `","plan_manifest":"","risk_policy":"","permission_manifest":""}},
+        {"kind":"spec_manifest","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"plan","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"base_commit","role":"","ref":"HEAD","digest":"git:sha1:` + a40 + `"},
+        {"kind":"risk_policy","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"permission_manifest","role":"","ref":"","digest":"sha256:` + z64 + `"}]}},
+      "current": {"presence":"known","value":{"spec_manifest":"sha256:` + z64 + `","plan_manifest":"sha256:` + z64 + `","risk_policy":"sha256:` + z64 + `","permission_manifest":"sha256:` + z64 + `"}},
       "base_commit_state": {"presence":"known","value":"ok"},
       "plan": {"presence":"known","value":{"tasks":[{"id":"T1","source_index":0,"minimum_risk_tier":"low","planner_risk_tier":"low","impact":{"contexts":["gate"],"modules":[]}}]}},
       "risk_policy": {"presence":"known","value":{"default_tier":"low","rules":[{"match":{"contexts":["gate"],"modules":[]},"tier":"low"}]}},
@@ -184,6 +199,46 @@ func validSnapshotJSON() string {
       "escalations": {"presence":"known","value":[]}
     }`
 }
+
+// 合法 submit snapshot（plan rev3——matrix 測試不得從 decide 底稿多重替換拼裝，
+// 否則可能因其他欄位違規而誤通過）：decision 群組四項 not_applicable、request known。
+func validSubmitSnapshotJSON() string {
+    z64 := strings.Repeat("0", 64)
+    a40 := strings.Repeat("a", 40)
+    na := `{"presence":"not_applicable","value":null}`
+    return `{
+      "schema_version": 1, "evaluation_phase": "submit",
+      "decision": ` + na + `, "reason": ` + na + `, "approver": ` + na + `, "entry": ` + na + `,
+      "request": {"presence":"known","value":{"gate":"gate2","subject":"plan:P1","bindings":[
+        {"kind":"spec_manifest","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"plan","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"base_commit","role":"","ref":"HEAD","digest":"git:sha1:` + a40 + `"},
+        {"kind":"risk_policy","role":"","ref":"","digest":"sha256:` + z64 + `"},
+        {"kind":"permission_manifest","role":"","ref":"","digest":"sha256:` + z64 + `"}]}},
+      "current": ` + na + `, "base_commit_state": ` + na + `,
+      "plan": ` + na + `, "risk_policy": ` + na + `,
+      "risk_selections": ` + na + `, "escalations": ` + na + `
+    }`
+}
+
+// 合法 decide/rejected snapshot（plan rev3）：decision="rejected"、reason 非空、
+// current/base_commit_state/plan/risk_policy 四項 not_applicable，其餘 known。
+func validRejectedSnapshotJSON() string {
+    j := validSnapshotJSON()
+    j = strings.Replace(j, `"value":"approved"`, `"value":"rejected"`, 1)
+    j = strings.Replace(j, `"reason": {"presence":"known","value":""}`,
+        `"reason": {"presence":"known","value":"not good enough"}`, 1)
+    na := `{"presence":"not_applicable","value":null}`
+    for _, k := range []string{"current", "base_commit_state", "plan", "risk_policy"} {
+        j = replaceGroup(j, k, na) // helper：以群組 key 為界整段替換（實作為 regexp `"<k>": \{.*?\}\}?` 或以 json round-trip 改欄位後重排）
+    }
+    j = strings.Replace(j,
+        `"risk_selections": {"presence":"known","value":[{"task_id":"T1","selected_risk_tier":"low","override_reason":""}]}`,
+        `"risk_selections": {"presence":"known","value":[]}`, 1)
+    return j
+}
+// replaceGroup 實作建議：decode 成 map[string]json.RawMessage → 覆寫該 key → 依固定
+// key 序重組——比 regexp 可靠且 deterministic。
 
 func mustSnapshot(t *testing.T) *FactsSnapshot {
     t.Helper()
@@ -229,25 +284,51 @@ func TestDecodeFactsSnapshotWrapperInvariant(t *testing.T) {
 }
 
 func TestDecodeFactsSnapshotPresenceMatrix(t *testing.T) {
-    // decide/rejected：plan 必須 not_applicable——known 即拒（matrix）
-    j := validSnapshotJSON()
-    j = strings.Replace(j, `"value":"approved"`, `"value":"rejected"`, 1)
+    // 各案例都從「該欄位形狀完全合法」的底稿出發、只翻一個欄位（plan rev3——
+    // 多重替換拼裝可能因其他違規誤通過）。
+    // decide/rejected 合法底稿 → 只把 plan 翻回 known → 必拒
+    j := replaceGroup(validRejectedSnapshotJSON(), "plan",
+        `{"presence":"known","value":{"tasks":[]}}`)
     if _, err := DecodeFactsSnapshot([]byte(j)); err == nil {
         t.Fatal("rejected with plan=known must violate presence matrix")
     }
-    // submit：request 不得 not_applicable
-    j2 := strings.Replace(validSnapshotJSON(), `"evaluation_phase": "decide"`, `"evaluation_phase": "submit"`, 1)
-    j2 = strings.Replace(j2,
-        `"request": {"presence":"known"`, `"request": {"presence":"not_applicable"`, 1)
+    // submit 合法底稿 → 只把 request 翻 not_applicable → 必拒
+    j2 := replaceGroup(validSubmitSnapshotJSON(), "request",
+        `{"presence":"not_applicable","value":null}`)
     if _, err := DecodeFactsSnapshot([]byte(j2)); err == nil {
         t.Fatal("submit with request=not_applicable must be rejected（R5.submit–R9 需要 request facts）")
     }
     // decide/approved：plan=missing 合法（本應 known 而缺 → unknown 路徑）
-    j3 := strings.Replace(validSnapshotJSON(),
-        `"plan": {"presence":"known","value":{"tasks":[{"id":"T1","source_index":0,"minimum_risk_tier":"low","planner_risk_tier":"low","impact":{"contexts":["gate"],"modules":[]}}]}}`,
-        `"plan": {"presence":"missing","value":null}`, 1)
+    j3 := replaceGroup(validSnapshotJSON(), "plan", `{"presence":"missing","value":null}`)
     if _, err := DecodeFactsSnapshot([]byte(j3)); err != nil {
         t.Fatalf("missing in a known-column must be legal: %v", err)
+    }
+}
+
+func TestDecodeFactsSnapshotInvalidDecisionColumn(t *testing.T) {
+    // rev3：decide/invalid 欄——R1 隔離案例的合法輸入形狀
+    j := validSnapshotJSON()
+    j = strings.Replace(j, `"value":"approved"`, `"value":"weird"`, 1)
+    na := `{"presence":"not_applicable","value":null}`
+    for _, k := range []string{"current", "base_commit_state", "plan", "risk_policy"} {
+        j = replaceGroup(j, k, na)
+    }
+    if _, err := DecodeFactsSnapshot([]byte(j)); err != nil {
+        t.Fatalf("invalid-decision snapshot must be decodable（R1 隔離輸入）: %v", err)
+    }
+}
+
+func TestDecodeFactsSnapshotR4RequestException(t *testing.T) {
+    // rev3：entry 非 pending → request 允許 not_applicable（service.go:98-101 先敗）
+    j := replaceGroup(validSnapshotJSON(), "entry",
+        `{"presence":"known","value":{"exists":false,"has_request":false,"has_record":false}}`)
+    j = replaceGroup(j, "request", `{"presence":"not_applicable","value":null}`)
+    na := `{"presence":"not_applicable","value":null}`
+    for _, k := range []string{"current", "base_commit_state", "plan", "risk_policy"} {
+        j = replaceGroup(j, k, na)
+    }
+    if _, err := DecodeFactsSnapshot([]byte(j)); err != nil {
+        t.Fatalf("entry-absent with request=not_applicable must be legal（R4 路徑）: %v", err)
     }
 }
 
@@ -379,15 +460,22 @@ type Rule struct {
     Verdict   string   `yaml:"verdict"`
     Refs      string   `yaml:"refs"`
     PerTask   bool     `yaml:"per_task"`
+    PerKind   bool     `yaml:"per_kind"` // plan rev3：對 required_kinds 逐 kind 實體化（R8/R9）
     // 四層 primary precedence 靜態 rank（spec §4；Task 6 使用）：
     StepRank  int    `yaml:"step_rank"`
     Stage     string `yaml:"stage"`      // "none" | "pre_loop" | "task_loop" | "post_loop"
     CheckRank int    `yaml:"check_rank"` // 僅 stage=task_loop 有意義
 }
 
+type RequiredKind struct {
+    Kind    string `yaml:"kind"`
+    Pattern string `yaml:"pattern"` // digest regex（沿 gate2.go:28-31）
+}
+
 type Bundle struct {
-    SchemaVersion int    `yaml:"schema_version"`
-    Rules         []Rule `yaml:"rules"`
+    SchemaVersion int            `yaml:"schema_version"`
+    RequiredKinds []RequiredKind `yaml:"required_kinds"` // 順序＝gate2BindingReqs（gate2.go:42-48），per_kind 實體化與 precedence 依此
+    Rules         []Rule         `yaml:"rules"`
 }
 
 type CompiledRule struct {
@@ -415,6 +503,7 @@ func LoadBundle(yamlSrc []byte, staticCostLimit uint64) (*CompiledBundle, error)
 //   risk_selections: list(map(string,string)); escalations: list(map(string,string))
 //   presence: map(string,string)  // 群組名 → "known"/"not_applicable"/"missing"
 //   tier_order: map(string,int)   // bundle 常數（host 注入）
+//   req_kind: string; req_index: int; req_pattern: string  // per_kind 規則專用（plan rev3）
 // 純函式 extension：tier_rank(string) -> int（未知 tier 回 -1；spec §3 限純函式）
 func celEnv() (*cel.Env, error)
 ```
@@ -574,6 +663,11 @@ type Result struct {
 //   per_task 規則：Plan presence==missing → 整組 when=unknown（"plan" 入 unknown_leaves）；
 //     ==not_applicable → 整組 not eligible；==known → 逐 task 實體化
 //     （activation 疊 task/sel；sel 由 task_id 對 risk_selections 首筆配對，無則 null）。
+//   per_kind 規則（plan rev3）：對 bundle.RequiredKinds 逐 kind 實體化——activation 疊
+//     req_kind/req_index/req_pattern；Violation.SourceIndex = req_index（kind occurrence
+//     rank 即 production 逐 kind 檢查序，gate2.go:292-306）；target 實體化為
+//     binding.<kind>。Request presence==missing → 整組 unknown；==not_applicable →
+//     整組 not eligible。
 //   eligibility 傳遞封閉（spec rev6）：eligible ⇔ 所有 dependency eligible 且 when=true；
 //     dependency false/unknown/not eligible → 下游 not eligible（when 不評估）。
 //   runtime cost：Program 帶 cel.CostLimit(runtimeCostLimit)；eval error →
@@ -676,7 +770,11 @@ func TestEvaluateNotApplicableIsNotUnknown(t *testing.T) {
 }
 
 func TestEvaluatePerTaskPlanMissingYieldsUnknown(t *testing.T) {
-    perTask := `  - id: RT
+    // plan rev3：純 per-task bundle——不得夾帶會在 approved snapshot 命中的 deny 規則
+    // （全域 truth deny>unknown，unknown 會被 false 蓋掉，測試就測不到本意）。
+    const perTaskOnlyBundle = `schema_version: 1
+rules:
+  - id: RT
     phase: decide
     when: "sel == null"
     effect: deny
@@ -685,11 +783,11 @@ func TestEvaluatePerTaskPlanMissingYieldsUnknown(t *testing.T) {
     priority: 10
     verdict: "RT"
     refs: "test"
-    step_rank: 3
+    step_rank: 10
     stage: task_loop
     check_rank: 0
 `
-    b, _ := LoadBundle(miniBundle(perTask), 1_000_000)
+    b, _ := LoadBundle([]byte(perTaskOnlyBundle), 1_000_000)
     s := mustSnapshot(t)
     s.Plan = Fact[PlanFacts]{Presence: Missing}
     r, _ := Evaluate(b, s, 100_000)
@@ -766,9 +864,9 @@ func TestEvaluateDeterministicBytes(t *testing.T) {
 |---|---|---|---|---|---|
 | R5.submit | submit | decision.eligibility | none | - | `!(request.gate in ["gate1","gate2","test_contract_approval"])`（service.go:46-48） |
 | R6.submit | submit | decision.eligibility | none | - | gate2 且 subject 非 `plan:` 前綴或 id 空（gate2.go:92-95） |
-| R7 | submit | decision.eligibility | none | - | bindings (kind,role) 重複（gate2.go:284-291） |
-| R8 | submit | decision.eligibility | none | - | 必備 5 kind 缺一或 role != ""（gate2.go:292-305） |
-| R9 | submit | decision.eligibility | none | - | digest 格式不符 regex（gate2.go:28-31、296-299；CEL `matches`） |
+| R7 | submit | decision.eligibility | none | - | bindings (kind,role) 重複——**全域檢查，在任何 kind 檢查之前**（gate2.go:284-291） |
+| R8 | submit | binding.&lt;kind&gt;（**per_kind**，rev3） | none | - | 該 required kind 無 role=="" 的 binding（gate2.go:292-306 逐 kind 迴圈的 not-found 分支） |
+| R9 | submit | binding.&lt;kind&gt;（**per_kind**，rev3） | none | - | 該 kind binding 存在但 digest 不符 `req_pattern`（gate2.go:296-299 的 found 分支；同 kind 下 R8/R9 互斥） |
 | R3 | decide | decision.eligibility | none | - | approver.name=="" && approver.email==""（app.go:5810-5821——gateDecide **步驟 2，先於 PrepareDecision**） |
 | R1 | decide | decision.eligibility | none | - | `!(decision in ["approved","rejected"])`（service.go:86-88） |
 | R2 | decide | decision.eligibility | none | - | rejected 且 reason==""（service.go:89-91） |
@@ -791,7 +889,13 @@ func TestEvaluateDeterministicBytes(t *testing.T) {
 | R16 | decide | decision.eligibility | none | - | escalations 存在 state!="resolved" 且 block_scope!="" 且（=="workspace" 或 == 導出 scope）；scope 導出內嵌（R15 豁免記載）：gate1→"workspace"、gate2+plan:X→"gate2:"+X、未知→"workspace"（app.go:5895-5912；project.go:81-96——**忽略 hard 旗標**） |
 
   - **step_rank 凍結表（plan rev2 修正——依 gateDecide 十一步實序，R3 先於 PrepareDecision、R16 在整個 PrepareDecision 之後）**：
-    - submit：R5.submit=0 → R6.submit=1 → R7=2 → R8=3 → R9=4（Submit → ValidateRequest → validateGate2Bindings 內部序；R8／R9 在迴圈內穿插，實作時對照 gate2.go:283-305 定 rank，不符以 production 為準）。
+    - submit：R5.submit=0 → R6.submit=1 → R7=2 → R8=R9=3（**同 step_rank**；production
+      先做 R7 全域重複檢查，再依 `gate2BindingReqs` 固定 kind 序逐項——found 即驗
+      digest（R9）、not found 才報 missing（R8），所以「較早 kind 的 R9」先於「較晚
+      kind 的 R8」：precedence 由 per_kind 的 `source_index`（kind occurrence rank）
+      承擔，同 kind 內 R8/R9 互斥無需 rank；gate2.go:283-306、42-48）。bundle 的
+      `required_kinds` 順序凍結為 spec_manifest → plan → base_commit → risk_policy →
+      permission_manifest。
     - decide：**R3=1**（gateDecide 步驟 2）→ R1=2 → R2=3 → R4=4 → R5.decide=5（PrepareDecision:86-105）→ R11=6 → R12=7（ReconcileBindings 現值比對，approved）→ R21=8 → R6.decide=9（BuildDecision:114-127）→ R24／task-loop／R26=10（build stage 層內再分 pre_loop/task_loop/post_loop）→ **R16=11**（gateDecide 步驟 8-9，於 PrepareDecision **完成後**才檢查）。
     - 實作時對照 gateDecide 十一步＋service.go 實序整表再驗一次，發現不符以 production 為準修 bundle 並在 commit message 記錄。
   - risk 規則（R24 起含 per_task 全部）guard 皆含 `decision == "approved"`（rejected 早退，gate2.go:114-119）。
@@ -799,7 +903,7 @@ func TestEvaluateDeterministicBytes(t *testing.T) {
 
 - [ ] **Step 1: Write the failing test**——表驅動隔離 fixture（測試碼同 plan rev1 `TestGate2BundleIsolatedRuleCoverage`：每條規則一組 Mutate → truth=false 且 Violations 含該 id；乾淨 snapshot → true）。fixture 由 `mustSnapshot` 複本逐條變異；submit fixture `evaluation_phase="submit"`、decision 群組 not_applicable。R16 案例含一筆 hard 語意驗證（state=open 一律擋，不看 hard）。
 - [ ] **Step 2: Run to verify failure**（bundle 檔不存在）。
-- [ ] **Step 3: Implement**——依上表逐條寫 YAML；R9 regex 沿 gate2.go:28-31。
+- [ ] **Step 3: Implement**——依上表逐條寫 YAML，檔首帶 `required_kinds` 常數表（五 kind 依 gate2BindingReqs 序，pattern 沿 gate2.go:28-31 兩條 regex）；R8／R9 標 `per_kind: true`。
 - [ ] **Step 4: Run to verify pass**＋gofmt＋`go vet ./internal/domainspec/`。
 - [ ] **Step 5: Commit**——`feat(domainspec): gate2 rule bundle——in-scope 規則落 CEL＋隔離 fixture 全覆蓋`
 
@@ -873,6 +977,9 @@ func TestPrimaryPrecedenceFourLayers(t *testing.T) {
         // 跨 gate step（plan rev2 新增）：
         {"submit beats decide", []Violation{
             {RuleID: "R1", SourceIndex: -1}, {RuleID: "R7", SourceIndex: -1}}, "R7"},
+        // kind occurrence rank（plan rev3——較早 kind 的 digest 錯先於較晚 kind 的 missing）：
+        {"earlier-kind R9 beats later-kind R8", []Violation{
+            {RuleID: "R8", SourceIndex: 1}, {RuleID: "R9", SourceIndex: 0}}, "R9"},
         {"R3 beats PrepareDecision internals", []Violation{
             {RuleID: "R11", SourceIndex: -1}, {RuleID: "R3", SourceIndex: -1}}, "R3"},
         {"BuildDecision beats R16", []Violation{
@@ -948,7 +1055,7 @@ func TestCompareCaseContract(t *testing.T) {
 **Files:**
 - Create: `internal/domainspec/corpus.go`（manifest 型別＋重放＋freshness）
 - Create: `internal/domainspec/corpus_oracle_test.go`（oracle adapters——test 檔，import `internal/gatepolicy`／`internal/gate`／`internal/escalation`；domainspec 本體維持零依賴）
-- Create: `domainspec_r3_oracle_test.go`（**repo root、package main test 檔**——R3 approver 檢查位於 app.go gateDecide 路徑，`internal/` 無法呼叫；沿既有 root 測試慣例（如 app_wsid_test.go）以 App 測試 helper 產生 R3 verdict。實作時先確認可測 seam；若 root helper 無法無 GUI 直呼，R3 oracle 改列豁免＋合成案例並於收斂報告記載）
+- Create: `domainspec_oracle_freshness_test.go`（**repo root、package main test 檔，plan rev3**——完整 freshness dispatcher 所在：root 可 import `internal/domainspec` 與全部 internal seam，並沿既有 root 測試慣例（app_gate_test.go:22 已證明 App gate seam 可測）直呼 R3 的 approver 檢查路徑。`internal/domainspec` 的測試 package 無法呼叫 root App seam，dispatcher 放 internal 側接不了線——`TestOracleFreshnessAllFresh`／`TestOracleFreshnessDetectsCorruption` 因此都放本檔。**R3 無「改豁免」fallback：R3 屬已核准 shadow 範圍，root 接線若不成立即 NO-GO**（spec §6 精神——範圍做不到就收斂，不降格）
 - Create: `internal/domainspec/testdata/corpus/*.json`
 - Test: `internal/domainspec/corpus_test.go`
 
@@ -978,7 +1085,9 @@ func ReplayCorpus(b *CompiledBundle, cases []CorpusCase, runtimeCostLimit uint64
 
 // VerifyOracleFreshness（plan rev2——出口 6b 的獨立可驗證 guard）：
 // 對每筆 evaluated 案例以 recompute 重跑 oracle，回傳固化 verdict 與重跑結果
-// 不一致的案例名。recompute 由 oracle adapter（test 檔）注入。
+// 不一致的案例名。純函式放 corpus.go；recompute dispatcher（含全部 seam，
+// 含 R3 App seam）於 repo root 的 freshness test 檔注入（plan rev3——internal
+// 測試 package 接不到 root seam，dispatcher 必須住在 root）。
 func VerifyOracleFreshness(cases []CorpusCase, recompute func(CorpusCase) (GoVerdict, error)) ([]string, error)
 ```
 
@@ -988,13 +1097,13 @@ func VerifyOracleFreshness(cases []CorpusCase, recompute func(CorpusCase) (GoVer
   - `gate_service_prepare`：`gate.Service.PrepareDecision`（stub journal 預置 pending entry）→ R1、R2、R4、**R5.decide**。
   - `gatepolicy_reconcile`：**`Gate2Policy.ReconcileBindings`**（pseudo-record＋stub digest 讀值——R11／R12 的實際 seam，plan rev2 補；PrepareDecision approved 分支同時可觀測 causes[0] 首錯序）→ R11、R12。
   - `gatepolicy_build`：`Gate2Policy.BuildDecision` → R21、**R6.decide**、R24–R31（含 R28 三檢查點）、R26；pass 案例的 `RiskDecisions` 即取其 `*gate.Metadata.RiskDecisions` 逐欄轉 `RiskDecision`。
-  - `escalation`：`escalation.BlockingFor`（scope 由案例 gate＋subject 對照 production `scopeForSubject` 值固化）→ R16（含 hard 案例）。
-  - `app_gatedecide`：root test 檔（R3）——App helper 以空 git identity 觸發 approver 拒絕。
+  - `escalation`：`escalation.BlockingFor`（scope 由案例 gate＋subject 對照 production `scopeForSubject` 值固化）→ R16。**hard 對齊警訊的證據建構（plan rev3）**：snapshot facts 沒有 hard 欄位，證據在 oracle 側——以 `escalation.Item{Hard: true, State: "open", BlockScope: ...}` 建 production escalation 呼叫 `BlockingFor` 得 blocked，投影成 facts（不含 hard）後 CEL 亦 blocked——兩側一致即證明「忽略 hard」語意被忠實複製；corpus 案例的 name／covers_rules 記明此建構。
+  - `app_gatedecide`：repo root freshness 檔內的 R3 adapter——沿 app_gate_test.go:22 的 App gate seam 慣例，以空 git identity 觸發 approver 拒絕（無 fallback，接不了線即 NO-GO）。
   - 訊息形狀對映：`map[oracleSeam]map[string]string`——**(seam, message pattern) → rule id**；R5／R6 的 submit／decide 由 seam 天然區分（單一全域字串表無法區分同文案，plan rev2 修正）。同 seam 內一筆錯誤命中多 pattern → 測試紅（對映必須唯一）。
-- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例＋乾淨 pass 案例（submit／decide 各一，approved pass 案例帶 RiskDecisions 逐欄固化）；precedence 案例**五筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 加跨 gate step 兩筆：R3+R24→R3、R30+R16→R30）；對齊警訊各一（R16 hard、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（Exempt）。
+- 案例集（(d) 留 Task 8）：每條 in-scope 規則隔離違規案例（per_kind 的 R8／R9 至少各一 kind）＋乾淨 pass 案例（submit／decide 各一，approved pass 案例帶 RiskDecisions 逐欄固化）；precedence 案例**六筆**（spec 三筆：R24+R30、R30@0+R25@1、R31+R26；plan rev2 跨 gate step 兩筆：R3+R24→R3、R30+R16→R30；plan rev3 kind occurrence 一筆：spec_manifest digest 錯＋plan kind missing→**R9**）；對齊警訊各一（R16 hard——建構見上、R11 Role!="" 不參與）；`acquisition_failed` 兩筆（LoadAt 錯、rev-parse fatal）；dirty-tree host boundary 一筆（Exempt）。
 
-- [ ] **Step 1: Write the failing tests**——`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）；`TestOracleFreshnessAllFresh`（recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑，取代 rev1「註解掉重呼」的手動實驗）。
-- [ ] **Step 2: Run to verify failure**；**Step 3: Implement**；**Step 4: `go test ./internal/domainspec/ -count=1` 全綠＋root 測試檔 `go test -run TestDomainspecR3Oracle . -count=1`＋gofmt**。
+- [ ] **Step 1: Write the failing tests**——internal 側：`TestReplayCorpusAllConsistent`（Mismatches 空、Inconsistent==0）；`TestCoverageComplete`（UncoveredRules 逐一比對豁免表 `exemptRules`，非豁免即紅）。root 檔（plan rev3）：`TestOracleFreshnessAllFresh`（dispatcher 覆蓋全部 seam 含 R3，recompute 全一致、回傳空）；`TestOracleFreshnessDetectsCorruption`（**程式化腐化**：複製 corpus、翻轉一筆固化 verdict 的 Outcome → VerifyOracleFreshness 必須點名該案例——出口 6b 可獨立驗證的紅路徑）。
+- [ ] **Step 2: Run to verify failure**；**Step 3: Implement**；**Step 4: `go test ./internal/domainspec/ -count=1` 全綠＋root freshness 檔 `go test -run TestOracleFreshness . -count=1`＋gofmt**。
 - [ ] **Step 5: Commit**——`feat(domainspec): corpus manifest＋seam-aware oracle harness＋freshness guard（出口 5 主體）`
 
 ---
@@ -1066,8 +1175,8 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
 ```
 
 - [ ] **Step 2: 驗全套**——`go test ./... -count=1`（全 repo）＋`gofmt -l .` 空。
-- [ ] **Step 3: 不接管佐證（出口 8）**——`git diff <spike 起點 commit>..HEAD --stat -- . ':(exclude)internal/domainspec' ':(exclude)docs' ':(exclude)go.mod' ':(exclude)go.sum' ':(exclude)domainspec_r3_oracle_test.go'` 輸出必須空；go.mod/go.sum 增項僅 cel-go（diff 內容貼進報告）；root 新增檔僅 `domainspec_r3_oracle_test.go`（test 檔，非 production 路徑）。
-- [ ] **Step 4: 收斂報告**——逐項列八個出口的證據（測試名＋輸出摘要）、coverage 表（per phase-specific id）、豁免表（R15／host 層項／acquisition_failed／dirty-tree；**R32 不豁免**——引 shadow RiskDecisions 逐欄比對證據）、剩餘風險（step_rank 人工凍結、A9 來源可用性、R3 root seam 可測性）、GO／NO-GO 判定與 M4.5 建議。措辭遵守證據鏈慣例：只寫實測結果，未驗證項明標。
+- [ ] **Step 3: 不接管佐證（出口 8）**——`git diff <spike 起點 commit>..HEAD --stat -- . ':(exclude)internal/domainspec' ':(exclude)docs' ':(exclude)go.mod' ':(exclude)go.sum' ':(exclude)domainspec_oracle_freshness_test.go'` 輸出必須空；go.mod/go.sum 增項僅 cel-go（diff 內容貼進報告）；root 新增檔僅 `domainspec_oracle_freshness_test.go`（test 檔，非 production 路徑）。
+- [ ] **Step 4: 收斂報告**——逐項列八個出口的證據（測試名＋輸出摘要）、coverage 表（per phase-specific id，R8／R9 per kind）、豁免表（R15／host 層項／acquisition_failed／dirty-tree；**R32 不豁免**——引 shadow RiskDecisions 逐欄比對證據；**R3 不豁免**——root 接線不成立即 NO-GO）、剩餘風險（step_rank 人工凍結、A9 來源可用性）、GO／NO-GO 判定與 M4.5 建議。措辭遵守證據鏈慣例：只寫實測結果，未驗證項明標。
 - [ ] **Step 5: Commit**——`docs(domainspec): spike 收斂報告——八項出口逐項證據＋GO/NO-GO`
 
 ---
@@ -1075,7 +1184,7 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
 ## Self-Review（已跑）
 
 1. **Spec coverage**：出口 1→Task 1；出口 2→Task 3；出口 3、4→Task 4；出口 5→Task 5–8；出口 6→Task 9（6a）＋Task 6／7（6b 程式化 guard）；出口 7→Task 2＋Task 3 digest；出口 8→Task 9。§1 對齊警訊兩筆→Task 7；§2 presence matrix／canonical→Task 1、2；§3 代數與聚合→Task 3、4；§4 比較契約（含 pass 側 RiskDecisions）→Task 6、7。
-2. **Placeholder scan**：無 TBD；R8／R9 rank 細序、step_rank 整表覆核、R3 root seam 可測性為**明標實作時驗證事項**（附 fallback 路徑），非 placeholder。
+2. **Placeholder scan**：無 TBD；step_rank 整表覆核為**明標實作時驗證事項**；R3 root 接線無 fallback（不成立即 NO-GO）；`replaceGroup` helper 附實作建議（RawMessage 覆寫），非 placeholder。
 3. **Type consistency**：`Fact[T]` 存取形（`.Value`／`.Presence`）在 Task 2／4／5／6 fixture 一致；`RiskDecision`（五欄）與 `RiskSelection`（三欄）分離，`GoVerdict.RiskDecisions` 用前者；`CompareCase` 簽章含 snapshot（Task 6／7 一致）。
 
 ## 修訂記錄
@@ -1098,4 +1207,21 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
   - P1：A9 案例改為 journal 實況三筆（initial approved／stale blocked 重建／
     override approved）；rejected pass 移列合成案例；出口 6b 改
     `VerifyOracleFreshness`＋程式化腐化測試，取代手動實驗。
+- rev3（2026-08-26，plan review gate 第二輪 4 P1＋1 補強收斂）：
+  - P1：R8／R9 改 **per_kind 實體化**（bundle 增 `required_kinds` 常數表，順序凍結
+    ＝gate2BindingReqs）——production 逐 kind found→R9／not found→R8，「較早 kind
+    digest 錯」先於「較晚 kind missing」，precedence 由 kind occurrence rank
+    （source_index）承擔；補 selector 案例與 corpus 第六筆 precedence 案例。
+  - P1：`validSnapshotJSON` 補齊五種 required binding 且 current 四值對齊 bound
+    digest（正式 bundle 下 clean 基準才可能 true）；per-task plan missing 測試改
+    純 per-task bundle（避免 deny 蓋掉 unknown）。
+  - P1：freshness dispatcher（含全部 seam）移至 repo root
+    `domainspec_oracle_freshness_test.go`（root 可 import internal，反向不可）；
+    **刪除 R3 豁免 fallback**——R3 屬已核准範圍，接線不成立即 NO-GO。
+  - P1：presence matrix 補 **decide/invalid 欄**（R1 隔離輸入）與 **entry 非
+    pending 例外**（request＋current 群組允許 not_applicable，R4 路徑）；matrix
+    測試改由合法底稿單欄翻轉（新增 validSubmitSnapshotJSON／
+    validRejectedSnapshotJSON／replaceGroup helper）。
+  - 補強：R16 hard 對齊警訊明定證據建構——oracle 側以 Hard:true 的 production
+    escalation 呼叫 BlockingFor，投影 facts（無 hard 欄位）後兩側皆 blocked。
 - rev1（2026-08-26）：初版。
