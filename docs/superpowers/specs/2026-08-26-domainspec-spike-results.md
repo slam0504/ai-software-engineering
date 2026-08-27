@@ -615,7 +615,7 @@ App seam 重放、逐欄輸出比對），**44 筆 corpus（41 evaluated＋3 acq
 `2026-08-26-domainspec-spike.md` rev9 Global Constraints／修訂記錄。
 
 **對 GO／NO-GO 判定的影響**：不改變判定（仍為 GO），但出口 5（corpus 重放一致性＋
-coverage＋precedence）在本次 fix wave 之前对 R10 這一塊留有一個「未驗證」的缺口——
+coverage＋precedence）在本次 fix wave 之前對 R10 這一塊留有一個「未驗證」的缺口——
 本裁決與三件證據補上這個缺口後，出口 5 才算完備成立；§六 GO 判定因此明載其前提是
 本裁決成立。
 
