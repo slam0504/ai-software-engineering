@@ -92,9 +92,12 @@ func validRejectedSnapshotJSON() string {
 	for _, k := range []string{"current", "base_commit_state", "plan", "risk_policy"} {
 		j = replaceGroup(j, k, na) // helper：以群組 key 為界整段替換（實作為 regexp `"<k>": \{.*?\}\}?` 或以 json round-trip 改欄位後重排）
 	}
-	j = strings.Replace(j,
-		`"risk_selections": {"presence":"known","value":[{"task_id":"T1","selected_risk_tier":"low","override_reason":""}]}`,
-		`"risk_selections": {"presence":"known","value":[]}`, 1)
+	// replaceGroup 重組整份 JSON 時一律輸出 `"key":value`（無空白，見 replaceGroup
+	// 實作），故這裡改回 rejected 的空 risk_selections 也要用同一種無空白格式
+	// 比對，否則 strings.Replace 靜默無 match、risk_selections 留著非空值——
+	// 一個「合法 rejected snapshot」意外帶著會觸發 R21 的 risk_selections（只有
+	// 真的跑 Evaluate 才會現形，先前消費端都沒有觸發）。
+	j = replaceGroup(j, "risk_selections", `{"presence":"known","value":[]}`)
 	return j
 }
 

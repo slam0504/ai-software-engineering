@@ -1,0 +1,148 @@
+{
+  "name": "isolated-R29",
+  "kind": "evaluated",
+  "evaluation_phase": "decide",
+  "oracle_seam": "gatepolicy_build",
+  "provenance": "gatepolicy_tests",
+  "facts_digest": "sha256:8c6d0906203fcfd1658febaf5cef46b891d55b1d21b81a399b676b787fb9f7ab",
+  "bundle_digest": "sha256:2a19b0a06d2dc0622bf2e095aba7e9e916f5cd634ddba982d5433d72e7d07b0a",
+  "snapshot": {
+    "schema_version": 1,
+    "evaluation_phase": "decide",
+    "decision": {
+      "presence": "known",
+      "value": "approved"
+    },
+    "reason": {
+      "presence": "known",
+      "value": ""
+    },
+    "approver": {
+      "presence": "known",
+      "value": {
+        "name": "u",
+        "email": "u@x"
+      }
+    },
+    "entry": {
+      "presence": "known",
+      "value": {
+        "exists": true,
+        "has_request": true,
+        "has_record": false
+      }
+    },
+    "request": {
+      "presence": "known",
+      "value": {
+        "gate": "gate2",
+        "subject": "plan:P1",
+        "bindings": [
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "plan",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "base_commit",
+            "role": "",
+            "ref": "HEAD",
+            "digest": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "kind": "risk_policy",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "permission_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      }
+    },
+    "current": {
+      "presence": "known",
+      "value": {
+        "spec_manifest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "plan_manifest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "risk_policy": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "permission_manifest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "base_commit_state": {
+      "presence": "known",
+      "value": "ok"
+    },
+    "plan": {
+      "presence": "known",
+      "value": {
+        "tasks": [
+          {
+            "id": "T1",
+            "source_index": 0,
+            "minimum_risk_tier": "high",
+            "planner_risk_tier": "low",
+            "impact": {
+              "contexts": [
+                "gate"
+              ],
+              "modules": []
+            }
+          }
+        ]
+      }
+    },
+    "risk_policy": {
+      "presence": "known",
+      "value": {
+        "default_tier": "low",
+        "rules": [
+          {
+            "match": {
+              "contexts": [
+                "gate"
+              ],
+              "modules": null
+            },
+            "tier": "high"
+          }
+        ]
+      }
+    },
+    "risk_selections": {
+      "presence": "known",
+      "value": [
+        {
+          "task_id": "T1",
+          "selected_risk_tier": "high",
+          "override_reason": ""
+        }
+      ]
+    },
+    "escalations": {
+      "presence": "known",
+      "value": []
+    }
+  },
+  "go_verdict": {
+    "outcome": "blocked",
+    "primary_rule_id": "R29",
+    "risk_decisions": null
+  },
+  "reason": "",
+  "role": "isolated",
+  "covers_rules": [
+    "R29"
+  ]
+}

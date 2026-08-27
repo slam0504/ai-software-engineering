@@ -1,0 +1,14 @@
+{
+  "name": "acquisition-failed-loadat-error",
+  "kind": "acquisition_failed",
+  "evaluation_phase": "submit",
+  "oracle_seam": "host_boundary",
+  "provenance": "host_boundary",
+  "facts_digest": "",
+  "bundle_digest": "",
+  "snapshot": null,
+  "go_verdict": null,
+  "reason": "LoadAt(spec_manifest/plan/risk_policy) 讀取 base_commit 對應 blob 失敗（對照 gate2.go:270-281 LoadAt 錯誤路徑）：facts 無法組成，計入 Exempt。",
+  "role": "none",
+  "covers_rules": null
+}

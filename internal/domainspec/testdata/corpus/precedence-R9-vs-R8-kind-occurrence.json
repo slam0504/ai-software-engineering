@@ -1,0 +1,97 @@
+{
+  "name": "precedence-R9-vs-R8-kind-occurrence",
+  "kind": "evaluated",
+  "evaluation_phase": "submit",
+  "oracle_seam": "gatepolicy_validate",
+  "provenance": "synthetic",
+  "facts_digest": "sha256:e267702b5de8edd93b30c6d033da1d63e8ae4b6370c6ac4cc992f41f8a7d76f8",
+  "bundle_digest": "sha256:2a19b0a06d2dc0622bf2e095aba7e9e916f5cd634ddba982d5433d72e7d07b0a",
+  "snapshot": {
+    "schema_version": 1,
+    "evaluation_phase": "submit",
+    "decision": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "reason": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "approver": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "entry": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "request": {
+      "presence": "known",
+      "value": {
+        "gate": "gate2",
+        "subject": "plan:P1",
+        "bindings": [
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "bogus"
+          },
+          {
+            "kind": "base_commit",
+            "role": "",
+            "ref": "HEAD",
+            "digest": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "kind": "risk_policy",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "permission_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      }
+    },
+    "current": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "base_commit_state": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "plan": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "risk_policy": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "risk_selections": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "escalations": {
+      "presence": "not_applicable",
+      "value": null
+    }
+  },
+  "go_verdict": {
+    "outcome": "blocked",
+    "primary_rule_id": "R9",
+    "risk_decisions": null
+  },
+  "reason": "",
+  "role": "precedence",
+  "covers_rules": [
+    "R9",
+    "R8"
+  ]
+}

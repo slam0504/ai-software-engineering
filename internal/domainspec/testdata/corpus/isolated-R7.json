@@ -1,0 +1,108 @@
+{
+  "name": "isolated-R7",
+  "kind": "evaluated",
+  "evaluation_phase": "submit",
+  "oracle_seam": "gatepolicy_validate",
+  "provenance": "gatepolicy_tests",
+  "facts_digest": "sha256:51f70286c90b43239579b094f29cfedb1be86e8ce2fa01a30191e9330874d9b6",
+  "bundle_digest": "sha256:2a19b0a06d2dc0622bf2e095aba7e9e916f5cd634ddba982d5433d72e7d07b0a",
+  "snapshot": {
+    "schema_version": 1,
+    "evaluation_phase": "submit",
+    "decision": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "reason": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "approver": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "entry": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "request": {
+      "presence": "known",
+      "value": {
+        "gate": "gate2",
+        "subject": "plan:P1",
+        "bindings": [
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "plan",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "base_commit",
+            "role": "",
+            "ref": "HEAD",
+            "digest": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "kind": "risk_policy",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "permission_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      }
+    },
+    "current": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "base_commit_state": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "plan": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "risk_policy": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "risk_selections": {
+      "presence": "not_applicable",
+      "value": null
+    },
+    "escalations": {
+      "presence": "not_applicable",
+      "value": null
+    }
+  },
+  "go_verdict": {
+    "outcome": "blocked",
+    "primary_rule_id": "R7",
+    "risk_decisions": null
+  },
+  "reason": "",
+  "role": "isolated",
+  "covers_rules": [
+    "R7"
+  ]
+}

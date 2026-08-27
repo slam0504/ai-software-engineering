@@ -1,0 +1,14 @@
+{
+  "name": "acquisition-failed-revparse-fatal",
+  "kind": "acquisition_failed",
+  "evaluation_phase": "submit",
+  "oracle_seam": "host_boundary",
+  "provenance": "host_boundary",
+  "facts_digest": "",
+  "bundle_digest": "",
+  "snapshot": null,
+  "go_verdict": null,
+  "reason": "git rev-parse --verify --quiet 對 base_commit 回傳非 exit0/exit1 的 fatal 錯誤（對照 gate2.go:234-248，非 stale 分支）：facts 無法組成，計入 Exempt。",
+  "role": "none",
+  "covers_rules": null
+}

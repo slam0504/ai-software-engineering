@@ -1,0 +1,14 @@
+{
+  "name": "acquisition-failed-dirty-worktree",
+  "kind": "acquisition_failed",
+  "evaluation_phase": "submit",
+  "oracle_seam": "host_boundary",
+  "provenance": "host_boundary",
+  "facts_digest": "",
+  "bundle_digest": "",
+  "snapshot": null,
+  "go_verdict": null,
+  "reason": "submit 前 worktree 非乾淨（dirty tree），host 邊界檢查中止：facts 無法組成，計入 Exempt。",
+  "role": "none",
+  "covers_rules": null
+}
