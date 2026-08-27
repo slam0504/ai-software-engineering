@@ -28,6 +28,13 @@ func TestPrimaryPrecedenceFourLayers(t *testing.T) {
 		// 跨 gate step（plan rev2 新增）：
 		{"submit beats decide", []Violation{
 			{RuleID: "R1", SourceIndex: -1}, {RuleID: "R7", SourceIndex: -1}}, "R7"},
+		// controller ruling（phaseRank layer 0）：decide R3 的 step_rank（1）比
+		// submit R7 的 step_rank（2）小，若排序只看 step_rank 數字（或退化成
+		// bundle 宣告序的巧合），R3 會贏；必須顯式先比 phase 才能保證 submit
+		// 全部先於 decide（spec §4 layer 1）——這筆案例會戳破「純 step_rank
+		// 比較」與「只靠宣告序」兩種錯誤實作，只有真的編碼 phaseRank 才會過。
+		{"phase rank beats lower step_rank number across phases", []Violation{
+			{RuleID: "R3", SourceIndex: -1}, {RuleID: "R7", SourceIndex: -1}}, "R7"},
 		// kind occurrence rank（plan rev3——較早 kind 的 digest 錯先於較晚 kind 的 missing）：
 		{"earlier-kind R9 beats later-kind R8", []Violation{
 			{RuleID: "R8", SourceIndex: 1}, {RuleID: "R9", SourceIndex: 0}}, "R9"},

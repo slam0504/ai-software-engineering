@@ -76,10 +76,31 @@ func BuildShadowRiskDecisions(s *FactsSnapshot) []RiskDecision {
 
 var stageRank = map[string]int{"none": 0, "pre_loop": 1, "task_loop": 2, "post_loop": 3}
 
-// precedenceKey 是 PrimaryViolation 四層裁決的排序鍵；bundleIdx 不是 spec §4
-// 的第五層語意，只是「四層完全打平時」的 determinism 保底（見 PrimaryViolation
-// 說明）。
+// phaseRank：spec §4 layer 1（gate step＝phase 先於 step 順序）——submit 全部
+// 先於 decide 全部。frozen step_rank table 是「每個 phase 各自從 0（或 1）
+// 重新編號」（見 testdata/gate2-bundle.yaml：submit R7.step_rank=2、decide
+// R1.step_rank=2 剛好撞號），若不顯式先比 phase，數值相同的 cross-phase
+// step_rank 會讓排序退化成偶然（controller ruling：不能讓這個 spec 規定的
+// 屬性只靠 bundle 檔案的宣告順序「碰巧」成立）。未知 phase 回傳極大值，
+// 讓其排到最後而不是 panic（validateRules 已在載入時擋下非法 phase，這裡
+// 純防禦）。
+func phaseRank(phase string) int {
+	switch phase {
+	case "submit":
+		return 0
+	case "decide":
+		return 1
+	default:
+		return int(^uint(0) >> 1) // math.MaxInt，未知 phase 排到最後
+	}
+}
+
+// precedenceKey 是 PrimaryViolation 的排序鍵：phaseRank 是 spec §4 layer 1
+// 的顯式編碼（見 phaseRank），其後才是四層 (step_rank, stageRank[stage],
+// source_index(-1 視為 0), check_rank)；bundleIdx 不是 spec 語意的一部分，
+// 只是「前五層完全打平時」的 determinism 保底（見 PrimaryViolation 說明）。
 type precedenceKey struct {
+	phaseRank int
 	stepRank  int
 	stageRank int
 	srcIndex  int
@@ -88,6 +109,9 @@ type precedenceKey struct {
 }
 
 func (a precedenceKey) less(b precedenceKey) bool {
+	if a.phaseRank != b.phaseRank {
+		return a.phaseRank < b.phaseRank
+	}
 	if a.stepRank != b.stepRank {
 		return a.stepRank < b.stepRank
 	}
@@ -103,15 +127,20 @@ func (a precedenceKey) less(b precedenceKey) bool {
 	return a.bundleIdx < b.bundleIdx
 }
 
-// PrimaryViolation：四層 precedence（spec §4）——
-// (step_rank, stageRank[stage], source_index(-1 視為 0), check_rank) 字典序最小者。
+// PrimaryViolation：spec §4 precedence——先比 phase（submit 先於
+// decide，見 phaseRank），再四層字典序 (step_rank, stageRank[stage],
+// source_index(-1 視為 0), check_rank) 選出最小者。
 //
-// bundleIdx tiebreak（Task 6 選擇）：四層鍵值可能完全打平——例如本檔測試把
-// submit phase 與 decide phase 的 Violations 人為合併比較時，兩個 phase 各自
-// 由 0（或 1）起算的 step_rank 剛好撞號。真實 Evaluate 呼叫一次只評估單一
-// phase，Result.Violations 不會真的橫跨兩個 phase，故這個 tiebreak 只在合成
-// 測試／未來跨 phase 合併情境下才會被觸發；用 b.Rules 的宣告序（bundle YAML
-// 內 submit 先於 decide）打平，保底 determinism，不做猜測式仲裁。
+// 在單次 Evaluate 呼叫內，phase 永遠不會混雜（Evaluate 依 rule.Phase ==
+// s.EvaluationPhase 過濾，只評估單一 phase——見 eval.go），所以 phaseRank
+// 這一層在正常呼叫路徑下恆為常數、不影響排序；它只在合成／跨 phase 彙總的
+// Violations 清單（例如本檔測試、或未來把兩個 phase 的結果合併比較的情境）
+// 才會真正發揮作用。即便如此仍必須顯式編碼這一層，而不是依賴 bundle YAML
+// 內 submit 規則恰好宣告在 decide 之前——後者只是巧合，不是 spec 保證。
+//
+// bundleIdx tiebreak：phaseRank／四層鍵值全部打平時（理論上要 phase 相同、
+// step_rank／stage／source_index／check_rank 都相同才會發生）用 b.Rules 的
+// 宣告序打平，保底 determinism，不做猜測式仲裁。
 //
 // 找不到對應規則（v.RuleID 不在 b.ByID——理論上不應發生，Violations 只會來自
 // 同一 bundle 的 Evaluate）的 violation 略過不參與排序，而非 panic：primary
@@ -143,6 +172,7 @@ func PrimaryViolation(b *CompiledBundle, r *Result) (Violation, bool) {
 			srcIndex = 0
 		}
 		key := precedenceKey{
+			phaseRank: phaseRank(rule.Phase),
 			stepRank:  rule.StepRank,
 			stageRank: stageRank[rule.Stage],
 			srcIndex:  srcIndex,
