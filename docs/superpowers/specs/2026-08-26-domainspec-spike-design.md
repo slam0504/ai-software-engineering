@@ -3,7 +3,7 @@
 Owner 2026-08-21 仲裁凍結的方向（見 auto memory `domainspec-spike-direction`）：**獨立、
 限時**的 spike，切點是 Gate 2 decision eligibility＋risk policy 的 **shadow evaluator**
 ——immutable facts snapshot 評估、現行 Go 實作保持權威、新 kernel 只比對不接管；不重塑
-M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev6。
+M4。第二階段 STALE facts、第三階段 TCA consistency 不在本 spike。本文件 rev7。
 
 ## 1. 範圍：要 shadow 的規則面
 
@@ -72,8 +72,11 @@ Rule ID**分拆（保持「每條規則單一 phase」的代數不變式，cover
   帶 `decision == "approved"` guard。
 
 其餘規則維持單 phase：R7–R9（＋lineage，不進 CEL）屬 submit（ValidateRequest）；
-R1–R4、R10–R12、R15–R16 與 risk 規則屬 decide。decide 案例不評估 submit 規則、反之
-亦然；submit corpus 的 decision facts 一律 `not_applicable`。
+R1–R4、R11–R12、R15–R16 與 risk 規則屬 decide——**R11–R12 沿 R10 guard**：R10 是
+PrepareDecision approved 分支的 guard／aggregation 機制（service.go:107-116——跑
+`ReconcileBindings`，回傳的 causes 必須為空），**非獨立 CEL 規則**；coverage 豁免與
+證據義務見 §4。decide 案例不評估 submit 規則、反之亦然；submit corpus 的 decision
+facts 一律 `not_applicable`。
 
 **Canonical 形式（rev2；rev3 修 plan.tasks）**：snapshot 帶 `schema_version`；presence
 以 pointer／wrapper 表達（nil＝missing，與合法零值區分）；`plan.tasks` **保留 plan
@@ -178,7 +181,14 @@ sha256 digest 可重放；decode 拒絕未知欄位（fail loud）。
   3. 任一 task-loop violation＋R26 extra selection——primary 必須是該 task-loop
      violation（task-loop 先於 post-loop）。
 
-  未覆蓋列表必須為空或明列豁免理由。
+  未覆蓋列表必須為空或明列豁免理由——**R10 豁免（rev7，completion gate 裁決）**：
+  guard／aggregation 無獨立 deny 內容，任何 R10 觸發必為 R11∨R12 觸發，隔離唯一命中
+  不可能成立；證據義務三件——(a) R11／R12 的 approved guard 已入 bundle（`gate2-
+  bundle.yaml` R11／R12 規則區塊，皆帶 `decision == 'approved'` 守門）；(b) gate
+  service seam 測試證明 approved-only（rejected 跳過 reconcile、bindings 已 stale
+  下仍成功，見 service.go:77-84）；(c) R10 transport 與 causes[0] 首錯序 corpus 案例
+  （經 PrepareDecision 全路徑，primary 對映 R11；R11＋R12 同時 stale → primary
+  R11）。
 - **不接管**：spike 全程不掛 production `gateDecide` 路徑、不加 runtime hook；比對只在
   測試／CLI harness 內發生。
 
@@ -280,4 +290,11 @@ R21–R34 risk 決議與送核路徑豁免項），完整表格與 file:line 見
   - P2：contexts／modules canonical 改**排序後去重**（production 無法觀測其
     multiplicity；bindings／risk_selections 的可觀測 duplicate 仍保留不去重）；
     補重排＋重複值相同 digest 測試（§5 出口 7）。
+- rev7（2026-08-27，completion gate 裁決：R10 定性為 guard／aggregation）：
+  - P1：completion gate 對收斂報告點名的「R10 scope 未驗證」P1 裁決為選項 2——R10
+    正式定性為 R11／R12 的 guard／aggregation 機制，非獨立 CEL 規則。理由：§1 已明定
+    R11／R12「沿 R10 guard」，R10 本身無獨立 deny 內容（任何觸發必為 R11∨R12
+    觸發），孤立唯一命中在定義上不可能成立；§4 coverage 條款本就允許豁免（未覆蓋
+    列表可明列豁免理由）。本次補上 R10 的明確豁免理由與三件證據義務（見 §4），
+    對應 plan rev9 與收斂報告 R10 裁決章節。
 - rev1（2026-08-26）：初版。

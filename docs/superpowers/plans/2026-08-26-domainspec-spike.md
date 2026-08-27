@@ -19,7 +19,7 @@
 - 三態 presence 全群組統一 wrapper；**missing → truth=unknown、not_applicable → 規則 not eligible（不影響 truth）**——兩者不可互混（plan gate rev2 P1）。
 - error 不併入 unknown：`status=evaluation_error` 與 `truth=unknown` 互不吞併。
 - gofmt 乾淨（觸碰檔案）；台灣用語書面中文 doc／commit；`go test ./internal/domainspec/... -count=1` 為每 task 通過門檻，收斂前跑全套 `go test ./...`。
-- 已知豁免（收斂報告必列）：R15（scope 導出）derivation 內嵌於 R16 `when`，coverage 以 scope-sensitive 案例＋豁免說明交代；R13／R17／R19／R20／lineage 屬 host 層（spec §1 不進 CEL 清單）。R32 不再豁免——由 Task 6 shadow RiskDecisions 逐欄比對承擔（plan rev2）。
+- 已知豁免（收斂報告必列）：R15（scope 導出）derivation 內嵌於 R16 `when`，coverage 以 scope-sensitive 案例＋豁免說明交代；R13／R17／R19／R20／lineage 屬 host 層（spec §1 不進 CEL 清單）；R10（guard／aggregation，證據義務三件——見 spec rev7 §4）。R32 不再豁免——由 Task 6 shadow RiskDecisions 逐欄比對承擔（plan rev2）。
 
 ---
 
@@ -1497,4 +1497,15 @@ func TestMutationBundleRuleFlipsCaught(t *testing.T) {
   - P2：mutation 測試依 CaseName 點名 `isolated-R31` 必在翻轉列、非 covers R31
     案例翻轉即紅（len>0 不足以證明翻對）；案例命名慣例 `isolated-<rule id>`
     凍結進案例集。
+- rev9（2026-08-27，completion gate 裁決：R10 定性為 guard／aggregation）：
+  - P1：對齊 spec rev7——R10 正式定性為 R11／R12 的 guard／aggregation 機制，非獨立
+    CEL 規則（completion gate 選項 2 裁決）；`已知豁免` 補列 R10，證據義務三件——
+    (a) R11／R12 的 approved guard 已入 bundle；(b) 根層新增
+    `TestR10ApprovedOnlyGuard`（真實 Gate2Policy＋stub loader/git，approved 對 stale
+    bindings 必敗、rejected 跳過 reconcile 必成功）；(c) 兩筆新 corpus 案例
+    `r10-transport-stale-approved`（role=alignment，R10 transport 全路徑）與
+    `r10-causes-first-error`（role=precedence，R11＋R12 同時 stale 驗 causes[0]
+    首錯序對映 CEL primary）；`gate_service_prepare` seam adapter 改接真正的
+    `gatepolicy.NewGate2Policy`（取代 stub），approved 分支才會真的跑到
+    `ReconcileBindings`。
 - rev1（2026-08-26）：初版。
