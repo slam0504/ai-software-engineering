@@ -101,3 +101,34 @@ func TestCompareCaseContract(t *testing.T) {
 		t.Fatal("evaluation_error must never compare equal")
 	}
 }
+
+// TestCompareCaseRejectedPassNilVsEmptyRiskDecisions（controller review 補測）：
+// decision=rejected 且 truth=="true" 是合法的 pass corpus 案例（spec §4——
+// 駁回成功也是 pass）。BuildShadowRiskDecisions 對非 approved 決議回傳
+// nil（見 compare.go 文件），但實際 corpus JSON 解碼出的 GoVerdict.RiskDecisions
+// 會是非 nil 的空 slice `[]RiskDecision{}`（`"risk_decisions": []`）。這正是
+// riskDecisionsEqual（5071cf6）要防的假陽性——若比對邏輯退化成
+// reflect.DeepEqual，nil 與空 slice 會被判定不相等，把合法的 rejected-pass
+// 案例誤報成不一致。
+func TestCompareCaseRejectedPassNilVsEmptyRiskDecisions(t *testing.T) {
+	s, err := DecodeFactsSnapshot([]byte(validRejectedSnapshotJSON()))
+	if err != nil {
+		t.Fatalf("decode rejected snapshot: %v", err)
+	}
+	b := bundleWithRanks(t)
+	r := &Result{Truth: "true", Status: "ok"}
+
+	if got := BuildShadowRiskDecisions(s); got != nil {
+		t.Fatalf("rejected decision must yield nil shadow risk decisions, got %+v", got)
+	}
+
+	good := GoVerdict{Outcome: "pass", RiskDecisions: []RiskDecision{}}
+	if ok, detail := CompareCase(b, s, r, good); !ok {
+		t.Fatalf("nil shadow vs decoded empty risk_decisions must still compare equal: %s", detail)
+	}
+
+	bad := GoVerdict{Outcome: "pass", RiskDecisions: []RiskDecision{{TaskID: "T1"}}}
+	if ok, _ := CompareCase(b, s, r, bad); ok {
+		t.Fatal("non-empty risk decisions for a rejected-pass case must be reported as mismatch")
+	}
+}
