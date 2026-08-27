@@ -255,3 +255,37 @@ func TestEvaluateDeterministicBytes(t *testing.T) {
 		t.Fatal("reason graph must be byte-identical across runs")
 	}
 }
+
+// TestEvaluatePerTaskSelMissingYieldsUnknown：final review 發現的 presence
+// 缺口回歸測試。decide presence matrix 合法容許 risk_selections missing
+// （facts.go validateDecideMatrix：isKnownColumn 允許 known 或 missing），此時
+// findSelection 一律回傳 nil，跟「risk_selections known 但該 task 無配對選擇」
+// 回傳的 nil 無法區分。R25（per_task，when: "decision == 'approved' && sel ==
+// null"）若不把 RefVars 含 sel 的規則對應到 risk_selections 群組的 own-presence
+// gate，就會把「未知」誤判成「已知為空」而 deny——spec §2 要求 missing →
+// unknown，不是 false。
+func TestEvaluatePerTaskSelMissingYieldsUnknown(t *testing.T) {
+	b := loadGate2Bundle(t)
+	s := mustSnapshot(t)
+	s.RiskSelections = Fact[[]RiskSelection]{Presence: Missing}
+
+	r := evalGate2(t, b, s)
+
+	if r.Truth != TruthUnknown {
+		t.Fatalf("risk_selections missing must yield unknown truth, got %s (violations=%+v)", r.Truth, r.Violations)
+	}
+	foundGroup := false
+	for _, g := range r.UnknownLeaves {
+		if g == "risk_selections" {
+			foundGroup = true
+		}
+	}
+	if !foundGroup {
+		t.Fatalf("unknown_leaves must contain risk_selections, got %v", r.UnknownLeaves)
+	}
+	for _, v := range r.Violations {
+		if v.RuleID == "R25" {
+			t.Fatalf("R25 must not fire deny when risk_selections is missing: %+v", r.Violations)
+		}
+	}
+}

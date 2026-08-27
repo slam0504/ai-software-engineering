@@ -175,7 +175,7 @@ func (fixedSizeCostEstimator) EstimateCallCost(_, _ string, _ *checker.AstNode, 
 
 // LoadBundle：strict YAML（KnownFields）→ enum／id 唯一／depends_on 存在且同 phase →
 // CEL compile/type-check（輸出必須 bool）→ static cost estimate 超限拒收 →
-// SCC 無環 → RefVars 抽取 → RequiredKinds 驗證 → digest。
+// SCC 無環 → RequiredKinds 驗證 → RefVars 抽取 → digest。
 func LoadBundle(yamlSrc []byte, staticCostLimit uint64) (*CompiledBundle, error) {
 	var raw Bundle
 	dec := yaml.NewDecoder(bytes.NewReader(yamlSrc))

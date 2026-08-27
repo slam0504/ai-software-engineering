@@ -27,8 +27,9 @@ const (
 	StatusEvaluationError Status = "evaluation_error"
 )
 
-// Violation 是單條規則單一實體化實例的完整命中紀錄（deny／allow 皆收，供
-// explain 與 Task 6 primary 裁決使用）。
+// Violation 只收 deny-effect 命中實例（frozen contract，見 recordInstance）；
+// allow 命中見 MatchedRuleIDs／ReasonGraph，不進這份列表。供 explain 與
+// PrimaryViolation 四層裁決使用。
 type Violation struct {
 	RuleID      string `json:"rule_id"`
 	Target      string `json:"target"`       // 實體化後（risk.T<id>／binding.<kind>）
@@ -274,11 +275,18 @@ func withOverrides(base map[string]any, overrides map[string]any) map[string]any
 }
 
 // refFactGroups 回傳 refVars 與 factGroupOrder 的交集，依 factGroupOrder 固定
-// 序——用於 deterministic 選取「第一個」missing／not_applicable 群組。
+// 序——用於 deterministic 選取「第一個」missing／not_applicable 群組。sel 是
+// findSelection 由 risk_selections 衍生出的頂層變數（見 buildBaseActivation／
+// per_task 展開），本身不是 factGroupOrder 裡的群組名，若不做映射，
+// RiskSelections.Presence==Missing 時引用 sel 的規則會漏掉 own-presence gate，
+// 讓 findSelection 回傳的 nil 被誤判成「已知但無選擇」而非「未知」（spec §2：
+// risk_selections missing → unknown，不是 deny）。因此把 RefVars 含 "sel"
+// 視同引用 "risk_selections" 群組；task 變數的等價語意已由 per_task 的
+// structuralGate("plan") 在展開前處理，不需要在這裡重複映射。
 func refFactGroups(refVars map[string]bool) []string {
 	var out []string
 	for _, g := range factGroupOrder {
-		if refVars[g] {
+		if refVars[g] || (g == "risk_selections" && refVars["sel"]) {
 			out = append(out, g)
 		}
 	}

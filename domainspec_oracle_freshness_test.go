@@ -621,6 +621,19 @@ func recomputeAppGateDecide(t *testing.T, c domainspec.CorpusCase) (domainspec.G
 			if e.BlockScope == "" {
 				continue
 			}
+			// EscalationCreate 一律建立 open／blocking escalation，這個 fixture
+			// 目前只覆蓋 corpus 案例的 open 狀態。若某案例的 escalation state 是
+			// "resolved"（不該再擋），照樣呼叫 EscalationCreate 會把它當成 open
+			// 建立，讓 recompute 出的 verdict 誤判成 blocking——而且不會顯式報
+			// 錯，只會在 freshness 比對時冒出一個看不出原因的 mismatch。目前
+			// corpus 沒有 resolved 案例，這裡先 fail loud，逼未來加案例的人補
+			// 上對應的 create-then-resolve 處理，而不是讓 fixture 悄悄產生錯誤
+			// 的 oracle。
+			if e.State == escalation.StateResolved {
+				return domainspec.GoVerdict{}, fmt.Errorf(
+					"recomputeAppGateDecide: case %q has escalation %s with state=resolved; this fixture only creates open escalations via EscalationCreate — add create-then-resolve handling before adding such a case",
+					c.Name, e.EscalationID)
+			}
 			if _, err := a.EscalationCreate("plan:P1", e.BlockScope, "domainspec oracle freshness fixture"); err != nil {
 				return domainspec.GoVerdict{}, err
 			}
