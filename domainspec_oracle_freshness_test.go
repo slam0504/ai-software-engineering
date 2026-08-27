@@ -101,11 +101,17 @@ var gatepolicyValidatePatterns = map[string][]string{
 	"R9":        {"does not match expected pattern"},
 }
 
+// R11／R12 分類（rev9 R10 裁決證據 (c)）：PrepareDecision 的 approved 分支把
+// ReconcileBindings 的 causes[0] 包成 "gate: pending request bindings are stale:
+// <cause>"（service.go:114）——R10 本身不是獨立 CEL 規則（design rev7 §2／§4），
+// 這裡的 wrapper 訊息忠實轉譯成 R11／R12 兩個既有 CEL 規則 id，不新增規則。
 var gateServicePreparePatterns = map[string][]string{
 	"R1":        {"unknown decision"},
 	"R2":        {"requires reason"},
 	"R4":        {"no pending request"},
 	"R5.decide": {"unknown gate"},
+	"R11":       {"pending request bindings are stale:", "changed"},
+	"R12":       {"pending request bindings are stale:", "missing"},
 }
 
 var gatepolicyReconcilePatterns = map[string][]string{
@@ -319,21 +325,6 @@ type missingCommitGit struct{}
 
 func (missingCommitGit) Git(args ...string) ([]byte, error) { return nil, fakeExitError{code: 1} }
 
-// stubGate2Policy 是 gate.GatePolicy 的最小 stand-in，供 gate_service_prepare
-// seam 的 registry 佔位（本檔涵蓋的 R1/R2/R4/R5.decide 四案例皆在觸及真正 policy
-// 之前就短路，見各自的 production 檢查順序；仍註冊一個 policy 避免未來新增
-// decide-phase 案例時因 registry 缺項而產生誤導性的 unknown-gate 假陽性）。
-type stubGate2Policy struct{}
-
-func (stubGate2Policy) ValidateRequest(gate.GateRequest) error { return nil }
-func (stubGate2Policy) BuildDecision(gate.GateRequest, string, gate.DecisionInput) (*gate.Metadata, error) {
-	return nil, nil
-}
-func (stubGate2Policy) SupersessionKey(g, s string) string { return g + "|" + s }
-func (stubGate2Policy) ReconcileBindings(gate.ApprovalRecord) ([]gate.StaleCause, error) {
-	return nil, nil
-}
-
 func appendGateOp(t *testing.T, j *gate.Journal, opID string, rec any) {
 	t.Helper()
 	raw, err := json.Marshal(rec)
@@ -388,8 +379,62 @@ func recomputeGatepolicyValidate(c domainspec.CorpusCase) (domainspec.GoVerdict,
 	return domainspec.GoVerdict{Outcome: domainspec.OutcomePass}, nil
 }
 
-// recomputeGateServicePrepare — R1/R2/R4/R5.decide：gate.Service.PrepareDecision
-// 對一個依 snapshot entry 狀態預置好的 journal 重跑。
+// missingCurrentFn 回傳一個 fail-loud 的 current* 讀值函式——供 gate2PolicyFromSnapshot
+// 在 snapshot 的 Current 群組非 known 時使用（R1/R2/R4/R5.decide 四案例皆在觸及
+// approved-only 分支之前就短路，理論上不會呼叫到；仍 fail loud 而非 panic，同
+// failFn 慣例）。
+func missingCurrentFn() (string, error) {
+	return "", fmt.Errorf("domainspec oracle: unexpected current* call (snapshot Current not known)")
+}
+
+// gate2PolicyFromSnapshot 依 snapshot 的 Current／BaseCommitState／Plan／RiskPolicy
+// facts 組一個真正的 gatepolicy.Gate2Policy——供 gate_service_prepare seam 的
+// approved 分支實際跑到 ReconcileBindings（R10 guard／aggregation 的證據義務
+// (c)，rev9）。手法與 recomputeGatepolicyReconcile／runBuildDecisionMeta 相同
+// （currentFn 固定回傳、existingCommitGit／missingCommitGit 依 BaseCommitState
+// 挑選），差別是這裡要同時支援 approved 分支後續的 BuildDecision（staticLoader
+// 帶上 Plan／RiskPolicy），而非只跑 ReconcileBindings 這一段。
+func gate2PolicyFromSnapshot(s *domainspec.FactsSnapshot) gate.GatePolicy {
+	var git plan.GitRunner = neverCalledGit{}
+	if s.BaseCommitState.Presence == domainspec.Known {
+		if derefStr(s.BaseCommitState) == "missing" {
+			git = missingCommitGit{}
+		} else {
+			git = existingCommitGit{}
+		}
+	}
+
+	currentFn := func(get func(domainspec.Current) string) func() (string, error) {
+		if s.Current.Presence != domainspec.Known || s.Current.Value == nil {
+			return missingCurrentFn
+		}
+		v := get(*s.Current.Value)
+		return func() (string, error) { return v, nil }
+	}
+
+	var pl plan.Plan
+	var pol plan.RiskPolicy
+	if s.Plan.Presence == domainspec.Known && s.Plan.Value != nil {
+		pl = planFromSnapshotTasks(s.Plan.Value.Tasks)
+	}
+	if s.RiskPolicy.Presence == domainspec.Known && s.RiskPolicy.Value != nil {
+		pol = riskPolicyFromSnapshotFacts(s.RiskPolicy.Value)
+	}
+
+	return gatepolicy.NewGate2Policy(staticLoader{pl: pl, pol: pol}, git,
+		currentFn(func(c domainspec.Current) string { return c.PlanManifest }),
+		currentFn(func(c domainspec.Current) string { return c.SpecManifest }),
+		currentFn(func(c domainspec.Current) string { return c.RiskPolicy }),
+		currentFn(func(c domainspec.Current) string { return c.PermissionManifest }))
+}
+
+// recomputeGateServicePrepare — R1/R2/R4/R5.decide/R11/R12：gate.Service.PrepareDecision
+// 對一個依 snapshot entry 狀態預置好的 journal 重跑。registry 掛真正的
+// Gate2Policy（rev9——取代原本從不 stale 的 stubGate2Policy），approved 分支才會
+// 真的跑到 ReconcileBindings，讓 R10 guard／aggregation 的 approved-only 語意
+// 與 R11/R12 transport 全路徑可以被這個 seam 實際證明；既有 R1/R2/R4/R5.decide
+// 四案例皆在觸及 ReconcileBindings 之前短路（見各自 production 檢查序），行為
+// 不受影響。
 func recomputeGateServicePrepare(t *testing.T, c domainspec.CorpusCase) (domainspec.GoVerdict, error) {
 	t.Helper()
 	s := c.Snapshot
@@ -414,7 +459,7 @@ func recomputeGateServicePrepare(t *testing.T, c domainspec.CorpusCase) (domains
 		appendGateOp(t, j, "op-rec", rec)
 	}
 
-	reg := gate.Registry{"gate2": stubGate2Policy{}}
+	reg := gate.Registry{"gate2": gate2PolicyFromSnapshot(s)}
 	svc := gate.NewService(j, reg, func() string { return "u2" }, func() string { return "t" }, noopEmitter{})
 	approver := approverFromSnapshot(s.Approver)
 	input := gate.DecisionInput{RiskSelections: riskSelectionsFromSnapshot(s.RiskSelections)}
@@ -730,6 +775,69 @@ func TestOracleFreshnessDetectsCorruption(t *testing.T) {
 	}
 	if len(mismatched) != 1 || mismatched[0] != target {
 		t.Fatalf("want exactly [%s], got %v", target, mismatched)
+	}
+}
+
+// TestR10ApprovedOnlyGuard（R10 裁決證據 (b)，rev9）：R10 本身不是獨立 CEL 規則
+// （design rev7 §2／§4——R11/R12「沿 R10 guard」），這裡直接對 gate.Service 的
+// production 程式碼證明 R10 guard 的 approved-only 語意：approved 分支必須真的
+// 跑 ReconcileBindings 並在 bindings 過期時 fail closed；rejected 分支必須完全
+// 跳過這段 reconcile（production 注解 service.go:77-84：「a rejection only needs
+// a reason and must still succeed on an otherwise-expired request」），即使
+// bindings 依然過期也要成功。
+func TestR10ApprovedOnlyGuard(t *testing.T) {
+	j, err := gate.OpenJournal(filepath.Join(t.TempDir(), "gate.jsonl"))
+	if err != nil {
+		t.Fatalf("open journal: %v", err)
+	}
+	defer j.Close()
+
+	z64 := strings.Repeat("0", 64)
+	boundSpecManifest := "sha256:" + strings.Repeat("1", 64) // 過期：與 current 不同
+	currentSpecManifest := "sha256:" + z64
+
+	bindings := []gate.Binding{
+		{Kind: "spec_manifest", Digest: boundSpecManifest},
+		{Kind: "plan", Digest: "sha256:" + z64},
+		{Kind: "base_commit", Ref: "HEAD", Digest: "git:sha1:" + strings.Repeat("a", 40)},
+		{Kind: "risk_policy", Digest: "sha256:" + z64},
+		{Kind: "permission_manifest", Digest: "sha256:" + z64},
+	}
+
+	const approvalID = "r10-guard"
+	req := gate.GateRequest{
+		Type: "gate_request", SchemaVersion: 2, ApprovalID: approvalID,
+		Gate: "gate2", Subject: "plan:P1", Bindings: bindings, CreatedAt: "t",
+	}
+	appendGateOp(t, j, "op-req", req)
+
+	fixed := func(v string) func() (string, error) {
+		return func() (string, error) { return v, nil }
+	}
+	policy := gatepolicy.NewGate2Policy(staticLoader{}, existingCommitGit{},
+		fixed("sha256:"+z64),       // current plan manifest：與 bound 一致
+		fixed(currentSpecManifest), // current spec manifest：STALE 對 bound
+		fixed("sha256:"+z64),       // current risk policy：與 bound 一致
+		fixed("sha256:"+z64))       // current permission manifest：與 bound 一致
+
+	reg := gate.Registry{"gate2": policy}
+	svc := gate.NewService(j, reg, func() string { return "u-r10" }, func() string { return "t" }, noopEmitter{})
+
+	// approved：R10 guard 必須真的擋下——ReconcileBindings 抓到 stale binding，
+	// PrepareDecision 把它包成 wrapper 錯誤（service.go:114），且可分類為 R11
+	// （spec_manifest changed）。
+	if _, err := svc.PrepareDecision(approvalID, "approved", "", gate.Approver{ID: "a", Method: "app-local"}, gate.DecisionInput{}); err == nil {
+		t.Fatal("approved PrepareDecision must fail against stale bindings（R10 guard）")
+	} else if !strings.Contains(err.Error(), "pending request bindings are stale:") {
+		t.Fatalf("want stale wrapper error, got: %v", err)
+	} else if ruleID, cerr := classify(gateServicePreparePatterns, err.Error()); cerr != nil || ruleID != "R11" {
+		t.Fatalf("want classified R11, got ruleID=%q err=%v (msg=%q)", ruleID, cerr, err.Error())
+	}
+
+	// rejected：R10 guard 必須完全跳過（approved-only）——同一筆仍過期的
+	// pending request，rejected 決議必須成功。
+	if _, err := svc.PrepareDecision(approvalID, "rejected", "not good enough", gate.Approver{}, gate.DecisionInput{}); err != nil {
+		t.Fatalf("rejected PrepareDecision must succeed even with stale bindings（R10 guard 只在 approved 執行）: %v", err)
 	}
 }
 
