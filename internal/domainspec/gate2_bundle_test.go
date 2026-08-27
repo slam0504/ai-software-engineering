@@ -296,6 +296,30 @@ func TestGate2BundleIsolatedRuleCoverage(t *testing.T) {
 				}}
 			},
 		},
+		{
+			// R16 gate2 fallback 保真（無 "plan:" 前綴時 derived scope 是
+			// "gate2:"+subject 原樣，不是 "workspace"——上一版 fix commit 曾
+			// 誤寫成 workspace，這裡補持久測試）。用 rejected 決議構造：
+			// production 的 subject 形狀檢查（R6.decide）只在 approved 路徑
+			// 才驗證（BuildDecision 的 rejected 分支不檢查 subject），escalation
+			// blocking 檢查則對 approved／rejected 一視同仁（gateDecide 步驟
+			// 3），故一個 subject 形狀不合法的 rejected gate2 決議在 production
+			// 是合法可達狀態，可用來獨立驗證 fallback 分支而不誤觸 R6.decide。
+			name: "R16/gate2-fallback-scope-match-blocks", ruleID: "R16", wantIdx: -1,
+			mutate: func(s *FactsSnapshot) {
+				s.Decision = Fact[string]{Presence: Known, Value: strPtr("rejected")}
+				s.Reason = Fact[string]{Presence: Known, Value: strPtr("not good enough")}
+				s.Current = Fact[Current]{Presence: NotApplicable}
+				s.BaseCommitState = Fact[string]{Presence: NotApplicable}
+				s.Plan = Fact[PlanFacts]{Presence: NotApplicable}
+				s.RiskPolicy = Fact[RiskPolicyFacts]{Presence: NotApplicable}
+				s.RiskSelections = Fact[[]RiskSelection]{Presence: Known, Value: &[]RiskSelection{}}
+				s.Request.Value.Subject = "weird-subject" // gate stays "gate2" (baseline)
+				s.Escalations = Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{
+					{EscalationID: "E6", State: "open", BlockScope: "gate2:weird-subject"},
+				}}
+			},
+		},
 	}
 
 	for _, c := range cases {
