@@ -1,6 +1,6 @@
-# Pre-M4 Readiness Backlog（rev2）
+# Pre-M4 Readiness Backlog（rev3）
 
-> 版本：rev2（2026-08-27，backlog review 第一輪 5 P1＋4 P2 收斂）
+> 版本：rev3（2026-08-27，backlog review 第二輪 5 P1＋3 P2 收斂）
 > 狀態：**待 owner review**——通過後才逐票估點（0.1 pt＝1 hr；混合性質或超過 2.0 pt 必拆）
 > 基準：HEAD `9be0f4d`（main，與 origin 同步）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
@@ -16,9 +16,9 @@
 7. TCA runner 近期信任邊界：本人、本機、自有 repo；外部不受信任程式另立 sandbox scope。
 8. `app.go` 不做全面重構；僅做 M4 所需 application seam 的局部抽取。
 9. Wall-clock 權威名單為 `docs/spikes/m3b-results.md` §7 的五條；其他候選須以現行 HEAD 重現並補入正式文件後才能加入。
-10. 本 backlog rev1 通過 review 後才估點。
+10. 本 backlog 通過 review 後才估點。
 
-**不在本 backlog 主軌，但於附錄 B 提供 durable locator**（rev2——repo 內原無 ticket 路徑，排除即失去追蹤入口）：legacy hydrate 兩張既核定票（見附錄 B）；DomainSpec spike 遞延 minors（`docs/superpowers/specs/2026-08-26-domainspec-spike-results.md` §五為權威清單，該檔已入 repo，追蹤入口成立）。
+**不在本 backlog**：legacy hydrate 系列——rev3 更正：rev1／rev2 誤列為「待辦兩票」，實際**均已於外部審核基準之前完成**（commit 證據見附錄 B），不存在待追蹤工作；DomainSpec spike 遞延 minors（`docs/superpowers/specs/2026-08-26-domainspec-spike-results.md` §五為權威清單，該檔已入 repo，追蹤入口成立）。
 
 ---
 
@@ -52,9 +52,9 @@
 
 - **背景**：語言最低版本與驗證工具鏈的語意未說清。rev2 更正：`go` directive（最低語言／模組版本）與 `toolchain` directive（建議工具鏈）**不是二選一、可並存**——rev1 誤寫成互斥選項。
 - **HEAD 證據**：`go.mod` 為 `go 1.25.0`；`README.md:95` 要求「Go 1.26+」、`:330` 標 Go 1.26；M3b 驗收使用 Go 1.26.5；reviewer 以 Go 1.25.0 實跑 `go build ./...` 通過（但 build 通過**不足以**宣稱 1.25 完整支援）。
-- **驗收條件**：(1) 先以 Go 1.25 實跑**完整 Go gate（test＋race＋vet）與 Wails build**——全綠才可宣告 1.25 為 minimum，否則 minimum 提升至實測通過的版本；(2) 依 (1) 結果同步 README 語意（「X minimum、1.26.5 validated」）；(3) **獨立決策**：是否加 `toolchain go1.26.5` 提升 reproducibility（與 minimum 判定無關，可並存）。
+- **驗收條件**（rev3 改版本歸因矩陣——「未全綠即提高 minimum」會把非版本因素誤判成版本不足）：(1) **同一 commit** 分別以 Go 1.25 與 1.26.5 跑完整 Go gate（test＋race＋vet）與 Wails build，做比較矩陣；(2) 只有**能歸因於 Go 版本不相容**的失敗（1.25 紅、1.26.5 綠、且排除環境／工具缺失）才提高 minimum；已知 wall-clock 名單（B1）與環境性失敗**不參與版本裁決**；(3) 依矩陣結果同步 README 語意（「X minimum、1.26.5 validated」）；(4) **獨立決策**：是否加 `toolchain go1.26.5` 提升 reproducibility（與 minimum 判定無關，可並存）。
 - **建議模組**：`go.mod`、`README.md`。
-- **依賴／裁決**：(1)(2) 為工程驗證項；(3) 需 owner 裁決。
+- **依賴／裁決**：建議 B1 完成後執行（或依 (2) 明文排除 wall-clock 偽陽）；(4) 需 owner 裁決。
 
 ---
 
@@ -64,7 +64,7 @@
 
 - **背景**：具名五條測試量的是排程與牆鐘而非同步契約，紅了須人工單獨重跑判定——與 fail-closed 的 required check 語意衝突，是 CI（B2）升 required 的硬前置。
 - **HEAD 證據**：`docs/spikes/m3b-results.md` §7 權威具名五條——`internal/codex/TestAppServerTerminateKillsGroup`、`internal/assist/TestClaudeAssistFailsLoudOnOversizedLine`、`internal/claude/TestMultiTurnSendAndTurnBoundaries`、root `TestInFlightTurnDoesNotBlockNewSession`、`internal/codex/TestAppServerMidStreamDeath`；§7 並記錄負載下 150 倍延遲的實測。
-- **驗收條件**：(1) 五條改為 channel／barrier／process-exit event 等確定性同步或 fake clock＋可注入 timeout policy；(2) 併行＋`-race`＋負載下重複執行不偽陽（次數於估點時定）；(3) 名單自 §7 移除；(4) 三條候選以現行 HEAD 重現——成立者補入文件後併入本票或開續票，不成立者除名（#9）。候選具名（rev2，原始紀錄 2026-08-21 session 首錄、2026-08-25 更新，未落正式文件）：
+- **驗收條件**：(1) 五條改為 channel／barrier／process-exit event 等確定性同步或 fake clock＋可注入 timeout policy；(2) 併行＋`-race`＋負載下重複執行不偽陽（次數於估點時定）；(3)（rev3 更正——**不得刪改 m3b-results.md §7 的歷史驗收紀錄**）§7 原始觀察保留，於各條**追加** resolved commit、修正方式與重驗證據；「目前有效名單」另立 living 狀態文件（或本 backlog 附錄）承載；(4) 三條候選以現行 HEAD 重現——成立者補入 living 文件後併入本票或開續票，不成立者除名（#9）。候選具名（rev2，原始紀錄 2026-08-21 session 首錄、2026-08-25 更新，未落正式文件）：
   - `internal/proc/TestOutputCancellationKillsGrandchildren`
   - 前端 `PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積`
   - 前端 `SpecWorkspace draft accept > discards spec-assist result if the file switches during the call`
@@ -75,7 +75,7 @@
 
 - **背景**：專案倡議「測試全綠＋review＋CI 過才合併」，自身尚無任何平台驗證——dogfooding gap 確認成立；required checks 是 M4 forge enforcement 的核心依賴。
 - **HEAD 證據**：repo 無 `.github/workflows`；2026-08-27 reviewer 以 GitHub API 唯讀核實 ruleset 空、main 無 branch protection、無 PR 歷史。
-- **驗收條件**：(1) workflow 覆蓋 Go build／`go vet`／test、frontend Vitest＋typecheck＋build、macOS Wails build、schema／checksum 檢查；(2) main ruleset 以上述為 required checks；(3) race＋全套測試升 required 前置 B1 完成；(4) 任意 reviewer checkout 同一 SHA 可由 CI 獨立產生同等證據；(5) **enforcement 實證（rev2 補——只設定不驗證，dogfooding 仍不成立）**：(5a) failing／missing required check 的 PR 實測不可合併（負向驗證）；(5b) checks 全綠後實測可合併；(5c) direct push、admin bypass 與緊急例外政策明文化；(5d) required-check 名稱變更時 fail loud（不得靜默降級為非必要）；(5e) ruleset 誤刪的回復方式，與外部（GitHub 設定面）變更需 owner 授權的規約。
+- **驗收條件**：(1) workflow 覆蓋 Go build／`go vet`／test、frontend Vitest＋typecheck＋build、macOS Wails build、schema／checksum 檢查；(2) main ruleset 以上述為 required checks；(3) race＋全套測試升 required 前置 B1 完成；(4) 任意 reviewer checkout 同一 SHA 可由 CI 獨立產生同等證據；(5) **enforcement 實證（rev2 補——只設定不驗證，dogfooding 仍不成立）**：(5a) failing／missing required check 的 PR 實測不可合併（負向驗證）；(5b) checks 全綠後實測可合併；(5c) direct push、admin bypass 與緊急例外政策明文化；(5d) required-check 名稱變更時 fail loud（不得靜默降級為非必要）；(5e) ruleset 誤刪的回復方式，與外部（GitHub 設定面）變更需 owner 授權的規約。**驗證方式邊界（rev3——本項實證會改變 GitHub 外部狀態）**：負向驗證一律使用測試 PR＋可回復 branch，驗證完即關閉／刪除；**不得**為了驗證把已知失敗內容合併進 main。
 - **建議模組**：`.github/workflows/`、GitHub repo settings（ruleset）。
 - **依賴／裁決**：required 完整化依賴 B1；GitHub-first 已裁（#4）。
 
@@ -107,7 +107,7 @@
 
 - **背景**：M4 若未先定義「核准內容如何不可變地綁定 implementation session」，只會多一套 Gate 3 UI 而未關閉治理迴路。本票產出 spec 文件（走 design gate），不含實作。
 - **HEAD 證據**：README 明載一般 session 不受 active spec／plan／permissions 約束（規劃中屬 M4）；DomainSpec spike 收斂報告（`2026-08-26-domainspec-spike-results.md`）提供 shadow evaluator 能力邊界供 Gate 3 explain 層設計參考。
-- **驗收條件**：spec 定義——(1) **TaskRun snapshot**（不可變）：Gate 1／Gate 2 approval ID＋digest、task ID、selected risk tier、permission manifest digest、TCA approval ID、expected-red／negative-control evidence digest、implementation base commit；(2) implementation session 自動綁定該 snapshot（#3，「複製上下文」不接受）；(3) Gate 3 通過條件綁定六件：TaskRun、promotion head、main base、oracle-surface digest、required-check run、review／evidence provenance（#5）；merge-group checks 明確定位為 Gate 3 後獨立平台驗證；(4) Forge interface：GitHub-first、保留 GitLab 擴充（#4）；(5) DomainSpec 定位為 shadow／explain（#6）；(6) **STALE／重驗生命週期（rev2 補——缺此則「不可變 snapshot」只能回答歷史上下文，擋不住過期核可進 Gate 3）**：(6a) TaskRun 建立時 active approvals 的 currentness 前置條件；(6b) spec／plan／TCA／permissions／base commit 任一變動後，既有 TaskRun 的 STALE 轉換規則；(6c) promotion head、main base 或 required-check 結果改變時 Gate 3 是否立即失效；(6d) implementation session resume 是否僅能回到原 TaskRun；(6e) STALE 後的處置語意——中止 session、保留 evidence 但禁止 Gate 3、或強制建立新 TaskRun，三者擇一明定；(6f) Gate 3 決議當下必須重新驗證的 bindings 清單。spec 通過 design gate 即為本票完成。
+- **驗收條件**：spec 定義——(1) **TaskRun snapshot**（不可變）：Gate 1／Gate 2 approval ID＋digest、task ID、selected risk tier、permission manifest digest、TCA approval ID、expected-red／negative-control evidence digest、implementation base commit；(2) implementation session 自動綁定該 snapshot（#3，「複製上下文」不接受）；(3) Gate 3 通過條件綁定六件：TaskRun、promotion head、main base、oracle-surface digest、required-check run、review／evidence provenance（#5）；merge-group checks 明確定位為 Gate 3 後獨立平台驗證；(4) Forge interface：GitHub-first、保留 GitLab 擴充（#4）；(5) DomainSpec 定位為 shadow／explain（#6）；(6) **STALE／重驗生命週期（rev2 補；rev3 標注決策歸屬——缺此則「不可變 snapshot」只能回答歷史上下文，擋不住過期核可進 Gate 3）**：(6a) TaskRun 建立時 active approvals 的 currentness 前置條件；(6b) 上游變動後既有 TaskRun 的 STALE 轉換規則——**必須區分三種形狀**：commit missing、binding digest 改變、單純 HEAD 前移；**HEAD 正常前移不得觸發 STALE**（沿既有 TCA 歷史錨點契約，不得破壞）；(6c)【**owner 決策**】main base 變動是否立即使 Gate 3 失效（promotion head／required-check 結果變動同組討論）；(6d)【**owner 決策**】implementation session resume 是否僅能回到原 TaskRun；(6e)【**owner 決策**】STALE 後的處置語意——中止 session、保留 evidence 但禁止 Gate 3、或強制建立新 TaskRun；(6f) Gate 3 決議當下必須重新驗證的 bindings 清單。(6c)(6d)(6e) 為商業流程選擇，於 B5 design gate 中列 owner 決議事項，非工程自行取捨。spec 通過 design gate 即為本票完成。
 - **建議模組**：`docs/superpowers/specs/`（新 spec）；牽動 `internal/`（設計對象：TaskRun／Forge／Gate 3 application service）。
 - **依賴／裁決**：無依賴（可先行）；核心裁決已定（#3/#4/#5/#6）。
 
@@ -129,7 +129,15 @@
 - **HEAD 證據**：B5 所列（enforcement 缺口為規劃中的 M4 範圍，非現況缺陷）。
 - **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。
 - **建議模組**：依 B5／B6 產出的 application service、forge adapter（GitHub）、frontend Gate 3 檢視。
-- **依賴／裁決**：依賴 B1–B6；**完整 SC4 驗收**另需 A1（本票不含，完成後開「SC4 端到端驗收」續票）；裁決已定（#3/#4/#5）。
+- **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6**（rev3 明列）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；【**owner 決策，估點前置**】pilot provider 單選——Claude 與 Codex 的 process／resume／session ownership 路徑不同，直接影響本票範圍與估點，估點前必須選定。
+
+### C2 SC4 authoring-to-Gate-3 端到端驗收
+
+- **背景**：C1 明文不宣稱完整 SC4；本票（rev3 新增）為完整承諾的 durable 追蹤入口——「app 內從 spec authoring、Gate 1、plan authoring、Gate 2、TCA 到 implementation、PR、Gate 3 全程不離開」。
+- **HEAD 證據**：同 A1（authoring 閉環缺口）＋B5（enforcement 缺口屬 M4 規劃）。
+- **驗收條件**：在 app 內建立／手動編輯 spec → Gate 1 核可 → plan 編輯 → Gate 2 核可（含 risk 決議）→ TCA → C1 的 implementation-to-Gate-3 全鏈——單一連續走查完成、全程不離開 app，各步驟以既有 gate 證據慣例留痕。
+- **建議模組**：無新模組（驗收性質票，串接 A1＋C1 產出）。
+- **依賴／裁決**：依賴 **A1＋C1**；無新裁決。
 
 ---
 
@@ -188,19 +196,17 @@
 | wall-clock 名單「五條」 | 屬實（m3b-results.md §7 為權威；另 3 條候選僅 session 登記，具名與處理見 B1） |
 | 審核基準 `4cb19b2` 未含 DomainSpec 系列 | 屬實；spike 未改 production／UI 路徑，上述事實不受影響 |
 
-## 附錄 B：既核定票 durable locator（legacy hydrate follow-ups）
+## 附錄 B：legacy hydrate follow-ups——已完成記錄（rev3 更正，不納入 backlog）
 
-主軌之外、owner 已核定的兩張票——本附錄為 repo 內追蹤入口（原先僅存於 session 記錄；後續若建立 GitHub issue，於此補 issue 編號）：
+rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審核基準 `4cb19b2` 之前完成**，commit 證據（rev3 已逐一以 `git log`＋ancestry 核實）：
 
-### LH-1 Audit＋空 window 重複掃描
+| 原誤列項 | 實際狀態 | Commit 證據 |
+|---|---|---|
+| 「空 window 重複掃描」 | 已完成——loadTurnsBefore 空 window 清旗標（§6a 四分支、persist 失敗 fail loud） | `0de1f78` |
+| 「audit 佐證」 | 已完成——backfill 失敗具名 audit（`legacy_transcript_backfill_failed`） | `fd88185` |
+| 「readEnvelopeRange 吞錯」 | 已完成——非 EOF 讀取錯誤 fail loud，不再當 EOF 靜默截頁 | `c8e1e52` |
 
-- **出處**：legacy transcript hydrate 收尾時 owner 核定（session 記錄，未落 repo ticket）。本條背景為 session 記錄之摘要重建，**展開前須回原核定記錄核對精確語意**，本附錄不替代之。
-- **驗收條件**：估點時由票主依原核定內容展開。
-
-### LH-2 `readEnvelopeRange` 吞錯與 spec 措辭對齊
-
-- **出處**：同上（owner 核定、session 記錄）。展開前須回原核定記錄核對；replay reliability spec（`docs/superpowers/specs/2026-08-24-replay-reliability-design.md`）為相鄰權威文件。
-- **驗收條件**：估點時由票主依原核定內容展開。
+對應 spec、plan、production 與測試均在 repo（`docs/superpowers/specs/2026-08-24-replay-reliability-design.md`、`rebuild_orchestrator.go`）。錯誤盤點根因：auto-memory 索引行過期（本文已正確標「勿再列為待辦」）——索引已同步更正。
 
 ## 修訂記錄
 
@@ -211,4 +217,11 @@
   - P1：排除項與 wall-clock 候選補 durable locator——附錄 B 收 legacy hydrate 兩票、B1 具名三條候選（出處更正為 2026-08-21 首錄／08-25 更新）。
   - P1：B2 補 enforcement 實證五項（負向合併驗證、bypass 政策、check 更名 fail loud、ruleset 回復與外部變更授權）。
   - P2：B6 準則精確化（允許 service／port 注入；禁 M4 domain mutable state 與 ad-hoc hook）；B3 拆 B3a／B3b、D2 拆 D2a／D2b（依自身「混合必拆」規則）；核實表 E2E 措辭補 lockfile transitive 事實；GitHub API 核實者更正為 reviewer。
+- rev3（2026-08-27，backlog review 第二輪 5 P1＋3 P2 收斂）：
+  - P1：附錄 B 更正為**已完成記錄**——LH 系列均於審核基準前完成（0de1f78／fd88185／c8e1e52，ancestry 已核實），rev1／rev2 誤列 pending 的根因（auto-memory 索引過期）已同步修正；排除項敘述同步。
+  - P1：A4 改同 commit 1.25／1.26.5 比較矩陣——只有可歸因版本不相容的失敗才提高 minimum；wall-clock（B1）與環境失敗不參與版本裁決。
+  - P1：B1 不再要求刪除 m3b-results.md §7 歷史紀錄——原始觀察保留＋追加 resolved 證據，「目前有效名單」另立 living 文件。
+  - P1：B5 (6c)(6d)(6e) 標注為 owner 決策（商業流程選擇）；(6b) 明定區分 commit missing／binding digest 改變／HEAD 前移，HEAD 正常前移不得 STALE（沿既有 TCA 錨點契約）。
+  - P1：C1 增 pilot provider 單選為估點前置 owner 決策；新增 **C2 SC4 authoring-to-Gate-3 端到端驗收**（依賴 A1＋C1），完整 SC4 自此有 durable 追蹤入口。
+  - P2：C1 依賴明列 B1／B2／B3a／B3b／B4／B5／B6；裁決事項第 10 項改為不綁版本措辭；B2 enforcement 實證補「測試 PR＋可回復 branch、不得為驗證合併已知失敗內容」邊界。
 - rev1（2026-08-27）：初版。
