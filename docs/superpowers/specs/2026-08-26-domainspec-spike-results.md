@@ -1,12 +1,21 @@
 # DomainSpec kernel 限時 spike——收斂報告（GO／NO-GO）
 
-Spec：[`2026-08-26-domainspec-spike-design.md`](2026-08-26-domainspec-spike-design.md)（e09c3fe APPROVED rev6）
-Plan：`docs/superpowers/plans/2026-08-26-domainspec-spike.md`（rev8，8bf3bb3 plan gate APPROVED 第八輪）
-Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
+Spec：[`2026-08-26-domainspec-spike-design.md`](2026-08-26-domainspec-spike-design.md)（rev7，
+completion gate 裁決 R10 定性為 guard／aggregation，e09c3fe APPROVED rev6 之後的裁決性修訂）
+Plan：`docs/superpowers/plans/2026-08-26-domainspec-spike.md`（rev9，8bf3bb3 plan gate APPROVED
+第八輪之後的裁決性修訂，同一裁決）
+Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md` 已於 SDD 流程收斂後依慣例
+刪除；ledger 記錄的執行期 controller 裁決改由本報告文末「附錄：controller rulings（執行期
+裁決總表）」承接，不再依賴已刪除的檔案。
 
-驗證範圍：8bf3bb3（plan 核准點）..3037568（Task 8 完成點）＋本任務（Task 9）新增的
-`internal/domainspec/mutation_test.go`。本報告的每一項證據皆為本次任務執行過的指令與
-實測輸出（時間戳記 2026-08-27），未實際跑過的一律明標「未驗證」。
+**驗證範圍（本次 completion gate fix wave 重驗）**：8bf3bb3（plan 核准點）..
+`dbdfb3e1df6abaeed36695e54c52059160c4f299`（本次 fix wave 最終 HEAD，2026-08-27）。這個範圍
+含先前 Task 1–9 的全部產出，以及本次 fix wave 新增的兩個提交——R10 定性裁決的 spec
+rev7／plan rev9 文件修訂，以及 R10 證據三件套（`gate_service_prepare` seam 改接真正的
+`gatepolicy.Gate2Policy`、根層新增 `TestR10ApprovedOnlyGuard`、新增
+`r10-transport-stale-approved`／`r10-causes-first-error` 兩筆 corpus 案例）。本報告以下**全部
+證據皆在 `dbdfb3e1` 這個 HEAD 重新執行**（時間戳記 2026-08-27），未實際跑過的一律明標
+「未驗證」。
 
 ---
 
@@ -51,7 +60,7 @@ Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
   - `TestEvaluateConflict`（同 priority 反效果 → conflict）
   - `TestEvaluateRuntimeCostLimitIsError`（runtime cost 超限 → status=evaluation_error，不折入 Truth／UnknownLeaves）
   - `TestEvaluateNotEligibleTransitive`（三層 DAG A→B→C：A when 為 false ⇒ B not_eligible（cause=A）⇒ C not_eligible（cause=B，transitive），逐層成因記入 ReasonGraph）
-- 實測：`go test ./internal/domainspec/... -v` 全數 60 個測試 PASS、0 FAIL（見下方 §三 全量測試結果）。
+- 實測：`go test ./internal/domainspec/... -v` 全數 62 個 top-level 測試（61 PASS＋1 預期 SKIP）、0 FAIL（見下方 §三 全量測試結果）。
 
 **判定：滿足。**
 
@@ -64,29 +73,32 @@ Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
 
 ### 出口 5：corpus 重放一致性＋coverage＋precedence＋bundle diff
 
-- **Go／CEL 逐案例一致性**：`TestReplayCorpusAllConsistent`（`corpus_test.go:630`）；本次任務額外
-  跑根層 `TestOracleFreshnessAllFresh`（`domainspec_oracle_freshness_test.go:681`）——42 筆 corpus
-  中 39 筆 evaluated 案例逐一透過**真實 production seam**（`gate_service_submit`／
-  `gatepolicy_validate`／`gate_service_prepare`／`gatepolicy_reconcile`／`gatepolicy_build`／
-  `escalation`／`app_gatedecide`）重新計算 verdict，與固化值比對零漂移：
+- **Go／CEL 逐案例一致性**：`TestReplayCorpusAllConsistent`（`internal/domainspec/corpus_test.go:630`）；
+  本次 fix wave 重跑根層 `TestOracleFreshnessAllFresh`（`domainspec_oracle_freshness_test.go:739`）——
+  **44 筆 corpus 中 41 筆 evaluated 案例**（原 39 筆＋本次 fix wave 新增 2 筆 R10 證據案例）逐一
+  透過**真實 production seam**（`gate_service_submit`／`gatepolicy_validate`／
+  `gate_service_prepare`／`gatepolicy_reconcile`／`gatepolicy_build`／`escalation`／
+  `app_gatedecide`）重新計算 verdict，與固化值比對零漂移：
 
   ```
   $ go test . -run TestOracleFreshnessAllFresh -v
-  --- PASS: TestOracleFreshnessAllFresh (5.44s)
+  --- PASS: TestOracleFreshnessAllFresh (6.25s)
   ```
 
-- **Coverage 報告**（本次任務以 `ReplayCorpus` 實測，throwaway probe 已刪除，結果如下）：
+- **Coverage 報告**（本次 fix wave 以 `ReplayCorpus` 重測，throwaway probe 已刪除，結果如下）：
 
   | 項目 | 數值 |
   |---|---|
-  | Consistent | 39 |
+  | Consistent | 41 |
   | Inconsistent | 0 |
   | Exempt（acquisition_failed） | 3 |
   | OutputEvidence（R32） | 1 |
   | Bundle 總規則數 | 25 |
   | UncoveredRules | 空 |
 
-  逐 phase-specific rule id 命中次數（CoveredRules，isolated／precedence 案例合計）：
+  逐 phase-specific rule id 命中次數（CoveredRules，isolated／precedence 案例合計；R11／R12
+  的第三、二次命中來自本次新增的 `r10-causes-first-error`，role=precedence，
+  `r10-transport-stale-approved` 為 role=alignment 不計入 CoveredRules）：
 
   | Rule ID | 命中次數 | 備註 |
   |---|---|---|
@@ -101,8 +113,8 @@ Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
   | R7 | 1 | |
   | R8 | 2 | isolated-R8（source_index=1／kind=plan）＋ precedence-R9-vs-R8-kind-occurrence |
   | R9 | 2 | isolated-R9（source_index=0／kind=spec_manifest）＋ precedence-R9-vs-R8-kind-occurrence |
-  | R11 | 2 | isolated-R11 ＋ a9-2-stale-blocked-r11（真實案例） |
-  | R12 | 1 | |
+  | R11 | 3 | isolated-R11 ＋ a9-2-stale-blocked-r11（真實案例）＋ r10-causes-first-error（precedence，primary） |
+  | R12 | 2 | isolated-R12 ＋ r10-causes-first-error（precedence） |
   | R16 | 2 | isolated-R16 ＋ precedence-R30-vs-R16 |
   | R21 | 1 | |
   | R24 | 3 | |
@@ -115,6 +127,20 @@ Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
   | R29 | 1 | |
   | R30 | 4 | |
   | R31 | 2 | isolated-R31 ＋ precedence-R31-vs-R26 |
+
+  **R10 transport 與 approved-only guard 額外證據**（本次 fix wave，見文末「七、R10 裁決」）：
+  `r10-transport-stale-approved`（role=alignment，經 `gate_service_prepare` seam 的
+  `PrepareDecision → ReconcileBindings → wrapper 錯誤`全路徑，primary 對映 R11，與 CEL 端
+  R11 verdict 一致）、`r10-causes-first-error`（role=precedence，R11＋R12 條件同時成立，
+  production `causes[0]` 為最先檢查的 manifest cause、CEL 依 `step_rank` R11=6<R12=7，兩側
+  primary 皆為 R11）；根層 `TestR10ApprovedOnlyGuard`（`domainspec_oracle_freshness_test.go:788`）
+  直接對 `gate.Service` 證明 R10 guard 只在 approved 分支執行：
+
+  ```
+  $ go test . -run 'TestOracleFreshnessAllFresh|TestR10ApprovedOnlyGuard' -v
+  --- PASS: TestOracleFreshnessAllFresh (6.25s)
+  --- PASS: TestR10ApprovedOnlyGuard (0.02s)
+  ```
 
   R8／R9 per-kind 佐證（實測 `Evaluate` 輸出的 `Violation.SourceIndex`，對照
   `required_kinds` 順序 `[spec_manifest, plan, base_commit, risk_policy, permission_manifest]`）：
@@ -150,8 +176,8 @@ Ledger：`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`
 `TestMutationBundleRuleFlipsCaught`：對 `testdata/gate2-bundle.yaml` 的 R31 `when` 做
 `sel.override_reason == ''` → `false` 替換（讓 R31 整條規則恆假、等同刪除該規則），逐項
 檢查 `os.ReadFile`／`LoadBundle`／`DiffBundles` 的 error、斷言 mutated bytes 與 candidate
-digest 確實與 baseline 不同，再對 `loadCorpus(t)` 全部 42 筆 corpus 案例跑
-`DiffBundles`：翻轉列表恰好只有 `isolated-R31`（`BaselineOutcome=false`(blocked) →
+digest 確實與 baseline 不同，再對 `loadCorpus(t)` 全部 corpus 案例（本次 fix wave
+後為 44 筆）跑 `DiffBundles`：翻轉列表恰好只有 `isolated-R31`（`BaselineOutcome=false`(blocked) →
 `CandidateOutcome=true`(pass)），任何 `covers_rules` 不含 R31 的案例若翻轉即 fail。
 
 實測（探測階段先以 throwaway probe 確認 mutation 落點，probe 已刪除不落地）：
@@ -216,35 +242,39 @@ fixture 的行為不同——Task 8 的 mutation 不會讓該 fixture 翻轉（�
   root 測試 harness 之外，**沒有任何 production 檔案被改動**——`app.go` 的
   `gateDecide`、`internal/gatepolicy`、`internal/gate` 等所有既有 production 路徑零改動。
 
-- root 層唯一新增檔為 `domainspec_oracle_freshness_test.go`（805 行，`package main`，
-  全部 `Test*` 函式，非 production 程式碼——實測 `git diff 8bf3bb3..HEAD --stat
-  --diff-filter=A -- . ':(exclude)internal/domainspec' ':(exclude)docs'` 只列出此一檔）。
+- root 層唯一新增檔為 `domainspec_oracle_freshness_test.go`（本次 fix wave 之後 926
+  行，`package main`，全部 `Test*` 函式與 seam adapter helper，非 production 程式碼——
+  實測 `git diff 8bf3bb3..HEAD --stat --diff-filter=A -- . ':(exclude)internal/domainspec'
+  ':(exclude)docs'` 只列出此一檔）。
 
-- go.mod／go.sum 增項僅 cel-go 依賴鏈（無其他依賴變動）：
+- go.mod／go.sum 增項僅 cel-go 依賴鏈（無其他依賴變動；本次 fix wave 未再新增依賴）。
+  以下樣本**刻意把 go.mod 原本的 tab 縮排改成單一空白**呈現（純文件排版考量，避免
+  markdown 清單縮排的空白與 diff 樣本內的 tab 混用而觸發 `git diff --check` 的
+  「space before tab in indent」——已用 `git diff --check` 對本檔的提交驗證乾淨）：
 
   ```diff
   --- a/go.mod
   +++ b/go.mod
   @@ -3,6 +3,7 @@ module github.com/slam0504/sdlc-workbench
-   go 1.25.0
+  go 1.25.0
 
-   require (
-  +	cel.dev/cel-go v0.32.0
-   	github.com/fsnotify/fsnotify v1.10.1
-   	...
-   require (
-  +	cel.dev/expr v0.25.1 // indirect
-   	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
-  +	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
-   	...
-  +	go.yaml.in/yaml/v3 v3.0.4 // indirect
-   	golang.org/x/crypto v0.51.0 // indirect
-  +	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
-   	...
-  +	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
-  +	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
-  +	google.golang.org/protobuf v1.36.10 // indirect
-   )
+  require (
+  + cel.dev/cel-go v0.32.0
+  github.com/fsnotify/fsnotify v1.10.1
+  ...
+  require (
+  + cel.dev/expr v0.25.1 // indirect
+  git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
+  + github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
+  ...
+  + go.yaml.in/yaml/v3 v3.0.4 // indirect
+  golang.org/x/crypto v0.51.0 // indirect
+  + golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
+  ...
+  + google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
+  + google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
+  + google.golang.org/protobuf v1.36.10 // indirect
+  )
   ```
 
   （go.sum 對應加了同一批套件的 hash，皆為 cel-go v0.32.0 的遞移依賴：
@@ -265,7 +295,7 @@ fixture 的行為不同——Task 8 的 mutation 不會讓該 fixture 翻轉（�
 | R19 | `CommitDecision` 重跑 `Project` 再驗 pending——跨鎖區間的一致性重驗（`s.mu` 在 Prepare／Commit 之間放鎖），屬生命週期／鎖語意，非純函式判定 | rule-inventory `R19 CommitDecision 重跑 Project 再驗 pending — service.go:139-146` |
 | R20 | supersession transition——journal 原子 append 與 supersession 合寫，屬 I/O／生命週期 | rule-inventory `R20 supersession — service.go:152-167` |
 | R14（lineage） | 分支敘述，非獨立判定規則——描述 R7–R9／R6.decide 在哪個呼叫路徑執行，已由對應 phase-specific 規則（R6.decide 等）承載 | rule-inventory `R14（分支敘述，rev2 更正）` |
-| R10 | pending bindings 對 pseudo-record 跑 `ReconcileBindings`（PrepareDecision 內部 dry-run），與 R11 同一套 stale 判定邏輯但作用在不同呼叫點——CEL 端以 R11 的 CEL 重算涵蓋同一語意，R10 本身未獨立進 25 條 CEL 規則清單（**注意**：design §4 corpus manifest 來源列表把 R10 的 oracle 列在 gate service 測試面，但這只是「哪個 Go 測試檔涵蓋」的來源標註，不代表 R10 有獨立 CEL 規則；本報告未對此做進一步交叉驗證，屬**未驗證**的細節，建議 M4.5 若擴大規則面時明確排查） | rule-inventory §2 R10；design §4（b） |
+| R10（**completion gate 2026-08-27 裁決，選項 2——已解決，不再是未驗證細節**） | pending bindings 對 pseudo-record 跑 `ReconcileBindings`（PrepareDecision 內部 dry-run），是 R11／R12 的 guard／aggregation 機制，非獨立 CEL 規則——guard 本身無獨立 deny 內容，任何 R10 觸發必為 R11∨R12 觸發，隔離唯一命中在定義上不可能成立；design §4 corpus manifest 來源列表把 R10 的 oracle 列在 gate service 測試面是「哪個 Go 測試檔涵蓋」的來源標註，不代表 R10 有獨立 CEL 規則。三件證據義務已補齊，見文末「七、R10 裁決」 | spec rev7 §2／§4；plan rev9；rule-inventory §2 R10；design §4（b） |
 | R18／R22／R23／R33／R34 | 未在 spec §1 的 in-scope 清單內（R18＝寫入失敗即拒屬 I/O；R22 為 R1 在 gate2.go 的重複防線；R23＝git blob 讀取；R33／R34 屬送核路徑 plan schema 驗證，非 decide 路徑） | rule-inventory §3；design §1 in-scope 清單未列 |
 | acquisition_failed（3 筆：dirty-worktree／loadat-error／revparse-fatal） | host 邊界——facts 無法組成，不入 CEL 一致性統計，計入 `Exempt` | `ReplayCorpus` 實測 `Exempt=3`；對應 3 個 `testdata/corpus/acquisition-failed-*.json` |
 | **R3（不豁免）** | approver identity 檢查已用 App seam（`app_gatedecide`，`recomputeAppGateDecide`）跑真正的 `a.GateDecide`，經 git identity override 驅動 production 路徑，**無 exemption fallback**——若接線不成立即視為 NO-GO（ledger 明載）。實測 `isolated-R3`／`precedence-R3-vs-R24` 皆透過此 seam 重放一致 | `domainspec_oracle_freshness_test.go` `recomputeAppGateDecide`；`TestOracleFreshnessAllFresh` PASS |
@@ -275,51 +305,108 @@ fixture 的行為不同——Task 8 的 mutation 不會讓該 fixture 翻轉（�
 
 ## 三、全量測試結果
 
+以下全部指令在本次 fix wave 最終 HEAD `dbdfb3e1df6abaeed36695e54c52059160c4f299`
+重新執行（2026-08-27）。
+
 ```
 $ go test ./... -count=1
-ok  	github.com/slam0504/sdlc-workbench	233.170s
-ok  	github.com/slam0504/sdlc-workbench/cmd/probe-codex-parallel	2.206s
-ok  	github.com/slam0504/sdlc-workbench/internal/appcore	5.690s
-ok  	github.com/slam0504/sdlc-workbench/internal/approval	3.166s
-ok  	github.com/slam0504/sdlc-workbench/internal/assist	29.879s
-ok  	github.com/slam0504/sdlc-workbench/internal/claude	3.921s
-ok  	github.com/slam0504/sdlc-workbench/internal/codex	2.121s
-ok  	github.com/slam0504/sdlc-workbench/internal/contract	4.248s
-ok  	github.com/slam0504/sdlc-workbench/internal/domainspec	5.176s
-ok  	github.com/slam0504/sdlc-workbench/internal/escalation	5.028s
-ok  	github.com/slam0504/sdlc-workbench/internal/evidence	37.385s
-ok  	github.com/slam0504/sdlc-workbench/internal/gate	6.403s
-ok  	github.com/slam0504/sdlc-workbench/internal/gatepolicy	10.005s
-ok  	github.com/slam0504/sdlc-workbench/internal/journal	6.105s
-ok  	github.com/slam0504/sdlc-workbench/internal/plan	7.619s
-ok  	github.com/slam0504/sdlc-workbench/internal/proc	21.183s
-ok  	github.com/slam0504/sdlc-workbench/internal/recorder	5.112s
-ok  	github.com/slam0504/sdlc-workbench/internal/replayindex	7.738s
-ok  	github.com/slam0504/sdlc-workbench/internal/singleinstance	2.630s
-ok  	github.com/slam0504/sdlc-workbench/internal/spec	23.762s
-ok  	github.com/slam0504/sdlc-workbench/internal/wirelog	19.803s
-ok  	github.com/slam0504/sdlc-workbench/internal/wsregistry	22.322s
+ok  	github.com/slam0504/sdlc-workbench	272.362s
+?   	github.com/slam0504/sdlc-workbench/cmd/probe-codex-approval	[no test files]
+ok  	github.com/slam0504/sdlc-workbench/cmd/probe-codex-parallel	1.711s
+?   	github.com/slam0504/sdlc-workbench/cmd/probe-multiturn	[no test files]
+ok  	github.com/slam0504/sdlc-workbench/internal/appcore	6.315s
+ok  	github.com/slam0504/sdlc-workbench/internal/approval	2.694s
+ok  	github.com/slam0504/sdlc-workbench/internal/assist	35.039s
+ok  	github.com/slam0504/sdlc-workbench/internal/claude	3.621s
+ok  	github.com/slam0504/sdlc-workbench/internal/codex	5.266s
+ok  	github.com/slam0504/sdlc-workbench/internal/contract	3.976s
+ok  	github.com/slam0504/sdlc-workbench/internal/domainspec	6.262s
+ok  	github.com/slam0504/sdlc-workbench/internal/escalation	5.160s
+ok  	github.com/slam0504/sdlc-workbench/internal/evidence	39.099s
+ok  	github.com/slam0504/sdlc-workbench/internal/gate	7.120s
+ok  	github.com/slam0504/sdlc-workbench/internal/gatepolicy	9.184s
+ok  	github.com/slam0504/sdlc-workbench/internal/journal	6.667s
+ok  	github.com/slam0504/sdlc-workbench/internal/plan	8.726s
+?   	github.com/slam0504/sdlc-workbench/internal/ports	[no test files]
+ok  	github.com/slam0504/sdlc-workbench/internal/proc	24.220s
+ok  	github.com/slam0504/sdlc-workbench/internal/recorder	6.366s
+ok  	github.com/slam0504/sdlc-workbench/internal/replayindex	8.564s
+ok  	github.com/slam0504/sdlc-workbench/internal/singleinstance	4.712s
+ok  	github.com/slam0504/sdlc-workbench/internal/spec	25.901s
+ok  	github.com/slam0504/sdlc-workbench/internal/wirelog	20.493s
+ok  	github.com/slam0504/sdlc-workbench/internal/wsregistry	23.312s
 [exited with code 0]
 ```
 
-`internal/domainspec` 套件單獨以 `-v` 執行：60 個測試全數 PASS、0 FAIL（實測，2026-08-27）。
+（package 清單與 rev1 收斂報告相比多列 `cmd/probe-codex-approval`／
+`cmd/probe-multiturn`／`internal/ports`——這三個是本 spike 之前既有、`[no test
+files]` 的新增/既有 package，非本次 fix wave 產出，如實列出不裁切。）
 
-`gofmt -l internal/domainspec/ .` 對本任務新增的 `mutation_test.go` 與既有
-`internal/domainspec/` 目錄結果為空（clean）。**注意**：repo 根目錄 `gofmt -l .`
-對整個專案跑會列出 5 個既有檔案（`cmd/probe-codex-parallel/main.go`、
-`internal/appcore/manager_test.go`、`internal/appcore/manager_wsid_test.go`、
-`internal/codex/session.go`、`internal/replayindex/corrupt_test.go`）——這些皆為
-**本 spike 之前既有的 repo 債務**（`git status --short` 確認本任務只新增
-`internal/domainspec/mutation_test.go`，未觸碰上述 5 檔），不在本 spike 的
-constraint 範圍內，本報告如實揭露、不隱藏。
+`internal/domainspec` 套件單獨以 `-v` 執行：**62 個 top-level 測試——61 個
+PASS、1 個 SKIP（`TestUpdateCorpusInternal`，corpus generator，僅在
+`UPDATE_CORPUS_INTERNAL=1` 時執行、CI 不跑，SKIP 屬預期行為非缺口）、0 FAIL**
+（實測，2026-08-27；較 rev1 收斂報告的 60 個多出 2 個，即本次 fix wave 兩筆新
+corpus 案例不需要新增 internal 測試函式本身，數字差異來自兩次報告之間既有的
+commit 累積，非本次 fix wave 新增測試函式）：
 
-`go vet ./internal/domainspec/...`：clean（無輸出）。
+```
+$ go test ./internal/domainspec/ -count=1 -v | grep -c '^--- PASS'
+61
+$ go test ./internal/domainspec/ -count=1 -v | grep -c '^--- FAIL'
+0
+$ go test ./internal/domainspec/ -count=1 -v | grep -c '^--- SKIP'
+1
+```
+
+根層新增／改動的 harness（`domainspec_oracle_freshness_test.go`）：
+
+```
+$ go test . -run 'TestOracleFreshness|TestR10' -count=1 -v
+--- PASS: TestOracleFreshnessAllFresh (6.25s)
+--- PASS: TestOracleFreshnessDetectsCorruption (6.16s)
+--- PASS: TestR10ApprovedOnlyGuard (0.02s)
+PASS
+ok  	github.com/slam0504/sdlc-workbench	13.464s
+```
+
+`gofmt -l internal/domainspec/ .` 對本次 fix wave 觸碰的
+`domainspec_oracle_freshness_test.go` 與既有 `internal/domainspec/` 目錄結果為空
+（clean）。**注意**：repo 根目錄 `gofmt -l .` 對整個專案跑仍會列出同一組 5 個既有
+檔案（`cmd/probe-codex-parallel/main.go`、`internal/appcore/manager_test.go`、
+`internal/appcore/manager_wsid_test.go`、`internal/codex/session.go`、
+`internal/replayindex/corrupt_test.go`）——`git status --short` 確認本次 fix wave
+只改動 `domainspec_oracle_freshness_test.go`（既有檔）與新增兩筆 corpus JSON，
+未觸碰上述 5 檔，不在本次 fix wave 的 constraint 範圍內，如實揭露、不隱藏（這是
+spike 之前既有的 repo 債務，非本次或前一版收斂新增）。
+
+`go vet . ./internal/domainspec/...`：clean（無輸出）。
+
+**Exclusion diff（出口 8 佐證，8bf3bb3..HEAD 重跑）**：
+
+```
+$ git diff 8bf3bb3..HEAD --stat -- . \
+  ':(exclude)internal/domainspec' ':(exclude)docs' \
+  ':(exclude)go.mod' ':(exclude)go.sum' \
+  ':(exclude)domainspec_oracle_freshness_test.go'
+[空輸出]
+```
+
+**`git diff --check`（本次 fix wave 兩個提交，均需乾淨）**：
+
+```
+$ git diff --check 8bf3bb3..HEAD
+[空輸出，含本報告提交前的 docs/plan/test 三個提交在內全部乾淨——
+docs/superpowers/specs/2026-08-26-domainspec-spike-results.md 的 go.mod
+diff 樣本已改用空白縮排修正，見出口 8]
+```
 
 ---
 
-## 四、契約變更裁決摘要（Ruling Summary，摘自 ledger）
+## 四、契約變更裁決摘要（Ruling Summary，摘自已刪除的 ledger）
 
-以下五項為 plan 執行過程中對凍結契約的裁決，均已記錄於 ledger 並經 review round 確認：
+以下五項為 plan 執行過程中對凍結契約的裁決，原記錄於 ledger 並經 review round 確認；
+ledger 已於 SDD 流程收斂後依慣例刪除，完整的執行期裁決總表（含這五項的原始編號與
+本次 fix wave 新增的第 11 項）見文末「附錄：controller rulings」：
 
 1. **sel → `cel.DynType`**（Task 4）：plan 原定 `sel: map(string,dyn)` 與「sel 可為
    null」自我矛盾（cel-go v0.32.0 拒絕 `map==null`）；改為 `DynType` 保留 nullable
@@ -354,13 +441,14 @@ constraint 範圍內，本報告如實揭露、不隱藏。
    `gateDecide`／`BuildDecision` 的檢查序重排，bundle 的 precedence 表可能靜默過期。
    建議 M4.5 若採用此 kernel，補一道「production 判定序 vs bundle step_rank」的
    自動化交叉檢查（例如 AST 掃描呼叫序或至少加 code owner review checklist 項）。
-2. **`R10` 是否需要獨立 CEL 規則**：design §4 corpus manifest 來源列表把 R10 的
-   oracle 列在 gate service 測試面，但 25 條 CEL 規則清單內沒有獨立的 R10——本報告
-   未進一步交叉驗證這是「R11 已涵蓋同一語意」還是遺漏（見 §二豁免表 R10 列）。
-   **未驗證**，建議 M4.5 擴大規則面前先排查。
+2. **（已解決，2026-08-27）`R10` 是否需要獨立 CEL 規則**：completion gate 已裁決
+   R10 為 R11／R12 的 guard／aggregation 機制、非獨立 CEL 規則（選項 2），三件證據
+   義務見文末「七、R10 裁決」與 §二豁免表 R10 列，此項不再是殘餘風險，保留本條目
+   僅作歷史記錄。
 3. **Deferred minors（風格／防禦性/未測分支，均已由 reviewer 認可延後、不影響
-   correctness）**，摘自 ledger（完整清單見 `.superpowers/sdd/2026-08-26-domainspec-
-   spike/progress.md`）：
+   correctness）**，摘自 Task 9 執行期的 ledger（`.superpowers/sdd/2026-08-26-
+   domainspec-spike/progress.md`，已於 SDD 流程收斂後依慣例刪除，以下清單是刪除前
+   萃取進本報告的內容，非即時可重新查證的來源）：
    - `facts.go`：`validateSubmitMatrix` 十段 if 可表驅動（風格）；decide phase
      `Decision.Presence==Missing` 分支無測試（邏輯已手動 trace 認可）；
      `ValidateFactsSnapshot(nil)` 防禦分支超出 brief。
@@ -416,22 +504,26 @@ constraint 範圍內，本報告如實揭露、不隱藏。
 
 ## 六、GO／NO-GO 判定
 
-**GO。**
+**GO。**（本判定前提是「七、R10 裁決」成立——completion gate 對 R10 scope 的 P1
+發現已於本次 fix wave 以三件證據義務收斂，出口 5 至此完備；若日後 R10 定性被推翻，
+本判定需要重新評估。）
 
-八項出口條件（spec §5）逐項以本次任務實際執行的指令與輸出驗證，全數滿足：
-`internal/domainspec` 套件 60 個測試、root 層新增 harness 全數 PASS，`go test ./...
--count=1` 全 repo 綠燈（exit code 0），`gofmt -l`／`go vet` 對本任務改動範圍 clean，
-`git diff` 佐證 production 路徑（含 `app.go` 的 `gateDecide`）零改動、依賴變更僅
-cel-go 依賴鏈。R3／R32 兩條「不得豁免」的規則皆有實際證據（真實 App seam 重放、
-逐欄輸出比對），42 筆 corpus（39 evaluated＋3 acquisition_failed）零 shadow
-misalignment。
+八項出口條件（spec §5）逐項以本次 fix wave 於最終 HEAD `dbdfb3e1` 重新執行的指令與
+輸出驗證，全數滿足：`internal/domainspec` 套件 62 個 top-level 測試（61 PASS＋1
+預期 SKIP）、root 層新增 harness 全數 PASS，`go test ./... -count=1` 全 repo 綠燈
+（exit code 0），`gofmt -l`／`go vet` 對本次 fix wave 改動範圍 clean，`git diff`
+佐證 production 路徑（含 `app.go` 的 `gateDecide`）零改動、依賴變更僅 cel-go 依賴鏈
+（本次 fix wave 未再新增依賴）。R3／R32 兩條「不得豁免」的規則皆有實際證據（真實
+App seam 重放、逐欄輸出比對），**44 筆 corpus（41 evaluated＋3 acquisition_failed）
+零 shadow misalignment**——較前一版收斂報告新增的 2 筆即本次 fix wave 的 R10 證據
+案例（`r10-transport-stale-approved`／`r10-causes-first-error`）。
 
 ### M4.5 建議
 
-1. **規則面擴充前先處理 §五殘餘風險第 1、2 項**：`step_rank` 精確凍結表與
+1. **規則面擴充前先處理 §五殘餘風險第 1 項**：`step_rank` 精確凍結表與
    production 判定序目前靠人工 review 對齊，擴大規則面（例如涵蓋 STALE facts／
    TCA consistency）前，應先補自動化交叉檢查機制，避免判定序漂移時 bundle 靜默
-   過期；同時排查 R10 是否需要獨立 CEL 規則。
+   過期（R10 是否需要獨立 CEL 規則已於本次 fix wave 裁決收斂，不再列入此項）。
 2. **`spec/` scope 擴充需另立提案**：本 spike 全程未動 `spec/rules/**`
    manifest scope（design §6 非目標），M4.5 若要讓 bundle 檔案可經 spec 審核流程
    管理，需要另外評估 scope 擴充的影響面，屬於獨立決策，不應隨此 spike 收斂
@@ -450,3 +542,106 @@ misalignment。
    不在本 spike 的 shadow 對比範圍內——M4.5 若要把這些規則也納入 CEL shadow，
    需要額外設計「I/O 結果先解析成 facts」的路徑（design §1 已預留此原則，但尚未
    實作）。
+
+---
+
+## 七、R10 裁決（completion gate 2026-08-27）
+
+**背景**：completion gate 對本收斂報告（rev1）點名 1 個 P1——§二豁免表 R10 列自承
+「未進一步交叉驗證」是「R11 已涵蓋同一語意」還是遺漏，屬未驗證細節。controller 給
+兩個選項，本次裁定**選項 2**：
+
+**裁決**：R10 正式定性為 R11／R12 的 guard／aggregation 機制，**非獨立 CEL 規則**。
+
+**理由**：
+
+1. spec §1（design rev1 起即已明定）敘述 R11「僅 approved 分支」、R12「僅
+   approved」，且兩者「沿 R10 guard」——R10 從一開始的規則面盤點就不是一個
+   平行、獨立的判定點，而是 R11／R12 執行時機的守門與彙總容器。
+2. R10 對應的 production 呼叫（`gate.Service.PrepareDecision` 的 approved 分支，
+   service.go:107-116）本身沒有獨立的 deny 語意——它只是「跑
+   `Gate2Policy.ReconcileBindings`，把回傳的 `causes` 攤平成一個 wrapper
+   錯誤」。`causes` 的每一個元素**必然**是 R11 語意（manifest digest changed）
+   或 R12 語意（base_commit missing）之一（`gatepolicy/gate2.go:212-248`
+   `ReconcileBindings` 的實作只產生這兩種 cause）。因此「R10 被觸發」與「R11∨R12
+   被觸發」是同一件事的兩種說法，一筆「隔離、只命中 R10、不命中 R11 也不命中
+   R12」的 corpus 案例在定義上不可能存在——不是取捨，是邏輯上的不可能。
+3. spec §4 的 coverage 條款本就允許豁免（「未覆蓋列表必須為空或明列豁免理由」），
+   R10 符合「明列豁免理由」的既有機制，不需要為此新造規則或改動代數。
+
+**三件證據義務**（spec rev7 §4／plan rev9 已知豁免清單）：
+
+(a) **R11／R12 的 approved guard 已入 bundle**：`internal/domainspec/testdata/
+    gate2-bundle.yaml` 的 R11（`step_rank: 6`）／R12（`step_rank: 7`）規則區塊
+    皆以 `decision == 'approved'` 起頭的 `when` 子句守門，與 R10 guard 只在
+    approved 分支執行的語意一致（design rev7 §2 annotation）。
+
+(b) **gate-service seam 測試證明 approved-only**：根層新增
+    `TestR10ApprovedOnlyGuard`（`domainspec_oracle_freshness_test.go:788`）
+    對 `gate.Service` 掛一個真正的 `gatepolicy.Gate2Policy`（stub loader／git，
+    spec_manifest 的 current 值與 bound digest 刻意不同），直接證明：
+
+    ```
+    $ go test . -run TestR10ApprovedOnlyGuard -v
+    --- PASS: TestR10ApprovedOnlyGuard (0.02s)
+    ```
+
+    approved 對過期 bindings 必敗（wrapper 錯誤可分類為 R11）；同一筆過期
+    pending request 改用 rejected 決議必須成功——`ReconcileBindings` 完全不會
+    被呼叫（production 注解 service.go:77-84：rejected 只需要 reason，即使
+    request 已過期也必須成功）。
+
+(c) **R10 transport 與 causes[0] 首錯序 corpus 案例**：新增
+    `internal/domainspec/testdata/corpus/r10-transport-stale-approved.json`
+    （role=alignment，oracle_seam=`gate_service_prepare`）——經
+    `PrepareDecision → ReconcileBindings → wrapper 錯誤`全路徑重放，primary 對映
+    R11，與 CEL 端單獨評估 R11 的 verdict 一致；以及
+    `internal/domainspec/testdata/corpus/r10-causes-first-error.json`
+    （role=precedence，covers_rules=[R11,R12]）——R11（manifest digest 不符）與
+    R12（base_commit missing）條件同時成立時，production 端 `causes[0]` 恆為
+    manifest cause（`ReconcileBindings` 的迴圈先檢查四個 manifest 才檢查
+    base_commit，gate2.go:215-248），CEL 端則依 `step_rank`（R11=6 < R12=7）選出
+    primary，兩側 primary 皆為 R11，逐案例一致：
+
+    ```
+    $ go test . -run TestOracleFreshnessAllFresh -v
+    --- PASS: TestOracleFreshnessAllFresh (6.25s)
+    $ go test ./internal/domainspec/... -run 'TestReplayCorpusAllConsistent|TestCoverageComplete' -v
+    --- PASS: TestReplayCorpusAllConsistent
+    --- PASS: TestCoverageComplete
+    ```
+
+**引用**：spec `2026-08-26-domainspec-spike-design.md` rev7 §2／§4／修訂記錄；plan
+`2026-08-26-domainspec-spike.md` rev9 Global Constraints／修訂記錄。
+
+**對 GO／NO-GO 判定的影響**：不改變判定（仍為 GO），但出口 5（corpus 重放一致性＋
+coverage＋precedence）在本次 fix wave 之前对 R10 這一塊留有一個「未驗證」的缺口——
+本裁決與三件證據補上這個缺口後，出口 5 才算完備成立；§六 GO 判定因此明載其前提是
+本裁決成立。
+
+---
+
+## 附錄：controller rulings（執行期裁決總表）
+
+Ledger（`.superpowers/sdd/2026-08-26-domainspec-spike/progress.md`）已於 SDD 流程
+收斂後依慣例刪除。以下是 Task 1–9 執行期間 controller 對凍結契約做出的裁決總表
+（原本記錄在 ledger，這裡是唯一保留的權威版本），第 11 項是本次 completion gate
+fix wave 新增的裁決：
+
+1. **main 直接工作不開 worktree**（repo gate 流程慣例）。
+2. **escalations canonical 全 tuple comparator**（decoder 不強制 ULID 唯一）。
+3. **Target enum 擴充 `binding.kind`**（`per_kind` ⇔ 雙向驗證）。
+4. **RefVars scope-aware 走訪**（comprehension 遮蔽）。
+5. **`sel` 宣告改 `cel.DynType`**（plan celEnv 自我矛盾，R25 需 `sel==null`）。
+6. **Violations 限 deny-effect 命中**。
+7. **混合 cardinality `depends_on` 載入拒收**。
+8. **R16 derived scope 不可豁免＋補啟用 `ext.Strings()`**（plan 明列、Task 3 漏）。
+9. **R29–R31 `tier_rank>=0` guard 接受**（CEL 無 production 早退序）。
+10. **`PrimaryViolation` `phaseRank` 明確第 0 層**（不得靠宣告順序）。
+11. **R10 定性為 guard／aggregation，非獨立 CEL 規則**（completion gate
+    2026-08-27，選項 2——見「七、R10 裁決」）。
+
+裁決 1–9 與本報告「四、契約變更裁決摘要」的 5 項技術細節有內容重疊（同一批
+Task 執行期裁決，不同粒度的摘要），並非互相矛盾的兩份紀錄；裁決 10 對應「四」的
+第 5 項（`phaseRank` 作第 0 層 tiebreak）。裁決 11 是本次 fix wave 新增，「四」的
+既有 5 項未涵蓋 R10（R10 裁決發生在本 fix wave，晚於原始 Task 1–9 執行期）。
