@@ -1,6 +1,7 @@
 # SDLC 協作工作台 App 規劃：從問答終端機到人機協作 cockpit
 
-> 版本：v1.11（2026-08-06）
+> 版本：v1.14（2026-08-27）
+> 版本原則（v1.14 起明文）：header 版本＝修訂記錄最新版（本檔為 **living** 文件）；核可綁定為 **frozen** 語意——下方「狀態」行的 digest 快照（app v1.10）不隨 living 修訂移動，兩者分離、不得互相推論。
 > 狀態：**已核可（第十輪 plan gate APPROVED）**——核可綁定 app v1.10 快照 `4192f95dbbb25f71527e7f7a41da0f864d61e801c7f98d8f37c625d27201841e`、M0 v1.9 `6b3c4331…3dc6`；本版僅狀態標記。**M0 coding NO-GO 解除**，自 M0 計畫 Task 1 開始。方案 A（Go + Wails v2 + Vue 3）為 M0 基線；app 定位個人自用（scope 決策，非合規確認）。
 > 配套文件：`sdlc-bdd-ddd-tdd-reference.md`（參考型 SDLC v2）、`sdlc-ai-agent-automation-plan.md`（AI agent 自動化規劃 v2.1）、`sdlc-workbench-m0-plan.md`（M0 spike 實作計畫 v1.10）
 > 範圍：規劃一個桌面 app，承載兩份配套文件定義的人機分工介面（規格輸入、表示圖顯示、檔案結構視窗、AI 結果輸出、agent 執行過程）；host 語言限定 Python 或 Golang；AI provider 為 Claude 與 Codex（訂閱帳號，官方 login flow）。
@@ -343,6 +344,10 @@ gate3 的核可與 merge queue 驗證是兩件事（v1.2 拆分）：核可綁�
 **仍待決**：CLI ownership 最終形式（待 M0 實測）；forge 選擇（M4 前）。（原「Anthropic 核准申請」行動項因自用定位撤下，僅在未來改變定位時重新浮出。）
 
 ## 10. 修訂記錄
+
+### v1.14（2026-08-27）— header 版本同步與 frozen／living 區分原則（Pre-M4 backlog A3）
+
+外部審核（2026-08-27 核實）指出 header 停在 v1.11 而修訂記錄已至 v1.13，核可權威性語意不清。本版：header 同步至最新修訂版、header 新增 frozen（核可 digest 快照）／living（修訂記錄）區分原則一行。同型掃描 `docs/architecture/` 其餘規劃文件：僅本檔有此漂移（m1.5 計畫的版本嵌於標題行、其餘 header 與修訂記錄一致）。內容章節零變更；SHA256SUMS 同步更新本檔 hash。
 
 ### v1.13（2026-08-18）— 新增 §5.6 Gate 決議一致性（承接 README 移出的實作流程）
 
