@@ -2,7 +2,6 @@ package domainspec
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
 )
 
@@ -190,7 +189,7 @@ func CompareCase(b *CompiledBundle, s *FactsSnapshot, r *Result, gv GoVerdict) (
 			return false, fmt.Sprintf("go verdict outcome=pass 但 cel truth=%q（應為 true）", r.Truth)
 		}
 		want := BuildShadowRiskDecisions(s)
-		if !reflect.DeepEqual(want, gv.RiskDecisions) {
+		if !riskDecisionsEqual(want, gv.RiskDecisions) {
 			return false, fmt.Sprintf("risk decisions 不一致：shadow=%+v go=%+v", want, gv.RiskDecisions)
 		}
 		return true, ""
@@ -198,4 +197,22 @@ func CompareCase(b *CompiledBundle, s *FactsSnapshot, r *Result, gv GoVerdict) (
 	default:
 		return false, fmt.Sprintf("無法辨識的 go verdict outcome %q", gv.Outcome)
 	}
+}
+
+// riskDecisionsEqual 逐欄＋依序比對兩份 RiskDecisions（R32 證據）。刻意不用
+// reflect.DeepEqual：nil（BuildShadowRiskDecisions 對 rejected／非 known plan
+// 的回傳值）與 JSON 解出的空 slice `[]RiskDecision{}`（GoVerdict doc：
+// 「rejected pass 為空」）對 reflect.DeepEqual 是不同值，會把語意相同的
+// 「沒有 risk decisions」誤判成不一致；長度比對＋逐欄 comparable 相等
+// （RiskDecision 五欄皆 string，可比較）避開這個 nil-vs-empty 假陽性。
+func riskDecisionsEqual(a, b []RiskDecision) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
