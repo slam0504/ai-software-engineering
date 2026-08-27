@@ -24,7 +24,7 @@ type Rule struct {
 	Phase     string   `yaml:"phase" json:"phase"`           // "submit" | "decide"（單值，spec rev4）
 	When      string   `yaml:"when" json:"when"`             // CEL 布林式
 	Effect    string   `yaml:"effect" json:"effect"`         // "deny" | "allow"
-	Target    string   `yaml:"target" json:"target"`         // "decision.eligibility" | "risk.task"（逐 task 實體化為 risk.T<id>）
+	Target    string   `yaml:"target" json:"target"`         // "decision.eligibility" | "risk.task"（逐 task 實體化為 risk.T<id>） | "binding.kind"（逐 kind 實體化為 binding.<kind>）
 	DependsOn []string `yaml:"depends_on" json:"depends_on"` // 限同 phase（spec rev5）
 	Priority  int      `yaml:"priority" json:"priority"`
 	Verdict   string   `yaml:"verdict" json:"verdict"`
@@ -77,7 +77,7 @@ type CompiledBundle struct {
 var (
 	validRulePhases  = map[string]bool{"submit": true, "decide": true}
 	validRuleEffects = map[string]bool{"deny": true, "allow": true}
-	validRuleTargets = map[string]bool{"decision.eligibility": true, "risk.task": true}
+	validRuleTargets = map[string]bool{"decision.eligibility": true, "risk.task": true, "binding.kind": true}
 	validRuleStages  = map[string]bool{"none": true, "pre_loop": true, "task_loop": true, "post_loop": true}
 )
 
@@ -231,8 +231,9 @@ func LoadBundle(yamlSrc []byte, staticCostLimit uint64) (*CompiledBundle, error)
 	}, nil
 }
 
-// validateRules 檢查 enum（phase／effect／target／stage）、id 唯一、depends_on
-// 存在且同 phase（spec rev5——跨 phase 依賴在載入時就必須拒收）。
+// validateRules 檢查 enum（phase／effect／target／stage）、per_kind／per_task
+// 與 target 的一致性、id 唯一、depends_on 存在且同 phase（spec rev5——跨 phase
+// 依賴在載入時就必須拒收）。
 func validateRules(rules []Rule) error {
 	seen := make(map[string]Rule, len(rules))
 	for _, r := range rules {
@@ -247,6 +248,20 @@ func validateRules(rules []Rule) error {
 		}
 		if !validRuleStages[r.Stage] {
 			return fmt.Errorf("domainspec: bundle: rule %q: invalid stage %q", r.ID, r.Stage)
+		}
+		// per_kind／per_task 與 target 一致性（controller ruling）：
+		// per_kind:true ⇔ target=="binding.kind"；per_task:true ⇔ target=="risk.task"。
+		if r.PerKind && r.Target != "binding.kind" {
+			return fmt.Errorf("domainspec: bundle: rule %q: per_kind=true requires target %q, got %q", r.ID, "binding.kind", r.Target)
+		}
+		if !r.PerKind && r.Target == "binding.kind" {
+			return fmt.Errorf("domainspec: bundle: rule %q: target %q requires per_kind=true", r.ID, r.Target)
+		}
+		if r.PerTask && r.Target != "risk.task" {
+			return fmt.Errorf("domainspec: bundle: rule %q: per_task=true requires target %q, got %q", r.ID, "risk.task", r.Target)
+		}
+		if !r.PerTask && r.Target == "risk.task" {
+			return fmt.Errorf("domainspec: bundle: rule %q: target %q requires per_task=true", r.ID, r.Target)
 		}
 		if _, dup := seen[r.ID]; dup {
 			return fmt.Errorf("domainspec: bundle: duplicate rule id %q", r.ID)
@@ -325,20 +340,78 @@ func validateRequiredKinds(kinds []RequiredKind) error {
 	return nil
 }
 
-// extractRefVars 走訪 checked AST，收集出現在 celTopLevelVars 集合內的頂層
-// ident（missing/not_applicable 判定的輸入，Task 4 使用）。
+// extractRefVars 走訪 checked AST，收集出現在 celTopLevelVars 集合內、且未被
+// comprehension 巨集（.exists()／.all() 等）迭代變數遮蔽的頂層 ident
+// （missing/not_applicable 判定的輸入，Task 4 使用）。
+//
+// 手寫遞迴（而非 celast.PostOrderVisit 的無狀態 Visitor）是必要的：遮蔽關係
+// 只在「目前這條路徑上是否處於某個 comprehension 的迴圈子樹」才成立，PostOrderVisit
+// 的單一 callback 沒有攜帶路徑上下文，無法分辨 escalations.exists(entry, ...) 裡
+// 的 entry 是巨集綁定的迭代變數、還是頂層同名變數。
 func extractRefVars(checkedAST *cel.Ast) map[string]bool {
 	refVars := make(map[string]bool)
-	celast.PostOrderVisit(checkedAST.NativeRep().Expr(), celast.NewExprVisitor(func(e celast.Expr) {
-		if e.Kind() != celast.IdentKind {
-			return
-		}
+	walkRefVars(checkedAST.NativeRep().Expr(), nil, refVars)
+	return refVars
+}
+
+// walkRefVars 遞迴走訪；shadowed 是目前路徑上、由外層 comprehension 引入而
+// 遮蔽同名頂層變數的迭代／累加變數名集合。comprehension 的 IterRange（被迭代
+// 的來源運算式，如 escalations.exists(entry, ...) 裡的 escalations）不受
+// 該 comprehension 自己引入的遮蔽影響——它在外層 scope 求值，只有
+// LoopCondition／LoopStep／Result 才在遮蔽範圍內。
+func walkRefVars(e celast.Expr, shadowed map[string]bool, refVars map[string]bool) {
+	if e == nil {
+		return
+	}
+	switch e.Kind() {
+	case celast.IdentKind:
 		name := e.AsIdent()
-		if celTopLevelVars[name] {
+		if celTopLevelVars[name] && !shadowed[name] {
 			refVars[name] = true
 		}
-	}))
-	return refVars
+	case celast.SelectKind:
+		walkRefVars(e.AsSelect().Operand(), shadowed, refVars)
+	case celast.CallKind:
+		call := e.AsCall()
+		if call.IsMemberFunction() {
+			walkRefVars(call.Target(), shadowed, refVars)
+		}
+		for _, arg := range call.Args() {
+			walkRefVars(arg, shadowed, refVars)
+		}
+	case celast.ListKind:
+		for _, elem := range e.AsList().Elements() {
+			walkRefVars(elem, shadowed, refVars)
+		}
+	case celast.MapKind:
+		for _, entry := range e.AsMap().Entries() {
+			me := entry.AsMapEntry()
+			walkRefVars(me.Key(), shadowed, refVars)
+			walkRefVars(me.Value(), shadowed, refVars)
+		}
+	case celast.StructKind:
+		for _, field := range e.AsStruct().Fields() {
+			walkRefVars(field.AsStructField().Value(), shadowed, refVars)
+		}
+	case celast.ComprehensionKind:
+		comp := e.AsComprehension()
+		// IterRange 在外層 scope 求值，不受本層新增的遮蔽影響。
+		walkRefVars(comp.IterRange(), shadowed, refVars)
+
+		inner := make(map[string]bool, len(shadowed)+3)
+		for k, v := range shadowed {
+			inner[k] = v
+		}
+		inner[comp.IterVar()] = true
+		if comp.HasIterVar2() {
+			inner[comp.IterVar2()] = true
+		}
+		inner[comp.AccuVar()] = true
+
+		walkRefVars(comp.LoopCondition(), inner, refVars)
+		walkRefVars(comp.LoopStep(), inner, refVars)
+		walkRefVars(comp.Result(), inner, refVars)
+	}
 }
 
 // bundleDigest = "sha256:" + hex(sha256(canonical JSON))。canonical 形＝
