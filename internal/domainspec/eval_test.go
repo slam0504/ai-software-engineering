@@ -193,6 +193,56 @@ func TestEvaluateRuntimeCostLimitIsError(t *testing.T) {
 	}
 }
 
+func TestEvaluateViolationsExcludeAllowMatches(t *testing.T) {
+	// controller ruling（Task 4 review）：Violations 只收 deny 命中——allow
+	// 命中若混進 Violations，會在 Task 6 的 PrimaryViolation 四層裁決裡冒充
+	// 成一條「違規」，可能用較小的 rank tuple 蓋過真正擋下請求的 deny。
+	// RD／RAT 分屬不同 target（decision.eligibility／risk.T1），無 conflict。
+	const mixedBundle = `schema_version: 1
+rules:
+  - id: RD
+    phase: decide
+    when: "decision == 'approved'"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "RD"
+    refs: "test"
+    step_rank: 2
+    stage: none
+  - id: RAT
+    phase: decide
+    when: "true"
+    effect: allow
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "RAT"
+    refs: "test"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 0
+`
+	b, err := LoadBundle([]byte(mixedBundle), 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Evaluate(b, mustSnapshot(t), 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Violations) != 1 || r.Violations[0].RuleID != "RD" {
+		t.Fatalf("violations must contain only the deny match: %+v", r.Violations)
+	}
+	matched := map[string]bool{}
+	for _, id := range r.MatchedRuleIDs {
+		matched[id] = true
+	}
+	if !matched["RD"] || !matched["RAT"] {
+		t.Fatalf("matched rule ids must include both deny and allow matches: %v", r.MatchedRuleIDs)
+	}
+}
+
 func TestEvaluateDeterministicBytes(t *testing.T) {
 	// 出口 4：同 facts 兩次評估，序列化輸出逐字節相等
 	b, _ := LoadBundle([]byte(dagBundle), 1_000_000)

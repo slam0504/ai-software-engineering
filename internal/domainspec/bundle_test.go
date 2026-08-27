@@ -199,6 +199,105 @@ func TestLoadBundleRefVarsComprehensionShadowing(t *testing.T) {
 	}
 }
 
+func TestLoadBundleRejectsPerTaskDependsOnPerKind(t *testing.T) {
+	// controller ruling（Task 4 review）：depends_on 只在「基數相同」或
+	// 「依賴方是 scalar」時合法——per_task 依賴 per_kind 是不同基數，載入時必拒。
+	const bad = `schema_version: 1
+rules:
+  - id: RK
+    phase: decide
+    when: "true"
+    effect: deny
+    target: binding.kind
+    per_kind: true
+    priority: 10
+    verdict: "RK"
+    refs: "test"
+    step_rank: 0
+    stage: none
+  - id: RT
+    phase: decide
+    when: "true"
+    effect: deny
+    target: risk.task
+    per_task: true
+    depends_on: [RK]
+    priority: 10
+    verdict: "RT"
+    refs: "test"
+    step_rank: 1
+    stage: task_loop
+    check_rank: 0
+`
+	if _, err := LoadBundle([]byte(bad), 1_000_000); err == nil {
+		t.Fatal("per_task depends_on per_kind must be rejected（cardinality mismatch）")
+	}
+}
+
+func TestLoadBundleRejectsScalarDependsOnPerTask(t *testing.T) {
+	const bad = `schema_version: 1
+rules:
+  - id: RT
+    phase: decide
+    when: "true"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "RT"
+    refs: "test"
+    step_rank: 0
+    stage: task_loop
+    check_rank: 0
+  - id: RS
+    phase: decide
+    when: "true"
+    effect: deny
+    target: decision.eligibility
+    depends_on: [RT]
+    priority: 10
+    verdict: "RS"
+    refs: "test"
+    step_rank: 1
+    stage: none
+`
+	if _, err := LoadBundle([]byte(bad), 1_000_000); err == nil {
+		t.Fatal("scalar depends_on per_task must be rejected（scalar 依賴 instantiated 規則）")
+	}
+}
+
+func TestLoadBundlePerTaskDependsOnScalarOK(t *testing.T) {
+	const ok = `schema_version: 1
+rules:
+  - id: RS
+    phase: decide
+    when: "true"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "RS"
+    refs: "test"
+    step_rank: 0
+    stage: none
+  - id: RT
+    phase: decide
+    when: "true"
+    effect: deny
+    target: risk.task
+    per_task: true
+    depends_on: [RS]
+    priority: 10
+    verdict: "RT"
+    refs: "test"
+    step_rank: 1
+    stage: task_loop
+    check_rank: 0
+`
+	if _, err := LoadBundle([]byte(ok), 1_000_000); err != nil {
+		t.Fatalf("per_task depends_on scalar must load OK: %v", err)
+	}
+}
+
 func TestLoadBundleRefVarsGenuineTopLevelRefAlongsideShadowed(t *testing.T) {
 	b, err := LoadBundle(refVarsBundle(`entry.exists && escalations.exists(x, x.state != "resolved")`), 1_000_000)
 	if err != nil {

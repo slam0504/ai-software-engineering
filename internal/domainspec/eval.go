@@ -332,39 +332,46 @@ func dependencyLabel(outcome string) string {
 	}
 }
 
-// lookupDependency 依 callerIndex 精確配對依賴規則的實例；找不到則退而使用
-// group-wide（-1）或第一個實例（0）——涵蓋 normal 規則依賴 per_task／per_kind
-// 規則等本 spike 未涵蓋測試的混合基數情境，避免 panic（非本 spike 主線，未逐一
-// 驗證）。
-func lookupDependency(states map[string]*ruleState, depID string, callerIndex int) (instanceOutcome, bool) {
-	rs, ok := states[depID]
-	if !ok || len(rs.instances) == 0 {
+// lookupDependency 依 depRule 的基數精確配對實例，不做 index 猜測（controller
+// ruling，Task 4：LoadBundle 的 depends_on cardinality 驗證已保證合法組合只剩
+// 兩種——見 validateRules）：
+//   - depRule 是 scalar（非 per_task／per_kind）：唯一實例固定在 index -1，
+//     與呼叫方（callerIndex）的基數無關；
+//   - depRule 與呼叫方同基數（per_task↔per_task／per_kind↔per_kind）：exact
+//     index 配對（同一 snapshot 下兩者展開的索引集合恆相同——見 Evaluate 的
+//     per_task／per_kind 展開，皆源自同一 cp.Plan.Value.Tasks／b.RequiredKinds）。
+//
+// 找不到實例（理論上不應發生，LoadBundle 已擋下基數不合法的組合）視為
+// unresolved，交由呼叫方 fail loud，不再退而猜測 index。
+func lookupDependency(states map[string]*ruleState, depRule *CompiledRule, callerIndex int) (instanceOutcome, bool) {
+	rs, ok := states[depRule.ID]
+	if !ok {
 		return instanceOutcome{}, false
 	}
-	if r, ok := rs.instances[callerIndex]; ok {
-		return r, true
+	if !depRule.PerTask && !depRule.PerKind {
+		r, ok := rs.instances[-1]
+		return r, ok
 	}
-	if r, ok := rs.instances[-1]; ok {
-		return r, true
-	}
-	if r, ok := rs.instances[0]; ok {
-		return r, true
-	}
-	return instanceOutcome{}, false
+	r, ok := rs.instances[callerIndex]
+	return r, ok
 }
 
 // checkDependencies 是 eligibility 傳遞封閉（spec rev6）：eligible ⇔ 所有
 // dependency eligible 且 when=true；依賴 false／unknown／not_eligible／error
-// 皆使下游 not eligible（when 不評估），cause 記錄哪個依賴、哪種狀態。
-func checkDependencies(rule *CompiledRule, callerIndex int, states map[string]*ruleState) (eligible bool, cause string) {
+// 皆使下游 not eligible（when 不評估），cause 記錄哪個依賴、哪種狀態。實例
+// unresolved（不應發生，見 lookupDependency 註解）一律 fail loud，不猜測。
+func checkDependencies(rule *CompiledRule, callerIndex int, states map[string]*ruleState, byID map[string]*CompiledRule) (eligible bool, cause string) {
 	for _, dep := range rule.DependsOn {
-		r, found := lookupDependency(states, dep, callerIndex)
-		if !found || r.outcome != "matched" {
-			label := "not_eligible"
-			if found {
-				label = dependencyLabel(r.outcome)
-			}
-			return false, fmt.Sprintf("dependency %s %s", dep, label)
+		depRule, ok := byID[dep]
+		if !ok {
+			return false, fmt.Sprintf("dependency %s instance unresolved", dep)
+		}
+		r, found := lookupDependency(states, depRule, callerIndex)
+		if !found {
+			return false, fmt.Sprintf("dependency %s instance unresolved", dep)
+		}
+		if r.outcome != "matched" {
+			return false, fmt.Sprintf("dependency %s %s", dep, dependencyLabel(r.outcome))
 		}
 	}
 	return true, ""
@@ -373,8 +380,8 @@ func checkDependencies(rule *CompiledRule, callerIndex int, states map[string]*r
 // evalInstance 是單一規則實例的兩階段聚合第一階段：依賴 eligibility → 本身
 // presence → CEL when（runtime cost 超限或型別非 bool → outcome="error"，
 // 不併入 unknown——owner 凍結）。
-func evalInstance(rule *CompiledRule, index int, target string, activation map[string]any, states map[string]*ruleState, presence map[string]Presence, prog cel.Program, unknownGroups map[string]bool) instanceOutcome {
-	if eligible, cause := checkDependencies(rule, index, states); !eligible {
+func evalInstance(rule *CompiledRule, index int, target string, activation map[string]any, states map[string]*ruleState, byID map[string]*CompiledRule, presence map[string]Presence, prog cel.Program, unknownGroups map[string]bool) instanceOutcome {
+	if eligible, cause := checkDependencies(rule, index, states, byID); !eligible {
 		return instanceOutcome{index: index, target: target, outcome: "not_eligible", cause: cause}
 	}
 	if outcome, cause, missing := checkOwnPresence(rule.RefVars, presence); outcome != "" {
@@ -398,14 +405,20 @@ func evalInstance(rule *CompiledRule, index int, target string, activation map[s
 }
 
 // recordInstance 把單一實例結果併入全域累積（Violations／MatchedRuleIDs／
-// evaluation_error 旗標）。
+// evaluation_error 旗標）。Violations 只收 deny 命中（controller ruling，
+// Task 4）：allow 命中若混進 Violations，會在 Task 6 的 PrimaryViolation
+// 四層裁決裡冒充成一條「違規」，可能用較小的 rank tuple 蓋過真正擋下請求的
+// deny——allow 命中仍完整保留在 MatchedRuleIDs／ReasonGraph，只是不進
+// Violations 這份「deny 完整列表」。
 func recordInstance(ir instanceOutcome, rule *CompiledRule, violations *[]Violation, matchedIDs map[string]bool, statusError *bool) {
 	switch ir.outcome {
 	case "matched":
 		matchedIDs[rule.ID] = true
-		*violations = append(*violations, Violation{
-			RuleID: rule.ID, Target: ir.target, SourceIndex: ir.index, Verdict: rule.Verdict,
-		})
+		if rule.Effect == "deny" {
+			*violations = append(*violations, Violation{
+				RuleID: rule.ID, Target: ir.target, SourceIndex: ir.index, Verdict: rule.Verdict,
+			})
+		}
 	case "error":
 		*statusError = true
 	}
@@ -570,7 +583,7 @@ func Evaluate(b *CompiledBundle, s *FactsSnapshot, runtimeCostLimit uint64) (*Re
 					"sel":  findSelection(cp.RiskSelections, task.ID),
 				})
 				target := "risk.T" + task.ID
-				ir := evalInstance(rule, task.SourceIndex, target, activation, states, presence, prog, unknownGroups)
+				ir := evalInstance(rule, task.SourceIndex, target, activation, states, b.ByID, presence, prog, unknownGroups)
 				rs.instances[task.SourceIndex] = ir
 				record(ir, target)
 			}
@@ -590,14 +603,14 @@ func Evaluate(b *CompiledBundle, s *FactsSnapshot, runtimeCostLimit uint64) (*Re
 					"req_kind": rk.Kind, "req_index": int64(ki), "req_pattern": rk.Pattern,
 				})
 				target := "binding." + rk.Kind
-				ir := evalInstance(rule, ki, target, activation, states, presence, prog, unknownGroups)
+				ir := evalInstance(rule, ki, target, activation, states, b.ByID, presence, prog, unknownGroups)
 				rs.instances[ki] = ir
 				record(ir, target)
 			}
 
 		default:
 			target := rule.Target
-			ir := evalInstance(rule, -1, target, baseActivation, states, presence, prog, unknownGroups)
+			ir := evalInstance(rule, -1, target, baseActivation, states, b.ByID, presence, prog, unknownGroups)
 			rs.instances[-1] = ir
 			record(ir, target)
 		}

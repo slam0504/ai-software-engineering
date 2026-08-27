@@ -236,9 +236,26 @@ func LoadBundle(yamlSrc []byte, staticCostLimit uint64) (*CompiledBundle, error)
 	}, nil
 }
 
+// ruleCardinality 是規則的實體化基數："scalar"（normal，唯一實例）、
+// "per_task"、"per_kind"——depends_on cardinality 驗證與錯誤訊息用。
+func ruleCardinality(r Rule) string {
+	switch {
+	case r.PerTask:
+		return "per_task"
+	case r.PerKind:
+		return "per_kind"
+	default:
+		return "scalar"
+	}
+}
+
 // validateRules 檢查 enum（phase／effect／target／stage）、per_kind／per_task
 // 與 target 的一致性、id 唯一、depends_on 存在且同 phase（spec rev5——跨 phase
-// 依賴在載入時就必須拒收）。
+// 依賴在載入時就必須拒收）、depends_on cardinality（controller ruling，Task 4：
+// 依賴邊只在「基數相同」或「依賴方是 scalar」時合法——per_task 依賴 per_kind、
+// scalar 依賴 per_task／per_kind 皆是「看似合理實則錯誤」的組合，若不在載入時
+// 擋下，Evaluate 的 lookupDependency 會被迫用 index 猜測法補洞，難以判斷正確
+// 語意，故直接 fail loud 在源頭）。
 func validateRules(rules []Rule) error {
 	seen := make(map[string]Rule, len(rules))
 	for _, r := range rules {
@@ -281,6 +298,10 @@ func validateRules(rules []Rule) error {
 			}
 			if depRule.Phase != r.Phase {
 				return fmt.Errorf("domainspec: bundle: rule %q (phase %q): depends_on %q is in phase %q", r.ID, r.Phase, dep, depRule.Phase)
+			}
+			rCard, depCard := ruleCardinality(r), ruleCardinality(depRule)
+			if depCard != "scalar" && depCard != rCard {
+				return fmt.Errorf("domainspec: bundle: rule %q (%s): depends_on %q is %s: cardinality mismatch (dependency must be scalar or same cardinality as %q)", r.ID, rCard, dep, depCard, r.ID)
 			}
 		}
 	}
