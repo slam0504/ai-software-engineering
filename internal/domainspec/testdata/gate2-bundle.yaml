@@ -341,27 +341,27 @@ rules:
 
   # R16：escalation blocking。derived scope 完整公式（app.go:5892-5912）：
   # gate1→"workspace"、gate2 with subject "plan:<id>"→"gate2:"+<id>、未知 gate→
-  # "workspace"。frozen celEnv（bundle.go）未載入 ext.Strings()，核心 CEL 沒有
-  # substring/split/字元索引，也沒有 host 函式可用（tier_rank 是唯一自訂函式，
-  # 非字串用途）——經 zzz_probe 系列實測確認 `"x".substring(...)`／`"x".split(...)`／
-  # `"x"[0]` 三者在本 celEnv 下皆編譯失敗（undeclared reference / 無匹配 overload）。
-  # 「subject 去掉 'plan:' 前綴、換成 'gate2:' 前綴」是一般化的前綴替換，
-  # RE2（matches() 底層）不支援 backreference，也無法在不取出中段字串的情況下
-  # 用 startsWith/endsWith/contains/matches 表達「兩個不同長度前綴、相同未知
-  # 長度尾段」的相等性——已反覆驗證無可行純 CEL 寫法。
-  #
-  # 因此本規則目前只落地「block_scope == workspace」（universal block，與 gate
-  # 無關，完整且正確）分支；gate2 專屬（"gate2:"+plan id）分支未實作，屬已知、
-  # 已記錄的 scope 落差，需 Task 3/4 controller 決議（例如在 bundle.go 加
-  # ext.Strings()，或在 activation 補一個 precomputed derived_scope 變數）後
-  # 才能補齊——見 task-5-report.md「concerns」。
+  # "workspace"。controller ruling（Task 5 fix commit）：bundle.go 的 celEnv
+  # 已補 ext.Strings()（plan Tech Stack 本就要求 substring 能力，Task 3 漏加），
+  # 用 `.substring(5)`（"plan:" 固定長度 5）取 subject 去掉前綴後的 id，CEL
+  # 端獨立重算 scope（R15 語意：不依賴任何 precomputed 值，mapping mutation
+  # 才可被測試獨立驗證）。
   - id: R16
     phase: decide
-    when: "escalations.exists(e, e.state != 'resolved' && e.block_scope != '' && e.block_scope == 'workspace')"
+    when: >-
+      escalations.exists(e, e.state != 'resolved' && e.block_scope != '' && (
+        e.block_scope == 'workspace' ||
+        e.block_scope == (
+          request.gate == 'gate1' ? 'workspace' :
+          (request.gate == 'gate2' && request.subject.startsWith('plan:')
+            ? 'gate2:' + request.subject.substring(5)
+            : 'workspace')
+        )
+      ))
     effect: deny
     target: decision.eligibility
     priority: 10
-    verdict: "blocked by workspace-scope escalation (gate2-specific scope branch NOT implemented — see refs)"
-    refs: "app.go:5892-5912;internal/escalation/project.go:81-96 (partial — gate2 per-plan scope branch not CEL-expressible under current celEnv)"
+    verdict: "blocked by escalation matching workspace or derived gate scope"
+    refs: "app.go:5892-5912;internal/escalation/project.go:81-96"
     step_rank: 11
     stage: none

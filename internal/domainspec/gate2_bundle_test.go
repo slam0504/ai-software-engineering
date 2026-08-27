@@ -270,6 +270,17 @@ func TestGate2BundleIsolatedRuleCoverage(t *testing.T) {
 				}}
 			},
 		},
+		{
+			// R15 scope-derivation 語意（controller ruling，fix commit）：CEL 端
+			// 獨立由 request.gate/request.subject（gate2、"plan:P1"）重算出
+			// "gate2:P1"，與 escalation 的 block_scope 完全相等才擋。
+			name: "R16/gate2-derived-scope-match-blocks", ruleID: "R16", wantIdx: -1,
+			mutate: func(s *FactsSnapshot) {
+				s.Escalations = Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{
+					{EscalationID: "E2", State: "open", BlockScope: "gate2:P1"},
+				}}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -300,6 +311,23 @@ func TestGate2BundleIsolatedRuleCoverage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGate2BundleR16ScopeDerivationIsNotOverInclusive：R15 scope-derivation
+// 語意的反證面（controller ruling，fix commit）——escalation 若 block_scope
+// 是「另一個 plan」的 derived scope（gate2:P2），不得誤擋 subject=plan:P1 的
+// 決議；證明 R16 的 CEL 重算確實是逐 gate/subject 動態算出、不是巧合命中
+// 固定字串（若退化成永遠 true 或只比對 "gate2:" 前綴，這個案例會被誤擋）。
+func TestGate2BundleR16ScopeDerivationIsNotOverInclusive(t *testing.T) {
+	b := loadGate2Bundle(t)
+	s := mustSnapshot(t) // request.subject == "plan:P1"
+	s.Escalations = Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{
+		{EscalationID: "E3", State: "open", BlockScope: "gate2:P2"},
+	}}
+	r := evalGate2(t, b, s)
+	if r.Truth != TruthTrue || len(r.Violations) != 0 {
+		t.Fatalf("escalation scoped to a different plan must not block: truth=%s violations=%+v", r.Truth, r.Violations)
 	}
 }
 

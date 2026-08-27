@@ -13,6 +13,7 @@ import (
 	celast "cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/ext"
 	"gopkg.in/yaml.v3"
 )
 
@@ -106,8 +107,16 @@ func tierRankValue(tier string) int64 {
 }
 
 // celEnv：凍結變數宣告（全 bundle 共用，Task 4 evaluate 沿用同一份宣告）。
+//
+// ext.Strings()（controller ruling，Task 5 fix commit）：plan 的 Tech Stack
+// 本就要求 substring 能力（R15 的 scope-derivation 語意——CEL 端獨立由
+// gate+subject 重算 escalation block scope，否則 mapping mutation 無法被
+// 測試獨立驗證），Task 3 建 celEnv 時漏加，屬遺漏而非刻意排除，本次授權補上。
+// 純新增能力（additive），不改動既有變數／函式宣告，對 Task 1-4 既有測試
+// 應無影響（已於 fix commit 重跑全套件驗證）。
 func celEnv() (*cel.Env, error) {
 	env, err := cel.NewEnv(
+		ext.Strings(),
 		cel.Variable("evaluation_phase", cel.StringType),
 		cel.Variable("decision", cel.StringType),
 		cel.Variable("reason", cel.StringType),
