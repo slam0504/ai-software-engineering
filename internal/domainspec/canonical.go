@@ -184,7 +184,7 @@ func normalizeSnapshot(s *FactsSnapshot) {
 		if escs == nil {
 			escs = []EscalationFact{}
 		}
-		sort.Slice(escs, func(i, j int) bool { return escs[i].EscalationID < escs[j].EscalationID })
+		sort.Slice(escs, func(i, j int) bool { return escalationLess(escs[i], escs[j]) })
 		*s.Escalations.Value = escs
 	}
 }
@@ -232,4 +232,18 @@ func riskSelectionLess(a, b RiskSelection) bool {
 		return a.SelectedRiskTier < b.SelectedRiskTier
 	}
 	return a.OverrideReason < b.OverrideReason
+}
+
+// escalationLess 依 (escalation_id, state, block_scope) 全序排序——decoder 不強制
+// escalation_id 唯一，單鍵排序在同 id 不同 state/block_scope 時對 sort.Slice（非
+// stable）而言是未定義序，會讓相同 multiset、不同輸入序的 snapshot canonicalize
+// 出不同 bytes。全 tuple 排序讓相同鍵值必為值相同的 struct，順序無關輸出。
+func escalationLess(a, b EscalationFact) bool {
+	if a.EscalationID != b.EscalationID {
+		return a.EscalationID < b.EscalationID
+	}
+	if a.State != b.State {
+		return a.State < b.State
+	}
+	return a.BlockScope < b.BlockScope
 }

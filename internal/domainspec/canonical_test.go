@@ -53,3 +53,21 @@ func TestCanonicalNilAndEmptySliceEqual(t *testing.T) {
 		t.Fatal("nil and empty slices must produce identical canonical form")
 	}
 }
+
+func TestCanonicalEscalationsDuplicateIDTieBreakOrderIndependent(t *testing.T) {
+	// review finding：同 escalation_id、不同 state/block_scope 的兩筆 escalation，
+	// 以相反輸入序插入，必須 canonicalize 成相同 digest（single-key sort.Slice 對
+	// tie 是未定義序，需要 (escalation_id, state, block_scope) 全 tuple tie-break）。
+	a, b := mustSnapshot(t), mustSnapshot(t)
+	e1 := EscalationFact{EscalationID: "ESC1", State: "open", BlockScope: "task"}
+	e2 := EscalationFact{EscalationID: "ESC1", State: "resolved", BlockScope: "gate"}
+	forward := []EscalationFact{e1, e2}
+	reverse := []EscalationFact{e2, e1}
+	a.Escalations.Value = &forward
+	b.Escalations.Value = &reverse
+	da, _ := SnapshotDigest(a)
+	db, _ := SnapshotDigest(b)
+	if da != db {
+		t.Fatalf("duplicate escalation_id with differing state/block_scope must tie-break deterministically: %s != %s", da, db)
+	}
+}
