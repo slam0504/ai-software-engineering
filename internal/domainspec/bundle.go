@@ -118,7 +118,12 @@ func celEnv() (*cel.Env, error) {
 		cel.Variable("plan", cel.MapType(cel.StringType, cel.DynType)),
 		cel.Variable("risk_policy", cel.MapType(cel.StringType, cel.DynType)),
 		cel.Variable("task", cel.MapType(cel.StringType, cel.DynType)),
-		cel.Variable("sel", cel.MapType(cel.StringType, cel.DynType)), // sel 可為 null（runtime binding，Task 4）
+		// sel 宣告為 dyn（而非 map(string,dyn)）：R25 的 guard 需要 `sel == null`
+		// 成立（Task 4 runtime binding；task_id 對 risk_selections 無配對時
+		// sel 為 null），但 cel-go v0.32.0 type-checker 對具體 Map 型別 vs
+		// null 的 `==` 比較不放行（只有 dyn／legacy nullable kind 才允許），
+		// 故改宣告為 dyn（controller ruling，Task 4 發現並修正）。
+		cel.Variable("sel", cel.DynType),
 		cel.Variable("current", cel.MapType(cel.StringType, cel.StringType)),
 		cel.Variable("risk_selections", cel.ListType(cel.MapType(cel.StringType, cel.StringType))),
 		cel.Variable("escalations", cel.ListType(cel.MapType(cel.StringType, cel.StringType))),
