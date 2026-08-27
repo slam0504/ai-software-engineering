@@ -1,0 +1,367 @@
+# gate2-bundle.yaml — Task 5：in-scope 規則全數落 CEL（DomainSpec spike）。
+#
+# required_kinds 順序＝gate2BindingReqs 固定序（internal/gatepolicy/gate2.go:42-48），
+# pattern 沿用同檔 28-31 兩條 regex；per_kind 規則（R8/R9）依此序逐 kind 實體化。
+schema_version: 1
+required_kinds:
+  - kind: spec_manifest
+    pattern: "^sha256:[0-9a-f]{64}$"
+  - kind: plan
+    pattern: "^sha256:[0-9a-f]{64}$"
+  - kind: base_commit
+    pattern: "^git:(sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})$"
+  - kind: risk_policy
+    pattern: "^sha256:[0-9a-f]{64}$"
+  - kind: permission_manifest
+    pattern: "^sha256:[0-9a-f]{64}$"
+
+rules:
+  # ---- submit phase（step_rank 0-3；production 序：R5.submit → R6.submit →
+  # R7（全域重複）→ 逐 required_kinds 序 found=驗 digest(R9) / not-found=missing(R8)）----
+
+  - id: R5.submit
+    phase: submit
+    when: "!(request.gate in ['gate1','gate2','test_contract_approval'])"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "unknown gate"
+    refs: "internal/gate/service.go:46-48"
+    step_rank: 0
+    stage: none
+
+  - id: R6.submit
+    phase: submit
+    when: "request.gate == 'gate2' && (!request.subject.startsWith('plan:') || request.subject == 'plan:')"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "gate2 subject must be plan:<nonempty id>"
+    refs: "internal/gatepolicy/gate2.go:92-95"
+    step_rank: 1
+    stage: none
+
+  - id: R7
+    phase: submit
+    when: "request.bindings.exists(a, !request.bindings.exists_one(b, b.kind == a.kind && b.role == a.role))"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "duplicate (kind,role) binding"
+    refs: "internal/gatepolicy/gate2.go:284-291"
+    step_rank: 2
+    stage: none
+
+  - id: R8
+    phase: submit
+    when: "!request.bindings.exists(b, b.kind == req_kind && b.role == '')"
+    effect: deny
+    target: binding.kind
+    per_kind: true
+    priority: 10
+    verdict: "missing required binding"
+    refs: "internal/gatepolicy/gate2.go:292-306"
+    step_rank: 3
+    stage: none
+
+  - id: R9
+    phase: submit
+    when: "request.bindings.exists(b, b.kind == req_kind && b.role == '' && !b.digest.matches(req_pattern))"
+    effect: deny
+    target: binding.kind
+    per_kind: true
+    priority: 10
+    verdict: "binding digest does not match required pattern"
+    refs: "internal/gatepolicy/gate2.go:296-299"
+    step_rank: 3
+    stage: none
+
+  # ---- decide phase（step_rank 1-11；依 gateDecide 十一步實序：R3 先於
+  # PrepareDecision(R1/R2/R4/R5.decide) → ReconcileBindings(R11/R12) →
+  # BuildDecision(R21/R6.decide/R24/risk task loop/R26) → R16 在 PrepareDecision
+  # 完成後才檢查）----
+
+  - id: R3
+    phase: decide
+    when: "approver.name == '' && approver.email == ''"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "git identity not configured"
+    refs: "app.go:5810-5821"
+    step_rank: 1
+    stage: none
+
+  - id: R1
+    phase: decide
+    when: "!(decision in ['approved','rejected'])"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "unknown decision"
+    refs: "internal/gate/service.go:86-88"
+    step_rank: 2
+    stage: none
+
+  - id: R2
+    phase: decide
+    when: "decision == 'rejected' && reason == ''"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "rejected decision requires reason"
+    refs: "internal/gate/service.go:89-91"
+    step_rank: 3
+    stage: none
+
+  - id: R4
+    phase: decide
+    when: "!entry.exists || !entry.has_request || entry.has_record"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "not a pending approval"
+    refs: "internal/gate/service.go:98-101"
+    step_rank: 4
+    stage: none
+
+  - id: R5.decide
+    phase: decide
+    when: "!(request.gate in ['gate1','gate2','test_contract_approval'])"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "unknown gate"
+    refs: "internal/gate/service.go:103-105"
+    step_rank: 5
+    stage: none
+
+  - id: R11
+    phase: decide
+    when: >-
+      decision == 'approved' && (
+        request.bindings.exists(b, b.kind == 'spec_manifest' && b.role == '' && b.digest != '' && b.digest != current.spec_manifest) ||
+        request.bindings.exists(b, b.kind == 'plan' && b.role == '' && b.digest != '' && b.digest != current.plan_manifest) ||
+        request.bindings.exists(b, b.kind == 'risk_policy' && b.role == '' && b.digest != '' && b.digest != current.risk_policy) ||
+        request.bindings.exists(b, b.kind == 'permission_manifest' && b.role == '' && b.digest != '' && b.digest != current.permission_manifest)
+      )
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "bound manifest digest stale against current"
+    refs: "internal/gatepolicy/gate2.go:215-232,261-268"
+    step_rank: 6
+    stage: none
+
+  - id: R12
+    phase: decide
+    when: "decision == 'approved' && base_commit_state == 'missing'"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "base_commit missing"
+    refs: "internal/gatepolicy/gate2.go:234-248"
+    step_rank: 7
+    stage: none
+
+  - id: R21
+    phase: decide
+    when: "decision == 'rejected' && size(risk_selections) > 0"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "rejected decision must not include risk selections"
+    refs: "internal/gatepolicy/gate2.go:114-118"
+    step_rank: 8
+    stage: none
+
+  - id: R6.decide
+    phase: decide
+    when: "decision == 'approved' && (!request.subject.startsWith('plan:') || request.subject == 'plan:')"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "gate2 subject must be plan:<nonempty id>"
+    refs: "internal/gatepolicy/gate2.go:124-127"
+    step_rank: 9
+    stage: none
+
+  - id: R24
+    phase: decide
+    when: "decision == 'approved' && risk_selections.exists(a, !risk_selections.exists_one(b, b.task_id == a.task_id))"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "duplicate risk selection for task"
+    refs: "internal/gatepolicy/gate2.go:134-140"
+    step_rank: 10
+    stage: pre_loop
+
+  - id: R25
+    phase: decide
+    when: "decision == 'approved' && sel == null"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "missing risk selection for task"
+    refs: "internal/gatepolicy/gate2.go:144-147"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 0
+
+  # R27：純 CEL 重算 ComputeMinimum（internal/plan/riskpolicy.go:23-41）——matched
+  # = 任一規則的 match.contexts 或 match.modules 與 task.impact 對應欄位交集非空
+  # （雙層 exists，不用 host intersect 函式）；recomputed = 無命中→default_tier，
+  # 否則命中規則中 tier_rank 最大者。用「task.minimum_risk_tier 恰為某一命中規則的
+  # tier，且沒有命中規則的 tier_rank 更高」表達「等於 max」，避免需要一般化的
+  # fold/reduce（CEL 只有 exists/all/filter/map，沒有使用者可呼叫的 reduce 巨集）。
+  - id: R27
+    phase: decide
+    when: >-
+      decision == 'approved' && (
+        risk_policy.rules.exists(r, r.match.contexts.exists(c, task.impact.contexts.exists(tc, tc == c)) || r.match.modules.exists(m, task.impact.modules.exists(tm, tm == m)))
+        ? !(
+            risk_policy.rules.exists(r, (r.match.contexts.exists(c, task.impact.contexts.exists(tc, tc == c)) || r.match.modules.exists(m, task.impact.modules.exists(tm, tm == m))) && r.tier == task.minimum_risk_tier) &&
+            !risk_policy.rules.exists(r2, (r2.match.contexts.exists(c, task.impact.contexts.exists(tc, tc == c)) || r2.match.modules.exists(m, task.impact.modules.exists(tm, tm == m))) && tier_rank(r2.tier) > tier_rank(task.minimum_risk_tier))
+          )
+        : risk_policy.default_tier != task.minimum_risk_tier
+      )
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "recomputed minimum_risk_tier does not match committed"
+    refs: "internal/gatepolicy/gate2.go:150-153;internal/plan/riskpolicy.go:4-41"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 1
+
+  - id: R28.minimum
+    phase: decide
+    when: "decision == 'approved' && tier_rank(task.minimum_risk_tier) < 0"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "unknown minimum_risk_tier"
+    refs: "internal/gatepolicy/gate2.go:154-157"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 2
+
+  - id: R28.planner
+    phase: decide
+    when: "decision == 'approved' && tier_rank(task.planner_risk_tier) < 0"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "unknown planner_risk_tier"
+    refs: "internal/gatepolicy/gate2.go:158-161"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 3
+
+  - id: R29
+    phase: decide
+    # controller note（Task 5）：production 只在 R28.minimum／R28.planner 兩者皆
+    # 通過（tier 皆合法）才會走到這個比較（gate2.go 154-164 是循序 early-return）；
+    # CEL 逐規則獨立求值沒有這個先後保證，若省略合法性守門，task.planner_risk_tier
+    # 為未知 tier（tier_rank=-1）時會與任何合法 minimum 比較恆成立（-1 必小於
+    # 1/2/3），造成本規則與 R28.planner 對同一 task 同時命中、破壞隔離測試的
+    # 「唯一命中」前提。故補上 brief 表未列出、但邏輯必要的雙邊合法性守門。
+    when: "decision == 'approved' && tier_rank(task.planner_risk_tier) >= 0 && tier_rank(task.minimum_risk_tier) >= 0 && tier_rank(task.planner_risk_tier) < tier_rank(task.minimum_risk_tier)"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "planner_risk_tier below minimum_risk_tier"
+    refs: "internal/gatepolicy/gate2.go:162-164"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 4
+
+  - id: R28.selected
+    phase: decide
+    when: "decision == 'approved' && sel != null && tier_rank(sel.selected_risk_tier) < 0"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "unknown selected_risk_tier"
+    refs: "internal/gatepolicy/gate2.go:165-168"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 5
+
+  - id: R30
+    phase: decide
+    # controller note（Task 5）：production 到達此檢查時 sel 必非 nil（selByTask
+    # 查找已在 R25 對應的早退保證），但 CEL 逐規則獨立求值，沒有 depends_on 銜接
+    # R25 的「已排除 null」前提——若省略 sel != null 會在 sel 為 null 時對
+    # sel.selected_risk_tier 觸發 CEL 求值錯誤（污染 Status，而非單純不命中）。
+    # 因此本規則顯式補上 brief 表未列出、但邏輯必要的 sel != null 守門。
+    when: "decision == 'approved' && sel != null && tier_rank(sel.selected_risk_tier) >= 0 && tier_rank(task.minimum_risk_tier) >= 0 && tier_rank(sel.selected_risk_tier) < tier_rank(task.minimum_risk_tier)"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "selected_risk_tier below minimum_risk_tier"
+    refs: "internal/gatepolicy/gate2.go:169-171"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 6
+
+  - id: R31
+    phase: decide
+    # 同 R30：sel != null 與 tier_rank>=0 合法性守門是 CEL 獨立求值下的必要補強
+    # （見 R30／R29 註解）。
+    when: "decision == 'approved' && sel != null && tier_rank(sel.selected_risk_tier) >= 0 && tier_rank(task.planner_risk_tier) >= 0 && tier_rank(sel.selected_risk_tier) < tier_rank(task.planner_risk_tier) && sel.override_reason == ''"
+    effect: deny
+    target: risk.task
+    per_task: true
+    priority: 10
+    verdict: "selected_risk_tier below planner_risk_tier without override_reason"
+    refs: "internal/gatepolicy/gate2.go:172-174"
+    step_rank: 10
+    stage: task_loop
+    check_rank: 7
+
+  - id: R26
+    phase: decide
+    when: "decision == 'approved' && risk_selections.exists(rs, !plan.tasks.exists(t, t.id == rs.task_id))"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "risk selection references unknown task id"
+    refs: "internal/gatepolicy/gate2.go:183-190"
+    step_rank: 10
+    stage: post_loop
+
+  # R16：escalation blocking。derived scope 完整公式（app.go:5892-5912）：
+  # gate1→"workspace"、gate2 with subject "plan:<id>"→"gate2:"+<id>、未知 gate→
+  # "workspace"。frozen celEnv（bundle.go）未載入 ext.Strings()，核心 CEL 沒有
+  # substring/split/字元索引，也沒有 host 函式可用（tier_rank 是唯一自訂函式，
+  # 非字串用途）——經 zzz_probe 系列實測確認 `"x".substring(...)`／`"x".split(...)`／
+  # `"x"[0]` 三者在本 celEnv 下皆編譯失敗（undeclared reference / 無匹配 overload）。
+  # 「subject 去掉 'plan:' 前綴、換成 'gate2:' 前綴」是一般化的前綴替換，
+  # RE2（matches() 底層）不支援 backreference，也無法在不取出中段字串的情況下
+  # 用 startsWith/endsWith/contains/matches 表達「兩個不同長度前綴、相同未知
+  # 長度尾段」的相等性——已反覆驗證無可行純 CEL 寫法。
+  #
+  # 因此本規則目前只落地「block_scope == workspace」（universal block，與 gate
+  # 無關，完整且正確）分支；gate2 專屬（"gate2:"+plan id）分支未實作，屬已知、
+  # 已記錄的 scope 落差，需 Task 3/4 controller 決議（例如在 bundle.go 加
+  # ext.Strings()，或在 activation 補一個 precomputed derived_scope 變數）後
+  # 才能補齊——見 task-5-report.md「concerns」。
+  - id: R16
+    phase: decide
+    when: "escalations.exists(e, e.state != 'resolved' && e.block_scope != '' && e.block_scope == 'workspace')"
+    effect: deny
+    target: decision.eligibility
+    priority: 10
+    verdict: "blocked by workspace-scope escalation (gate2-specific scope branch NOT implemented — see refs)"
+    refs: "app.go:5892-5912;internal/escalation/project.go:81-96 (partial — gate2 per-plan scope branch not CEL-expressible under current celEnv)"
+    step_rank: 11
+    stage: none
