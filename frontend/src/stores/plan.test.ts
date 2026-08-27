@@ -53,6 +53,14 @@ describe('plan store', () => {
     expect(p.errors).toEqual([])
   })
 
+  it('clearErrors(kind) 只清同類 error，不動其他 kind（A2：submit 重試不誤清 save 的錯誤）', () => {
+    const p = usePlan()
+    p.pushError('save failed', 'save')
+    p.pushError('submit failed', 'submit')
+    p.clearErrors('submit')
+    expect(p.errors).toEqual(['save failed'])
+  })
+
   it('does not mutate session store state', () => {
     const p = usePlan()
     const s = useSession()

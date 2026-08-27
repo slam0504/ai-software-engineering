@@ -264,13 +264,15 @@ async function createNewFile() {
   const path = newFilePath.value
   const writer = props.write ?? PlanWrite
   newFileBusy.value = true
+  plan.clearErrors('newFile') // A2：新操作開始清同類（newFile）舊 transient error
   try {
     await writer(path, templateFor(path), '')
     await loadFileList()
     selectFile(path)
     newFilePath.value = ''
+    plan.clearErrors('newFile') // A2：操作成功清該操作既有錯誤
   } catch (e) {
-    plan.pushError(String(e))
+    plan.pushError(String(e), 'newFile')
   } finally {
     newFileBusy.value = false
   }
@@ -311,24 +313,33 @@ function applyDraft() {
 async function saveFile() {
   const writer = props.write ?? PlanWrite
   saveBusy.value = true
+  plan.clearErrors('save') // A2：新操作開始清同類（save）舊 transient error
   try {
     const newDigest = await writer(effectivePath.value, plan.currentContent, plan.currentDigest)
     plan.currentDigest = newDigest
     bufferDirty.value = false
+    plan.clearErrors('save') // A2：操作成功清該操作既有錯誤
     await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
   } catch (e) {
-    plan.pushError(String(e))
+    plan.pushError(String(e), 'save')
   } finally {
     saveBusy.value = false
   }
 }
 
+// submitForApproval（A2：error lifecycle 三原則）——HEAD 上這裡成功路徑從未清
+// 過 plan.errors，Gate 2 dirty-tree 送核失敗後即使後續修正＋再送核成功，舊錯誤
+// 仍留在畫面（A9 驗收 sec-12 記錄的真實缺陷）。原則 1：再次點送核時先清掉「上次
+// 送核」的錯誤（kind='submit'，不動 save／previewCommit 等其他操作留下的錯誤）；
+// 原則 2：這次送核成功後也明確清掉（雙重保險，語意對應驗收條件逐條核對）。
 async function submitForApproval() {
   submitBusy.value = true
+  plan.clearErrors('submit')
   try {
     submitResult.value = await SubmitPlanForApproval(planIdInput.value)
+    plan.clearErrors('submit')
   } catch (e) {
-    plan.pushError(String(e))
+    plan.pushError(String(e), 'submit')
   } finally {
     submitBusy.value = false
   }
@@ -336,12 +347,14 @@ async function submitForApproval() {
 
 async function previewCommit() {
   commitBusy.value = true
+  plan.clearErrors('commit') // A2：新操作開始清同類（commit）舊 transient error
   try {
     const res = await PreviewPlanCommit()
     commitToken.value = res.token
     commitDiff.value = res.diff
+    plan.clearErrors('commit') // A2：操作成功清該操作既有錯誤
   } catch (e) {
-    plan.pushError(String(e))
+    plan.pushError(String(e), 'commit')
   } finally {
     commitBusy.value = false
   }
@@ -350,13 +363,15 @@ async function previewCommit() {
 async function confirmCommit() {
   if (!commitToken.value) return
   commitBusy.value = true
+  plan.clearErrors('commit') // A2：confirmCommit 與 previewCommit 共用同一個 commit 生命週期（連續兩步操作），同一 kind
   try {
     await ConfirmPlanCommit(commitToken.value, commitMessage.value)
     commitToken.value = null
     commitDiff.value = ''
     commitMessage.value = ''
+    plan.clearErrors('commit') // A2：操作成功清該操作既有錯誤
   } catch (e) {
-    plan.pushError(String(e))
+    plan.pushError(String(e), 'commit')
   } finally {
     commitBusy.value = false
   }

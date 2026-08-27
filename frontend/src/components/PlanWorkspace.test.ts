@@ -99,6 +99,26 @@ describe('PlanWorkspace', () => {
     expect(w.find('[data-test=plan-errors]').text()).toContain('assist: 無生效規格核可——先完成 Gate 1')
   })
 
+  // A2（Pre-M4 Readiness Backlog）回歸：Gate 2 dirty-tree 送核失敗後，後續
+  // 修正＋再送核成功，舊錯誤不得留在畫面（A9 驗收 sec-12 記錄的真實缺陷）。
+  it('送核失敗→修正→再送核成功後，舊的送核錯誤要清空', async () => {
+    mocks.SubmitPlanForApproval
+      .mockRejectedValueOnce(new Error('assist: 無生效規格核可——先完成 Gate 1'))
+      .mockResolvedValueOnce('approval-123')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/my-plan.yaml' } })
+    await flushPromises()
+
+    await w.find('[data-test=submit-gate2]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=plan-errors]').text()).toContain('assist: 無生效規格核可——先完成 Gate 1')
+
+    // 模擬「修正」：再次送核（無需真的改內容，重現的是送核 lifecycle，不是修正本身）
+    await w.find('[data-test=submit-gate2]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=plan-errors]').exists()).toBe(false)
+  })
+
   // review fix（spec §3.8 回填）：「建立升級項目」帶目前 plan 檔 rel path 當
   // sourceRef，blockScope 留空（不預設阻擋哪個 gate scope）。
   it('點擊「建立升級項目」emit escalate，sourceRef=目前 plan 檔 rel path', async () => {
