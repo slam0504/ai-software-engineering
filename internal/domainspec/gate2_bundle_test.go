@@ -281,6 +281,21 @@ func TestGate2BundleIsolatedRuleCoverage(t *testing.T) {
 				}}
 			},
 		},
+		{
+			// R15 scope-derivation 語意——test_contract_approval 分支
+			// （task review fix commit）：production scopeForSubject 對 tca
+			// 的 subject "task:<plan>/<task>" 去掉 "task:" 前綴、換成 "tca:"
+			// 前綴；CEL 端獨立重算出 "tca:P1/T1"，與 escalation 的 block_scope
+			// 完全相等才擋。
+			name: "R16/tca-derived-scope-match-blocks", ruleID: "R16", wantIdx: -1,
+			mutate: func(s *FactsSnapshot) {
+				s.Request.Value.Gate = "test_contract_approval"
+				s.Request.Value.Subject = "task:P1/T1"
+				s.Escalations = Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{
+					{EscalationID: "E4", State: "open", BlockScope: "tca:P1/T1"},
+				}}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -328,6 +343,40 @@ func TestGate2BundleR16ScopeDerivationIsNotOverInclusive(t *testing.T) {
 	r := evalGate2(t, b, s)
 	if r.Truth != TruthTrue || len(r.Violations) != 0 {
 		t.Fatalf("escalation scoped to a different plan must not block: truth=%s violations=%+v", r.Truth, r.Violations)
+	}
+}
+
+// TestGate2BundleR16TCAScopeDerivationIsNotOverInclusive：同上，針對
+// test_contract_approval 分支的反證面（task review fix commit）——escalation
+// 若 block_scope 是「另一個 tca id」的 derived scope（tca:P2/T1），不得誤擋
+// subject=task:P1/T1 的 test_contract_approval 決議。
+func TestGate2BundleR16TCAScopeDerivationIsNotOverInclusive(t *testing.T) {
+	b := loadGate2Bundle(t)
+	s := mustSnapshot(t)
+	s.Request.Value.Gate = "test_contract_approval"
+	s.Request.Value.Subject = "task:P1/T1"
+	s.Escalations = Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{
+		{EscalationID: "E5", State: "open", BlockScope: "tca:P2/T1"},
+	}}
+	r := evalGate2(t, b, s)
+	if r.Truth != TruthTrue || len(r.Violations) != 0 {
+		t.Fatalf("escalation scoped to a different tca id must not block: truth=%s violations=%+v", r.Truth, r.Violations)
+	}
+}
+
+// TestGate2BundleR6DecideRequiresGate2Guard：production 的 subject-shape
+// 檢查活在 Gate2Policy.BuildDecision 內，只有 dispatch 已解出 gate=="gate2"
+// 才會執行到（task review Important 1）。一個 approved 的 gate1 決議
+// （subject 恆為 "workspace"，本就不是 "plan:<id>" 形狀）在補上 gate 守門前
+// 會被 R6.decide 誤擋；補上後必須 truth==true。
+func TestGate2BundleR6DecideRequiresGate2Guard(t *testing.T) {
+	b := loadGate2Bundle(t)
+	s := mustSnapshot(t)
+	s.Request.Value.Gate = "gate1"
+	s.Request.Value.Subject = "workspace"
+	r := evalGate2(t, b, s)
+	if r.Truth != TruthTrue || len(r.Violations) != 0 {
+		t.Fatalf("approved gate1 decision must not trip R6.decide: truth=%s violations=%+v", r.Truth, r.Violations)
 	}
 }
 

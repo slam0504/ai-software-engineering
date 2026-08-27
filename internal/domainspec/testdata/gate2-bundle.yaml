@@ -177,12 +177,20 @@ rules:
 
   - id: R6.decide
     phase: decide
-    when: "decision == 'approved' && (!request.subject.startsWith('plan:') || request.subject == 'plan:')"
+    # controller note（task review fix commit）：production 的這個檢查活在
+    # Gate2Policy.BuildDecision 內，只有 dispatch 已解出 gate=="gate2" 才會
+    # 執行到（PrepareDecision 依 req.Gate 選 policy——service.go:117）；CEL
+    # 逐規則獨立求值、與 gate 無關地跑，若省略 gate 守門，一個 approved 的
+    # gate1／test_contract_approval 決議只要 subject 形狀「剛好」不像
+    # "plan:<id>"（gate1 的 subject 恆為 "workspace"，本就不是這個形狀）就會
+    # 被本規則誤擋。R6.submit 已有 `request.gate == 'gate2' &&` 守門，這裡補上
+    # 同款守門對齊。
+    when: "decision == 'approved' && request.gate == 'gate2' && (!request.subject.startsWith('plan:') || request.subject == 'plan:')"
     effect: deny
     target: decision.eligibility
     priority: 10
     verdict: "gate2 subject must be plan:<nonempty id>"
-    refs: "internal/gatepolicy/gate2.go:124-127"
+    refs: "internal/gatepolicy/gate2.go:124-127;internal/gate/service.go:117"
     step_rank: 9
     stage: none
 
@@ -339,13 +347,20 @@ rules:
     step_rank: 10
     stage: post_loop
 
-  # R16：escalation blocking。derived scope 完整公式（app.go:5892-5912）：
-  # gate1→"workspace"、gate2 with subject "plan:<id>"→"gate2:"+<id>、未知 gate→
-  # "workspace"。controller ruling（Task 5 fix commit）：bundle.go 的 celEnv
-  # 已補 ext.Strings()（plan Tech Stack 本就要求 substring 能力，Task 3 漏加），
-  # 用 `.substring(5)`（"plan:" 固定長度 5）取 subject 去掉前綴後的 id，CEL
-  # 端獨立重算 scope（R15 語意：不依賴任何 precomputed 值，mapping mutation
-  # 才可被測試獨立驗證）。
+  # R16：escalation blocking。derived scope 完整公式對照 app.go:5895-5912 的
+  # 四路 switch（controller ruling，task review fix commit——第一版漏了
+  # test_contract_approval 分支、且 gate2 誤把「無 plan: 前綴」的 fallback
+  # 收斂成 'workspace'，兩者皆與 production 不符，已修正）：
+  #   - gate1                  → "workspace"
+  #   - gate2   有 "plan:" 前綴 → "gate2:" + <去掉 "plan:" 後的部分>
+  #             無 "plan:" 前綴 → "gate2:" + subject（原樣，不是 workspace）
+  #   - test_contract_approval 有 "task:" 前綴 → "tca:" + <去掉 "task:" 後的部分>
+  #             無 "task:" 前綴 → "tca:" + subject（原樣）
+  #   - 其他（未知 gate）        → "workspace"
+  # bundle.go 的 celEnv 已於 Task 5 fix commit 補 ext.Strings()（plan Tech
+  # Stack 本就要求 substring 能力），`.substring(5)`（"plan:"／"task:" 皆固定
+  # 長度 5）取前綴後的剩餘部分；CEL 端獨立重算 scope（R15 語意：不依賴任何
+  # precomputed 值，mapping mutation 才可被測試獨立驗證）。
   - id: R16
     phase: decide
     when: >-
@@ -353,15 +368,17 @@ rules:
         e.block_scope == 'workspace' ||
         e.block_scope == (
           request.gate == 'gate1' ? 'workspace' :
-          (request.gate == 'gate2' && request.subject.startsWith('plan:')
-            ? 'gate2:' + request.subject.substring(5)
-            : 'workspace')
+          (request.gate == 'gate2'
+            ? (request.subject.startsWith('plan:') ? 'gate2:' + request.subject.substring(5) : 'gate2:' + request.subject)
+            : (request.gate == 'test_contract_approval'
+                ? (request.subject.startsWith('task:') ? 'tca:' + request.subject.substring(5) : 'tca:' + request.subject)
+                : 'workspace'))
         )
       ))
     effect: deny
     target: decision.eligibility
     priority: 10
     verdict: "blocked by escalation matching workspace or derived gate scope"
-    refs: "app.go:5892-5912;internal/escalation/project.go:81-96"
+    refs: "app.go:5895-5912;internal/escalation/project.go:81-96"
     step_rank: 11
     stage: none
