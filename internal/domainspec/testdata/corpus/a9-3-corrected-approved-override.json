@@ -1,0 +1,146 @@
+{
+  "name": "a9-3-corrected-approved-override",
+  "kind": "evaluated",
+  "evaluation_phase": "decide",
+  "oracle_seam": "gatepolicy_build",
+  "provenance": "a9_workspace",
+  "facts_digest": "sha256:20743a0cf7f336d3fd2fa4f4550d89e88c3f1a91c1780a4464936d99da918884",
+  "bundle_digest": "sha256:2a19b0a06d2dc0622bf2e095aba7e9e916f5cd634ddba982d5433d72e7d07b0a",
+  "snapshot": {
+    "schema_version": 1,
+    "evaluation_phase": "decide",
+    "decision": {
+      "presence": "known",
+      "value": "approved"
+    },
+    "reason": {
+      "presence": "known",
+      "value": ""
+    },
+    "approver": {
+      "presence": "known",
+      "value": {
+        "name": "eason_tseng",
+        "email": ""
+      }
+    },
+    "entry": {
+      "presence": "known",
+      "value": {
+        "exists": true,
+        "has_request": true,
+        "has_record": false
+      }
+    },
+    "request": {
+      "presence": "known",
+      "value": {
+        "gate": "gate2",
+        "subject": "plan:a9",
+        "bindings": [
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "spec/",
+            "digest": "sha256:f3e6751e859ccc67509eedb1e9052225d517f1e359c9ca72a609565e9e821a5d"
+          },
+          {
+            "kind": "plan",
+            "role": "",
+            "ref": "plan/",
+            "digest": "sha256:579859307eda271d04ad88e604a832a6a88a01f3296623f40d6e285f26b531a6"
+          },
+          {
+            "kind": "base_commit",
+            "role": "",
+            "ref": "HEAD",
+            "digest": "git:sha1:bed3640660df4a7e470e5e0335ce5897da4c9f56"
+          },
+          {
+            "kind": "risk_policy",
+            "role": "",
+            "ref": "plan/risk-policy.yaml",
+            "digest": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb"
+          },
+          {
+            "kind": "permission_manifest",
+            "role": "",
+            "ref": "plan/permissions/",
+            "digest": "sha256:769cbef3e93f638d382acc19c3c2decf13a281b83454a2cb0b68424a1bb0fa92"
+          }
+        ]
+      }
+    },
+    "current": {
+      "presence": "known",
+      "value": {
+        "spec_manifest": "sha256:f3e6751e859ccc67509eedb1e9052225d517f1e359c9ca72a609565e9e821a5d",
+        "plan_manifest": "sha256:579859307eda271d04ad88e604a832a6a88a01f3296623f40d6e285f26b531a6",
+        "risk_policy": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb",
+        "permission_manifest": "sha256:769cbef3e93f638d382acc19c3c2decf13a281b83454a2cb0b68424a1bb0fa92"
+      }
+    },
+    "base_commit_state": {
+      "presence": "known",
+      "value": "ok"
+    },
+    "plan": {
+      "presence": "known",
+      "value": {
+        "tasks": [
+          {
+            "id": "T1",
+            "source_index": 0,
+            "minimum_risk_tier": "medium",
+            "planner_risk_tier": "high",
+            "impact": {
+              "contexts": [
+                "gate"
+              ],
+              "modules": [
+                "internal/gate"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "risk_policy": {
+      "presence": "known",
+      "value": {
+        "default_tier": "medium",
+        "rules": []
+      }
+    },
+    "risk_selections": {
+      "presence": "known",
+      "value": [
+        {
+          "task_id": "T1",
+          "selected_risk_tier": "medium",
+          "override_reason": "walking skeleton 僅動 gate journal 附加路徑，回歸面窄；抽驗用途接受中風險控管"
+        }
+      ]
+    },
+    "escalations": {
+      "presence": "known",
+      "value": []
+    }
+  },
+  "go_verdict": {
+    "outcome": "pass",
+    "primary_rule_id": "",
+    "risk_decisions": [
+      {
+        "task_id": "T1",
+        "minimum_risk_tier": "medium",
+        "planner_risk_tier": "high",
+        "selected_risk_tier": "medium",
+        "override_reason": "walking skeleton 僅動 gate journal 附加路徑，回歸面窄；抽驗用途接受中風險控管"
+      }
+    ]
+  },
+  "reason": "",
+  "role": "alignment",
+  "covers_rules": null
+}

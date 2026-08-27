@@ -1,0 +1,140 @@
+{
+  "name": "a9-2-stale-blocked-r11",
+  "kind": "evaluated",
+  "evaluation_phase": "decide",
+  "oracle_seam": "gatepolicy_reconcile",
+  "provenance": "a9_workspace",
+  "facts_digest": "sha256:e47e4b31e26518a2c93f625f1070137f7fc4aa7fd564f0bc0687cf8e12e89a7c",
+  "bundle_digest": "sha256:2a19b0a06d2dc0622bf2e095aba7e9e916f5cd634ddba982d5433d72e7d07b0a",
+  "snapshot": {
+    "schema_version": 1,
+    "evaluation_phase": "decide",
+    "decision": {
+      "presence": "known",
+      "value": "approved"
+    },
+    "reason": {
+      "presence": "known",
+      "value": ""
+    },
+    "approver": {
+      "presence": "known",
+      "value": {
+        "name": "eason_tseng",
+        "email": ""
+      }
+    },
+    "entry": {
+      "presence": "known",
+      "value": {
+        "exists": true,
+        "has_request": true,
+        "has_record": false
+      }
+    },
+    "request": {
+      "presence": "known",
+      "value": {
+        "gate": "gate2",
+        "subject": "plan:a9",
+        "bindings": [
+          {
+            "kind": "spec_manifest",
+            "role": "",
+            "ref": "spec/",
+            "digest": "sha256:f3e6751e859ccc67509eedb1e9052225d517f1e359c9ca72a609565e9e821a5d"
+          },
+          {
+            "kind": "plan",
+            "role": "",
+            "ref": "plan/",
+            "digest": "sha256:5404e2d89372e25187315fb99dea7f0f2d8307e797694363a14c13440de49f81"
+          },
+          {
+            "kind": "base_commit",
+            "role": "",
+            "ref": "HEAD",
+            "digest": "git:sha1:84125c667473cc10ca0f9fd1ebbde54ff373763b"
+          },
+          {
+            "kind": "risk_policy",
+            "role": "",
+            "ref": "plan/risk-policy.yaml",
+            "digest": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb"
+          },
+          {
+            "kind": "permission_manifest",
+            "role": "",
+            "ref": "plan/permissions/",
+            "digest": "sha256:769cbef3e93f638d382acc19c3c2decf13a281b83454a2cb0b68424a1bb0fa92"
+          }
+        ]
+      }
+    },
+    "current": {
+      "presence": "known",
+      "value": {
+        "spec_manifest": "sha256:f3e6751e859ccc67509eedb1e9052225d517f1e359c9ca72a609565e9e821a5d",
+        "plan_manifest": "sha256:579859307eda271d04ad88e604a832a6a88a01f3296623f40d6e285f26b531a6",
+        "risk_policy": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb",
+        "permission_manifest": "sha256:769cbef3e93f638d382acc19c3c2decf13a281b83454a2cb0b68424a1bb0fa92"
+      }
+    },
+    "base_commit_state": {
+      "presence": "known",
+      "value": "ok"
+    },
+    "plan": {
+      "presence": "known",
+      "value": {
+        "tasks": [
+          {
+            "id": "T1",
+            "source_index": 0,
+            "minimum_risk_tier": "medium",
+            "planner_risk_tier": "medium",
+            "impact": {
+              "contexts": [
+                "gate"
+              ],
+              "modules": [
+                "internal/gate"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "risk_policy": {
+      "presence": "known",
+      "value": {
+        "default_tier": "medium",
+        "rules": []
+      }
+    },
+    "risk_selections": {
+      "presence": "known",
+      "value": [
+        {
+          "task_id": "T1",
+          "selected_risk_tier": "medium",
+          "override_reason": ""
+        }
+      ]
+    },
+    "escalations": {
+      "presence": "known",
+      "value": []
+    }
+  },
+  "go_verdict": {
+    "outcome": "blocked",
+    "primary_rule_id": "R11",
+    "risk_decisions": null
+  },
+  "reason": "",
+  "role": "isolated",
+  "covers_rules": [
+    "R11"
+  ]
+}

@@ -381,6 +381,194 @@ func buildAcquisitionFailedCorpusCases() []CorpusCase {
 	}
 }
 
+// ---- A9 真實案例（provenance a9_workspace，出口 5 收尾）----
+//
+// 來源：~/playground/wb-accept-a9g2（唯讀擷取，一次性 offline 步驟，未修改該
+// workspace 任何檔案）——
+//
+//   - .workbench/gate.jsonl：op_id 01M0XZEHN4000... 的 gate_request／
+//     approval_record（初次核可，02:47:36／02:47:54）、transition to stale
+//     （02:48:43，cause="plan changed"，evidence_ref=579859...）、
+//     op_id 01M0XZJR9M0002... 的 gate_request／approval_record（修正版核可，
+//     02:49:54／02:50:29，metadata.risk_decisions 含 override_reason）。
+//   - .workbench/escalation.jsonl：escalation_item（stale，hard=true，
+//     block_scope=gate2:a9，source_ref=舊 approval_id）、escalation_transition
+//     to resolved（reason=superseded-by:新 approval_id）——證實 plan rev2 修正
+//     後的事實：無 rejected record，stale 完全走 escalation 通道。
+//   - git log（唯讀 `git show`）：84125c6（plan/a9.yaml 初版：minimum_risk_tier=
+//     medium／planner_risk_tier=medium；plan/risk-policy.yaml：default_tier=
+//     medium、rules:[]）、bed3640（同檔案 planner_risk_tier 上調至 high，
+//     觸發第二次送核；risk-policy.yaml 未變）。
+//
+// 三筆 FactsSnapshot 的 binding digest／git commit OID／risk_decisions 逐欄
+// 直接抄自上述 journal／git show 輸出（無合成值）；go_verdict 依 production
+// 語意手動標定（推導過程見下方個別函式註解），落地後由
+// domainspec_oracle_freshness_test.go 的 gatepolicy_build／gatepolicy_reconcile
+// seam adapter（真正呼叫 Gate2Policy.BuildDecision／ReconcileBindings）機械
+// 驗證——若驗證發現手動標定有誤，屬 shadow misalignment，必須調查後如實記載
+// （不得為了讓測試綠燈而悄悄改標定去遷就結果）。
+//
+// entry facts 三筆一律 {exists:true, has_request:true, has_record:false}：
+// 沿用整個 corpus（含 clean-decide-approved／isolated-R11／R12／
+// alignment-R11-role-not-participating 等既有 decide-phase 案例）的唯一慣例
+// ——has_record=true 只在專門的「R4」隔離案例出現（R4 的 CEL when 直接命中
+// entry.has_record）。ReconcileBindings 本身也不讀 entry（只有
+// gate_service_prepare／PrepareDecision 這個不同的 seam 才檢查 has_record），
+// 兩者一致，不是巧合遷就。
+const (
+	a9SpecDigest       = "sha256:f3e6751e859ccc67509eedb1e9052225d517f1e359c9ca72a609565e9e821a5d"
+	a9RiskPolicyDigest = "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb"
+	a9PermDigest       = "sha256:769cbef3e93f638d382acc19c3c2decf13a281b83454a2cb0b68424a1bb0fa92"
+	a9Plan1Digest      = "sha256:5404e2d89372e25187315fb99dea7f0f2d8307e797694363a14c13440de49f81"
+	a9Plan2Digest      = "sha256:579859307eda271d04ad88e604a832a6a88a01f3296623f40d6e285f26b531a6"
+	a9BaseCommit1      = "git:sha1:84125c667473cc10ca0f9fd1ebbde54ff373763b"
+	a9BaseCommit2      = "git:sha1:bed3640660df4a7e470e5e0335ce5897da4c9f56"
+	a9OverrideReason   = "walking skeleton 僅動 gate journal 附加路徑，回歸面窄；抽驗用途接受中風險控管"
+)
+
+func a9RequestBindings(planDigest, baseCommit string) []Binding {
+	return []Binding{
+		{Kind: "spec_manifest", Role: "", Ref: "spec/", Digest: a9SpecDigest},
+		{Kind: "plan", Role: "", Ref: "plan/", Digest: planDigest},
+		{Kind: "base_commit", Role: "", Ref: "HEAD", Digest: baseCommit},
+		{Kind: "risk_policy", Role: "", Ref: "plan/risk-policy.yaml", Digest: a9RiskPolicyDigest},
+		{Kind: "permission_manifest", Role: "", Ref: "plan/permissions/", Digest: a9PermDigest},
+	}
+}
+
+func a9Entry() *Entry { return &Entry{Exists: true, HasRequest: true, HasRecord: false} }
+
+func a9Approver() *Approver { return &Approver{Name: "eason_tseng", Email: ""} }
+
+// a9InitialApprovedSnapshot（a9-1-initial-approved）：approval_id
+// 01M0XZEHN4000DRB364G09H7NM 初次核可當下（84125c6：T1 minimum=medium／
+// planner=medium，risk-policy 無 rule，選擇 selected=medium 無 override）。
+// bindings＝current（尚未 stale），R11 不應命中；R27（recomputed minimum 對
+// risk_policy default_tier）／R29-R31（tier 比較）皆因三值相等而不命中——
+// 全域應為 pass，risk_decisions 逐位元組等於 gate.jsonl 記錄的
+// metadata.risk_decisions。
+func a9InitialApprovedSnapshot() *FactsSnapshot {
+	return &FactsSnapshot{
+		SchemaVersion: 1, EvaluationPhase: "decide",
+		Decision: Fact[string]{Presence: Known, Value: strPtr("approved")},
+		Reason:   Fact[string]{Presence: Known, Value: strPtr("")},
+		Approver: Fact[Approver]{Presence: Known, Value: a9Approver()},
+		Entry:    Fact[Entry]{Presence: Known, Value: a9Entry()},
+		Request: Fact[Request]{Presence: Known, Value: &Request{
+			Gate: "gate2", Subject: "plan:a9", Bindings: a9RequestBindings(a9Plan1Digest, a9BaseCommit1),
+		}},
+		Current: Fact[Current]{Presence: Known, Value: &Current{
+			SpecManifest: a9SpecDigest, PlanManifest: a9Plan1Digest,
+			RiskPolicy: a9RiskPolicyDigest, PermissionManifest: a9PermDigest,
+		}},
+		BaseCommitState: Fact[string]{Presence: Known, Value: strPtr("ok")},
+		Plan: Fact[PlanFacts]{Presence: Known, Value: &PlanFacts{Tasks: []PlanTask{
+			{ID: "T1", SourceIndex: 0, MinimumRiskTier: "medium", PlannerRiskTier: "medium",
+				Impact: Impact{Contexts: []string{"gate"}, Modules: []string{"internal/gate"}}},
+		}}},
+		RiskPolicy: Fact[RiskPolicyFacts]{Presence: Known, Value: &RiskPolicyFacts{DefaultTier: "medium", Rules: []RiskRule{}}},
+		RiskSelections: Fact[[]RiskSelection]{Presence: Known, Value: &[]RiskSelection{
+			{TaskID: "T1", SelectedRiskTier: "medium", OverrideReason: ""},
+		}},
+		Escalations: Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{}},
+	}
+}
+
+// a9StaleBlockedSnapshot（a9-2-stale-blocked-r11）：以 escalation.jsonl 記錄的
+// stale 事件重建「舊 pending（實為已核可）對新 current」時點的 facts——
+// request.bindings 維持 01M0XZEHN4000DRB364G09H7NM 核可當下凍結的值
+// （plan digest=a9Plan1Digest／base_commit=84125c6），current.plan_manifest
+// 換成 gate.jsonl transition 記錄的 evidence_ref（a9Plan2Digest，即修正版
+// plan 內容的即時 digest，早於它被 commit 成 bed3640）；spec_manifest／
+// risk_policy／permission_manifest 三者 current 與 bound 相同（journal 的
+// transition 只有一筆 cause="plan changed"，代表其餘三者未變）。
+//
+// 手動核對 25 條規則：僅 R11（bound plan digest != current plan_manifest）
+// 命中；base_commit_state=ok（84125c6 仍是有效 commit，§3.9 歷史錨點不因
+// HEAD 前進而 stale）→ 不觸發 base_commit missing 分支；plan/risk_policy/
+// risk_selections 維持初次核可的值（medium/medium／無 rule／selected=medium
+// 無 override）→ R27/R29/R30/R31 均不命中。角色因此合法標為 isolated，
+// covers_rules=[R11]（唯一符合條件的真實案例，不是為了湊 coverage 硬套）。
+func a9StaleBlockedSnapshot() *FactsSnapshot {
+	return &FactsSnapshot{
+		SchemaVersion: 1, EvaluationPhase: "decide",
+		Decision: Fact[string]{Presence: Known, Value: strPtr("approved")},
+		Reason:   Fact[string]{Presence: Known, Value: strPtr("")},
+		Approver: Fact[Approver]{Presence: Known, Value: a9Approver()},
+		Entry:    Fact[Entry]{Presence: Known, Value: a9Entry()},
+		Request: Fact[Request]{Presence: Known, Value: &Request{
+			Gate: "gate2", Subject: "plan:a9", Bindings: a9RequestBindings(a9Plan1Digest, a9BaseCommit1),
+		}},
+		Current: Fact[Current]{Presence: Known, Value: &Current{
+			SpecManifest: a9SpecDigest, PlanManifest: a9Plan2Digest, // ← stale：evidence_ref
+			RiskPolicy: a9RiskPolicyDigest, PermissionManifest: a9PermDigest,
+		}},
+		BaseCommitState: Fact[string]{Presence: Known, Value: strPtr("ok")},
+		Plan: Fact[PlanFacts]{Presence: Known, Value: &PlanFacts{Tasks: []PlanTask{
+			{ID: "T1", SourceIndex: 0, MinimumRiskTier: "medium", PlannerRiskTier: "medium",
+				Impact: Impact{Contexts: []string{"gate"}, Modules: []string{"internal/gate"}}},
+		}}},
+		RiskPolicy: Fact[RiskPolicyFacts]{Presence: Known, Value: &RiskPolicyFacts{DefaultTier: "medium", Rules: []RiskRule{}}},
+		RiskSelections: Fact[[]RiskSelection]{Presence: Known, Value: &[]RiskSelection{
+			{TaskID: "T1", SelectedRiskTier: "medium", OverrideReason: ""},
+		}},
+		Escalations: Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{}},
+	}
+}
+
+// a9CorrectedApprovedSnapshot（a9-3-corrected-approved-override）：approval_id
+// 01M0XZJR9M0002FYPQFQH63E14 修正版核可（bed3640：T1 planner 上調至 high，
+// minimum 不變仍 medium），selected=medium＋override_reason 非空（journal
+// metadata 逐字抄錄）。bindings＝current（新送核，未 stale）。手動核對：
+// selected(2) < planner(3) 為真，但 override_reason 非空 → R31 不命中
+// （override 例外正確生效）；其餘規則同 a9InitialApprovedSnapshot 分析不命中
+// → 全域 pass，risk_decisions 逐位元組等於 gate.jsonl 記錄值。
+func a9CorrectedApprovedSnapshot() *FactsSnapshot {
+	return &FactsSnapshot{
+		SchemaVersion: 1, EvaluationPhase: "decide",
+		Decision: Fact[string]{Presence: Known, Value: strPtr("approved")},
+		Reason:   Fact[string]{Presence: Known, Value: strPtr("")},
+		Approver: Fact[Approver]{Presence: Known, Value: a9Approver()},
+		Entry:    Fact[Entry]{Presence: Known, Value: a9Entry()},
+		Request: Fact[Request]{Presence: Known, Value: &Request{
+			Gate: "gate2", Subject: "plan:a9", Bindings: a9RequestBindings(a9Plan2Digest, a9BaseCommit2),
+		}},
+		Current: Fact[Current]{Presence: Known, Value: &Current{
+			SpecManifest: a9SpecDigest, PlanManifest: a9Plan2Digest,
+			RiskPolicy: a9RiskPolicyDigest, PermissionManifest: a9PermDigest,
+		}},
+		BaseCommitState: Fact[string]{Presence: Known, Value: strPtr("ok")},
+		Plan: Fact[PlanFacts]{Presence: Known, Value: &PlanFacts{Tasks: []PlanTask{
+			{ID: "T1", SourceIndex: 0, MinimumRiskTier: "medium", PlannerRiskTier: "high",
+				Impact: Impact{Contexts: []string{"gate"}, Modules: []string{"internal/gate"}}},
+		}}},
+		RiskPolicy: Fact[RiskPolicyFacts]{Presence: Known, Value: &RiskPolicyFacts{DefaultTier: "medium", Rules: []RiskRule{}}},
+		RiskSelections: Fact[[]RiskSelection]{Presence: Known, Value: &[]RiskSelection{
+			{TaskID: "T1", SelectedRiskTier: "medium", OverrideReason: a9OverrideReason},
+		}},
+		Escalations: Fact[[]EscalationFact]{Presence: Known, Value: &[]EscalationFact{}},
+	}
+}
+
+func buildA9CorpusCases(t *testing.T, b *CompiledBundle) []CorpusCase {
+	t.Helper()
+	return []CorpusCase{
+		corpusEvaluatedCase(t, b, "a9-1-initial-approved", a9InitialApprovedSnapshot(),
+			"gatepolicy_build", "a9_workspace", "alignment", nil,
+			GoVerdict{Outcome: OutcomePass, RiskDecisions: []RiskDecision{
+				{TaskID: "T1", MinimumRiskTier: "medium", PlannerRiskTier: "medium", SelectedRiskTier: "medium", OverrideReason: ""},
+			}}),
+		corpusEvaluatedCase(t, b, "a9-2-stale-blocked-r11", a9StaleBlockedSnapshot(),
+			"gatepolicy_reconcile", "a9_workspace", "isolated", []string{"R11"},
+			GoVerdict{Outcome: OutcomeBlocked, PrimaryRuleID: "R11"}),
+		corpusEvaluatedCase(t, b, "a9-3-corrected-approved-override", a9CorrectedApprovedSnapshot(),
+			"gatepolicy_build", "a9_workspace", "alignment", nil,
+			GoVerdict{Outcome: OutcomePass, RiskDecisions: []RiskDecision{
+				{TaskID: "T1", MinimumRiskTier: "medium", PlannerRiskTier: "high", SelectedRiskTier: "medium", OverrideReason: a9OverrideReason},
+			}}),
+	}
+}
+
 func buildAllCorpusCases(t *testing.T, b *CompiledBundle) []CorpusCase {
 	t.Helper()
 	var out []CorpusCase
@@ -388,6 +576,7 @@ func buildAllCorpusCases(t *testing.T, b *CompiledBundle) []CorpusCase {
 	out = append(out, buildCleanCorpusCases(t, b)...)
 	out = append(out, buildPrecedenceCorpusCases(t, b)...)
 	out = append(out, buildAlignmentCorpusCases(t, b)...)
+	out = append(out, buildA9CorpusCases(t, b)...)
 	out = append(out, buildAcquisitionFailedCorpusCases()...)
 	return out
 }
@@ -703,9 +892,9 @@ func TestOutputEvidenceRequiresMultiTaskNonIDOrder(t *testing.T) {
 }
 
 // TestReplayAndDiffRejectInvalidCorpusDirect：以 Go constructor 建「digest
-// 自洽但 phase↔seam 不符」的案例，不經 loadCorpus(t) 直接傳給 ReplayCorpus——
-// corpus-level 驗證不得只活在 helper。DiffBundles 的等價半邊留給 Task 8（尚未
-// 實作），此處只驗 ReplayCorpus 半邊。
+// 自洽但 phase↔seam 不符」的案例，不經 loadCorpus(t) 直接傳給 ReplayCorpus／
+// DiffBundles——corpus-level 驗證不得只活在 helper，兩個直收 []CorpusCase 的
+// 入口都要各自呼叫 ValidateCorpus。
 func TestReplayAndDiffRejectInvalidCorpusDirect(t *testing.T) {
 	b := loadGate2Bundle(t)
 	s := mustSnapshot(t) // decide phase snapshot
@@ -724,12 +913,15 @@ func TestReplayAndDiffRejectInvalidCorpusDirect(t *testing.T) {
 	if _, err := ReplayCorpus(b, []CorpusCase{c}, gate2BundleRuntimeCostLimit); err == nil {
 		t.Fatal("ReplayCorpus must reject a phase/seam-illegal case passed directly (not via loadCorpus)")
 	}
+	if _, err := DiffBundles(b, b, []CorpusCase{c}, gate2BundleRuntimeCostLimit); err == nil {
+		t.Fatal("DiffBundles must reject a phase/seam-illegal case passed directly (not via loadCorpus)")
+	}
 }
 
 // TestUnionInvalidRejectedAtAllEntries：Go constructor 建兩種 union-invalid
 // 案例（evaluated 帶 reason；acquisition_failed 帶 snapshot＋digest），直接傳
-// 給 ReplayCorpus／VerifyOracleFreshness 兩入口皆必須拒（stub recompute 驗證
-// freshness 半邊；DiffBundles 半邊留給 Task 8）。
+// 給 ReplayCorpus／VerifyOracleFreshness／DiffBundles 三個入口皆必須拒（stub
+// recompute 驗證 freshness 半邊）。
 func TestUnionInvalidRejectedAtAllEntries(t *testing.T) {
 	b := loadGate2Bundle(t)
 	s := mustSnapshot(t)
@@ -763,6 +955,9 @@ func TestUnionInvalidRejectedAtAllEntries(t *testing.T) {
 		}
 		if _, err := VerifyOracleFreshness(cases, stubRecompute); err == nil {
 			t.Fatalf("VerifyOracleFreshness must reject union-invalid case %q", bad.Name)
+		}
+		if _, err := DiffBundles(b, b, cases, gate2BundleRuntimeCostLimit); err == nil {
+			t.Fatalf("DiffBundles must reject union-invalid case %q", bad.Name)
 		}
 	}
 }
