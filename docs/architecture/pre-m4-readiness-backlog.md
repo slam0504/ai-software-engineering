@@ -1,8 +1,8 @@
-# Pre-M4 Readiness Backlog（rev3）
+# Pre-M4 Readiness Backlog（rev4）
 
-> 版本：rev3（2026-08-27，backlog review 第二輪 5 P1＋3 P2 收斂）
-> 狀態：**待 owner review**——通過後才逐票估點（0.1 pt＝1 hr；混合性質或超過 2.0 pt 必拆）
-> 基準：HEAD `9be0f4d`（main，與 origin 同步）
+> 版本：rev4（2026-08-27，backlog review 第三輪 2 P1＋1 P2 收斂＋owner 兩項裁決落地）
+> 狀態：**待 owner review**——通過後才估點（0.1 pt＝1 hr；混合性質或超過 2.0 pt 必拆）；**估點範圍（rev4 凍結）：本輪只估 A／B／C 軌；D 軌各票受 owner scope／宣稱／政策／立項／上限決策影響，待立項後估**
+> 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
 
 ## 已裁決事項（owner 2026-08-27，各票引用時以編號標注）
@@ -52,9 +52,9 @@
 
 - **背景**：語言最低版本與驗證工具鏈的語意未說清。rev2 更正：`go` directive（最低語言／模組版本）與 `toolchain` directive（建議工具鏈）**不是二選一、可並存**——rev1 誤寫成互斥選項。
 - **HEAD 證據**：`go.mod` 為 `go 1.25.0`；`README.md:95` 要求「Go 1.26+」、`:330` 標 Go 1.26；M3b 驗收使用 Go 1.26.5；reviewer 以 Go 1.25.0 實跑 `go build ./...` 通過（但 build 通過**不足以**宣稱 1.25 完整支援）。
-- **驗收條件**（rev3 改版本歸因矩陣——「未全綠即提高 minimum」會把非版本因素誤判成版本不足）：(1) **同一 commit** 分別以 Go 1.25 與 1.26.5 跑完整 Go gate（test＋race＋vet）與 Wails build，做比較矩陣；(2) 只有**能歸因於 Go 版本不相容**的失敗（1.25 紅、1.26.5 綠、且排除環境／工具缺失）才提高 minimum；已知 wall-clock 名單（B1）與環境性失敗**不參與版本裁決**；(3) 依矩陣結果同步 README 語意（「X minimum、1.26.5 validated」）；(4) **獨立決策**：是否加 `toolchain go1.26.5` 提升 reproducibility（與 minimum 判定無關，可並存）。
+- **驗收條件**（rev3 改版本歸因矩陣；rev4 落 owner 裁決）：(1) **同一 commit** 分別以 Go 1.25 與 1.26.5 跑完整 Go gate（test＋race＋vet）與 Wails build，做比較矩陣；**1.25 腳必須記錄實際 `go version` 輸出，並以 `GOTOOLCHAIN=local` 執行**——目前環境 `GOTOOLCHAIN=auto` 會自動切到 1.26.5，不設即 1.25 證據無效（owner 2026-08-27 裁決附帶條件）；(2) 只有**能歸因於 Go 版本不相容**的失敗（1.25 紅、1.26.5 綠、且排除環境／工具缺失）才提高 minimum；已知 wall-clock 名單（B1）與環境性失敗**不參與版本裁決**；(3) 依矩陣結果同步 README 語意（「X minimum、1.26.5 validated」）；(4) **已裁決（owner 2026-08-27）：採用 `toolchain go1.26.5`**——與 minimum 判定並存。
 - **建議模組**：`go.mod`、`README.md`。
-- **依賴／裁決**：建議 B1 完成後執行（或依 (2) 明文排除 wall-clock 偽陽）；(4) 需 owner 裁決。
+- **依賴／裁決**：建議 B1 完成後執行（或依 (2) 明文排除 wall-clock 偽陽）；裁決已定，無待決項。
 
 ---
 
@@ -83,7 +83,7 @@
 
 - **背景**：M3b 的 UI 驗收（wails dev＋Playwright）有價值但屬一次性操作，非 repo 可重跑資產。（rev2：原 B3 依「混合性質必拆」自我規則拆為 B3a／B3b。）
 - **HEAD 證據**：`frontend/package.json` 無直接宣告的 E2E dependency、script、config 與 suite（lockfile 有 Vitest 的 optional Playwright transitive entry）。
-- **驗收條件**：(1) repo 內可執行的 browser E2E suite，覆蓋 Gate 1、Gate 2、STALE、session recovery、approval 核心流；(2) 納入 B2 的 CI（可為 non-required 起步）。
+- **驗收條件**：(1) repo 內可執行的 browser E2E suite，覆蓋 Gate 1、Gate 2、STALE、session recovery、approval 核心流；(2) **CI provider 邊界（rev4 凍結）**：required CI 路徑一律使用 **deterministic fake／replay provider**——不需訂閱帳號、不需外部網路，任意第三方 checkout 可重跑；live Claude／Codex 的驗收另列為獨立項目，**不作 required check**；(3) 納入 B2 的 CI（可為 non-required 起步）。
 - **建議模組**：`frontend/`（新 e2e 目錄）、`.github/workflows`。
 - **依賴／裁決**：與 B2 互相配合；無需裁決。
 
@@ -129,7 +129,7 @@
 - **HEAD 證據**：B5 所列（enforcement 缺口為規劃中的 M4 範圍，非現況缺陷）。
 - **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。
 - **建議模組**：依 B5／B6 產出的 application service、forge adapter（GitHub）、frontend Gate 3 檢視。
-- **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6**（rev3 明列）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；【**owner 決策，估點前置**】pilot provider 單選——Claude 與 Codex 的 process／resume／session ownership 路徑不同，直接影響本票範圍與估點，估點前必須選定。
+- **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6**（rev3 明列）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；**pilot provider 已裁決（owner 2026-08-27）：Claude**——現有實機證據已跑過 Bash 核可並實際寫檔，per-WSID 子行程是較自然的 TaskRun ownership 邊界；Codex 的共用 app-server generation 會為第一條垂直切片多帶一層共享生命週期複雜度。
 
 ### C2 SC4 authoring-to-Gate-3 端到端驗收
 
@@ -182,7 +182,7 @@
 
 ---
 
-## 附錄 A：外部審核主張的核實記錄（2026-08-27，HEAD `9be0f4d`）
+## 附錄 A：外部審核主張的核實記錄（2026-08-27，盤點基準 `9be0f4d`）
 
 | 主張 | 核實 |
 |---|---|
@@ -224,4 +224,15 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
   - P1：B5 (6c)(6d)(6e) 標注為 owner 決策（商業流程選擇）；(6b) 明定區分 commit missing／binding digest 改變／HEAD 前移，HEAD 正常前移不得 STALE（沿既有 TCA 錨點契約）。
   - P1：C1 增 pilot provider 單選為估點前置 owner 決策；新增 **C2 SC4 authoring-to-Gate-3 端到端驗收**（依賴 A1＋C1），完整 SC4 自此有 durable 追蹤入口。
   - P2：C1 依賴明列 B1／B2／B3a／B3b／B4／B5／B6；裁決事項第 10 項改為不綁版本措辭；B2 enforcement 實證補「測試 PR＋可回復 branch、不得為驗證合併已知失敗內容」邊界。
+- rev4（2026-08-27，backlog review 第三輪 2 P1＋1 P2 收斂＋owner 兩項裁決落地）：
+  - P1：B3a 凍結 CI provider 邊界——required CI 路徑一律 deterministic fake／replay
+    （免訂閱、免外網、第三方可重跑）；live provider 驗收另列、不作 required check。
+  - P1：估點範圍凍結——本輪只估 A／B／C 軌；D 軌各票受 owner scope／宣稱／政策／
+    立項／上限決策影響，待立項後估。
+  - P2：`9be0f4d` 改稱「盤點基準」（rev1 起始時之 main），不再稱 HEAD——修訂
+    commit 不改變盤點內容之基準，避免稽核事實失真。
+  - 裁決落地：A4 採 `toolchain go1.26.5`，1.25 比較腳強制記錄 `go version`＋
+    `GOTOOLCHAIN=local`（現環境 auto 會自動切換，不設即證據無效）；C1 pilot
+    provider 選 **Claude**（實機證據既有、per-WSID ownership 邊界自然；Codex 共用
+    app-server generation 增加共享生命週期複雜度）。
 - rev1（2026-08-27）：初版。
