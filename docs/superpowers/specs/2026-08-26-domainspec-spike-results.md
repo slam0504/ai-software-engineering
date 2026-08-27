@@ -401,6 +401,16 @@ constraint 範圍內，本報告如實揭露、不隱藏。
    spec §1 的兩個「對齊警訊」），涵蓋的是已知的兩個 production 行為細節，不是
    escalation／entry 欄位全狀態空間的窮舉——若 M4.5 擴大規則面，這塊需要視新規則
    需求擴充。
+6. **`sel`／`risk_selections` presence 缺口（final review 發現，已於本 wave
+   修復）**：per_task 規則的 own-presence gate（`checkOwnPresence`／
+   `refFactGroups`）原本只用 CEL 頂層變數名比對 `factGroupOrder`，而 `sel` 是
+   `findSelection` 由 `risk_selections` 衍生出的變數、本身不在 `factGroupOrder`
+   裡，導致 `RiskSelections.Presence==Missing`（decide presence matrix 合法容許）
+   時，引用 `sel` 的規則（如 R25）把 `findSelection` 回傳的 `nil` 誤判成「已知但
+   無選擇」而 deny，而非 spec §2 要求的 unknown。已在 `refFactGroups` 把 RefVars
+   含 `sel` 映射到 `risk_selections` 群組修復，回歸測試
+   `TestEvaluatePerTaskSelMissingYieldsUnknown`（`internal/domainspec/eval_test.go`）
+   涵蓋，並以 revert-check 確認該測試在修復前會失敗。
 
 ---
 
@@ -431,7 +441,10 @@ misalignment。
    現存、可能被清理的 workspace），避免未來重放失敗。
 4. **`CostEstimate.Max` 的靜態成本估計選擇**（§五第 3 項 `bundle.go` deferred
    minor）：目前是實作者在 brief 未明確指定下的保守選擇，M4.5 正式採用前建議
-   owner 明確 sign-off 這個選擇（或改用更精確的估計策略）。
+   owner 明確 sign-off 這個選擇（或改用更精確的估計策略）。`gate2-bundle.yaml`
+   實際採用的 static cost limit（50,000,000）刻意調得寬鬆，是為了容納 R27
+   雙層 `exists` 重算在 `fixedSizeCostEstimator`（固定 size hint 64）下數千萬量級
+   的靜態估計值，機制本身仍由 `TestLoadBundleRejectsStaticCostOverLimit` 驗證。
 5. **豁免表 R13／R17／R19／R20 等 host 層規則**：這些規則的正確性目前完全依賴
    既有 production 測試（`internal/gate`／`internal/gatepolicy` 套件既有測試），
    不在本 spike 的 shadow 對比範圍內——M4.5 若要把這些規則也納入 CEL shadow，
