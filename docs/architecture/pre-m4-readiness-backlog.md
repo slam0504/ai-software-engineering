@@ -1,7 +1,7 @@
-# Pre-M4 Readiness Backlog（rev4）
+# Pre-M4 Readiness Backlog（rev5·估點版）
 
-> 版本：rev4（2026-08-27，backlog review 第三輪 2 P1＋1 P2 收斂＋owner 兩項裁決落地）
-> 狀態：**待 owner review**——通過後才估點（0.1 pt＝1 hr；混合性質或超過 2.0 pt 必拆）；**估點範圍（rev4 凍結）：本輪只估 A／B／C 軌；D 軌各票受 owner scope／宣稱／政策／立項／上限決策影響，待立項後估**
+> 版本：rev5（2026-08-27，rev4 通過 review；本版加入 A／B／C 軌估點與拆票，票面語意除 A4 措辭校正外不變）
+> 狀態：**估點待 owner review**——D 軌待立項後估（rev4 凍結）
 > 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
 
@@ -52,7 +52,7 @@
 
 - **背景**：語言最低版本與驗證工具鏈的語意未說清。rev2 更正：`go` directive（最低語言／模組版本）與 `toolchain` directive（建議工具鏈）**不是二選一、可並存**——rev1 誤寫成互斥選項。
 - **HEAD 證據**：`go.mod` 為 `go 1.25.0`；`README.md:95` 要求「Go 1.26+」、`:330` 標 Go 1.26；M3b 驗收使用 Go 1.26.5；reviewer 以 Go 1.25.0 實跑 `go build ./...` 通過（但 build 通過**不足以**宣稱 1.25 完整支援）。
-- **驗收條件**（rev3 改版本歸因矩陣；rev4 落 owner 裁決）：(1) **同一 commit** 分別以 Go 1.25 與 1.26.5 跑完整 Go gate（test＋race＋vet）與 Wails build，做比較矩陣；**1.25 腳必須記錄實際 `go version` 輸出，並以 `GOTOOLCHAIN=local` 執行**——目前環境 `GOTOOLCHAIN=auto` 會自動切到 1.26.5，不設即 1.25 證據無效（owner 2026-08-27 裁決附帶條件）；(2) 只有**能歸因於 Go 版本不相容**的失敗（1.25 紅、1.26.5 綠、且排除環境／工具缺失）才提高 minimum；已知 wall-clock 名單（B1）與環境性失敗**不參與版本裁決**；(3) 依矩陣結果同步 README 語意（「X minimum、1.26.5 validated」）；(4) **已裁決（owner 2026-08-27）：採用 `toolchain go1.26.5`**——與 minimum 判定並存。
+- **驗收條件**（rev3 改版本歸因矩陣；rev4 落 owner 裁決）：(1) **同一 commit** 分別以 Go 1.25 與 1.26.5 跑完整 Go gate（test＋race＋vet）與 Wails build，做比較矩陣；**1.25 腳必須記錄實際 `go version` 輸出，並以 `GOTOOLCHAIN=local` 執行**——自動切換風險發生在**加入 `toolchain go1.26.5` 的受測 commit** 上（現行 go.mod 尚無 toolchain directive，`GOTOOLCHAIN=auto` 下實際仍為 1.25.0）；受測 commit 含 toolchain 後不設 `GOTOOLCHAIN=local` 即 1.25 證據無效（owner 2026-08-27 裁決附帶條件，措辭依估點 gate 校正）；(2) 只有**能歸因於 Go 版本不相容**的失敗（1.25 紅、1.26.5 綠、且排除環境／工具缺失）才提高 minimum；已知 wall-clock 名單（B1）與環境性失敗**不參與版本裁決**；(3) 依矩陣結果同步 README 語意（「X minimum、1.26.5 validated」）；(4) **已裁決（owner 2026-08-27）：採用 `toolchain go1.26.5`**——與 minimum 判定並存。
 - **建議模組**：`go.mod`、`README.md`。
 - **依賴／裁決**：建議 B1 完成後執行（或依 (2) 明文排除 wall-clock 偽陽）；裁決已定，無待決項。
 
@@ -208,6 +208,33 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 
 對應 spec、plan、production 與測試均在 repo（`docs/superpowers/specs/2026-08-24-replay-reliability-design.md`、`rebuild_orchestrator.go`）。錯誤盤點根因：auto-memory 索引行過期（本文已正確標「勿再列為待辦」）——索引已同步更正。
 
+## 估點（rev5，A／B／C 軌；0.1 pt＝1 hr 實際工作，不含等候）
+
+拆票依規則執行（>2.0 pt 或混合性質必拆）；「假設」欄記載估點成立前提，前提破壞時該票重估。等候時間（design gate 往返、CI runner 排隊）不計工時、拉長日曆時間，已標注於備註。
+
+| 票 | 拆分範圍 | pt | 假設／備註 |
+|---|---|---|---|
+| A1a | Editor 同步閉環：updateListener→受控 buffer、dirty state、Spec 手動儲存、digest optimistic locking、真實輸入 integration test（A1 驗收 1-4＋6） | 1.4 | 沿用既有 SpecWrite 類 bindings 的 digest 機制，不新增 backend surface |
+| A1b | 外部檔案變更 reload／compare／保留流程（A1 驗收 5）＋對應測試 | 0.6 | 以 on-focus／操作前檢查實作，不引入 file watcher；compare 以並列顯示起步 |
+| A2 | Error lifecycle 三原則＋回歸測試 | 0.4 | 範圍限 plan store＋同型檢視 spec store，不動 escalation 機制 |
+| A3 | 文件版本同步＋frozen／living 原則＋同型掃描 | 0.2 | — |
+| A4 | 1.25／1.26.5 比較矩陣＋go.mod toolchain＋README | 0.4 | 兩腳全套執行屬監督型等候（約 1 hr 內），計入；建議 B1a 後執行 |
+| B1a | Go 側六條確定性化（權威五條＋`internal/proc` 候選重現與處置）＋§7 追加 resolved 證據 | 1.5 | 每條平均 2.5 hr（理解＋重設計＋負載重驗）；若任一條需重構被測程式本體，該條獨立開票重估 |
+| B1b | 前端兩條候選重現與處置＋living 有效名單文件 | 0.3 | — |
+| B2 | 最小 CI workflows＋ruleset＋enforcement 實證五項＋政策文件 | 1.2 | macOS runner 可用；CI 迭代的 runner 等候不計工時（日曆另計）；測試 PR 驗畢即清 |
+| B3a-1 | E2E 基建：Playwright＋deterministic fake／replay provider harness＋1 條 smoke flow | 1.0 | 混合性質拆分（基建屬 spike 性質）；假設可沿用既有 Go 測試 double 思路造 fake provider CLI |
+| B3a-2 | 其餘核心流覆蓋（Gate 1／Gate 2／STALE／recovery／approval） | 0.9 | 依 B3a-1 harness；每流平均 1.5-2 hr |
+| B3b | 最小 native smoke 自動化 | 0.5 | 依 B2 macOS build job |
+| B4 | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | — |
+| B5 | TaskRun／Gate 3／forge 契約 spec（authoring＋gate 修訂輪工作量） | 1.2 | design gate 往返等候不計工時；(6c)(6d)(6e) owner 決議於 gate 中取得 |
+| B6 | M4 application seams 局部抽取 | 1.4 | 假設 B5 落地後僅需 service 骨架＋M4 觸及 orchestration 抽取；若 B5 要求更大重組，重估 |
+| C1a | TaskRun snapshot（domain＋持久化）＋Claude session 自動綁定注入 | 1.2 | pilot=Claude（已裁決）；沿 per-WSID ownership 既有機制 |
+| C1b | GitHub forge adapter：PR 建立＋required-check 讀取 | 0.8 | 唯讀＋建立 PR 的最小 API 面；不含 merge queue |
+| C1c | Gate 3 決議面（UI＋決議＋evidence 顯示）＋切片串接走查 | 1.2 | 沿既有 gate UI 慣例 |
+| C2 | SC4 authoring-to-Gate-3 端到端驗收走查 | 0.3 | 驗收性質；依賴 A1a／A1b／C1a-c 全部完成 |
+
+**小計**：A 軌 3.0 pt（30 hr）｜B 軌 8.6 pt（86 hr）｜C 軌 3.5 pt（35 hr）｜**合計 15.1 pt（約 151 hr 實際工作）**。排程換算（團隊 throughput 約 0.6 pt／day）為另一維度，於排程時另算，不與工程量混用。
+
 ## 修訂記錄
 
 - rev2（2026-08-27，backlog review 第一輪 5 P1＋4 P2 收斂）：
@@ -235,4 +262,10 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
     `GOTOOLCHAIN=local`（現環境 auto 會自動切換，不設即證據無效）；C1 pilot
     provider 選 **Claude**（實機證據既有、per-WSID ownership 邊界自然；Codex 共用
     app-server generation 增加共享生命週期複雜度）。
+- rev5（2026-08-27，估點版——rev4 通過 review 後依裁決進入估點）：
+  - 加入 A／B／C 軌逐票估點表（合計 15.1 pt）；依「>2.0 pt 或混合必拆」拆
+    A1→A1a/A1b、B1→B1a/B1b、B3a→B3a-1/B3a-2、C1→C1a/C1b/C1c；假設欄記載
+    前提，破壞即重估。
+  - A4 措辭校正（owner 核可於估點 commit 順手修）：GOTOOLCHAIN 自動切換風險
+    發生在加入 toolchain directive 的受測 commit，非現行 go.mod。
 - rev1（2026-08-27）：初版。
