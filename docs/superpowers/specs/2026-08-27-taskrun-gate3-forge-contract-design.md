@@ -1,9 +1,9 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
-> 版本：rev3（2026-08-28，design gate 第二輪 4 P1＋1 P2 收斂）
+> 版本：rev4（2026-08-28，design gate 第三輪 4 P1＋1 P2 收斂；owner 兩項裁決回填——啟動失敗 resume-to-original 接受、零 CHANGES_REQUESTED 保留但限具效力 reviewer）
 > 狀態：**待 design gate**
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
-> 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
+> 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3／rev4 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
 
 ## 1. 目的
 
@@ -80,7 +80,7 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
    - (i) **臨界區 A**（`workflowMu`，沿 gateDecide 先例 app.go:5823-5824）：完成 §2.2 全部前置驗證後 append `taskrun_created`（snapshot 本體，durable）。
    - (ii) 鎖外：組裝 session 資源（broker／socket／MCP config；沿 startClaude committed-rollback 慣例，app.go:7328-7335）。
    - (iii) **臨界區 B**（`workflowMu`）：currentness 重驗（重跑 §2.2 第 1-2 項）→ 通過即 append `taskrun_bound{wsid}`。在 (0) 不變式下，重驗與 bound 提交之間**不可能**有任何 gate journal 寫入介入——此即原子性保證。
-   - (iv) 鎖外：`claude.Start` → publish host。wsregistry Entry 的 `{task_run_id, snapshot_digest}` 隨既有 `registry.Bind`／`commitClaudeResume` 的 Entry 落盤寫入（init event 觸發，app.go:7404-7416；四步原子落盤契約 store.go:182-218），**不新增獨立寫入點**。
+   - (iv) 鎖外：`claude.Start` → publish host。wsregistry Entry 的 `{task_run_id, snapshot_digest}` 於 **`commitSessionIdentity`**（app.go:1181-1188——StartSession Accept 成功後、claude／codex 兩 provider 共同掛點，app.go:6901／6921）寫入，沿 store 私有 `mutate()` 慣例（store.go:359-373）新增寫入方法；四步原子落盤契約 store.go:182-218。**rev4 錨點更正（修 rev3 P2）**：claude `registry.Bind`（registry.go:57-70）寫的是獨立的 sessionID→{cwd, wsid} 反查表 JSON，與 wsregistry 是不同 store，不得作為本欄位掛點；`SetResume`（app.go:8996）為 Claude init event 專屬、僅覆寫 ResumeSessionID，亦非本欄位入口。
    - 殘餘窗口：git repo 外部狀態（commit 遭 GC／branch 刪除）無法納入臨界區；由 §4.1 staleness 形狀與 §5.3 決議時重驗承接。
 2. **權威階層（rev3 凍結）**：TaskRun journal 是綁定的**唯一權威**；wsregistry Entry 的 `{task_run_id, snapshot_digest}` 是 **derived cache**（供 resume 快速定位），可自 journal 重建。兩者不一致一律以 journal 為準修復 Entry；不得反向以 Entry 補寫 journal。
 3. **Repair matrix（startup repair 逐分割點；rev3 補）**：
@@ -88,7 +88,10 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
    | 分割點 | 觀測形狀 | 修復 |
    |---|---|---|
    | created 後、bound 前 crash | journal：created 非終態、無 bound | append `taskrun_aborted`（終態；snapshot 保留供審計，不可再綁定） |
-   | bound 後、Entry 落盤前 crash（或 Entry 寫入失敗） | journal：bound；Entry 無綁定欄位或不存在 | 「bound 無活 session」→ §3.5 resume；session 重建時依 journal 回填 Entry |
+   | bound 後、Entry 落盤前 crash（或 Entry 寫入失敗） | journal：bound；Entry 無綁定欄位或不存在，**且 Entry 非 tombstoned**（RemovedAt 空） | 「bound 無活 session」→ §3.5 resume；session 重建時依 journal 回填 Entry |
+   | Entry tombstoned、journal 為 bound 且無 `taskrun_abandoned` | §3.6 journal-先行序被違反或 legacy 殘留（tombstone＝RemovedAt 非空，store.go:310-322，**無復活路徑**：Put／mutate 一律拒絕，store.go:291-306／359-373） | **不得依「Entry 遺失」列重建、不得 resume**：append `taskrun_abandoned` 收斂＋corruption audit event |
+   | `taskrun_abandoned` 已 append、移除六步未完成即 crash | journal：abandoned；Entry 未 tombstoned 或中間步驟殘留 | startup repair 重新驅動移除流程至 tombstone_persist 完成（六步凍結順序 app.go:7112） |
+   | Gate 3 approved 落盤後、`taskrun_completed` append 前 crash | gate journal：gate3 approved record（subject `taskrun:<ULID>`）；TaskRun journal：仍 bound | startup repair 依 gate3 record 確定性補 append `taskrun_completed`（§3.4） |
    | Entry 有綁定欄位、journal 無對應 bound | 逆向分裂（正常排序下不應出現） | fail loud：落 corruption audit event、該 session 不得視為 implementation session；修復＝清除 Entry 綁定欄位（journal 權威），不得偽造 bound |
    | Entry 與 journal 的 snapshot_digest 不一致 | 資料毀損或錯繫 | fail loud，拒絕 resume（沿 §3.5） |
    | `claude.Start` 失敗（bound 已 append、未 crash；現況此時尚無 Entry，app.go:7379-7383） | bound、無活 session、session 資源已 rollback | **統一走 §3.5 resume-to-original**：bound 且從未成功建立 session 者，「resume」＝為原綁定重新建立 session（前置：非 STALE）。不轉 aborted、不建新 TaskRun——消除 rev2「Start 失敗轉 aborted」與狀態機 `bound →（stale｜completed）` 的矛盾；`aborted` 唯一來源為 created 未達 bound |
@@ -110,13 +113,25 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
    - 既有 schema 前置：現行 repo 的 permission 檔需先遷移為 schema v1（C1a 範圍內的一次性遷移；遷移後 Gate 2 重送核使 digest 更新）。
 3. **TaskRun 標記**：`task_run_id` 入 session env／MCP config（app.go:7309 既有機制），供 evidence 收集與 audit 歸屬。
 
-### 3.4 TaskRun 狀態機（rev2 補）
+### 3.4 TaskRun 狀態機（rev2 補；rev4 增 abandoned 與 completed 觸發時點）
 
-`created →（bound | aborted）`；`bound →（stale | completed）`；終態＝`aborted`／`stale`／`completed`。全部以 journal transition op 表達；startup repair 負責 crash 殘留的收斂（§3.2(3)）。orphan 定義：`created` 未達 `bound`＝aborted；`bound` 無活 session＝可 resume，非 orphan。**rev3 澄清**：`aborted` 唯一入口為 `created`；`claude.Start` 失敗不進 aborted（§3.2(3) 統一走 resume-to-original），狀態機不擴寬。
+`created →（bound | aborted）`；`bound →（stale | completed | abandoned）`；終態＝`aborted`／`stale`／`completed`／`abandoned`。全部以 journal transition op 表達；startup repair 負責 crash 殘留的收斂（§3.2(3)）。orphan 定義：`created` 未達 `bound`＝aborted；`bound` 無活 session＝可 resume，非 orphan。**rev3 澄清（owner 裁決已接受）**：`aborted` 唯一入口為 `created`；`claude.Start` 失敗不進 aborted（§3.2(3) 統一走 resume-to-original）。**rev4 補**：
+
+- **`abandoned`（新終態）**：使用者移除 session 之明示放棄（§3.6），僅可自 `bound` 進入；不可 resume、不可再綁定、產出禁入 Gate 3；transcript／evidence 保留（同 §4.2(3) 審計原則）。
+- **`completed` 觸發時點（rev4 凍結）**：Gate 3 approved 決議當下——`gateDecide` 的 `workflowMu` 臨界區內 `svc.CommitDecision(prepared)`（app.go:5854，臨界區形狀 app.go:5823-5854）成功後、同一臨界區內 append `taskrun_completed`。gate journal 與 TaskRun journal 間的 crash split 由 §3.2(3) repair matrix 依 gate3 record 確定性收斂。completed 後 session 之後續產出不再屬於該 TaskRun（該 TaskRun 不可再送 Gate 3）。
 
 ### 3.5 Resume（owner 裁決 6d，已定）
 
-Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 `{task_run_id, snapshot_digest}` 與 journal 內 snapshot 一致；**不允許重新綁定**至其他 TaskRun。TaskRun 已 STALE → 依 §4.2 凍結語意（session 不可再產生新 turn）。`internal/claude.Registry` 的 resume 驗證面（registry.go:57-99）為現成掛點。**rev3 補（journal 權威，§3.2(2)）**：Entry 遺失或缺綁定欄位時，以 journal 的 bound 紀錄為準重建 Entry，不阻擋 resume；bound 且**從未**成功建立 session 者（Start 失敗、bound 後立即 crash），resume＝為原綁定重新建立 session——無 transcript 可續屬合法形狀，非錯誤。
+Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 `{task_run_id, snapshot_digest}` 與 journal 內 snapshot 一致；**不允許重新綁定**至其他 TaskRun。TaskRun 已 STALE → 依 §4.2 凍結語意（session 不可再產生新 turn）。`internal/claude.Registry` 的 resume 驗證面（registry.go:57-99）為現成掛點。**rev3 補（journal 權威，§3.2(2)）**：Entry 遺失或缺綁定欄位時，以 journal 的 bound 紀錄為準重建 Entry，不阻擋 resume；bound 且**從未**成功建立 session 者（Start 失敗、bound 後立即 crash），resume＝為原綁定重新建立 session——無 transcript 可續屬合法形狀，非錯誤。**§3.5 全部 resume 規則的前置**：Entry 未 tombstoned（tombstoned＝§3.6 abandoned 路徑，永不 resume）。
+
+### 3.6 Session 移除與 TaskRun lifecycle（rev4 補——tombstone 契約）
+
+現行 `RemoveSession` 為六步凍結順序（deny_approvals → teardown → lease_finalize → cleanup_files → … → tombstone_persist，app.go:7100-7209），tombstone（`Entry.RemovedAt`，store.go:310-322）**無任何復活路徑**（`Put`／`mutate` 一律拒絕，store.go:291-306／359-373）；`Removable()`（manager.go:328-347）不要求 session idle，活的 session 一樣可移除。tombstone 與 §3.2(3)「Entry 遺失依 journal 重建」是**不同形狀，不得混用**。rev4 凍結：
+
+1. **允許移除 bound TaskRun 的 session，語意＝明示放棄**：移除流程於 deny_approvals **之前**，先在 `workflowMu` 臨界區內 append `taskrun_abandoned`（journal 先行、tombstone 在後——沿 §3.2(2) journal 權威排序原則）；之後接續既有六步。
+2. **UI 前置**：前端既有兩段式 confirm（SessionList.vue:105-111）必須呈現「將放棄 TaskRun、不可恢復」語意；不得靜默放棄。
+3. TaskRun 已為終態（stale／completed／aborted）或無 TaskRun 之一般 session：移除不追加 transition，逕走既有六步。
+4. Crash split 收斂見 §3.2(3)（tombstone-無-abandoned 收斂列、abandoned-移除未完成列）。
 
 ## 4. STALE／重驗生命週期
 
@@ -129,11 +144,18 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
 | **commit missing** | `implementation_base_commit`／`test_commit`／上游 base_commit 於 repo 消失（rev-parse exit1） | TaskRun → STALE（fail closed：讀取錯誤≠missing，沿 R13） |
 | **單純 HEAD 前移** | workspace／main HEAD 正常前進，上述皆未觸發 | **不得 STALE**（沿 TCA 錨點契約） |
 
-### 4.2 STALE 處置（owner 裁決 6e，已定）
+### 4.2 STALE 處置（owner 裁決 6e，已定；rev4 補 transition protocol）
 
-TaskRun STALE 後**立即凍結 implementation session**：
+**Transition protocol（rev4 凍結——上游 gate stale、TaskRun journal stale、runtime freeze 三狀態的寫入順序與競態關閉）**：
 
-1. 拒絕新 turn 與新 tool approval（approval broker 對該 session fail closed）。
+1. **偵測與 durable ordering**：durable stale 只產生於持 `workflowMu` 的寫入路徑（§3.2(0) 單一寫入者不變式下的全部寫入面：watcher `reconcileGate1NotifyOnly`、`gateDecide`、`RunEvidence`、TaskRun 建立臨界區）。同一臨界區內依序：(a) gate journal stale transition（既有 Reconcile）→ (b) 對每個受影響的 bound TaskRun append `taskrun_stale` → (c) 設 runtime freeze latch → (d) 逐筆 deny 該 WSID 全部 pending approvals（沿 `denyApprovalsForRemove` 先例，app.go:7076-7080）。detect-only 讀取（§3.2(0)）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
+2. **Freeze latch（monotonic）**：per-WSID set-once 旗標，設定後於該 TaskRun 生命週期內永不清除；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）。latch 為 runtime-only——重啟後於 startup repair 階段自 TaskRun journal 重建（終態 `stale` ⇒ latch set），先於任何 resume 可能發生前完成。
+3. **原子 fail-closed 檢查**：`SendMessage`（app.go:6930-6976，現況僅 beginTxn＋manager 鎖）與 `resolveApproval`（app.go:6783-6810，現況僅 `apprMu`）**維持不取 `workflowMu`**（hot path 不得撞 §3.2 長臨界區）——改為在各自既有鎖內檢查 latch，且步驟 1(c) 設定 latch 時取得同一把鎖：check 與 set 互斥，關閉「檢查通過後 latch 才設」的競速窗。latch 設定前已 admit 的進行中 turn 屬下列凍結效果 (2) 受控收束；其後續 tool approval 仍被 latch 擋下。
+4. **Crash split repair**：gate journal stale 已落、`taskrun_stale` 未落 → startup repair 掃全部 bound TaskRun 以 detect-only 重算 currentness，不成立者補 append `taskrun_stale`＋set latch；`taskrun_stale` 已落、latch 未設 → latch 依 (2) 於 startup 自 journal 重建。兩向皆收斂，無需跨 store 交易。
+
+**凍結效果**（TaskRun STALE 後**立即凍結 implementation session**）：
+
+1. 拒絕新 turn 與新 tool approval（freeze latch fail closed，機制見上）。
 2. 進行中 turn 取消或受控收束（不強殺進行中的工具呼叫、但不再核可新的）。
 3. transcript 與 evidence **全數保留**（審計資產，不銷毀）。
 4. 該 TaskRun 的產出**禁止進 Gate 3**；繼續實作必須建立**新 TaskRun**（上游重核後重新走 §2.2）。
@@ -152,16 +174,21 @@ Gate 3 approval request 的 bindings（沿 `gate.Binding{Kind, Role, Ref, Digest
 2. `promotion_head`——PR head commit OID（格式沿 reGitOID，gate2.go:28-31）。
 3. `main_base`——PR base（main）commit OID。
 4. `oracle_surface`——digest 必須等於 TaskRun 抄錄值。
-5. `required_check_manifest`（rev2 改——單筆 check run 無法證明 required set 完整；rev3 補確定性收斂）——canonical manifest 的 digest，manifest 內容：
+5. `required_check_manifest`（rev2 改——單筆 check run 無法證明 required set 完整；rev3 補確定性收斂；rev4 補 provider identity——名稱非權威 key）——canonical manifest 的 digest，manifest 內容：
    - `manifest_schema`：固定 1。
-   - `required_names[]`：**權威集合**＝forge ruleset／branch protection 定義的 required check 名稱清單（決議時自 forge 讀取），**字典序排序**；forge 回傳重複名稱→fail loud（不靜默去重）。
-   - `runs[]`：依 `name` 字典序排序、每 name **恰一筆** `{name, run_id, head_sha, status, conclusion}`（巢狀 key 依此字面序）。**同名多次執行的收斂規則（current-effective run）**：取 `started_at` 最新者，tie-break `run_id` 較大者；驗證條件施加於收斂後的那一筆。
-   - 驗證條件：names 與 runs **集合相等**（無缺漏、無重複）、全部 `conclusion == success`、全部 `head_sha == promotion_head`。
+   - `required_checks[]`：**權威集合**＝forge ruleset／branch protection 定義的 required checks（決議時自 forge 讀取），每筆 `{context, app_id}`（巢狀 key 依此字面序；`app_id` 可空＝不限來源——對齊 branch protection API `required_status_checks.checks[]` 的 `{context, app_id}` 形狀），依 `(context, app_id)` 排序；forge 回傳重複 `(context, app_id)` →fail loud（不靜默去重）。
+   - `runs[]`：依 `(name, app_id)` 排序、每 required check **恰一筆** `{name, app_id, run_id, head_sha, status, conclusion}`。**歸屬規則（rev4）**：run 屬於某 required check 當 `name == context` 且（required `app_id` 為空，或 `run.app_id == app_id`）；required `app_id` 為空且同名 run 來自多個不同 app →歸屬歧義，fail loud。**同 key 多次執行的收斂規則（current-effective run）**：取 `started_at` 最新者，tie-break `run_id` 較大者；驗證條件施加於收斂後的那一筆。
+   - 驗證條件：required_checks 與 runs **集合相等**（無缺漏、無重複）、全部 `conclusion == success`、全部 `head_sha == promotion_head`。
 6. `review_evidence_provenance`（rev2 定權威；rev3 補 current-effective 規則與 implementation evidence schema）——canonical manifest 的 digest，兩節、各有具名權威：
-   - **Review 節（權威＝GitHub PR review）**：列表＝**每 reviewer 至多一筆 current-effective review**，依 `reviewer_login` 字典序排序（unique key）；每筆 `{reviewer_login, review_id, state, reviewed_head_sha, submitted_at}`（巢狀 key 依此字面序）。**Current-effective 規則**：該 reviewer 全部 review 中 `state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 且 `submitted_at` 最新者（tie-break `review_id` 較大者）；`COMMENTED`／`PENDING` 不改變有效狀態、不入 manifest。**驗證條件（rev3 收斂——修「較早 approval 在後續非核准 review 下仍通過」）**：至少一 reviewer 的 current-effective `state == APPROVED` 且 `reviewed_head_sha == promotion_head`；**且不存在任何 current-effective `state == CHANGES_REQUESTED`**（任一存在即不符）；`DISMISSED`＝該 reviewer 無有效核可（不計入亦不阻擋）。〔rev3 選擇註記：零 CHANGES_REQUESTED 為 fail-closed 預設，較 GitHub 預設 branch protection 嚴；owner 可於 gate 裁決放寬。〕任意呼叫者自產 manifest 無效——決議時自 forge **重讀**比對（§5.3(5)）。
+   - **Review 節（權威＝GitHub PR review；rev4 補 reviewer eligibility——公開 repo 任何人可 review，僅具權限者影響合併）**：列表＝**每具效力 reviewer 至多一筆 current-effective review**，依 `reviewer_login` 字典序排序（unique key）；每筆 `{reviewer_login, permission, review_id, state, reviewed_head_sha, submitted_at}`（巢狀 key 依此字面序）。**Eligibility（rev4 凍結）**：決議時經 forge 逐 reviewer 查 collaborator permission，`permission ∈ {write, maintain, admin}` 才入 manifest；不具效力者**完全不入 manifest**——其 approval 不放行、其 CHANGES_REQUESTED 亦不阻擋（雙向修正）。CODEOWNERS／required approving review count 等深度 review policy 屬平台強制（B2 ruleset），Gate 3 不重演（merge-group 定位段同理）。**Current-effective 規則**：該 reviewer 全部 review 中 `state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 且 `submitted_at` 最新者（tie-break `review_id` 較大者）；`COMMENTED`／`PENDING` 不改變有效狀態、不入 manifest。**驗證條件**：至少一具效力 reviewer 的 current-effective `state == APPROVED` 且 `reviewed_head_sha == promotion_head`；**且不存在任何具效力 reviewer 的 current-effective `state == CHANGES_REQUESTED`**；`DISMISSED`＝該 reviewer 無有效核可（不計入亦不阻擋）。〔owner 裁決（第三輪）：零 current-effective CHANGES_REQUESTED 保留為 fail-closed 預設，僅施加於具效力 reviewer。〕任意呼叫者自產 manifest 無效——決議時自 forge **重讀**比對（§5.3(5)）。
    - **Evidence 節（權威＝Workbench evidence journal；rev3 凍結 implementation evidence schema——修「任意 {evidence_id, digest} 列表、空集合或他人紀錄可通過」）**：
-     - 新 journal record type **`implementation_evidence`**（schema v1）：`{schema_version: 1, evidence_id（ULID、exactly-once，journal.go:30-32）, task_run_id, kind, base_commit, head_commit, command, cwd, exit_code, stdout_digest, stderr_digest, started_at, finished_at, result}`。為 evidence journal record type 白名單（現況僅 `evidence_run`／`mutation`，journal.go:68-92）的 additive 第三種；現有 `EvidenceRun`（runner.go:70-90）承載 TCA 語意（expected_red／negative_control），**不重用、不改欄位**。
-     - **必要種類與完整性**：`kind` v1 僅凍結 `test_run`。Gate 3 要求至少一筆 `test_run` 同時滿足：`task_run_id`＝＝本 TaskRun、`base_commit`＝＝snapshot `implementation_base_commit`、`head_commit`＝＝`promotion_head`、`result`＝＝green（exit 0）。空集合或無任一滿足者→不符。commit range 以 OID 對錨定（兩 OID 已完整內容定址該 diff）；**不採 diff bytes digest**——diff 輸出跨 git 版本非確定。
+     - 新 journal record type **`implementation_evidence`**（schema v1）：`{schema_version: 1, evidence_id（ULID、exactly-once，journal.go:30-32）, task_run_id, kind, plan_commit, base_commit, head_commit, command, cwd, exit_code, stdout_digest, stderr_digest, started_at, finished_at, result}`。為 evidence journal record type 白名單（現況僅 `evidence_run`／`mutation`，journal.go:68-92）的 additive 第三種；現有 `EvidenceRun`（runner.go:70-90）承載 TCA 語意（expected_red／negative_control），**不重用、不改欄位**。
+     - **產生契約（rev4 凍結——修「任意成功命令可滿足」）**：`test_run` 必須由 workbench evidence runner 產生，沿 TCA runner 防呆契約（package doc runner.go:6-10）並在兩處收緊：
+       - (a) **Command 唯一來源＝committed plan**：runner 以 `LoadAt(plan_commit, plan_id)` → `task.TestContract.Command` 載入（runner.go:155-162、213 先例），caller **不得傳入 command**；`plan_commit`＝TaskRun snapshot 之 gate2 record `base_commit` binding 所指 commit（權威值），record 的 `command` 欄位為 runner 抄錄、供 Gate 3 重載比對。
+       - (b) **執行環境**：於 `head_commit` 的 detached worktree 執行（`NewWorktree(repoRoot, commit, ...)` 先例，worktree.go:76-106；crash 清理沿 wt journal，worktree.go:274-329），不得於使用者 worktree。
+       - (c) **OID 由 runner 解析（不採 TCA 現況 caller 傳入形狀**，TcaWorkspace.vue:191-196 使用者輸入、runner.go:250-251 直抄**）**：`head_commit` 由 runner rev-parse 為完整 OID；`base_commit` 自 snapshot 抄錄並驗其為 `head_commit` 祖先。
+       - (d) stdout／stderr 經 CAS digest（runner.go:219-226 先例）。
+     - **必要種類與完整性**：`kind` v1 僅凍結 `test_run`。Gate 3 要求至少一筆 `test_run` 同時滿足：`task_run_id`＝＝本 TaskRun、`plan_commit`＝＝snapshot 之 gate2 base_commit、`base_commit`＝＝snapshot `implementation_base_commit`、`head_commit`＝＝`promotion_head`、`result`＝＝green（exit 0）、且 **record `command` ＝＝ Gate 3 自 `plan_commit` 重載之 `task.TestContract.Command`**（§5.3(5)）。空集合或無任一滿足者→不符。commit range 以 OID 對錨定（兩 OID 已完整內容定址該 diff）；**不採 diff bytes digest**——diff 輸出跨 git 版本非確定。
      - **權威集合由 Gate 3 重建**：`PrepareDecision` 以 `task_run_id` 掃 evidence journal 重建完整 `{evidence_id, record_digest}` 集合（依 `evidence_id` 字典序排序），重算 manifest digest 必須等於 binding digest——**集合相等，非子集**；request 後新增 evidence 造成 mismatch→依 §4.3 轉終態、重新送核。任意呼叫者自產列表無效；CAS 重讀重驗沿 tca.go:27-38 契約。
 
 **Canonical manifest 共同規則（rev3 凍結）**：§5.1(5)(6) 兩 manifest 皆含 `manifest_schema: 1`；digest＝`"sha256:" + hex(sha256(canonical_json(manifest)))`，canonicalization 同 §2.3（key 依本 spec 表列字面序、strict decode、未知欄位拒絕）；陣列一律依上列具名排序鍵排序後輸出，**forge／journal 回傳順序不得影響 digest**；同鍵多筆一律以具名 current-effective 規則收斂為至多一筆後才進 manifest。
@@ -180,8 +207,10 @@ Gate 3 `PrepareDecision`（approved 分支）必須重驗，任一不符→依 �
 2. `promotion_head` == forge 現時 PR head（防決議與 push 競態）。
 3. `required_check_manifest` 重建：自 forge 重讀 required 集合與 runs，重算 manifest 必須與 binding digest 一致，且滿足 §5.1(5) 全部驗證條件——**missing／pending／failed 三態皆為不符**，不得以「目前存在的 runs 剛好都綠」替代集合完整性。
 4. `main_base` 為 forge 現時 PR base，且 promotion_head 為 main_base 的 descendant。
-5. `review_evidence_provenance` 重建：review 節自 forge 重讀、依 §5.1(6) current-effective 規則重建比對（含零 CHANGES_REQUESTED 條件）；evidence 節依 §5.1(6) 以 `task_run_id` 自 journal 重建權威集合（集合相等＋required kind 滿足）＋CAS 重讀重驗。
+5. `review_evidence_provenance` 重建：review 節自 forge 重讀（含**逐 reviewer eligibility 重查**，§5.1(6)）、依 current-effective 規則重建比對（零 CHANGES_REQUESTED 條件限具效力 reviewer）；evidence 節依 §5.1(6) 以 `task_run_id` 自 journal 重建權威集合（集合相等＋required kind 滿足＋record `command` 對 `plan_commit` 重載之 `TestContract.Command` 比對）＋CAS 重讀重驗。
 6. rejected 分支沿 gate 慣例：僅需 reason，跳過重驗（在過期上下文上駁回必須成立）。
+
+approved 重驗全數通過 → `CommitDecision` 落盤後、同一 `workflowMu` 臨界區內 append `taskrun_completed`（§3.4；臨界區既有形狀 app.go:5823-5854；crash split 收斂見 §3.2(3)）。
 
 ## 6. Forge interface（owner 裁決 #4；rev2 補 idempotency 與型別區分）
 
@@ -197,10 +226,13 @@ type Forge interface {
     EnsurePullRequest(ctx, repo RepoID, headRef, baseRef BranchRef, taskRunID string, meta PRMeta) (PRRef, error)
     GetPullRequest(ctx, repo RepoID, pr PRRef) (PRState{HeadOID, BaseOID, State}, error)
     // required 權威集合＋逐 check 狀態；三態（missing／pending／completed{conclusion}）必須可區分。
-    // CheckRun 必含 {Name, RunID, HeadOID, Status, Conclusion, StartedAt}——StartedAt 供 §5.1(5) 同名收斂（rev3 補）。
-    GetRequiredChecks(ctx, repo RepoID, pr PRRef, head OID) (RequiredChecks{RequiredNames []string, Runs []CheckRun}, error)
+    // rev4：required key＝{Context, AppID}（AppID 可空＝不限來源，對齊 branch protection API）；
+    // CheckRun 必含 {Name, AppID, RunID, HeadOID, Status, Conclusion, StartedAt}——StartedAt 供 §5.1(5) 收斂。
+    GetRequiredChecks(ctx, repo RepoID, pr PRRef, head OID) (RequiredChecks{Required []RequiredCheckRef, Runs []CheckRun}, error)
     // PR review 讀取面（rev2 補——§5.1(6) review 節的權威來源）；SubmittedAt 供 current-effective 收斂（rev3 補）。
     GetReviews(ctx, repo RepoID, pr PRRef) ([]Review{ReviewID, ReviewerLogin, State, ReviewedHeadOID, SubmittedAt}, error)
+    // reviewer eligibility（rev4 補——§5.1(6) 具效力 reviewer 判定；決議時逐 reviewer 查詢）。
+    GetCollaboratorPermission(ctx, repo RepoID, login string) (Permission, error)
 }
 ```
 
@@ -216,10 +248,10 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 1. TaskRun 欄位、抄錄一致性與 digest preimage（TaskRunPayloadV1 逐欄含巢狀 key 序、省略自身、canonicalization）無歧義（§2.1／§2.3）。
 2. currentness 前置（含 test_commit 錨定與空 diff 規則）可逐條轉為測試（§2.2）。
-3. 綁定不可繞過且**可跨重啟恢復**（§3.1 持久化＋基數）；gate journal 單一寫入者不變式、權威階層與逐分割點 repair matrix 完整、無未定義 crash split（§3.2／§3.4）。
+3. 綁定不可繞過且**可跨重啟恢復**（§3.1 持久化＋基數）；gate journal 單一寫入者不變式、權威階層與逐分割點 repair matrix 完整、無未定義 crash split；session 移除 tombstone 契約（abandoned 終態）與 completed 觸發時點凍結（§3.2／§3.4／§3.6）。
 4. Permission schema v1、strict decode 與 deterministic mapping 凍結，讀取來源為 commit tree 非 worktree（§3.3(2)）。
-5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
-6. Gate 3 綁定 manifest（required 集合完整性、review／evidence 雙權威）確定性收斂——canonical 排序鍵、同名 check／同 reviewer current-effective 規則、implementation evidence schema 與 Gate 3 重建權威集合——與決議時重驗清單 fail-closed 無缺口（§5）。
+5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；STALE transition protocol（durable ordering／monotonic latch／原子 fail-closed 檢查／crash repair）可逐條轉為測試；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
+6. Gate 3 綁定 manifest（required 集合完整性、review／evidence 雙權威）確定性收斂——canonical 排序鍵、`(context, app_id)` 權威 key、reviewer eligibility、同 key current-effective 規則、implementation evidence schema 與 runner 產生契約、Gate 3 重建權威集合——與決議時重驗清單 fail-closed 無缺口（§5）。
 7. Forge port 型別區分與 EnsurePullRequest idempotency 凍結（§6）。
 
 ## 9. 非目標
@@ -230,6 +262,13 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 ## 修訂記錄
 
+- rev4（2026-08-28，design gate 第三輪 4 P1＋1 P2 收斂；驗證來源＝2026-08-28 第二次盤讀 app.go:7100-7209／6930-6976／6783-6810／1181-1188、store.go:291-373、runner.go:155-262、worktree.go:76-106、registry.go:19-70）：
+  - P1（RemoveSession tombstone 衝突）：新 §3.6——允許移除 bound TaskRun 之 session 但語意＝明示放棄，`taskrun_abandoned`（新終態，僅自 bound 進入）journal 先行、tombstone 在後；tombstone 無復活路徑，repair matrix 明確排除「當一般 Entry 遺失重建」並補 tombstone-無-abandoned／abandoned-移除未完成兩列；UI 兩段式 confirm 呈現放棄語意。`completed` 觸發時點凍結＝Gate 3 approved 決議同一 workflowMu 臨界區（CommitDecision 後 append），跨 journal crash split 依 gate3 record 確定性收斂（§3.2(3)／§3.4／§3.6）。
+  - P1（STALE 凍結無 transition protocol）：§4.2 補 protocol——durable ordering（gate journal stale → taskrun_stale → runtime latch → deny pending approvals，同一 workflowMu 臨界區）；per-WSID monotonic freeze latch（set-once，startup 自 journal 重建）；SendMessage／resolveApproval 維持不取 workflowMu，改在各自既有鎖內做 latch 原子 check（與 set 同鎖互斥）；雙向 crash split repair（§4.2）。
+  - P1（evidence 未證明核准測試於 promotion head 執行）：§5.1(6) 補 runner 產生契約——command 唯一來源＝committed plan（`LoadAt(plan_commit)` → `TestContract.Command`，caller 不得傳入；record 增 `plan_commit` 欄位）；於 head_commit 之 detached worktree 執行（TCA worktree 先例）；OID 由 runner rev-parse（不採 TCA caller-傳入現況）；Gate 3 重載 command 比對入必要條件與 §5.3(5)。
+  - P1（forge manifest 缺 GitHub 權威身分條件）：required check 權威 key 改 `(context, app_id)`（對齊 branch protection API），run 歸屬規則＋歧義 fail loud；review 節補 reviewer eligibility（決議時查 collaborator permission ∈ write/maintain/admin，不具效力者雙向不計）；CODEOWNERS 等深度 policy 維持平台強制（B2），Gate 3 不重演；Forge port 補 `RequiredCheckRef`／`CheckRun.AppID`／`GetCollaboratorPermission`（§5.1(5)(6)／§6）。
+  - P2（wsregistry 落盤錨點錯誤）：Entry `{task_run_id, snapshot_digest}` 掛點更正為 `commitSessionIdentity`（StartSession Accept 後、雙 provider 共用，app.go:1181-1188），沿 store `mutate()` 慣例新增寫入方法；`registry.Bind` 為獨立 claude session 反查表非 wsregistry（§3.2(1)(iv)）。
+  - Owner 裁決回填：啟動失敗 resume-to-original 接受（§3.4 rev3 澄清維持）；零 current-effective CHANGES_REQUESTED 保留、限具效力 reviewer（§5.1(6)）。
 - rev3（2026-08-28，design gate 第二輪 4 P1＋1 P2 收斂）：
   - P1（currentness 重驗非原子）：凍結 gate journal **單一寫入者不變式**——所有 append（含 Reconcile stale transition）必須持 `workflowMu`；讀取入口改 detect-only 投影（不落盤）；列舉現況 7 個違反入口為實作遷移前置（§3.2(0)）。捨棄替代案（讀取全取鎖／generation CAS）附因。驗證來源：2026-08-28 盤讀 app.go:5716-5730、service.go:191-261 等。
   - P1（TaskRun journal／wsregistry crash split）：凍結**權威階層**（journal 唯一權威、Entry 為 derived cache 可重建）；durable ordering 改兩段短臨界區、`claude.Start` 移出鎖外、Entry 隨既有 init-event Bind 落盤不新增寫入點（對齊 production 實際時機 app.go:7404-7416）；補逐分割點 **repair matrix**；`claude.Start` 失敗統一走 resume-to-original，`aborted` 唯一入口為 created，消除 rev2 與狀態機的矛盾（§3.2(1)-(3)／§3.4／§3.5）。
