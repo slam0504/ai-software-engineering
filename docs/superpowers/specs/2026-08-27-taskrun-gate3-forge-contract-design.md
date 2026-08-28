@@ -1,7 +1,7 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
 > 版本：rev8（2026-08-28，design gate 第七輪 1 P1 收斂——durable 寫入改依 cause owner 分流，形狀表僅為偵測分類）
-> 狀態：**待 design gate**
+> 狀態：**design gate 通過**（2026-08-28 第八輪 Approved @ rev8／d5a18a9——歷經八輪：rev1 初版起算，7 輪 findings 全數收斂，第八輪零 P1／P2；B5 票依驗收條件即為完成，後續進 B6／C1）
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
 > 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3–rev5 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
 
