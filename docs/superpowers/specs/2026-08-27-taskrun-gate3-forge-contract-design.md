@@ -1,9 +1,9 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
-> 版本：rev4（2026-08-28，design gate 第三輪 4 P1＋1 P2 收斂；owner 兩項裁決回填——啟動失敗 resume-to-original 接受、零 CHANGES_REQUESTED 保留但限具效力 reviewer）
+> 版本：rev5（2026-08-28，design gate 第四輪 3 P1 收斂——required checks 一對一 coverage、latch 鎖序與線性化、runtime 部分失敗 fail-closed）
 > 狀態：**待 design gate**
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
-> 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3／rev4 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
+> 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3–rev5 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
 
 ## 1. 目的
 
@@ -91,7 +91,7 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
    | bound 後、Entry 落盤前 crash（或 Entry 寫入失敗） | journal：bound；Entry 無綁定欄位或不存在，**且 Entry 非 tombstoned**（RemovedAt 空） | 「bound 無活 session」→ §3.5 resume；session 重建時依 journal 回填 Entry |
    | Entry tombstoned、journal 為 bound 且無 `taskrun_abandoned` | §3.6 journal-先行序被違反或 legacy 殘留（tombstone＝RemovedAt 非空，store.go:310-322，**無復活路徑**：Put／mutate 一律拒絕，store.go:291-306／359-373） | **不得依「Entry 遺失」列重建、不得 resume**：append `taskrun_abandoned` 收斂＋corruption audit event |
    | `taskrun_abandoned` 已 append、移除六步未完成即 crash | journal：abandoned；Entry 未 tombstoned 或中間步驟殘留 | startup repair 重新驅動移除流程至 tombstone_persist 完成（六步凍結順序 app.go:7112） |
-   | Gate 3 approved 落盤後、`taskrun_completed` append 前 crash | gate journal：gate3 approved record（subject `taskrun:<ULID>`）；TaskRun journal：仍 bound | startup repair 依 gate3 record 確定性補 append `taskrun_completed`（§3.4） |
+   | Gate 3 approved 落盤後、`taskrun_completed` append 前 crash 或 append 失敗 | gate journal：gate3 approved record（subject `taskrun:<ULID>`）；TaskRun journal：仍 bound | repair（startup＋runtime 觸發點，§4.2(4)）依 gate3 record 確定性補 append `taskrun_completed`；程序未重啟期間由 pending-completed 旗標阻擋衝突 transition（dominance 規則見 §3.4） |
    | Entry 有綁定欄位、journal 無對應 bound | 逆向分裂（正常排序下不應出現） | fail loud：落 corruption audit event、該 session 不得視為 implementation session；修復＝清除 Entry 綁定欄位（journal 權威），不得偽造 bound |
    | Entry 與 journal 的 snapshot_digest 不一致 | 資料毀損或錯繫 | fail loud，拒絕 resume（沿 §3.5） |
    | `claude.Start` 失敗（bound 已 append、未 crash；現況此時尚無 Entry，app.go:7379-7383） | bound、無活 session、session 資源已 rollback | **統一走 §3.5 resume-to-original**：bound 且從未成功建立 session 者，「resume」＝為原綁定重新建立 session（前置：非 STALE）。不轉 aborted、不建新 TaskRun——消除 rev2「Start 失敗轉 aborted」與狀態機 `bound →（stale｜completed）` 的矛盾；`aborted` 唯一來源為 created 未達 bound |
@@ -119,6 +119,10 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
 
 - **`abandoned`（新終態）**：使用者移除 session 之明示放棄（§3.6），僅可自 `bound` 進入；不可 resume、不可再綁定、產出禁入 Gate 3；transcript／evidence 保留（同 §4.2(3) 審計原則）。
 - **`completed` 觸發時點（rev4 凍結）**：Gate 3 approved 決議當下——`gateDecide` 的 `workflowMu` 臨界區內 `svc.CommitDecision(prepared)`（app.go:5854，臨界區形狀 app.go:5823-5854）成功後、同一臨界區內 append `taskrun_completed`。gate journal 與 TaskRun journal 間的 crash split 由 §3.2(3) repair matrix 依 gate3 record 確定性收斂。completed 後 session 之後續產出不再屬於該 TaskRun（該 TaskRun 不可再送 Gate 3）。
+- **Completed dominance 與 pending-completed（rev5 補——關閉「decision 已落、completed append 失敗、程序未重啟」窗口）**：
+  - `CommitDecision` 成功之瞬間，該 TaskRun 進入 runtime **pending-completed** 旗標（與 freeze latch 同為持 `workflowMu` 寫入者所有之 per-TaskRun 狀態；monotonic，至 `taskrun_completed` 落盤成功才視為收斂）。旗標存續期間，凍結序列（§4.2）與移除流程（§3.6）**不得**對該 TaskRun append `taskrun_stale`／`taskrun_abandoned`（兩路徑皆持 `workflowMu`，進入時檢查旗標即互斥）。
+  - `taskrun_completed` append 失敗或**結果不確定**（crash／`ErrRegistryUncertain` 類形狀）→ fail closed：一律視為「可能已提交」，旗標維持、阻擋持續；收斂由 §4.2(4) repair 觸發點（startup＋runtime 兩種）補 append。
+  - **Dominance 規則**：gate3 approved record（subject `taskrun:<ULID>`）存在 ⇒ 該 TaskRun 的權威終態＝`completed`。若 journal 仍殘留其後的 `taskrun_stale`／`taskrun_abandoned` op（違反阻擋規則的 crash 殘留），projection 層面忽略之＋corruption audit event——以 projection 規則收斂，不需「自終態轉移」的非法 transition。
 
 ### 3.5 Resume（owner 裁決 6d，已定）
 
@@ -130,7 +134,7 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
 
 1. **允許移除 bound TaskRun 的 session，語意＝明示放棄**：移除流程於 deny_approvals **之前**，先在 `workflowMu` 臨界區內 append `taskrun_abandoned`（journal 先行、tombstone 在後——沿 §3.2(2) journal 權威排序原則）；之後接續既有六步。
 2. **UI 前置**：前端既有兩段式 confirm（SessionList.vue:105-111）必須呈現「將放棄 TaskRun、不可恢復」語意；不得靜默放棄。
-3. TaskRun 已為終態（stale／completed／aborted）或無 TaskRun 之一般 session：移除不追加 transition，逕走既有六步。
+3. TaskRun 已為終態（stale／completed／aborted）或無 TaskRun 之一般 session：移除不追加 transition，逕走既有六步。**rev5 補**：TaskRun 處於 pending-completed（§3.4）→ 不得追加 `taskrun_abandoned`；移除須待 completed 收斂後依本項終態形狀處理。
 4. Crash split 收斂見 §3.2(3)（tombstone-無-abandoned 收斂列、abandoned-移除未完成列）。
 
 ## 4. STALE／重驗生命週期
@@ -148,10 +152,16 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
 
 **Transition protocol（rev4 凍結——上游 gate stale、TaskRun journal stale、runtime freeze 三狀態的寫入順序與競態關閉）**：
 
-1. **偵測與 durable ordering**：durable stale 只產生於持 `workflowMu` 的寫入路徑（§3.2(0) 單一寫入者不變式下的全部寫入面：watcher `reconcileGate1NotifyOnly`、`gateDecide`、`RunEvidence`、TaskRun 建立臨界區）。同一臨界區內依序：(a) gate journal stale transition（既有 Reconcile）→ (b) 對每個受影響的 bound TaskRun append `taskrun_stale` → (c) 設 runtime freeze latch → (d) 逐筆 deny 該 WSID 全部 pending approvals（沿 `denyApprovalsForRemove` 先例，app.go:7076-7080）。detect-only 讀取（§3.2(0)）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
-2. **Freeze latch（monotonic）**：per-WSID set-once 旗標，設定後於該 TaskRun 生命週期內永不清除；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）。latch 為 runtime-only——重啟後於 startup repair 階段自 TaskRun journal 重建（終態 `stale` ⇒ latch set），先於任何 resume 可能發生前完成。
-3. **原子 fail-closed 檢查**：`SendMessage`（app.go:6930-6976，現況僅 beginTxn＋manager 鎖）與 `resolveApproval`（app.go:6783-6810，現況僅 `apprMu`）**維持不取 `workflowMu`**（hot path 不得撞 §3.2 長臨界區）——改為在各自既有鎖內檢查 latch，且步驟 1(c) 設定 latch 時取得同一把鎖：check 與 set 互斥，關閉「檢查通過後 latch 才設」的競速窗。latch 設定前已 admit 的進行中 turn 屬下列凍結效果 (2) 受控收束；其後續 tool approval 仍被 latch 擋下。
-4. **Crash split repair**：gate journal stale 已落、`taskrun_stale` 未落 → startup repair 掃全部 bound TaskRun 以 detect-only 重算 currentness，不成立者補 append `taskrun_stale`＋set latch；`taskrun_stale` 已落、latch 未設 → latch 依 (2) 於 startup 自 journal 重建。兩向皆收斂，無需跨 store 交易。
+1. **偵測與 ordering（rev5 調整——凍結方向 runtime 先行）**：durable stale 只產生於持 `workflowMu` 的寫入路徑（§3.2(0) 單一寫入者不變式下的全部寫入面：watcher `reconcileGate1NotifyOnly`、`gateDecide`、`RunEvidence`、TaskRun 建立臨界區）。同一臨界區內依序：(a) gate journal stale transition（既有 Reconcile）→ (b) **設 runtime freeze latch＋逐筆 deny 該 WSID 全部 pending approvals**（沿 `denyApprovalsForRemove` 先例，app.go:7076-7080；純 runtime 動作，不可失敗）→ (c) append `taskrun_stale`。**原則凍結：凍結方向的 runtime 效果不得以 journal append 成功為前置；放行方向（resume、Gate 3 決議、新 TaskRun 建立）必須以 durable 紀錄與重驗為前置。**步驟 (c) 失敗——含 journal degraded（write／sync 錯誤後拒絕後續 append 之既有語意，gate journal.go:11／56、evidence journal.go:23／125）——時 latch 已設、session 已凍結，fail closed 已達成；journal 收斂延後至 (4) repair。detect-only 讀取（§3.2(0)）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
+2. **Freeze latch（monotonic；rev5 補唯一 owner 與設定端鎖序）**：
+   - **唯一 owner**：App 層 per-WSID freeze state，寫入僅由持 `workflowMu` 的 freeze 序列執行（單一寫入者）；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）。set-once，於該 TaskRun 生命週期內永不清除。
+   - **設定端固定鎖序**：`workflowMu`（已持）→ 取 manager 鎖、設 turn-admission 旗標、釋放 → 取 `apprMu`、設 approval 旗標＋執行 (1)(b) 之逐筆 deny、釋放。latch 概念上一個、實作為**兩個同源 monotonic 旗標**（各在其鎖域，rev4「同一把鎖」之精確化——admission 與 approval 本就分屬 manager 鎖與 `apprMu` 兩鎖域，無法共用單鎖）；兩旗標設定間隙的唯一後果是「已 admit 的 turn 之後續 approval」——仍被 approval 旗標擋下，fail closed 不破。**除 freeze 設定端外，禁止任何路徑同時持有 manager 鎖與 `apprMu`**（現況兩鎖無交疊持有：`SendMessage` 僅 manager 鎖 app.go:6930-6976、`resolveApproval` 僅 `apprMu` app.go:6783-6810——此不變式凍結；設定端依固定順序取鎖且逐把釋放，無死鎖形狀）。
+   - latch 為 runtime-only——重啟後於 startup repair 階段自 TaskRun journal＋detect-only currentness 重建（終態 `stale` ⇒ latch set），先於任何 resume 可能發生前完成。
+3. **線性化點與 system-deny 豁免（rev5 精確化）**：新 turn 的線性化點＝`Manager.BeginSubmit` 成功返回（manager 鎖內完成旗標檢查後才 admit）。approval resolution 的線性化點＝`apprMu` 臨界區內「檢查旗標＋自 pending 取出」完成之瞬間——旗標檢查必在 `apprMu` 內、`p.resolve` 呼叫前完成（現況 resolveApproval 先解鎖再 `p.resolve` 的形狀維持：凡於旗標設定後進入 `apprMu` 者必見旗標；已於鎖內 admit 者，其鎖外 `p.resolve` 不再受旗標影響）。**旗標僅阻擋 `allow=true` 之核可與新 turn admission；`allow=false`（deny）永遠合法、不受旗標阻擋**——(1)(b) 的系統 deny 與使用者 deny 皆得執行（拒絕方向與 fail closed 一致，freeze 序列不會被自身 latch 擋住）。latch 設定前已 admit 的進行中 turn 屬下列凍結效果 (2) 受控收束；其後續 tool approval 仍被旗標擋下。
+4. **Repair 觸發點（rev5——不限 startup）**：
+   - (i) **startup repair**：gate journal stale 已落、`taskrun_stale` 未落 → 掃全部 bound TaskRun 以 detect-only 重算 currentness，不成立者補 append `taskrun_stale`＋set latch；`taskrun_stale` 已落、latch 未設 → latch 依 (2) 自 journal 重建。
+   - (ii) **runtime repair（程序未重啟）**：每個持 `workflowMu` 寫入路徑進入時做收斂檢查——latch 已設而 `taskrun_stale` 未落（或 §3.4 pending-completed 殘留）且 journal 可寫 → 補 append；journal degraded 期間，所有依賴 append 的 workflow 操作（TaskRun 建立、gate decide、resume 放行）因既有拒絕語意自然 fail closed，而 latch 只增不減——runtime 凍結不因 journal 失敗而漏。
+   - 兩向皆收斂，無需跨 store 交易。
 
 **凍結效果**（TaskRun STALE 後**立即凍結 implementation session**）：
 
@@ -177,8 +187,9 @@ Gate 3 approval request 的 bindings（沿 `gate.Binding{Kind, Role, Ref, Digest
 5. `required_check_manifest`（rev2 改——單筆 check run 無法證明 required set 完整；rev3 補確定性收斂；rev4 補 provider identity——名稱非權威 key）——canonical manifest 的 digest，manifest 內容：
    - `manifest_schema`：固定 1。
    - `required_checks[]`：**權威集合**＝forge ruleset／branch protection 定義的 required checks（決議時自 forge 讀取），每筆 `{context, app_id}`（巢狀 key 依此字面序；`app_id` 可空＝不限來源——對齊 branch protection API `required_status_checks.checks[]` 的 `{context, app_id}` 形狀），依 `(context, app_id)` 排序；forge 回傳重複 `(context, app_id)` →fail loud（不靜默去重）。
-   - `runs[]`：依 `(name, app_id)` 排序、每 required check **恰一筆** `{name, app_id, run_id, head_sha, status, conclusion}`。**歸屬規則（rev4）**：run 屬於某 required check 當 `name == context` 且（required `app_id` 為空，或 `run.app_id == app_id`）；required `app_id` 為空且同名 run 來自多個不同 app →歸屬歧義，fail loud。**同 key 多次執行的收斂規則（current-effective run）**：取 `started_at` 最新者，tie-break `run_id` 較大者；驗證條件施加於收斂後的那一筆。
-   - 驗證條件：required_checks 與 runs **集合相等**（無缺漏、無重複）、全部 `conclusion == success`、全部 `head_sha == promotion_head`。
+   - `runs[]`：依 `(context, required_app_id)` 排序（與 required_checks 同 key 序）、每 required check **恰一筆** `{context, required_app_id, run_name, run_app_id, run_id, head_sha, status, conclusion}`——**同時記錄 required 端 key 與實際 run 的 app identity**（rev5 修 null-key 語意：required_app_id 可空、run_app_id 為實際值，兩者可不同）。
+   - **歸屬（attribution）規則**：run 可歸屬於 required check 當 `run_name == context` 且（`required_app_id` 為空，或 `run_app_id == required_app_id`）；`required_app_id` 為空且候選 run 來自多個不同 `run_app_id` →歸屬歧義，fail loud。**同 key 多次執行的收斂規則（current-effective run）**：取 `started_at` 最新者，tie-break `run_id` 較大者；驗證條件施加於收斂後的那一筆。
+   - **驗證條件（rev5 改「集合相等」為一對一 coverage——(context, app_id=null) 與 (name, app_id=實際值) 依 key 比較必然不等，集合相等不可滿足）**：required_checks 與 runs **一對一對應（bijection）**——每一 required check 恰有一筆歸屬 run（無缺漏），runs 僅含歸屬於某 required check 者（無多餘），一筆 run 至多歸屬一個 required check（多重歸屬→fail loud）；全部 `conclusion == success`；全部 `head_sha == promotion_head`。
 6. `review_evidence_provenance`（rev2 定權威；rev3 補 current-effective 規則與 implementation evidence schema）——canonical manifest 的 digest，兩節、各有具名權威：
    - **Review 節（權威＝GitHub PR review；rev4 補 reviewer eligibility——公開 repo 任何人可 review，僅具權限者影響合併）**：列表＝**每具效力 reviewer 至多一筆 current-effective review**，依 `reviewer_login` 字典序排序（unique key）；每筆 `{reviewer_login, permission, review_id, state, reviewed_head_sha, submitted_at}`（巢狀 key 依此字面序）。**Eligibility（rev4 凍結）**：決議時經 forge 逐 reviewer 查 collaborator permission，`permission ∈ {write, maintain, admin}` 才入 manifest；不具效力者**完全不入 manifest**——其 approval 不放行、其 CHANGES_REQUESTED 亦不阻擋（雙向修正）。CODEOWNERS／required approving review count 等深度 review policy 屬平台強制（B2 ruleset），Gate 3 不重演（merge-group 定位段同理）。**Current-effective 規則**：該 reviewer 全部 review 中 `state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 且 `submitted_at` 最新者（tie-break `review_id` 較大者）；`COMMENTED`／`PENDING` 不改變有效狀態、不入 manifest。**驗證條件**：至少一具效力 reviewer 的 current-effective `state == APPROVED` 且 `reviewed_head_sha == promotion_head`；**且不存在任何具效力 reviewer 的 current-effective `state == CHANGES_REQUESTED`**；`DISMISSED`＝該 reviewer 無有效核可（不計入亦不阻擋）。〔owner 裁決（第三輪）：零 current-effective CHANGES_REQUESTED 保留為 fail-closed 預設，僅施加於具效力 reviewer。〕任意呼叫者自產 manifest 無效——決議時自 forge **重讀**比對（§5.3(5)）。
    - **Evidence 節（權威＝Workbench evidence journal；rev3 凍結 implementation evidence schema——修「任意 {evidence_id, digest} 列表、空集合或他人紀錄可通過」）**：
@@ -250,8 +261,8 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 2. currentness 前置（含 test_commit 錨定與空 diff 規則）可逐條轉為測試（§2.2）。
 3. 綁定不可繞過且**可跨重啟恢復**（§3.1 持久化＋基數）；gate journal 單一寫入者不變式、權威階層與逐分割點 repair matrix 完整、無未定義 crash split；session 移除 tombstone 契約（abandoned 終態）與 completed 觸發時點凍結（§3.2／§3.4／§3.6）。
 4. Permission schema v1、strict decode 與 deterministic mapping 凍結，讀取來源為 commit tree 非 worktree（§3.3(2)）。
-5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；STALE transition protocol（durable ordering／monotonic latch／原子 fail-closed 檢查／crash repair）可逐條轉為測試；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
-6. Gate 3 綁定 manifest（required 集合完整性、review／evidence 雙權威）確定性收斂——canonical 排序鍵、`(context, app_id)` 權威 key、reviewer eligibility、同 key current-effective 規則、implementation evidence schema 與 runner 產生契約、Gate 3 重建權威集合——與決議時重驗清單 fail-closed 無缺口（§5）。
+5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；STALE transition protocol（凍結方向 runtime 先行的 ordering、monotonic latch 唯一 owner 與設定端鎖序、線性化點與 system-deny 豁免、startup＋runtime repair 觸發點）可逐條轉為測試；completed dominance 與 pending-completed 阻擋規則無缺口（§3.4）；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
+6. Gate 3 綁定 manifest（required 集合完整性、review／evidence 雙權威）確定性收斂——canonical 排序鍵、`(context, app_id)` 權威 key 與**一對一 coverage（bijection）**規則、reviewer eligibility、同 key current-effective 規則、implementation evidence schema 與 runner 產生契約、Gate 3 重建權威集合——與決議時重驗清單 fail-closed 無缺口（§5）。
 7. Forge port 型別區分與 EnsurePullRequest idempotency 凍結（§6）。
 
 ## 9. 非目標
@@ -262,6 +273,10 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 ## 修訂記錄
 
+- rev5（2026-08-28，design gate 第四輪 3 P1 收斂）：
+  - P1（app_id null 時集合相等不可滿足）：`runs[]` 改同時記錄 `{context, required_app_id}` 與實際 `{run_name, run_app_id}`；驗證條件由「集合相等」改為**一對一 coverage（bijection）**——每 required check 恰一筆歸屬 run、runs 無多餘、一 run 至多歸屬一 required check（多重歸屬 fail loud）（§5.1(5)）。
+  - P1（latch 無單一線性化與鎖序）：精確化 rev4「同一把鎖」——latch 唯一 owner＝持 workflowMu 之 freeze 序列；實作為 manager 鎖域＋apprMu 鎖域兩個同源 monotonic 旗標，設定端固定鎖序（workflowMu→manager 鎖→apprMu，逐把釋放）＋「除設定端外禁止同時持兩鎖」不變式；線性化點凍結（新 turn＝BeginSubmit 成功返回；approval＝apprMu 內檢查＋pending 取出，p.resolve 鎖外形狀維持）；**allow=false 之 deny 永遠合法**——freeze 序列的系統 deny 不被自身 latch 阻擋（§4.2(2)(3)）。
+  - P1（runtime 部分成功不 fail closed）：凍結方向 runtime 先行原則——latch＋deny 先於 `taskrun_stale` append 且不以 append 成功為前置（journal degraded 之既有拒絕語意＝gate journal.go:11/56、evidence journal.go:23/125，本輪盤讀確認）；repair 觸發點擴為 startup＋**每個持 workflowMu 寫入路徑進入時**；completed 側補 **pending-completed 旗標**（CommitDecision 成功即設，阻擋 stale/abandoned 追加，append 失敗或結果不確定一律視為可能已提交）＋ **completed dominance**（gate3 approved record 存在⇒權威終態 completed，殘留衝突 op 由 projection 忽略＋audit）（§4.2(1)(4)／§3.4／§3.6(3)／§3.2(3)）。
 - rev4（2026-08-28，design gate 第三輪 4 P1＋1 P2 收斂；驗證來源＝2026-08-28 第二次盤讀 app.go:7100-7209／6930-6976／6783-6810／1181-1188、store.go:291-373、runner.go:155-262、worktree.go:76-106、registry.go:19-70）：
   - P1（RemoveSession tombstone 衝突）：新 §3.6——允許移除 bound TaskRun 之 session 但語意＝明示放棄，`taskrun_abandoned`（新終態，僅自 bound 進入）journal 先行、tombstone 在後；tombstone 無復活路徑，repair matrix 明確排除「當一般 Entry 遺失重建」並補 tombstone-無-abandoned／abandoned-移除未完成兩列；UI 兩段式 confirm 呈現放棄語意。`completed` 觸發時點凍結＝Gate 3 approved 決議同一 workflowMu 臨界區（CommitDecision 後 append），跨 journal crash split 依 gate3 record 確定性收斂（§3.2(3)／§3.4／§3.6）。
   - P1（STALE 凍結無 transition protocol）：§4.2 補 protocol——durable ordering（gate journal stale → taskrun_stale → runtime latch → deny pending approvals，同一 workflowMu 臨界區）；per-WSID monotonic freeze latch（set-once，startup 自 journal 重建）；SendMessage／resolveApproval 維持不取 workflowMu，改在各自既有鎖內做 latch 原子 check（與 set 同鎖互斥）；雙向 crash split repair（§4.2）。
