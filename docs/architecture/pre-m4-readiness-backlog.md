@@ -1,6 +1,7 @@
-# Pre-M4 Readiness Backlog（rev5·估點版）
+# Pre-M4 Readiness Backlog（rev6·估點版）
 
-> 版本：rev5（2026-08-27，rev4 通過 review；本版加入 A／B／C 軌估點與拆票，票面語意除 A4 措辭校正外不變）
+> 版本：rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
+> 前版：rev5（2026-08-27，rev4 通過 review；本版加入 A／B／C 軌估點與拆票，票面語意除 A4 措辭校正外不變）
 > 狀態：**估點待 owner review**——D 軌待立項後估（rev4 凍結）
 > 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
@@ -111,13 +112,21 @@
 - **建議模組**：`docs/superpowers/specs/`（新 spec）；牽動 `internal/`（設計對象：TaskRun／Forge／Gate 3 application service）。
 - **依賴／裁決**：無依賴（可先行）；核心裁決已定（#3/#4/#5/#6）。
 
-### B6 `app.go` M4 application seams（局部抽取）
+### B6a gate 單一寫入者＋Gate 3 policy／manifest seams（rev6 拆自 B6）
 
-- **背景**：`app.go` 已達 423,700 bytes，application orchestration 高度集中，與內部文件「輕量接線層」宣稱落差確認；但全面重構會混入大量既有 concurrency 風險——僅抽 M4 會觸碰的部分。
-- **HEAD 證據**：`ls -la app.go` = 423,700 bytes；App 結構含 lifecycle／startup／registry／replay index／lease／mutex／ownership／shutdown／latch／測試 hook 等多責任。
-- **驗收條件**：(1) 新增 TaskRun／Forge／Gate 3 對應的 application service（依 B5 spec）；(2) Wails binding 留在 `app.go`；(3) 只抽出 M4 觸及的既有 orchestration；(4) 驗收準則（rev2 精確化）：**允許** App 注入 application service／port reference；**不得**新增 M4 domain mutable state 或 ad-hoc test hook 於 App aggregate；新測試注入點走 interface／fake adapter——不以行數或物理切檔為驗收條件；(5) 抽取部分的既有測試全綠（含 race）。
-- **建議模組**：`app.go`、`internal/appcore`（或新 application package）。
-- **依賴／裁決**：依賴 B5 spec；裁決已定（#8）。
+- **背景**（原 B6）：`app.go` 已達 423,700 bytes，application orchestration 高度集中，與內部文件「輕量接線層」宣稱落差確認；但全面重構會混入大量既有 concurrency 風險——僅抽 M4 會觸碰的部分。拆票依「>2.0 pt 必拆」規則（B6 plan rev3 重算 2.05 pt），owner 於 B6 plan gate 第三輪核准。
+- **HEAD 證據**：同原 B6；plan＝`docs/superpowers/plans/2026-08-28-b6-m4-application-seams.md`（Task 1-6b＋10a）。
+- **驗收條件**：(1) Forge port（型別＋interface＋fake）；(2) gate journal 單一寫入者——讀面七入口 detect-only 遷移＋寫面唯一 Submit 呼叫點入 workflowMu；(3) `gate3_promotion` policy 骨架＋manifest 收斂＋pending 終態封閉（Expired／TerminalCause）；(4) Wails binding 留在 `app.go`、不新增 M4 domain mutable state 或 ad-hoc test hook 於 App aggregate、新測試注入走 interface／fake；(5) 既有測試全綠含 race。**獨立結案**——不待 B6b。
+- **建議模組**：`app.go`、`internal/forge`（新）、`internal/gate`、`internal/gatepolicy`。
+- **依賴／裁決**：僅依賴 B5 spec；裁決已定（#8＋拆票裁決 2026-08-28）。
+
+### B6b 綁定持久化＋freeze latch seams（rev6 拆自 B6）
+
+- **背景**：同 B6a 拆票脈絡；承載 B5 §3.1／§4.2(2)(3) 的既有 store 與 admission orchestration seams。
+- **HEAD 證據**：同原 B6；plan 同上（Task 7-9＋10b）。
+- **驗收條件**：(1) `wsregistry.Entry` TaskRun 綁定欄位＋雙向 1:1 write-once＋persistOrRollback failure matrix；(2) freeze latch——`FreezeTurns`（兩種 turn admission 檢查）＋approval 旗標＋雙鎖同持設定端＋鎖不洩漏；(3) 同 B6a 驗收 (4)(5)。**B6b 完成後才宣告原 B6 整體驗收完成。**
+- **建議模組**：`app.go`、`internal/wsregistry`、`internal/appcore`。
+- **依賴／裁決**：僅依賴 B5 spec（B6a→B6b 為建議執行順序、**非技術相依**）；裁決同上。
 
 ---
 
@@ -129,7 +138,7 @@
 - **HEAD 證據**：B5 所列（enforcement 缺口為規劃中的 M4 範圍，非現況缺陷）。
 - **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。
 - **建議模組**：依 B5／B6 產出的 application service、forge adapter（GitHub）、frontend Gate 3 檢視。
-- **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6**（rev3 明列）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；**pilot provider 已裁決（owner 2026-08-27）：Claude**——現有實機證據已跑過 Bash 核可並實際寫檔，per-WSID 子行程是較自然的 TaskRun ownership 邊界；Codex 的共用 app-server generation 會為第一條垂直切片多帶一層共享生命週期複雜度。
+- **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6a、B6b**（rev3 明列；rev6 依拆票改 B6→B6a＋B6b）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；**pilot provider 已裁決（owner 2026-08-27）：Claude**——現有實機證據已跑過 Bash 核可並實際寫檔，per-WSID 子行程是較自然的 TaskRun ownership 邊界；Codex 的共用 app-server generation 會為第一條垂直切片多帶一層共享生命週期複雜度。
 
 ### C2 SC4 authoring-to-Gate-3 端到端驗收
 
@@ -227,13 +236,14 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | B3b | 最小 native smoke 自動化 | 0.5 | 依 B2 macOS build job |
 | B4 | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | — |
 | B5 | TaskRun／Gate 3／forge 契約 spec（authoring＋gate 修訂輪工作量） | 1.2 | design gate 往返等候不計工時；(6c)(6d)(6e) owner 決議於 gate 中取得 |
-| B6 | M4 application seams 局部抽取 | 1.4 | 假設 B5 落地後僅需 service 骨架＋M4 觸及 orchestration 抽取；若 B5 要求更大重組，重估 |
+| B6a | gate 單一寫入者＋Gate 3 policy／manifest seams（rev6 拆） | 1.45 | B6 plan rev3 bottom-up 重估（原 1.4 pt 前提破壞作廢）；plan Task 1-6b＋10a |
+| B6b | 綁定持久化＋freeze latch seams（rev6 拆） | 0.6 | 同上；plan Task 7-9＋10b；B6a→B6b 為建議順序非相依 |
 | C1a | TaskRun snapshot（domain＋持久化）＋Claude session 自動綁定注入 | 1.2 | pilot=Claude（已裁決）；沿 per-WSID ownership 既有機制 |
 | C1b | GitHub forge adapter：PR 建立＋required-check 讀取 | 0.8 | 唯讀＋建立 PR 的最小 API 面；不含 merge queue |
 | C1c | Gate 3 決議面（UI＋決議＋evidence 顯示）＋切片串接走查 | 1.2 | 沿既有 gate UI 慣例 |
 | C2 | SC4 authoring-to-Gate-3 端到端驗收走查 | 0.3 | 驗收性質；依賴 A1a／A1b／C1a-c 全部完成 |
 
-**小計**：A 軌 3.0 pt（30 hr）｜B 軌 8.6 pt（86 hr）｜C 軌 3.5 pt（35 hr）｜**合計 15.1 pt（約 151 hr 實際工作）**。排程換算（團隊 throughput 約 0.6 pt／day）為另一維度，於排程時另算，不與工程量混用。
+**小計（rev6 更新——B6 拆票重估）**：A 軌 3.0 pt（30 hr）｜B 軌 9.25 pt（92.5 hr）｜C 軌 3.5 pt（35 hr）｜**合計 15.75 pt（約 157.5 hr 實際工作）**。排程換算（團隊 throughput 約 0.6 pt／day）為另一維度，於排程時另算，不與工程量混用。
 
 ## 修訂記錄
 
@@ -262,6 +272,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
     `GOTOOLCHAIN=local`（現環境 auto 會自動切換，不設即證據無效）；C1 pilot
     provider 選 **Claude**（實機證據既有、per-WSID ownership 邊界自然；Codex 共用
     app-server generation 增加共享生命週期複雜度）。
+- rev6（2026-08-28，B6 拆票）：B6 plan gate 第三輪 owner 裁決落地——B6 拆 **B6a**（gate 單一寫入者＋Gate 3 policy／manifest，1.45 pt）／**B6b**（綁定持久化＋freeze latch，0.6 pt）；拆票理由＝plan rev3 bottom-up 重估 2.05 pt 逾 2.0 拆票線（原 1.4 pt「僅 service 骨架」前提破壞）。兩票皆僅依賴 B5、可獨立結案；B6a→B6b 為建議順序非技術相依；原 B6 整體驗收於 B6b 完成後宣告。C1 相依 B6→B6a＋B6b；B 軌小計 8.6→9.25、合計 15.1→15.75 pt。
 - rev5（2026-08-27，估點版——rev4 通過 review 後依裁決進入估點）：
   - 加入 A／B／C 軌逐票估點表（合計 15.1 pt）；依「>2.0 pt 或混合必拆」拆
     A1→A1a/A1b、B1→B1a/B1b、B3a→B3a-1/B3a-2、C1→C1a/C1b/C1c；假設欄記載
