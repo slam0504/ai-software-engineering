@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev2（2026-08-28，plan gate 第一輪 8 P1 收斂；owner 裁決回填——Task 8-9 留 B6、bottom-up 重估）
+> 版本：rev3（2026-08-28，plan gate 第二輪 4 P1＋1 P2 收斂——Expired 終態封閉、Submit seam 對齊唯一呼叫點、freeze 鎖處理完整化、persistOrRollback 契約）
 > 狀態：**待 plan gate**
-> 票源：Pre-M4 Readiness Backlog B6（原估 1.4 pt；rev2 bottom-up 重估 **1.9 pt**，見估點表——未逾 2.0 pt 拆票線）
+> 票源：Pre-M4 Readiness Backlog B6（原估 1.4 pt 作廢；rev3 重算 **2.05 pt**——逾 2.0 pt 拆票線，**提議拆 B6a／B6b**，見估點表，請 owner 於 gate 裁決）
 
 **Goal:** 依 B5 spec 建立 M4 所需的 application seams——Forge port、Gate 3 policy 骨架與 manifest 收斂邏輯、gate 讀取路徑 detect-only 遷移、wsregistry 綁定欄位、freeze latch 機制——不含 TaskRun domain 本體（C1a）、GitHub adapter（C1b）、Gate 3 UI（C1c）。
 
@@ -32,23 +32,25 @@
 
 **Owner 裁決（plan gate 第一輪）已回填**：(1) Task 8-9 留在 B6——latch 是既有 admission／approval orchestration 的 seam；cause 偵測、journal transition 與 startup／runtime repair 留 C1a。(2) 原估 1.4 pt 不得沿用，rev2 逐 task bottom-up 重算如下；未逾 2.0 pt 不拆票。
 
-**Bottom-up 估點（rev2；0.1 pt＝1 hr）**：
+**Bottom-up 估點（rev3 重算；0.1 pt＝1 hr）**：
 
-| Task | 內容 | pt |
-|---|---|---|
-| 1 | forge port＋fake | 0.1 |
-| 2 | ListDetectOnly（含 unknown-gate fail closed） | 0.1 |
-| 3 | 七入口 detect-only 遷移＋gateListReconciled＋既有測試語意更新 | 0.2 |
-| 3b | gate Submit writer seam（三送核路徑入 workflowMu＋hook 測試） | 0.15 |
-| 4 | required-check manifest（含 RFC3339 嚴格解析） | 0.2 |
-| 5 | review manifest（含 RFC3339 嚴格解析） | 0.1 |
-| 6 | gate3 policy 骨架（含 subject 交叉驗證＋mismatch／transient 錯誤分類） | 0.2 |
-| 6b | Gate 3 pending 終態 seam（gate.Expired＋ExpirePending＋gateDecide 接線） | 0.25 |
-| 7 | wsregistry 1:1 雙向基數（跨 WSID 掃描＋partial-pair 防護） | 0.15 |
-| 8 | FreezeTurns＋兩種 admission 檢查 | 0.15 |
-| 9 | approval freeze 旗標＋雙鎖設定端 | 0.2 |
-| 10 | 全套驗證＋驗收對照 | 0.1 |
-| **合計** | | **1.9** |
+| Task | 內容 | pt | 拆票歸屬 |
+|---|---|---|---|
+| 1 | forge port＋fake | 0.1 | B6a |
+| 2 | ListDetectOnly（含 unknown-gate fail closed） | 0.1 | B6a |
+| 3 | 七入口 detect-only 遷移＋gateListReconciled＋既有測試語意更新 | 0.2 | B6a |
+| 3b | submitGateRequest 唯一 Submit 呼叫點入 workflowMu＋barrier 測試 | 0.15 | B6a |
+| 4 | required-check manifest（含 RFC3339 嚴格解析） | 0.2 | B6a |
+| 5 | review manifest（含 RFC3339 嚴格解析） | 0.1 | B6a |
+| 6 | gate3 policy 骨架（含 subject 交叉驗證＋mismatch／transient 錯誤分類） | 0.2 | B6a |
+| 6b | Gate 3 pending 終態封閉（三入口 State==Pending＋Expired＋terminal cause 投影＋gateDecide 接線） | 0.35 | B6a |
+| 7 | wsregistry 1:1 雙向基數（跨 WSID 掃描＋partial-pair＋persistOrRollback failure matrix） | 0.2 | B6b |
+| 8 | FreezeTurns＋兩種 admission 檢查 | 0.15 | B6b |
+| 9 | approval freeze 旗標＋雙鎖設定端（含鎖不洩漏測試） | 0.2 | B6b |
+| 10 | 全套驗證＋驗收對照（各拆票收尾各半） | 0.1 | B6a/B6b |
+| **合計** | | **2.05** | B6a **1.45**／B6b **0.6** |
+
+**拆票提議（rev3——逾 2.0 pt 依規則必拆）**：**B6a**＝gate 單一寫入者＋Gate 3 policy／manifest（Task 1-6b）；**B6b**＝綁定持久化＋freeze latch seams（Task 7-9）。兩票獨立可驗收（B6a 不依賴 B6b；B6b 僅依賴 B5 spec），執行順序 B6a→B6b。本 plan 文件同時承載兩票，任務歸屬如上表；backlog 票面拆分請 owner 於 gate 裁決後落 backlog 修訂。
 
 ## Global Constraints
 
@@ -477,63 +479,61 @@ git commit -m "feat(app): B6 Task 3——gate 讀取路徑 detect-only 遷移；
 
 ---
 
-### Task 3b: gate Submit writer seam（rev2 補——三送核路徑入 workflowMu）
+### Task 3b: gate Submit writer seam（rev2 補；rev3 修——**唯一** Submit 呼叫點在 submitGateRequest wrapper 內）
 
 **Files:**
-- Modify: `app.go`——`submitGateRequest()`（gate1 送核）、`submitPlanForApproval()`、`submitTestContract()` 中呼叫 `svc.Submit(...)` 的段落
+- Modify: `app.go`——`submitGateRequest()`（**production 唯一的 `svc.Submit` 呼叫點**；gate1／gate2／TCA 三條送核路徑都先進這個 wrapper——rev2「三個呼叫點原地替換」判讀錯誤，照做會繞過 wrapper 的 missing-binding escalation 建立／解除契約）
 - Test: `app_gate_test.go`（追加）
 
 **Interfaces:**
-- Consumes: 既有 `svc.Submit(gateName, subject string, bindings []Binding) (string, error)`；既有 hook `onWorkflowMuAttempt`／`onWorkflowMuAcquired`（app.go:608-610）。
-- Produces: `func (a *App) gateSubmitLocked(gateName, subject string, bindings []gate.Binding) (string, error)`——取 `workflowMu` 後呼叫 `svc.Submit`（B5 §3.2(0)：**任何** gate journal append 都必須持 workflowMu，Submit 的 request append 也是 append）。三條送核路徑（gate1／gate2／TCA）一律改經此 seam。
+- Consumes: 既有 `svc.Submit(gateName, subject string, bindings []Binding) (string, error)`；`submitGateRequest` 既有的 escalation 契約。
+- Produces: `submitGateRequest` 內的唯一 `svc.Submit` 呼叫收進 `workflowMu` 臨界區（B5 §3.2(0)：任何 gate journal append 持鎖）；**三個既有 caller 完全不動**，escalation 建立／解除契約原樣保留。
 
-- [ ] **Step 1: 寫 failing test（三種 gate 的 Submit 都在 workflowMu 下）**
+- [ ] **Step 1: 寫 failing barrier test（證明 append 真的被 mutex 阻擋——計數式 hook 只證明 hook 被呼叫，rev3 改 barrier）**
 
 ```go
-func TestGateSubmitPathsHoldWorkflowMu(t *testing.T) {
+func TestGateSubmitBlockedByWorkflowMu(t *testing.T) {
 	a := newGateTestApp(t)
-	var acquired int
-	a.onWorkflowMuAcquired = func() { acquired++ }
-	submitGate1(t, a) // 沿既有測試的 gate1 送核 helper（TestGateLiveLoop 已有同型流程）
-	if acquired == 0 {
-		t.Fatal("gate1 Submit 應取 workflowMu（B5 §3.2(0) 任何 append 持鎖）")
+	before := gateOpsCount(t, a)
+	a.workflowMu.Lock() // 測試預先持鎖（barrier）
+	done := make(chan error, 1)
+	go func() { done <- submitGate1Err(t, a) }() // 沿既有 gate1 送核 helper，回傳 error 版本
+	// 持鎖期間：送核 goroutine 不得產生任何新 gate op
+	time.Sleep(50 * time.Millisecond) // 給 goroutine 走到取鎖點（僅此用途；非結果斷言的等待）
+	if got := gateOpsCount(t, a); got != before {
+		a.workflowMu.Unlock()
+		t.Fatalf("workflowMu 持有期間 Submit 不得 append：ops %d→%d", before, got)
 	}
-	// gate2 與 TCA 路徑各自斷言 acquired 遞增——沿既有 submit→approve 流程
-	// helper 逐一觸發 SubmitPlanForApproval／SubmitTestContract，斷言計數增加。
+	a.workflowMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := gateOpsCount(t, a); got == before {
+		t.Fatal("釋放後 Submit 應完成 append")
+	}
 }
 ```
 
-（hook 已存在於 App struct，app.go:608-610——若現行 hook 只在 gateDecide 路徑觸發，本 task 將 hook 呼叫統一收進 seam 的取鎖處。）
+（`gateOpsCount` 讀取需經 `a.gateJournal.Ops()`——本測試中在持 workflowMu 下讀取安全：journal 有自己的 mu，且 Submit 被擋在 workflowMu 外。）
 
-- [ ] **Step 2: 跑 `go test -race -run TestGateSubmitPathsHoldWorkflowMu -count=1 .`，預期 FAIL**
-- [ ] **Step 3: 實作 seam 並遷移三條路徑**
+- [ ] **Step 2: 跑 `go test -race -run TestGateSubmitBlockedByWorkflowMu -count=1 .`，預期 FAIL（現行 Submit 不取 workflowMu，持鎖期間 append 照樣發生）**
+- [ ] **Step 3: 實作——只改 `submitGateRequest` 內的唯一呼叫點**
+
+於 `submitGateRequest` 中包住既有 `svc.Submit` 呼叫（escalation 建立／解除契約行不動、僅 Submit 行納入臨界區）：
 
 ```go
-// gateSubmitLocked：gate journal 的 Submit writer seam（B5 spec §3.2(0)）——
-// 單一寫入者不變式涵蓋「任何 append」：request append 與 transition append
-// 同等待遇。三條送核路徑（gate1 submitGateRequest、gate2
-// submitPlanForApproval、TCA submitTestContract）一律經此取 workflowMu。
-// 已持 workflowMu 的呼叫者不得重入（沿 esc*Locked 重入規約）。
-func (a *App) gateSubmitLocked(gateName, subject string, bindings []gate.Binding) (string, error) {
-	if a.onWorkflowMuAttempt != nil {
-		a.onWorkflowMuAttempt()
-	}
+	// B5 spec §3.2(0)：Submit 的 request append 也是 gate journal append——
+	// 單一寫入者不變式涵蓋任何 append。三條送核路徑（gate1/gate2/TCA）
+	// 都經本 wrapper，此處是唯一 Submit 呼叫點；missing-binding escalation
+	// 契約在鎖外原樣保留。
 	a.workflowMu.Lock()
-	defer a.workflowMu.Unlock()
-	if a.onWorkflowMuAcquired != nil {
-		a.onWorkflowMuAcquired()
-	}
-	svc, err := a.ensureGate()
-	if err != nil {
-		return "", err
-	}
-	return svc.Submit(gateName, subject, bindings)
-}
+	id, err := svc.Submit(gateName, subject, bindings)
+	a.workflowMu.Unlock()
 ```
 
-三個呼叫點的 `svc.Submit(...)` 原地替換為 `a.gateSubmitLocked(...)`；替換前逐點確認該路徑當下未持 workflowMu（`submitPlanForApproval` 的 escalation 分支在 Submit **之後**才取鎖，app.go:5051——確認 Submit 移入鎖內後與該分支無重入；若有，重排為單一臨界區）。
+（實作前確認 `submitGateRequest` 當下不持 workflowMu、且 Submit 前後的 escalation 邏輯與鎖無重入——`submitPlanForApproval` 的 escalation 分支在 wrapper 返回後才取鎖，app.go:5051，無巢狀。）
 
-- [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race -count=1 .` 全綠（送核相關既有測試零回歸）**
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race -count=1 .` 全綠（三條送核路徑與 escalation 既有測試零回歸）**
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1303,16 +1303,18 @@ git commit -m "feat(gatepolicy): B6 Task 6——gate3_promotion policy 骨架與
 ### Task 6b: Gate 3 pending 終態 seam（rev2 補——B5 §4.3 expired transition）
 
 **Files:**
-- Modify: `internal/gate/types.go`（State 常數）、`internal/gate/service.go`（`ExpirePending`）、`internal/gate/project.go`（expired 投影）
-- Modify: `app.go`——`gateDecide`（app.go:5805-5855）錯誤分支
+- Modify: `internal/gate/types.go`（State 常數＋`GateEntry.TerminalCause`）、`internal/gate/service.go`（`ExpirePending`＋`PrepareDecision`／`CommitDecision` 的 State 判定）、`internal/gate/project.go`（expired 投影＋terminal cause）
+- Modify: `app.go`——`gateDecide`（app.go:5805-5855）錯誤分支；`GateEntryDTO`＋`gateEntriesToDTO`（Task 3 產物）補 `TerminalCause` 欄位映射
 - Test: `internal/gate/service_test.go`、`app_gate_test.go`（追加）
 
 **Interfaces:**
 - Consumes: Task 6 的 `gatepolicy.ErrGate3Mismatch`；既有 `Transition`／`findEntry`／`appendOp`。
 - Produces:
   - `gate.Expired State = "expired"`（終態；僅 pending 可轉入）。
-  - `func (s *Service) ExpirePending(approvalID, cause string) error`——驗證 entry 為 pending 後 append `Transition{To: "expired", Cause}`；非 pending 回 `ErrNotPending`。
-  - `gateDecide` 錯誤分支：`errors.Is(err, gatepolicy.ErrGate3Mismatch)` → 同一 workflowMu 臨界區內 `svc.ExpirePending(id, err.Error())`，回傳具名錯誤（「request 已轉 expired，需重新送核」）；transient error 原樣回傳、request 維持 pending。
+  - **三入口同步封閉（rev3——只改 ExpirePending 不夠：`e.Record != nil || e.Request == nil` 的形狀檢查對 expired entry 仍判 pending，expired 後仍可 Prepare／Commit、重複 expire 仍 append）**：`ExpirePending`、`PrepareDecision`、`CommitDecision` 三者的 pending 判定一律改為**明確要求 `e.State == Pending`**（原形狀檢查保留為輔）。
+  - `func (s *Service) ExpirePending(approvalID, cause string) error`——`State == Pending` 才 append `Transition{To: "expired", Cause}`；否則回 `ErrNotPending`（含已 expired——重複 expire 不新增 record）。
+  - **Terminal cause 投影（rev3 P2）**：`GateEntry` 增 `TerminalCause string`——projection 於 transition 使 entry 進入非 Active 終態（expired／stale／superseded）時記下該 transition 的 `Cause`（最新者為準）；`GateEntryDTO` 同步增欄位。C1c 的失效原因呈現自此有 durable 出口，不依賴當次 Wails error。
+  - `gateDecide` 錯誤分支：`errors.Is(err, gatepolicy.ErrGate3Mismatch)` → 同一 workflowMu 臨界區內 `svc.ExpirePending(approvalID, err.Error())`，回傳具名錯誤；transient error 原樣回傳、request 維持 pending。
 
 - [ ] **Step 1: 寫 failing tests（gate 層）**
 
@@ -1330,9 +1332,22 @@ func TestExpirePending(t *testing.T) {
 	if st := stateOf(entries, id); st != Expired {
 		t.Fatalf("pending 應轉 expired, got %s", st)
 	}
-	// 終態：不可再決議
-	if err := s.Decide(id, "approved", "", Approver{ID: "o", Method: "ui"}, DecisionInput{}); err == nil {
-		t.Fatal("expired request 不可決議")
+	// 終態封閉（rev3）：expired 後 Prepare 與 Commit 均回 ErrNotPending
+	if _, err := s.PrepareDecision(id, "approved", "", Approver{ID: "o", Method: "ui"}, DecisionInput{}); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("expired 後 Prepare 應回 ErrNotPending, got %v", err)
+	}
+	// 重複 expire：回 ErrNotPending 且不新增 journal record
+	opsBefore := len(s.opsForTest())
+	if err := s.ExpirePending(id, "again"); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("重複 expire 應回 ErrNotPending, got %v", err)
+	}
+	if len(s.opsForTest()) != opsBefore {
+		t.Fatal("重複 expire 不得 append")
+	}
+	// terminal cause 投影（rev3 P2）：重新投影後 cause 仍在
+	entries2, _ := s.ListDetectOnly()
+	if c := terminalCauseOf(entries2, id); c != "reverify mismatch" {
+		t.Fatalf("TerminalCause 應為 expire cause, got %q", c)
 	}
 	// 非 pending（已決議者）不可 expire
 	id2 := submitAndApprove(t, s)
@@ -1340,16 +1355,36 @@ func TestExpirePending(t *testing.T) {
 		t.Fatalf("active record 應回 ErrNotPending, got %v", err)
 	}
 }
+
+func TestCommitDecisionFailsAfterExpire(t *testing.T) {
+	// prepared decision 在 Commit 前被 expire → Commit 必須失敗（rev3）
+	s, _ := newTestService(t)
+	id, err := s.Submit("gate1", "spec", validGate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := s.PrepareDecision(id, "approved", "", Approver{ID: "o", Method: "ui"}, DecisionInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpirePending(id, "raced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitDecision(prepared); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("expire 後 Commit 應回 ErrNotPending, got %v", err)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑 `go test -race ./internal/gate/ -run ExpirePending -count=1`，預期 FAIL**
 - [ ] **Step 3: 實作 gate 層**
 
-types.go 加 `Expired State = "expired"`；project.go 的 transition 套用邏輯補 expired 分支（先讀現行 transition 處理——pending entry 收到 `To: "expired"` transition → State=Expired、終態不再變化；若現行 Project 對 pending 的 transition 一律忽略，補「expired 專屬」分支並在測試固定既有行為不變）；service.go：
+types.go 加 `Expired State = "expired"`；`GateEntry` 增 `TerminalCause string`。project.go：(a) transition 套用邏輯補 expired 分支（pending entry 收到 `To: "expired"` transition → State=Expired、終態不再變化；先讀現行 transition 處理並以測試固定既有行為不變）；(b) entry 進入非 Active 終態（expired／stale／superseded）的 transition，其 `Cause` 寫入 `TerminalCause`（多次以最新為準）。service.go——**三入口同步改 State 判定（rev3）**：
 
 ```go
-// ExpirePending：pending request 轉 expired 終態（B5 spec §4.3——決議時
-// 重驗 mismatch 的 pending 不得永久留 pending）。僅 pending 可轉入；
+// ExpirePending：pending request 轉 expired 終態（B5 spec §4.3）。
+// rev3：pending 判定必須看 State——expired entry 的 Record/Request 形狀
+// 與 pending 相同，僅形狀檢查會讓 expired 再被 expire／Prepare／Commit。
 // 呼叫端（gateDecide）持 workflowMu——本方法的 append 屬單一寫入者路徑。
 func (s *Service) ExpirePending(approvalID, cause string) error {
 	s.mu.Lock()
@@ -1359,13 +1394,15 @@ func (s *Service) ExpirePending(approvalID, cause string) error {
 		return err
 	}
 	e := findEntry(entries, approvalID)
-	if e == nil || e.Record != nil || e.Request == nil {
+	if e == nil || e.State != Pending || e.Record != nil || e.Request == nil {
 		return ErrNotPending
 	}
 	return s.appendOp(Transition{Type: "transition", ApprovalID: approvalID,
 		To: string(Expired), At: s.now(), Cause: cause})
 }
 ```
+
+`PrepareDecision` 與 `CommitDecision` 的既有 pending 檢查（`e == nil || e.Record != nil || e.Request == nil`，service.go:143-146 同型兩處）同步加上 `|| e.State != Pending`——CommitDecision 每次重新 Project（service.go:139），故「Prepare 後被 expire、Commit 前」的競態由此攔截（TestCommitDecisionFailsAfterExpire 固定此行為）。
 
 - [ ] **Step 4: 跑 Step 2 指令預期 PASS**
 - [ ] **Step 5: 寫 failing test（app 層 gateDecide 接線）**
@@ -1382,7 +1419,9 @@ func TestGateDecideGate3MismatchExpiresPending(t *testing.T) {
 		VerifyProvenance: func(id, d, h string) error { return nil },
 	})
 	id := submitGate3Request(t, a) // 以形狀合法的六 binding 直接經 svc.Submit 造 pending
-	err := a.gateDecide(id, "approved", "", testApprover())
+	// rev3：gateDecide 實際簽章第四參數為 []gate.RiskSelection（gate3 無
+	// risk 選擇→nil）；approver 由 git identity 於內部取得，非參數。
+	err := a.gateDecide(id, "approved", "", nil)
 	if err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("mismatch 應轉終態並回具名錯誤：%v", err)
 	}
@@ -1394,20 +1433,28 @@ func TestGateDecideGate3MismatchExpiresPending(t *testing.T) {
 		VerifyProvenance: func(id, d, h string) error { return nil },
 	})
 	id2 := submitGate3Request(t, a)
-	if err := a.gateDecide(id2, "approved", "", testApprover()); err == nil {
+	if err := a.gateDecide(id2, "approved", "", nil); err == nil {
 		t.Fatal("transient 應回錯")
 	}
 	assertGateState(t, a, id2, "pending")
 }
 ```
 
+（`gateDecide` 簽章以 production 為準——實作 Step 前先讀 app.go:5805 實名與參數序，測試呼叫逐字對齊；上例以第二輪 gate 指認的 `[]gate.RiskSelection` 第四參數書寫。）
+
+```go
+```
+
 - [ ] **Step 6: 實作 gateDecide 錯誤分支（PrepareDecision 回錯處，仍在 workflowMu 內）**
 
 ```go
-	prepared, err := svc.PrepareDecision(id, decision, reason, approver, input)
+	// 變數名依 gateDecide 現行本體逐字對齊（approvalID／decision／reason 與
+	// PrepareDecision 呼叫處的實參名，app.go:5826 附近）——以下以現行
+	// prepared, err := svc.PrepareDecision(...) 行為錨點，僅插入錯誤分支：
+	prepared, err := svc.PrepareDecision(approvalID, decision, reason, approver, input)
 	if err != nil {
 		if errors.Is(err, gatepolicy.ErrGate3Mismatch) {
-			if xerr := svc.ExpirePending(id, err.Error()); xerr != nil {
+			if xerr := svc.ExpirePending(approvalID, err.Error()); xerr != nil {
 				return fmt.Errorf("gate3 重驗不符且轉終態失敗（journal 收斂交 repair）：%w", errors.Join(err, xerr))
 			}
 			return fmt.Errorf("gate3 重驗不符，request 已轉 expired，需重新送核：%w", err)
@@ -1537,36 +1584,53 @@ func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// （伪码層級的骨架——entry 取得／迭代與 persist 呼叫沿 mutate 現行
-	// 實作逐字對齊；以下分支語意為凍結內容）
-	target, ok := s.entryLocked(wsid)
+	// rev3：durable 契約沿 mutate（store.go:359-373）逐字展開——所有欄位
+	// mutation 必須走 persistOrRollback（store.go:262-284）：rename 前失敗
+	// → 記憶體回滾 old；directory sync 後不確定 → ErrRegistryUncertain
+	// latch（不回滾）。entry 取得與集合迭代對齊 s.file 的實際欄位名。
+	old, ok := s.file.Entries[wsid] // 欄位存取形狀依 mutate 現行實作對齊
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrEntryNotFound, wsid)
 	}
-	if target.RemovedAt != "" {
+	if old.RemovedAt != "" {
 		return fmt.Errorf("%w: %q", ErrTombstoned, wsid)
 	}
-	if (target.TaskRunID == "") != (target.SnapshotDigest == "") {
+	if (old.TaskRunID == "") != (old.SnapshotDigest == "") {
 		return fmt.Errorf("wsregistry: %q 綁定欄位 partial pair（corruption），拒絕寫入", wsid)
 	}
-	if target.TaskRunID != "" {
-		if target.TaskRunID == taskRunID && target.SnapshotDigest == snapshotDigest {
-			return nil // 冪等（resume 回填）
+	if old.TaskRunID != "" {
+		if old.TaskRunID == taskRunID && old.SnapshotDigest == snapshotDigest {
+			return nil // 冪等（resume 回填）——零變更不觸發 persist
 		}
-		return fmt.Errorf("wsregistry: %q 已綁定 taskrun %s，拒絕重綁", wsid, target.TaskRunID)
+		return fmt.Errorf("wsregistry: %q 已綁定 taskrun %s，拒絕重綁", wsid, old.TaskRunID)
 	}
-	for _, e := range s.entriesLocked() {
-		if e.WSID != wsid && e.TaskRunID == taskRunID {
-			return fmt.Errorf("wsregistry: taskrun %s 已綁定於 %q（1:1 基數），拒絕", taskRunID, e.WSID)
+	for w, e := range s.file.Entries {
+		if w != wsid && e.TaskRunID == taskRunID {
+			return fmt.Errorf("wsregistry: taskrun %s 已綁定於 %q（1:1 基數），拒絕", taskRunID, w)
 		}
 	}
-	target.TaskRunID = taskRunID
-	target.SnapshotDigest = snapshotDigest
-	return s.persistTargetLocked(target) // 沿 mutate 的 persist 步驟
+	next := old
+	next.TaskRunID = taskRunID
+	next.SnapshotDigest = snapshotDigest
+	s.file.Entries[wsid] = next
+	return s.persistOrRollback(wsid, old) // 沿既有簽章：失敗回滾 old、uncertain 進 latch
 }
 ```
 
-註：`entryLocked`／`entriesLocked`／`persistTargetLocked` 為示意名——實作時直接沿 `mutate`（store.go:359-373）內部對 `s.file` 的實際存取與 `persistLocked` 呼叫展開，**不新增抽象**；分支語意（a)-(d) 與錯誤訊息為凍結內容，不得簡化。
+註：`s.file.Entries` 與 `persistOrRollback` 簽章以 store.go 現行為準逐字對齊（mutate 為唯一先例，**不新增抽象**）；分支語意（a)-(d) 與錯誤訊息為凍結內容。
+
+補 **failure matrix 測試**（rev3——成功 round-trip 不足以驗證 durable seam）：沿該包既有 persist 失敗測試的 `hook func(fsyncStep) error` 注入慣例（store.go:102-127），對 `SetTaskRunBinding` 加兩列：
+
+```go
+func TestSetTaskRunBindingPersistFailureMatrix(t *testing.T) {
+	// (1) rename 前失敗（temp write／file sync 注入錯誤）→ 記憶體回滾：
+	//     Get 回傳 old（無綁定欄位）、方法回錯、後續操作不受影響
+	// (2) directory sync 注入錯誤 → ErrRegistryUncertain latch：方法回
+	//     uncertain、Store.Uncertain() == true、後續 mutation 一律被 latch 擋
+	// 兩列皆沿既有 persist failure 測試的 hook 注入寫法（同檔既有案例為模板），
+	// 斷言形狀對齊 mutate 的既有 failure 測試。
+}
+```
 
 - [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race ./internal/wsregistry/ -count=1` 全包**
 - [ ] **Step 5: Commit**
@@ -1665,7 +1729,8 @@ func (m *Manager) FreezeTurns(w WSID, during func()) error {
 
 ```go
 	if sl.turnsFrozen {
-		return "", fmt.Errorf("appcore: session %q 已凍結（TaskRun STALE fail closed），拒絕新 turn", w)
+		// rev3：SubmissionID 為 struct 非 string——零值用 SubmissionID{}
+		return SubmissionID{}, fmt.Errorf("appcore: session %q 已凍結（TaskRun STALE fail closed），拒絕新 turn", w)
 	}
 ```
 
@@ -1774,7 +1839,7 @@ func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
 		defer a.apprMu.Unlock()
 		a.apprFrozen[w] = true
 		for id, p := range a.apprPending {
-			if p.wsid != string(w) { // 欄位名依 Step 1 確認結果對齊
+			if p.wsid != w { // rev3：wsid 已是 appcore.WSID，直接比較，不做 string 轉換
 				continue
 			}
 			drained = append(drained, p)
@@ -1795,20 +1860,51 @@ func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
 }
 ```
 
-`resolveApproval`（app.go:6783-6810）在 `apprMu` 臨界區內、**先處理 `!ok` 再檢查旗標**（rev2 修——rev1 在確認存在前讀 `p.wsid` 會對未知／逾時 approval 的 allow=true nil dereference）：
+`resolveApproval`（app.go:6783-6810）在 `apprMu` 臨界區內、**先處理 `!ok` 再檢查旗標**（rev2 修 nil dereference；**rev3 修鎖洩漏**——production 以手動 `Lock`／`Unlock` 管理 `apprMu`，早退分支必須先 `Unlock`，否則之後所有 approval 操作死鎖）：
 
 ```go
+	a.apprMu.Lock()
 	p, ok := a.apprPending[id]
 	if !ok {
-		// 沿既有 not-found 錯誤路徑（原碼行為不變）
-		return errNotFoundExisting
+		a.apprMu.Unlock() // rev3：手動鎖管理——早退必先解鎖
+		return errNotFoundExisting // 沿既有 not-found 錯誤路徑（原碼行為不變）
 	}
-	if allow && a.apprFrozen[appcore.WSID(p.wsid)] {
+	if allow && a.apprFrozen[p.wsid] { // rev3：p.wsid 已是 appcore.WSID，直接索引
+		a.apprMu.Unlock() // 早退解鎖；pending 保留在 map——同筆之後仍可 deny
 		return fmt.Errorf("approval %s：session 已凍結（fail closed），僅可 deny", id)
 	}
+	// ……以下沿既有流程（自 map 移除、unregister、Unlock、鎖外 p.resolve）……
 ```
 
-（檢查位置＝線性化點：`apprMu` 內、`p.resolve` 呼叫前——B5 §4.2(3)；`allow=false` 不檢查。）
+（檢查位置＝線性化點：`apprMu` 內、`p.resolve` 呼叫前——B5 §4.2(3)；`allow=false` 不檢查。frozen-allow 分支**不移除 pending**——同筆 deny 之後仍可完成。）
+
+補鎖不洩漏回歸測試：
+
+```go
+func TestFrozenAllowLeavesLockAndPendingUsable(t *testing.T) {
+	a := newApprovalTestApp(t)
+	w := startSessionWithPendingApproval(t, a, "appr-1")
+	a.workflowMu.Lock()
+	_ = a.freezeImplementationSession(w, "stale")
+	a.workflowMu.Unlock()
+	registerLatePending(t, a, w, "appr-x")
+	if err := a.resolveApprovalForTest("appr-x", true); err == nil {
+		t.Fatal("frozen allow 應拒絕")
+	}
+	// rev3：allow 失敗後——(1) 同筆 deny 仍可完成（pending 未被移除、鎖未洩漏）
+	if err := a.resolveApprovalForTest("appr-x", false); err != nil {
+		t.Fatalf("同筆 deny 應成功：%v", err)
+	}
+	// (2) 其他 approval 操作不卡死（apprMu 未洩漏）——not-found 路徑立即返回
+	done := make(chan struct{})
+	go func() { _ = a.resolveApprovalForTest("no-such", false); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("apprMu 疑似洩漏：後續 approval 操作卡死")
+	}
+}
+```
 
 - [ ] **Step 5: 跑 Step 3 指令預期 PASS；`go test -race -count=1 .` root 包全綠（特別確認既有 approval／remove 測試零回歸——`denyApprovalsForRemove` 不受影響：它走自己的 deny 路徑且 deny 永遠合法）**
 - [ ] **Step 6: Commit**
@@ -1844,6 +1940,13 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
+- rev3（2026-08-28，plan gate 第二輪 4 P1＋1 P2 收斂）：
+  - P1 Expired 未封閉：`ExpirePending`／`PrepareDecision`／`CommitDecision` 三入口 pending 判定同步加 `State == Pending`（形狀檢查對 expired entry 誤判 pending）；補三測試——expire 後 Prepare/Commit 回 ErrNotPending、prepared-then-expired 的 Commit 失敗、重複 expire 不 append。app 測試與插入片段依 production 簽章重寫（第四參數 `[]gate.RiskSelection`、變數名對齊現行本體）。
+  - P1 Submit call graph 誤判：production 唯一 `svc.Submit` 呼叫點在 `submitGateRequest` wrapper 內（三 caller 都經它）——rev2「三呼叫點替換」作廢，改只在 wrapper 內收鎖、caller 不動、escalation 契約保留；計數 hook 測試改 **barrier 測試**（預持 workflowMu 斷言無新 op、釋放後完成）。
+  - P1 freeze 鎖洩漏／型別：resolveApproval 手動鎖管理——兩個早退分支補 `Unlock`、frozen-allow 不移除 pending（同筆可再 deny）；`p.wsid` 直接比較（已是 appcore.WSID）；Task 8 回傳 `SubmissionID{}`；補「frozen allow 後同筆 deny 可完成＋其他 approval 不卡死」測試。
+  - P1 durable 契約：`SetTaskRunBinding` 改保留 old→寫 `s.file.Entries[wsid]`→`persistOrRollback(wsid, old)`（rename 前失敗回滾／dir-sync 不確定進 latch）；補 failure matrix 兩列測試（沿既有 hook 注入慣例）。
+  - P2 terminal cause 無出口：`GateEntry.TerminalCause`＋DTO 欄位＋projection 於終態 transition 記錄 cause；測試斷言重新投影後 cause 仍在。
+  - 估點重算 **2.05 pt**——逾 2.0 拆票線：提議拆 **B6a**（Task 1-6b，1.45 pt）／**B6b**（Task 7-9，0.6 pt），請 owner 裁決後落 backlog。
 - rev2（2026-08-28，plan gate 第一輪 8 P1 收斂）：
   - P1 Gate 3 application service 缺段：新增 `ErrGate3Mismatch` mismatch／transient 錯誤分類（Task 6）＋Task 6b（`gate.Expired` 終態、`ExpirePending`、gateDecide mismatch 分流——B5 §4.3 落地）；TaskRun domain 仍留 C1a。
   - P1 Submit 未持鎖：新增 Task 3b writer seam，gate1／gate2／TCA 三送核路徑入 workflowMu＋hook 測試。
