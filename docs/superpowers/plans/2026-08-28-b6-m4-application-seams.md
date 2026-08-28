@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev7（2026-08-28，plan gate 第六輪 1 P1 收斂——Gate 3 pending 的 ReconcileBindings 繞過路徑封閉：pending pseudo-record 回空、決議時重驗統一由 BuildDecision 承載）
-> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b）
+> 版本：rev8（2026-08-28，implementation follow-up erratum——Task 3b `TestGateSubmitHoldsWorkflowMu` 的單一 write-once-true 布林旗標鑑別力不足，改記錄兩次 probe 的完整序列並精確斷言 `[false true]`；production contract、scope、估點均未變）
+> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8 為 implementation follow-up 發現的測試鑑別力 erratum，未重開完整 plan gate——收緊測試以符合 rev7 已核准的不變量，非設計變更）
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
 **Goal:** 依 B5 spec 建立 M4 所需的 application seams——Forge port、Gate 3 policy 骨架與 manifest 收斂邏輯、gate 讀取路徑 detect-only 遷移、wsregistry 綁定欄位、freeze latch 機制——不含 TaskRun domain 本體（C1a）、GitHub adapter（C1b）、Gate 3 UI（C1c）。
@@ -492,9 +492,11 @@ git commit -m "feat(app): B6 Task 3——gate 讀取路徑 detect-only 遷移；
 - Consumes: 既有 `svc.Submit(gateName, subject string, bindings []Binding) (string, error)`；`submitGateRequest` 既有的 escalation 契約。
 - Produces: `submitGateRequest` 內的唯一 `svc.Submit` 呼叫收進 `workflowMu` 臨界區（B5 §3.2(0)：任何 gate journal append 持鎖）；**三個既有 caller 完全不動**，escalation 建立／解除契約原樣保留。
 
-- [ ] **Step 1: 寫 failing test（rev4 改**確定性 TryLock probe**——rev3 的 sleep barrier 在排程延遲超過 50ms 時，錯誤實作也會誤通過）**
+- [ ] **Step 1: 寫 failing test（rev4 改**確定性 TryLock probe**——rev3 的 sleep barrier 在排程延遲超過 50ms 時，錯誤實作也會誤通過；rev8 改**序列斷言**——見下方 erratum 說明）**
 
 以注入的 `GatePolicy` 在 `svc.Submit` 呼叫 `ValidateRequest` 時（必然位於 Submit 臨界區內）用 `workflowMu.TryLock()` 探測鎖是否已被持有——確定性、零 sleep，且不新增 backlog 禁止的 App ad-hoc test hook（probe 是測試注入的 policy，非 App aggregate 的 hook）：
+
+**rev8 erratum**：probe 實際會觸發兩次——第一次是 `submitGateRequest` 自己的 app 層 pre-validation（應在鎖外）、第二次是 `svc.Submit` 內部再驗同一 policy（應在鎖內）。若只用單一 write-once-true 布林旗標（rev4-rev7 版本）記錄「是否曾經有一次持鎖」，一個「鎖只加在第一次呼叫（app 層 pre-validation）、`svc.Submit` 本身無鎖」的錯誤實作會讓第一次探測就把旗標設為 true，第二次探測不會再清回 false，測試因而**誤通過**（見 Task 3b follow-up 報告 Mutation B 實測證據）。改記錄兩次 probe 的完整序列並精確斷言次數與順序，而非只看「曾經持鎖」：
 
 ```go
 // probePolicy：包裝實際 gate1 policy，僅在 ValidateRequest 時執行 probe。
@@ -513,22 +515,27 @@ func TestGateSubmitHoldsWorkflowMu(t *testing.T) {
 	if _, err := a.ensureGate(); err != nil {
 		t.Fatal(err)
 	}
-	var heldDuringSubmit bool
+	// heldSequence 依序記錄兩次 probe 的觀測：第一次＝submitGateRequest 自己
+	// 的 app 層 pre-validation（應在鎖外，false）；第二次＝svc.Submit 內部再
+	// 驗同一 policy（應在臨界區內，true）。單一布林值無法區分「只有第一次
+	// 持鎖」（錯誤實作）與「只有第二次持鎖」（正確實作）——必須斷言完整序列。
+	var heldSequence []bool
 	a.gateReg["gate1"] = probePolicy{GatePolicy: a.gateReg["gate1"], probe: func() {
-		if a.workflowMu.TryLock() { // 取得成功＝Submit 路徑沒持鎖（錯誤實作）
+		if a.workflowMu.TryLock() {
 			a.workflowMu.Unlock()
+			heldSequence = append(heldSequence, false)
 			return
 		}
-		heldDuringSubmit = true // TryLock 失敗＝鎖已被 Submit 路徑持有
+		heldSequence = append(heldSequence, true)
 	}}
 	submitGate1(t, a) // 沿既有 gate1 送核 helper
-	if !heldDuringSubmit {
-		t.Fatal("svc.Submit（ValidateRequest 時點）應持有 workflowMu（B5 §3.2(0)）")
+	if len(heldSequence) != 2 || heldSequence[0] || !heldSequence[1] {
+		t.Fatalf("workflowMu held-sequence across the two ValidateRequest probes = %v, want [false true]（B5 §3.2(0)）", heldSequence)
 	}
 }
 ```
 
-- [ ] **Step 2: 跑 `go test -race -run TestGateSubmitHoldsWorkflowMu -count=1 .`，預期 FAIL（現行 Submit 不取 workflowMu，TryLock 會成功）**
+- [ ] **Step 2: 跑 `go test -race -run TestGateSubmitHoldsWorkflowMu -count=1 .`，預期 FAIL（現行 Submit 不取 workflowMu，序列為 `[false false]`）**
 - [ ] **Step 3: 實作——只改 `submitGateRequest` 內的唯一呼叫點**
 
 於 `submitGateRequest` 中包住既有 `svc.Submit` 呼叫（escalation 建立／解除契約行不動、僅 Submit 行納入臨界區）：
@@ -2176,6 +2183,11 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
+- rev8（2026-08-28，**implementation follow-up erratum**——Task 3b 測試鑑別力缺口，**production contract、scope、估點均未變，未重開完整 plan gate**）：
+  - 背景：Task 3b（commit `4c62bc6`）把 `submitGateRequest` 內唯一的 `svc.Submit` 收進 `workflowMu` 臨界區；review 以 mutation 證實 **production 的鎖位置正確**（Mutation A：移除鎖→測試 FAIL；Mutation C：鎖過寬包住整個 wrapper→`-timeout` 揭露自我 deadlock），但**測試本身鑑別力不足**。
+  - 缺口：`TestGateSubmitHoldsWorkflowMu` 原本用單一 write-once-true 布林 `heldDuringSubmit` 記錄「探測期間是否曾經持鎖」。probe 實際觸發兩次——第一次是 `submitGateRequest` 自己的 app 層 pre-validation（應在鎖外）、第二次是 `svc.Submit` 內部再驗同一 policy（應在鎖內）。**Mutation B**（把鎖從 `svc.Submit` 移到 app 層 pre-validation、`svc.Submit` 本身無鎖）實測序列為 `[true false]`：第一次探測就把旗標設為 true，第二次不會清回 false，舊測試因而**誤通過**（PASS，本應 FAIL）——無法區分「只有 pre-validation 持鎖」的錯誤實作與「只有 `svc.Submit` 持鎖」的正確實作。
+  - 收斂：改記錄兩次 probe 的完整序列（`heldSequence []bool`），精確斷言呼叫次數恰為兩次、順序恰為 `[false true]`。Task 3b Step 1 虛擬碼同步更新（見上方程式碼區塊與 erratum 說明），避免留下已證實會誤通過的範本。三種情境驗證：正確實作（committed app.go）→ `[false true]` PASS；Mutation A（移除鎖）→ `[false false]` FAIL；Mutation B（鎖移到 pre-validation）→ `[true false]` FAIL。
+  - Scope 邊界：`app.go` 未改動（production contract 不變）；Submit 與 escalation 之間的既有窗口維持 deferred（不在本次修正範圍）；未重開完整 plan gate——這是收緊測試以符合 rev7 已核准的不變量，不是設計變更。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-3b-followup-report.md`。
 - rev7（2026-08-28，plan gate 第六輪 1 P1 收斂）：
   - P1（pending mismatch 繞過 expired）：production PrepareDecision 對 pending pseudo-record 先呼叫 ReconcileBindings、得 cause 即轉未包裝一般錯誤且不執行 BuildDecision（service.go:107）——C1a 若把 TaskRun STALE 接在 ReconcileBindings，sentinel 分支永不觸發、pending 永久滯留（違反 B5 §4.3）。凍結契約（採 gate 建議方案一）：`Gate3Policy.ReconcileBindings` 對 pending pseudo-record（`Decision == ""`）一律回空，pending 失效統一由 BuildDecision 決議時重驗＋mismatch sentinel 承載；已核可 record 才回 stale cause（C1a 接線點）。補 `TestGate3ReconcileBindingsPendingPseudoRecordEmpty` 單元測試＋Task 6b 契約備註（`TestGateDecideGate3MismatchExpiresPending` 即 pending＋TaskRun STALE→expired 的直接回歸；C1a 的 VerifyTaskRun 實作不得改走 ReconcileBindings pending 分支）。
 - rev6（2026-08-28，plan gate 第五輪 2 P1＋1 P2 收斂）：

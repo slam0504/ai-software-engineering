@@ -194,9 +194,14 @@ func (p probePolicy) ValidateRequest(req gate.GateRequest) error {
 // TestGateSubmitHoldsWorkflowMu：B6 Task 3b——svc.Submit 的 request append 也
 // 是 gate journal append，§3.2(0) 單一寫入者不變式要求任何 append 都持
 // workflowMu。用 workflowMu.TryLock() 做確定性探測（零 sleep）：probe 會在
-// submitGateRequest 鎖外的 pre-validation（TryLock 成功）與 svc.Submit 內部
-// 再驗一次（正確實作下鎖內、TryLock 失敗）各觸發一次；只要有一次 TryLock
-// 失敗即代表 Submit 路徑確實持鎖。
+// submitGateRequest 鎖外的 pre-validation（第一次）與 svc.Submit 內部再驗一次
+// 同一 policy（第二次）各觸發一次。
+//
+// Task 3b follow-up erratum：原本用單一 write-once-true 布林 heldDuringSubmit
+// 只要「曾經有一次持鎖」就通過，無法區分「只有第一次（pre-validation）持
+// 鎖、Submit 本身沒鎖」的錯誤實作與正確實作——兩者都會讓旗標變 true。改記錄
+// 完整序列並精確斷言次數與順序：第一次（app 層 pre-validation）不應持鎖、
+// 第二次（svc.Submit 內部再驗）應持鎖，序列須恰為 [false true]。
 func TestGateSubmitHoldsWorkflowMu(t *testing.T) {
 	a := newTestAppGit(t)
 	a.SpecWrite("spec/glossary.md", "term v1", "")
@@ -205,19 +210,25 @@ func TestGateSubmitHoldsWorkflowMu(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var heldDuringSubmit bool
+	// heldSequence 依序記錄兩次 probe 的觀測：
+	// 第一次＝submitGateRequest 自己的 app 層 pre-validation（應在鎖外，false）；
+	// 第二次＝svc.Submit 內部再驗同一 policy（應在新加的臨界區內，true）。
+	// 單一布林值無法區分「只有第一次持鎖」（錯誤實作）與「只有第二次持鎖」
+	// （正確實作）——必須斷言完整序列，見 Mutation B。
+	var heldSequence []bool
 	a.gateReg["gate1"] = probePolicy{GatePolicy: a.gateReg["gate1"], probe: func() {
-		if a.workflowMu.TryLock() { // 取得成功＝此次呼叫時點沒持鎖
+		if a.workflowMu.TryLock() {
 			a.workflowMu.Unlock()
+			heldSequence = append(heldSequence, false)
 			return
 		}
-		heldDuringSubmit = true // TryLock 失敗＝鎖已被 Submit 路徑持有
+		heldSequence = append(heldSequence, true)
 	}}
 
 	if _, err := a.SubmitForApproval(); err != nil {
 		t.Fatal(err)
 	}
-	if !heldDuringSubmit {
-		t.Fatal("svc.Submit（ValidateRequest 時點）應持有 workflowMu（B5 §3.2(0)）")
+	if len(heldSequence) != 2 || heldSequence[0] || !heldSequence[1] {
+		t.Fatalf("workflowMu held-sequence across the two ValidateRequest probes = %v, want [false true]（app 層 pre-validation 不應持鎖、svc.Submit 內部再驗時應持鎖，B5 §3.2(0)）", heldSequence)
 	}
 }
