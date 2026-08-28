@@ -2,6 +2,7 @@ package gate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -501,5 +502,65 @@ func TestStalePendingApproveFailsRejectSucceeds(t *testing.T) {
 	}
 	if _, err := s.PrepareDecision(id, "rejected", "已過期", approver(), DecisionInput{}); err != nil {
 		t.Fatalf("reject on stale pending must still succeed: %v", err) // rejected 免驗證
+	}
+}
+
+// submitAndApprove submits and approves a gate1 request matching the fixed
+// current-manifest digest (hex64), returning its approval id. For use with
+// services built via newTestServiceWithCurrent/newTestService.
+func submitAndApprove(t *testing.T, s *Service) string {
+	t.Helper()
+	id, err := s.Submit("gate1", "workspace", gate1Bindings())
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if err := s.Decide(id, "approved", "", approver(), DecisionInput{}); err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	return id
+}
+
+// setCurrent rebuilds gate1's policy with a new current-manifest reader
+// (white-box: in-package test rewrites the registry entry directly).
+func setCurrent(s *Service, fn ManifestFn) {
+	s.reg["gate1"] = NewGate1Policy(fn)
+}
+
+func TestListDetectOnlyShowsStaleWithoutAppend(t *testing.T) {
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
+	id := submitAndApprove(t, s)
+	// 讓 current 改變 → Active record 的 binding 與現值不符
+	setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
+
+	before := len(s.opsForTest())
+	entries, err := s.ListDetectOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stateOf(entries, id); got != Stale {
+		t.Fatalf("detect-only 應呈現 Stale, got %s", got)
+	}
+	if after := len(s.opsForTest()); after != before {
+		t.Fatalf("detect-only 不得 append：ops %d→%d", before, after)
+	}
+	// 對照組：List() 會落 durable transition
+	if _, err := s.List(); err != nil {
+		t.Fatal(err)
+	}
+	if after := len(s.opsForTest()); after == before {
+		t.Fatal("List() 應 append stale transition")
+	}
+}
+
+func TestListDetectOnlyUnknownGateFailsClosed(t *testing.T) {
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
+	_ = submitAndApprove(t, s)
+	delete(s.reg, "gate1") // white-box：模擬 record 的 gate 不在 registry
+	before := len(s.opsForTest())
+	if _, err := s.ListDetectOnly(); err == nil || !errors.Is(err, ErrUnknownGate) {
+		t.Fatalf("unknown gate 應回 ErrUnknownGate, got %v", err)
+	}
+	if len(s.opsForTest()) != before {
+		t.Fatal("回錯時 journal 不得增長")
 	}
 }

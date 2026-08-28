@@ -195,6 +195,40 @@ func (s *Service) List() ([]GateEntry, error) {
 	return Project(s.j.Ops())
 }
 
+// ListDetectOnly 回傳與「Reconcile 後 Project」等值的投影，但不 append
+// journal（B5 spec §3.2(0)：gate journal 單一寫入者——durable stale
+// transition 只准持 workflowMu 的寫入路徑落盤；純讀取入口一律走本方法）。
+// policy 檢查與 Reconcile 相同：Active record 經 ReconcileBindings 有
+// cause 即以 Stale 呈現；current-read 錯誤 fail closed 回傳 error。
+func (s *Service) ListDetectOnly() ([]GateEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := Project(s.j.Ops())
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.State != Active || e.Record == nil {
+			continue
+		}
+		pol, ok := s.reg[e.Record.Gate]
+		if !ok {
+			return nil, fmt.Errorf("%w %q", ErrUnknownGate, e.Record.Gate) // 沿 Reconcile fail closed（rev2 修——continue 會 fail open 呈現 Active）
+		}
+		causes, err := pol.ReconcileBindings(*e.Record)
+		if err != nil {
+			return nil, err // fail closed，沿 Reconcile
+		}
+		if len(causes) > 0 {
+			e.State = Stale
+			// TerminalCause 欄位由 Task 6b 引入後，此處同步補
+			// e.TerminalCause = causes[0].Cause（等值契約，見 Task 6b）
+		}
+	}
+	return entries, nil
+}
+
 // Lookup returns the (possibly nil, if still pending) record and current
 // state for approvalID. Used by the TCA gate2_approval resolver to look up
 // an approval by id without pulling the whole projection.
