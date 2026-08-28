@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/slam0504/sdlc-workbench/internal/gate"
 )
 
 // ---- Gate 1 live-loop 測試基盤（temp git workspace）----
@@ -174,5 +176,48 @@ func TestGateDecideRejectsWithoutGitIdentity(t *testing.T) {
 	id, _ := a.SubmitForApproval()
 	if err := a.GateDecide(id, "approved", "", nil); err == nil {
 		t.Fatal("missing git identity must reject approval")
+	}
+}
+
+// probePolicy：包裝實際 gate policy，僅在 ValidateRequest 時執行 probe——測試
+// 注入的 policy，不是 App aggregate 的 ad-hoc test hook（B6 Task 3b 施工約束）。
+type probePolicy struct {
+	gate.GatePolicy
+	probe func()
+}
+
+func (p probePolicy) ValidateRequest(req gate.GateRequest) error {
+	p.probe()
+	return p.GatePolicy.ValidateRequest(req)
+}
+
+// TestGateSubmitHoldsWorkflowMu：B6 Task 3b——svc.Submit 的 request append 也
+// 是 gate journal append，§3.2(0) 單一寫入者不變式要求任何 append 都持
+// workflowMu。用 workflowMu.TryLock() 做確定性探測（零 sleep）：probe 會在
+// submitGateRequest 鎖外的 pre-validation（TryLock 成功）與 svc.Submit 內部
+// 再驗一次（正確實作下鎖內、TryLock 失敗）各觸發一次；只要有一次 TryLock
+// 失敗即代表 Submit 路徑確實持鎖。
+func TestGateSubmitHoldsWorkflowMu(t *testing.T) {
+	a := newTestAppGit(t)
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+
+	var heldDuringSubmit bool
+	a.gateReg["gate1"] = probePolicy{GatePolicy: a.gateReg["gate1"], probe: func() {
+		if a.workflowMu.TryLock() { // 取得成功＝此次呼叫時點沒持鎖
+			a.workflowMu.Unlock()
+			return
+		}
+		heldDuringSubmit = true // TryLock 失敗＝鎖已被 Submit 路徑持有
+	}}
+
+	if _, err := a.SubmitForApproval(); err != nil {
+		t.Fatal(err)
+	}
+	if !heldDuringSubmit {
+		t.Fatal("svc.Submit（ValidateRequest 時點）應持有 workflowMu（B5 §3.2(0)）")
 	}
 }

@@ -6109,7 +6109,13 @@ func (a *App) submitGateRequest(svc *gate.Service, gateName, subject string, bin
 			return "", verr
 		}
 	}
+	// B5 spec §3.2(0)：Submit 的 request append 也是 gate journal append——
+	// 單一寫入者不變式涵蓋任何 append。三條送核路徑（gate1/gate2/TCA）都經
+	// 本 wrapper，此處是唯一 Submit 呼叫點；missing-binding escalation 契約
+	// 在鎖外原樣保留。
+	a.workflowMu.Lock()
 	id, err := svc.Submit(gateName, subject, bindings)
+	a.workflowMu.Unlock()
 	if err != nil {
 		return "", err
 	}
