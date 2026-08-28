@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev6（2026-08-28，plan gate 第五輪 2 P1＋1 P2 收斂——detect-only 投影 TerminalCause 等值、helper 對齊既有簽名、Rejected precedence 斷言）
+> 版本：rev7（2026-08-28，plan gate 第六輪 1 P1 收斂——Gate 3 pending 的 ReconcileBindings 繞過路徑封閉：pending pseudo-record 回空、決議時重驗統一由 BuildDecision 承載）
 > 狀態：**待 plan gate**
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
@@ -1157,6 +1157,20 @@ func TestGate3BuildDecisionRejectedSkipsReverify(t *testing.T) {
 	}
 }
 
+func TestGate3ReconcileBindingsPendingPseudoRecordEmpty(t *testing.T) {
+	// rev7（plan gate 第六輪 P1）：pending pseudo-record 必須回空——
+	// PrepareDecision 的前置檢查會把 cause 轉成未包裝一般錯誤並跳過
+	// BuildDecision（service.go:107），pending 會繞過 expired 永久滯留。
+	p := NewGate3Policy(Gate3Deps{})
+	causes, err := p.ReconcileBindings(gate.ApprovalRecord{
+		Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+		Decision: "", // pending pseudo-record 形狀
+	})
+	if err != nil || len(causes) != 0 {
+		t.Fatalf("pending pseudo-record 必須回 (nil, nil)：causes=%v err=%v", causes, err)
+	}
+}
+
 func TestGate3NilDepsFailClosed(t *testing.T) {
 	p := NewGate3Policy(Gate3Deps{})
 	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
@@ -1286,11 +1300,23 @@ func (p *Gate3Policy) SupersessionKey(gateName, subject string) string {
 	return gateName + "\x00" + subject
 }
 
-// ReconcileBindings：Gate 3 record 的 staleness 由 TaskRun currentness 承載
-//（B5 §4.3 決議時重驗為主）；骨架期回空——C1a 接 TaskRun reader 後補
-// taskrun STALE → gate3 record stale 的對應。
-func (p *Gate3Policy) ReconcileBindings(_ gate.ApprovalRecord) ([]gate.StaleCause, error) {
-	return nil, nil
+// ReconcileBindings——**契約凍結（rev7，plan gate 第六輪 P1）**：
+//
+// production PrepareDecision 會先以 pending request 建 pseudo-record 呼叫
+// 本方法做 staleness 前置檢查；一旦回傳 cause，會被轉成**未包裝**一般
+// 錯誤並直接返回，BuildDecision 不執行（service.go:107）。若 pending 的
+// TaskRun STALE 判定接在這裡，gateDecide 的 errors.Is(ErrGate3Mismatch)
+// 分支永遠不會觸發——pending 永久滯留，違反 B5 §4.3。因此凍結：
+//   - pending pseudo-record（rec.Decision == ""）**一律回空**——pending
+//     Gate 3 的失效只走決議時重驗（BuildDecision → mismatch sentinel →
+//     gateDecide ExpirePending；owner 裁決 6c 決議時重驗、不輪詢）。
+//   - 已核可 record（rec.Decision == "approved"）才回 stale cause——C1a
+//     接 TaskRun reader 後補「TaskRun STALE → gate3 record stale」；骨架期回空。
+func (p *Gate3Policy) ReconcileBindings(rec gate.ApprovalRecord) ([]gate.StaleCause, error) {
+	if rec.Decision == "" {
+		return nil, nil // pending：決議時重驗承載，不得在此回 cause
+	}
+	return nil, nil // approved record：C1a 接線；骨架期回空
 }
 ```
 
@@ -1632,6 +1658,8 @@ func TestGateDecideGate3MismatchExpiresPending(t *testing.T) {
 ```
 
 （`gateDecide` 簽章以 production 為準——實作 Step 前先讀 app.go:5805 實名與參數序，測試呼叫逐字對齊；上例以第二輪 gate 指認的 `[]gate.RiskSelection` 第四參數書寫。）
+
+**rev7 契約備註**：本測試即「pending Gate 3＋TaskRun STALE → request 轉 expired」的直接回歸——TaskRun STALE 在決議時經 `VerifyTaskRun` 以 mismatch sentinel 呈現（Task 6 的 ReconcileBindings pending 契約保證此路徑不被 PrepareDecision 前置檢查繞過）；C1a 接線時 `VerifyTaskRun` 的實作即「讀 TaskRun journal 判 STALE→回 `ErrGate3Mismatch` 包裝錯誤」，不得改走 ReconcileBindings pending 分支。
 
 ```go
 ```
@@ -2148,6 +2176,8 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
+- rev7（2026-08-28，plan gate 第六輪 1 P1 收斂）：
+  - P1（pending mismatch 繞過 expired）：production PrepareDecision 對 pending pseudo-record 先呼叫 ReconcileBindings、得 cause 即轉未包裝一般錯誤且不執行 BuildDecision（service.go:107）——C1a 若把 TaskRun STALE 接在 ReconcileBindings，sentinel 分支永不觸發、pending 永久滯留（違反 B5 §4.3）。凍結契約（採 gate 建議方案一）：`Gate3Policy.ReconcileBindings` 對 pending pseudo-record（`Decision == ""`）一律回空，pending 失效統一由 BuildDecision 決議時重驗＋mismatch sentinel 承載；已核可 record 才回 stale cause（C1a 接線點）。補 `TestGate3ReconcileBindingsPendingPseudoRecordEmpty` 單元測試＋Task 6b 契約備註（`TestGateDecideGate3MismatchExpiresPending` 即 pending＋TaskRun STALE→expired 的直接回歸；C1a 的 VerifyTaskRun 實作不得改走 ReconcileBindings pending 分支）。
 - rev6（2026-08-28，plan gate 第五輪 2 P1＋1 P2 收斂）：
   - P1 detect-only 等值缺口：Task 6b 明列同步修改 `ListDetectOnly`——stale 判定同時投影 `TerminalCause = causes[0].Cause`（durable Reconcile 寫 transition 後 Project 會投影 cause，service.go:237；只設 State 會與 durable 路徑不等值、失去 B5 §4.3 失效原因）；補 `TestListDetectOnlyMatchesDurableReconcile` 等值測試（state＋cause 與隨後 List() 相等、detect-only 前後 journal 不增長）。
   - P1 helper 編譯：`hex64("a")`／`hex64("b")` 全數改既有無參數 `hex64()`／`hex64b()`（project_test.go:67、service_test.go:133）；`validGate1Bindings()` 改既有 `gate1Bindings()`；補齊 `terminalCauseOf`／`journalTransitionCause` 具體實作（先前僅引用未定義）。
