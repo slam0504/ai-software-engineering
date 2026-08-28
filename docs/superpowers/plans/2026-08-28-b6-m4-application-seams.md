@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev5（2026-08-28，plan gate 第四輪 2 P1＋1 P2 收斂——TerminalCause 對齊 production precedence、aggregate 結案順序中立化）
+> 版本：rev6（2026-08-28，plan gate 第五輪 2 P1＋1 P2 收斂——detect-only 投影 TerminalCause 等值、helper 對齊既有簽名、Rejected precedence 斷言）
 > 狀態：**待 plan gate**
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
@@ -297,10 +297,10 @@ git commit -m "feat(forge): B6 Task 1——Forge port 型別、interface 與 fak
 
 ```go
 func TestListDetectOnlyShowsStaleWithoutAppend(t *testing.T) {
-	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64("a"), nil })
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
 	id := submitAndApprove(t, s) // 既有測試已有同型流程；若無此 helper，內聯 Submit+Decide 兩行
 	// 讓 current 改變 → Active record 的 binding 與現值不符
-	setCurrent(s, func() (string, error) { return "sha256:" + hex64("b"), nil })
+	setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
 
 	before := len(s.opsForTest())
 	entries, err := s.ListDetectOnly()
@@ -356,6 +356,8 @@ func (s *Service) ListDetectOnly() ([]GateEntry, error) {
 		}
 		if len(causes) > 0 {
 			e.State = Stale
+			// TerminalCause 欄位由 Task 6b 引入後，此處同步補
+			// e.TerminalCause = causes[0].Cause（等值契約，見 Task 6b）
 		}
 	}
 	return entries, nil
@@ -366,7 +368,7 @@ func (s *Service) ListDetectOnly() ([]GateEntry, error) {
 
 ```go
 func TestListDetectOnlyUnknownGateFailsClosed(t *testing.T) {
-	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64("a"), nil })
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
 	_ = submitAndApprove(t, s)
 	delete(s.reg, "gate1") // white-box：模擬 record 的 gate 不在 registry
 	before := len(s.opsForTest())
@@ -1331,7 +1333,7 @@ git commit -m "feat(gatepolicy): B6 Task 6——gate3_promotion policy 骨架與
 ```go
 func TestExpirePending(t *testing.T) {
 	s, _ := newTestService(t)
-	id, err := s.Submit("gate1", "spec", validGate1Bindings())
+	id, err := s.Submit("gate1", "spec", gate1Bindings())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1369,7 +1371,7 @@ func TestExpirePending(t *testing.T) {
 func TestCommitDecisionFailsAfterExpire(t *testing.T) {
 	// prepared decision 在 Commit 前被 expire → Commit 必須失敗（rev3）
 	s, _ := newTestService(t)
-	id, err := s.Submit("gate1", "spec", validGate1Bindings())
+	id, err := s.Submit("gate1", "spec", gate1Bindings())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1392,12 +1394,12 @@ func TestTerminalCauseProjection(t *testing.T) {
 	// record（helper journalTransitionCause：掃 opsForTest 解碼 transition、
 	// 取該 id 指定 To 的最新 Cause——自我一致，不猜 production 字串）。
 	newSvc := func(t *testing.T) *Service {
-		s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64("a"), nil })
+		s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
 		return s
 	}
 	t.Run("expired 後全忽略且 cause 不覆寫", func(t *testing.T) {
 		s := newSvc(t)
-		id, err := s.Submit("gate1", "spec", validGate1Bindings())
+		id, err := s.Submit("gate1", "spec", gate1Bindings())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1417,10 +1419,34 @@ func TestTerminalCauseProjection(t *testing.T) {
 			t.Fatalf("cause 不得被覆寫：%q", c)
 		}
 	})
+	t.Run("rejected 後全忽略且 TerminalCause 維持空", func(t *testing.T) {
+		// rev6（P2）：既有測試只驗 Rejected 的 state 不變——補新欄位斷言。
+		// Rejected 的拒絕原因承載於 record.Reason，TerminalCause 應維持空。
+		s := newSvc(t)
+		id, err := s.Submit("gate1", "spec", gate1Bindings())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Decide(id, "rejected", "not good", Approver{ID: "o", Method: "ui"}, DecisionInput{}); err != nil {
+			t.Fatal(err)
+		}
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "stale", At: "t2", Cause: "stray-a"})
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "superseded", At: "t3", Cause: "stray-b"})
+		entries, err := s.ListDetectOnly()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stateOf(entries, id) != Rejected {
+			t.Fatal("Rejected 後 transition 應全忽略（既有 precedence）")
+		}
+		if c := terminalCauseOf(entries, id); c != "" {
+			t.Fatalf("Rejected 的 TerminalCause 應維持空：%q", c)
+		}
+	})
 	t.Run("stale→superseded 接受、superseded→stale 忽略", func(t *testing.T) {
 		s := newSvc(t)
 		id := submitAndApprove(t, s)
-		setCurrent(s, func() (string, error) { return "sha256:" + hex64("b"), nil })
+		setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
 		if _, err := s.List(); err != nil { // durable reconcile 落 stale transition
 			t.Fatal(err)
 		}
@@ -1467,7 +1493,7 @@ func TestTerminalCauseProjection(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑 `go test -race ./internal/gate/ -run ExpirePending -count=1`，預期 FAIL**
+- [ ] **Step 2: 跑 `go test -race ./internal/gate/ -run 'ExpirePending|CommitDecisionFailsAfterExpire|TerminalCauseProjection|ListDetectOnlyMatchesDurable' -count=1`，預期 FAIL（rev6——focused 指令涵蓋本 task 全部新測試，不只 ExpirePending）**
 - [ ] **Step 3: 實作 gate 層**
 
 types.go 加 `Expired State = "expired"`；`GateEntry` 增 `TerminalCause string`。project.go：(a) transition 套用邏輯補 expired 分支（pending entry 收到 `To: "expired"` transition → State=Expired；Expired 之後的 transition 全部忽略——與既有 Rejected 同級）；(b) **precedence 沿 production 現行規則（project.go:78），rev4「首個終態後全忽略」作廢**（會改壞既有 Stale→Superseded 允許路徑，project_test.go:109 固定 superseded 不得被 stale 降級）：Stale→Superseded 接受（state 更新）；Superseded→Stale 忽略；Rejected／Expired 後全忽略；(c) `TerminalCause` **只在 transition 實際改變 state 時更新**——被忽略的 transition 不得覆寫 state 或 cause。service.go——**三入口同步改 State 判定（rev3）**：
@@ -1494,6 +1520,80 @@ func (s *Service) ExpirePending(approvalID, cause string) error {
 ```
 
 `PrepareDecision` 與 `CommitDecision` 的既有 pending 檢查（`e == nil || e.Record != nil || e.Request == nil`，service.go:143-146 同型兩處）同步加上 `|| e.State != Pending`——CommitDecision 每次重新 Project（service.go:139），故「Prepare 後被 expire、Commit 前」的競態由此攔截（TestCommitDecisionFailsAfterExpire 固定此行為）。
+
+**同步修改 `ListDetectOnly`（rev6——「與 durable reconcile 等值」契約涵蓋 TerminalCause）**：Task 2 的實作在本 task 引入欄位後補投影——durable `Reconcile()` 會把 causes 寫成 transition（service.go:237）再由 Project 投影 cause，detect-only 若只設 State 會回傳 `TerminalCause=""`，與 durable 路徑不等值、B5 §4.3 的失效原因也遺失：
+
+```go
+		if len(causes) > 0 {
+			e.State = Stale
+			e.TerminalCause = causes[0].Cause // 多筆 cause 只有第一筆使 Active→Stale（rev5 precedence：cause 隨實際 state 變化）
+		}
+```
+
+等值測試：
+
+```go
+func TestListDetectOnlyMatchesDurableReconcile(t *testing.T) {
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
+	id := submitAndApprove(t, s)
+	setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
+	before := len(s.opsForTest())
+	detect, err := s.ListDetectOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.opsForTest()) != before {
+		t.Fatal("detect-only 不得 append")
+	}
+	durable, err := s.List() // 隨後的 durable reconcile
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateOf(detect, id) != stateOf(durable, id) {
+		t.Fatalf("state 不等值：detect=%s durable=%s", stateOf(detect, id), stateOf(durable, id))
+	}
+	dc, uc := terminalCauseOf(detect, id), terminalCauseOf(durable, id)
+	if dc == "" || dc != uc {
+		t.Fatalf("TerminalCause 不等值：detect=%q durable=%q", dc, uc)
+	}
+}
+```
+
+**新增測試 helper（rev6 補齊實作——service_test.go）**：
+
+```go
+func terminalCauseOf(entries []GateEntry, id string) string {
+	for _, e := range entries {
+		if e.ApprovalID == id {
+			return e.TerminalCause
+		}
+	}
+	return ""
+}
+
+// journalTransitionCause：掃 journal ops 解碼 transition record，回傳該
+// approvalID 指定 To 的最新 Cause（ops 依序掃，最後符合者即最新）；
+// 查無即 Fatal。
+func journalTransitionCause(t *testing.T, s *Service, id, to string) string {
+	t.Helper()
+	cause := ""
+	for _, op := range s.opsForTest() {
+		for _, raw := range op.Records {
+			var tr Transition
+			if err := json.Unmarshal(raw, &tr); err != nil || tr.Type != "transition" {
+				continue
+			}
+			if tr.ApprovalID == id && tr.To == to {
+				cause = tr.Cause
+			}
+		}
+	}
+	if cause == "" {
+		t.Fatalf("journal 無 %s→%s transition", id, to)
+	}
+	return cause
+}
+```
 
 - [ ] **Step 4: 跑 Step 2 指令預期 PASS**
 - [ ] **Step 5: 寫 failing test（app 層 gateDecide 接線）**
@@ -2048,6 +2148,10 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
+- rev6（2026-08-28，plan gate 第五輪 2 P1＋1 P2 收斂）：
+  - P1 detect-only 等值缺口：Task 6b 明列同步修改 `ListDetectOnly`——stale 判定同時投影 `TerminalCause = causes[0].Cause`（durable Reconcile 寫 transition 後 Project 會投影 cause，service.go:237；只設 State 會與 durable 路徑不等值、失去 B5 §4.3 失效原因）；補 `TestListDetectOnlyMatchesDurableReconcile` 等值測試（state＋cause 與隨後 List() 相等、detect-only 前後 journal 不增長）。
+  - P1 helper 編譯：`hex64("a")`／`hex64("b")` 全數改既有無參數 `hex64()`／`hex64b()`（project_test.go:67、service_test.go:133）；`validGate1Bindings()` 改既有 `gate1Bindings()`；補齊 `terminalCauseOf`／`journalTransitionCause` 具體實作（先前僅引用未定義）。
+  - P2 Rejected 斷言：TerminalCauseProjection 補「rejected 後 stale/superseded 全忽略且 TerminalCause 維持空」subtest（拒絕原因承載於 record.Reason）；Task 6b focused 測試指令擴為涵蓋全部新測試。
 - rev5（2026-08-28，plan gate 第四輪 2 P1＋1 P2 收斂）：
   - P1 TerminalCause precedence：rev4「首個終態後全忽略」作廢（改壞 production 允許的 Stale→Superseded，project.go:78）——改沿現行 precedence：Stale→Superseded 接受（state＋cause 更新）、Superseded→Stale 忽略、Rejected／Expired 後全忽略；cause 只隨實際 state 變化更新。表格測試重寫：三案例各自的 follow-up transition 依 precedence 斷言（含 Stale→Superseded 接受案例）；stale／superseded 的 cause 斷言取自 journal transition record（`journalTransitionCause` helper），不留空值。
   - P1 aggregate 結案順序中立：B6a／B6b 各自獨立結案；原 B6 aggregate 僅於兩票皆完成時關閉、由**後完成之票**於收尾 task 確認（Task 10a/10b 對稱條款；backlog B6a/B6b 同步）。
