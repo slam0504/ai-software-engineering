@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev8（2026-08-28，implementation follow-up erratum——Task 3b `TestGateSubmitHoldsWorkflowMu` 的單一 write-once-true 布林旗標鑑別力不足，改記錄兩次 probe 的完整序列並精確斷言 `[false true]`；production contract、scope、估點均未變）
-> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8 為 implementation follow-up 發現的測試鑑別力 erratum，未重開完整 plan gate——收緊測試以符合 rev7 已核准的不變量，非設計變更）
+> 版本：rev9（2026-08-28，implementation 對照 spec 發現的 verifier bijection erratum——`VerifyRequiredCheckManifest` 原僅比對陣列長度，未逐條重驗 §5.1(5) bijection，改為 Verify 自己完成六項檢查、不依賴 Build 已先執行；production contract、scope、估點均未變）
+> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8／rev9 皆為 implementation follow-up 發現的 erratum，未重開完整 plan gate——rev8 收緊測試以符合 rev7 已核准的不變量，rev9 補完 exported verifier 自身應履行的 bijection 保證，兩者均非設計變更）
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
 **Goal:** 依 B5 spec 建立 M4 所需的 application seams——Forge port、Gate 3 policy 骨架與 manifest 收斂邏輯、gate 讀取路徑 detect-only 遷移、wsregistry 綁定欄位、freeze latch 機制——不含 TaskRun domain 本體（C1a）、GitHub adapter（C1b）、Gate 3 UI（C1c）。
@@ -573,7 +573,7 @@ git commit -m "feat(app): B6 Task 3b——gate Submit writer seam，三送核路
 - Produces:
   - `type RequiredCheckManifest struct{ ManifestSchema int; RequiredChecks []RequiredCheckEntry; Runs []CheckRunEntry }`
   - `func BuildRequiredCheckManifest(rc forge.RequiredChecks, head forge.OID) (RequiredCheckManifest, error)`（attribution＋current-effective＋排序＋bijection，違規回 error）
-  - `func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error`（全 success＋全 head match）
+  - `func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error`（**rev9**：不依賴 `BuildRequiredCheckManifest` 已先執行，自行完成 §5.1(5) 全部 bijection 重驗——required key 唯一、每 run 的 key 存在於 required 集合且恰一筆、每 required key 必須被覆蓋、run_id 不得多重歸屬、attribution 重驗——外加全 success＋全 head match）
   - `func ManifestDigest(v any) (string, error)`（`"sha256:" + hex(sha256(json.Marshal))`——struct 宣告序＝spec 字面序，沿 domainspec canonical.go 先例；本 Task 與 Task 5 共用）
 
 - [ ] **Step 1: 寫 failing tests（表格測試覆蓋 B5 §5.1(5) 全部規則）**
@@ -734,6 +734,90 @@ func TestVerifyRequiredCheckManifest(t *testing.T) {
 		t.Fatal("head 不符應 fail")
 	}
 }
+
+// TestVerifyRequiredCheckManifestBijection（rev9 新增——verifier bijection
+// erratum 修正）：全部案例以 literal 手刻 manifest 直接呼叫 Verify，不經
+// Build，證明 Verify 自身履行 §5.1(5) 保證，不是借用 Build 的前提。
+func TestVerifyRequiredCheckManifestBijection(t *testing.T) {
+	head := forge.OID("aaaa")
+	ok := func(context string, app *int64, runName string, runApp int64, runID int64, status, concl string) CheckRunEntry {
+		return CheckRunEntry{Context: context, RequiredAppID: app, RunName: runName, RunAppID: runApp,
+			RunID: runID, HeadSHA: "aaaa", Status: status, Conclusion: concl}
+	}
+	cases := []struct {
+		name    string
+		m       RequiredCheckManifest
+		wantErr string
+	}{
+		{name: "等長但 key 不對應（owner 反例）——一項重複、另一項缺漏，必須 FAIL",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "lint", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
+					ok("ci", i64(42), "ci", 42, 2, "completed", "success"),
+				}},
+			wantErr: "重複覆蓋"},
+		{name: "required key 重複（Verify 端自己拒絕，非借用 Build 前提）",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "ci", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
+				}},
+			wantErr: "重複"},
+		{name: "run 的 required key 不存在於 required 集合（多餘）",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("lint", i64(42), "lint", 42, 1, "completed", "success"),
+				}},
+			wantErr: "不存在於 required 集合"},
+		{name: "同一 required key 被兩筆 run 重複覆蓋",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
+					ok("ci", i64(42), "ci", 42, 2, "completed", "success"),
+				}},
+			wantErr: "重複覆蓋"},
+		{name: "required key 缺漏（無對應 run）",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "lint", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
+				}},
+			wantErr: "missing"},
+		{name: "同一 run_id 歸屬兩個不同 required key（多重歸屬）",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "lint", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
+					ok("lint", i64(42), "lint", 42, 1, "completed", "success"),
+				}},
+			wantErr: "多重歸屬"},
+		{name: "attribution 不符：run_name ≠ context",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "not-ci", 42, 1, "completed", "success"),
+				}},
+			wantErr: "attribution 不符"},
+		{name: "attribution 不符：run_app_id ≠ required_app_id",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}},
+				Runs: []CheckRunEntry{
+					ok("ci", i64(42), "ci", 43, 1, "completed", "success"),
+				}},
+			wantErr: "attribution 不符"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyRequiredCheckManifest(tc.m, head)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
 ```
 
 - [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run 'RequiredCheck' -count=1`，預期 FAIL（型別不存在）**
@@ -859,22 +943,65 @@ func BuildRequiredCheckManifest(rc forge.RequiredChecks, head forge.OID) (Requir
 	return RequiredCheckManifest{ManifestSchema: 1, RequiredChecks: entries, Runs: runs}, nil
 }
 
-// VerifyRequiredCheckManifest：收斂後逐筆驗證——全 completed+success、
-// 全 head_sha == promotion_head（B5 §5.1(5) 驗證條件；missing 已由
-// Build 擋下）。
+// VerifyRequiredCheckManifest：獨立重驗 §5.1(5) 全部驗證條件——**不依賴
+// BuildRequiredCheckManifest 已先執行**（rev9 erratum 修正：exported
+// verifier 必須自己履行宣稱的保證，不能借用 Build 的前提；原版僅比對
+// len(RequiredChecks)==len(Runs) 判定 coverage，對「等長但 key 不對應
+// （一項重複、另一項缺漏）」的輸入會誤判通過，違反 §5.1(5) bijection）。
+// 逐條檢查：
+//  1. required key (context, app_id) 必須唯一（Verify 自己拒絕重複，不
+//     借用 Build 已去重的前提）。
+//  2. 每筆 run 的 required key 必須存在於 required 集合，且同一 key 恰
+//     一筆 run（不存在／重複覆蓋 fail loud）。
+//  3. 每個 required key 最後都必須被覆蓋（無缺漏 fail loud）。
+//  4. 同一 run_id 不得歸屬多個 required key（多重歸屬 fail loud）。
+//  5. attribution 重驗：run_name == context，且 required_app_id == nil
+//     或 run_app_id == required_app_id。
+//  6. 全 completed+success、全 head_sha == promotion_head（既有規則）。
 func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error {
 	if m.ManifestSchema != 1 {
 		return fmt.Errorf("manifest_schema %d 不支援", m.ManifestSchema)
 	}
-	if len(m.RequiredChecks) != len(m.Runs) {
-		return fmt.Errorf("coverage 破缺：required %d、runs %d", len(m.RequiredChecks), len(m.Runs))
+	required := map[string]RequiredCheckEntry{}
+	for _, rc := range m.RequiredChecks {
+		k := keyOf(rc.Context, rc.AppID)
+		if _, dup := required[k]; dup {
+			return fmt.Errorf("required check 重複 key：%s", k)
+		}
+		required[k] = rc
 	}
+	covered := map[string]bool{}
+	usedRun := map[int64]string{}
 	for _, r := range m.Runs {
+		k := keyOf(r.Context, r.RequiredAppID)
+		rc, ok := required[k]
+		if !ok {
+			return fmt.Errorf("run %d 歸屬 required key %s 不存在於 required 集合（多餘）", r.RunID, k)
+		}
+		if covered[k] {
+			return fmt.Errorf("required key %s 重複覆蓋：多筆 run 歸屬同一 required check", k)
+		}
+		if prevKey, dup := usedRun[r.RunID]; dup {
+			return fmt.Errorf("run %d 多重歸屬：%s 與 %s", r.RunID, prevKey, k)
+		}
+		if r.RunName != rc.Context {
+			return fmt.Errorf("run %d attribution 不符：run_name=%q ≠ context=%q", r.RunID, r.RunName, rc.Context)
+		}
+		if rc.AppID != nil && r.RunAppID != *rc.AppID {
+			return fmt.Errorf("run %d attribution 不符：run_app_id=%d ≠ required_app_id=%d", r.RunID, r.RunAppID, *rc.AppID)
+		}
+		covered[k] = true
+		usedRun[r.RunID] = k
 		if r.Status != "completed" || r.Conclusion != "success" {
-			return fmt.Errorf("required %q 非 success（status=%s conclusion=%s）", r.Context, r.Status, r.Conclusion)
+			return fmt.Errorf("required %q 非 success（status=%s conclusion=%s）", k, r.Status, r.Conclusion)
 		}
 		if r.HeadSHA != string(head) {
-			return fmt.Errorf("required %q head %s ≠ promotion_head %s", r.Context, r.HeadSHA, head)
+			return fmt.Errorf("required %q head %s ≠ promotion_head %s", k, r.HeadSHA, head)
+		}
+	}
+	for k := range required {
+		if !covered[k] {
+			return fmt.Errorf("required %s missing：無覆蓋 run", k)
 		}
 	}
 	return nil
@@ -2182,6 +2309,12 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 3. **Type consistency**：`apprFrozen` 統一 `map[appcore.WSID]bool`（rev2 修正）；`BuildReviewSection` 回傳 `([]ReviewEntry, error)` 於 Produces 與實作一致；`ErrGate3Mismatch` 於 Task 6 定義、Task 6b 消費；`Expired` 於 Task 6b 定義、`ListDetectOnly`（Task 2）投影相容。
 
 ## 修訂記錄
+
+- rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
+  - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
+  - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋反例本身＋七個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、run_id 多重歸屬、兩種 attribution 不符形狀）。
+  - 非漏洞判定：目前尚非可利用的 production 漏洞——§5.3(3) 決議時重驗是自 forge 重讀重建 manifest（走 `BuildRequiredCheckManifest`，其本身已結構性保證 bijection），再與 binding digest 比對，production 路徑不會把「等長但 key 不對應」的殘缺 manifest 送進 `Verify`。但 `VerifyRequiredCheckManifest` 是 exported 函式、簽章不要求輸入必經 Build（brief 原有的 `TestVerifyRequiredCheckManifest` 本身就是 literal 手刻 manifest 直接呼叫），沒有履行其宣稱的保證；Task 6 對 Verify 的接線方式（是否／如何被 C1b 的 `Gate3Deps.VerifyForge` 呼叫）尚未定案，故依 owner 裁定一次做對，不留 follow-up。
+  - Scope 邊界：`BuildRequiredCheckManifest` 的部分排序鍵（僅 `keyOf(context, app_id)`，非全 tuple）維持不變——Build 排序前已拒絕重複 required key、且 bijection 保證陣列內鍵值唯一，不落入 domainspec canonical 先例（`escalationLess` 全 tuple 排序）要防範的「同鍵不同值、sort.Slice 非 stable」風險，故不需要跟進改動；`used[RunID]` 沿用單一 `run_id` 為 key（`forge.CheckRun.RunID` 為 forge port 對 check run 的唯一識別欄位，見 forge.go 型別註解）；pending／failed 三態語意（`Status != "completed" || Conclusion != "success"`）維持現行做法，符合 §5.3(3)。production contract、scope、估點均未改，未重開完整 plan gate——這是補完 exported verifier 自身應履行的 bijection 保證，不是設計變更。
 
 - rev8（2026-08-28，**implementation follow-up erratum**——Task 3b 測試鑑別力缺口，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 背景：Task 3b（commit `4c62bc6`）把 `submitGateRequest` 內唯一的 `svc.Submit` 收進 `workflowMu` 臨界區；review 以 mutation 證實 **production 的鎖位置正確**（Mutation A：移除鎖→測試 FAIL；Mutation C：鎖過寬包住整個 wrapper→`-timeout` 揭露自我 deadlock），但**測試本身鑑別力不足**。
