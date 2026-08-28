@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -80,7 +82,7 @@ func TestGateLiveLoopSubmitApproveThenStale(t *testing.T) {
 	}
 	a.SpecWrite("spec/glossary.md", "term v2", digestOf(t, a, "spec/glossary.md"))
 	commitAll(t, a)
-	list, _ = a.GateList() // reconcile 觸發 STALE
+	list, _ = a.GateList() // detect-only 投影：讀取當下呈現 stale（不落盤，見 TestGateListDetectOnlyDoesNotPersistStale）
 	if stateOf(list, id) != "stale" {
 		t.Fatalf("want stale after spec change, got %s", stateOf(list, id))
 	}
@@ -123,6 +125,45 @@ func TestGateListDetectOnlyDoesNotPersistStale(t *testing.T) {
 	}
 	if got := gateOpsCount(t, a); got != opsBefore {
 		t.Fatalf("GateList 不得 append：ops %d→%d", opsBefore, got)
+	}
+}
+
+// TestRunEvidencePersistsStaleGateTransition：RunEvidence（B6 Task 3 保留的
+// durable 寫入路徑）在 workflowMu 下呼叫 a.gateListReconciled()——這一步若
+// 偵測到 stale transition 會把它 append 進 gate journal，跟 GateList 的
+// detect-only 投影不同。本測試只證明「RunEvidence 這條路徑確實落盤」；
+// 「只有持 workflowMu 的寫入路徑才會落盤」是另一個全稱命題，正向測試證不了，
+// 要守它需要另一道結構性檢查，不在本票範圍（B5 spec §3.2(0)）。
+//
+// 用一個不存在的 planID 呼叫 RunEvidence：app.go 的 runEvidence 在
+// workflowMu.Lock 之後立刻呼叫 gateListReconciled()（durable append 在此
+// 完成），才往下查找該 planID 的 active Gate 2 approval——查無此 plan 便在
+// Unlock 後回傳「no active Gate 2 approval for plan」。斷言錯誤訊息確實是
+// 這個 gate2 查找失敗分支，而不是 kind／mutationID／evidenceJournal 等更早
+// 的前置檢查失敗，避免測試因為別的原因提早失敗而變成 vacuous pass。
+func TestRunEvidencePersistsStaleGateTransition(t *testing.T) {
+	a, _ := newTestAppEvidence(t) // 沿用既有「已接好 evidenceJournal」的建構方式
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.SpecWrite("spec/glossary.md", "term v2", digestOf(t, a, "spec/glossary.md"))
+	commitAll(t, a) // 使 current manifest 與 record binding 不符
+
+	opsBefore := gateOpsCount(t, a)
+	const missingPlanID = "no-such-plan"
+	wantErr := fmt.Sprintf("evidence: no active Gate 2 approval for plan %q", missingPlanID)
+	_, err = a.RunEvidence("irrelevant-approval", missingPlanID, "T1", strings.Repeat("0", 40), "expected_red", "")
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("want gate2 查找失敗 error %q, got %v", wantErr, err)
+	}
+	if got := gateOpsCount(t, a); got <= opsBefore {
+		t.Fatalf("RunEvidence 應 append durable stale transition：ops %d→%d", opsBefore, got)
 	}
 }
 
