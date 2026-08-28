@@ -1,0 +1,1452 @@
+# B6 M4 Application Seams Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+> 版本：rev1（2026-08-28）
+> 狀態：**待 plan gate**
+> 票源：Pre-M4 Readiness Backlog B6（1.4 pt；假設「B5 落地後僅需 service 骨架＋M4 觸及 orchestration 抽取」）
+
+**Goal:** 依 B5 spec 建立 M4 所需的 application seams——Forge port、Gate 3 policy 骨架與 manifest 收斂邏輯、gate 讀取路徑 detect-only 遷移、wsregistry 綁定欄位、freeze latch 機制——不含 TaskRun domain 本體（C1a）、GitHub adapter（C1b）、Gate 3 UI（C1c）。
+
+**Architecture:** 沿既有 ports-and-adapters 慣例：`internal/forge` 為純 port（型別＋interface＋fake）；Gate 3 policy 與 manifest 收斂進 `internal/gatepolicy`（`internal/gate` 維持零 domain import 凍結）；detect-only 投影加在 `gate.Service`；App 只注入 service／port reference，不新增 M4 domain mutable state。
+
+**Tech Stack:** Go 1.25（stdlib only，無新外部依賴）；測試沿 `go vet ./...`＋`go test -race ./... -count=1` 慣例。
+
+**Spec:** `docs/superpowers/specs/2026-08-27-taskrun-gate3-forge-contract-design.md`（rev8，design gate 通過）
+
+## B6／C1 範圍分界與重估評估（plan gate 首輪需裁決）
+
+| B5 spec 要求 | 歸屬 | 理由 |
+|---|---|---|
+| §3.2(0) gate journal 單一寫入者不變式——7 入口 detect-only 遷移 | **B6**（Task 2-3） | M4 觸及的既有 orchestration 抽取核心；TaskRun 建立（C1a）依賴此前置 |
+| §6 Forge port 型別＋interface | **B6**（Task 1） | service 骨架；C1b 實作 GitHub adapter |
+| §5.1(5)(6) canonical manifest 收斂（bijection／current-effective／eligibility） | **B6**（Task 4-5） | 純邏輯、無依賴、測試價值高；C1b/C1c 呼叫 |
+| §5.2 `gate3_promotion` policy 註冊＋binding 形狀驗證＋重驗編排骨架 | **B6**（Task 6） | Gate 3 application service 骨架；深度依賴以 interface 注入、C1 接線 |
+| §3.1 wsregistry Entry `{task_run_id, snapshot_digest}`＋write-once 方法 | **B6**（Task 7） | 既有 store 的 seam 擴充（mutate 慣例）；C1a 呼叫 |
+| §4.2(2)(3) freeze latch 機制＋admission 檢查（SendMessage／resolveApproval） | **B6**（Task 8-9） | 觸及既有 orchestration（Manager.BeginSubmit／resolveApproval）；觸發序列（cause 偵測→freeze）歸 C1a |
+| §2 TaskRun snapshot／journal／狀態機／digest；§3.2 建立交易；§3.5 resume；§3.6 abandoned；§4.2 freeze 觸發序列與 repair | **C1a** | backlog 估點表明文「TaskRun snapshot（domain＋持久化）＋綁定注入」 |
+| GitHub forge adapter、認證、rate limit | **C1b** | backlog 明文 |
+| Gate 3 決議 UI＋evidence 顯示＋走查 | **C1c** | backlog 明文 |
+
+**重估評估**：B5 rev2→rev8 新增了單一寫入者遷移（7 入口）與 freeze latch 機制，超出估點時「僅 service 骨架」的想像；但兩者本質仍是「M4 觸及的既有 orchestration 抽取」（B6 票面文字涵蓋）。本 plan 任務粗估合計 ≈1.4-1.6 pt，與原估 1.4 pt 相當——**判定前提未破壞、不觸發重估**；若 plan gate 認定 Task 8-9（latch）應歸 C1a，B6 降為 ≈1.1 pt，兩案皆不需改票。請 owner 於 plan gate 首輪裁決分界採本表或改劃。
+
+## Global Constraints
+
+- Module：`github.com/slam0504/sdlc-workbench`；Go 1.25.0（go.mod 現值，A4 的 toolchain 變更與本票無關）。
+- 驗證指令（每 task 結尾）：`go vet ./...` 與 `go test -race ./... -count=1`（受影響 package 先跑單包，commit 前跑全套）。
+- 無新外部依賴；一律 stdlib。
+- `internal/gate` 維持零 domain import（tca.go:1-12 架構凍結）——Gate 3 policy 只能進 `internal/gatepolicy`。
+- Wails bindings 留在 `app.go`；internal packages 不得 import app 層。
+- App aggregate 不新增 M4 domain mutable state；新測試注入點走 interface／fake（B6 驗收 4）。
+- 註解與 doc comment 用繁體中文、對齊既有風格（見 app.go workflowMu doc 的密度）。
+- Commit message 格式沿 repo 慣例：`feat(scope): ...`／`test(scope): ...`，一 task 一 commit（含測試）。
+
+---
+
+### Task 1: Forge port（`internal/forge`——型別、interface、fake）
+
+**Files:**
+- Create: `internal/forge/forge.go`
+- Create: `internal/forge/fake.go`
+- Test: `internal/forge/fake_test.go`
+
+**Interfaces:**
+- Consumes: 無（純 port，僅 stdlib）。
+- Produces: `forge.Forge` interface 與全部型別（下列逐字），供 Task 4-6 與 C1b 使用。
+
+- [ ] **Step 1: 寫 `forge.go`（型別與 interface，B5 §6 逐字對應）**
+
+```go
+// Package forge 定義 Workbench 對 forge（GitHub-first）的最小 port——
+// 全部唯讀＋EnsurePullRequest，不含 merge（B5 spec §6）。實作為 C1b 的
+// GitHub adapter；本套件僅型別與契約，零外部依賴。
+package forge
+
+import "context"
+
+// RepoID／BranchRef／OID 型別明確區分：repo identity、branch ref、commit OID
+//（B5 §6——防止字串混用）。
+type RepoID struct {
+	Owner string
+	Repo  string
+}
+type BranchRef string // refs/heads/... 全名
+type OID string       // git commit OID（hex）
+
+type PRRef struct {
+	Number int
+}
+type PRState struct {
+	HeadOID OID
+	BaseOID OID
+	State   string // "open"／"closed"／"merged"
+}
+type PRMeta struct {
+	Title string
+	Body  string
+}
+
+// RequiredCheckRef 是 required check 的權威 key（B5 §5.1(5)）：
+// AppID 為 nil ＝ 不限來源（對齊 branch protection API 的 {context, app_id}）。
+type RequiredCheckRef struct {
+	Context string
+	AppID   *int64
+}
+type CheckRun struct {
+	Name       string
+	AppID      int64
+	RunID      int64
+	HeadOID    OID
+	Status     string // "queued"／"in_progress"／"completed"
+	Conclusion string // completed 時："success"／"failure"／...
+	StartedAt  string // RFC3339
+}
+type RequiredChecks struct {
+	Required []RequiredCheckRef
+	Runs     []CheckRun
+}
+
+type Review struct {
+	ReviewID        int64
+	ReviewerLogin   string
+	State           string // "APPROVED"／"CHANGES_REQUESTED"／"DISMISSED"／"COMMENTED"／"PENDING"
+	ReviewedHeadOID OID
+	SubmittedAt     string // RFC3339
+}
+
+// Permission 是 collaborator permission（B5 §5.1(6) eligibility）。
+type Permission string
+
+const (
+	PermissionAdmin    Permission = "admin"
+	PermissionMaintain Permission = "maintain"
+	PermissionWrite    Permission = "write"
+	PermissionRead     Permission = "read"
+	PermissionNone     Permission = "none"
+)
+
+// Eligible 回傳該 permission 是否具 review 效力（write／maintain／admin）。
+func (p Permission) Eligible() bool {
+	return p == PermissionWrite || p == PermissionMaintain || p == PermissionAdmin
+}
+
+// Forge 錯誤語意 fail closed：讀取失敗＝無法決議，不得當作
+// checks 未設定或 review 不存在（B5 §6）。
+type Forge interface {
+	// EnsurePullRequest 以 (repo, headRef, baseRef, taskRunID marker) 確定性收斂：
+	// 既有 open PR 同 head/base 且 marker 相符→回傳之；marker 不符或同
+	// head/base 多筆→fail loud；不存在→建立（body/label 帶 taskrun:<ULID>）。
+	EnsurePullRequest(ctx context.Context, repo RepoID, headRef, baseRef BranchRef, taskRunID string, meta PRMeta) (PRRef, error)
+	GetPullRequest(ctx context.Context, repo RepoID, pr PRRef) (PRState, error)
+	GetRequiredChecks(ctx context.Context, repo RepoID, pr PRRef, head OID) (RequiredChecks, error)
+	GetReviews(ctx context.Context, repo RepoID, pr PRRef) ([]Review, error)
+	GetCollaboratorPermission(ctx context.Context, repo RepoID, login string) (Permission, error)
+}
+```
+
+- [ ] **Step 2: 寫 `fake.go`（可注入回傳值的 fake，供本 repo 各包測試）**
+
+```go
+package forge
+
+import "context"
+
+// Fake 是測試用 Forge：每個方法回傳對應欄位；Err 非 nil 時一律回傳 Err
+//（模擬 forge 讀取失敗的 fail-closed 路徑）。沿 gate stubPolicy 慣例：
+// production-adjacent fake，不進 _test.go 因跨套件使用（gatepolicy 測試）。
+type Fake struct {
+	Err            error
+	PR             PRRef
+	PRState        PRState
+	RequiredChecks RequiredChecks
+	Reviews        []Review
+	Permissions    map[string]Permission // login → permission；缺項回 PermissionNone
+}
+
+var _ Forge = (*Fake)(nil)
+
+func (f *Fake) EnsurePullRequest(_ context.Context, _ RepoID, _, _ BranchRef, _ string, _ PRMeta) (PRRef, error) {
+	if f.Err != nil {
+		return PRRef{}, f.Err
+	}
+	return f.PR, nil
+}
+func (f *Fake) GetPullRequest(_ context.Context, _ RepoID, _ PRRef) (PRState, error) {
+	if f.Err != nil {
+		return PRState{}, f.Err
+	}
+	return f.PRState, nil
+}
+func (f *Fake) GetRequiredChecks(_ context.Context, _ RepoID, _ PRRef, _ OID) (RequiredChecks, error) {
+	if f.Err != nil {
+		return RequiredChecks{}, f.Err
+	}
+	return f.RequiredChecks, nil
+}
+func (f *Fake) GetReviews(_ context.Context, _ RepoID, _ PRRef) ([]Review, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.Reviews, nil
+}
+func (f *Fake) GetCollaboratorPermission(_ context.Context, _ RepoID, login string) (Permission, error) {
+	if f.Err != nil {
+		return PermissionNone, f.Err
+	}
+	if p, ok := f.Permissions[login]; ok {
+		return p, nil
+	}
+	return PermissionNone, nil
+}
+```
+
+- [ ] **Step 3: 寫測試（fake 契約＋Eligible）**
+
+```go
+package forge
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+func TestFakeErrShortCircuitsAllMethods(t *testing.T) {
+	f := &Fake{Err: errors.New("boom")}
+	ctx := context.Background()
+	if _, err := f.GetPullRequest(ctx, RepoID{}, PRRef{}); err == nil {
+		t.Fatal("GetPullRequest 應回傳 Err")
+	}
+	if _, err := f.GetRequiredChecks(ctx, RepoID{}, PRRef{}, OID("x")); err == nil {
+		t.Fatal("GetRequiredChecks 應回傳 Err")
+	}
+	if _, err := f.GetReviews(ctx, RepoID{}, PRRef{}); err == nil {
+		t.Fatal("GetReviews 應回傳 Err")
+	}
+	if _, err := f.GetCollaboratorPermission(ctx, RepoID{}, "u"); err == nil {
+		t.Fatal("GetCollaboratorPermission 應回傳 Err")
+	}
+}
+
+func TestPermissionEligible(t *testing.T) {
+	for p, want := range map[Permission]bool{
+		PermissionAdmin: true, PermissionMaintain: true, PermissionWrite: true,
+		PermissionRead: false, PermissionNone: false,
+	} {
+		if p.Eligible() != want {
+			t.Fatalf("%s.Eligible()=%v, want %v", p, !want, want)
+		}
+	}
+}
+
+func TestFakePermissionDefaultNone(t *testing.T) {
+	f := &Fake{}
+	p, err := f.GetCollaboratorPermission(context.Background(), RepoID{}, "stranger")
+	if err != nil || p != PermissionNone {
+		t.Fatalf("缺項應回 PermissionNone, got %v %v", p, err)
+	}
+}
+```
+
+- [ ] **Step 4: 執行 `go test -race ./internal/forge/ -count=1`，預期 PASS；`go vet ./internal/forge/`**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/forge/
+git commit -m "feat(forge): B6 Task 1——Forge port 型別、interface 與 fake（B5 spec §6）"
+```
+
+---
+
+### Task 2: `gate.Service.ListDetectOnly`（B5 §3.2(0) detect-only 投影）
+
+**Files:**
+- Modify: `internal/gate/service.go`（在 `List` 之後新增方法）
+- Test: `internal/gate/service_test.go`（追加）
+
+**Interfaces:**
+- Consumes: 既有 `Project(ops []GateOp) ([]GateEntry, error)`、`GatePolicy.ReconcileBindings(rec ApprovalRecord) ([]StaleCause, error)`。
+- Produces: `func (s *Service) ListDetectOnly() ([]GateEntry, error)`——與 `List()` 呈現同等 stale 判定，但**不 append journal**。Task 3 的 app.go 讀取路徑呼叫它。
+
+- [ ] **Step 1: 寫 failing test（detect-only 顯示 stale 且 journal 不長）**
+
+沿 `newTestServiceWithCurrent` 既有 helper（service_test.go:55-107）：以會回報 mismatch 的 `current` 函數建 service，先 Submit＋Decide 造出 Active record，再改變 current 使 ReconcileBindings 產生 stale cause。
+
+```go
+func TestListDetectOnlyShowsStaleWithoutAppend(t *testing.T) {
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64("a"), nil })
+	id := submitAndApprove(t, s) // 既有測試已有同型流程；若無此 helper，內聯 Submit+Decide 兩行
+	// 讓 current 改變 → Active record 的 binding 與現值不符
+	setCurrent(s, func() (string, error) { return "sha256:" + hex64("b"), nil })
+
+	before := len(s.opsForTest())
+	entries, err := s.ListDetectOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stateOf(entries, id); got != Stale {
+		t.Fatalf("detect-only 應呈現 Stale, got %s", got)
+	}
+	if after := len(s.opsForTest()); after != before {
+		t.Fatalf("detect-only 不得 append：ops %d→%d", before, after)
+	}
+	// 對照組：List() 會落 durable transition
+	if _, err := s.List(); err != nil {
+		t.Fatal(err)
+	}
+	if after := len(s.opsForTest()); after == before {
+		t.Fatal("List() 應 append stale transition")
+	}
+}
+```
+
+註：`submitAndApprove`／`setCurrent`／`stateOf` 若 service_test.go 尚無同名 helper，於同檔新增（`setCurrent` 直接重建 policy registry：`s.reg["gate1"] = NewGate1Policy(fn)`——white-box in-package 測試可直接賦值；`stateOf` 為 5 行線性掃描）。
+
+- [ ] **Step 2: 跑 `go test -race ./internal/gate/ -run TestListDetectOnly -count=1`，預期 FAIL（方法不存在）**
+- [ ] **Step 3: 實作 `ListDetectOnly`**
+
+```go
+// ListDetectOnly 回傳與「Reconcile 後 Project」等值的投影，但不 append
+// journal（B5 spec §3.2(0)：gate journal 單一寫入者——durable stale
+// transition 只准持 workflowMu 的寫入路徑落盤；純讀取入口一律走本方法）。
+// policy 檢查與 Reconcile 相同：Active record 經 ReconcileBindings 有
+// cause 即以 Stale 呈現；current-read 錯誤 fail closed 回傳 error。
+func (s *Service) ListDetectOnly() ([]GateEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := Project(s.j.Ops())
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.State != Active || e.Record == nil {
+			continue
+		}
+		pol, ok := s.reg[e.Record.Gate]
+		if !ok {
+			continue // 沿 Reconcile 的 unknown-gate 寬容（不猜測、不動它）
+		}
+		causes, err := pol.ReconcileBindings(*e.Record)
+		if err != nil {
+			return nil, err // fail closed，沿 Reconcile
+		}
+		if len(causes) > 0 {
+			e.State = Stale
+		}
+	}
+	return entries, nil
+}
+```
+
+實作前先讀 `Reconcile()`（service.go:222-254）確認 unknown-gate 與錯誤處理分支逐一對齊；有出入以 Reconcile 現行為準並在測試中固定。
+
+- [ ] **Step 4: 跑 Step 2 指令，預期 PASS；再跑 `go test -race ./internal/gate/ -count=1` 全包**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/gate/
+git commit -m "feat(gate): B6 Task 2——ListDetectOnly detect-only 投影（B5 §3.2(0) 單一寫入者前置）"
+```
+
+---
+
+### Task 3: app.go 七入口 detect-only 遷移＋寫入路徑保留 reconcile
+
+**Files:**
+- Modify: `app.go`——`gateList()`（app.go:5725-5762）、`runEvidence` 的 gateList 呼叫（app.go:5236-5251）
+- Test: `app_gate_test.go`（追加）
+
+**Interfaces:**
+- Consumes: Task 2 的 `svc.ListDetectOnly()`；既有 `svc.List()`。
+- Produces: `a.gateList()`（改為 detect-only，七個讀取入口自動生效——它們全呼叫 `a.gateList()`）；新增 `a.gateListReconciled()`（呼叫 `svc.List()`，doc 註明「caller 必須持 workflowMu」）供 `runEvidence` 與後續 C1a 寫入路徑使用。
+
+- [ ] **Step 1: 寫 failing test（GateList 讀取不落 stale transition；RunEvidence 路徑仍落）**
+
+沿 `app_gate_test.go` 的 `TestGateLiveLoopSubmitApproveThenStale` 既有 fixture 手法（造 Active gate1 → 改動 spec 使 manifest 改變）：
+
+```go
+func TestGateListDetectOnlyDoesNotPersistStale(t *testing.T) {
+	a := newGateTestApp(t) // 沿既有 app_gate_test 的建構 helper
+	approvalID := approveGate1(t, a)
+	mutateSpecManifest(t, a) // 使 current manifest 與 record binding 不符
+
+	opsBefore := gateOpsCount(t, a)
+	entries, err := a.GateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := dtoState(entries, approvalID); st != "stale" {
+		t.Fatalf("讀取應呈現 stale, got %s", st)
+	}
+	if got := gateOpsCount(t, a); got != opsBefore {
+		t.Fatalf("GateList 不得 append：ops %d→%d", opsBefore, got)
+	}
+}
+```
+
+`gateOpsCount`：white-box 讀 `a.gateJournal.Ops()` 長度。`newGateTestApp`／`approveGate1`／`mutateSpecManifest` 沿既有測試檔同型 helper（該檔已有 submit→approve→stale 全流程可拆用；若 helper 為內聯，抽出共用）。
+
+- [ ] **Step 2: 跑 `go test -race -run TestGateListDetectOnly -count=1 .`，預期 FAIL（現行 GateList 會 append）**
+- [ ] **Step 3: 遷移 `gateList()` 並新增 `gateListReconciled()`**
+
+`gateList()` 只改一行呼叫並更新 doc；DTO 映射邏輯抽成共用：
+
+```go
+// gateList：GateList 的本體（不進交易閘，見 beginTxn 的 doc）。
+// B6 起為 detect-only 投影（B5 §3.2(0)）：呈現與 reconcile 後相同的
+// stale 判定，但不落 durable transition——durable stale 只准持
+// workflowMu 的寫入路徑（gateListReconciled／reconcileLocked）產生。
+func (a *App) gateList() ([]GateEntryDTO, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.ListDetectOnly()
+	if err != nil {
+		return nil, err
+	}
+	return a.gateEntriesToDTO(entries), nil
+}
+
+// gateListReconciled：Reconcile-before-Project 的 durable 版本。
+// caller 必須持有 workflowMu（單一寫入者不變式）；目前呼叫者：
+// runEvidence（app.go §3.8 接線）。C1a 的 TaskRun 建立臨界區沿用。
+func (a *App) gateListReconciled() ([]GateEntryDTO, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.List()
+	if err != nil {
+		return nil, err
+	}
+	return a.gateEntriesToDTO(entries), nil
+}
+
+// gateEntriesToDTO：原 gateList 的 DTO 映射本體，原樣搬移（含 degraded 標示）。
+func (a *App) gateEntriesToDTO(entries []gate.GateEntry) []GateEntryDTO {
+	// ……原 app.go:5730-5761 的迴圈原封搬入，零語意變更……
+}
+```
+
+`runEvidence` 內原 `a.gateList()`（app.go:5236-5251，位於 workflowMu 臨界區）改呼叫 `a.gateListReconciled()`。其餘六個入口（submitPlanForApproval:5019、validateTestCommit:5433、evidenceCommitCandidates:5480、submitTestContract:5564、gateDecisionContext:5660、planAssist:6475）呼叫 `a.gateList()` 不動——遷移經由 `gateList()` 本體生效。
+
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；跑 `go test -race -count=1 .`（root 包全部 app tests）確認零回歸——特別注意 `TestGateLiveLoopSubmitApproveThenStale` 若斷言「讀取後 journal 有 stale transition」需依 B5 §3.2(0) 更新斷言（讀取不落盤、由寫入路徑落盤），並在 commit message 註明語意變更依據**
+- [ ] **Step 5: Commit**
+
+```bash
+git add app.go app_gate_test.go
+git commit -m "feat(app): B6 Task 3——gate 讀取路徑 detect-only 遷移；runEvidence 保留 durable reconcile（B5 §3.2(0)）"
+```
+
+---
+
+### Task 4: required-check manifest 收斂（`internal/gatepolicy/gate3_manifest.go`）
+
+**Files:**
+- Create: `internal/gatepolicy/gate3_manifest.go`
+- Test: `internal/gatepolicy/gate3_manifest_test.go`
+
+**Interfaces:**
+- Consumes: Task 1 的 `forge.RequiredChecks`／`forge.CheckRun`／`forge.RequiredCheckRef`／`forge.OID`。
+- Produces:
+  - `type RequiredCheckManifest struct{ ManifestSchema int; RequiredChecks []RequiredCheckEntry; Runs []CheckRunEntry }`
+  - `func BuildRequiredCheckManifest(rc forge.RequiredChecks, head forge.OID) (RequiredCheckManifest, error)`（attribution＋current-effective＋排序＋bijection，違規回 error）
+  - `func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error`（全 success＋全 head match）
+  - `func ManifestDigest(v any) (string, error)`（`"sha256:" + hex(sha256(json.Marshal))`——struct 宣告序＝spec 字面序，沿 domainspec canonical.go 先例；本 Task 與 Task 5 共用）
+
+- [ ] **Step 1: 寫 failing tests（表格測試覆蓋 B5 §5.1(5) 全部規則）**
+
+```go
+package gatepolicy
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/slam0504/sdlc-workbench/internal/forge"
+)
+
+func i64(v int64) *int64 { return &v }
+
+func TestBuildRequiredCheckManifest(t *testing.T) {
+	head := forge.OID("aaaa")
+	run := func(name string, app, id int64, started, concl string) forge.CheckRun {
+		return forge.CheckRun{Name: name, AppID: app, RunID: id, HeadOID: head,
+			Status: "completed", Conclusion: concl, StartedAt: started}
+	}
+	cases := []struct {
+		name    string
+		rc      forge.RequiredChecks
+		wantErr string // 空字串＝成功
+		check   func(t *testing.T, m RequiredCheckManifest)
+	}{
+		{name: "app_id 為 nil 可由任一 app 的 run 覆蓋（bijection 而非 key 相等）",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci"}},
+				Runs:     []forge.CheckRun{run("ci", 42, 1, "2026-08-28T01:00:00Z", "success")}},
+			check: func(t *testing.T, m RequiredCheckManifest) {
+				if len(m.Runs) != 1 || m.Runs[0].RunAppID != 42 || m.Runs[0].RequiredAppID != nil {
+					t.Fatalf("run 應記錄 required_app_id=nil 與 run_app_id=42：%+v", m.Runs)
+				}
+			}},
+		{name: "同名多次執行取 started_at 最新（tie 取 run_id 大者）",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci", AppID: i64(42)}},
+				Runs: []forge.CheckRun{
+					run("ci", 42, 1, "2026-08-28T01:00:00Z", "failure"),
+					run("ci", 42, 2, "2026-08-28T02:00:00Z", "success")}},
+			check: func(t *testing.T, m RequiredCheckManifest) {
+				if m.Runs[0].RunID != 2 {
+					t.Fatalf("current-effective 應為 run 2：%+v", m.Runs)
+				}
+			}},
+		{name: "required_app_id 為 nil 且同名 run 來自多 app → 歸屬歧義 fail loud",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci"}},
+				Runs: []forge.CheckRun{
+					run("ci", 42, 1, "2026-08-28T01:00:00Z", "success"),
+					run("ci", 43, 2, "2026-08-28T02:00:00Z", "success")}},
+			wantErr: "歸屬歧義"},
+		{name: "required 缺對應 run → 無缺漏違反",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci"}, {Context: "lint"}},
+				Runs:     []forge.CheckRun{run("ci", 42, 1, "2026-08-28T01:00:00Z", "success")}},
+			wantErr: "missing"},
+		{name: "forge 回傳重複 required key → fail loud",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci", AppID: i64(42)}, {Context: "ci", AppID: i64(42)}},
+				Runs:     []forge.CheckRun{run("ci", 42, 1, "2026-08-28T01:00:00Z", "success")}},
+			wantErr: "重複"},
+		{name: "非 required 的 run 不入 manifest（無多餘）",
+			rc: forge.RequiredChecks{
+				Required: []forge.RequiredCheckRef{{Context: "ci", AppID: i64(42)}},
+				Runs: []forge.CheckRun{
+					run("ci", 42, 1, "2026-08-28T01:00:00Z", "success"),
+					run("extra", 42, 9, "2026-08-28T01:00:00Z", "success")}},
+			check: func(t *testing.T, m RequiredCheckManifest) {
+				if len(m.Runs) != 1 {
+					t.Fatalf("extra run 不得入 manifest：%+v", m.Runs)
+				}
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := BuildRequiredCheckManifest(tc.rc, head)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.ManifestSchema != 1 {
+				t.Fatalf("manifest_schema 必為 1")
+			}
+			tc.check(t, m)
+		})
+	}
+}
+
+func TestRequiredCheckManifestDigestOrderIndependent(t *testing.T) {
+	head := forge.OID("aaaa")
+	rc := forge.RequiredChecks{
+		Required: []forge.RequiredCheckRef{{Context: "b", AppID: i64(1)}, {Context: "a", AppID: i64(1)}},
+		Runs: []forge.CheckRun{
+			{Name: "a", AppID: 1, RunID: 1, HeadOID: head, Status: "completed", Conclusion: "success", StartedAt: "t1"},
+			{Name: "b", AppID: 1, RunID: 2, HeadOID: head, Status: "completed", Conclusion: "success", StartedAt: "t1"}}}
+	m1, err := BuildRequiredCheckManifest(rc, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 反轉 forge 回傳順序
+	rc.Required[0], rc.Required[1] = rc.Required[1], rc.Required[0]
+	rc.Runs[0], rc.Runs[1] = rc.Runs[1], rc.Runs[0]
+	m2, err := BuildRequiredCheckManifest(rc, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := ManifestDigest(m1)
+	d2, _ := ManifestDigest(m2)
+	if d1 != d2 || !strings.HasPrefix(d1, "sha256:") {
+		t.Fatalf("forge 回傳順序不得影響 digest：%s vs %s", d1, d2)
+	}
+}
+
+func TestVerifyRequiredCheckManifest(t *testing.T) {
+	head := forge.OID("aaaa")
+	base := RequiredCheckManifest{ManifestSchema: 1,
+		RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}},
+		Runs: []CheckRunEntry{{Context: "ci", RequiredAppID: i64(42), RunName: "ci",
+			RunAppID: 42, RunID: 1, HeadSHA: "aaaa", Status: "completed", Conclusion: "success"}}}
+	if err := VerifyRequiredCheckManifest(base, head); err != nil {
+		t.Fatal(err)
+	}
+	pending := base
+	pending.Runs = []CheckRunEntry{{Context: "ci", RequiredAppID: i64(42), RunName: "ci",
+		RunAppID: 42, RunID: 1, HeadSHA: "aaaa", Status: "in_progress"}}
+	if err := VerifyRequiredCheckManifest(pending, head); err == nil {
+		t.Fatal("pending 應不符（三態皆為不符，B5 §5.3(3)）")
+	}
+	wrongHead := base
+	wrongHead.Runs[0].HeadSHA = "bbbb"
+	if err := VerifyRequiredCheckManifest(wrongHead, head); err == nil {
+		t.Fatal("head 不符應 fail")
+	}
+}
+```
+
+- [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run 'RequiredCheck' -count=1`，預期 FAIL（型別不存在）**
+- [ ] **Step 3: 實作**
+
+```go
+// gate3_manifest.go——B5 spec §5.1(5)(6) canonical manifest 收斂。
+// Digest 沿 domainspec canonical 先例：struct 宣告序＝spec 字面序，
+// encoding/json 的欄位序即 canonical 序；陣列由 Build* 排序後才進 struct。
+package gatepolicy
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"github.com/slam0504/sdlc-workbench/internal/forge"
+)
+
+type RequiredCheckEntry struct {
+	Context string `json:"context"`
+	AppID   *int64 `json:"app_id"`
+}
+type CheckRunEntry struct {
+	Context       string `json:"context"`
+	RequiredAppID *int64 `json:"required_app_id"`
+	RunName       string `json:"run_name"`
+	RunAppID      int64  `json:"run_app_id"`
+	RunID         int64  `json:"run_id"`
+	HeadSHA       string `json:"head_sha"`
+	Status        string `json:"status"`
+	Conclusion    string `json:"conclusion"`
+}
+type RequiredCheckManifest struct {
+	ManifestSchema int                  `json:"manifest_schema"`
+	RequiredChecks []RequiredCheckEntry `json:"required_checks"`
+	Runs           []CheckRunEntry      `json:"runs"`
+}
+
+func ManifestDigest(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func keyOf(ctx string, app *int64) string {
+	if app == nil {
+		return ctx + "\x00*"
+	}
+	return fmt.Sprintf("%s\x00%d", ctx, *app)
+}
+
+// BuildRequiredCheckManifest：attribution＋current-effective＋排序＋一對一
+// coverage（B5 §5.1(5)）。任何違規（重複 required key、歸屬歧義、缺漏、
+// 一 run 多歸屬）→ error，不產出部分 manifest。
+func BuildRequiredCheckManifest(rc forge.RequiredChecks, head forge.OID) (RequiredCheckManifest, error) {
+	seen := map[string]bool{}
+	for _, r := range rc.Required {
+		k := keyOf(r.Context, r.AppID)
+		if seen[k] {
+			return RequiredCheckManifest{}, fmt.Errorf("required check 重複 key：%s", k)
+		}
+		seen[k] = true
+	}
+	used := map[int64]string{} // run_id → 已歸屬的 required key（一 run 至多歸屬一 required）
+	var runs []CheckRunEntry
+	for _, r := range rc.Required {
+		var candidates []forge.CheckRun
+		apps := map[int64]bool{}
+		for _, cr := range rc.Runs {
+			if cr.Name != r.Context {
+				continue
+			}
+			if r.AppID != nil && cr.AppID != *r.AppID {
+				continue
+			}
+			candidates = append(candidates, cr)
+			apps[cr.AppID] = true
+		}
+		if r.AppID == nil && len(apps) > 1 {
+			return RequiredCheckManifest{}, fmt.Errorf("required %q（app_id 不限）歸屬歧義：%d 個不同 app 的同名 run", r.Context, len(apps))
+		}
+		if len(candidates) == 0 {
+			return RequiredCheckManifest{}, fmt.Errorf("required %s missing：無可歸屬 run", keyOf(r.Context, r.AppID))
+		}
+		eff := candidates[0] // current-effective：started_at 最新、tie run_id 大者
+		for _, c := range candidates[1:] {
+			if c.StartedAt > eff.StartedAt || (c.StartedAt == eff.StartedAt && c.RunID > eff.RunID) {
+				eff = c
+			}
+		}
+		if prev, ok := used[eff.RunID]; ok {
+			return RequiredCheckManifest{}, fmt.Errorf("run %d 多重歸屬：%s 與 %s", eff.RunID, prev, keyOf(r.Context, r.AppID))
+		}
+		used[eff.RunID] = keyOf(r.Context, r.AppID)
+		runs = append(runs, CheckRunEntry{Context: r.Context, RequiredAppID: r.AppID,
+			RunName: eff.Name, RunAppID: eff.AppID, RunID: eff.RunID, HeadSHA: string(eff.HeadOID),
+			Status: eff.Status, Conclusion: eff.Conclusion})
+	}
+	required := append([]forge.RequiredCheckRef(nil), rc.Required...)
+	sort.Slice(required, func(i, j int) bool { return keyOf(required[i].Context, required[i].AppID) < keyOf(required[j].Context, required[j].AppID) })
+	sort.Slice(runs, func(i, j int) bool { return keyOf(runs[i].Context, runs[i].RequiredAppID) < keyOf(runs[j].Context, runs[j].RequiredAppID) })
+	entries := make([]RequiredCheckEntry, len(required))
+	for i, r := range required {
+		entries[i] = RequiredCheckEntry{Context: r.Context, AppID: r.AppID}
+	}
+	return RequiredCheckManifest{ManifestSchema: 1, RequiredChecks: entries, Runs: runs}, nil
+}
+
+// VerifyRequiredCheckManifest：收斂後逐筆驗證——全 completed+success、
+// 全 head_sha == promotion_head（B5 §5.1(5) 驗證條件；missing 已由
+// Build 擋下）。
+func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error {
+	if m.ManifestSchema != 1 {
+		return fmt.Errorf("manifest_schema %d 不支援", m.ManifestSchema)
+	}
+	if len(m.RequiredChecks) != len(m.Runs) {
+		return fmt.Errorf("coverage 破缺：required %d、runs %d", len(m.RequiredChecks), len(m.Runs))
+	}
+	for _, r := range m.Runs {
+		if r.Status != "completed" || r.Conclusion != "success" {
+			return fmt.Errorf("required %q 非 success（status=%s conclusion=%s）", r.Context, r.Status, r.Conclusion)
+		}
+		if r.HeadSHA != string(head) {
+			return fmt.Errorf("required %q head %s ≠ promotion_head %s", r.Context, r.HeadSHA, head)
+		}
+	}
+	return nil
+}
+```
+
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go vet ./internal/gatepolicy/`**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/gatepolicy/gate3_manifest.go internal/gatepolicy/gate3_manifest_test.go
+git commit -m "feat(gatepolicy): B6 Task 4——required-check manifest 收斂（bijection／current-effective／(context,app_id) key，B5 §5.1(5)）"
+```
+
+---
+
+### Task 5: review manifest 收斂（eligibility＋current-effective＋零 CHANGES_REQUESTED）
+
+**Files:**
+- Modify: `internal/gatepolicy/gate3_manifest.go`（追加）
+- Test: `internal/gatepolicy/gate3_manifest_test.go`（追加）
+
+**Interfaces:**
+- Consumes: Task 1 的 `forge.Review`／`forge.Permission`；Task 4 的 `ManifestDigest`。
+- Produces:
+  - `type ReviewEntry struct{ ReviewerLogin, Permission string; ReviewID int64; State, ReviewedHeadSHA, SubmittedAt string }`
+  - `func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) []ReviewEntry`（僅具效力 reviewer、每人一筆 current-effective、依 login 排序）
+  - `func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error`（≥1 APPROVED@head 且零 CHANGES_REQUESTED）
+
+- [ ] **Step 1: 寫 failing tests**
+
+```go
+func rev(login, state, head, at string, id int64) forge.Review {
+	return forge.Review{ReviewID: id, ReviewerLogin: login, State: state,
+		ReviewedHeadOID: forge.OID(head), SubmittedAt: at}
+}
+
+func TestBuildReviewSection(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "eve": forge.PermissionRead}
+	entries := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "t1", 1),
+		rev("alice", "CHANGES_REQUESTED", "aaaa", "t2", 2), // 後者 supersede
+		rev("alice", "COMMENTED", "aaaa", "t3", 3),         // COMMENTED 不改變有效狀態
+		rev("eve", "APPROVED", "aaaa", "t1", 4),            // read 權限：不入 manifest
+		rev("bob", "CHANGES_REQUESTED", "aaaa", "t1", 5),   // 無權限紀錄→None：不入
+	}, perms)
+	if len(entries) != 1 || entries[0].ReviewerLogin != "alice" || entries[0].State != "CHANGES_REQUESTED" {
+		t.Fatalf("僅 alice 的 current-effective（CR）應入 manifest：%+v", entries)
+	}
+}
+
+func TestVerifyReviewSection(t *testing.T) {
+	head := forge.OID("aaaa")
+	ok := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"}}
+	if err := VerifyReviewSection(ok, head); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyReviewSection(nil, head); err == nil {
+		t.Fatal("零 review 應不符")
+	}
+	staleHead := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "APPROVED", ReviewedHeadSHA: "bbbb", SubmittedAt: "t1"}}
+	if err := VerifyReviewSection(staleHead, head); err == nil {
+		t.Fatal("過期 head 的 approval 不算")
+	}
+	withCR := append(append([]ReviewEntry(nil), ok...), ReviewEntry{ReviewerLogin: "carol",
+		Permission: "write", ReviewID: 2, State: "CHANGES_REQUESTED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"})
+	if err := VerifyReviewSection(withCR, head); err == nil {
+		t.Fatal("存在具效力 CHANGES_REQUESTED 應不符（owner 裁決：零 CR）")
+	}
+	dismissed := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"},
+		{ReviewerLogin: "dave", Permission: "write", ReviewID: 2,
+			State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t2"}}
+	if err := VerifyReviewSection(dismissed, head); err != nil {
+		t.Fatalf("DISMISSED 不計入亦不阻擋：%v", err)
+	}
+}
+```
+
+- [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run 'ReviewSection' -count=1`，預期 FAIL**
+- [ ] **Step 3: 實作**
+
+```go
+type ReviewEntry struct {
+	ReviewerLogin   string `json:"reviewer_login"`
+	Permission      string `json:"permission"`
+	ReviewID        int64  `json:"review_id"`
+	State           string `json:"state"`
+	ReviewedHeadSHA string `json:"reviewed_head_sha"`
+	SubmittedAt     string `json:"submitted_at"`
+}
+
+// BuildReviewSection：每具效力 reviewer 至多一筆 current-effective review
+//（B5 §5.1(6)）。eligibility＝permission ∈ {write,maintain,admin}；不具
+// 效力者完全不入（approval 不放行、CHANGES_REQUESTED 亦不阻擋）。
+// current-effective＝state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 中
+// submitted_at 最新（tie 取 review_id 大者）；COMMENTED／PENDING 不參與。
+func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) []ReviewEntry {
+	eff := map[string]forge.Review{}
+	for _, r := range reviews {
+		if !perms[r.ReviewerLogin].Eligible() {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+		default:
+			continue
+		}
+		cur, ok := eff[r.ReviewerLogin]
+		if !ok || r.SubmittedAt > cur.SubmittedAt ||
+			(r.SubmittedAt == cur.SubmittedAt && r.ReviewID > cur.ReviewID) {
+			eff[r.ReviewerLogin] = r
+		}
+	}
+	logins := make([]string, 0, len(eff))
+	for l := range eff {
+		logins = append(logins, l)
+	}
+	sort.Strings(logins)
+	out := make([]ReviewEntry, 0, len(logins))
+	for _, l := range logins {
+		r := eff[l]
+		out = append(out, ReviewEntry{ReviewerLogin: l, Permission: string(perms[l]),
+			ReviewID: r.ReviewID, State: r.State, ReviewedHeadSHA: string(r.ReviewedHeadOID),
+			SubmittedAt: r.SubmittedAt})
+	}
+	return out
+}
+
+// VerifyReviewSection：≥1 current-effective APPROVED@promotion_head，且
+// 不存在任何 current-effective CHANGES_REQUESTED（owner 裁決：fail-closed
+// 預設，限具效力 reviewer）；DISMISSED 不計入亦不阻擋。
+func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error {
+	approvedAtHead := false
+	for _, e := range entries {
+		switch e.State {
+		case "CHANGES_REQUESTED":
+			return fmt.Errorf("reviewer %s 有 current-effective CHANGES_REQUESTED（零 CR 條件）", e.ReviewerLogin)
+		case "APPROVED":
+			if e.ReviewedHeadSHA == string(head) {
+				approvedAtHead = true
+			}
+		}
+	}
+	if !approvedAtHead {
+		return fmt.Errorf("無 current-effective APPROVED 於 promotion_head %s", head)
+	}
+	return nil
+}
+```
+
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；跑 `go test -race ./internal/gatepolicy/ -count=1` 全包**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/gatepolicy/gate3_manifest.go internal/gatepolicy/gate3_manifest_test.go
+git commit -m "feat(gatepolicy): B6 Task 5——review manifest 收斂（eligibility／current-effective／零 CR，B5 §5.1(6)）"
+```
+
+---
+
+### Task 6: `gate3_promotion` policy 骨架＋註冊
+
+**Files:**
+- Create: `internal/gatepolicy/gate3.go`
+- Test: `internal/gatepolicy/gate3_test.go`
+- Modify: `app.go`（`ensureGate` 的 registry，app.go:3888-3894）
+
+**Interfaces:**
+- Consumes: `gate.GatePolicy` interface（policy.go）、`gate.Binding`／`gate.GateRequest`／`gate.StaleCause`；Task 4-5 的 Build/Verify（C1 於 deps 內呼叫，本 task 僅編排）。
+- Produces:
+  - `type Gate3Deps struct{ VerifyTaskRun func(taskRunID, snapshotDigest string) error; VerifyForge func(promotionHead, mainBase, requiredCheckDigest string) error; VerifyProvenance func(taskRunID, provenanceDigest, promotionHead string) error }`
+  - `func NewGate3Policy(deps Gate3Deps) gate.GatePolicy`——註冊名 `"gate3_promotion"`、subject 形狀 `taskrun:<ULID>`；deps 為 nil 時對應檢查回「gate3: dependency not wired（C1）」error（fail closed）。
+
+- [ ] **Step 1: 寫 failing tests**
+
+```go
+package gatepolicy
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/slam0504/sdlc-workbench/internal/gate"
+)
+
+func gate3Bindings() []gate.Binding {
+	d := "sha256:" + strings.Repeat("ab", 32)
+	oid := "git:sha1:" + strings.Repeat("a", 40)
+	return []gate.Binding{
+		{Kind: "task_run", Ref: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Digest: d},
+		{Kind: "promotion_head", Ref: oid, Digest: oid},
+		{Kind: "main_base", Ref: oid, Digest: oid},
+		{Kind: "oracle_surface", Digest: d},
+		{Kind: "required_check_manifest", Digest: d},
+		{Kind: "review_evidence_provenance", Digest: d},
+	}
+}
+
+func TestGate3ValidateRequestBindingShapes(t *testing.T) {
+	p := NewGate3Policy(Gate3Deps{})
+	ok := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	if err := p.ValidateRequest(ok); err != nil {
+		t.Fatal(err)
+	}
+	missing := ok
+	missing.Bindings = ok.Bindings[:5] // 少 review_evidence_provenance
+	if err := p.ValidateRequest(missing); err == nil {
+		t.Fatal("缺 binding 應拒絕")
+	}
+	badSubject := ok
+	badSubject.Subject = "plan:x"
+	if err := p.ValidateRequest(badSubject); err == nil {
+		t.Fatal("subject 形狀錯誤應拒絕")
+	}
+}
+
+func TestGate3BuildDecisionApprovedRunsAllChecksFailClosed(t *testing.T) {
+	var order []string
+	deps := Gate3Deps{
+		VerifyTaskRun:    func(id, dg string) error { order = append(order, "taskrun"); return nil },
+		VerifyForge:      func(h, b, d string) error { order = append(order, "forge"); return nil },
+		VerifyProvenance: func(id, d, h string) error { order = append(order, "provenance"); return nil },
+	}
+	p := NewGate3Policy(deps)
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "taskrun,forge,provenance" {
+		t.Fatalf("重驗順序應為 §5.3 序：%v", order)
+	}
+	// 任一 deps 失敗 → fail closed
+	deps.VerifyForge = func(h, b, d string) error { return errors.New("head moved") }
+	p = NewGate3Policy(deps)
+	if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil {
+		t.Fatal("forge 重驗失敗應 fail closed")
+	}
+}
+
+func TestGate3BuildDecisionRejectedSkipsReverify(t *testing.T) {
+	called := false
+	p := NewGate3Policy(Gate3Deps{VerifyTaskRun: func(id, dg string) error { called = true; return nil }})
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	if _, err := p.BuildDecision(req, "rejected", gate.DecisionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("rejected 分支跳過重驗（B5 §5.3(6)）")
+	}
+}
+
+func TestGate3NilDepsFailClosed(t *testing.T) {
+	p := NewGate3Policy(Gate3Deps{})
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil ||
+		!strings.Contains(err.Error(), "not wired") {
+		t.Fatal("deps 未接線應 fail closed 且錯誤具名")
+	}
+}
+```
+
+- [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run Gate3 -count=1`，預期 FAIL**
+- [ ] **Step 3: 實作 `gate3.go`**
+
+```go
+// gate3.go——B5 spec §5 的 Gate 3 policy 骨架（B6）：binding 形狀驗證與
+// 決議時重驗「編排」在此凍結；重驗的三組實體檢查（TaskRun currentness、
+// forge 現時狀態、provenance 重建）以 Gate3Deps 注入，C1a/C1b/C1c 接線。
+// deps 未接線時 fail closed——註冊存在但不可能誤放行。
+package gatepolicy
+
+import (
+	"fmt"
+	"regexp"
+
+	"github.com/slam0504/sdlc-workbench/internal/gate"
+)
+
+var reTaskRunRef = regexp.MustCompile(`^taskrun:[0-9A-HJKMNP-TV-Z]{26}$`)
+
+type Gate3Deps struct {
+	VerifyTaskRun    func(taskRunID, snapshotDigest string) error            // §5.3(1)
+	VerifyForge      func(promotionHead, mainBase, requiredCheckDigest string) error // §5.3(2)(3)(4)
+	VerifyProvenance func(taskRunID, provenanceDigest, promotionHead string) error   // §5.3(5)
+}
+
+type gate3BindingReq struct {
+	kind     string
+	digestRe *regexp.Regexp
+	refRe    *regexp.Regexp
+}
+
+var gate3BindingReqs = []gate3BindingReq{
+	{kind: "task_run", digestRe: reSHA256, refRe: reTaskRunRef},
+	{kind: "promotion_head", digestRe: reGitOID},
+	{kind: "main_base", digestRe: reGitOID},
+	{kind: "oracle_surface", digestRe: reSHA256},
+	{kind: "required_check_manifest", digestRe: reSHA256},
+	{kind: "review_evidence_provenance", digestRe: reSHA256},
+}
+
+type Gate3Policy struct{ deps Gate3Deps }
+
+var _ gate.GatePolicy = (*Gate3Policy)(nil)
+
+func NewGate3Policy(deps Gate3Deps) gate.GatePolicy { return &Gate3Policy{deps: deps} }
+
+func (p *Gate3Policy) ValidateRequest(req gate.GateRequest) error {
+	if !reTaskRunRef.MatchString(req.Subject) {
+		return fmt.Errorf("gate3: subject 形狀必須為 taskrun:<ULID>，得 %q", req.Subject)
+	}
+	found := map[string]gate.Binding{}
+	for _, b := range req.Bindings {
+		if _, dup := found[b.Kind]; dup {
+			return fmt.Errorf("gate3: binding %q 重複", b.Kind)
+		}
+		found[b.Kind] = b
+	}
+	for _, r := range gate3BindingReqs {
+		b, ok := found[r.kind]
+		if !ok {
+			return fmt.Errorf("gate3: 缺 binding %q", r.kind)
+		}
+		if r.digestRe != nil && !r.digestRe.MatchString(b.Digest) {
+			return fmt.Errorf("gate3: binding %q digest 形狀不符：%q", r.kind, b.Digest)
+		}
+		if r.refRe != nil && !r.refRe.MatchString(b.Ref) {
+			return fmt.Errorf("gate3: binding %q ref 形狀不符：%q", r.kind, b.Ref)
+		}
+	}
+	if len(req.Bindings) != len(gate3BindingReqs) {
+		return fmt.Errorf("gate3: binding 數 %d ≠ %d（不得有未知 binding）", len(req.Bindings), len(gate3BindingReqs))
+	}
+	return nil
+}
+
+// BuildDecision：approved 分支執行 §5.3 決議時重驗（fail closed）；
+// rejected 分支僅需 reason（由 Service 層既有驗證），跳過重驗。
+func (p *Gate3Policy) BuildDecision(req gate.GateRequest, decision string, _ gate.DecisionInput) (*gate.Metadata, error) {
+	if decision != "approved" {
+		return nil, nil
+	}
+	b := map[string]gate.Binding{}
+	for _, x := range req.Bindings {
+		b[x.Kind] = x
+	}
+	if p.deps.VerifyTaskRun == nil || p.deps.VerifyForge == nil || p.deps.VerifyProvenance == nil {
+		return nil, fmt.Errorf("gate3: dependency not wired（C1 接線前不可決議）")
+	}
+	taskRunID := b["task_run"].Ref[len("taskrun:"):]
+	if err := p.deps.VerifyTaskRun(taskRunID, b["task_run"].Digest); err != nil {
+		return nil, fmt.Errorf("gate3 重驗(1) taskrun: %w", err)
+	}
+	if err := p.deps.VerifyForge(b["promotion_head"].Digest, b["main_base"].Digest, b["required_check_manifest"].Digest); err != nil {
+		return nil, fmt.Errorf("gate3 重驗(2-4) forge: %w", err)
+	}
+	if err := p.deps.VerifyProvenance(taskRunID, b["review_evidence_provenance"].Digest, b["promotion_head"].Digest); err != nil {
+		return nil, fmt.Errorf("gate3 重驗(5) provenance: %w", err)
+	}
+	return nil, nil
+}
+
+func (p *Gate3Policy) SupersessionKey(gateName, subject string) string {
+	return gateName + "\x00" + subject
+}
+
+// ReconcileBindings：Gate 3 record 的 staleness 由 TaskRun currentness 承載
+//（B5 §4.3 決議時重驗為主）；骨架期回空——C1a 接 TaskRun reader 後補
+// taskrun STALE → gate3 record stale 的對應。
+func (p *Gate3Policy) ReconcileBindings(_ gate.ApprovalRecord) ([]gate.StaleCause, error) {
+	return nil, nil
+}
+```
+
+- [ ] **Step 4: 在 `ensureGate()` registry（app.go:3888-3894）追加一行**
+
+```go
+	"gate3_promotion": gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{}),
+```
+
+（deps 空＝fail closed，C1 接線時替換；本行使 registry 完整、Reconcile 對未來 gate3 record 不落 unknown-gate 分支。）
+
+- [ ] **Step 5: 跑 Step 2 指令預期 PASS；`go test -race -count=1 .` root 包確認 ensureGate 無回歸**
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/gatepolicy/gate3.go internal/gatepolicy/gate3_test.go app.go
+git commit -m "feat(gatepolicy): B6 Task 6——gate3_promotion policy 骨架與註冊（B5 §5.2／§5.3，deps fail closed 待 C1）"
+```
+
+---
+
+### Task 7: wsregistry Entry 綁定欄位＋write-once 方法
+
+**Files:**
+- Modify: `internal/wsregistry/store.go`（Entry struct＋新方法）
+- Test: `internal/wsregistry/store_test.go`（追加；沿該包既有測試檔）
+
+**Interfaces:**
+- Consumes: 既有 `mutate(wsid string, fn func(*Entry)) error`（store.go:359——單交易欄位更新＋tombstone 檢查）。
+- Produces:
+  - `Entry` 追加欄位：`TaskRunID string \`json:"task_run_id,omitempty"\``、`SnapshotDigest string \`json:"snapshot_digest,omitempty"\``（omitempty——舊檔零遷移）。
+  - `func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error`——write-once：已有不同值即拒絕（B5 §3.1 不允許重綁）；同值冪等成功（resume 回填路徑）。C1a 於 `commitSessionIdentity` 掛點呼叫。
+
+- [ ] **Step 1: 寫 failing tests**
+
+```go
+func TestSetTaskRunBindingWriteOnce(t *testing.T) {
+	s := newTestStore(t) // 沿該包既有 helper；若名稱不同，用現行建構慣例
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Get("w1")
+	if e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" || e.SnapshotDigest != "sha256:aa" {
+		t.Fatalf("綁定欄位未落：%+v", e)
+	}
+	// 冪等：同值再寫成功（resume 依 journal 回填）
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatalf("同值應冪等：%v", err)
+	}
+	// 不同值：拒絕（不允許重綁，B5 §3.1）
+	if err := s.SetTaskRunBinding("w1", "01BX5ZZKBKACTAV9WEVGEMMVRZ", "sha256:bb"); err == nil {
+		t.Fatal("重綁應拒絕")
+	}
+}
+
+func TestSetTaskRunBindingTombstoned(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("w1", "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
+		t.Fatal("tombstoned entry 應拒絕（mutate 內建檢查）")
+	}
+}
+```
+
+（持久化 round-trip 由 `mutate`→`persistLocked` 既有四步契約承載；該包既有測試已覆蓋 persist，僅需確認新欄位經 JSON round-trip 不丟——在第一個測試補 re-open 斷言：以同 path 重開 Store 後 `Get("w1")` 欄位仍在。）
+
+- [ ] **Step 2: 跑 `go test -race ./internal/wsregistry/ -run TaskRunBinding -count=1`，預期 FAIL**
+- [ ] **Step 3: 實作（Entry 加兩欄位＋方法）**
+
+```go
+// SetTaskRunBinding 寫入 implementation session 的 TaskRun 綁定（B5 spec
+// §3.1）。write-once：既有綁定與參數不同即拒絕（不允許重綁）；同值冪等
+//（resume 依 journal 回填 Entry 的路徑）。tombstone 由 mutate 統一拒絕。
+// 權威階層（B5 §3.2(2)）：本欄位是 TaskRun journal 的 derived cache——
+// 衝突一律以 journal 為準修復，不得反向補寫 journal。
+func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error {
+	if taskRunID == "" || snapshotDigest == "" {
+		return fmt.Errorf("wsregistry: task_run_id 與 snapshot_digest 不得為空")
+	}
+	var conflict error
+	err := s.mutate(wsid, func(e *Entry) {
+		if e.TaskRunID != "" && (e.TaskRunID != taskRunID || e.SnapshotDigest != snapshotDigest) {
+			conflict = fmt.Errorf("wsregistry: %q 已綁定 taskrun %s，拒絕重綁為 %s", wsid, e.TaskRunID, taskRunID)
+			return
+		}
+		e.TaskRunID = taskRunID
+		e.SnapshotDigest = snapshotDigest
+	})
+	if err != nil {
+		return err
+	}
+	return conflict
+}
+```
+
+註：`mutate` 的 fn 無 error 回傳——conflict 以閉包變數帶出，且 conflict 時**不改欄位**即無多餘 persist 語意（`mutate` 仍會走一次 persist，同值冪等寫入無害；若既有 `mutate` 對零變更有短路，沿其行為）。實作時讀 `mutate` 現行為並在測試固定。
+
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race ./internal/wsregistry/ -count=1` 全包**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/wsregistry/
+git commit -m "feat(wsregistry): B6 Task 7——Entry TaskRun 綁定欄位＋SetTaskRunBinding write-once（B5 §3.1／§3.2(2)）"
+```
+
+---
+
+### Task 8: `appcore.Manager` turn-admission freeze 旗標
+
+**Files:**
+- Modify: `internal/appcore/manager.go`（slot 加欄位＋`FreezeTurns`＋`BeginSubmit` 檢查）
+- Test: `internal/appcore/manager_test.go`（追加；沿該包既有測試慣例）
+
+**Interfaces:**
+- Consumes: 既有 slot 結構與 `BeginSubmit(w WSID) (SubmissionID, error)`（manager.go:645）。
+- Produces: `func (m *Manager) FreezeTurns(w WSID, during func()) error`——於 `m.mu` 臨界區內設 slot 的 `turnsFrozen = true`（monotonic，無解除方法）並呼叫 `during()`（仍持 `m.mu`——B5 §4.2(2) 雙鎖同持的 manager 側；`during` 內由 App 取 `apprMu` 設 approval 旗標）。`BeginSubmit` 對 frozen slot 回具名 error。Task 9 與 C1a 使用。
+
+- [ ] **Step 1: 寫 failing tests**
+
+```go
+func TestFreezeTurnsBlocksBeginSubmit(t *testing.T) {
+	m := newTestManager(t) // 沿該包既有建構慣例（appcore.New + 最小 Config）
+	w := reserveActive(t, m) // 既有測試應有 reserve→active 流程 helper；無則內聯
+	ran := false
+	if err := m.FreezeTurns(w, func() { ran = true }); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("during 回呼必須在凍結時執行（雙鎖同持窗口）")
+	}
+	if _, err := m.BeginSubmit(w); err == nil {
+		t.Fatal("frozen slot 的 BeginSubmit 應拒絕")
+	}
+}
+
+func TestFreezeTurnsMonotonicAndUnknownWSID(t *testing.T) {
+	m := newTestManager(t)
+	if err := m.FreezeTurns(WSID("nope"), func() {}); err == nil {
+		t.Fatal("未知 WSID 應回 error")
+	}
+	w := reserveActive(t, m)
+	if err := m.FreezeTurns(w, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	// 重複凍結冪等成功（monotonic set-once）
+	if err := m.FreezeTurns(w, func() {}); err != nil {
+		t.Fatalf("重複凍結應冪等：%v", err)
+	}
+}
+```
+
+- [ ] **Step 2: 跑 `go test -race ./internal/appcore/ -run FreezeTurns -count=1`，預期 FAIL**
+- [ ] **Step 3: 實作**
+
+slot struct 加 `turnsFrozen bool`（zero value＝未凍結，restart 後由 C1a startup repair 依 journal 重建——B5 §4.2(2)）：
+
+```go
+// FreezeTurns 設定該 WSID 的 turn-admission 凍結旗標（monotonic——B5 spec
+// §4.2(2)：set-once、生命週期內不清除；重啟後由 startup repair 自 TaskRun
+// journal 重建）。during 在仍持 m.mu 時執行——freeze 設定端的雙鎖同持
+// 窗口（manager 鎖→apprMu 固定順序）由呼叫端在 during 內取 apprMu 完成；
+// 除此路徑外任何程式不得同時持有兩鎖。
+func (m *Manager) FreezeTurns(w WSID, during func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, ok := m.slots[w]
+	if !ok {
+		return fmt.Errorf("appcore: FreezeTurns 未知 WSID %q", w)
+	}
+	sl.turnsFrozen = true
+	if during != nil {
+		during()
+	}
+	return nil
+}
+```
+
+`BeginSubmit`（manager.go:645）於既有 phase 檢查後追加：
+
+```go
+	if sl.turnsFrozen {
+		return "", fmt.Errorf("appcore: session %q 已凍結（TaskRun STALE fail closed），拒絕新 turn", w)
+	}
+```
+
+- [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race ./internal/appcore/ -count=1` 全包**
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/appcore/
+git commit -m "feat(appcore): B6 Task 8——FreezeTurns monotonic 旗標＋BeginSubmit 拒絕（B5 §4.2(2)）"
+```
+
+---
+
+### Task 9: App approval freeze 旗標＋雙鎖設定端＋resolveApproval 檢查
+
+**Files:**
+- Modify: `app.go`——`apprMu` 欄位群（app.go:401-406 附近加 `apprFrozen`）、`resolveApproval`（app.go:6783-6810）、新增 `freezeImplementationSession`
+- Test: `app_freeze_test.go`（新檔，沿 app_*_test.go topic 檔慣例）
+
+**Interfaces:**
+- Consumes: Task 8 的 `manager.FreezeTurns(w, during)`；既有 `apprPending`／`apprOrder`（app.go:401-406）、`pendingApproval.resolve(allow bool, reason string)`（denyApprovalsForRemove 呼叫形狀，app.go:7076-7080）。
+- Produces: `func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error`——**caller 必須持 workflowMu**（單一寫入者）；內部 `manager.FreezeTurns(w, during)`，`during` 取 `apprMu` 設 `apprFrozen[w]`＋原子 drain 該 WSID pending；兩鎖釋放後鎖外逐筆 `resolve(false, reason)`（best-effort，合併錯誤回傳、不回滾旗標）。`resolveApproval` 對 `allow=true` 且 frozen 拒絕；`allow=false` 一律放行。C1a 的 STALE 觸發序列呼叫本方法。
+
+- [ ] **Step 1: 前置確認（读码，不改碼）**：`pendingApproval` struct 是否已有 WSID 歸屬欄位（`denyApprovalsForRemove` 能按 WSID 逐筆 deny，推定有——找到該欄位名）；`resolve` 的簽名與鎖外呼叫慣例（app.go:7076-7080 現行形狀）。以下步驟以欄位名 `wsid` 書寫，實作時對齊實名。
+- [ ] **Step 2: 寫 failing tests**
+
+```go
+// app_freeze_test.go——B6 Task 9：freeze latch 的 approval 側（B5 §4.2(2)(3)）。
+func TestFreezeImplementationSessionDrainsAndBlocksAllow(t *testing.T) {
+	a := newApprovalTestApp(t) // 沿 app_test.go 既有 approval 測試建構 helper
+	w := startSessionWithPendingApproval(t, a, "appr-1") // 造出一筆 pending
+	a.workflowMu.Lock()
+	err := a.freezeImplementationSession(w, "taskrun stale")
+	a.workflowMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// drained：pending 已不在，且已被 resolve(false)
+	if _, ok := a.lookupPendingForTest("appr-1"); ok {
+		t.Fatal("pending 應已 drain")
+	}
+	// 之後任何 allow=true 被拒；allow=false 仍合法
+	if err := a.resolveApprovalForTest("appr-2-late", true); err == nil {
+		t.Fatal("frozen 後 allow 應拒絕")
+	}
+}
+
+func TestResolveApprovalDenyAlwaysLegalWhenFrozen(t *testing.T) {
+	a := newApprovalTestApp(t)
+	w := startSessionWithPendingApproval(t, a, "appr-1")
+	// 凍結但故意留一筆晚註冊的 pending（模擬 latch 設定前已 admit 的 turn 之後續 approval）
+	a.workflowMu.Lock()
+	_ = a.freezeImplementationSession(w, "stale")
+	a.workflowMu.Unlock()
+	registerLatePending(t, a, w, "appr-late")
+	if err := a.resolveApprovalForTest("appr-late", false); err != nil {
+		t.Fatalf("deny 永遠合法（B5 §4.2(3)）：%v", err)
+	}
+	if err := a.resolveApprovalForTest("appr-late2", true); err == nil {
+		t.Fatal("allow 應被旗標擋下")
+	}
+}
+```
+
+測試 helper（`newApprovalTestApp`／`startSessionWithPendingApproval`／`lookupPendingForTest`／`resolveApprovalForTest`／`registerLatePending`）沿 app_test.go 既有 approval 流程測試的建構方式抽取；white-box in-package（`package main` 測試檔）可直接操作 `apprPending`。
+
+- [ ] **Step 3: 跑 `go test -race -run 'Freeze|ResolveApprovalDeny' -count=1 .`，預期 FAIL**
+- [ ] **Step 4: 實作**
+
+App struct（apprMu 欄位群旁）加：
+
+```go
+	// apprFrozen：per-WSID approval 凍結旗標（B5 spec §4.2(2)——freeze latch
+	// 的 apprMu 鎖域側；monotonic set-once）。寫入唯一路徑＝
+	// freezeImplementationSession（持 workflowMu 的 freeze 序列，經
+	// manager.FreezeTurns 的 during 回呼在雙鎖同持下設定）。
+	// resolveApproval 對 allow=true 檢查；allow=false 永遠合法。
+	apprFrozen map[string]bool
+```
+
+（`NewApp` 初始化 `apprFrozen: map[string]bool{}`，沿 apprPending 慣例。）
+
+```go
+// freezeImplementationSession——B5 spec §4.2(1)(b)(2)：freeze latch 設定端。
+// caller 必須持有 workflowMu（單一寫入者）。鎖序固定：manager 鎖 →
+// apprMu（同持，FreezeTurns 的 during 窗口內取得）→ 設兩旗標＋原子 drain
+// → 逆序釋放 → 鎖外逐筆 resolve(false)（best-effort：失敗合併回傳＋不
+// 回滾旗標——旗標與 drain 是不可回滾的記憶體操作，resolve 失敗不解除
+// freeze）。除本路徑外，任何程式不得同時持有 manager 鎖與 apprMu。
+func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
+	var drained []*pendingApproval
+	err := a.manager.FreezeTurns(w, func() {
+		a.apprMu.Lock()
+		defer a.apprMu.Unlock()
+		a.apprFrozen[string(w)] = true
+		for id, p := range a.apprPending {
+			if p.wsid != string(w) { // 欄位名依 Step 1 確認結果對齊
+				continue
+			}
+			drained = append(drained, p)
+			delete(a.apprPending, id)
+			a.removeApprOrderLocked(id) // 沿 unregisterApproval 的 apprOrder 同步慣例
+		}
+	})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, p := range drained {
+		if rerr := p.resolve(false, reason); rerr != nil { // 沿 denyApprovalsForRemove 形狀
+			errs = append(errs, rerr)
+		}
+	}
+	return errors.Join(errs...) // 合併回報；不回滾旗標
+}
+```
+
+`resolveApproval`（app.go:6783-6810）在 `apprMu` 臨界區內、取出 pending 之前追加：
+
+```go
+	if allow && a.apprFrozen[p.wsid] {
+		return fmt.Errorf("approval %s：session 已凍結（fail closed），僅可 deny", id)
+	}
+```
+
+（檢查位置＝線性化點：`apprMu` 內、`p.resolve` 呼叫前——B5 §4.2(3)；`allow=false` 不檢查。）
+
+- [ ] **Step 5: 跑 Step 3 指令預期 PASS；`go test -race -count=1 .` root 包全綠（特別確認既有 approval／remove 測試零回歸——`denyApprovalsForRemove` 不受影響：它走自己的 deny 路徑且 deny 永遠合法）**
+- [ ] **Step 6: Commit**
+
+```bash
+git add app.go app_freeze_test.go
+git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定端＋resolveApproval fail-closed 檢查（B5 §4.2(2)(3)）"
+```
+
+---
+
+### Task 10: 全套驗證＋B6 驗收對照
+
+**Files:**
+- 無新增；驗證性 task。
+
+- [ ] **Step 1: `go vet ./...`，預期零輸出**
+- [ ] **Step 2: `go test -race ./... -count=1`，預期全綠（wall-clock 名單 `docs/spikes/m3b-results.md` §7 五條若偶發，依 B1 慣例標注不算回歸、重跑確認）**
+- [ ] **Step 3: `cd frontend && npx vue-tsc --noEmit && npx vitest run`——本票無前端變更，跑一次確認零影響**
+- [ ] **Step 4: B6 驗收條件逐項對照，寫入 commit message 或 PR 描述**：
+  - (1) TaskRun／Forge／Gate 3 application service：forge port（Task 1）、gate3 policy＋manifest（Task 4-6）✅；TaskRun service 本體＝C1a（範圍分界表）。
+  - (2) Wails binding 全部留在 app.go（Task 3/9 只改本體與內部方法）✅。
+  - (3) 只抽 M4 觸及的 orchestration（七入口 detect-only、runEvidence reconcile、approval freeze）✅。
+  - (4) App 未新增 M4 domain mutable state（apprFrozen／turnsFrozen 為 runtime latch，非 domain state；測試注入走 forge.Fake／Gate3Deps）——此判定請 review 者確認。
+  - (5) 抽取部分既有測試全綠含 race ✅（Step 2 證據）。
+- [ ] **Step 5: Commit（若 Step 4 產出文件變更）＋回報**
+
+## Self-Review 紀錄（rev1）
+
+1. **Spec coverage**：B5 §3.2(0)（Task 2-3）、§5.1(5)（Task 4）、§5.1(6) review 節（Task 5）、§5.2/§5.3 編排（Task 6）、§3.1 持久化欄位（Task 7）、§4.2(2)(3) latch 機制（Task 8-9）。§2/§3.2-§3.6/§4.1-4.3 觸發序列/§5.1(6) evidence 節重建/§6 GitHub 實作＝C1a/C1b/C1c（範圍分界表）。
+2. **Placeholder scan**：Task 9 Step 1 的 `pendingApproval.wsid` 欄位名為讀碼確認項（非實作留白）——已以 denyApprovalsForRemove 的按-WSID-deny 行為佐證欄位存在，僅名稱待對齊；Task 2/3 的測試 helper 標注「沿既有／若無則內聯」均附具體作法。
+3. **Type consistency**：`forge.OID`／`forge.Permission`／`RequiredCheckEntry`／`ReviewEntry`／`Gate3Deps` 在 Task 1/4/5/6 間簽名一致；`FreezeTurns(w, during)` 在 Task 8 定義、Task 9 消費一致。
