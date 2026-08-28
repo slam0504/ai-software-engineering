@@ -116,7 +116,7 @@
 
 - **背景**（原 B6）：`app.go` 已達 423,700 bytes，application orchestration 高度集中，與內部文件「輕量接線層」宣稱落差確認；但全面重構會混入大量既有 concurrency 風險——僅抽 M4 會觸碰的部分。拆票依「>2.0 pt 必拆」規則（B6 plan rev3 重算 2.05 pt），owner 於 B6 plan gate 第三輪核准。
 - **HEAD 證據**：同原 B6；plan＝`docs/superpowers/plans/2026-08-28-b6-m4-application-seams.md`（Task 1-6b＋10a）。
-- **驗收條件**：(1) Forge port（型別＋interface＋fake）；(2) gate journal 單一寫入者——讀面七入口 detect-only 遷移＋寫面唯一 Submit 呼叫點入 workflowMu；(3) `gate3_promotion` policy 骨架＋manifest 收斂＋pending 終態封閉（Expired／TerminalCause）；(4) Wails binding 留在 `app.go`、不新增 M4 domain mutable state 或 ad-hoc test hook 於 App aggregate、新測試注入走 interface／fake；(5) 既有測試全綠含 race。**獨立結案**——不待 B6b。
+- **驗收條件**：(1) Forge port（型別＋interface＋fake）；(2) gate journal 單一寫入者——讀面七入口 detect-only 遷移＋寫面唯一 Submit 呼叫點入 workflowMu；(3) `gate3_promotion` policy 骨架＋manifest 收斂＋pending 終態封閉（Expired／TerminalCause）；(4) Wails binding 留在 `app.go`、不新增 M4 domain mutable state 或 ad-hoc test hook 於 App aggregate、新測試注入走 interface／fake；(5) 既有測試全綠含 race。**獨立結案**——不待 B6b；若本票為兩票中後完成者，收尾時確認原 B6 aggregate 關閉。
 - **建議模組**：`app.go`、`internal/forge`（新）、`internal/gate`、`internal/gatepolicy`。
 - **依賴／裁決**：僅依賴 B5 spec；裁決已定（#8＋拆票裁決 2026-08-28）。
 
@@ -124,7 +124,7 @@
 
 - **背景**：同 B6a 拆票脈絡；承載 B5 §3.1／§4.2(2)(3) 的既有 store 與 admission orchestration seams。
 - **HEAD 證據**：同原 B6；plan 同上（Task 7-9＋10b）。
-- **驗收條件**：(1) `wsregistry.Entry` TaskRun 綁定欄位＋雙向 1:1 write-once＋persistOrRollback failure matrix；(2) freeze latch——`FreezeTurns`（兩種 turn admission 檢查）＋approval 旗標＋雙鎖同持設定端＋鎖不洩漏；(3) 同 B6a 驗收 (4)(5)。**B6b 完成後才宣告原 B6 整體驗收完成。**
+- **驗收條件**：(1) `wsregistry.Entry` TaskRun 綁定欄位＋雙向 1:1 write-once＋persistOrRollback failure matrix；(2) freeze latch——`FreezeTurns`（兩種 turn admission 檢查）＋approval 旗標＋雙鎖同持設定端＋鎖不洩漏；(3) 同 B6a 驗收 (4)(5)。**獨立結案**；原 B6 aggregate 於兩票皆完成時關閉、由後完成之票確認（不固定綁在本票）。
 - **建議模組**：`app.go`、`internal/wsregistry`、`internal/appcore`。
 - **依賴／裁決**：僅依賴 B5 spec（B6a→B6b 為建議執行順序、**非技術相依**）；裁決同上。
 
@@ -217,7 +217,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 
 對應 spec、plan、production 與測試均在 repo（`docs/superpowers/specs/2026-08-24-replay-reliability-design.md`、`rebuild_orchestrator.go`）。錯誤盤點根因：auto-memory 索引行過期（本文已正確標「勿再列為待辦」）——索引已同步更正。
 
-## 估點（rev5，A／B／C 軌；0.1 pt＝1 hr 實際工作，不含等候）
+## 估點（rev5 制定、rev6 更新 B6 拆票；A／B／C 軌；0.1 pt＝1 hr 實際工作，不含等候）
 
 拆票依規則執行（>2.0 pt 或混合性質必拆）；「假設」欄記載估點成立前提，前提破壞時該票重估。等候時間（design gate 往返、CI runner 排隊）不計工時、拉長日曆時間，已標注於備註。
 
@@ -272,11 +272,11 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
     `GOTOOLCHAIN=local`（現環境 auto 會自動切換，不設即證據無效）；C1 pilot
     provider 選 **Claude**（實機證據既有、per-WSID ownership 邊界自然；Codex 共用
     app-server generation 增加共享生命週期複雜度）。
-- rev6（2026-08-28，B6 拆票）：B6 plan gate 第三輪 owner 裁決落地——B6 拆 **B6a**（gate 單一寫入者＋Gate 3 policy／manifest，1.45 pt）／**B6b**（綁定持久化＋freeze latch，0.6 pt）；拆票理由＝plan rev3 bottom-up 重估 2.05 pt 逾 2.0 拆票線（原 1.4 pt「僅 service 骨架」前提破壞）。兩票皆僅依賴 B5、可獨立結案；B6a→B6b 為建議順序非技術相依；原 B6 整體驗收於 B6b 完成後宣告。C1 相依 B6→B6a＋B6b；B 軌小計 8.6→9.25、合計 15.1→15.75 pt。
 - rev5（2026-08-27，估點版——rev4 通過 review 後依裁決進入估點）：
   - 加入 A／B／C 軌逐票估點表（合計 15.1 pt）；依「>2.0 pt 或混合必拆」拆
     A1→A1a/A1b、B1→B1a/B1b、B3a→B3a-1/B3a-2、C1→C1a/C1b/C1c；假設欄記載
     前提，破壞即重估。
   - A4 措辭校正（owner 核可於估點 commit 順手修）：GOTOOLCHAIN 自動切換風險
     發生在加入 toolchain directive 的受測 commit，非現行 go.mod。
+- rev6（2026-08-28，B6 拆票）：B6 plan gate 第三輪 owner 裁決落地——B6 拆 **B6a**（gate 單一寫入者＋Gate 3 policy／manifest，1.45 pt）／**B6b**（綁定持久化＋freeze latch，0.6 pt）；拆票理由＝plan rev3 bottom-up 重估 2.05 pt 逾 2.0 拆票線（原 1.4 pt「僅 service 骨架」前提破壞）。兩票皆僅依賴 B5、**各自獨立結案**；B6a→B6b 為建議順序非技術相依；**原 B6 aggregate 於兩票皆完成時關閉、由後完成之票確認**（不固定綁在 B6b）。C1 相依 B6→B6a＋B6b；B 軌小計 8.6→9.25、合計 15.1→15.75 pt。
 - rev1（2026-08-27）：初版。
