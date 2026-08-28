@@ -1,6 +1,6 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
-> 版本：rev6（2026-08-28，design gate 第五輪 3 P1 收斂——freeze 先於一切可失敗 append、pending-completed 前置設定與唯一解除路徑、雙鎖同持與 deny 契約）
+> 版本：rev7（2026-08-28，design gate 第六輪 1 P1＋2 P2 收斂——反向分裂排序禁止＋形狀分流、pending-completed 成功清除點、CommitDecision 錨點校正）
 > 狀態：**待 design gate**
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
 > 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3–rev5 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
@@ -120,8 +120,8 @@ TaskRun 建立到 session publish 之間的競態（List → Lookup → git 讀 
 - **`abandoned`（新終態）**：使用者移除 session 之明示放棄（§3.6），僅可自 `bound` 進入；不可 resume、不可再綁定、產出禁入 Gate 3；transcript／evidence 保留（同 §4.2(3) 審計原則）。
 - **`completed` 觸發時點（rev4 凍結）**：Gate 3 approved 決議當下——`gateDecide` 的 `workflowMu` 臨界區內 `svc.CommitDecision(prepared)`（app.go:5854，臨界區形狀 app.go:5823-5854）成功後、同一臨界區內 append `taskrun_completed`。gate journal 與 TaskRun journal 間的 crash split 由 §3.2(3) repair matrix 依 gate3 record 確定性收斂。completed 後 session 之後續產出不再屬於該 TaskRun（該 TaskRun 不可再送 Gate 3）。
 - **Completed dominance 與 pending-completed（rev5 補——關閉「decision 已落、completed append 失敗、程序未重啟」窗口）**：
-  - **旗標於 `CommitDecision` attempt 之前設定（rev6 調整）**：production gate append 於 write／sync error 直接回錯（service.go:222-261），但底層 record 可能已完整寫入、僅 sync 結果不確定（journal.go:56）——「成功後才設旗標」會在此不確定形狀漏擋。gateDecide approved 分支於 §5.3 重驗全數通過、呼叫 `CommitDecision` **之前**設定 per-TaskRun **pending-completed** 旗標（與 freeze latch 同為持 `workflowMu` 寫入者所有之狀態）。旗標存續期間，凍結序列（§4.2）與移除流程（§3.6）**不得**對該 TaskRun append `taskrun_stale`／`taskrun_abandoned`（兩路徑皆持 `workflowMu`，進入時檢查旗標即互斥）。
-  - `CommitDecision` 或 `taskrun_completed` append 任一失敗或**結果不確定**（crash、sync 不確定形狀）→ fail closed：一律視為「可能已提交」，旗標維持、阻擋持續。**旗標唯一解除路徑（rev6 凍結）**：journal 重新開啟（repair／reopen）後讀取確認——gate3 approved record **存在** → 補 append `taskrun_completed` 收斂（§4.2(4) repair 觸發點）後旗標視為已收斂；**確認不存在** → 決議未提交，清除旗標、Gate 3 request 維持 pending（可重試決議）。除此二形狀外旗標不得清除。
+  - **旗標於 `CommitDecision` attempt 之前設定（rev6 調整；rev7 校正錨點）**：production gate append 於 write／sync error 直接回錯（`CommitDecision`→`appendOp` 錯誤直接回傳，service.go:135-175、append 於 168-170），但底層 record 可能已完整寫入、僅 sync 結果不確定（journal.go:56）——「成功後才設旗標」會在此不確定形狀漏擋。gateDecide approved 分支於 §5.3 重驗全數通過、呼叫 `CommitDecision` **之前**設定 per-TaskRun **pending-completed** 旗標（與 freeze latch 同為持 `workflowMu` 寫入者所有之狀態）。旗標存續期間，凍結序列（§4.2）與移除流程（§3.6）**不得**對該 TaskRun append `taskrun_stale`／`taskrun_abandoned`（兩路徑皆持 `workflowMu`，進入時檢查旗標即互斥）。
+  - **旗標解除限三形狀（rev7 補成功清除點）**：(a) **正常收斂**——`CommitDecision` 與 `taskrun_completed` 兩次 append 皆回傳成功 → 同一 `workflowMu` 臨界區內立即清除旗標（正常 completed 的 session 不受 §3.6 pending-completed 阻擋）；(b)(c) **失敗／不確定分支**——任一 append 失敗或結果不確定（crash、sync 不確定形狀）→ fail closed：一律視為「可能已提交」、旗標維持，僅得於 journal 重新開啟（repair／reopen）後讀取確認解除：gate3 approved record **存在** → 補 append `taskrun_completed` 收斂（§4.2(4) repair 觸發點）；**確認不存在** → 決議未提交，清除旗標、Gate 3 request 維持 pending（可重試決議）。除此三形狀外旗標不得清除。
   - **Dominance 規則**：gate3 approved record（subject `taskrun:<ULID>`）存在 ⇒ 該 TaskRun 的權威終態＝`completed`。若 journal 仍殘留其後的 `taskrun_stale`／`taskrun_abandoned` op（違反阻擋規則的 crash 殘留），projection 層面忽略之＋corruption audit event——以 projection 規則收斂，不需「自終態轉移」的非法 transition。
 
 ### 3.5 Resume（owner 裁決 6d，已定）
@@ -152,7 +152,10 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
 
 **Transition protocol（rev4 凍結——上游 gate stale、TaskRun journal stale、runtime freeze 三狀態的寫入順序與競態關閉）**：
 
-1. **偵測與 ordering（rev6 再調整——freeze 先於任何可失敗的 append）**：durable stale 只產生於持 `workflowMu` 的寫入路徑（§3.2(0) 單一寫入者不變式下的全部寫入面：watcher `reconcileGate1NotifyOnly`、`gateDecide`、`RunEvidence`、TaskRun 建立臨界區）。同一臨界區內依序：(a) 以 detect-only 投影計算 currentness、識別全部受影響的 bound TaskRun——偵測必須與 append 分離（production `Reconcile` 為偵測即 append、append 失敗即返回的形狀，service.go:222-261，不得直接沿用作為第一步）→ (b) **runtime freeze（不可回滾）**：依 (2) 之雙鎖同持鎖序設定兩旗標＋原子 drain pending approvals → (c) durable append：gate journal stale transition（既有 Reconcile append 面）→ `taskrun_stale`。**原則凍結：凍結方向的 runtime 效果先於任何可失敗的 durable append、不以任何 append 成功為前置；放行方向（resume、Gate 3 決議、新 TaskRun 建立）必須以 durable 紀錄與重驗為前置。**(c) 中任一 append 失敗或結果不確定——含 journal degraded（write／sync 錯誤後拒絕後續 append 之既有語意，gate journal.go:11／56、evidence journal.go:23／125）——freeze 維持、錯誤合併回傳呼叫端，journal 收斂延後至 (4) repair。detect-only 讀取路徑（非持鎖）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
+1. **偵測與 ordering（rev6 再調整——freeze 先於任何可失敗的 append）**：durable stale 只產生於持 `workflowMu` 的寫入路徑（§3.2(0) 單一寫入者不變式下的全部寫入面：watcher `reconcileGate1NotifyOnly`、`gateDecide`、`RunEvidence`、TaskRun 建立臨界區）。同一臨界區內依序：(a) 以 detect-only 投影計算 currentness、識別全部受影響的 bound TaskRun——偵測必須與 append 分離（production `Reconcile` 為偵測即 append、append 失敗即返回的形狀，service.go:222-261，不得直接沿用作為第一步）→ (b) **runtime freeze（不可回滾）**：依 (2) 之雙鎖同持鎖序設定兩旗標＋原子 drain pending approvals → (c) durable append——**依 §4.1 形狀決定寫入集合與順序（rev7 凍結——排序禁止反向分裂）**：
+   - **形狀 1（上游核可失效）**：先 append gate journal stale transition（既有 Reconcile append 面）並**確認回傳成功**，才 append `taskrun_stale`；gate append 失敗或結果不確定（含 degraded，gate journal.go:11／56）→ **不得寫 `taskrun_stale`**，僅靠 latch fail closed、錯誤合併回傳——「TaskRun=stale、gate=Active」的反向分裂被排序禁止，不需反向 repair row 與 cause payload。
+   - **形狀 2／3（binding digest 改變、commit missing）**：無對應 gate journal transition，僅 append `taskrun_stale`；此時 gate Active＋TaskRun stale 為**合法組合**，非分裂。
+   - **原則凍結：凍結方向的 runtime 效果先於任何可失敗的 durable append、不以任何 append 成功為前置；放行方向（resume、Gate 3 決議、新 TaskRun 建立）必須以 durable 紀錄與重驗為前置。**任一 append 失敗或結果不確定（degraded 語意同上，evidence journal.go:23／125 同）→ freeze 維持、錯誤合併回傳呼叫端，journal 收斂延後至 (4) repair。detect-only 讀取路徑（非持鎖）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
 2. **Freeze latch（monotonic；rev5 補唯一 owner 與設定端鎖序）**：
    - **唯一 owner**：App 層 per-WSID freeze state，寫入僅由持 `workflowMu` 的 freeze 序列執行（單一寫入者）；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）。set-once，於該 TaskRun 生命週期內永不清除。
    - **設定端固定鎖序（rev6 改雙鎖同持——rev5 逐把釋放形狀作廢：釋放 manager 鎖後、取得 `apprMu` 前，resolveApproval 可先入 `apprMu` 見舊旗標並取出 pending，「仍被 approval 旗標擋下」不成立）**：`workflowMu`（已持）→ 取 manager 鎖 → 取 `apprMu` → 設 turn-admission 與 approval 兩旗標＋於 `apprMu` 內**原子 drain** 該 WSID 全部 pending approvals（自 pending map 取出並移除；此即 freeze 對 approval 的線性化點）→ **逆序釋放**兩鎖 → 鎖外逐筆 `resolve(false)`。latch 概念上一個、實作為兩個同源 monotonic 旗標（各在其鎖域）；設定端同持兩鎖，任何 admission／resolution 只能完整發生於 freeze 之前或之後，**無中間窗口**。**除 freeze 設定端外，禁止任何路徑同時持有 manager 鎖與 `apprMu`**（現況兩鎖無交疊持有：`SendMessage` 僅 manager 鎖 app.go:6930-6976、`resolveApproval` 僅 `apprMu` app.go:6783-6810——此不變式凍結；設定端為唯一雙持路徑、固定 manager 鎖→`apprMu` 順序，無死鎖形狀）。
@@ -160,8 +163,8 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
    - latch 為 runtime-only——重啟後於 startup repair 階段自 TaskRun journal＋detect-only currentness 重建（終態 `stale` ⇒ latch set），先於任何 resume 可能發生前完成。
 3. **線性化點與 system-deny 豁免（rev5 精確化）**：新 turn 的線性化點＝`Manager.BeginSubmit` 成功返回（manager 鎖內完成旗標檢查後才 admit）。approval resolution 的線性化點＝`apprMu` 臨界區內「檢查旗標＋自 pending 取出」完成之瞬間——旗標檢查必在 `apprMu` 內、`p.resolve` 呼叫前完成（現況 resolveApproval 先解鎖再 `p.resolve` 的形狀維持：凡於旗標設定後進入 `apprMu` 者必見旗標；已於鎖內 admit 者，其鎖外 `p.resolve` 不再受旗標影響）。**旗標僅阻擋 `allow=true` 之核可與新 turn admission；`allow=false`（deny）永遠合法、不受旗標阻擋**——freeze 序列（(2) deny 契約）的系統 deny 與使用者 deny 皆得執行（拒絕方向與 fail closed 一致，freeze 序列不會被自身 latch 擋住）。latch 設定前已 admit 的進行中 turn 屬下列凍結效果 (2) 受控收束；其後續 tool approval 仍被旗標擋下。
 4. **Repair 觸發點（rev5——不限 startup）**：
-   - (i) **startup repair**：gate journal stale 已落、`taskrun_stale` 未落 → 掃全部 bound TaskRun 以 detect-only 重算 currentness，不成立者補 append `taskrun_stale`＋set latch；`taskrun_stale` 已落、latch 未設 → latch 依 (2) 自 journal 重建。
-   - (ii) **runtime repair（程序未重啟）**：每個持 `workflowMu` 寫入路徑進入時做收斂檢查——latch 已設而 `taskrun_stale` 未落且 journal 可寫 → 補 append；§3.4 pending-completed 殘留 → 依其唯一解除路徑（reopen 讀取確認）收斂；journal degraded 期間，所有依賴 append 的 workflow 操作（TaskRun 建立、gate decide、resume 放行）因既有拒絕語意自然 fail closed，而 latch 只增不減——runtime 凍結不因 journal 失敗而漏。
+   - (i) **startup repair**：掃全部 bound TaskRun 以 detect-only 重算 currentness，不成立者依 (1)(c) 形狀規則補 append（形狀 1 先確認／補 gate stale **成功**，再補 `taskrun_stale`）＋set latch；`taskrun_stale` 已落、latch 未設 → latch 依 (2) 自 journal 重建。
+   - (ii) **runtime repair（程序未重啟）**：每個持 `workflowMu` 寫入路徑進入時做收斂檢查——latch 已設而 `taskrun_stale` 未落 → 依 (1)(c) 形狀規則補 append（形狀 1 且 gate journal 不可寫 → 僅維持 latch，不寫 `taskrun_stale`）；§3.4 pending-completed 殘留 → 依其解除路徑收斂；journal degraded 期間，所有依賴 append 的 workflow 操作（TaskRun 建立、gate decide、resume 放行）因既有拒絕語意自然 fail closed，而 latch 只增不減——runtime 凍結不因 journal 失敗而漏。
    - 兩向皆收斂，無需跨 store 交易。
 
 **凍結效果**（TaskRun STALE 後**立即凍結 implementation session**）：
@@ -262,7 +265,7 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 2. currentness 前置（含 test_commit 錨定與空 diff 規則）可逐條轉為測試（§2.2）。
 3. 綁定不可繞過且**可跨重啟恢復**（§3.1 持久化＋基數）；gate journal 單一寫入者不變式、權威階層與逐分割點 repair matrix 完整、無未定義 crash split；session 移除 tombstone 契約（abandoned 終態）與 completed 觸發時點凍結（§3.2／§3.4／§3.6）。
 4. Permission schema v1、strict decode 與 deterministic mapping 凍結，讀取來源為 commit tree 非 worktree（§3.3(2)）。
-5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；STALE transition protocol（freeze 先於一切可失敗 append 的 ordering、雙鎖同持設定端＋`apprMu` 內原子 drain＋best-effort resolve 之 deny 契約、線性化點與 system-deny 豁免、startup＋runtime repair 觸發點）可逐條轉為測試；completed dominance 與 pending-completed（commit attempt 前設定、唯一解除路徑）阻擋規則無缺口（§3.4）；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
+5. STALE 三形狀與 HEAD 前移不誤判可逐條轉為測試（§4.1）；STALE transition protocol（freeze 先於一切可失敗 append 的 ordering、形狀分流的 durable 順序——反向分裂被排序禁止、雙鎖同持設定端＋`apprMu` 內原子 drain＋best-effort resolve 之 deny 契約、線性化點與 system-deny 豁免、startup＋runtime repair 觸發點）可逐條轉為測試；completed dominance 與 pending-completed（commit attempt 前設定、三形狀解除）阻擋規則無缺口（§3.4）；6d／6e／6c 裁決語意落地（§3.5／§4.2／§4.3）。
 6. Gate 3 綁定 manifest（required 集合完整性、review／evidence 雙權威）確定性收斂——canonical 排序鍵、`(context, app_id)` 權威 key 與**一對一 coverage（bijection）**規則、reviewer eligibility、同 key current-effective 規則、implementation evidence schema 與 runner 產生契約、Gate 3 重建權威集合——與決議時重驗清單 fail-closed 無缺口（§5）。
 7. Forge port 型別區分與 EnsurePullRequest idempotency 凍結（§6）。
 
@@ -274,6 +277,10 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 ## 修訂記錄
 
+- rev7（2026-08-28，design gate 第六輪 1 P1＋2 P2 收斂）：
+  - P1（反向分裂未定義）：採「排序禁止」案——形狀 1（上游核可失效）gate stale **確認成功**後才寫 `taskrun_stale`，gate append 失敗／不確定即止於 latch fail closed（不寫 taskrun_stale、不需反向 repair row 與 cause payload）；並把 §4.1 形狀 2／3 明確分流（無 gate transition，gate Active＋TaskRun stale 為合法組合非分裂）；repair 兩觸發點同步依形狀規則排序（§4.2(1)(c)(4)）。
+  - P2（成功路徑無清除點）：pending-completed 解除凍結為三形狀——兩 append 皆成功即同臨界區清除；失敗／不確定僅 reopen 讀取確認解除（存在→補 completed；不存在→清旗標續 pending）（§3.4）。
+  - P2（錨點錯段）：CommitDecision 引用自 service.go:222-261（Reconcile）校正為 service.go:135-175、append 於 168-170（§3.4）。
 - rev6（2026-08-28，design gate 第五輪 3 P1 收斂）：
   - P1（freeze 仍在第一次可失敗 append 之後）：§4.2(1) 序列改為 detect-only 偵測（與 production Reconcile 偵測即 append 形狀明確分離，service.go:222-261）→ runtime freeze → 兩份 durable append；任一 append 失敗或不確定，freeze 維持、錯誤合併回傳。
   - P1（pending-completed 未涵蓋 CommitDecision 結果不確定）：旗標改於 `CommitDecision` attempt **之前**設定；任何 append error／不確定一律視為可能已提交；唯一解除路徑＝journal reopen 讀取確認（record 存在→補 completed 收斂；確認不存在→清旗標、request 維持 pending 可重試）（§3.4）。
