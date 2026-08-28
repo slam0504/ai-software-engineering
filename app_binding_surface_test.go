@@ -732,7 +732,6 @@ var osMutators = map[string]bool{
 var protectedImplInternalCallers = map[string]map[string]string{
 	"gateList": {
 		"submitPlanForApproval":    "同一交易內的 gate projection 讀取",
-		"runEvidence":              "同上",
 		"evidenceCommitCandidates": "同上",
 		"submitTestContract":       "同上",
 		"gateDecisionContext":      "同上",

@@ -86,6 +86,46 @@ func TestGateLiveLoopSubmitApproveThenStale(t *testing.T) {
 	}
 }
 
+// gateOpsCount：white-box 讀 gate journal 目前 op 數（B6 Task 3 detect-only
+// 迴歸樁——純讀取入口不得 append durable transition，見 B5 spec §3.2(0)）。
+func gateOpsCount(t *testing.T, a *App) int {
+	t.Helper()
+	if a.gateJournal == nil {
+		t.Fatal("gateJournal not initialized")
+	}
+	return len(a.gateJournal.Ops())
+}
+
+// TestGateListDetectOnlyDoesNotPersistStale：GateList（純讀取入口）呈現 stale
+// 投影，但不得 append durable stale transition——durable stale 只准持
+// workflowMu 的寫入路徑（gateListReconciled／reconcileLocked）產生。
+func TestGateListDetectOnlyDoesNotPersistStale(t *testing.T) {
+	a := newTestAppGit(t) // temp git repo workspace + wired gate.Service
+	a.SpecWrite("spec/glossary.md", "term v1", "")
+	commitAll(t, a)
+	id, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.GateDecide(id, "approved", "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.SpecWrite("spec/glossary.md", "term v2", digestOf(t, a, "spec/glossary.md"))
+	commitAll(t, a) // 使 current manifest 與 record binding 不符
+
+	opsBefore := gateOpsCount(t, a)
+	list, err := a.GateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stateOf(list, id); got != "stale" {
+		t.Fatalf("讀取應呈現 stale, got %s", got)
+	}
+	if got := gateOpsCount(t, a); got != opsBefore {
+		t.Fatalf("GateList 不得 append：ops %d→%d", opsBefore, got)
+	}
+}
+
 func TestGateDecideRejectsWithoutGitIdentity(t *testing.T) {
 	a := newTestAppGitNoIdentity(t)
 	a.SpecWrite("spec/glossary.md", "x", "")

@@ -5233,7 +5233,7 @@ func (a *App) runEvidence(expectedGate2ApprovalID, planID, taskID, testCommit, k
 	}
 
 	a.workflowMu.Lock()
-	entries, err := a.gateList()
+	entries, err := a.gateListReconciled()
 	if err != nil {
 		a.workflowMu.Unlock()
 		return "", err
@@ -5722,7 +5722,25 @@ func (a *App) GateList() ([]GateEntryDTO, error) {
 }
 
 // gateList：GateList 的本體（不進交易閘，見 beginTxn 的 doc）。
+// B6 起為 detect-only 投影（B5 §3.2(0)）：呈現與 reconcile 後相同的
+// stale 判定，但不落 durable transition——durable stale 只准持
+// workflowMu 的寫入路徑（gateListReconciled／reconcileLocked）產生。
 func (a *App) gateList() ([]GateEntryDTO, error) {
+	svc, err := a.ensureGate()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := svc.ListDetectOnly()
+	if err != nil {
+		return nil, err
+	}
+	return a.gateEntriesToDTO(entries), nil
+}
+
+// gateListReconciled：Reconcile-before-Project 的 durable 版本。
+// caller 必須持有 workflowMu（單一寫入者不變式）；目前呼叫者：
+// runEvidence（app.go §3.8 接線）。C1a 的 TaskRun 建立臨界區沿用。
+func (a *App) gateListReconciled() ([]GateEntryDTO, error) {
 	svc, err := a.ensureGate()
 	if err != nil {
 		return nil, err
@@ -5731,6 +5749,11 @@ func (a *App) gateList() ([]GateEntryDTO, error) {
 	if err != nil {
 		return nil, err
 	}
+	return a.gateEntriesToDTO(entries), nil
+}
+
+// gateEntriesToDTO：原 gateList 的 DTO 映射本體，原樣搬移（含 degraded 標示）。
+func (a *App) gateEntriesToDTO(entries []gate.GateEntry) []GateEntryDTO {
 	degraded := a.gateJournal != nil && a.gateJournal.Degraded()
 	out := make([]GateEntryDTO, 0, len(entries))
 	for _, e := range entries {
@@ -5758,7 +5781,7 @@ func (a *App) gateList() ([]GateEntryDTO, error) {
 		}
 		out = append(out, dto)
 	}
-	return out, nil
+	return out
 }
 
 // gitConfigValue：`git -C workspace config <key>`；missing key → ""（不是錯誤，
