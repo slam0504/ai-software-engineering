@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/forge"
@@ -175,10 +176,18 @@ func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error 
 			return fmt.Errorf("required %q head %s ≠ promotion_head %s", k, r.HeadSHA, head)
 		}
 	}
+	var missing []string
 	for k := range required {
 		if !covered[k] {
-			return fmt.Errorf("required %s missing：無覆蓋 run", k)
+			missing = append(missing, k)
 		}
+	}
+	if len(missing) > 0 {
+		// 比照 gate2.go:183-189 先例：多筆缺漏時收集後排序再組訊息，
+		// 避免 map 疊代序讓回報的缺漏 key 不確定；列出全部缺漏 key
+		// 以提高診斷價值（owner 裁定方向，P2-1 follow-up）。
+		sort.Strings(missing)
+		return fmt.Errorf("required missing：無覆蓋 run：%s", strings.Join(missing, ", "))
 	}
 	return nil
 }

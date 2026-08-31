@@ -208,6 +208,15 @@ func TestVerifyRequiredCheckManifestBijection(t *testing.T) {
 					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
 				}},
 			wantErr: "missing"},
+		{name: "多個 required key 同時缺漏 → 錯誤訊息確定性列出全部缺漏 key（排序，非 map 疊代序）——P2-1 follow-up",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{
+					{Context: "zeta"}, {Context: "lint"}, {Context: "alpha", AppID: i64(1)}},
+				Runs: nil},
+			// 宣告序刻意與排序後序不同（zeta, lint, alpha）——若實作仍是
+			// map 遍歷＋回傳單一 key，這個完整訊息斷言必定不吻合（不穩定
+			// 或直接缺漏其餘 key）；只有排序後列出全部三個 key 才會通過。
+			wantErr: "alpha\x001, lint\x00*, zeta\x00*"},
 		{name: "同一 run_id 歸屬兩個不同 required key（多重歸屬）",
 			m: RequiredCheckManifest{ManifestSchema: 1,
 				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "lint", AppID: i64(42)}},

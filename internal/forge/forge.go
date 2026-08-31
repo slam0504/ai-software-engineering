@@ -36,7 +36,7 @@ type RequiredCheckRef struct {
 type CheckRun struct {
 	Name       string
 	AppID      int64
-	RunID      int64
+	RunID      int64 // repo 範圍內唯一識別一次 check run；Build／VerifyRequiredCheckManifest 據此判定「一 run 至多歸屬一 required check」——adapter 實作必須保證此唯一性
 	HeadOID    OID
 	Status     string // "queued"／"in_progress"／"completed"
 	Conclusion string // completed 時："success"／"failure"／...
