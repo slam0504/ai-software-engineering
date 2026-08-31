@@ -191,3 +191,148 @@ func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error 
 	}
 	return nil
 }
+
+type ReviewEntry struct {
+	ReviewerLogin   string `json:"reviewer_login"`
+	Permission      string `json:"permission"`
+	ReviewID        int64  `json:"review_id"`
+	State           string `json:"state"`
+	ReviewedHeadSHA string `json:"reviewed_head_sha"`
+	SubmittedAt     string `json:"submitted_at"`
+}
+
+// BuildReviewSection：每具效力 reviewer 至多一筆 current-effective review
+// （B5 §5.1(6)）。eligibility＝permission ∈ {write,maintain,admin}；不具
+// 效力者完全不入（approval 不放行、CHANGES_REQUESTED 亦不阻擋）。
+// current-effective＝state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 中
+// submitted_at（解析後 time.Time）最新者（tie 取 review_id 大者）；
+// COMMENTED／PENDING 不參與、不入 section。
+//
+// Fail-closed 規則（rev10——修正 perms map 零值語意造成的 CR 方向
+// fail-open，B5 §6）：
+//   - state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 的 review，其
+//     reviewer 的 permission key 必須存在於 perms；缺漏（查無／未查詢）
+//     不得等同 PermissionNone，須 fail loud。
+//   - permission 值必須是已知列舉（admin／maintain／write／read／none）；
+//     未知值（含空字串）→fail loud。
+//   - COMMENTED／PENDING 不參與 current-effective，可不要求 permission。
+//   - 未知 review state（非上述五種）不得靜默跳過，須 fail loud。
+//
+// SubmittedAt 正規化（rev10 新增契約——固定 digest preimage）：寫入
+// ReviewEntry 的 SubmittedAt 為解析後時間值的 UTC RFC3339Nano 表示
+// （ts.UTC().Format(time.RFC3339Nano)，非 time.RFC3339——避免丟失
+// fractional seconds）；current-effective 收斂比較仍用解析後的 time.Time。
+func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) ([]ReviewEntry, error) {
+	type effRev struct {
+		r  forge.Review
+		at time.Time
+	}
+	eff := map[string]effRev{}
+	for _, r := range reviews {
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			p, ok := perms[r.ReviewerLogin]
+			if !ok {
+				return nil, fmt.Errorf("review %d（reviewer %s, state %s）缺少 permission 查詢結果，不得等同 none（fail closed，B5 §6）", r.ReviewID, r.ReviewerLogin, r.State)
+			}
+			switch p {
+			case forge.PermissionAdmin, forge.PermissionMaintain, forge.PermissionWrite, forge.PermissionRead, forge.PermissionNone:
+			default:
+				return nil, fmt.Errorf("review %d（reviewer %s）permission 值未知：%q", r.ReviewID, r.ReviewerLogin, string(p))
+			}
+			if !p.Eligible() {
+				continue
+			}
+		case "COMMENTED", "PENDING":
+			continue
+		default:
+			return nil, fmt.Errorf("review %d（reviewer %s）未知 state：%q（不得靜默跳過）", r.ReviewID, r.ReviewerLogin, r.State)
+		}
+		ts, perr := time.Parse(time.RFC3339, r.SubmittedAt)
+		if perr != nil {
+			return nil, fmt.Errorf("review %d submitted_at 非 RFC3339：%q", r.ReviewID, r.SubmittedAt)
+		}
+		cur, ok := eff[r.ReviewerLogin]
+		if !ok || ts.After(cur.at) || (ts.Equal(cur.at) && r.ReviewID > cur.r.ReviewID) {
+			eff[r.ReviewerLogin] = effRev{r: r, at: ts}
+		}
+	}
+	logins := make([]string, 0, len(eff))
+	for l := range eff {
+		logins = append(logins, l)
+	}
+	sort.Strings(logins)
+	out := make([]ReviewEntry, 0, len(logins))
+	for _, l := range logins {
+		e := eff[l]
+		out = append(out, ReviewEntry{ReviewerLogin: l, Permission: string(perms[l]),
+			ReviewID: e.r.ReviewID, State: e.r.State, ReviewedHeadSHA: string(e.r.ReviewedHeadOID),
+			SubmittedAt: e.at.UTC().Format(time.RFC3339Nano)})
+	}
+	return out, nil
+}
+
+// VerifyReviewSection：結構性重驗 section 自身的 canonical／決議不變量
+// （rev10——沿 Task 4 exported verifier 原則：exported verifier 必須自行
+// 履行其宣稱的契約，不能只依賴 Build 已先驗證的前提）：
+//  1. reviewer_login 嚴格遞增（連帶保證排序與唯一性）。
+//  2. permission 是已知列舉值且必須 eligible（write／maintain／admin）。
+//  3. state 僅能是 APPROVED／CHANGES_REQUESTED／DISMISSED。
+//  4. submitted_at 合法 RFC3339，且等於重新格式化的 UTC RFC3339Nano
+//     canonical value（非 canonical 表示 → fail loud）。
+//  5. 至少一筆 current-effective APPROVED @ head、零 CHANGES_REQUESTED；
+//     DISMISSED 不計入亦不阻擋。
+//
+// 範圍聲明：本函式僅驗證 section 自身的 canonical／決議不變量，
+// **不證明**其完整來自 Forge——例如 caller 把某具效力 reviewer 的
+// CHANGES_REQUESTED 整筆刪除後，剩餘 section 仍可能滿足以上五項全部
+// 檢查（遞增、permission 列舉且 eligible、state 白名單、canonical
+// timestamp、零 CR），這是 []ReviewEntry 單獨無法證明的資訊缺口。
+// 完整性由 C1 於決議時重新 GetReviews、查齊 permissions、
+// BuildReviewSection、VerifyReviewSection、組合 manifest 並比對 digest
+// 保證（B5 spec §5.3(5)）。
+func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error {
+	approvedAtHead := false
+	prevLogin := ""
+	for i, e := range entries {
+		if i > 0 && e.ReviewerLogin <= prevLogin {
+			return fmt.Errorf("reviewer_login 非嚴格遞增：%q 之後接 %q", prevLogin, e.ReviewerLogin)
+		}
+		prevLogin = e.ReviewerLogin
+
+		switch forge.Permission(e.Permission) {
+		case forge.PermissionWrite, forge.PermissionMaintain, forge.PermissionAdmin:
+		case forge.PermissionRead, forge.PermissionNone:
+			return fmt.Errorf("reviewer %s permission=%s 不具效力，不應出現於 section", e.ReviewerLogin, e.Permission)
+		default:
+			return fmt.Errorf("reviewer %s permission 值未知：%q", e.ReviewerLogin, e.Permission)
+		}
+
+		switch e.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+		default:
+			return fmt.Errorf("reviewer %s state 不在白名單：%q", e.ReviewerLogin, e.State)
+		}
+
+		ts, perr := time.Parse(time.RFC3339, e.SubmittedAt)
+		if perr != nil {
+			return fmt.Errorf("reviewer %s submitted_at 非 RFC3339：%q", e.ReviewerLogin, e.SubmittedAt)
+		}
+		if canonical := ts.UTC().Format(time.RFC3339Nano); e.SubmittedAt != canonical {
+			return fmt.Errorf("reviewer %s submitted_at 非 canonical UTC RFC3339Nano：%q（應為 %q）", e.ReviewerLogin, e.SubmittedAt, canonical)
+		}
+
+		switch e.State {
+		case "CHANGES_REQUESTED":
+			return fmt.Errorf("reviewer %s 有 current-effective CHANGES_REQUESTED（零 CR 條件）", e.ReviewerLogin)
+		case "APPROVED":
+			if e.ReviewedHeadSHA == string(head) {
+				approvedAtHead = true
+			}
+		}
+	}
+	if !approvedAtHead {
+		return fmt.Errorf("無 current-effective APPROVED 於 promotion_head %s", head)
+	}
+	return nil
+}

@@ -292,3 +292,304 @@ func TestManifestCanonicalJSONKeyOrder(t *testing.T) {
 		t.Fatalf("canonical JSON 鍵序契約破裂：\n got=%s\nwant=%s", got, want)
 	}
 }
+
+func rev(login, state, head, at string, id int64) forge.Review {
+	return forge.Review{ReviewID: id, ReviewerLogin: login, State: state,
+		ReviewedHeadOID: forge.OID(head), SubmittedAt: at}
+}
+
+func TestBuildReviewSection(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "eve": forge.PermissionRead}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
+		rev("alice", "CHANGES_REQUESTED", "aaaa", "2026-08-28T02:00:00Z", 2), // 後者 supersede
+		rev("alice", "COMMENTED", "aaaa", "2026-08-28T03:00:00Z", 3),         // COMMENTED 不改變有效狀態
+		rev("eve", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 4),            // 明確 read 權限：不入 section
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ReviewerLogin != "alice" || entries[0].State != "CHANGES_REQUESTED" {
+		t.Fatalf("僅 alice 的 current-effective（CR）應入 section：%+v", entries)
+	}
+	if entries[0].SubmittedAt != "2026-08-28T02:00:00Z" {
+		t.Fatalf("SubmittedAt 應正規化為 UTC RFC3339Nano：%q", entries[0].SubmittedAt)
+	}
+}
+
+// TestBuildReviewSectionPermissionNoneExcluded：明確 none（key 存在、值為
+// none）——安全排除，不入 section，不視為錯誤（區分於 key 缺漏，rev10）。
+func TestBuildReviewSectionPermissionNoneExcluded(t *testing.T) {
+	perms := map[string]forge.Permission{"bob": forge.PermissionNone}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("bob", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("明確 none 應安全排除：%+v", entries)
+	}
+}
+
+// TestBuildReviewSectionPermissionKeyMissingFailsLoud：perms 完全沒有該
+// reviewer 的 key（未查詢／查詢失敗）——不得等同 none，須 fail loud
+// （B5 §6 fail-closed；rev10 修正原「無紀錄→None：不入」的 fail-open 缺口）。
+func TestBuildReviewSectionPermissionKeyMissingFailsLoud(t *testing.T) {
+	perms := map[string]forge.Permission{}
+	_, err := BuildReviewSection([]forge.Review{
+		rev("bob", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err == nil || !strings.Contains(err.Error(), "缺少") {
+		t.Fatalf("permission key 缺漏應 fail loud，got %v", err)
+	}
+}
+
+// TestBuildReviewSectionUnknownPermissionValueFailsLoud：key 存在但值非
+// 已知列舉（含空字串）——fail loud，不得靜默視為不具效力。
+func TestBuildReviewSectionUnknownPermissionValueFailsLoud(t *testing.T) {
+	cases := map[string]forge.Permission{"typo": forge.Permission("writeXX"), "empty": forge.Permission("")}
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
+			perms := map[string]forge.Permission{"bob": p}
+			_, err := BuildReviewSection([]forge.Review{
+				rev("bob", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
+			}, perms)
+			if err == nil || !strings.Contains(err.Error(), "未知") {
+				t.Fatalf("未知 permission 值應 fail loud，got %v", err)
+			}
+		})
+	}
+}
+
+// TestBuildReviewSectionUnknownStateFailsLoud：非白名單 review state 不得
+// 靜默跳過（rev10 新規則）。
+func TestBuildReviewSectionUnknownStateFailsLoud(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	_, err := BuildReviewSection([]forge.Review{
+		rev("alice", "REQUEST_CHANGES_TYPO", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err == nil || !strings.Contains(err.Error(), "未知") {
+		t.Fatalf("未知 state 應 fail loud，got %v", err)
+	}
+}
+
+// TestBuildReviewSectionPendingNotRequirePermission：COMMENTED／PENDING
+// 不參與 current-effective，可不要求 permission（即使 key 缺漏也不報錯，
+// 因為根本不查）。
+func TestBuildReviewSectionPendingNotRequirePermission(t *testing.T) {
+	perms := map[string]forge.Permission{}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "PENDING", "aaaa", "2026-08-28T01:00:00Z", 1),
+		rev("alice", "COMMENTED", "aaaa", "2026-08-28T02:00:00Z", 2),
+	}, perms)
+	if err != nil {
+		t.Fatalf("PENDING／COMMENTED 不應要求 permission：%v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("PENDING／COMMENTED 不入 section：%+v", entries)
+	}
+}
+
+func TestBuildReviewSectionTimezoneAndParseError(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	// 03:00+08:00 實際早於 01:00Z——字典序會誤判為較新（rev2）
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "CHANGES_REQUESTED", "aaaa", "2026-08-28T03:00:00+08:00", 1),
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 2),
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].State != "APPROVED" {
+		t.Fatalf("current-effective 應依實際時間為 APPROVED：%+v", entries)
+	}
+	if _, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "bad-time", 1)}, perms); err == nil {
+		t.Fatal("submitted_at 非 RFC3339 應 fail loud")
+	}
+}
+
+// TestBuildReviewSectionTieBreakReviewID：同一 reviewer 兩筆 review 的
+// submitted_at 相同時，取 review_id 較大者為 current-effective。
+func TestBuildReviewSectionTieBreakReviewID(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 5),
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 9),
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].State != "APPROVED" || entries[0].ReviewID != 9 {
+		t.Fatalf("tie-break 應取 review_id 較大者：%+v", entries)
+	}
+}
+
+// TestBuildReviewSectionSubmittedAtNormalization：rev10 新增契約——寫入
+// ReviewEntry 的 SubmittedAt 為 UTC RFC3339Nano canonical value，且
+// 2026-08-28T01:00:00Z 與 2026-08-28T01:00:00+00:00 兩種輸入表示同一時刻，
+// 必須產出完全相同的 section bytes（固定 digest preimage，避免決議時
+// 重讀重算產生假 mismatch）。
+func TestBuildReviewSectionSubmittedAtNormalization(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	a, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00+00:00", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	if string(ab) != string(bb) {
+		t.Fatalf("Z 與 +00:00 兩種表示應產出相同 section bytes：%s vs %s", ab, bb)
+	}
+	// 帶 fractional seconds 的輸入不得被截斷精度（用 RFC3339Nano，非 RFC3339）。
+	frac, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00.123456789Z", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frac[0].SubmittedAt != "2026-08-28T01:00:00.123456789Z" {
+		t.Fatalf("RFC3339Nano 正規化不得丟失 fractional seconds：%q", frac[0].SubmittedAt)
+	}
+}
+
+// TestBuildReviewSectionOrderIndependent：reviews 輸入順序反轉，section
+// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）。
+func TestBuildReviewSectionOrderIndependent(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "bob": forge.PermissionMaintain}
+	reviews := []forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
+		rev("bob", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 2),
+	}
+	m1, err := BuildReviewSection(reviews, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reversed := []forge.Review{reviews[1], reviews[0]}
+	m2, err := BuildReviewSection(reversed, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, _ := json.Marshal(m1)
+	b2, _ := json.Marshal(m2)
+	if string(b1) != string(b2) {
+		t.Fatalf("輸入順序不得影響 section bytes：%s vs %s", b1, b2)
+	}
+}
+
+// TestReviewEntryCanonicalJSONKeyOrder——canonical digest 跨實作契約的
+// 鍵序 golden test（比照 Task 4 TestManifestCanonicalJSONKeyOrder 形狀）。
+func TestReviewEntryCanonicalJSONKeyOrder(t *testing.T) {
+	entries := []ReviewEntry{
+		{ReviewerLogin: "alice", Permission: "write", ReviewID: 1, State: "APPROVED",
+			ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+	}
+	got, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"reviewer_login":"alice","permission":"write","review_id":1,"state":"APPROVED","reviewed_head_sha":"aaaa","submitted_at":"2026-08-28T01:00:00Z"}]`
+	if string(got) != want {
+		t.Fatalf("canonical JSON 鍵序契約破裂：\n got=%s\nwant=%s", got, want)
+	}
+}
+
+func TestVerifyReviewSection(t *testing.T) {
+	head := forge.OID("aaaa")
+	ok := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
+	if err := VerifyReviewSection(ok, head); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyReviewSection(nil, head); err == nil {
+		t.Fatal("零 review 應不符")
+	}
+	staleHead := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "APPROVED", ReviewedHeadSHA: "bbbb", SubmittedAt: "2026-08-28T01:00:00Z"}}
+	if err := VerifyReviewSection(staleHead, head); err == nil {
+		t.Fatal("過期 head 的 approval 不算")
+	}
+	withCR := []ReviewEntry{ok[0], {ReviewerLogin: "carol",
+		Permission: "write", ReviewID: 2, State: "CHANGES_REQUESTED",
+		ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
+	if err := VerifyReviewSection(withCR, head); err == nil {
+		t.Fatal("存在具效力 CHANGES_REQUESTED 應不符（owner 裁決：零 CR）")
+	}
+	dismissed := []ReviewEntry{ok[0], {ReviewerLogin: "dave", Permission: "write", ReviewID: 2,
+		State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T02:00:00Z"}}
+	if err := VerifyReviewSection(dismissed, head); err != nil {
+		t.Fatalf("DISMISSED 不計入亦不阻擋：%v", err)
+	}
+}
+
+// TestVerifyReviewSectionDismissedOnlyNoApproval：具效力 reviewer 的
+// current-effective 是 DISMISSED、且無其他 APPROVED——不得通過（DISMISSED
+// 不計入亦不阻擋 ≠ 視為 approval）。
+func TestVerifyReviewSectionDismissedOnlyNoApproval(t *testing.T) {
+	entries := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
+	if err := VerifyReviewSection(entries, forge.OID("aaaa")); err == nil {
+		t.Fatal("僅 DISMISSED、無 APPROVED 應不符")
+	}
+}
+
+// TestVerifyReviewSectionStructuralInvariants：Verify 自身履行的四項結構
+// 性檢查（rev10——沿 Task 4 exported verifier 原則），各自獨立負向案例；
+// 全部以 literal 手刻 entries 直接呼叫 Verify，不經 Build。
+func TestVerifyReviewSectionStructuralInvariants(t *testing.T) {
+	head := forge.OID("aaaa")
+	base := func() ReviewEntry {
+		return ReviewEntry{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+			State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}
+	}
+	cases := []struct {
+		name    string
+		entries []ReviewEntry
+		wantErr string
+	}{
+		{name: "reviewer_login 非嚴格遞增（重複）",
+			entries: []ReviewEntry{base(), base()},
+			wantErr: "非嚴格遞增"},
+		{name: "reviewer_login 非嚴格遞增（逆序）",
+			entries: []ReviewEntry{
+				{ReviewerLogin: "bob", Permission: "write", ReviewID: 1, State: "APPROVED",
+					ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+				{ReviewerLogin: "alice", Permission: "write", ReviewID: 2, State: "APPROVED",
+					ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+			},
+			wantErr: "非嚴格遞增"},
+		{name: "permission 未知列舉值",
+			entries: func() []ReviewEntry { e := base(); e.Permission = "superuser"; return []ReviewEntry{e} }(),
+			wantErr: "未知"},
+		{name: "permission 為明確不具效力值（read）不應出現於 section",
+			entries: func() []ReviewEntry { e := base(); e.Permission = "read"; return []ReviewEntry{e} }(),
+			wantErr: "不具效力"},
+		{name: "state 不在白名單",
+			entries: func() []ReviewEntry { e := base(); e.State = "COMMENTED"; return []ReviewEntry{e} }(),
+			wantErr: "白名單"},
+		{name: "submitted_at 非 RFC3339",
+			entries: func() []ReviewEntry { e := base(); e.SubmittedAt = "not-a-time"; return []ReviewEntry{e} }(),
+			wantErr: "非 RFC3339"},
+		{name: "submitted_at 非 canonical（+00:00 而非 Z）",
+			entries: func() []ReviewEntry {
+				e := base()
+				e.SubmittedAt = "2026-08-28T01:00:00+00:00"
+				return []ReviewEntry{e}
+			}(),
+			wantErr: "非 canonical"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyReviewSection(tc.entries, head)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
