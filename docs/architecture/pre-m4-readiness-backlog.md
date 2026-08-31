@@ -1,6 +1,6 @@
 # Pre-M4 Readiness Backlog（rev7·估點版）
 
-> 版本：rev7（2026-08-28，C1 驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——B6 Task 5 review section 契約施工事實核對的對應落地，owner 裁示；其餘票面不變）
+> 版本：rev7（2026-08-31，C1 驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——B6 Task 5 review section 契約施工事實核對的對應落地，owner 裁示；其餘票面不變）
 > 前版：rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
 > 狀態：**估點待 owner review**——D 軌待立項後估（rev4 凍結）
 > 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
@@ -279,5 +279,5 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
   - A4 措辭校正（owner 核可於估點 commit 順手修）：GOTOOLCHAIN 自動切換風險
     發生在加入 toolchain directive 的受測 commit，非現行 go.mod。
 - rev6（2026-08-28，B6 拆票）：B6 plan gate 第三輪 owner 裁決落地——B6 拆 **B6a**（gate 單一寫入者＋Gate 3 policy／manifest，1.45 pt）／**B6b**（綁定持久化＋freeze latch，0.6 pt）；拆票理由＝plan rev3 bottom-up 重估 2.05 pt 逾 2.0 拆票線（原 1.4 pt「僅 service 骨架」前提破壞）。兩票皆僅依賴 B5、**各自獨立結案**；B6a→B6b 為建議順序非技術相依；**原 B6 aggregate 於兩票皆完成時關閉、由後完成之票確認**（不固定綁在 B6b）。C1 相依 B6→B6a＋B6b；B 軌小計 8.6→9.25、合計 15.1→15.75 pt。
-- rev7（2026-08-28，C1 驗收條件補案例）：B6 Task 5（review section 收斂）尚未實作前的施工事實核對發現 `VerifyReviewSection` 依設計無法偵測 caller 整筆刪除某具效力 reviewer 的 review（完整性責任在 C1），owner 裁示於 **C1 Implementation-to-Gate-3 垂直切片**的驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——C1 決議時須自 Forge 重讀完整 review 集合並查齊 permissions，驗收須證明具效力 CR 不會被篩除得到假綠。僅動 C1 該列驗收條件敘述，其餘票面／估點不變。
+- rev7（2026-08-31，C1 驗收條件補案例）：B6 Task 5（review section 收斂）尚未實作前的施工事實核對發現 `VerifyReviewSection` 依設計無法偵測 caller 整筆刪除某具效力 reviewer 的 review（完整性責任在 C1），owner 裁示於 **C1 Implementation-to-Gate-3 垂直切片**的驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——C1 決議時須自 Forge 重讀完整 review 集合並查齊 permissions，驗收須證明具效力 CR 不會被篩除得到假綠。僅動 C1 該列驗收條件敘述，其餘票面／估點不變。
 - rev1（2026-08-27）：初版。

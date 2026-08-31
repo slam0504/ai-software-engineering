@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev10（2026-08-28，配合 B5 spec rev9——Task 5 依施工事實核對的 owner 裁決重寫，改稱「review section 收斂」：VerifyReviewSection 補結構性重驗＋範圍聲明、perms map 查無／未知值 fail loud、submitted_at 正規化為 UTC RFC3339Nano、刪除空宣稱 Consumes、不再建 manifest 外殼與 digest（歸 C1）；估點維持 0.1 pt 不動）
+> 版本：rev10（2026-08-31，配合 B5 spec rev9——Task 5 依施工事實核對的 owner 裁決重寫，改稱「review section 收斂」：VerifyReviewSection 補結構性重驗＋範圍聲明、perms map 查無／未知值 fail loud、submitted_at 正規化為 UTC RFC3339Nano、刪除空宣稱 Consumes、不再建 manifest 外殼與 digest（歸 C1）；估點維持 0.1 pt 不動）
 > 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8／rev9／rev10 皆為 implementation follow-up 發現的 erratum／契約缺口，**未重開完整 plan gate**——rev8 收緊測試以符合 rev7 已核准的不變量、rev9 補完 exported verifier 自身應履行的 bijection 保證、rev10 配合 B5 spec rev9 補完 Task 5 尚未實作前發現的三項契約缺口＋範圍收斂，四者均非設計變更、rev10 明確**未重估**）
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
@@ -582,6 +582,7 @@ git commit -m "feat(app): B6 Task 3b——gate Submit writer seam，三送核路
 package gatepolicy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -825,6 +826,48 @@ func TestVerifyRequiredCheckManifestBijection(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestManifestCanonicalJSONKeyOrder——canonical digest 跨實作契約的鍵序
+// golden test（B6 Task 4 follow-up 2，owner 裁定）。三個 struct 的欄位
+// 宣告序目前與 spec §5.1(5) 字面序一致（RequiredCheckEntry={context,
+// app_id}；CheckRunEntry={context, required_app_id, run_name, run_app_id,
+// run_id, head_sha, status, conclusion}；RequiredCheckManifest=
+// {manifest_schema, required_checks, runs}），但先前沒有任何測試斷言
+// json.Marshal 的實際鍵序——若日後有人調換欄位宣告順序，只有跨實作
+// digest 比對失敗時才會暴露。
+//
+// 刻意不轉 map[string]any 比較：Go 的 map 沒有固定疊代序、也不記錄
+// 原始 JSON 鍵序，轉成 map 後兩個鍵序不同但值集合相同的 JSON 會比較
+// 相等，等於完全測不到鍵序漂移。canonical digest 的定義基礎正是「struct
+// 宣告序＝spec 字面序＝json.Marshal 輸出序」，所以必須直接比對
+// json.Marshal 輸出的精確位元組／字串，而非其反解後的資料值。
+//
+// fixture 為完整三層 struct，且 AppID／RequiredAppID 的 nil 與非 nil
+// 兩種形狀各出現一次（ci 帶 app_id=42、lint 的 app_id／required_app_id
+// 皆為 nil），確保 golden 字串同時覆蓋兩種指標序列化形狀。
+func TestManifestCanonicalJSONKeyOrder(t *testing.T) {
+	m := RequiredCheckManifest{
+		ManifestSchema: 1,
+		RequiredChecks: []RequiredCheckEntry{
+			{Context: "ci", AppID: i64(42)},
+			{Context: "lint", AppID: nil},
+		},
+		Runs: []CheckRunEntry{
+			{Context: "ci", RequiredAppID: i64(42), RunName: "ci", RunAppID: 42, RunID: 1,
+				HeadSHA: "aaaa", Status: "completed", Conclusion: "success"},
+			{Context: "lint", RequiredAppID: nil, RunName: "lint", RunAppID: 99, RunID: 2,
+				HeadSHA: "aaaa", Status: "completed", Conclusion: "success"},
+		},
+	}
+	got, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"manifest_schema":1,"required_checks":[{"context":"ci","app_id":42},{"context":"lint","app_id":null}],"runs":[{"context":"ci","required_app_id":42,"run_name":"ci","run_app_id":42,"run_id":1,"head_sha":"aaaa","status":"completed","conclusion":"success"},{"context":"lint","required_app_id":null,"run_name":"lint","run_app_id":99,"run_id":2,"head_sha":"aaaa","status":"completed","conclusion":"success"}]}`
+	if string(got) != want {
+		t.Fatalf("canonical JSON 鍵序契約破裂：\n got=%s\nwant=%s", got, want)
 	}
 }
 ```
@@ -2628,12 +2671,14 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
-- rev10（2026-08-28，**Task 5 尚未實作前的施工事實核對——B5 spec rev9 對應的契約補完＋範圍收斂**，owner 逐條裁決；**production contract 不受影響（Task 5 未實作）、未重開完整 plan gate、估點維持 0.1 pt 不動、未重估**）：
+- rev10（2026-08-31，**Task 5 尚未實作前的施工事實核對——B5 spec rev9 對應的契約補完＋範圍收斂**，owner 逐條裁決；**production contract 不受影響（Task 5 未實作）、未重開完整 plan gate、估點維持 0.1 pt 不動、未重估**）：
   - ①（沿 Task 4 已確立的「exported verifier 必須履行自己宣稱的契約」原則）`VerifyReviewSection` 原僅掃 state、無法察覺入參集合本身是錯的。補結構性重驗：`reviewer_login` 嚴格遞增、`permission` 已知列舉且 eligible、`state` 白名單、`submitted_at` 合法且已正規化。**owner 同時指出殘留缺口**：即使全部結構檢查通過，仍無法偵測 caller 把某 reviewer 的 CR 整筆刪除——`[]ReviewEntry` 單獨無法證明其完整來自 Forge，這是資訊不足非邏輯漏洞。doc-comment 明文此範圍聲明：完整性由 **C1** 於決議時重新 `GetReviews`、查齊 permissions、`BuildReviewSection`、`VerifyReviewSection`、組合 manifest 並比對 digest 保證（B5 spec §5.3(5)）。
   - ②（澄清既有 §6 語意，非新增契約）`perms map[string]forge.Permission` 的 Go 零值語意讓「權限查無／未查詢」與「已確認 read／none」無法區分，兩者皆變成 `Eligible()==false`，使 CHANGES_REQUESTED 方向 fail-open，與 §6 fail-closed 語意衝突。凍結：`state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED}` 的 review，其 reviewer permission key 必須存在，缺漏 fail loud；值須為已知列舉（含空字串 fail loud）；`write／maintain／admin` 入候選，明確 `read／none` 安全排除；`COMMENTED／PENDING` 不參與、可不要求 permission；未知 review state 不得靜默跳過。連帶測試修正：刪除原「Bob 無紀錄→None：不入」案例，改為三案例（明確 none、key 缺漏、未知值）。
   - ③（**本次唯一新增的 spec 級契約**，B5 spec 同步升 rev9）`ReviewEntry.SubmittedAt` 原存 forge 原始字串；RFC3339 允許同一時刻多種字面表示（`Z` 與 `+00:00`），未正規化會使決議時重讀重算產生不同 digest、假 mismatch、pending 誤判失效（§4.3）。凍結：寫入時正規化為 `ts.UTC().Format(time.RFC3339Nano)`（非 `time.RFC3339`，避免丟失 fractional seconds）；`BuildReviewSection` 仍以解析後 `time.Time` 比較收斂；`VerifyReviewSection` 新增「輸入字串等於重新格式化 canonical value」檢查。新增測試證明兩種表示產出完全相同 section bytes。
   - ④ Task 5 改稱「review section 收斂」（原稱「review manifest 收斂」）；**不建 manifest 外殼、不算 digest**（歸 C1）；刪除 Interfaces 內「Consumes: Task 4 的 `ManifestDigest`」空宣稱（原範本從未呼叫）；補 `ReviewEntry` 精確 JSON 鍵序 golden test（比照 Task 4 `TestManifestCanonicalJSONKeyOrder` 形狀）與 `reviews` 輸入順序反轉後 section bytes 相同測試；補齊 tie-break（同 submitted_at 不同 review_id）、`PENDING` 狀態、eligible reviewer 的 current-effective 為 `DISMISSED` 且無其他 approval、Verify 四項結構條件各自獨立負向案例。B6／C1 範圍分界表 `§5.1(5)(6)` 一列措辭校正為「manifest 外殼＋digest 歸 C1」。
   - Scope 邊界：本輪為 doc-only 契約落地（Task 5 尚未實作），不影響 Task 1-4 已完成內容；未重開完整 plan gate、未重估。
+  - **補回漏載範本（owner 2026-08-31 裁示，doc-only）**：Task 4 Step 1 測試範本先前未收錄 `TestManifestCanonicalJSONKeyOrder`——該 golden test 已於 follow-up 2（`22088cb`）落地並通過驗收，但 follow-up 2 的 owner 指定範圍只涵蓋 Step 3 虛擬碼、Step 1 bijection 案例與 rev9 案例數，故未同步。依 plan 可重放性要求補入，內容與 `internal/gatepolicy/gate3_manifest_test.go` 的實際測試逐字一致；並補上該範本 import 區塊原本缺少的 `"encoding/json"`（照抄會編譯失敗）。**production contract 與程式碼均未變**。
+  - **日期更正（owner 2026-08-31 裁示，不另升版）**：spec rev9／plan rev10／backlog rev7 三個條目原誤標 2026-08-28，實際落地日為 2026-08-31，已更正；版本號維持不變。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。

@@ -1,6 +1,6 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
-> 版本：rev9（2026-08-28，implementation 對照發現的 digest preimage 缺口——§5.1(6) `submitted_at` 未定值正規化，凍結為 UTC RFC3339Nano；同時澄清既有 permission 查詢 fail-closed 語意（非新增契約）；production 契約其餘部分未變）
+> 版本：rev9（2026-08-31，implementation 對照發現的 digest preimage 缺口——§5.1(6) `submitted_at` 未定值正規化，凍結為 UTC RFC3339Nano；同時澄清既有 permission 查詢 fail-closed 語意（非新增契約）；production 契約其餘部分未變）
 > 狀態：**design gate 通過**（2026-08-28 第八輪 Approved @ rev8／d5a18a9——歷經八輪：rev1 初版起算，7 輪 findings 全數收斂，第八輪零 P1／P2；B5 票依驗收條件即為完成，後續進 B6／C1）。rev9 為 B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示後走**窄幅 design re-review**收斂——**未重開完整 design gate、未重估**；`submitted_at` 正規化為新增 spec 級契約，permission 查詢 fail-closed 為既有 §6 語意之澄清（非新增）。
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
 > 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3–rev5 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
@@ -280,7 +280,7 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 ## 修訂記錄
 
-- rev9（2026-08-28，B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示；走窄幅 design re-review，**未重開完整 design gate、未重估**；production 契約其餘部分未變）：
+- rev9（2026-08-31，B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示；走窄幅 design re-review，**未重開完整 design gate、未重估**；production 契約其餘部分未變）：
   - **新增契約**：§5.1(6) `submitted_at` 正規化——manifest 值固定為解析後時間之 UTC RFC3339Nano 表示（非 `time.RFC3339`，避免丟失 fractional seconds）；current-effective 收斂比較仍用解析後 `time.Time`；驗證須檢查欄位值等於重新格式化之 canonical value。失敗場景：未正規化時，`2026-08-28T01:00:00Z` 與 `2026-08-28T01:00:00+00:00` 表示同一時刻卻產生不同 digest，決議時重讀重算產生假 mismatch，pending Gate 3 request 被誤判失效（§4.3）。共同規則段補時間值正規化通則，並註記 §5.1(5) `required_check_manifest` 無時間值欄位、不受影響（Task 4 已完成內容不變）。
   - **澄清（非新增）**：§5.1(6) eligibility 查詢 fail-closed 語意——對 `state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 之 review，permission 查無／查詢失敗不得等同 `none`，須 fail loud（沿既有 §6 語意）；permission 值須為已知列舉，未知值 fail loud；未知 review state 不得靜默跳過。
   - B6 Task 5（review section 收斂）依此重寫；不涉及 Task 4／已完成內容。
