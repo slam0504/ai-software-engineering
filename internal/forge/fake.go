@@ -2,9 +2,8 @@ package forge
 
 import "context"
 
-// Fake 是測試用 Forge：每個方法回傳對應欄位；Err 非 nil 時一律回傳 Err
-// （模擬 forge 讀取失敗的 fail-closed 路徑）。放在 fake.go 而非 _test.go：
-// production-adjacent fake 需跨套件使用，gatepolicy 測試依賴它。
+// Fake 是測試用 Forge：各方法由欄位提供固定回傳值；Err 非 nil 時
+// 一律回傳 Err，供測試模擬 Forge 呼叫失敗。
 type Fake struct {
 	Err            error
 	PR             PRRef
