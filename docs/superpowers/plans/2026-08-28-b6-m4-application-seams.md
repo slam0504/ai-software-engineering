@@ -1652,6 +1652,38 @@ func TestGate3ValidateRequestBindingShapes(t *testing.T) {
 		t.Fatal("task_run ref 形狀不符 taskrun:<ULID> 應拒絕（與 subject 形狀檢查各自獨立）")
 	}
 
+	// Task 6 施工依據補測（P2，design re-review 發現）：reTaskRunRef 用
+	// Crockford base32（排除 I/L/O/U，與 contract.NewULID 產生器一致，
+	// internal/contract/envelope.go:10）。上面兩案例只測「前綴整個錯」與
+	// 「形狀整個錯」，沒有「前綴正確、26 碼、僅字元集違規」的值——若 regex
+	// 被放寬成 [0-9A-Z]{26}（即 tca.go:65 reApprovalRef 現行形狀），既有
+	// 測試一個都不會紅。reTaskRunRef 同時用於 subject 與 task_run binding
+	// 的 ref，補兩條獨立案例。
+
+	// 案例 A：subject 與 task_run binding 的 Ref 使用同一個 26 碼、前綴
+	// 正確，但含 Crockford 排除字母（I）的值——兩者相等使交叉比對也不會
+	// 擋，只有 subject 形狀檢查能抓到 regex 放寬的 mutation（ValidateRequest
+	// 的 subject 檢查在最前面）。
+	excludedCharSubjectAndRef := ok
+	excludedCharSubjectAndRef.Subject = "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAI" // 'I' 屬 Crockford 排除字元
+	excludedCharSubjectAndRef.Bindings = append([]gate.Binding{}, ok.Bindings...)
+	excludedCharSubjectAndRef.Bindings[0] = gate.Binding{Kind: "task_run", Ref: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAI", Digest: "sha256:" + strings.Repeat("ab", 32)}
+	if err := p.ValidateRequest(excludedCharSubjectAndRef); err == nil || !strings.Contains(err.Error(), "subject 形狀必須為") {
+		t.Fatalf("subject 含 Crockford 排除字母應拒絕且命中 subject 形狀訊息：%v", err)
+	}
+
+	// 案例 B：subject 合法、task_run binding 的 Ref 含排除字母（I）——
+	// 獨立守住 binding ref 格式檢查。斷言必須命中「ref 形狀不符」而非僅
+	// err != nil：若移除 refRe 檢查，subject 與 ref 不相等仍會被最後的
+	// 交叉比對擋下（訊息為「不一致」），只判斷 err != nil 會讓這個 mutation
+	// 誤通過。
+	excludedCharTaskRunRefOnly := ok
+	excludedCharTaskRunRefOnly.Bindings = append([]gate.Binding{}, ok.Bindings...)
+	excludedCharTaskRunRefOnly.Bindings[0] = gate.Binding{Kind: "task_run", Ref: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAI", Digest: "sha256:" + strings.Repeat("ab", 32)}
+	if err := p.ValidateRequest(excludedCharTaskRunRefOnly); err == nil || !strings.Contains(err.Error(), "ref 形狀不符") {
+		t.Fatalf("task_run ref 含 Crockford 排除字母應拒絕且命中 ref 形狀訊息：%v", err)
+	}
+
 	// 六種 binding 缺一測一（owner 明訂：成本低且避免代表案例漏掉特殊 ref，
 	// 例如 task_run 有 refRe、其餘沒有）。
 	for _, kind := range []string{
@@ -1897,6 +1929,9 @@ func TestGate3NilDepsFailClosed(t *testing.T) {
 ```
 - [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run Gate3 -count=1`，預期 FAIL**
   - **mutation 測試流程凍結（owner 明訂，起因是先前有 mutation 假綠、根因未確認）**：本 task 任何 mutation 測試（驗證測試對 production code 變異的鑑別力）執行前，必須先證明 mutation diff 已實際套用到檔案（如 `git diff` 或 `diff` 顯示變更存在）且檔案內容 hash 已改變（如變異前後 `sha256sum`／`shasum` 不同）；不得僅憑「應該已套用」就放行紅／綠判讀。
+  - **Crockford 字元集 mutation（施工依據補測，doc-only erratum，詳見修訂記錄 rev10 末尾）**：
+    1. `reTaskRunRef` 放寬為 `[0-9A-Z]{26}`（即 `tca.go:65` `reApprovalRef` 現行形狀）→ 案例 A（`excludedCharSubjectAndRef`：`subject` 與 `task_run.Ref` 同一個含排除字母的值）必須轉紅，且須紅在 subject 形狀斷言（`strings.Contains(err.Error(), "subject 形狀必須為")`）。
+    2. 移除 `task_run` binding 的 `refRe` 檢查（`gate3BindingReqs` 的 `task_run` 項不設 `refRe`）→ 案例 B（`excludedCharTaskRunRefOnly`：`subject` 合法、`task_run.Ref` 含排除字母）必須轉紅，且須紅在 `"ref 形狀不符"` 訊息斷言——若改成只判斷 `err != nil`，交叉比對的「不一致」錯誤會掩蓋 ref 檢查缺失，mutation 會誤通過。
 - [ ] **Step 3: 實作 `gate3.go`**
 
 ```go
@@ -2906,6 +2941,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **日期更正（owner 2026-08-31 裁示，不另升版）**：spec rev9／plan rev10／backlog rev7 三個條目原誤標 2026-08-28，實際落地日為 2026-08-31，已更正；版本號維持不變。
   - **Task 5 follow-up：`TestBuildReviewSectionOrderIndependent` 補明確升冪斷言（owner 2026-08-31 裁示，不另升版）**：原測試只比對「輸入反轉後 section bytes 相等」，使「移除 `sort.Strings(logins)`」的 mutation 鑑別力是機率性的——`BuildReviewSection` 把結果收進 map 再取 logins，無 sort 時輸出順序由 Go map 疊代隨機化決定、與輸入順序無關，兩次 Build 有相當機率恰好同序而讓 mutation 存活（實測 8 次樣本僅紅 7 次）。owner 否決「增加 reviewer 數量」方案——Go map 疊代分布未承諾均勻，樣本數不能可靠換算成 1/n!，仍是機率性證據。改為保留 bytes 相等斷言（證明 Forge 輸入順序不影響輸出）並另外明確斷言輸出為 `alice, bob`（證明 canonical section 依 `reviewer_login` 字典序升冪）；acceptance mutation 改為「升冪換降冪」（確定性、必紅），「完全移除 sort」降級為補充性、機率性 mutation，不作為 acceptance 依據。production code（`BuildReviewSection`／`VerifyReviewSection`）未變。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-5-followup-report.md`。
   - **Task 6 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：實作前施工事實核對發現 brief／plan 的 gate3 範本與 repo 既有慣例兩處不一致。①`SupersessionKey` 原範本用 `gateName + "\x00" + subject`，但 gate1（`internal/gate/policy.go:57-59`）、gate2（`internal/gatepolicy/gate2.go:197-199`）、TCA（`internal/gatepolicy/tca.go:283-285`）、stubPolicy（`internal/gate/service_test.go:85`）四個既有實作與 `GatePolicy` interface doc 皆為 `gateName+"|"+subject`，且 gate3 的 subject 形狀 `taskrun:<ULID>` 不可能含 `|`，無另用 NUL 分隔的理由——改回 `"|"`。②`BuildDecision` 原簽章 `_ gate.DecisionInput` 整個丟棄輸入，非空 `RiskSelections` 會被靜默吃掉；歸因需準確——**gate1、TCA 對所有 decision 都不接受 risk**，**gate2 在 approved 會消費 risk、只在 rejected 禁止**，**Gate 3 是無 risk policy，應對齊 gate1／TCA 與 `DecisionInput` 契約**（不是「三者都一樣」）——改為 approved／rejected 兩條路徑皆拒絕非空 `RiskSelections`。③連帶把 `internal/gate/policy.go` 第 16 行 `DecisionInput.RiskSelections` 註解由「gate2 用；gate1/tca 為空」補成「gate2 用；gate1/tca/gate3 為空」（comment-only，未改邏輯／import，`internal/gate` 零 domain import 架構凍結不變）。同步補 Step 1 測試範本：`SupersessionKey` 直接斷言、approved／rejected 非空 risk 各一獨立案例、六種缺 binding 全測、三個 nil deps／三個 deps error 各自獨立且斷言下游未執行、digest 形狀（sha256／gitOID）與 task_run ref 形狀負向案例、未知 binding（第 7 筆）、`ErrGate3Mismatch` 經 `%w` 傳遞可用 `errors.Is` 辨識且未包裝 error 不誤判；`ReconcileBindings` pending pseudo-record 回空一案仍為 Task 6 範圍上限，完整 `PrepareDecision → ErrGate3Mismatch → ExpirePending` 鏈維持屬 Task 6b、不提前拉入。另凍結 mutation 測試流程要求：執行前須先證明 diff 已套用且檔案 hash 已改變（起因是先前有 mutation 假綠、根因未確認）。**observation（不改動）**：TCA 的 `reApprovalRef` 用 `[0-9A-Z]{26}` 比 Crockford 寬（`contract.NewULID`，`internal/contract/envelope.go:10`，用 Crockford `0123456789ABCDEFGHJKMNPQRSTVWXYZ`）——brief 的 `[0-9A-HJKMNP-TV-Z]{26}` 正確、TCA 較寬；無 production 影響證據前不另開修正、不混入本票。**production contract 不受影響（Task 6 未實作）、spec §5.2／backlog 不變（①②非 spec 級契約）、未重開完整 plan gate、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-preflight-report.md`。
+  - **Task 6 施工依據補測——Crockford 字元集兩條獨立負向案例（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：design re-review 發現上一則 Task 6 preflight erratum 遺留的 P2 缺口——Step 1 範本的 subject／ref 負向案例只有「前綴整個錯」（`badSubject`）與「形狀整個錯」（`badTaskRunRef`）兩種，沒有任何值是「`taskrun:` 前綴正確、26 碼、僅字元集違規」；若 `reTaskRunRef` 被放寬成 `[0-9A-Z]{26}`（即 `tca.go:65` `reApprovalRef` 現行形狀）現有測試一個都不會紅。`reTaskRunRef` 同時用於 subject 與 `task_run` binding 的 ref，補兩條獨立案例：(A) `subject` 與 `task_run.Ref` 使用同一個 26 碼、含 Crockford 排除字母（`I`）的值，斷言命中 subject 形狀訊息（`ValidateRequest` 的 subject 檢查在最前面，兩者相等使交叉比對也不會擋）；(B) `subject` 合法、`task_run.Ref` 含排除字母，斷言必須命中「ref 形狀不符」而非僅 `err != nil`——否則移除 refRe 檢查後，交叉比對的「不一致」錯誤會掩蓋 ref 檢查缺失，mutation 會誤通過。連帶於 Step 2 mutation 測試流程凍結段補列兩項對應 mutation：「regex 放寬為 `[0-9A-Z]{26}`」（案例 A 必紅）與「移除 `task_run` binding 的 `refRe` 檢查」（案例 B 必紅，且須由訊息斷言抓到）。**production contract 不受影響（Task 6 未實作）、spec／backlog 不變、未重開完整 plan gate、估點未變**。詳見補測報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-crockford-report.md`。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
