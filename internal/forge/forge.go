@@ -6,7 +6,7 @@ package forge
 import "context"
 
 // RepoID／BranchRef／OID 型別明確區分：repo identity、branch ref、commit OID
-//（B5 §6——防止字串混用）。
+// （B5 §6——防止字串混用）。
 type RepoID struct {
 	Owner string
 	Repo  string

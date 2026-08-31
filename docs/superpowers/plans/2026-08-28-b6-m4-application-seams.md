@@ -88,7 +88,7 @@ package forge
 import "context"
 
 // RepoID／BranchRef／OID 型別明確區分：repo identity、branch ref、commit OID
-//（B5 §6——防止字串混用）。
+// （B5 §6——防止字串混用）。
 type RepoID struct {
 	Owner string
 	Repo  string
@@ -175,8 +175,8 @@ package forge
 import "context"
 
 // Fake 是測試用 Forge：每個方法回傳對應欄位；Err 非 nil 時一律回傳 Err
-//（模擬 forge 讀取失敗的 fail-closed 路徑）。沿 gate stubPolicy 慣例：
-// production-adjacent fake，不進 _test.go 因跨套件使用（gatepolicy 測試）。
+// （模擬 forge 讀取失敗的 fail-closed 路徑）。放在 fake.go 而非 _test.go：
+// production-adjacent fake 需跨套件使用，gatepolicy 測試依賴它。
 type Fake struct {
 	Err            error
 	PR             PRRef
@@ -1138,7 +1138,7 @@ func TestBuildReviewSectionPermissionNoneExcluded(t *testing.T) {
 
 // TestBuildReviewSectionPermissionKeyMissingFailsLoud：perms 完全沒有該
 // reviewer 的 key（未查詢／查詢失敗）——不得等同 none，須 fail loud
-//（B5 §6 fail-closed；rev10 修正原「無紀錄→None：不入」的 fail-open 缺口）。
+// （B5 §6 fail-closed；rev10 修正原「無紀錄→None：不入」的 fail-open 缺口）。
 func TestBuildReviewSectionPermissionKeyMissingFailsLoud(t *testing.T) {
 	perms := map[string]forge.Permission{}
 	_, err := BuildReviewSection([]forge.Review{
@@ -1416,7 +1416,7 @@ type ReviewEntry struct {
 }
 
 // BuildReviewSection：每具效力 reviewer 至多一筆 current-effective review
-//（B5 §5.1(6)）。eligibility＝permission ∈ {write,maintain,admin}；不具
+// （B5 §5.1(6)）。eligibility＝permission ∈ {write,maintain,admin}；不具
 // 效力者完全不入（approval 不放行、CHANGES_REQUESTED 亦不阻擋）。
 // current-effective＝state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 中
 // submitted_at（解析後 time.Time）最新者（tie 取 review_id 大者）；
@@ -1434,7 +1434,7 @@ type ReviewEntry struct {
 //
 // SubmittedAt 正規化（rev10 新增契約——固定 digest preimage）：寫入
 // ReviewEntry 的 SubmittedAt 為解析後時間值的 UTC RFC3339Nano 表示
-//（ts.UTC().Format(time.RFC3339Nano)，非 time.RFC3339——避免丟失
+// （ts.UTC().Format(time.RFC3339Nano)，非 time.RFC3339——避免丟失
 // fractional seconds）；current-effective 收斂比較仍用解析後的 time.Time。
 func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) ([]ReviewEntry, error) {
 	type effRev struct {
@@ -1487,7 +1487,7 @@ func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permissio
 }
 
 // VerifyReviewSection：結構性重驗 section 自身的 canonical／決議不變量
-//（rev10——沿 Task 4 exported verifier 原則：exported verifier 必須自行
+// （rev10——沿 Task 4 exported verifier 原則：exported verifier 必須自行
 // 履行其宣稱的契約，不能只依賴 Build 已先驗證的前提）：
 //  1. reviewer_login 嚴格遞增（連帶保證排序與唯一性）。
 //  2. permission 是已知列舉值且必須 eligible（write／maintain／admin）。
