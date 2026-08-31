@@ -1,6 +1,7 @@
 package gatepolicy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -247,5 +248,47 @@ func TestVerifyRequiredCheckManifestBijection(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestManifestCanonicalJSONKeyOrder——canonical digest 跨實作契約的鍵序
+// golden test（B6 Task 4 follow-up 2，owner 裁定）。三個 struct 的欄位
+// 宣告序目前與 spec §5.1(5) 字面序一致（RequiredCheckEntry={context,
+// app_id}；CheckRunEntry={context, required_app_id, run_name, run_app_id,
+// run_id, head_sha, status, conclusion}；RequiredCheckManifest=
+// {manifest_schema, required_checks, runs}），但先前沒有任何測試斷言
+// json.Marshal 的實際鍵序——若日後有人調換欄位宣告順序，只有跨實作
+// digest 比對失敗時才會暴露。
+//
+// 刻意不轉 map[string]any 比較：Go 的 map 沒有固定疊代序、也不記錄
+// 原始 JSON 鍵序，轉成 map 後兩個鍵序不同但值集合相同的 JSON 會比較
+// 相等，等於完全測不到鍵序漂移。canonical digest 的定義基礎正是「struct
+// 宣告序＝spec 字面序＝json.Marshal 輸出序」，所以必須直接比對
+// json.Marshal 輸出的精確位元組／字串，而非其反解後的資料值。
+//
+// fixture 為完整三層 struct，且 AppID／RequiredAppID 的 nil 與非 nil
+// 兩種形狀各出現一次（ci 帶 app_id=42、lint 的 app_id／required_app_id
+// 皆為 nil），確保 golden 字串同時覆蓋兩種指標序列化形狀。
+func TestManifestCanonicalJSONKeyOrder(t *testing.T) {
+	m := RequiredCheckManifest{
+		ManifestSchema: 1,
+		RequiredChecks: []RequiredCheckEntry{
+			{Context: "ci", AppID: i64(42)},
+			{Context: "lint", AppID: nil},
+		},
+		Runs: []CheckRunEntry{
+			{Context: "ci", RequiredAppID: i64(42), RunName: "ci", RunAppID: 42, RunID: 1,
+				HeadSHA: "aaaa", Status: "completed", Conclusion: "success"},
+			{Context: "lint", RequiredAppID: nil, RunName: "lint", RunAppID: 99, RunID: 2,
+				HeadSHA: "aaaa", Status: "completed", Conclusion: "success"},
+		},
+	}
+	got, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"manifest_schema":1,"required_checks":[{"context":"ci","app_id":42},{"context":"lint","app_id":null}],"runs":[{"context":"ci","required_app_id":42,"run_name":"ci","run_app_id":42,"run_id":1,"head_sha":"aaaa","status":"completed","conclusion":"success"},{"context":"lint","required_app_id":null,"run_name":"lint","run_app_id":99,"run_id":2,"head_sha":"aaaa","status":"completed","conclusion":"success"}]}`
+	if string(got) != want {
+		t.Fatalf("canonical JSON 鍵序契約破裂：\n got=%s\nwant=%s", got, want)
 	}
 }

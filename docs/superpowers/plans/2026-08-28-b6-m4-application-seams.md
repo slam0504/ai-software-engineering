@@ -786,6 +786,15 @@ func TestVerifyRequiredCheckManifestBijection(t *testing.T) {
 					ok("ci", i64(42), "ci", 42, 1, "completed", "success"),
 				}},
 			wantErr: "missing"},
+		{name: "多個 required key 同時缺漏 → 錯誤訊息確定性列出全部缺漏 key（排序，非 map 疊代序）——P2-1 follow-up",
+			m: RequiredCheckManifest{ManifestSchema: 1,
+				RequiredChecks: []RequiredCheckEntry{
+					{Context: "zeta"}, {Context: "lint"}, {Context: "alpha", AppID: i64(1)}},
+				Runs: nil},
+			// 宣告序刻意與排序後序不同（zeta, lint, alpha）——若實作仍是
+			// map 遍歷＋回傳單一 key，這個完整訊息斷言必定不吻合（不穩定
+			// 或直接缺漏其餘 key）；只有排序後列出全部三個 key 才會通過。
+			wantErr: "alpha\x001, lint\x00*, zeta\x00*"},
 		{name: "同一 run_id 歸屬兩個不同 required key（多重歸屬）",
 			m: RequiredCheckManifest{ManifestSchema: 1,
 				RequiredChecks: []RequiredCheckEntry{{Context: "ci", AppID: i64(42)}, {Context: "lint", AppID: i64(42)}},
@@ -835,6 +844,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/forge"
@@ -999,10 +1009,18 @@ func VerifyRequiredCheckManifest(m RequiredCheckManifest, head forge.OID) error 
 			return fmt.Errorf("required %q head %s ≠ promotion_head %s", k, r.HeadSHA, head)
 		}
 	}
+	var missing []string
 	for k := range required {
 		if !covered[k] {
-			return fmt.Errorf("required %s missing：無覆蓋 run", k)
+			missing = append(missing, k)
 		}
+	}
+	if len(missing) > 0 {
+		// 比照 gate2.go:183-189 先例：多筆缺漏時收集後排序再組訊息，
+		// 避免 map 疊代序讓回報的缺漏 key 不確定；列出全部缺漏 key
+		// 以提高診斷價值（owner 裁定方向，P2-1 follow-up）。
+		sort.Strings(missing)
+		return fmt.Errorf("required missing：無覆蓋 run：%s", strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -2312,7 +2330,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
-  - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋反例本身＋七個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、run_id 多重歸屬、兩種 attribution 不符形狀）。
+  - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
   - 非漏洞判定：目前尚非可利用的 production 漏洞——§5.3(3) 決議時重驗是自 forge 重讀重建 manifest（走 `BuildRequiredCheckManifest`，其本身已結構性保證 bijection），再與 binding digest 比對，production 路徑不會把「等長但 key 不對應」的殘缺 manifest 送進 `Verify`。但 `VerifyRequiredCheckManifest` 是 exported 函式、簽章不要求輸入必經 Build（brief 原有的 `TestVerifyRequiredCheckManifest` 本身就是 literal 手刻 manifest 直接呼叫），沒有履行其宣稱的保證；Task 6 對 Verify 的接線方式（是否／如何被 C1b 的 `Gate3Deps.VerifyForge` 呼叫）尚未定案，故依 owner 裁定一次做對，不留 follow-up。
   - Scope 邊界：`BuildRequiredCheckManifest` 的部分排序鍵（僅 `keyOf(context, app_id)`，非全 tuple）維持不變——Build 排序前已拒絕重複 required key、且 bijection 保證陣列內鍵值唯一，不落入 domainspec canonical 先例（`escalationLess` 全 tuple 排序）要防範的「同鍵不同值、sort.Slice 非 stable」風險，故不需要跟進改動；`used[RunID]` 沿用單一 `run_id` 為 key（`forge.CheckRun.RunID` 於 repo 範圍內唯一識別一次 check run，目前為對齊 GitHub check-run id 語意的**假設**、非已驗證的契約——已於 forge.go 補上唯一性契約註解供 C1b adapter 對照；C1b 的 GitHub adapter 實作**尚未端到端驗證**此假設是否成立）；pending／failed 三態語意（`Status != "completed" || Conclusion != "success"`）維持現行做法，符合 §5.3(3)。production contract、scope、估點均未改，未重開完整 plan gate——這是補完 exported verifier 自身應履行的 bijection 保證，不是設計變更。
 
