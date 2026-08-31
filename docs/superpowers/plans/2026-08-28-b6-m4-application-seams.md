@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev9（2026-08-28，implementation 對照 spec 發現的 verifier bijection erratum——`VerifyRequiredCheckManifest` 原僅比對陣列長度，未逐條重驗 §5.1(5) bijection，改為 Verify 自己完成六項檢查、不依賴 Build 已先執行；production contract、scope、估點均未變）
-> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8／rev9 皆為 implementation follow-up 發現的 erratum，未重開完整 plan gate——rev8 收緊測試以符合 rev7 已核准的不變量，rev9 補完 exported verifier 自身應履行的 bijection 保證，兩者均非設計變更）
+> 版本：rev10（2026-08-28，配合 B5 spec rev9——Task 5 依施工事實核對的 owner 裁決重寫，改稱「review section 收斂」：VerifyReviewSection 補結構性重驗＋範圍聲明、perms map 查無／未知值 fail loud、submitted_at 正規化為 UTC RFC3339Nano、刪除空宣稱 Consumes、不再建 manifest 外殼與 digest（歸 C1）；估點維持 0.1 pt 不動）
+> 狀態：**plan gate 通過**（2026-08-28 第七輪 Approved @ rev7——六輪 findings 全數收斂；B6a／B6b 可獨立執行，沿建議順序先 B6a 再 B6b。rev8／rev9／rev10 皆為 implementation follow-up 發現的 erratum／契約缺口，**未重開完整 plan gate**——rev8 收緊測試以符合 rev7 已核准的不變量、rev9 補完 exported verifier 自身應履行的 bijection 保證、rev10 配合 B5 spec rev9 補完 Task 5 尚未實作前發現的三項契約缺口＋範圍收斂，四者均非設計變更、rev10 明確**未重估**）
 > 票源：Pre-M4 Readiness Backlog **B6a／B6b**（owner 於 plan gate 第三輪核准拆票：B6a 1.45 pt／B6b 0.6 pt；backlog rev6 已同步拆列。兩票**皆只依賴 B5**、各自獨立結案——B6a→B6b 為建議執行順序、非技術相依；原 B6 的 aggregate 狀態於**兩票皆完成**時關閉，由**後完成之票**負責確認，不固定綁在 B6b）
 
 **Goal:** 依 B5 spec 建立 M4 所需的 application seams——Forge port、Gate 3 policy 骨架與 manifest 收斂邏輯、gate 讀取路徑 detect-only 遷移、wsregistry 綁定欄位、freeze latch 機制——不含 TaskRun domain 本體（C1a）、GitHub adapter（C1b）、Gate 3 UI（C1c）。
@@ -12,7 +12,7 @@
 
 **Tech Stack:** Go 1.25（stdlib only，無新外部依賴）；測試沿 `go vet ./...`＋`go test -race ./... -count=1` 慣例。
 
-**Spec:** `docs/superpowers/specs/2026-08-27-taskrun-gate3-forge-contract-design.md`（rev8，design gate 通過）
+**Spec:** `docs/superpowers/specs/2026-08-27-taskrun-gate3-forge-contract-design.md`（rev9，design gate 通過；rev9 為窄幅 design re-review，未重開完整 design gate）
 
 ## B6／C1 範圍分界與估點（plan gate 第一輪已裁決）
 
@@ -20,7 +20,7 @@
 |---|---|---|
 | §3.2(0) gate journal 單一寫入者不變式——7 入口 detect-only 遷移 | **B6**（Task 2-3） | M4 觸及的既有 orchestration 抽取核心；TaskRun 建立（C1a）依賴此前置 |
 | §6 Forge port 型別＋interface | **B6**（Task 1） | service 骨架；C1b 實作 GitHub adapter |
-| §5.1(5)(6) canonical manifest 收斂（bijection／current-effective／eligibility） | **B6**（Task 4-5） | 純邏輯、無依賴、測試價值高；C1b/C1c 呼叫 |
+| §5.1(5)(6) canonical manifest 收斂（bijection／current-effective／eligibility） | **B6**（Task 4-5，rev10 措辭校正——Task 5 只產出 review **section**，manifest 外殼＋digest 歸 **C1**） | 純邏輯、無依賴、測試價值高；C1b/C1c 呼叫 |
 | §5.2 `gate3_promotion` policy 註冊＋binding 形狀驗證＋重驗編排骨架 | **B6**（Task 6） | Gate 3 application service 骨架；深度依賴以 interface 注入、C1 接線 |
 | §4.3 pending Gate 3 request 轉終態（mismatch／transient 區分＋expired transition 寫入入口） | **B6**（Task 6b，rev2 補——plan gate P1） | 缺此則 PrepareDecision 遇 mismatch 只能回錯、pending 永不收斂，B5 §4.3 無法成立 |
 | §3.2(0) gate Submit 三送核路徑入 workflowMu | **B6**（Task 3b，rev2 補——plan gate P1） | 單一寫入者不變式涵蓋「任何 append」，rev1 只遷移了 Reconcile 面 |
@@ -41,7 +41,7 @@
 | 3 | 七入口 detect-only 遷移＋gateListReconciled＋既有測試語意更新 | 0.2 | B6a |
 | 3b | submitGateRequest 唯一 Submit 呼叫點入 workflowMu＋TryLock probe 測試 | 0.15 | B6a |
 | 4 | required-check manifest（含 RFC3339 嚴格解析） | 0.2 | B6a |
-| 5 | review manifest（含 RFC3339 嚴格解析） | 0.1 | B6a |
+| 5 | review section 收斂（含 RFC3339 嚴格解析＋submitted_at 正規化；rev10 範圍收斂——不建 manifest 外殼／不算 digest，估點不動） | 0.1 | B6a |
 | 6 | gate3 policy 骨架（含 subject 交叉驗證＋mismatch／transient 錯誤分類） | 0.2 | B6a |
 | 6b | Gate 3 pending 終態封閉（三入口 State==Pending＋Expired＋terminal cause 投影＋gateDecide 接線） | 0.35 | B6a |
 | 7 | wsregistry 1:1 雙向基數（跨 WSID 掃描＋partial-pair＋persistOrRollback failure matrix） | 0.2 | B6b |
@@ -1036,18 +1036,20 @@ git commit -m "feat(gatepolicy): B6 Task 4——required-check manifest 收斂�
 
 ---
 
-### Task 5: review manifest 收斂（eligibility＋current-effective＋零 CHANGES_REQUESTED）
+### Task 5: review section 收斂（eligibility＋current-effective＋零 CHANGES_REQUESTED）
+
+**rev10 範圍收斂（owner 裁決，B5 spec rev9 對應）**：本 Task **不建立 manifest 外殼、不計算 digest**——完整 `review_evidence_provenance` 還包含 evidence section，`manifest_schema: 1` 與最終 digest 留給 **C1** 於決議時組合。Task 5 只產出 review **section**（`[]ReviewEntry`）與其 Build／Verify。
 
 **Files:**
 - Modify: `internal/gatepolicy/gate3_manifest.go`（追加）
 - Test: `internal/gatepolicy/gate3_manifest_test.go`（追加）
 
 **Interfaces:**
-- Consumes: Task 1 的 `forge.Review`／`forge.Permission`；Task 4 的 `ManifestDigest`。
+- Consumes: Task 1 的 `forge.Review`／`forge.Permission`。
 - Produces:
-  - `type ReviewEntry struct{ ReviewerLogin, Permission string; ReviewID int64; State, ReviewedHeadSHA, SubmittedAt string }`
-  - `func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) ([]ReviewEntry, error)`（僅具效力 reviewer、每人一筆 current-effective、依 login 排序；SubmittedAt 非 RFC3339 → error fail loud，rev2）
-  - `func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error`（≥1 APPROVED@head 且零 CHANGES_REQUESTED）
+  - `type ReviewEntry struct{ ReviewerLogin, Permission string; ReviewID int64; State, ReviewedHeadSHA, SubmittedAt string }`（`SubmittedAt` 為正規化後的 **UTC RFC3339Nano** canonical value，非 forge 原始字面值——見下）
+  - `func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) ([]ReviewEntry, error)`——僅具效力 reviewer（write／maintain／admin）、每人一筆 current-effective（依 `submitted_at` 解析後的 `time.Time` 比較，tie 取 `review_id` 大者）、依 `login` 排序。**Fail-closed 規則（rev10——修正 perms map 零值語意造成的 CR 方向 fail-open，B5 §6）**：`state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 的 review，其 reviewer 的 permission **key 必須存在**於 `perms`，缺漏（查無／未查詢）不得等同 `PermissionNone`，須 fail loud；permission 值須為已知列舉（`admin／maintain／write／read／none`），未知值（含空字串）→fail loud；`COMMENTED／PENDING` 不參與 current-effective，可不要求 permission；**未知 review state 不得靜默跳過**，須 fail loud。寫入 `SubmittedAt` 前正規化為 `ts.UTC().Format(time.RFC3339Nano)`（rev10 新增契約——固定 digest preimage，不用 `time.RFC3339`，避免丟失 fractional seconds）。
+  - `func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error`——**結構性重驗**（rev10，沿 Task 4 exported verifier 原則）：(1) `reviewer_login` 嚴格遞增；(2) `permission` 是已知列舉值且必須 eligible；(3) `state` 僅能是 `APPROVED／CHANGES_REQUESTED／DISMISSED`；(4) `submitted_at` 合法 RFC3339 且等於重新格式化的 canonical value；(5) ≥1 current-effective `APPROVED@head`、零 `CHANGES_REQUESTED`。**範圍聲明（doc-comment 明文，rev10）**：僅驗證 section 自身的 canonical／決議不變量，**不證明**其完整來自 Forge（例如 caller 把某具效力 reviewer 的 CHANGES_REQUESTED 整筆刪除後，剩餘 section 仍可能滿足全部五項檢查——這是 `[]ReviewEntry` 單獨無法證明的資訊缺口）；完整性由 **C1** 於決議時重新 `GetReviews`、查齊 permissions、`BuildReviewSection`、`VerifyReviewSection`、組合 manifest 並比對 digest 保證（B5 spec §5.3(5)）。
 
 - [ ] **Step 1: 寫 failing tests**
 
@@ -1063,14 +1065,90 @@ func TestBuildReviewSection(t *testing.T) {
 		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
 		rev("alice", "CHANGES_REQUESTED", "aaaa", "2026-08-28T02:00:00Z", 2), // 後者 supersede
 		rev("alice", "COMMENTED", "aaaa", "2026-08-28T03:00:00Z", 3),         // COMMENTED 不改變有效狀態
-		rev("eve", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 4),            // read 權限：不入 manifest
-		rev("bob", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 5),   // 無權限紀錄→None：不入
+		rev("eve", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 4),            // 明確 read 權限：不入 section
 	}, perms)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 1 || entries[0].ReviewerLogin != "alice" || entries[0].State != "CHANGES_REQUESTED" {
-		t.Fatalf("僅 alice 的 current-effective（CR）應入 manifest：%+v", entries)
+		t.Fatalf("僅 alice 的 current-effective（CR）應入 section：%+v", entries)
+	}
+	if entries[0].SubmittedAt != "2026-08-28T02:00:00Z" {
+		t.Fatalf("SubmittedAt 應正規化為 UTC RFC3339Nano：%q", entries[0].SubmittedAt)
+	}
+}
+
+// TestBuildReviewSectionPermissionNoneExcluded：明確 none（key 存在、值為
+// none）——安全排除，不入 section，不視為錯誤（區分於 key 缺漏，rev10）。
+func TestBuildReviewSectionPermissionNoneExcluded(t *testing.T) {
+	perms := map[string]forge.Permission{"bob": forge.PermissionNone}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("bob", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("明確 none 應安全排除：%+v", entries)
+	}
+}
+
+// TestBuildReviewSectionPermissionKeyMissingFailsLoud：perms 完全沒有該
+// reviewer 的 key（未查詢／查詢失敗）——不得等同 none，須 fail loud
+//（B5 §6 fail-closed；rev10 修正原「無紀錄→None：不入」的 fail-open 缺口）。
+func TestBuildReviewSectionPermissionKeyMissingFailsLoud(t *testing.T) {
+	perms := map[string]forge.Permission{}
+	_, err := BuildReviewSection([]forge.Review{
+		rev("bob", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err == nil || !strings.Contains(err.Error(), "缺少") {
+		t.Fatalf("permission key 缺漏應 fail loud，got %v", err)
+	}
+}
+
+// TestBuildReviewSectionUnknownPermissionValueFailsLoud：key 存在但值非
+// 已知列舉（含空字串）——fail loud，不得靜默視為不具效力。
+func TestBuildReviewSectionUnknownPermissionValueFailsLoud(t *testing.T) {
+	cases := map[string]forge.Permission{"typo": forge.Permission("writeXX"), "empty": forge.Permission("")}
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
+			perms := map[string]forge.Permission{"bob": p}
+			_, err := BuildReviewSection([]forge.Review{
+				rev("bob", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
+			}, perms)
+			if err == nil || !strings.Contains(err.Error(), "未知") {
+				t.Fatalf("未知 permission 值應 fail loud，got %v", err)
+			}
+		})
+	}
+}
+
+// TestBuildReviewSectionUnknownStateFailsLoud：非白名單 review state 不得
+// 靜默跳過（rev10 新規則）。
+func TestBuildReviewSectionUnknownStateFailsLoud(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	_, err := BuildReviewSection([]forge.Review{
+		rev("alice", "REQUEST_CHANGES_TYPO", "aaaa", "2026-08-28T01:00:00Z", 1),
+	}, perms)
+	if err == nil || !strings.Contains(err.Error(), "未知") {
+		t.Fatalf("未知 state 應 fail loud，got %v", err)
+	}
+}
+
+// TestBuildReviewSectionPendingNotRequirePermission：COMMENTED／PENDING
+// 不參與 current-effective，可不要求 permission（即使 key 缺漏也不報錯，
+// 因為根本不查）。
+func TestBuildReviewSectionPendingNotRequirePermission(t *testing.T) {
+	perms := map[string]forge.Permission{}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "PENDING", "aaaa", "2026-08-28T01:00:00Z", 1),
+		rev("alice", "COMMENTED", "aaaa", "2026-08-28T02:00:00Z", 2),
+	}, perms)
+	if err != nil {
+		t.Fatalf("PENDING／COMMENTED 不應要求 permission：%v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("PENDING／COMMENTED 不入 section：%+v", entries)
 	}
 }
 
@@ -1093,10 +1171,100 @@ func TestBuildReviewSectionTimezoneAndParseError(t *testing.T) {
 	}
 }
 
+// TestBuildReviewSectionTieBreakReviewID：同一 reviewer 兩筆 review 的
+// submitted_at 相同時，取 review_id 較大者為 current-effective。
+func TestBuildReviewSectionTieBreakReviewID(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	entries, err := BuildReviewSection([]forge.Review{
+		rev("alice", "CHANGES_REQUESTED", "aaaa", "2026-08-28T01:00:00Z", 5),
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 9),
+	}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].State != "APPROVED" || entries[0].ReviewID != 9 {
+		t.Fatalf("tie-break 應取 review_id 較大者：%+v", entries)
+	}
+}
+
+// TestBuildReviewSectionSubmittedAtNormalization：rev10 新增契約——寫入
+// ReviewEntry 的 SubmittedAt 為 UTC RFC3339Nano canonical value，且
+// 2026-08-28T01:00:00Z 與 2026-08-28T01:00:00+00:00 兩種輸入表示同一時刻，
+// 必須產出完全相同的 section bytes（固定 digest preimage，避免決議時
+// 重讀重算產生假 mismatch）。
+func TestBuildReviewSectionSubmittedAtNormalization(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite}
+	a, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00+00:00", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	if string(ab) != string(bb) {
+		t.Fatalf("Z 與 +00:00 兩種表示應產出相同 section bytes：%s vs %s", ab, bb)
+	}
+	// 帶 fractional seconds 的輸入不得被截斷精度（用 RFC3339Nano，非 RFC3339）。
+	frac, err := BuildReviewSection([]forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00.123456789Z", 1)}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frac[0].SubmittedAt != "2026-08-28T01:00:00.123456789Z" {
+		t.Fatalf("RFC3339Nano 正規化不得丟失 fractional seconds：%q", frac[0].SubmittedAt)
+	}
+}
+
+// TestBuildReviewSectionOrderIndependent：reviews 輸入順序反轉，section
+// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）。
+func TestBuildReviewSectionOrderIndependent(t *testing.T) {
+	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "bob": forge.PermissionMaintain}
+	reviews := []forge.Review{
+		rev("alice", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 1),
+		rev("bob", "APPROVED", "aaaa", "2026-08-28T01:00:00Z", 2),
+	}
+	m1, err := BuildReviewSection(reviews, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reversed := []forge.Review{reviews[1], reviews[0]}
+	m2, err := BuildReviewSection(reversed, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, _ := json.Marshal(m1)
+	b2, _ := json.Marshal(m2)
+	if string(b1) != string(b2) {
+		t.Fatalf("輸入順序不得影響 section bytes：%s vs %s", b1, b2)
+	}
+}
+
+// TestReviewEntryCanonicalJSONKeyOrder——canonical digest 跨實作契約的
+// 鍵序 golden test（比照 Task 4 TestManifestCanonicalJSONKeyOrder 形狀）。
+func TestReviewEntryCanonicalJSONKeyOrder(t *testing.T) {
+	entries := []ReviewEntry{
+		{ReviewerLogin: "alice", Permission: "write", ReviewID: 1, State: "APPROVED",
+			ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+	}
+	got, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"reviewer_login":"alice","permission":"write","review_id":1,"state":"APPROVED","reviewed_head_sha":"aaaa","submitted_at":"2026-08-28T01:00:00Z"}]`
+	if string(got) != want {
+		t.Fatalf("canonical JSON 鍵序契約破裂：\n got=%s\nwant=%s", got, want)
+	}
+}
+
 func TestVerifyReviewSection(t *testing.T) {
 	head := forge.OID("aaaa")
 	ok := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
-		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"}}
+		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
 	if err := VerifyReviewSection(ok, head); err != nil {
 		t.Fatal(err)
 	}
@@ -1104,21 +1272,82 @@ func TestVerifyReviewSection(t *testing.T) {
 		t.Fatal("零 review 應不符")
 	}
 	staleHead := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
-		State: "APPROVED", ReviewedHeadSHA: "bbbb", SubmittedAt: "t1"}}
+		State: "APPROVED", ReviewedHeadSHA: "bbbb", SubmittedAt: "2026-08-28T01:00:00Z"}}
 	if err := VerifyReviewSection(staleHead, head); err == nil {
 		t.Fatal("過期 head 的 approval 不算")
 	}
-	withCR := append(append([]ReviewEntry(nil), ok...), ReviewEntry{ReviewerLogin: "carol",
-		Permission: "write", ReviewID: 2, State: "CHANGES_REQUESTED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"})
+	withCR := []ReviewEntry{ok[0], {ReviewerLogin: "carol",
+		Permission: "write", ReviewID: 2, State: "CHANGES_REQUESTED",
+		ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
 	if err := VerifyReviewSection(withCR, head); err == nil {
 		t.Fatal("存在具效力 CHANGES_REQUESTED 應不符（owner 裁決：零 CR）")
 	}
-	dismissed := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
-		State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t1"},
-		{ReviewerLogin: "dave", Permission: "write", ReviewID: 2,
-			State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "t2"}}
+	dismissed := []ReviewEntry{ok[0], {ReviewerLogin: "dave", Permission: "write", ReviewID: 2,
+		State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T02:00:00Z"}}
 	if err := VerifyReviewSection(dismissed, head); err != nil {
 		t.Fatalf("DISMISSED 不計入亦不阻擋：%v", err)
+	}
+}
+
+// TestVerifyReviewSectionDismissedOnlyNoApproval：具效力 reviewer 的
+// current-effective 是 DISMISSED、且無其他 APPROVED——不得通過（DISMISSED
+// 不計入亦不阻擋 ≠ 視為 approval）。
+func TestVerifyReviewSectionDismissedOnlyNoApproval(t *testing.T) {
+	entries := []ReviewEntry{{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+		State: "DISMISSED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}}
+	if err := VerifyReviewSection(entries, forge.OID("aaaa")); err == nil {
+		t.Fatal("僅 DISMISSED、無 APPROVED 應不符")
+	}
+}
+
+// TestVerifyReviewSectionStructuralInvariants：Verify 自身履行的四項結構
+// 性檢查（rev10——沿 Task 4 exported verifier 原則），各自獨立負向案例；
+// 全部以 literal 手刻 entries 直接呼叫 Verify，不經 Build。
+func TestVerifyReviewSectionStructuralInvariants(t *testing.T) {
+	head := forge.OID("aaaa")
+	base := func() ReviewEntry {
+		return ReviewEntry{ReviewerLogin: "alice", Permission: "write", ReviewID: 1,
+			State: "APPROVED", ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"}
+	}
+	cases := []struct {
+		name    string
+		entries []ReviewEntry
+		wantErr string
+	}{
+		{name: "reviewer_login 非嚴格遞增（重複）",
+			entries: []ReviewEntry{base(), base()},
+			wantErr: "非嚴格遞增"},
+		{name: "reviewer_login 非嚴格遞增（逆序）",
+			entries: []ReviewEntry{
+				{ReviewerLogin: "bob", Permission: "write", ReviewID: 1, State: "APPROVED",
+					ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+				{ReviewerLogin: "alice", Permission: "write", ReviewID: 2, State: "APPROVED",
+					ReviewedHeadSHA: "aaaa", SubmittedAt: "2026-08-28T01:00:00Z"},
+			},
+			wantErr: "非嚴格遞增"},
+		{name: "permission 未知列舉值",
+			entries: func() []ReviewEntry { e := base(); e.Permission = "superuser"; return []ReviewEntry{e} }(),
+			wantErr: "未知"},
+		{name: "permission 為明確不具效力值（read）不應出現於 section",
+			entries: func() []ReviewEntry { e := base(); e.Permission = "read"; return []ReviewEntry{e} }(),
+			wantErr: "不具效力"},
+		{name: "state 不在白名單",
+			entries: func() []ReviewEntry { e := base(); e.State = "COMMENTED"; return []ReviewEntry{e} }(),
+			wantErr: "白名單"},
+		{name: "submitted_at 非 RFC3339",
+			entries: func() []ReviewEntry { e := base(); e.SubmittedAt = "not-a-time"; return []ReviewEntry{e} }(),
+			wantErr: "非 RFC3339"},
+		{name: "submitted_at 非 canonical（+00:00 而非 Z）",
+			entries: func() []ReviewEntry { e := base(); e.SubmittedAt = "2026-08-28T01:00:00+00:00"; return []ReviewEntry{e} }(),
+			wantErr: "非 canonical"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyReviewSection(tc.entries, head)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 ```
@@ -1140,7 +1369,23 @@ type ReviewEntry struct {
 //（B5 §5.1(6)）。eligibility＝permission ∈ {write,maintain,admin}；不具
 // 效力者完全不入（approval 不放行、CHANGES_REQUESTED 亦不阻擋）。
 // current-effective＝state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 中
-// submitted_at 最新（tie 取 review_id 大者）；COMMENTED／PENDING 不參與。
+// submitted_at（解析後 time.Time）最新者（tie 取 review_id 大者）；
+// COMMENTED／PENDING 不參與、不入 section。
+//
+// Fail-closed 規則（rev10——修正 perms map 零值語意造成的 CR 方向
+// fail-open，B5 §6）：
+//   - state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED} 的 review，其
+//     reviewer 的 permission key 必須存在於 perms；缺漏（查無／未查詢）
+//     不得等同 PermissionNone，須 fail loud。
+//   - permission 值必須是已知列舉（admin／maintain／write／read／none）；
+//     未知值（含空字串）→fail loud。
+//   - COMMENTED／PENDING 不參與 current-effective，可不要求 permission。
+//   - 未知 review state（非上述五種）不得靜默跳過，須 fail loud。
+//
+// SubmittedAt 正規化（rev10 新增契約——固定 digest preimage）：寫入
+// ReviewEntry 的 SubmittedAt 為解析後時間值的 UTC RFC3339Nano 表示
+//（ts.UTC().Format(time.RFC3339Nano)，非 time.RFC3339——避免丟失
+// fractional seconds）；current-effective 收斂比較仍用解析後的 time.Time。
 func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permission) ([]ReviewEntry, error) {
 	type effRev struct {
 		r  forge.Review
@@ -1148,13 +1393,24 @@ func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permissio
 	}
 	eff := map[string]effRev{}
 	for _, r := range reviews {
-		if !perms[r.ReviewerLogin].Eligible() {
-			continue
-		}
 		switch r.State {
 		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
-		default:
+			p, ok := perms[r.ReviewerLogin]
+			if !ok {
+				return nil, fmt.Errorf("review %d（reviewer %s, state %s）缺少 permission 查詢結果，不得等同 none（fail closed，B5 §6）", r.ReviewID, r.ReviewerLogin, r.State)
+			}
+			switch p {
+			case forge.PermissionAdmin, forge.PermissionMaintain, forge.PermissionWrite, forge.PermissionRead, forge.PermissionNone:
+			default:
+				return nil, fmt.Errorf("review %d（reviewer %s）permission 值未知：%q", r.ReviewID, r.ReviewerLogin, string(p))
+			}
+			if !p.Eligible() {
+				continue
+			}
+		case "COMMENTED", "PENDING":
 			continue
+		default:
+			return nil, fmt.Errorf("review %d（reviewer %s）未知 state：%q（不得靜默跳過）", r.ReviewID, r.ReviewerLogin, r.State)
 		}
 		ts, perr := time.Parse(time.RFC3339, r.SubmittedAt)
 		if perr != nil {
@@ -1172,20 +1428,64 @@ func BuildReviewSection(reviews []forge.Review, perms map[string]forge.Permissio
 	sort.Strings(logins)
 	out := make([]ReviewEntry, 0, len(logins))
 	for _, l := range logins {
-		r := eff[l].r
+		e := eff[l]
 		out = append(out, ReviewEntry{ReviewerLogin: l, Permission: string(perms[l]),
-			ReviewID: r.ReviewID, State: r.State, ReviewedHeadSHA: string(r.ReviewedHeadOID),
-			SubmittedAt: r.SubmittedAt})
+			ReviewID: e.r.ReviewID, State: e.r.State, ReviewedHeadSHA: string(e.r.ReviewedHeadOID),
+			SubmittedAt: e.at.UTC().Format(time.RFC3339Nano)})
 	}
 	return out, nil
 }
 
-// VerifyReviewSection：≥1 current-effective APPROVED@promotion_head，且
-// 不存在任何 current-effective CHANGES_REQUESTED（owner 裁決：fail-closed
-// 預設，限具效力 reviewer）；DISMISSED 不計入亦不阻擋。
+// VerifyReviewSection：結構性重驗 section 自身的 canonical／決議不變量
+//（rev10——沿 Task 4 exported verifier 原則：exported verifier 必須自行
+// 履行其宣稱的契約，不能只依賴 Build 已先驗證的前提）：
+//  1. reviewer_login 嚴格遞增（連帶保證排序與唯一性）。
+//  2. permission 是已知列舉值且必須 eligible（write／maintain／admin）。
+//  3. state 僅能是 APPROVED／CHANGES_REQUESTED／DISMISSED。
+//  4. submitted_at 合法 RFC3339，且等於重新格式化的 UTC RFC3339Nano
+//     canonical value（非 canonical 表示 → fail loud）。
+//  5. 至少一筆 current-effective APPROVED @ head、零 CHANGES_REQUESTED；
+//     DISMISSED 不計入亦不阻擋。
+//
+// 範圍聲明：本函式僅驗證 section 自身的 canonical／決議不變量，
+// **不證明**其完整來自 Forge——例如 caller 把某具效力 reviewer 的
+// CHANGES_REQUESTED 整筆刪除後，剩餘 section 仍可能滿足以上五項全部
+// 檢查（遞增、permission 列舉且 eligible、state 白名單、canonical
+// timestamp、零 CR），這是 []ReviewEntry 單獨無法證明的資訊缺口。
+// 完整性由 C1 於決議時重新 GetReviews、查齊 permissions、
+// BuildReviewSection、VerifyReviewSection、組合 manifest 並比對 digest
+// 保證（B5 spec §5.3(5)）。
 func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error {
 	approvedAtHead := false
-	for _, e := range entries {
+	prevLogin := ""
+	for i, e := range entries {
+		if i > 0 && e.ReviewerLogin <= prevLogin {
+			return fmt.Errorf("reviewer_login 非嚴格遞增：%q 之後接 %q", prevLogin, e.ReviewerLogin)
+		}
+		prevLogin = e.ReviewerLogin
+
+		switch forge.Permission(e.Permission) {
+		case forge.PermissionWrite, forge.PermissionMaintain, forge.PermissionAdmin:
+		case forge.PermissionRead, forge.PermissionNone:
+			return fmt.Errorf("reviewer %s permission=%s 不具效力，不應出現於 section", e.ReviewerLogin, e.Permission)
+		default:
+			return fmt.Errorf("reviewer %s permission 值未知：%q", e.ReviewerLogin, e.Permission)
+		}
+
+		switch e.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+		default:
+			return fmt.Errorf("reviewer %s state 不在白名單：%q", e.ReviewerLogin, e.State)
+		}
+
+		ts, perr := time.Parse(time.RFC3339, e.SubmittedAt)
+		if perr != nil {
+			return fmt.Errorf("reviewer %s submitted_at 非 RFC3339：%q", e.ReviewerLogin, e.SubmittedAt)
+		}
+		if canonical := ts.UTC().Format(time.RFC3339Nano); e.SubmittedAt != canonical {
+			return fmt.Errorf("reviewer %s submitted_at 非 canonical UTC RFC3339Nano：%q（應為 %q）", e.ReviewerLogin, e.SubmittedAt, canonical)
+		}
+
 		switch e.State {
 		case "CHANGES_REQUESTED":
 			return fmt.Errorf("reviewer %s 有 current-effective CHANGES_REQUESTED（零 CR 條件）", e.ReviewerLogin)
@@ -1207,7 +1507,7 @@ func VerifyReviewSection(entries []ReviewEntry, head forge.OID) error {
 
 ```bash
 git add internal/gatepolicy/gate3_manifest.go internal/gatepolicy/gate3_manifest_test.go
-git commit -m "feat(gatepolicy): B6 Task 5——review manifest 收斂（eligibility／current-effective／零 CR，B5 §5.1(6)）"
+git commit -m "feat(gatepolicy): B6 Task 5——review section 收斂（eligibility／current-effective／零 CR／submitted_at 正規化，B5 §5.1(6)）"
 ```
 
 ---
@@ -2328,6 +2628,12 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
 
 ## 修訂記錄
 
+- rev10（2026-08-28，**Task 5 尚未實作前的施工事實核對——B5 spec rev9 對應的契約補完＋範圍收斂**，owner 逐條裁決；**production contract 不受影響（Task 5 未實作）、未重開完整 plan gate、估點維持 0.1 pt 不動、未重估**）：
+  - ①（沿 Task 4 已確立的「exported verifier 必須履行自己宣稱的契約」原則）`VerifyReviewSection` 原僅掃 state、無法察覺入參集合本身是錯的。補結構性重驗：`reviewer_login` 嚴格遞增、`permission` 已知列舉且 eligible、`state` 白名單、`submitted_at` 合法且已正規化。**owner 同時指出殘留缺口**：即使全部結構檢查通過，仍無法偵測 caller 把某 reviewer 的 CR 整筆刪除——`[]ReviewEntry` 單獨無法證明其完整來自 Forge，這是資訊不足非邏輯漏洞。doc-comment 明文此範圍聲明：完整性由 **C1** 於決議時重新 `GetReviews`、查齊 permissions、`BuildReviewSection`、`VerifyReviewSection`、組合 manifest 並比對 digest 保證（B5 spec §5.3(5)）。
+  - ②（澄清既有 §6 語意，非新增契約）`perms map[string]forge.Permission` 的 Go 零值語意讓「權限查無／未查詢」與「已確認 read／none」無法區分，兩者皆變成 `Eligible()==false`，使 CHANGES_REQUESTED 方向 fail-open，與 §6 fail-closed 語意衝突。凍結：`state ∈ {APPROVED,CHANGES_REQUESTED,DISMISSED}` 的 review，其 reviewer permission key 必須存在，缺漏 fail loud；值須為已知列舉（含空字串 fail loud）；`write／maintain／admin` 入候選，明確 `read／none` 安全排除；`COMMENTED／PENDING` 不參與、可不要求 permission；未知 review state 不得靜默跳過。連帶測試修正：刪除原「Bob 無紀錄→None：不入」案例，改為三案例（明確 none、key 缺漏、未知值）。
+  - ③（**本次唯一新增的 spec 級契約**，B5 spec 同步升 rev9）`ReviewEntry.SubmittedAt` 原存 forge 原始字串；RFC3339 允許同一時刻多種字面表示（`Z` 與 `+00:00`），未正規化會使決議時重讀重算產生不同 digest、假 mismatch、pending 誤判失效（§4.3）。凍結：寫入時正規化為 `ts.UTC().Format(time.RFC3339Nano)`（非 `time.RFC3339`，避免丟失 fractional seconds）；`BuildReviewSection` 仍以解析後 `time.Time` 比較收斂；`VerifyReviewSection` 新增「輸入字串等於重新格式化 canonical value」檢查。新增測試證明兩種表示產出完全相同 section bytes。
+  - ④ Task 5 改稱「review section 收斂」（原稱「review manifest 收斂」）；**不建 manifest 外殼、不算 digest**（歸 C1）；刪除 Interfaces 內「Consumes: Task 4 的 `ManifestDigest`」空宣稱（原範本從未呼叫）；補 `ReviewEntry` 精確 JSON 鍵序 golden test（比照 Task 4 `TestManifestCanonicalJSONKeyOrder` 形狀）與 `reviews` 輸入順序反轉後 section bytes 相同測試；補齊 tie-break（同 submitted_at 不同 review_id）、`PENDING` 狀態、eligible reviewer 的 current-effective 為 `DISMISSED` 且無其他 approval、Verify 四項結構條件各自獨立負向案例。B6／C1 範圍分界表 `§5.1(5)(6)` 一列措辭校正為「manifest 外殼＋digest 歸 C1」。
+  - Scope 邊界：本輪為 doc-only 契約落地（Task 5 尚未實作），不影響 Task 1-4 已完成內容；未重開完整 plan gate、未重估。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。

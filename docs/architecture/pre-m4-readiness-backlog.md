@@ -1,7 +1,7 @@
-# Pre-M4 Readiness Backlog（rev6·估點版）
+# Pre-M4 Readiness Backlog（rev7·估點版）
 
-> 版本：rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
-> 前版：rev5（2026-08-27，rev4 通過 review；本版加入 A／B／C 軌估點與拆票，票面語意除 A4 措辭校正外不變）
+> 版本：rev7（2026-08-28，C1 驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——B6 Task 5 review section 契約施工事實核對的對應落地，owner 裁示；其餘票面不變）
+> 前版：rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
 > 狀態：**估點待 owner review**——D 軌待立項後估（rev4 凍結）
 > 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
@@ -136,7 +136,7 @@
 
 - **背景**：先證明 M4 **新增**的治理迴路（核准上下文綁定 → PR → Gate 3）端到端閉合，再抽象多 provider／多 forge。**範圍限縮聲明（rev2）**：本票起點是「已選定 task」，不含 spec／plan authoring 與 Gate 1／Gate 2／TCA 流程（該些為 M2／M3 已驗收資產）；因此**本票完成不得宣稱滿足完整 SC4**——「app 內從 authoring 到 Gate 3 全程不離開」的完整驗收，須待 A1 完成後另立驗收項（見依賴欄）。選擇限縮而非前移起點的理由：垂直切片的價值在最小範圍證明新迴路，authoring 閉環是獨立缺口（A1），混入會讓失敗訊號無法歸因。
 - **HEAD 證據**：B5 所列（enforcement 缺口為規劃中的 M4 範圍，非現況缺陷）。
-- **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。
+- **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。**Forge 回傳 eligible CR 不得經篩除後假綠（rev7 新增，B6 Task 5 施工事實核對對應）**：C1 決議時必須自 Forge 重讀完整 review 集合並查齊 permissions；針對「Forge 實際回傳了某具效力 reviewer 的 `CHANGES_REQUESTED`」的情形，驗收須證明該筆不會被篩除而得到假綠——`VerifyReviewSection`（B6 Task 5）依設計無法偵測 caller 整筆刪除某 reviewer 的 review（見該函式 doc-comment 之範圍聲明），完整性責任在 C1 的重讀重建路徑，非 Task 5 的 section-level 驗證。
 - **建議模組**：依 B5／B6 產出的 application service、forge adapter（GitHub）、frontend Gate 3 檢視。
 - **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6a、B6b**（rev3 明列；rev6 依拆票改 B6→B6a＋B6b）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；**pilot provider 已裁決（owner 2026-08-27）：Claude**——現有實機證據已跑過 Bash 核可並實際寫檔，per-WSID 子行程是較自然的 TaskRun ownership 邊界；Codex 的共用 app-server generation 會為第一條垂直切片多帶一層共享生命週期複雜度。
 
@@ -279,4 +279,5 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
   - A4 措辭校正（owner 核可於估點 commit 順手修）：GOTOOLCHAIN 自動切換風險
     發生在加入 toolchain directive 的受測 commit，非現行 go.mod。
 - rev6（2026-08-28，B6 拆票）：B6 plan gate 第三輪 owner 裁決落地——B6 拆 **B6a**（gate 單一寫入者＋Gate 3 policy／manifest，1.45 pt）／**B6b**（綁定持久化＋freeze latch，0.6 pt）；拆票理由＝plan rev3 bottom-up 重估 2.05 pt 逾 2.0 拆票線（原 1.4 pt「僅 service 骨架」前提破壞）。兩票皆僅依賴 B5、**各自獨立結案**；B6a→B6b 為建議順序非技術相依；**原 B6 aggregate 於兩票皆完成時關閉、由後完成之票確認**（不固定綁在 B6b）。C1 相依 B6→B6a＋B6b；B 軌小計 8.6→9.25、合計 15.1→15.75 pt。
+- rev7（2026-08-28，C1 驗收條件補案例）：B6 Task 5（review section 收斂）尚未實作前的施工事實核對發現 `VerifyReviewSection` 依設計無法偵測 caller 整筆刪除某具效力 reviewer 的 review（完整性責任在 C1），owner 裁示於 **C1 Implementation-to-Gate-3 垂直切片**的驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例——C1 決議時須自 Forge 重讀完整 review 集合並查齊 permissions，驗收須證明具效力 CR 不會被篩除得到假綠。僅動 C1 該列驗收條件敘述，其餘票面／估點不變。
 - rev1（2026-08-27）：初版。
