@@ -460,7 +460,11 @@ func TestBuildReviewSectionSubmittedAtNormalization(t *testing.T) {
 }
 
 // TestBuildReviewSectionOrderIndependent：reviews 輸入順序反轉，section
-// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）。
+// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）；另外明確
+// 斷言輸出順序為 alice, bob（canonical section 依 reviewer_login 字典序
+// 升冪）。這兩個斷言證明不同性質：前者證明 Forge 輸入順序不影響輸出，
+// 後者證明輸出本身確實依升冪排序——只留前者時「移除 sort」的 mutation
+// 鑑別力是機率性的（Go map 疊代分布未承諾均勻，見 rev10 修訂記錄末尾）。
 func TestBuildReviewSectionOrderIndependent(t *testing.T) {
 	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "bob": forge.PermissionMaintain}
 	reviews := []forge.Review{
@@ -470,6 +474,9 @@ func TestBuildReviewSectionOrderIndependent(t *testing.T) {
 	m1, err := BuildReviewSection(reviews, perms)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(m1) != 2 || m1[0].ReviewerLogin != "alice" || m1[1].ReviewerLogin != "bob" {
+		t.Fatalf("canonical section 須依 reviewer_login 字典序升冪：got=%+v", m1)
 	}
 	reversed := []forge.Review{reviews[1], reviews[0]}
 	m2, err := BuildReviewSection(reversed, perms)

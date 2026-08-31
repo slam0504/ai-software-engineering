@@ -1264,7 +1264,11 @@ func TestBuildReviewSectionSubmittedAtNormalization(t *testing.T) {
 }
 
 // TestBuildReviewSectionOrderIndependent：reviews 輸入順序反轉，section
-// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）。
+// bytes 完全相同（B5 共同規則——forge 回傳順序不得影響 digest）；另外明確
+// 斷言輸出順序為 alice, bob（canonical section 依 reviewer_login 字典序
+// 升冪）。這兩個斷言證明不同性質：前者證明 Forge 輸入順序不影響輸出，
+// 後者證明輸出本身確實依升冪排序——只留前者時「移除 sort」的 mutation
+// 鑑別力是機率性的（Go map 疊代分布未承諾均勻，見 rev10 修訂記錄末尾）。
 func TestBuildReviewSectionOrderIndependent(t *testing.T) {
 	perms := map[string]forge.Permission{"alice": forge.PermissionWrite, "bob": forge.PermissionMaintain}
 	reviews := []forge.Review{
@@ -1274,6 +1278,9 @@ func TestBuildReviewSectionOrderIndependent(t *testing.T) {
 	m1, err := BuildReviewSection(reviews, perms)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(m1) != 2 || m1[0].ReviewerLogin != "alice" || m1[1].ReviewerLogin != "bob" {
+		t.Fatalf("canonical section 須依 reviewer_login 字典序升冪：got=%+v", m1)
 	}
 	reversed := []forge.Review{reviews[1], reviews[0]}
 	m2, err := BuildReviewSection(reversed, perms)
@@ -2679,6 +2686,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - Scope 邊界：本輪為 doc-only 契約落地（Task 5 尚未實作），不影響 Task 1-4 已完成內容；未重開完整 plan gate、未重估。
   - **補回漏載範本（owner 2026-08-31 裁示，doc-only）**：Task 4 Step 1 測試範本先前未收錄 `TestManifestCanonicalJSONKeyOrder`——該 golden test 已於 follow-up 2（`22088cb`）落地並通過驗收，但 follow-up 2 的 owner 指定範圍只涵蓋 Step 3 虛擬碼、Step 1 bijection 案例與 rev9 案例數，故未同步。依 plan 可重放性要求補入，內容與 `internal/gatepolicy/gate3_manifest_test.go` 的實際測試逐字一致；並補上該範本 import 區塊原本缺少的 `"encoding/json"`（照抄會編譯失敗）。**production contract 與程式碼均未變**。
   - **日期更正（owner 2026-08-31 裁示，不另升版）**：spec rev9／plan rev10／backlog rev7 三個條目原誤標 2026-08-28，實際落地日為 2026-08-31，已更正；版本號維持不變。
+  - **Task 5 follow-up：`TestBuildReviewSectionOrderIndependent` 補明確升冪斷言（owner 2026-08-31 裁示，不另升版）**：原測試只比對「輸入反轉後 section bytes 相等」，使「移除 `sort.Strings(logins)`」的 mutation 鑑別力是機率性的——`BuildReviewSection` 把結果收進 map 再取 logins，無 sort 時輸出順序由 Go map 疊代隨機化決定、與輸入順序無關，兩次 Build 有相當機率恰好同序而讓 mutation 存活（實測 8 次樣本僅紅 7 次）。owner 否決「增加 reviewer 數量」方案——Go map 疊代分布未承諾均勻，樣本數不能可靠換算成 1/n!，仍是機率性證據。改為保留 bytes 相等斷言（證明 Forge 輸入順序不影響輸出）並另外明確斷言輸出為 `alice, bob`（證明 canonical section 依 `reviewer_login` 字典序升冪）；acceptance mutation 改為「升冪換降冪」（確定性、必紅），「完全移除 sort」降級為補充性、機率性 mutation，不作為 acceptance 依據。production code（`BuildReviewSection`／`VerifyReviewSection`）未變。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-5-followup-report.md`。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
