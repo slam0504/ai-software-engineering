@@ -1567,6 +1567,7 @@ git commit -m "feat(gatepolicy): B6 Task 5——review section 收斂（eligibil
 - Create: `internal/gatepolicy/gate3.go`
 - Test: `internal/gatepolicy/gate3_test.go`
 - Modify: `app.go`（`ensureGate` 的 registry，app.go:3888-3894）
+- Modify: `internal/gate/policy.go`（comment-only：`DecisionInput.RiskSelections` 註解補列 gate3 為空，不改邏輯／import——Task 6 implementation preflight erratum）
 
 **Interfaces:**
 - Consumes: `gate.GatePolicy` interface（policy.go）、`gate.Binding`／`gate.GateRequest`／`gate.StaleCause`；Task 4-5 的 Build/Verify（C1 於 deps 內呼叫，本 task 僅編排）。
@@ -1581,6 +1582,7 @@ package gatepolicy
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1606,11 +1608,6 @@ func TestGate3ValidateRequestBindingShapes(t *testing.T) {
 	if err := p.ValidateRequest(ok); err != nil {
 		t.Fatal(err)
 	}
-	missing := ok
-	missing.Bindings = ok.Bindings[:5] // 少 review_evidence_provenance
-	if err := p.ValidateRequest(missing); err == nil {
-		t.Fatal("缺 binding 應拒絕")
-	}
 	badSubject := ok
 	badSubject.Subject = "plan:x"
 	if err := p.ValidateRequest(badSubject); err == nil {
@@ -1620,6 +1617,74 @@ func TestGate3ValidateRequestBindingShapes(t *testing.T) {
 	crossed.Subject = "taskrun:01BX5ZZKBKACTAV9WEVGEMMVRZ" // 形狀合法但 ≠ task_run binding
 	if err := p.ValidateRequest(crossed); err == nil {
 		t.Fatal("subject 與 task_run binding 不一致應拒絕（rev2 P1）")
+	}
+	dup := ok
+	dup.Bindings = append(append([]gate.Binding{}, ok.Bindings...), ok.Bindings[0])
+	if err := p.ValidateRequest(dup); err == nil {
+		t.Fatal("binding 重複應拒絕")
+	}
+	unknown := ok
+	unknown.Bindings = append(append([]gate.Binding{}, ok.Bindings...),
+		gate.Binding{Kind: "unknown_kind", Digest: "sha256:" + strings.Repeat("cd", 32)})
+	if err := p.ValidateRequest(unknown); err == nil {
+		t.Fatal("未知 binding（第 7 筆）應拒絕")
+	}
+	badTaskRunDigest := ok
+	badTaskRunDigest.Bindings = append([]gate.Binding{}, ok.Bindings...)
+	badTaskRunDigest.Bindings[0] = gate.Binding{Kind: "task_run", Ref: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Digest: "not-sha256"}
+	if err := p.ValidateRequest(badTaskRunDigest); err == nil {
+		t.Fatal("task_run digest 非 sha256 形狀應拒絕")
+	}
+	badPromotionHeadDigest := ok
+	badPromotionHeadDigest.Bindings = append([]gate.Binding{}, ok.Bindings...)
+	badPromotionHeadDigest.Bindings[1] = gate.Binding{
+		Kind:   "promotion_head",
+		Ref:    "git:sha1:" + strings.Repeat("a", 40),
+		Digest: "sha256:" + strings.Repeat("ab", 32), // gitOID 欄位誤填 sha256 形狀
+	}
+	if err := p.ValidateRequest(badPromotionHeadDigest); err == nil {
+		t.Fatal("promotion_head digest 非 gitOID 形狀應拒絕")
+	}
+	badTaskRunRef := ok
+	badTaskRunRef.Bindings = append([]gate.Binding{}, ok.Bindings...)
+	badTaskRunRef.Bindings[0] = gate.Binding{Kind: "task_run", Ref: "not-a-taskrun-ref", Digest: "sha256:" + strings.Repeat("ab", 32)}
+	if err := p.ValidateRequest(badTaskRunRef); err == nil {
+		t.Fatal("task_run ref 形狀不符 taskrun:<ULID> 應拒絕（與 subject 形狀檢查各自獨立）")
+	}
+
+	// 六種 binding 缺一測一（owner 明訂：成本低且避免代表案例漏掉特殊 ref，
+	// 例如 task_run 有 refRe、其餘沒有）。
+	for _, kind := range []string{
+		"task_run", "promotion_head", "main_base",
+		"oracle_surface", "required_check_manifest", "review_evidence_provenance",
+	} {
+		kind := kind
+		t.Run("missing_"+kind, func(t *testing.T) {
+			req := ok
+			var bindings []gate.Binding
+			for _, b := range ok.Bindings {
+				if b.Kind != kind {
+					bindings = append(bindings, b)
+				}
+			}
+			req.Bindings = bindings
+			if err := p.ValidateRequest(req); err == nil {
+				t.Fatalf("缺 binding %q 應拒絕", kind)
+			}
+		})
+	}
+}
+
+func TestGate3SupersessionKey(t *testing.T) {
+	// SupersessionKey 回歸 repo 預設慣例（gate1／gate2／TCA／stubPolicy 與
+	// GatePolicy interface doc 皆為 gateName+"|"+subject）——Task 6
+	// implementation preflight erratum①，gate3 的 subject taskrun:<ULID>
+	// 不可能含 "|"，無另用 "\x00" 分隔的理由。
+	p := NewGate3Policy(Gate3Deps{})
+	got := p.SupersessionKey("gate3_promotion", "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	want := "gate3_promotion|taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }
 
@@ -1646,6 +1711,122 @@ func TestGate3BuildDecisionApprovedRunsAllChecksFailClosed(t *testing.T) {
 	}
 }
 
+func TestGate3BuildDecisionEachDepErrorStopsDownstream(t *testing.T) {
+	// 三個 deps error 各自獨立案例，並斷言失敗後下游 deps 未執行（spy）。
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	sentinel := errors.New("boom")
+
+	t.Run("VerifyTaskRun_error", func(t *testing.T) {
+		var spy []string
+		p := NewGate3Policy(Gate3Deps{
+			VerifyTaskRun:    func(id, dg string) error { spy = append(spy, "taskrun"); return sentinel },
+			VerifyForge:      func(h, b, d string) error { spy = append(spy, "forge"); return nil },
+			VerifyProvenance: func(id, d, h string) error { spy = append(spy, "provenance"); return nil },
+		})
+		if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil {
+			t.Fatal("taskrun 重驗失敗應 fail closed")
+		}
+		if strings.Join(spy, ",") != "taskrun" {
+			t.Fatalf("taskrun 失敗後不得執行 forge／provenance，實際=%v", spy)
+		}
+	})
+
+	t.Run("VerifyForge_error", func(t *testing.T) {
+		var spy []string
+		p := NewGate3Policy(Gate3Deps{
+			VerifyTaskRun:    func(id, dg string) error { spy = append(spy, "taskrun"); return nil },
+			VerifyForge:      func(h, b, d string) error { spy = append(spy, "forge"); return sentinel },
+			VerifyProvenance: func(id, d, h string) error { spy = append(spy, "provenance"); return nil },
+		})
+		if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil {
+			t.Fatal("forge 重驗失敗應 fail closed")
+		}
+		if strings.Join(spy, ",") != "taskrun,forge" {
+			t.Fatalf("forge 失敗後不得執行 provenance，實際=%v", spy)
+		}
+	})
+
+	t.Run("VerifyProvenance_error", func(t *testing.T) {
+		var spy []string
+		p := NewGate3Policy(Gate3Deps{
+			VerifyTaskRun:    func(id, dg string) error { spy = append(spy, "taskrun"); return nil },
+			VerifyForge:      func(h, b, d string) error { spy = append(spy, "forge"); return nil },
+			VerifyProvenance: func(id, d, h string) error { spy = append(spy, "provenance"); return sentinel },
+		})
+		if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil {
+			t.Fatal("provenance 重驗失敗應 fail closed")
+		}
+		if strings.Join(spy, ",") != "taskrun,forge,provenance" {
+			t.Fatalf("provenance 是最後一步，前兩步應已執行，實際=%v", spy)
+		}
+	})
+}
+
+func TestGate3BuildDecisionEachNilDepFailsClosed(t *testing.T) {
+	// 三個 nil deps 各自獨立案例；nil 檢查在任何 deps 呼叫前執行，
+	// 斷言失敗後下游 deps 未執行（spy 應為空）。
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+
+	cases := []struct {
+		name string
+		deps func(spy *[]string) Gate3Deps
+	}{
+		{name: "VerifyTaskRun_nil", deps: func(spy *[]string) Gate3Deps {
+			return Gate3Deps{
+				VerifyForge:      func(h, b, d string) error { *spy = append(*spy, "forge"); return nil },
+				VerifyProvenance: func(id, d, h string) error { *spy = append(*spy, "provenance"); return nil },
+			}
+		}},
+		{name: "VerifyForge_nil", deps: func(spy *[]string) Gate3Deps {
+			return Gate3Deps{
+				VerifyTaskRun:    func(id, dg string) error { *spy = append(*spy, "taskrun"); return nil },
+				VerifyProvenance: func(id, d, h string) error { *spy = append(*spy, "provenance"); return nil },
+			}
+		}},
+		{name: "VerifyProvenance_nil", deps: func(spy *[]string) Gate3Deps {
+			return Gate3Deps{
+				VerifyTaskRun: func(id, dg string) error { *spy = append(*spy, "taskrun"); return nil },
+				VerifyForge:   func(h, b, d string) error { *spy = append(*spy, "forge"); return nil },
+			}
+		}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var spy []string
+			p := NewGate3Policy(c.deps(&spy))
+			if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil ||
+				!strings.Contains(err.Error(), "not wired") {
+				t.Fatalf("%s 應 fail closed 且錯誤具名：%v", c.name, err)
+			}
+			if len(spy) != 0 {
+				t.Fatalf("%s：nil 檢查應在任何 deps 呼叫前擋下，實際執行=%v", c.name, spy)
+			}
+		})
+	}
+}
+
+func TestGate3BuildDecisionRejectsNonEmptyRiskSelections(t *testing.T) {
+	// Task 6 implementation preflight erratum②：Gate 3 是無 risk policy，
+	// 應對齊 gate1／TCA 與 DecisionInput 契約——approved／rejected 兩條
+	// 路徑都必須拒絕非空 RiskSelections（gate2 才是「approved 消費、
+	// rejected 禁止」的例外）。
+	p := NewGate3Policy(Gate3Deps{
+		VerifyTaskRun:    func(id, dg string) error { return nil },
+		VerifyForge:      func(h, b, d string) error { return nil },
+		VerifyProvenance: func(id, d, h string) error { return nil },
+	})
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+	risk := gate.DecisionInput{RiskSelections: []gate.RiskSelection{{TaskID: "t1", SelectedRiskTier: "high"}}}
+
+	if _, err := p.BuildDecision(req, "approved", risk); err == nil {
+		t.Fatal("approved 分支非空 RiskSelections 應拒絕")
+	}
+	if _, err := p.BuildDecision(req, "rejected", risk); err == nil {
+		t.Fatal("rejected 分支非空 RiskSelections 應拒絕")
+	}
+}
+
 func TestGate3BuildDecisionRejectedSkipsReverify(t *testing.T) {
 	called := false
 	p := NewGate3Policy(Gate3Deps{VerifyTaskRun: func(id, dg string) error { called = true; return nil }})
@@ -1658,10 +1839,40 @@ func TestGate3BuildDecisionRejectedSkipsReverify(t *testing.T) {
 	}
 }
 
+func TestGate3BuildDecisionMismatchSentinelPropagation(t *testing.T) {
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
+
+	t.Run("wrapped_mismatch_is_recognizable", func(t *testing.T) {
+		p := NewGate3Policy(Gate3Deps{
+			VerifyTaskRun:    func(id, dg string) error { return fmt.Errorf("taskrun stale: %w", ErrGate3Mismatch) },
+			VerifyForge:      func(h, b, d string) error { return nil },
+			VerifyProvenance: func(id, d, h string) error { return nil },
+		})
+		_, err := p.BuildDecision(req, "approved", gate.DecisionInput{})
+		if !errors.Is(err, ErrGate3Mismatch) {
+			t.Fatalf("%%w 包裝的 ErrGate3Mismatch 必須可用 errors.Is 辨識：%v", err)
+		}
+	})
+
+	t.Run("unwrapped_error_not_misjudged_as_mismatch", func(t *testing.T) {
+		p := NewGate3Policy(Gate3Deps{
+			VerifyTaskRun:    func(id, dg string) error { return errors.New("forge 讀取逾時") }, // transient，未包裝
+			VerifyForge:      func(h, b, d string) error { return nil },
+			VerifyProvenance: func(id, d, h string) error { return nil },
+		})
+		_, err := p.BuildDecision(req, "approved", gate.DecisionInput{})
+		if errors.Is(err, ErrGate3Mismatch) {
+			t.Fatal("未包裝的 transient error 不得被誤判為 ErrGate3Mismatch")
+		}
+	})
+}
+
 func TestGate3ReconcileBindingsPendingPseudoRecordEmpty(t *testing.T) {
 	// rev7（plan gate 第六輪 P1）：pending pseudo-record 必須回空——
 	// PrepareDecision 的前置檢查會把 cause 轉成未包裝一般錯誤並跳過
 	// BuildDecision（service.go:107），pending 會繞過 expired 永久滯留。
+	// Task 6 只證明這一點——完整的 PrepareDecision → ErrGate3Mismatch →
+	// ExpirePending 鏈仍屬 Task 6b，不在此提前拉入。
 	p := NewGate3Policy(Gate3Deps{})
 	causes, err := p.ReconcileBindings(gate.ApprovalRecord{
 		Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1673,6 +1884,9 @@ func TestGate3ReconcileBindingsPendingPseudoRecordEmpty(t *testing.T) {
 }
 
 func TestGate3NilDepsFailClosed(t *testing.T) {
+	// 鏡射實際 registry 註冊形狀（app.go ensureGate：
+	// gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{})，全 deps 為零值）——
+	// 註冊存在但 deps 未接線時不放行。
 	p := NewGate3Policy(Gate3Deps{})
 	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
 	if _, err := p.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil ||
@@ -1681,8 +1895,8 @@ func TestGate3NilDepsFailClosed(t *testing.T) {
 	}
 }
 ```
-
 - [ ] **Step 2: 跑 `go test -race ./internal/gatepolicy/ -run Gate3 -count=1`，預期 FAIL**
+  - **mutation 測試流程凍結（owner 明訂，起因是先前有 mutation 假綠、根因未確認）**：本 task 任何 mutation 測試（驗證測試對 production code 變異的鑑別力）執行前，必須先證明 mutation diff 已實際套用到檔案（如 `git diff` 或 `diff` 顯示變更存在）且檔案內容 hash 已改變（如變異前後 `sha256sum`／`shasum` 不同）；不得僅憑「應該已套用」就放行紅／綠判讀。
 - [ ] **Step 3: 實作 `gate3.go`**
 
 ```go
@@ -1710,7 +1924,7 @@ var reTaskRunRef = regexp.MustCompile(`^taskrun:[0-9A-HJKMNP-TV-Z]{26}$`)
 var ErrGate3Mismatch = errors.New("gate3: 重驗確認不符")
 
 type Gate3Deps struct {
-	VerifyTaskRun    func(taskRunID, snapshotDigest string) error            // §5.3(1)
+	VerifyTaskRun    func(taskRunID, snapshotDigest string) error                    // §5.3(1)
 	VerifyForge      func(promotionHead, mainBase, requiredCheckDigest string) error // §5.3(2)(3)(4)
 	VerifyProvenance func(taskRunID, provenanceDigest, promotionHead string) error   // §5.3(5)
 }
@@ -1771,9 +1985,14 @@ func (p *Gate3Policy) ValidateRequest(req gate.GateRequest) error {
 	return nil
 }
 
-// BuildDecision：approved 分支執行 §5.3 決議時重驗（fail closed）；
-// rejected 分支僅需 reason（由 Service 層既有驗證），跳過重驗。
-func (p *Gate3Policy) BuildDecision(req gate.GateRequest, decision string, _ gate.DecisionInput) (*gate.Metadata, error) {
+// BuildDecision：Gate 3 為無 risk policy（對齊 gate1／TCA 與 DecisionInput
+// 契約，§3.1）——approved／rejected 兩條路徑皆拒絕非空 RiskSelections。
+// approved 分支另執行 §5.3 決議時重驗（fail closed）；rejected 分支僅需
+// reason（由 Service 層既有驗證），跳過重驗。
+func (p *Gate3Policy) BuildDecision(req gate.GateRequest, decision string, input gate.DecisionInput) (*gate.Metadata, error) {
+	if len(input.RiskSelections) > 0 {
+		return nil, fmt.Errorf("gate3: risk selections not accepted")
+	}
 	if decision != "approved" {
 		return nil, nil
 	}
@@ -1798,7 +2017,7 @@ func (p *Gate3Policy) BuildDecision(req gate.GateRequest, decision string, _ gat
 }
 
 func (p *Gate3Policy) SupersessionKey(gateName, subject string) string {
-	return gateName + "\x00" + subject
+	return gateName + "|" + subject
 }
 
 // ReconcileBindings——**契約凍結（rev7，plan gate 第六輪 P1）**：
@@ -2686,6 +2905,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **補回漏載範本（owner 2026-08-31 裁示，doc-only）**：Task 4 Step 1 測試範本先前未收錄 `TestManifestCanonicalJSONKeyOrder`——該 golden test 已於 follow-up 2（`22088cb`）落地並通過驗收，但 follow-up 2 的 owner 指定範圍只涵蓋 Step 3 虛擬碼、Step 1 bijection 案例與 rev9 案例數，故未同步。依 plan 可重放性要求補入，內容與 `internal/gatepolicy/gate3_manifest_test.go` 的實際測試逐字一致；並補上該範本 import 區塊原本缺少的 `"encoding/json"`（照抄會編譯失敗）。**production contract 與程式碼均未變**。
   - **日期更正（owner 2026-08-31 裁示，不另升版）**：spec rev9／plan rev10／backlog rev7 三個條目原誤標 2026-08-28，實際落地日為 2026-08-31，已更正；版本號維持不變。
   - **Task 5 follow-up：`TestBuildReviewSectionOrderIndependent` 補明確升冪斷言（owner 2026-08-31 裁示，不另升版）**：原測試只比對「輸入反轉後 section bytes 相等」，使「移除 `sort.Strings(logins)`」的 mutation 鑑別力是機率性的——`BuildReviewSection` 把結果收進 map 再取 logins，無 sort 時輸出順序由 Go map 疊代隨機化決定、與輸入順序無關，兩次 Build 有相當機率恰好同序而讓 mutation 存活（實測 8 次樣本僅紅 7 次）。owner 否決「增加 reviewer 數量」方案——Go map 疊代分布未承諾均勻，樣本數不能可靠換算成 1/n!，仍是機率性證據。改為保留 bytes 相等斷言（證明 Forge 輸入順序不影響輸出）並另外明確斷言輸出為 `alice, bob`（證明 canonical section 依 `reviewer_login` 字典序升冪）；acceptance mutation 改為「升冪換降冪」（確定性、必紅），「完全移除 sort」降級為補充性、機率性 mutation，不作為 acceptance 依據。production code（`BuildReviewSection`／`VerifyReviewSection`）未變。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-5-followup-report.md`。
+  - **Task 6 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：實作前施工事實核對發現 brief／plan 的 gate3 範本與 repo 既有慣例兩處不一致。①`SupersessionKey` 原範本用 `gateName + "\x00" + subject`，但 gate1（`internal/gate/policy.go:57-59`）、gate2（`internal/gatepolicy/gate2.go:197-199`）、TCA（`internal/gatepolicy/tca.go:283-285`）、stubPolicy（`internal/gate/service_test.go:85`）四個既有實作與 `GatePolicy` interface doc 皆為 `gateName+"|"+subject`，且 gate3 的 subject 形狀 `taskrun:<ULID>` 不可能含 `|`，無另用 NUL 分隔的理由——改回 `"|"`。②`BuildDecision` 原簽章 `_ gate.DecisionInput` 整個丟棄輸入，非空 `RiskSelections` 會被靜默吃掉；歸因需準確——**gate1、TCA 對所有 decision 都不接受 risk**，**gate2 在 approved 會消費 risk、只在 rejected 禁止**，**Gate 3 是無 risk policy，應對齊 gate1／TCA 與 `DecisionInput` 契約**（不是「三者都一樣」）——改為 approved／rejected 兩條路徑皆拒絕非空 `RiskSelections`。③連帶把 `internal/gate/policy.go` 第 16 行 `DecisionInput.RiskSelections` 註解由「gate2 用；gate1/tca 為空」補成「gate2 用；gate1/tca/gate3 為空」（comment-only，未改邏輯／import，`internal/gate` 零 domain import 架構凍結不變）。同步補 Step 1 測試範本：`SupersessionKey` 直接斷言、approved／rejected 非空 risk 各一獨立案例、六種缺 binding 全測、三個 nil deps／三個 deps error 各自獨立且斷言下游未執行、digest 形狀（sha256／gitOID）與 task_run ref 形狀負向案例、未知 binding（第 7 筆）、`ErrGate3Mismatch` 經 `%w` 傳遞可用 `errors.Is` 辨識且未包裝 error 不誤判；`ReconcileBindings` pending pseudo-record 回空一案仍為 Task 6 範圍上限，完整 `PrepareDecision → ErrGate3Mismatch → ExpirePending` 鏈維持屬 Task 6b、不提前拉入。另凍結 mutation 測試流程要求：執行前須先證明 diff 已套用且檔案 hash 已改變（起因是先前有 mutation 假綠、根因未確認）。**observation（不改動）**：TCA 的 `reApprovalRef` 用 `[0-9A-Z]{26}` 比 Crockford 寬（`contract.NewULID`，`internal/contract/envelope.go:10`，用 Crockford `0123456789ABCDEFGHJKMNPQRSTVWXYZ`）——brief 的 `[0-9A-HJKMNP-TV-Z]{26}` 正確、TCA 較寬；無 production 影響證據前不另開修正、不混入本票。**production contract 不受影響（Task 6 未實作）、spec §5.2／backlog 不變（①②非 spec 級契約）、未重開完整 plan gate、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-preflight-report.md`。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。

@@ -13,7 +13,7 @@ type StaleCause struct{ Cause, EvidenceRef string }
 // copied by Service from the request; policies never see raw request
 // bindings here.
 type DecisionInput struct {
-	RiskSelections []RiskSelection // gate2 用；gate1/tca 為空
+	RiskSelections []RiskSelection // gate2 用；gate1/tca/gate3 為空
 }
 
 type RiskSelection struct{ TaskID, SelectedRiskTier, OverrideReason string }
