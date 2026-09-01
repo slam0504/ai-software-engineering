@@ -2296,8 +2296,9 @@ func TestTerminalCauseProjection(t *testing.T) {
 func TestProjectExpiredAndTerminalCausePrecedence(t *testing.T) {
 	// Task 6b：project.go 的 expired 分支＋TerminalCause changed 旗標語意。
 	// 直接餵手造的 GateOp 序列（不經 Service），對照 plan「D. mutation 鑑別
-	// 表」：#1（expired 只能由 Pending 轉入）、#4（changed=false 時不得
-	// 覆寫 cause）、#6（既有 Stale→Superseded 允許路徑不得改壞）。
+	// 表」：#1（expired 只能由 Pending 轉入）、#4／#5／#6（changed=false 時
+	// 不得覆寫 cause，分別對應 stale/superseded/expired 三種重複情境）、
+	// #8（既有 Stale→Superseded 允許路徑不得改壞）。
 	t.Run("pending→expired 接受", func(t *testing.T) {
 		ops := []GateOp{
 			opWith(t, GateRequest{ApprovalID: "A", Gate: "gate3_promotion", Subject: "taskrun:x"}),
@@ -2368,7 +2369,7 @@ func TestProjectExpiredAndTerminalCausePrecedence(t *testing.T) {
 			t.Fatalf("Rejected 的 TerminalCause 應維持空：%q", e.TerminalCause)
 		}
 	})
-	t.Run("expired→expired 重複忽略、cause 不覆寫（mutation #4）", func(t *testing.T) {
+	t.Run("expired→expired 重複忽略、cause 不覆寫（mutation #6）", func(t *testing.T) {
 		ops := []GateOp{
 			opWith(t, GateRequest{ApprovalID: "A", Gate: "gate3_promotion", Subject: "taskrun:x"}),
 			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "first"}),
@@ -2382,7 +2383,44 @@ func TestProjectExpiredAndTerminalCausePrecedence(t *testing.T) {
 			t.Fatalf("重複 expired 不得覆寫 cause：%q", e.TerminalCause)
 		}
 	})
-	t.Run("stale→superseded 接受、cause 隨之更新（mutation #6 對照組）", func(t *testing.T) {
+	t.Run("stale→stale 重複忽略、cause 不覆寫（mutation #4）", func(t *testing.T) {
+		// 守住 stale case 的「排除自身值」子句 e.State != Stale：若被移除，
+		// 第二筆 stale transition 會讓 e.State = Stale 成 no-op，但
+		// changed 會被誤設為 true，TerminalCause 遭第二筆 cause 覆寫。
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "first-stale"}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "second-stale"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Stale {
+			t.Fatalf("want stale, got %s", e.State)
+		}
+		if e.TerminalCause != "first-stale" {
+			t.Fatalf("重複 stale 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("superseded→superseded 重複忽略、cause 不覆寫（mutation #5）", func(t *testing.T) {
+		// 守住 superseded case 的「排除自身值」子句 e.State != Superseded：
+		// 若被移除，第二筆 superseded transition 會讓 e.State = Superseded
+		// 成 no-op，但 changed 會被誤設為 true，TerminalCause 遭第二筆
+		// cause 覆寫。
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "first-superseded"}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "second-superseded"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Superseded {
+			t.Fatalf("want superseded, got %s", e.State)
+		}
+		if e.TerminalCause != "first-superseded" {
+			t.Fatalf("重複 superseded 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("stale→superseded 接受、cause 隨之更新（mutation #8 對照組）", func(t *testing.T) {
 		ops := []GateOp{
 			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
 				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
@@ -2711,7 +2749,7 @@ func assertGateState(t *testing.T, a *App, approvalID, want string) {
 }
 ```
 
-- [ ] **Step 5b: mutation #12／#14 定著測試（`app_gate_test.go`；Task 6b implementation preflight erratum——owner 指定 #12 的確定性形狀，見 plan「E. mutation #12」；#14 為 DTO 欄位映射的直接覆蓋）**
+- [ ] **Step 5b: mutation #12／#16 定著測試（`app_gate_test.go`；Task 6b implementation preflight erratum——owner 指定 #12 的確定性形狀，見 plan「E. mutation #12」；#16（preflight2 重新編號前為 #14）為 DTO 欄位映射的直接覆蓋）**
 
 `ExpirePending` 的 append 失敗（`gateDecide` 的 `xerr`）若被靜默吞掉，Step 6 的錯誤分支會誤報「已轉 expired」但 journal 其實沒寫入。確定性觸發（owner 指定）：在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，讓 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定失敗——`gate.Journal.Close()`（internal/gate/journal.go 現 line 70）只關閉 file handle、不預先設 `degraded`；下一次 `Append` 時 `j.degraded` 仍為 false，進到 `j.f.Write(buf)`，在已關閉的 file 上失敗，就地設 `degraded = true` 並回傳該 error（internal/journal/journal.go 現 line 125-135）。`gateDecide` 的 `reconcileLocked` 在 `PrepareDecision` 之前執行，那時 journal 尚未關閉，不受影響；`Project` 讀的是記憶體中的 `j.ops`（`Ops()`），journal 關閉後仍可讀，故「仍為 pending」的斷言可正常執行。
 
@@ -2746,7 +2784,8 @@ func TestGateDecideExpirePendingAppendFailureIsNotSwallowed(t *testing.T) {
 	assertGateState(t, a, id, "pending")
 }
 
-// TestGateEntryDTOMapsTerminalCause：mutation #14——gateEntriesToDTO 若不
+// TestGateEntryDTOMapsTerminalCause：mutation #16（preflight2 重新編號前為
+// #14）——gateEntriesToDTO 若不
 // 映射 TerminalCause，這裡必須紅。journal 正常（不關閉），mismatch 讓
 // ExpirePending 成功寫入 expired，之後檢查 DTO 的 TerminalCause 非空。
 func TestGateEntryDTOMapsTerminalCause(t *testing.T) {
@@ -2803,24 +2842,28 @@ func TestGateEntryDTOMapsTerminalCause(t *testing.T) {
 ```
 
 - [ ] **Step 7: 跑 `go test -race -run 'Gate3Mismatch|ExpirePendingAppendFailure|MapsTerminalCause' -count=1 .` 預期 PASS；`go test -race -count=1 . ./internal/gate/` 全綠**
-- [ ] **Step 7a: mutation 鑑別表（Task 6b implementation preflight erratum 補——D 段，14 項；本輪僅需證明「可執行」，不要求逐項跑完紅綠，見 preflight 報告的範本落地驗證記錄）**
+- [ ] **Step 7a: mutation 鑑別表（Task 6b implementation preflight erratum 補——D 段，16 項；本輪僅需證明「可執行」，不要求逐項跑完紅綠，見 preflight 報告的範本落地驗證記錄）**
+
+**（preflight2 修正：原第 4 列「重複 stale／重複 superseded／重複 expired」塞了三個情境但只有 expired→expired 一個測試守——拆成第 4／5／6 列一對一對應，全表重新編號為 16 項，不再稱 14 項。）**
 
 | # | Mutation | 應紅案例 | 鑑別測試 |
 |---|---|---|---|
 | 1 | `case "expired"` 允許非 Pending 轉入 | 非 Pending 收 expired transition 不得轉 Expired | `TestProjectExpiredAndTerminalCausePrecedence`（Step 1a，`active/stale/superseded/rejected→expired 忽略` 子案例） |
 | 2 | stale case 移除 `!= Expired` guard | Expired 後 stale 不得覆寫 | `TestTerminalCauseProjection`（`expired 後全忽略且 cause 不覆寫`） |
 | 3 | superseded case 移除 `!= Expired` guard | Expired 後 superseded 不得覆寫 | 同上（同一子案例同時餵 stray superseded／stale） |
-| 4 | `TerminalCause` 改無條件寫入（不看 `changed`） | 重複 stale／重複 superseded／重複 expired 不得覆寫既有 cause | `TestProjectExpiredAndTerminalCausePrecedence`（`expired→expired 重複忽略`）／`TestExpirePending`（重複 expire 不 append） |
-| 5 | 替 Rejected 補寫 `TerminalCause` | Rejected 的 TerminalCause 必須維持空 | `TestTerminalCauseProjection`（`rejected 後全忽略且 TerminalCause 維持空`）／`TestProjectExpiredAndTerminalCausePrecedence`（`rejected→expired 忽略`） |
-| 6 | stale case 允許覆寫 Superseded | 既有 `TestProjectStaleAfterSupersededDoesNotDowngrade`（project_test.go:109） | 同名既有測試＋`TestProjectExpiredAndTerminalCausePrecedence`（`stale→superseded 接受`／`superseded→stale 忽略` 加 cause 斷言） |
-| 7 | `ExpirePending` 移除 `State != Pending` | 重複 expire 不得新增 record | `TestExpirePending` |
-| 8 | `PrepareDecision` 不加 `State != Pending` | expired 後 Prepare 應回 `ErrNotPending` | `TestExpirePending` |
-| 9 | `CommitDecision` 不加 `State != Pending` | prepared 後被 expire、Commit 應失敗 | `TestCommitDecisionFailsAfterExpire` |
-| 10 | `gateDecide` 改用 `err != nil` 而非 `errors.Is` | transient 錯誤不得被誤標 expired（維持 pending） | `TestGateDecideGate3MismatchExpiresPending`（transient 分支） |
-| 11 | `gateDecide` 移除 `ExpirePending` 呼叫 | mismatch 應轉 expired | `TestGateDecideGate3MismatchExpiresPending`（mismatch 分支） |
-| 12 | `ExpirePending` 失敗時吞掉 `xerr` | 見 Step 5b——必須有可編譯測試範本 | `TestGateDecideExpirePendingAppendFailureIsNotSwallowed` |
-| 13 | `ListDetectOnly` 不補 `TerminalCause` | detect-only 與 durable 等值測試 | `TestListDetectOnlyMatchesDurableReconcile` |
-| 14 | `gateEntriesToDTO` 不映射 `TerminalCause` | DTO 欄位測試 | `TestGateEntryDTOMapsTerminalCause` |
+| 4 | stale case 移除排除自身值子句 `e.State != Stale` | 重複 stale（cause 不同）不得覆寫既有 cause——移除後 `e.State = Stale` 雖是 no-op，但 `changed` 會被誤設 true | `TestProjectExpiredAndTerminalCausePrecedence`（Step 1a preflight2 新增，`stale→stale 重複忽略、cause 不覆寫`） |
+| 5 | superseded case 移除排除自身值子句 `e.State != Superseded` | 重複 superseded（cause 不同）不得覆寫既有 cause——同構於 #4 | `TestProjectExpiredAndTerminalCausePrecedence`（Step 1a preflight2 新增，`superseded→superseded 重複忽略、cause 不覆寫`） |
+| 6 | `TerminalCause` 改無條件寫入（不看 `changed`） | 重複 expired 不得覆寫既有 cause（此 mutation 範圍較廣，亦會被 `stale→expired`／`superseded→expired`／`superseded→stale` 等忽略型 transition 的 cause 斷言連帶命中） | `TestProjectExpiredAndTerminalCausePrecedence`（`expired→expired 重複忽略`）／`TestExpirePending`（重複 expire 不 append） |
+| 7 | 替 Rejected 補寫 `TerminalCause` | Rejected 的 TerminalCause 必須維持空 | `TestTerminalCauseProjection`（`rejected 後全忽略且 TerminalCause 維持空`）／`TestProjectExpiredAndTerminalCausePrecedence`（`rejected→expired 忽略`） |
+| 8 | stale case 允許覆寫 Superseded | 既有 `TestProjectStaleAfterSupersededDoesNotDowngrade`（project_test.go:109） | 同名既有測試＋`TestProjectExpiredAndTerminalCausePrecedence`（`stale→superseded 接受`／`superseded→stale 忽略` 加 cause 斷言） |
+| 9 | `ExpirePending` 移除 `State != Pending` | 重複 expire 不得新增 record | `TestExpirePending` |
+| 10 | `PrepareDecision` 不加 `State != Pending` | expired 後 Prepare 應回 `ErrNotPending` | `TestExpirePending` |
+| 11 | `CommitDecision` 不加 `State != Pending` | prepared 後被 expire、Commit 應失敗 | `TestCommitDecisionFailsAfterExpire` |
+| 12 | `gateDecide` 改用 `err != nil` 而非 `errors.Is` | transient 錯誤不得被誤標 expired（維持 pending） | `TestGateDecideGate3MismatchExpiresPending`（transient 分支） |
+| 13 | `gateDecide` 移除 `ExpirePending` 呼叫 | mismatch 應轉 expired | `TestGateDecideGate3MismatchExpiresPending`（mismatch 分支） |
+| 14 | `ExpirePending` 失敗時吞掉 `xerr` | 見 Step 5b——必須有可編譯測試範本 | `TestGateDecideExpirePendingAppendFailureIsNotSwallowed` |
+| 15 | `ListDetectOnly` 不補 `TerminalCause` | detect-only 與 durable 等值測試 | `TestListDetectOnlyMatchesDurableReconcile` |
+| 16 | `gateEntriesToDTO` 不映射 `TerminalCause` | DTO 欄位測試 | `TestGateEntryDTOMapsTerminalCause` |
 
 - [ ] **Step 8: Commit**
 
@@ -3327,7 +3370,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **Task 6 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：實作前施工事實核對發現 brief／plan 的 gate3 範本與 repo 既有慣例兩處不一致。①`SupersessionKey` 原範本用 `gateName + "\x00" + subject`，但 gate1（`internal/gate/policy.go:57-59`）、gate2（`internal/gatepolicy/gate2.go:197-199`）、TCA（`internal/gatepolicy/tca.go:283-285`）、stubPolicy（`internal/gate/service_test.go:85`）四個既有實作與 `GatePolicy` interface doc 皆為 `gateName+"|"+subject`，且 gate3 的 subject 形狀 `taskrun:<ULID>` 不可能含 `|`，無另用 NUL 分隔的理由——改回 `"|"`。②`BuildDecision` 原簽章 `_ gate.DecisionInput` 整個丟棄輸入，非空 `RiskSelections` 會被靜默吃掉；歸因需準確——**gate1、TCA 對所有 decision 都不接受 risk**，**gate2 在 approved 會消費 risk、只在 rejected 禁止**，**Gate 3 是無 risk policy，應對齊 gate1／TCA 與 `DecisionInput` 契約**（不是「三者都一樣」）——改為 approved／rejected 兩條路徑皆拒絕非空 `RiskSelections`。③連帶把 `internal/gate/policy.go` 第 16 行 `DecisionInput.RiskSelections` 註解由「gate2 用；gate1/tca 為空」補成「gate2 用；gate1/tca/gate3 為空」（comment-only，未改邏輯／import，`internal/gate` 零 domain import 架構凍結不變）。同步補 Step 1 測試範本：`SupersessionKey` 直接斷言、approved／rejected 非空 risk 各一獨立案例、六種缺 binding 全測、三個 nil deps／三個 deps error 各自獨立且斷言下游未執行、digest 形狀（sha256／gitOID）與 task_run ref 形狀負向案例、未知 binding（第 7 筆）、`ErrGate3Mismatch` 經 `%w` 傳遞可用 `errors.Is` 辨識且未包裝 error 不誤判；`ReconcileBindings` pending pseudo-record 回空一案仍為 Task 6 範圍上限，完整 `PrepareDecision → ErrGate3Mismatch → ExpirePending` 鏈維持屬 Task 6b、不提前拉入。另凍結 mutation 測試流程要求：執行前須先證明 diff 已套用且檔案 hash 已改變（起因是先前有 mutation 假綠、根因未確認）。**observation（不改動）**：TCA 的 `reApprovalRef` 用 `[0-9A-Z]{26}` 比 Crockford 寬（`contract.NewULID`，`internal/contract/envelope.go:10`，用 Crockford `0123456789ABCDEFGHJKMNPQRSTVWXYZ`）——brief 的 `[0-9A-HJKMNP-TV-Z]{26}` 正確、TCA 較寬；無 production 影響證據前不另開修正、不混入本票。**production contract 不受影響（Task 6 未實作）、spec §5.2／backlog 不變（①②非 spec 級契約）、未重開完整 plan gate、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-preflight-report.md`。
   - **Task 6 施工依據補測——Crockford 字元集兩條獨立負向案例（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：design re-review 發現上一則 Task 6 preflight erratum 遺留的 P2 缺口——Step 1 範本的 subject／ref 負向案例只有「前綴整個錯」（`badSubject`）與「形狀整個錯」（`badTaskRunRef`）兩種，沒有任何值是「`taskrun:` 前綴正確、26 碼、僅字元集違規」；若 `reTaskRunRef` 被放寬成 `[0-9A-Z]{26}`（即 `tca.go:65` `reApprovalRef` 現行形狀）現有測試一個都不會紅。`reTaskRunRef` 同時用於 subject 與 `task_run` binding 的 ref，補兩條獨立案例：(A) `subject` 與 `task_run.Ref` 使用同一個 26 碼、含 Crockford 排除字母（`I`）的值，斷言命中 subject 形狀訊息（`ValidateRequest` 的 subject 檢查在最前面，兩者相等使交叉比對也不會擋）；(B) `subject` 合法、`task_run.Ref` 含排除字母，斷言必須命中「ref 形狀不符」而非僅 `err != nil`——否則移除 refRe 檢查後，交叉比對的「不一致」錯誤會掩蓋 ref 檢查缺失，mutation 會誤通過。連帶於 Step 2 mutation 測試流程凍結段補列兩項對應 mutation：「regex 放寬為 `[0-9A-Z]{26}`」（案例 A 必紅）與「移除 `task_run` binding 的 `refRe` 檢查」（案例 B 必紅，且須由訊息斷言抓到）。**production contract 不受影響（Task 6 未實作）、spec／backlog 不變、未重開完整 plan gate、估點未變**。詳見補測報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-crockford-report.md`。
   - **Task 6 測試強化 follow-up——risk selections 拒絕改兩個獨立 subtest（owner 2026-08-31 裁示，doc-only，Task 6 implementation 已完成於 `315a99c`）**：owner 直接核對出 `TestGate3BuildDecisionRejectsNonEmptyRiskSelections` 在單一函式內順序斷言 approved／rejected 兩個分支——approved 的 `t.Fatal` 會先中止整個函式，使「移除共同的 `len(RiskSelections) > 0` guard」的 mutation 套用後，committed suite 只會停在 approved，無法獨立證明 rejected 路徑也被守住；附帶問題是兩個斷言都只判斷 `err == nil`，沒有訊息斷言。改為兩個 `t.Run` subtest（`approved`／`rejected`）各自獨立執行，並各自斷言錯誤訊息含 `"risk selections not accepted"`。驗證：mutation 套用後兩個 subtest 皆紅（含獨立取得 rejected 的紅燈證據），還原後 production 檔案 hash byte-identical。**production contract 與 gate3.go 零變更、未重開完整 plan gate、估點未變**。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-followup-report.md`。
-  - **Task 6b implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6b 尚未實作）**：實作前施工事實核對發現 Task 6b 段有一個結構性缺口與多處漂移，owner 裁示一次修完。**(A)** `project.go` 的狀態機改動原本只有散文、無程式碼範本，而它承載 Expired 只由 pending 進入、終態 precedence、`TerminalCause` 更新時機——補為採 `changed` 旗標的完整可重放範本（stale/superseded 不得覆寫 Rejected 與 Expired、同值不算改變；expired 僅 Pending→Expired；只有 `changed` 才寫 `TerminalCause`；Rejected 仍只由 `approval_record` 產生、原因留在 `Record.Reason`）；`types.go` 的 `Expired` 常數與 `GateEntry.TerminalCause`、`GateEntryDTO`／`gateEntriesToDTO` 的欄位映射一併補具體範本行。**(B)** 同值投影窮舉：`List` 自動帶、`ListDetectOnly` 手動補、`Lookup` 刻意不擴充（四個消費端皆查 gate2 record 且只用 `State` 判有效性，不顯示失效原因）——明文記成決定，避免下一輪被誤判為漏補；既有狀態判定全為對 `Active` 的正向比對、無窮舉 `switch`，新增 `Expired` 相容；前端 `resolveState` 對未知 key 原樣回傳，badge 樣式與 i18n 歸 **C1c**。**(C)** 漂移校正並改以函式／符號名為主要定位、行號只作當前輔助（`PrepareDecision`／`CommitDecision` 的 pending 判定現分別在 line 99／144，非同段 143-146；`gateDecide` 現 line 5829、`svc.PrepareDecision` 呼叫現 line 5852；`newGateTestApp`／`terminalCauseOf`／`journalTransitionCause` 等既有引用改對齊實際可用的 `newTestAppGit`，`submitGate3Request`／`assertGateState` 兩個測試 helper 補完整可編譯內容）；移除一組空的 ` ```go ``` ` code fence。**(D)** 補 14 項 mutation 鑑別表（Step 7a），逐項標明對應鑑別測試，含新增的 `internal/gate/project_test.go` 直接投影測試（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a）。**(E)** mutation #12（`ExpirePending` 失敗時吞掉 `xerr`）補可編譯測試範本 `TestGateDecideExpirePendingAppendFailureIsNotSwallowed`（Step 5b）——在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，使 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定性失敗；另補 mutation #14（DTO 未映射 `TerminalCause`）測試 `TestGateEntryDTOMapsTerminalCause`。Files 清單同步加入 `internal/gate/project_test.go`。**(F)** 範本落地驗證時另發現 Step 5 的 `TestGateDecideGate3MismatchExpiresPending` 在 `a.ensureGate()` 從未跑過的情況下對 `a.gateReg`（nil map）賦值，會 panic——補 `a.ensureGate()` 前置呼叫（與 Step 5a／5b 既有寫法一致）。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、未重開完整 plan gate、估點未變（0.35 pt）**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight-report.md`。
+  - **Task 6b implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6b 尚未實作）**：實作前施工事實核對發現 Task 6b 段有一個結構性缺口與多處漂移，owner 裁示一次修完。**(A)** `project.go` 的狀態機改動原本只有散文、無程式碼範本，而它承載 Expired 只由 pending 進入、終態 precedence、`TerminalCause` 更新時機——補為採 `changed` 旗標的完整可重放範本（stale/superseded 不得覆寫 Rejected 與 Expired、同值不算改變；expired 僅 Pending→Expired；只有 `changed` 才寫 `TerminalCause`；Rejected 仍只由 `approval_record` 產生、原因留在 `Record.Reason`）；`types.go` 的 `Expired` 常數與 `GateEntry.TerminalCause`、`GateEntryDTO`／`gateEntriesToDTO` 的欄位映射一併補具體範本行。**(B)** 同值投影窮舉：`List` 自動帶、`ListDetectOnly` 手動補、`Lookup` 刻意不擴充（四個消費端皆查 gate2 record 且只用 `State` 判有效性，不顯示失效原因）——明文記成決定，避免下一輪被誤判為漏補；既有狀態判定全為對 `Active` 的正向比對、無窮舉 `switch`，新增 `Expired` 相容；前端 `resolveState` 對未知 key 原樣回傳，badge 樣式與 i18n 歸 **C1c**。**(C)** 漂移校正並改以函式／符號名為主要定位、行號只作當前輔助（`PrepareDecision`／`CommitDecision` 的 pending 判定現分別在 line 99／144，非同段 143-146；`gateDecide` 現 line 5829、`svc.PrepareDecision` 呼叫現 line 5852；`newGateTestApp`／`terminalCauseOf`／`journalTransitionCause` 等既有引用改對齊實際可用的 `newTestAppGit`，`submitGate3Request`／`assertGateState` 兩個測試 helper 補完整可編譯內容）；移除一組空的 ` ```go ``` ` code fence。**(D)** 補 16 項 mutation 鑑別表（Step 7a；preflight2 修正前初版誤植 14 項，見本條末尾追記），逐項標明對應鑑別測試，含新增的 `internal/gate/project_test.go` 直接投影測試（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a）。**(E)** mutation #12（`ExpirePending` 失敗時吞掉 `xerr`）補可編譯測試範本 `TestGateDecideExpirePendingAppendFailureIsNotSwallowed`（Step 5b）——在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，使 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定性失敗；另補 mutation #16（preflight2 重新編號前為 #14；DTO 未映射 `TerminalCause`）測試 `TestGateEntryDTOMapsTerminalCause`。Files 清單同步加入 `internal/gate/project_test.go`。**(F)** 範本落地驗證時另發現 Step 5 的 `TestGateDecideGate3MismatchExpiresPending` 在 `a.ensureGate()` 從未跑過的情況下對 `a.gateReg`（nil map）賦值，會 panic——補 `a.ensureGate()` 前置呼叫（與 Step 5a／5b 既有寫法一致）。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、未重開完整 plan gate、估點未變（0.35 pt）**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight-report.md`。**preflight2 修正（owner 2026-08-31 design re-review 後裁示，doc-only，Task 6b 仍未實作）**：**(A2)** mutation 鑑別表第 4 列「重複 stale／重複 superseded／重複 expired 不得覆寫既有 cause」塞了三個情境，但範本測試只有 `expired→expired` 一個——`changed` 旗標裡「排除自身值」的 `e.State != Stale`／`e.State != Superseded` 兩個子句因此無測試守護。補 `Stale→Stale`、`Superseded→Superseded` 兩個獨立 subtest（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a），原第 4 列拆成三列一對一對應，mutation 表**由 14 項改為 16 項並全表重新編號**（原 #5-14 依序遞補為 #7-16；本條前段 (D)(E) 提及的舊編號已同步更正）；檢查其餘各列未發現同型「一列多情境、測試只涵蓋其中一個」問題。**(B2)** brief 正典化（owner 裁定）：契約正典＝committed plan；Task 6b 派工正典＝`task-6b-brief.md`（須與 plan 本 Task 6b 段逐字一致）；`task-6-brief.md` 內的 Task 6b 段降為歷史合併快照、非正典、不得用於 Task 6b implementation（該檔案本身及其 Task 6 段不受影響，仍為已驗收的 Task 6 artifact）。往後一致性驗證只比較 plan Task 6b 段 ↔ `task-6b-brief.md`，不再以 `task-6-brief.md` 當同步證據。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、plan 維持 rev10、估點未變（0.35 pt）**。詳見 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight2-report.md`。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
