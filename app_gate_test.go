@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/slam0504/sdlc-workbench/internal/gate"
+	"github.com/slam0504/sdlc-workbench/internal/gatepolicy"
 )
 
 // ---- Gate 1 live-loop 測試基盤（temp git workspace）----
@@ -253,4 +255,158 @@ func TestEnsureGateRegistersGate3Promotion(t *testing.T) {
 		!strings.Contains(err.Error(), "not wired") {
 		t.Fatalf("registry 註冊的 gate3_promotion 應為 nil-deps 版本、approved 決議 fail closed 且錯誤具名：%v", err)
 	}
+}
+
+// ---- Task 6b: gateDecide 的 Gate 3 mismatch/transient 分流（B5 §4.3）----
+
+// submitGate3Request：以形狀合法的六 binding 直接經 svc.Submit 造一筆
+// pending gate3_promotion request（繞過 app 層 GateSubmit binding——本票
+// 只測 gateDecide 的錯誤分流，不重複測 Submit 路徑）。呼叫端須先確保
+// a.ensureGate() 已跑過（gateDecide／gateList 內部亦會呼叫，冪等）。
+func submitGate3Request(t *testing.T, a *App) string {
+	t.Helper()
+	svc, err := a.ensureGate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := "sha256:" + strings.Repeat("ab", 32)
+	oid := "git:sha1:" + strings.Repeat("a", 40)
+	bindings := []gate.Binding{
+		{Kind: "task_run", Ref: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Digest: d},
+		{Kind: "promotion_head", Ref: oid, Digest: oid},
+		{Kind: "main_base", Ref: oid, Digest: oid},
+		{Kind: "oracle_surface", Digest: d},
+		{Kind: "required_check_manifest", Digest: d},
+		{Kind: "review_evidence_provenance", Digest: d},
+	}
+	id, err := svc.Submit("gate3_promotion", "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", bindings)
+	if err != nil {
+		t.Fatalf("submitGate3Request: %v", err)
+	}
+	return id
+}
+
+// assertGateState：以 gateList()（detect-only 投影）核對 approvalID 目前
+// 的 state 字面值；查無該筆即 Fatal（不得把「查無」誤讀為某個 state）。
+func assertGateState(t *testing.T, a *App, approvalID, want string) {
+	t.Helper()
+	entries, err := a.gateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.ApprovalID == approvalID {
+			if e.State != want {
+				t.Fatalf("approval %s state = %q, want %q", approvalID, e.State, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("approval %s not found in gateList()", approvalID)
+}
+
+func TestGateDecideGate3MismatchExpiresPending(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.ensureGate(); err != nil { // a.gateReg 由 ensureGate 首次填入，須先跑過才能白箱覆寫
+		t.Fatal(err)
+	}
+	// white-box：以 mismatch deps 覆寫 registry 的 gate3 policy
+	a.gateReg["gate3_promotion"] = gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{
+		VerifyTaskRun: func(id, dg string) error {
+			return fmt.Errorf("snapshot 不符: %w", gatepolicy.ErrGate3Mismatch)
+		},
+		VerifyForge:      func(h, b, d string) error { return nil },
+		VerifyProvenance: func(id, d, h string) error { return nil },
+	})
+	id := submitGate3Request(t, a) // 以形狀合法的六 binding 直接經 svc.Submit 造 pending
+	// rev3：gateDecide 實際簽章第四參數為 []gate.RiskSelection（gate3 無
+	// risk 選擇→nil）；approver 由 git identity 於內部取得，非參數。
+	err := a.gateDecide(id, "approved", "", nil)
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("mismatch 應轉終態並回具名錯誤：%v", err)
+	}
+	assertGateState(t, a, id, "expired")
+	// transient（未包 sentinel）→ 維持 pending
+	a.gateReg["gate3_promotion"] = gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{
+		VerifyTaskRun:    func(id, dg string) error { return errors.New("forge 讀取逾時") },
+		VerifyForge:      func(h, b, d string) error { return nil },
+		VerifyProvenance: func(id, d, h string) error { return nil },
+	})
+	id2 := submitGate3Request(t, a)
+	if err := a.gateDecide(id2, "approved", "", nil); err == nil {
+		t.Fatal("transient 應回錯")
+	}
+	assertGateState(t, a, id2, "pending")
+}
+
+// TestGateDecideExpirePendingAppendFailureIsNotSwallowed：mutation #14——
+// ExpirePending 的 append 失敗（gateDecide 的 xerr）若被靜默吞掉，Step 6
+// 的錯誤分支會誤報「已轉 expired」但 journal 其實沒寫入。確定性觸發：
+// 在 VerifyTaskRun closure 內先關閉 a.gateJournal，讓 mismatch 之後的
+// ExpirePending append 因檔案已關閉而確定失敗。
+func TestGateDecideExpirePendingAppendFailureIsNotSwallowed(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	id := submitGate3Request(t, a)
+	a.gateReg["gate3_promotion"] = gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{
+		VerifyTaskRun: func(taskRunID, snapshotDigest string) error {
+			if cerr := a.gateJournal.Close(); cerr != nil {
+				t.Fatalf("gateJournal.Close: %v", cerr)
+			}
+			return fmt.Errorf("snapshot 不符: %w", gatepolicy.ErrGate3Mismatch)
+		},
+		VerifyForge:      func(h, b, d string) error { return nil },
+		VerifyProvenance: func(id, d, h string) error { return nil },
+	})
+	err := a.gateDecide(id, "approved", "", nil)
+	if err == nil {
+		t.Fatal("journal 已關閉，ExpirePending 的 append 應失敗，gateDecide 不得回 nil")
+	}
+	if !errors.Is(err, gatepolicy.ErrGate3Mismatch) {
+		t.Fatalf("錯誤必須仍可 errors.Is 判斷出 mismatch：%v", err)
+	}
+	if !strings.Contains(err.Error(), "轉終態失敗") {
+		t.Fatalf("錯誤訊息必須具名指出轉終態失敗（不得靜默吞掉 xerr）：%v", err)
+	}
+	// journal 已關閉，append 必失敗——request 必須仍是 pending（不得誤稱已 expired）。
+	assertGateState(t, a, id, "pending")
+}
+
+// TestGateEntryDTOMapsTerminalCause：mutation #16——gateEntriesToDTO 若不
+// 映射 TerminalCause，這裡必須紅。journal 正常（不關閉），mismatch 讓
+// ExpirePending 成功寫入 expired，之後檢查 DTO 的 TerminalCause 非空。
+func TestGateEntryDTOMapsTerminalCause(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	id := submitGate3Request(t, a)
+	a.gateReg["gate3_promotion"] = gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{
+		VerifyTaskRun: func(taskRunID, snapshotDigest string) error {
+			return fmt.Errorf("snapshot 不符: %w", gatepolicy.ErrGate3Mismatch)
+		},
+		VerifyForge:      func(h, b, d string) error { return nil },
+		VerifyProvenance: func(id, d, h string) error { return nil },
+	})
+	if err := a.gateDecide(id, "approved", "", nil); err == nil {
+		t.Fatal("mismatch 應回錯")
+	}
+	entries, err := a.gateList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.ApprovalID == id {
+			if e.State != "expired" {
+				t.Fatalf("want expired, got %s", e.State)
+			}
+			if e.TerminalCause == "" {
+				t.Fatal("DTO 的 TerminalCause 不得為空——gateEntriesToDTO 必須映射該欄位")
+			}
+			return
+		}
+	}
+	t.Fatalf("approval %s not found", id)
 }

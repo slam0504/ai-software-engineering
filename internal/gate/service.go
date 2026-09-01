@@ -96,7 +96,7 @@ func (s *Service) PrepareDecision(id, decision, reason string, approver Approver
 		return PreparedDecision{}, err
 	}
 	e := findEntry(entries, id)
-	if e == nil || e.Record != nil || e.Request == nil { // must be pending: has request, no record yet
+	if e == nil || e.State != Pending || e.Record != nil || e.Request == nil { // must be pending: has request, no record yet
 		return PreparedDecision{}, ErrNotPending
 	}
 	req := normalizeRequest(*e.Request)
@@ -141,7 +141,7 @@ func (s *Service) CommitDecision(p PreparedDecision) error {
 		return err
 	}
 	e := findEntry(entries, rec.ApprovalID)
-	if e == nil || e.Record != nil || e.Request == nil {
+	if e == nil || e.State != Pending || e.Record != nil || e.Request == nil {
 		return ErrNotPending
 	}
 	policy, ok := s.reg[rec.Gate]
@@ -186,6 +186,25 @@ func (s *Service) Decide(id, decision, reason string, approver Approver, input D
 	return s.CommitDecision(p)
 }
 
+// ExpirePending：pending request 轉 expired 終態（B5 spec §4.3）。
+// rev3：pending 判定必須看 State——expired entry 的 Record/Request 形狀
+// 與 pending 相同，僅形狀檢查會讓 expired 再被 expire／Prepare／Commit。
+// 呼叫端（gateDecide）持 workflowMu——本方法的 append 屬單一寫入者路徑。
+func (s *Service) ExpirePending(approvalID, cause string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := Project(s.j.Ops())
+	if err != nil {
+		return err
+	}
+	e := findEntry(entries, approvalID)
+	if e == nil || e.State != Pending || e.Record != nil || e.Request == nil {
+		return ErrNotPending
+	}
+	return s.appendOp(Transition{Type: "transition", ApprovalID: approvalID,
+		To: string(Expired), At: s.now(), Cause: cause})
+}
+
 // List reconciles every gate's bindings against current state, then returns
 // the projection.
 func (s *Service) List() ([]GateEntry, error) {
@@ -222,8 +241,7 @@ func (s *Service) ListDetectOnly() ([]GateEntry, error) {
 		}
 		if len(causes) > 0 {
 			e.State = Stale
-			// TerminalCause 欄位由 Task 6b 引入後，此處同步補
-			// e.TerminalCause = causes[0].Cause（等值契約，見 Task 6b）
+			e.TerminalCause = causes[0].Cause // 多筆 cause 只有第一筆使 Active→Stale（rev5 precedence：cause 隨實際 state 變化）
 		}
 	}
 	return entries, nil

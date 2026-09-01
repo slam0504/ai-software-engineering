@@ -225,6 +225,165 @@ func TestProjectNormalizesV1AndRejectedTerminal(t *testing.T) {
 	}
 }
 
+func TestProjectExpiredAndTerminalCausePrecedence(t *testing.T) {
+	// Task 6b：project.go 的 expired 分支＋TerminalCause changed 旗標語意。
+	// 直接餵手造的 GateOp 序列（不經 Service），對照 plan「D. mutation 鑑別
+	// 表」：#1（expired 只能由 Pending 轉入）、#4／#5／#6（changed=false 時
+	// 不得覆寫 cause，分別對應 stale/superseded/expired 三種重複情境）、
+	// #8（既有 Stale→Superseded 允許路徑不得改壞）。
+	t.Run("pending→expired 接受", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, GateRequest{ApprovalID: "A", Gate: "gate3_promotion", Subject: "taskrun:x"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "mismatch"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Expired {
+			t.Fatalf("want expired, got %s", e.State)
+		}
+		if e.TerminalCause != "mismatch" {
+			t.Fatalf("TerminalCause = %q, want %q", e.TerminalCause, "mismatch")
+		}
+	})
+	t.Run("active→expired 忽略（mutation #1）", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "should-not-apply"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Active {
+			t.Fatalf("expired 不得套用於非 pending entry，got %s", e.State)
+		}
+		if e.TerminalCause != "" {
+			t.Fatalf("被忽略的 transition 不得寫入 TerminalCause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("stale→expired 忽略", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "went-stale"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "should-not-apply"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Stale {
+			t.Fatalf("want stale, got %s", e.State)
+		}
+		if e.TerminalCause != "went-stale" {
+			t.Fatalf("TerminalCause 應維持 stale 的 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("superseded→expired 忽略", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approval"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "should-not-apply"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Superseded {
+			t.Fatalf("want superseded, got %s", e.State)
+		}
+		if e.TerminalCause != "new approval" {
+			t.Fatalf("TerminalCause 應維持 superseded 的 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("rejected→expired 忽略、TerminalCause 維持空", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "rejected"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "should-not-apply"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Rejected {
+			t.Fatalf("want rejected, got %s", e.State)
+		}
+		if e.TerminalCause != "" {
+			t.Fatalf("Rejected 的 TerminalCause 應維持空：%q", e.TerminalCause)
+		}
+	})
+	t.Run("expired→expired 重複忽略、cause 不覆寫（mutation #6）", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, GateRequest{ApprovalID: "A", Gate: "gate3_promotion", Subject: "taskrun:x"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "first"}),
+			opWith(t, Transition{ApprovalID: "A", To: "expired", Cause: "second"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Expired {
+			t.Fatalf("want expired, got %s", e.State)
+		}
+		if e.TerminalCause != "first" {
+			t.Fatalf("重複 expired 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("stale→stale 重複忽略、cause 不覆寫（mutation #4）", func(t *testing.T) {
+		// 守住 stale case 的「排除自身值」子句 e.State != Stale：若被移除，
+		// 第二筆 stale transition 會讓 e.State = Stale 成 no-op，但
+		// changed 會被誤設為 true，TerminalCause 遭第二筆 cause 覆寫。
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "first-stale"}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "second-stale"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Stale {
+			t.Fatalf("want stale, got %s", e.State)
+		}
+		if e.TerminalCause != "first-stale" {
+			t.Fatalf("重複 stale 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("superseded→superseded 重複忽略、cause 不覆寫（mutation #5）", func(t *testing.T) {
+		// 守住 superseded case 的「排除自身值」子句 e.State != Superseded：
+		// 若被移除，第二筆 superseded transition 會讓 e.State = Superseded
+		// 成 no-op，但 changed 會被誤設為 true，TerminalCause 遭第二筆
+		// cause 覆寫。
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "first-superseded"}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "second-superseded"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Superseded {
+			t.Fatalf("want superseded, got %s", e.State)
+		}
+		if e.TerminalCause != "first-superseded" {
+			t.Fatalf("重複 superseded 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+	t.Run("stale→superseded 接受、cause 隨之更新（mutation #8 對照組）", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "went-stale"}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approved"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Superseded {
+			t.Fatalf("want superseded (既有 precedence，project_test.go:109 固定), got %s", e.State)
+		}
+		if e.TerminalCause != "new approved" {
+			t.Fatalf("TerminalCause 應隨實際 state 變化更新：%q", e.TerminalCause)
+		}
+	})
+	t.Run("superseded→stale 忽略、cause 不變", func(t *testing.T) {
+		ops := []GateOp{
+			opWith(t, ApprovalRecord{ApprovalID: "A", Gate: "gate1", Decision: "approved",
+				Bindings: gate1B("sha256:x", "git:sha1:c1")}),
+			opWith(t, Transition{ApprovalID: "A", To: "superseded", Cause: "new approved"}),
+			opWith(t, Transition{ApprovalID: "A", To: "stale", Cause: "late-stale"}),
+		}
+		e := entryByID(mustProject(t, ops), "A")
+		if e.State != Superseded {
+			t.Fatalf("want superseded, got %s", e.State)
+		}
+		if e.TerminalCause != "new approved" {
+			t.Fatalf("被忽略的 stale 不得覆寫 cause：%q", e.TerminalCause)
+		}
+	})
+}
+
 func TestGate1LegacyEmptyRoleStillValid(t *testing.T) {
 	bs := []Binding{
 		{Kind: "spec_manifest", Digest: "sha256:" + strings.Repeat("a", 64)},

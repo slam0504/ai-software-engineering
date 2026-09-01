@@ -564,3 +564,225 @@ func TestListDetectOnlyUnknownGateFailsClosed(t *testing.T) {
 		t.Fatal("回錯時 journal 不得增長")
 	}
 }
+
+// ---- Task 6b: Gate 3 pending 終態 seam（B5 §4.3）----
+
+func terminalCauseOf(entries []GateEntry, id string) string {
+	for _, e := range entries {
+		if e.ApprovalID == id {
+			return e.TerminalCause
+		}
+	}
+	return ""
+}
+
+// journalTransitionCause：掃 journal ops 解碼 transition record，回傳該
+// approvalID 指定 To 的最新 Cause（ops 依序掃，最後符合者即最新）；
+// 查無即 Fatal。
+func journalTransitionCause(t *testing.T, s *Service, id, to string) string {
+	t.Helper()
+	cause := ""
+	for _, op := range s.opsForTest() {
+		for _, raw := range op.Records {
+			var tr Transition
+			if err := json.Unmarshal(raw, &tr); err != nil || tr.Type != "transition" {
+				continue
+			}
+			if tr.ApprovalID == id && tr.To == to {
+				cause = tr.Cause
+			}
+		}
+	}
+	if cause == "" {
+		t.Fatalf("journal 無 %s→%s transition", id, to)
+	}
+	return cause
+}
+
+func TestExpirePending(t *testing.T) {
+	s, _ := newTestService(t)
+	id, err := s.Submit("gate1", "spec", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpirePending(id, "reverify mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := s.ListDetectOnly()
+	if st := stateOf(entries, id); st != Expired {
+		t.Fatalf("pending 應轉 expired, got %s", st)
+	}
+	// 終態封閉（rev3）：expired 後 Prepare 與 Commit 均回 ErrNotPending
+	if _, err := s.PrepareDecision(id, "approved", "", Approver{ID: "o", Method: "ui"}, DecisionInput{}); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("expired 後 Prepare 應回 ErrNotPending, got %v", err)
+	}
+	// 重複 expire：回 ErrNotPending 且不新增 journal record
+	opsBefore := len(s.opsForTest())
+	if err := s.ExpirePending(id, "again"); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("重複 expire 應回 ErrNotPending, got %v", err)
+	}
+	if len(s.opsForTest()) != opsBefore {
+		t.Fatal("重複 expire 不得 append")
+	}
+	// terminal cause 投影（rev3 P2）：重新投影後 cause 仍在
+	entries2, _ := s.ListDetectOnly()
+	if c := terminalCauseOf(entries2, id); c != "reverify mismatch" {
+		t.Fatalf("TerminalCause 應為 expire cause, got %q", c)
+	}
+	// 非 pending（已決議者）不可 expire
+	id2 := submitAndApprove(t, s)
+	if err := s.ExpirePending(id2, "x"); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("active record 應回 ErrNotPending, got %v", err)
+	}
+}
+
+func TestCommitDecisionFailsAfterExpire(t *testing.T) {
+	// prepared decision 在 Commit 前被 expire → Commit 必須失敗（rev3）
+	s, _ := newTestService(t)
+	id, err := s.Submit("gate1", "spec", gate1Bindings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := s.PrepareDecision(id, "approved", "", Approver{ID: "o", Method: "ui"}, DecisionInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpirePending(id, "raced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitDecision(prepared); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("expire 後 Commit 應回 ErrNotPending, got %v", err)
+	}
+}
+
+func TestTerminalCauseProjection(t *testing.T) {
+	// rev5（P2）；Task 6b implementation preflight erratum 補完整範本：precedence 沿 production
+	// （`Project` 函式的 `"transition"` case，見 Step 3 新範本）——
+	// Stale→Superseded 接受、Superseded→Stale 忽略、Expired 後全忽略；
+	// cause 只隨實際 state 變化更新。stale／superseded 的 cause 斷言取自
+	// journal 內對應 transition record（helper journalTransitionCause：
+	// 掃 opsForTest 解碼 transition、取該 id 指定 To 的最新 Cause——自我
+	// 一致，不猜 production 字串）。
+	newSvc := func(t *testing.T) *Service {
+		s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
+		return s
+	}
+	t.Run("expired 後全忽略且 cause 不覆寫", func(t *testing.T) {
+		s := newSvc(t)
+		id, err := s.Submit("gate1", "spec", gate1Bindings())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ExpirePending(id, "cause-expired"); err != nil {
+			t.Fatal(err)
+		}
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "superseded", At: "t2", Cause: "stray-a"})
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "stale", At: "t3", Cause: "stray-b"})
+		entries, err := s.ListDetectOnly()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := stateOf(entries, id); st != Expired {
+			t.Fatalf("Expired 後 transition 應全忽略：%s", st)
+		}
+		if c := terminalCauseOf(entries, id); c != "cause-expired" {
+			t.Fatalf("cause 不得被覆寫：%q", c)
+		}
+	})
+	t.Run("rejected 後全忽略且 TerminalCause 維持空", func(t *testing.T) {
+		// rev6（P2）：既有測試只驗 Rejected 的 state 不變——補新欄位斷言。
+		// Rejected 的拒絕原因承載於 record.Reason，TerminalCause 應維持空。
+		s := newSvc(t)
+		id, err := s.Submit("gate1", "spec", gate1Bindings())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Decide(id, "rejected", "not good", Approver{ID: "o", Method: "ui"}, DecisionInput{}); err != nil {
+			t.Fatal(err)
+		}
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "stale", At: "t2", Cause: "stray-a"})
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "superseded", At: "t3", Cause: "stray-b"})
+		entries, err := s.ListDetectOnly()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stateOf(entries, id) != Rejected {
+			t.Fatal("Rejected 後 transition 應全忽略（既有 precedence）")
+		}
+		if c := terminalCauseOf(entries, id); c != "" {
+			t.Fatalf("Rejected 的 TerminalCause 應維持空：%q", c)
+		}
+	})
+	t.Run("stale→superseded 接受、superseded→stale 忽略", func(t *testing.T) {
+		s := newSvc(t)
+		id := submitAndApprove(t, s)
+		setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
+		if _, err := s.List(); err != nil { // durable reconcile 落 stale transition
+			t.Fatal(err)
+		}
+		entries, _ := s.ListDetectOnly()
+		if stateOf(entries, id) != Stale {
+			t.Fatal("前置：應 stale")
+		}
+		staleCause := terminalCauseOf(entries, id)
+		if staleCause == "" || staleCause != journalTransitionCause(t, s, id, "stale") {
+			t.Fatalf("TerminalCause 應等於 journal stale transition 的 Cause：%q", staleCause)
+		}
+		// Stale→Superseded：production 允許——state 與 cause 都更新
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "superseded", At: "t2", Cause: "new approved gate1 next"})
+		entries2, _ := s.ListDetectOnly()
+		if stateOf(entries2, id) != Superseded {
+			t.Fatal("Stale→Superseded 應接受（`Project` 函式 `\"transition\"` case 的 precedence）")
+		}
+		if c := terminalCauseOf(entries2, id); c != "new approved gate1 next" {
+			t.Fatalf("cause 應隨實際 state 變化更新：%q", c)
+		}
+		// Superseded→Stale：忽略——state 與 cause 皆不變（project_test.go:109 固定）
+		_ = s.appendOp(Transition{Type: "transition", ApprovalID: id, To: "stale", At: "t3", Cause: "late-stale"})
+		entries3, _ := s.ListDetectOnly()
+		if stateOf(entries3, id) != Superseded {
+			t.Fatal("Superseded→Stale 應忽略")
+		}
+		if c := terminalCauseOf(entries3, id); c != "new approved gate1 next" {
+			t.Fatalf("被忽略的 transition 不得覆寫 cause：%q", c)
+		}
+	})
+	t.Run("superseded（核可 supersede 路徑）cause 等於 journal record", func(t *testing.T) {
+		s := newSvc(t)
+		id := submitAndApprove(t, s)
+		_ = submitAndApprove(t, s) // 同 subject 第二筆 approved → 前筆 superseded
+		entries, _ := s.ListDetectOnly()
+		if stateOf(entries, id) != Superseded {
+			t.Fatal("應 superseded")
+		}
+		want := journalTransitionCause(t, s, id, "superseded")
+		if c := terminalCauseOf(entries, id); c == "" || c != want {
+			t.Fatalf("TerminalCause 應等於 journal transition Cause：%q vs %q", c, want)
+		}
+	})
+}
+
+func TestListDetectOnlyMatchesDurableReconcile(t *testing.T) {
+	s, _ := newTestServiceWithCurrent(t, func() (string, error) { return "sha256:" + hex64(), nil })
+	id := submitAndApprove(t, s)
+	setCurrent(s, func() (string, error) { return "sha256:" + hex64b(), nil })
+	before := len(s.opsForTest())
+	detect, err := s.ListDetectOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.opsForTest()) != before {
+		t.Fatal("detect-only 不得 append")
+	}
+	durable, err := s.List() // 隨後的 durable reconcile
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateOf(detect, id) != stateOf(durable, id) {
+		t.Fatalf("state 不等值：detect=%s durable=%s", stateOf(detect, id), stateOf(durable, id))
+	}
+	dc, uc := terminalCauseOf(detect, id), terminalCauseOf(durable, id)
+	if dc == "" || dc != uc {
+		t.Fatalf("TerminalCause 不等值：detect=%q durable=%q", dc, uc)
+	}
+}

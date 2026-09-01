@@ -75,15 +75,45 @@ func Project(ops []GateOp) ([]GateEntry, error) {
 				var tr Transition
 				_ = json.Unmarshal(raw, &tr)
 				e := get(tr.ApprovalID)
-				switch tr.To { // stale/superseded/rejected 皆終態，不復活
+				// changed 只在本次 transition 實際改變 e.State 時為
+				// true——只有這時才更新 TerminalCause（Task 6b）。Rejected
+				// 不出現在這個 switch：它只由上面 "approval_record" 分支的
+				// r.Decision == "rejected" 設定（且該分支本身已限定
+				// e.State == Pending 才生效），原因留在 Record.Reason，此
+				// 處永不補寫 TerminalCause。Rejected／Expired 都只能從
+				// Pending 轉入、且 ops 依序套用，先成立的終態會讓 State
+				// 離開 Pending，另一條終態路徑的入口條件自然不再成立——
+				// 「先成立的終態保持不變」不需要額外互斥判斷。
+				changed := false
+				switch tr.To {
 				case "stale":
-					if e.State != Superseded && e.State != Rejected {
+					// 不得覆寫 Superseded／Rejected／Expired（同級終態，
+					// 先成立者不變）；已是 Stale 不算改變（避免被同狀態
+					// 的後續 transition 覆寫 cause）。
+					if e.State != Superseded && e.State != Rejected &&
+						e.State != Expired && e.State != Stale {
 						e.State = Stale
+						changed = true
 					}
 				case "superseded":
-					if e.State != Rejected {
+					// 允許 Stale→Superseded（既有修復路徑，
+					// project_test.go:109 固定）；不得覆寫 Rejected／
+					// Expired；已是 Superseded 不算改變。
+					if e.State != Rejected && e.State != Expired &&
+						e.State != Superseded {
 						e.State = Superseded
+						changed = true
 					}
+				case "expired":
+					// B5 §4.3：expired 僅由 Pending 轉入——其餘狀態（含
+					// 重複 expire）一律忽略，不得覆寫既有終態。
+					if e.State == Pending {
+						e.State = Expired
+						changed = true
+					}
+				}
+				if changed {
+					e.TerminalCause = tr.Cause
 				}
 			default:
 				return nil, fmt.Errorf("unknown record _type %q", probe.Type)

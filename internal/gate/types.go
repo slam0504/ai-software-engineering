@@ -10,6 +10,7 @@ const (
 	Stale      State = "stale"
 	Superseded State = "superseded"
 	Rejected   State = "rejected"
+	Expired    State = "expired" // B5 §4.3：pending Gate 3 request 決議時重驗確認不符後的終態；僅 Pending 可轉入
 )
 
 type Binding struct {
@@ -74,4 +75,9 @@ type GateEntry struct {
 	State      State
 	Record     *ApprovalRecord
 	Request    *GateRequest
+	// TerminalCause：本筆進入目前終態（stale/superseded/expired）那次
+	// transition 的 Cause；只在該次 transition 實際改變 State 時寫入（見
+	// project.go 的 changed 旗標）。Rejected 恆為空——拒絕原因承載於
+	// Record.Reason，不重複進本欄位（Task 6b）。
+	TerminalCause string
 }

@@ -5706,6 +5706,7 @@ type GateEntryDTO struct {
 	Reason             string         `json:"reason,omitempty"`
 	Approver           *gate.Approver `json:"approver,omitempty"`
 	JournalDegraded    bool           `json:"journal_degraded,omitempty"`
+	TerminalCause      string         `json:"terminal_cause,omitempty"`
 }
 
 // GateList 回傳 Gate 1 projection。Service.List 內部先 Reconcile 才
@@ -5758,7 +5759,8 @@ func (a *App) gateEntriesToDTO(entries []gate.GateEntry) []GateEntryDTO {
 	degraded := a.gateJournal != nil && a.gateJournal.Degraded()
 	out := make([]GateEntryDTO, 0, len(entries))
 	for _, e := range entries {
-		dto := GateEntryDTO{ApprovalID: e.ApprovalID, State: string(e.State), JournalDegraded: degraded}
+		dto := GateEntryDTO{ApprovalID: e.ApprovalID, State: string(e.State),
+			TerminalCause: e.TerminalCause, JournalDegraded: degraded}
 		if e.Request != nil {
 			dto.Gate = e.Request.Gate
 			dto.Subject = e.Request.Subject
@@ -5852,6 +5854,12 @@ func (a *App) gateDecide(approvalID, decision, reason string, riskSelections []g
 	prepared, err := svc.PrepareDecision(approvalID, decision, reason, approver,
 		gate.DecisionInput{RiskSelections: riskSelections}) // 2. 硬性 validator＋approved 的 current-binding validation
 	if err != nil {
+		if errors.Is(err, gatepolicy.ErrGate3Mismatch) {
+			if xerr := svc.ExpirePending(approvalID, err.Error()); xerr != nil {
+				return fmt.Errorf("gate3 重驗不符且轉終態失敗（journal 收斂交 repair）：%w", errors.Join(err, xerr))
+			}
+			return fmt.Errorf("gate3 重驗不符，request 已轉 expired，需重新送核：%w", err)
+		}
 		return err
 	}
 	scope := scopeForSubject(prepared.Record.Gate, prepared.Record.Subject)
