@@ -232,3 +232,25 @@ func TestGateSubmitHoldsWorkflowMu(t *testing.T) {
 		t.Fatalf("workflowMu held-sequence across the two ValidateRequest probes = %v, want [false true]（app 層 pre-validation 不應持鎖、svc.Submit 內部再驗時應持鎖，B5 §3.2(0)）", heldSequence)
 	}
 }
+
+// TestEnsureGateRegistersGate3Promotion——B6 Task 6：ensureGate() 的
+// registry 必須同時證明兩件事（owner 明訂）：
+//  1. "gate3_promotion" 已註冊（registry 含該 key）；
+//  2. nil deps（app.go 以零值 gatepolicy.Gate3Deps{} 註冊）對 approved
+//     決議 fail closed——只證明「已註冊」不夠，還要證明註冊的是真的沒
+//     接線、不可能誤放行的 policy 實例。
+func TestEnsureGateRegistersGate3Promotion(t *testing.T) {
+	a, _ := newTestApp(t)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	policy, ok := a.gateReg["gate3_promotion"]
+	if !ok {
+		t.Fatal(`registry 缺 "gate3_promotion"`)
+	}
+	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+	if _, err := policy.BuildDecision(req, "approved", gate.DecisionInput{}); err == nil ||
+		!strings.Contains(err.Error(), "not wired") {
+		t.Fatalf("registry 註冊的 gate3_promotion 應為 nil-deps 版本、approved 決議 fail closed 且錯誤具名：%v", err)
+	}
+}

@@ -3891,6 +3891,7 @@ func (a *App) ensureGate() (*gate.Service, error) {
 				currentPlanManifest, currentSpecManifest, currentRiskPolicyDigest, currentPermissionManifest),
 			"test_contract_approval": gatepolicy.NewTCAPolicy(appEvidenceStore{a: a}, appGateReader{a: a},
 				a.planLoader, a.planGit, currentOracleDigest),
+			"gate3_promotion": gatepolicy.NewGate3Policy(gatepolicy.Gate3Deps{}),
 		}
 		a.gateReg = reg // Task 24：submitGateRequest 的 §3.8 (2) pre-validation 用
 		a.gateSvc = gate.NewService(j, reg, ulidFn, nowFn, gateEmitter{a})
