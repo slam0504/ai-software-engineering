@@ -2876,21 +2876,28 @@ git commit -m "feat(gate): B6 Task 6b——Expired 終態＋ExpirePending＋gate
 
 ### Task 7: wsregistry Entry 綁定欄位＋write-once 方法
 
+**Task 7 preflight erratum（owner 2026-08-31 裁示，doc-only，Task 7 尚未實作）**：本段為施工事實核對後的訂正版，修正原範本的自相矛盾、假 helper 與失敗注入 placeholder，並補完整可編譯的 committed 測試範本＋mutation 鑑別表。詳見修訂記錄 rev10 末尾 Task 7 preflight erratum 條目，以及 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-7-preflight-report.md`。
+
 **Files:**
 - Modify: `internal/wsregistry/store.go`（Entry struct＋新方法）
 - Test: `internal/wsregistry/store_test.go`（追加；沿該包既有測試檔）
+- Test: `internal/wsregistry/fsync_test.go`（preflight 新增——`TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites` 的 `writes` 枚舉表加一列 `SetTaskRunBinding`，見 B8）
 
 **Interfaces:**
-- Consumes: 既有 `mutate(wsid string, fn func(*Entry)) error`（store.go:359——單交易欄位更新＋tombstone 檢查）。
+- Consumes（preflight 校正——原「Consumes: 既有 mutate」與 Step 3 註解「不能用 mutate」自相矛盾，二擇一以 Step 3 為準）：沿 `mutate`（`func (s *Store) mutate`，現 store.go:359）的 lock→檢查→改欄位→`persistOrRollback` 骨架**展開**，但**不呼叫** `mutate` 本身——`mutate` 的 `fn func(*Entry)` 只看得到單一 entry，無法完成 SetTaskRunBinding 需要的跨 WSID 掃描（B5 §3.1 雙向 1:1 基數）。
 - Produces:
   - `Entry` 追加欄位：`TaskRunID string \`json:"task_run_id,omitempty"\``、`SnapshotDigest string \`json:"snapshot_digest,omitempty"\``（omitempty——舊檔零遷移）。
-  - `func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error`——**雙向 1:1**（rev2 修——B5 §3.1 基數是雙向的）：(a) 該 WSID 已綁不同 TaskRun → 拒絕；(b) 該 TaskRunID 已綁在**另一個 WSID**（含 tombstoned entry——已放棄的綁定不可轉移）→ 拒絕；(c) partial pair（TaskRunID 與 SnapshotDigest 只有其一非空）→ corruption，拒絕不覆寫；(d) 同值冪等成功（resume 回填路徑）。跨 WSID 掃描與寫入在**同一把 store 鎖**內完成。C1a 於 `commitSessionIdentity` 掛點呼叫。
+  - `func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error`——**雙向 1:1**（rev2 修——B5 §3.1 基數是雙向的）：(a) 該 WSID 已綁不同 TaskRun → 拒絕；(b) 該 TaskRunID 已綁在**另一個 WSID**（含 tombstoned entry——已放棄的綁定不可轉移）→ 拒絕；(c) partial pair（TaskRunID 與 SnapshotDigest 只有其一非空）→ corruption，拒絕不覆寫；(d) 同值冪等成功（resume 回填路徑），且冪等路徑**不觸發 persist**（見 B5 節）。跨 WSID 掃描與寫入在**同一把 store 鎖**內完成。C1a 於 `commitSessionIdentity` 掛點呼叫。
 
 - [ ] **Step 1: 寫 failing tests**
 
+沿該包既有慣例，用 `openStore(t)`（回 `(*Store, string)`，fsync_test.go:53）或 `Open(filepath.Join(t.TempDir(), "ws.json"))`（store_test.go 慣例）——**`newTestStore` 不存在，不得沿用**。
+
 ```go
+// ---- B3：write-once 兩形狀（同值冪等、同 TaskRun 不同 digest 拒絕、不同
+// TaskRun 重綁拒絕）----
 func TestSetTaskRunBindingWriteOnce(t *testing.T) {
-	s := newTestStore(t) // 沿該包既有 helper；若名稱不同，用現行建構慣例
+	s, _ := openStore(t)
 	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
 		t.Fatal(err)
 	}
@@ -2905,27 +2912,80 @@ func TestSetTaskRunBindingWriteOnce(t *testing.T) {
 	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
 		t.Fatalf("同值應冪等：%v", err)
 	}
-	// 不同值：拒絕（不允許重綁，B5 §3.1）
-	if err := s.SetTaskRunBinding("w1", "01BX5ZZKBKACTAV9WEVGEMMVRZ", "sha256:bb"); err == nil {
-		t.Fatal("重綁應拒絕")
+
+	t.Run("same_taskrun_different_digest_rejected", func(t *testing.T) {
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:bb"); err == nil {
+			t.Fatal("同 TaskRun、不同 digest 應拒絕")
+		}
+		if e, _ := s.Get("w1"); e.SnapshotDigest != "sha256:aa" {
+			t.Fatalf("拒絕後不得改動既有欄位，got %+v", e)
+		}
+	})
+
+	t.Run("different_taskrun_rebind_rejected", func(t *testing.T) {
+		if err := s.SetTaskRunBinding("w1", "01BX5ZZKBKACTAV9WEVGEMMVRZ", "sha256:cc"); err == nil {
+			t.Fatal("不同 TaskRun 重綁應拒絕")
+		}
+		if e, _ := s.Get("w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("拒絕後不得改動既有欄位，got %+v", e)
+		}
+	})
+}
+
+// ---- B1：空輸入，各自獨立的負向案例 ----
+func TestSetTaskRunBindingRejectsEmptyTaskRunID(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "", "sha256:aa"); err == nil {
+		t.Fatal("空 taskRunID 應拒絕")
+	}
+	if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("拒絕後不得寫入任何欄位：%+v", e)
+	}
+}
+
+func TestSetTaskRunBindingRejectsEmptySnapshotDigest(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", ""); err == nil {
+		t.Fatal("空 snapshotDigest 應拒絕")
+	}
+	if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("拒絕後不得寫入任何欄位：%+v", e)
+	}
+}
+
+func TestSetTaskRunBindingNotFound(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.SetTaskRunBinding("nope", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("不存在的 wsid 應回 ErrEntryNotFound，got %v", err)
 	}
 }
 
 func TestSetTaskRunBindingTombstoned(t *testing.T) {
-	s := newTestStore(t)
+	s, _ := openStore(t)
 	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Remove("w1", "user_removed"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
-		t.Fatal("tombstoned entry 應拒絕")
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); !errors.Is(err, ErrTombstoned) {
+		t.Fatalf("tombstoned entry 應回 ErrTombstoned，got %v", err)
 	}
 }
 
+// ---- B4：跨 WSID 1:1 基數。測資陷阱（owner 明訂）：跨 WSID 掃描排在「目標
+// 已綁」guard 之後——若目標 entry 本身已綁，會先被前一個 guard 攔下，鑑別
+// 力落在錯的 guard。這裡的目標 entry（w2／w3）必須乾淨未綁；且刻意用「同
+// TaskRunID、不同 digest」而非同值 pair，避免錯誤實作把檢查寫成「比較整個
+// pair」也能通過（同值 pair 在錯誤實作下會被誤判成不同綁定而放行）。----
 func TestSetTaskRunBindingCrossWSIDCardinality(t *testing.T) {
-	s := newTestStore(t)
+	s, _ := openStore(t)
 	for _, w := range []string{"w1", "w2", "w3"} {
 		if err := s.Put(Entry{WSID: w, Provider: "claude", CreatedAt: "t"}); err != nil {
 			t.Fatal(err)
@@ -2934,32 +2994,179 @@ func TestSetTaskRunBindingCrossWSIDCardinality(t *testing.T) {
 	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
 		t.Fatal(err)
 	}
-	// 同一 TaskRunID 綁到另一個 WSID → 拒絕（1:1 雙向）
-	if err := s.SetTaskRunBinding("w2", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
-		t.Fatal("duplicate TaskRunID 跨 WSID 應拒絕")
-	}
-	// tombstoned 佔用也算佔用：w1 移除後 TaskRun 仍不可轉移到 w3（abandoned 不可再綁定）
-	if err := s.Remove("w1", "user_removed"); err != nil {
+
+	t.Run("duplicate_taskrun_different_digest_rejected", func(t *testing.T) {
+		// w2 目標乾淨未綁；同 TaskRunID、不同 digest。
+		if err := s.SetTaskRunBinding("w2", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:cc"); err == nil {
+			t.Fatal("duplicate TaskRunID 跨 WSID 應拒絕（1:1 雙向），即使 digest 不同")
+		}
+		if e, ok := s.Get("w2"); ok && e.TaskRunID != "" {
+			t.Fatalf("拒絕後 w2 不得被寫入：%+v", e)
+		}
+	})
+
+	t.Run("tombstoned_occupancy_not_transferable", func(t *testing.T) {
+		if err := s.Remove("w1", "user_removed"); err != nil {
+			t.Fatal(err)
+		}
+		// w3 目標乾淨未綁；佔用方（w1）已 tombstoned——abandoned 綁定仍不可
+		// 轉移（B5 §3.6）。同樣用不同 digest 避免同值 pair 掩蓋鑑別力。
+		if err := s.SetTaskRunBinding("w3", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:dd"); err == nil {
+			t.Fatal("tombstoned 佔用的 TaskRunID 不可轉移")
+		}
+	})
+}
+
+// ---- B2：partial pair 兩個方向。繞過 SetTaskRunBinding 本身、用 Put 直接
+// 塞欄位造出 partial pair（Put 不驗證綁定欄位配對，寫得進去）。----
+func TestSetTaskRunBindingPartialPairCorruption(t *testing.T) {
+	t.Run("taskrun_only", func(t *testing.T) {
+		s, _ := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t",
+			TaskRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAV"}); err != nil { // SnapshotDigest 缺
+			t.Fatal(err)
+		}
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
+			t.Fatal("partial pair（僅 TaskRunID）應視為 corruption 拒絕，不得靜默補全")
+		}
+	})
+
+	t.Run("digest_only", func(t *testing.T) {
+		s, _ := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t",
+			SnapshotDigest: "sha256:aa"}); err != nil { // TaskRunID 缺
+			t.Fatal(err)
+		}
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
+			t.Fatal("partial pair（僅 SnapshotDigest）應視為 corruption 拒絕，不得靜默補全")
+		}
+	})
+}
+
+// ---- B5：冪等不落盤。注入 stepWrite 錯誤，同值重寫仍應成功——證明冪等
+// 路徑沒有呼叫 persist（若呼叫了，這裡會因注入的錯誤而失敗）。----
+func TestSetTaskRunBindingIdempotentDoesNotPersist(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetTaskRunBinding("w3", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
-		t.Fatal("tombstoned 佔用的 TaskRunID 不可轉移（B5 §3.6 abandoned 不可再綁定）")
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	failAt(s, stepWrite, errors.New("disk full"))
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatalf("冪等路徑不應呼叫 persist，got %v", err)
 	}
 }
 
-func TestSetTaskRunBindingPartialPairCorruption(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t",
-		TaskRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAV"}); err != nil { // SnapshotDigest 缺——partial pair
+// ---- B6：reopen round-trip ＋ 舊檔零遷移 ----
+func TestSetTaskRunBindingRoundTripAcrossOpen(t *testing.T) {
+	s, path := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil {
-		t.Fatal("partial pair 應視為 corruption 拒絕，不得靜默補全")
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
 	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := reopened.Get("w1")
+	if !ok || e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" || e.SnapshotDigest != "sha256:aa" {
+		t.Fatalf("重新 Open 後綁定欄位必須仍在：%+v ok=%v", e, ok)
+	}
+}
+
+func TestSetTaskRunBindingLegacyFileZeroMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ws.json")
+	legacy := `{
+  "schema_version": 2,
+  "entries": {
+    "w1": {"wsid": "w1", "provider": "claude", "created_at": "t"}
+  }
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("舊檔（無新欄位）Open 不應報錯：%v", err)
+	}
+	e, ok := s.Get("w1")
+	if !ok || e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("舊檔零遷移：新欄位應為空，got %+v ok=%v", e, ok)
+	}
+}
+
+// ---- B7：failure matrix，改寫為可編譯測試（原為散文註解）----
+func TestSetTaskRunBindingPersistFailureMatrix(t *testing.T) {
+	t.Run("pre_rename_failure_rolls_back", func(t *testing.T) {
+		s, path := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		failAt(s, stepWrite, errors.New("disk full"))
+		err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa")
+		if err == nil {
+			t.Fatal("stepWrite 失敗必須回錯")
+		}
+		if errors.Is(err, ErrRegistryUncertain) || s.Uncertain() {
+			t.Fatalf("rename 前失敗不得 latch：%v", err)
+		}
+		if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+			t.Fatalf("記憶體必須回滾（無綁定欄位），got %+v", e)
+		}
+		if e, _ := diskEntry(t, path, "w1"); e.TaskRunID != "" {
+			t.Fatalf("磁碟必須維持舊值，got %+v", e)
+		}
+	})
+
+	t.Run("dir_sync_failure_latches_uncertain", func(t *testing.T) {
+		s, path := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		failAt(s, stepDirSync, errors.New("dir fsync EIO"))
+		err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa")
+		if !errors.Is(err, ErrRegistryUncertain) {
+			t.Fatalf("directory sync 失敗必須回 ErrRegistryUncertain，got %v", err)
+		}
+		if !s.Uncertain() {
+			t.Fatal("directory sync 失敗必須 latch uncertain")
+		}
+		// 不回滾：rename 已成功，退回舊值等於宣稱一個 process 內無法證明的事實
+		// （沿 fsync_test.go:229 起既有斷言形狀）。
+		if e, _ := s.Get("w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("記憶體不得退回舊值，got %+v", e)
+		}
+		if e, _ := diskEntry(t, path, "w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("rename 已成功，磁碟應為新值，got %+v", e)
+		}
+	})
 }
 ```
 
-（持久化 round-trip 由 `mutate`→`persistLocked` 既有四步契約承載；該包既有測試已覆蓋 persist，僅需確認新欄位經 JSON round-trip 不丟——在第一個測試補 re-open 斷言：以同 path 重開 Store 後 `Get("w1")` 欄位仍在。）
+**B8：latch 枚舉表新增 `SetTaskRunBinding`**——`fsync_test.go` 既有的 `TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites`（現 fsync_test.go:224 起）的 `writes` map（現 255-268）加一列，證明新 mutator 沒有繞過 uncertain latch。該測試的 `w1` 對 TaskRun 綁定欄位而言是**乾淨未綁**（該測試只動 `ResumeSessionID`／`LegacyTranscript`，新欄位從未被寫過），符合直接沿用：
+
+```go
+	writes := map[string]func() error{
+		"Put":                      func() error { return s.Put(Entry{WSID: "w2", Provider: "codex", CreatedAt: "t"}) },
+		"Remove":                   func() error { return s.Remove("w1", "user_removed") },
+		"DeleteUncommitted":        func() error { return s.DeleteUncommitted("w1") },
+		"CommitResume":             func() error { return s.CommitResume("w1", "x", "lbl") },
+		"SetResume":                func() error { return s.SetResume("w1", "y") },
+		"ResetView":                func() error { return s.ResetView("w1", "evt") },
+		"ClearLegacyTranscript":    func() error { return s.ClearLegacyTranscript("w1") },
+		"SetLayout":                func() error { return s.SetLayout(Layout{Pins: []string{"w1"}}) },
+		"BackfillResume":           func() error { return s.BackfillResume(map[string]string{"w1": "z"}) },
+		"BackfillLegacyTranscript": func() error { return s.BackfillLegacyTranscript([]string{"w1"}) },
+		"MarkMigrated":             func() error { return s.MarkMigrated([]Entry{{WSID: "w9"}}) },
+		"SetTaskRunBinding":        func() error { return s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa") },
+		"Sync":                     func() error { return s.Sync() },
+	}
+```
 
 - [ ] **Step 2: 跑 `go test -race ./internal/wsregistry/ -run TaskRunBinding -count=1`，預期 FAIL**
 - [ ] **Step 3: 實作（Entry 加兩欄位＋方法）**
@@ -2967,29 +3174,30 @@ func TestSetTaskRunBindingPartialPairCorruption(t *testing.T) {
 ```go
 // SetTaskRunBinding 寫入 implementation session 的 TaskRun 綁定（B5 spec
 // §3.1 雙向 1:1 基數）。單一 s.mu 臨界區內完成全部檢查與寫入：
-//   (a) 目標 entry 不存在／tombstoned → 拒絕（沿 mutate 語意）；
-//   (b) 目標 entry 已綁不同值 → 拒絕（不允許重綁）；同值冪等成功；
-//   (c) partial pair（TaskRunID 與 SnapshotDigest 僅其一非空）→ corruption，拒絕；
-//   (d) taskRunID 已出現在任何其他 entry（含 tombstoned——abandoned 綁定
-//       不可轉移，B5 §3.6）→ 拒絕。
+//
+//	(a) 目標 entry 不存在／tombstoned → 拒絕（沿 mutate 語意）；
+//	(b) 目標 entry 已綁不同值 → 拒絕（不允許重綁）；同值冪等成功、不觸發 persist；
+//	(c) partial pair（TaskRunID 與 SnapshotDigest 僅其一非空）→ corruption，拒絕；
+//	(d) taskRunID 已出現在任何其他 entry（含 tombstoned——abandoned 綁定
+//	    不可轉移，B5 §3.6）→ 拒絕。
+//
 // 權威階層（B5 §3.2(2)）：本欄位是 TaskRun journal 的 derived cache——
 // 衝突一律以 journal 為準修復，不得反向補寫 journal。
 //
-// 實作骨架：不能用 mutate（其 fn 看不到其他 entries）——沿 mutate 的
-// lock→檢查→改欄位→persistLocked 骨架（store.go:359-373）展開，於同一
-// s.mu 臨界區先跨全 entries 掃描（fileFormat 的 entries 集合——實作時
-// 對齊實際欄位名），再寫目標 entry 並 persistLocked。
+// 實作骨架：**不能用 mutate**（其 fn 看不到其他 entries，見 Interfaces 段
+// Consumes 校正）——沿 `mutate`（現 store.go:359）的 lock→檢查→改欄位→
+// persistOrRollback 骨架展開，於同一 s.mu 臨界區先跨全 entries 掃描
+// `s.file.Entries`，再寫目標 entry 並呼叫 `persistOrRollback`（現 store.go:274）。
 func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error {
 	if taskRunID == "" || snapshotDigest == "" {
 		return fmt.Errorf("wsregistry: task_run_id 與 snapshot_digest 不得為空")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// rev3：durable 契約沿 mutate（store.go:359-373）逐字展開——所有欄位
-	// mutation 必須走 persistOrRollback（store.go:262-284）：rename 前失敗
-	// → 記憶體回滾 old；directory sync 後不確定 → ErrRegistryUncertain
+	// 所有欄位 mutation 必須走 persistOrRollback（現 store.go:274）：rename
+	// 前失敗 → 記憶體回滾 old；directory sync 後不確定 → ErrRegistryUncertain
 	// latch（不回滾）。entry 取得與集合迭代對齊 s.file 的實際欄位名。
-	old, ok := s.file.Entries[wsid] // 欄位存取形狀依 mutate 現行實作對齊
+	old, ok := s.file.Entries[wsid]
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrEntryNotFound, wsid)
 	}
@@ -3014,7 +3222,7 @@ func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error 
 	next.TaskRunID = taskRunID
 	next.SnapshotDigest = snapshotDigest
 	s.file.Entries[wsid] = next
-	// rev4：persistOrRollback 實際簽章接 rollback closure（store.go:274）——
+	// persistOrRollback 實際簽章接 rollback closure（現 store.go:274）——
 	// rename 前失敗時由 closure 還原記憶體；dir-sync 不確定進 latch 不回滾。
 	return s.persistOrRollback(func() {
 		s.file.Entries[wsid] = old
@@ -3022,20 +3230,7 @@ func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error 
 }
 ```
 
-註：`s.file.Entries` 與 `persistOrRollback` 簽章以 store.go 現行為準逐字對齊（mutate 為唯一先例，**不新增抽象**）；分支語意（a)-(d) 與錯誤訊息為凍結內容。
-
-補 **failure matrix 測試**（rev3——成功 round-trip 不足以驗證 durable seam）：沿該包既有 persist 失敗測試的 `hook func(fsyncStep) error` 注入慣例（store.go:102-127），對 `SetTaskRunBinding` 加兩列：
-
-```go
-func TestSetTaskRunBindingPersistFailureMatrix(t *testing.T) {
-	// (1) rename 前失敗（temp write／file sync 注入錯誤）→ 記憶體回滾：
-	//     Get 回傳 old（無綁定欄位）、方法回錯、後續操作不受影響
-	// (2) directory sync 注入錯誤 → ErrRegistryUncertain latch：方法回
-	//     uncertain、Store.Uncertain() == true、後續 mutation 一律被 latch 擋
-	// 兩列皆沿既有 persist failure 測試的 hook 注入寫法（同檔既有案例為模板），
-	// 斷言形狀對齊 mutate 的既有 failure 測試。
-}
-```
+註：`s.file.Entries` 與 `persistOrRollback` 簽章以 store.go 現行為準逐字對齊（`mutate` 為唯一先例，**不新增抽象**）；分支語意 (a)-(d) 與錯誤訊息為凍結內容。
 
 - [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race ./internal/wsregistry/ -count=1` 全包**
 - [ ] **Step 5: Commit**
@@ -3044,6 +3239,27 @@ func TestSetTaskRunBindingPersistFailureMatrix(t *testing.T) {
 git add internal/wsregistry/
 git commit -m "feat(wsregistry): B6 Task 7——Entry TaskRun 綁定欄位＋SetTaskRunBinding write-once（B5 §3.1／§3.2(2)）"
 ```
+
+**Mutation 鑑別表（逐條一對一，preflight 補完）**：
+
+| # | Mutation（植入處／情境） | 預期紅燈斷言 | 對應測試 |
+|---|---|---|---|
+| 1 | `taskRunID == ""` 檢查被移除 | 空 taskRunID 應拒絕（改寫入成功） | `TestSetTaskRunBindingRejectsEmptyTaskRunID` |
+| 2 | `snapshotDigest == ""` 檢查被移除 | 空 snapshotDigest 應拒絕 | `TestSetTaskRunBindingRejectsEmptySnapshotDigest` |
+| 3 | `!ok` 分支（entry 不存在）被移除或誤判 | 不存在的 wsid 應回 `ErrEntryNotFound` | `TestSetTaskRunBindingNotFound` |
+| 4 | `old.RemovedAt != ""` 檢查被移除 | tombstoned entry 應回 `ErrTombstoned` | `TestSetTaskRunBindingTombstoned` |
+| 5 | partial pair 檢查（僅 TaskRunID 非空）被移除 | 應視為 corruption 拒絕 | `TestSetTaskRunBindingPartialPairCorruption/taskrun_only` |
+| 6 | partial pair 檢查（僅 SnapshotDigest 非空）被移除 | 應視為 corruption 拒絕 | `TestSetTaskRunBindingPartialPairCorruption/digest_only` |
+| 7 | 同值冪等短路被移除（一律當重綁處理） | 同值重寫應成功、不得回錯 | `TestSetTaskRunBindingWriteOnce`（冪等段）；並可見 mutation 存活於 `TestSetTaskRunBindingIdempotentDoesNotPersist`（會誤觸 persist） |
+| 8 | 重綁檢查改成「只比對 digest」（放過同 TaskRun 不同 digest） | 同 TaskRun、不同 digest 應拒絕 | `TestSetTaskRunBindingWriteOnce/same_taskrun_different_digest_rejected` |
+| 9 | 重綁檢查改成「只比對 TaskRunID」（放過不同 TaskRun） | 不同 TaskRun 重綁應拒絕 | `TestSetTaskRunBindingWriteOnce/different_taskrun_rebind_rejected` |
+| 10 | 跨 WSID 掃描迴圈被移除，或誤寫成「比較整個 pair」而非「比較 TaskRunID」 | 目標 entry **乾淨未綁**、同 TaskRunID 不同 digest 仍應拒絕（**測資陷阱**：若目標本身已綁，會先撞前一個 guard，鑑別力是假的——本列刻意用乾淨的 w2） | `TestSetTaskRunBindingCrossWSIDCardinality/duplicate_taskrun_different_digest_rejected` |
+| 11 | 跨 WSID 掃描跳過 tombstoned entries（只掃 live） | tombstoned 佔用的 TaskRunID 轉移到乾淨的 w3 仍應拒絕 | `TestSetTaskRunBindingCrossWSIDCardinality/tombstoned_occupancy_not_transferable` |
+| 12 | `persistOrRollback` 的 rollback closure 被移除或還原錯值 | rename 前（`stepWrite`）失敗必須回錯＋記憶體回滾（`Get` 無綁定欄位）＋`Uncertain()` 為 false | `TestSetTaskRunBindingPersistFailureMatrix/pre_rename_failure_rolls_back` |
+| 13 | dir-sync 失敗被誤處理為一般回滾（違反 §步驟 4 不回滾契約） | 回 `ErrRegistryUncertain`、`Uncertain()` 為 true、記憶體**不**回滾、`diskEntry` 讀到新值 | `TestSetTaskRunBindingPersistFailureMatrix/dir_sync_failure_latches_uncertain` |
+| 14 | `SetTaskRunBinding` 繞過 latch 檢查（例如直接寫 `s.file.Entries` 不經 `persistOrRollback`） | latch 後呼叫 `SetTaskRunBinding` 必須被拒絕（同其餘 12 個既有 writer） | `TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites`（B8 新增列） |
+
+**「跨 WSID 掃描與寫入同鎖」的驗證方式（owner 明訂，本輪不加機率性 concurrency mutation）**：本輪以**程式結構**（單一 `s.mu` 臨界區內完成掃描＋寫入，讀碼可證——`SetTaskRunBinding` 從 `s.mu.Lock()` 到 `persistOrRollback` 回傳全程未釋放鎖）＋**`-race` 驗證**為準。若要另外宣稱 mutation 鑑別力，必須設計確定性觀測點（例如比照 `SetLayout` 的 `compareHook` 慣例，在掃描與寫入之間插測試專用鉤子，用 `TryLock()` 量「有沒有人持鎖」），不能靠大量迴圈碰排程去撞出機率性訊號——本輪不做這件事，留白記在此處，若未來要補須新開範疇。
 
 ---
 
@@ -3371,6 +3587,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **Task 6 施工依據補測——Crockford 字元集兩條獨立負向案例（owner 2026-08-31 裁示，doc-only，Task 6 尚未實作）**：design re-review 發現上一則 Task 6 preflight erratum 遺留的 P2 缺口——Step 1 範本的 subject／ref 負向案例只有「前綴整個錯」（`badSubject`）與「形狀整個錯」（`badTaskRunRef`）兩種，沒有任何值是「`taskrun:` 前綴正確、26 碼、僅字元集違規」；若 `reTaskRunRef` 被放寬成 `[0-9A-Z]{26}`（即 `tca.go:65` `reApprovalRef` 現行形狀）現有測試一個都不會紅。`reTaskRunRef` 同時用於 subject 與 `task_run` binding 的 ref，補兩條獨立案例：(A) `subject` 與 `task_run.Ref` 使用同一個 26 碼、含 Crockford 排除字母（`I`）的值，斷言命中 subject 形狀訊息（`ValidateRequest` 的 subject 檢查在最前面，兩者相等使交叉比對也不會擋）；(B) `subject` 合法、`task_run.Ref` 含排除字母，斷言必須命中「ref 形狀不符」而非僅 `err != nil`——否則移除 refRe 檢查後，交叉比對的「不一致」錯誤會掩蓋 ref 檢查缺失，mutation 會誤通過。連帶於 Step 2 mutation 測試流程凍結段補列兩項對應 mutation：「regex 放寬為 `[0-9A-Z]{26}`」（案例 A 必紅）與「移除 `task_run` binding 的 `refRe` 檢查」（案例 B 必紅，且須由訊息斷言抓到）。**production contract 不受影響（Task 6 未實作）、spec／backlog 不變、未重開完整 plan gate、估點未變**。詳見補測報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-crockford-report.md`。
   - **Task 6 測試強化 follow-up——risk selections 拒絕改兩個獨立 subtest（owner 2026-08-31 裁示，doc-only，Task 6 implementation 已完成於 `315a99c`）**：owner 直接核對出 `TestGate3BuildDecisionRejectsNonEmptyRiskSelections` 在單一函式內順序斷言 approved／rejected 兩個分支——approved 的 `t.Fatal` 會先中止整個函式，使「移除共同的 `len(RiskSelections) > 0` guard」的 mutation 套用後，committed suite 只會停在 approved，無法獨立證明 rejected 路徑也被守住；附帶問題是兩個斷言都只判斷 `err == nil`，沒有訊息斷言。改為兩個 `t.Run` subtest（`approved`／`rejected`）各自獨立執行，並各自斷言錯誤訊息含 `"risk selections not accepted"`。驗證：mutation 套用後兩個 subtest 皆紅（含獨立取得 rejected 的紅燈證據），還原後 production 檔案 hash byte-identical。**production contract 與 gate3.go 零變更、未重開完整 plan gate、估點未變**。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-followup-report.md`。
   - **Task 6b implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6b 尚未實作）**：實作前施工事實核對發現 Task 6b 段有一個結構性缺口與多處漂移，owner 裁示一次修完。**(A)** `project.go` 的狀態機改動原本只有散文、無程式碼範本，而它承載 Expired 只由 pending 進入、終態 precedence、`TerminalCause` 更新時機——補為採 `changed` 旗標的完整可重放範本（stale/superseded 不得覆寫 Rejected 與 Expired、同值不算改變；expired 僅 Pending→Expired；只有 `changed` 才寫 `TerminalCause`；Rejected 仍只由 `approval_record` 產生、原因留在 `Record.Reason`）；`types.go` 的 `Expired` 常數與 `GateEntry.TerminalCause`、`GateEntryDTO`／`gateEntriesToDTO` 的欄位映射一併補具體範本行。**(B)** 同值投影窮舉：`List` 自動帶、`ListDetectOnly` 手動補、`Lookup` 刻意不擴充（四個消費端皆查 gate2 record 且只用 `State` 判有效性，不顯示失效原因）——明文記成決定，避免下一輪被誤判為漏補；既有狀態判定全為對 `Active` 的正向比對、無窮舉 `switch`，新增 `Expired` 相容；前端 `resolveState` 對未知 key 原樣回傳，badge 樣式與 i18n 歸 **C1c**。**(C)** 漂移校正並改以函式／符號名為主要定位、行號只作當前輔助（`PrepareDecision`／`CommitDecision` 的 pending 判定現分別在 line 99／144，非同段 143-146；`gateDecide` 現 line 5829、`svc.PrepareDecision` 呼叫現 line 5852；`newGateTestApp`／`terminalCauseOf`／`journalTransitionCause` 等既有引用改對齊實際可用的 `newTestAppGit`，`submitGate3Request`／`assertGateState` 兩個測試 helper 補完整可編譯內容）；移除一組空的 ` ```go ``` ` code fence。**(D)** 補 16 項 mutation 鑑別表（Step 7a；preflight2 修正前初版誤植 14 項，見本條末尾追記），逐項標明對應鑑別測試，含新增的 `internal/gate/project_test.go` 直接投影測試（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a）。**(E)** mutation #12（`ExpirePending` 失敗時吞掉 `xerr`）補可編譯測試範本 `TestGateDecideExpirePendingAppendFailureIsNotSwallowed`（Step 5b）——在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，使 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定性失敗；另補 mutation #16（preflight2 重新編號前為 #14；DTO 未映射 `TerminalCause`）測試 `TestGateEntryDTOMapsTerminalCause`。Files 清單同步加入 `internal/gate/project_test.go`。**(F)** 範本落地驗證時另發現 Step 5 的 `TestGateDecideGate3MismatchExpiresPending` 在 `a.ensureGate()` 從未跑過的情況下對 `a.gateReg`（nil map）賦值，會 panic——補 `a.ensureGate()` 前置呼叫（與 Step 5a／5b 既有寫法一致）。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、未重開完整 plan gate、估點未變（0.35 pt）**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight-report.md`。**preflight2 修正（owner 2026-08-31 design re-review 後裁示，doc-only，Task 6b 仍未實作）**：**(A2)** mutation 鑑別表第 4 列「重複 stale／重複 superseded／重複 expired 不得覆寫既有 cause」塞了三個情境，但範本測試只有 `expired→expired` 一個——`changed` 旗標裡「排除自身值」的 `e.State != Stale`／`e.State != Superseded` 兩個子句因此無測試守護。補 `Stale→Stale`、`Superseded→Superseded` 兩個獨立 subtest（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a），原第 4 列拆成三列一對一對應，mutation 表**由 14 項改為 16 項並全表重新編號**（原 #5-14 依序遞補為 #7-16；本條前段 (D)(E) 提及的舊編號已同步更正）；檢查其餘各列未發現同型「一列多情境、測試只涵蓋其中一個」問題。**(B2)** brief 正典化（owner 裁定）：契約正典＝committed plan；Task 6b 派工正典＝`task-6b-brief.md`（須與 plan 本 Task 6b 段逐字一致）；`task-6-brief.md` 內的 Task 6b 段降為歷史合併快照、非正典、不得用於 Task 6b implementation（該檔案本身及其 Task 6 段不受影響，仍為已驗收的 Task 6 artifact）。往後一致性驗證只比較 plan Task 6b 段 ↔ `task-6b-brief.md`，不再以 `task-6-brief.md` 當同步證據。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、plan 維持 rev10、估點未變（0.35 pt）**。詳見 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight2-report.md`。
+  - **Task 7 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 7 尚未實作）**：Task 7 沒有 brief，plan 是唯一可重放來源，實作前施工事實核對發現範本自相矛盾、假 helper 與失敗注入 placeholder，owner 裁示一次修完。**(A)** 漂移校正四項：①Interfaces 段原寫「Consumes: 既有 `mutate`」，但 Step 3 註解明寫「不能用 mutate（其 fn 看不到其他 entries）」，自相矛盾——改為「沿 `mutate`（現 store.go:359）骨架展開但不呼叫」；②Step 1 範本用的 `newTestStore(t)` 該包不存在——改用實際慣例 `openStore(t)`（回 `(*Store, string)`，fsync_test.go:53）或 `Open(filepath.Join(t.TempDir(), "ws.json"))`；③`hook func(fsyncStep) error` 行號原標「store.go:102-127」有漂移——改為「hook 欄位現 store.go:113、注入點 140-141、`fsyncStep` 常數 52-60、注入器為 `ForceStepHookForTest` ＋ `failAt` helper（fsync_test.go:44）」；④`persistOrRollback` 行號原有兩處寫法（「262-284」與「274」）——統一為現 store.go:274。全部改以「函式／符號名＋（現 line N）」形式定位，降低未來再漂移的機率。**(B)** 補完整可編譯的 committed 測試範本（原為散文 placeholder）：空 `taskRunID`／空 `snapshotDigest` 各自獨立負向案例；partial pair 兩方向（僅 TaskRunID／僅 SnapshotDigest，經 `Put` 繞過 `SetTaskRunBinding` 造出）；write-once 兩形狀（同 TaskRun 不同 digest 拒絕、不同 TaskRun 重綁拒絕，原範本只有同值冪等）；跨 WSID 測資改用「目標乾淨未綁＋同 TaskRun 不同 digest」（避免掩蓋「比較整個 pair」這種錯誤實作，因為跨 WSID 掃描排在「目標已綁」guard 之後，若目標已綁會先撞錯的 guard）；冪等不落盤（注入 `stepWrite` 錯誤仍應成功，證明冪等路徑未呼叫 persist）；reopen round-trip 與舊檔零遷移各自完整程式碼；failure matrix 兩列改寫為使用 `failAt`／`diskEntry`／`Uncertain()` 的可編譯測試（rename 前失敗回滾且不 latch、dir-sync 失敗 latch 且不回滾＋磁碟核對新值）；latch 枚舉表（`TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites`）新增 `SetTaskRunBinding` 一列，證明新 mutator 未繞過既有 latch——Files 清單同步加入 `internal/wsregistry/fsync_test.go`。**(C)** 補 14 項 mutation 鑑別表，逐條一對一對應到上述測試，並在表格與正文中明寫「跨 WSID mutation 測資不得先撞『目標已綁』guard」這條測資陷阱；「跨 WSID 掃描與寫入同鎖」本輪以程式結構（單一 `s.mu` 臨界區可讀碼證明）＋`-race` 驗證為準，明文排除機率性 concurrency mutation（若未來要另外宣稱鑑別力，須新設確定性觀測點，例如比照 `SetLayout` 的 `compareHook` 慣例）。**不建立 `task-7-brief.md`**（owner 明訂，避免新增第二來源——Task 7 目前 plan 是唯一可重放來源）。**production contract 不受影響（Task 7 未實作）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-7-preflight-report.md`。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
