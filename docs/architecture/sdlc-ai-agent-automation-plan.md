@@ -1,6 +1,7 @@
 # AI Agent 協作自動化規劃：規格定案後的實作、驗證與部署流程
 
-> 版本：v2.1（2026-08-05）
+> 版本：v2.2（2026-09-01，治理修正——mutation acceptance table 預設 N/N 全跑門檻，新增 §6.7；同步校正 §4／§6.3／§11 的「抽驗」措辭以免與新規則矛盾）
+> 前版：v2.1（2026-08-05）
 > 狀態：架構規劃稿（第二輪審核：v2 可接受為架構規劃稿）；已依第二輪審核（3 P1 / 2 P2）修訂為 v2.1，目標升為 pilot-ready 執行契約前仍需完成 §12 的前置條件與實際演練。
 > 配套文件：`sdlc-bdd-ddd-tdd-reference.md`（參考型 SDLC v2）
 > 範圍：自動化 Phase 3（迭代開發）至 Phase 4（發布）；Phase 0–2 的需求分析、提問確認與定案仍由人主導，AI 僅輔助。
@@ -89,7 +90,7 @@ AI 輔助範圍不變（草擬 Gherkin、歧義偵測、NFR 覆蓋檢查），Ga
 
 - **業務關鍵 scenario 必附輸入輸出 oracle**：examples / decision table，讓測試綁定有明確的對錯判準，而非只有自然語言 step。
 - **測試綁定需獨立 review**（在 Stage C 以 Test Contract Approval 執行，見 §3、§6.1）：Gate 1 核准的是意圖表示；可執行驗收契約在測試綁定被核准時才成立。
-- **重要規則加入 negative control**：核准條件包含「測試在故意做錯的實作上會失敗」的證據；高風險功能採 mutation testing 或人工抽樣操作驗證測試辨識力。
+- **重要規則加入 negative control**：核准條件包含「測試在故意做錯的實作上會失敗」的證據；高風險功能採 mutation testing 或人工抽樣操作驗證測試辨識力。**但若 implementation plan 已為該 task 列出有限且逐項編號的 mutation acceptance table，適用 §6.7 的 N/N 全跑門檻，不得以抽樣替代。**
 
 **產出**（進 version control，Gate 1 後以 branch protection 鎖定）：
 
@@ -172,7 +173,7 @@ main（受保護；D1 + merge queue 守門）
 1. **Branch protection / ruleset + required Code Owner review**：CODEOWNERS 只指定 reviewer，必須搭配這兩者才有阻擋合併的效力。
 2. **各角色獨立身分與最小權限**：implementer 與 test binder 使用不同身分與 token；共用同一 token 的「不同 agent」不構成職責分離。權限清單由 Gate 2 綁定。
 3. **CI 政策檢查**：實作 PR touch oracle surface 即失敗。
-4. **辨識力驗證取代數量檢查**：「assertion 數量不得減少」偵測不了 assertion 被改弱；改用 §4 的 negative control / mutation testing 抽驗。
+4. **辨識力驗證取代數量檢查**：「assertion 數量不得減少」偵測不了 assertion 被改弱；改用 §4 的 negative control / mutation testing 辨識力驗證（plan 若列有逐項編號的 mutation acceptance table，依 §6.7 為 N/N 全跑，不是抽驗）。
 
 **保證強度的準確描述**（P2 修正）：以上 1–3 保證的是「implementer 無法讓未核准的 oracle-surface 變更進入受保護分支（integration / main）」，不是檔案系統層的唯讀——agent 仍能在本機或 feature branch 修改、commit、push 這些檔案。若需要「寫不進」等級的保證，另需 managed path allowlist、檔案系統權限或獨立 test repo；採用與否依風險在 Gate 2 政策決定。
 
@@ -193,6 +194,23 @@ Worktree 只隔離檔案狀態，不隔離憑證、網路與共享外部環境�
 ### 6.6 上下文供給（P2 修正）
 
 「最小充分上下文」限制的是**無關資料**（降低偏航、token 成本與 prompt injection 面），不是禁止探索：agent 保有查 immediate callers、shared utilities、外部契約的受控擴展能力；需要超出配給範圍時走升級，不是硬牆。
+
+### 6.7 Mutation acceptance table 的執行門檻（v2.2 新增）
+
+當 implementation plan 為某個 task 列出**有限且逐項編號**的 mutation acceptance table（形如「#N 變異植入處 → 預期轉紅的測試」），該表即為驗收契約的一部分，**預設必須 N/N 全跑**——不得以抽樣、少數代表項、或「範本可執行」替代。
+
+每一項的完成定義（缺一即該項未完成）：
+
+1. **套用**：mutation 已實際套用到 production 檔——`git diff`／`diff` 顯示變更存在，且檔案內容 hash 已改變（變異前後 `shasum`／`sha256sum` 不同）。
+2. **紅在正題**：表中指定的測試（含 subtest 名）確實 FAIL，且失敗訊息是該測試自己的斷言訊息——不是撞到其他 guard，也不是由其他測試連帶失敗。
+3. **還原**：還原後檔案與變異前 **byte-identical**（hash 相同）。不指定還原手段，但須留下比對證據。
+4. **回綠**：該 task 的基準測試指令回綠。
+
+**「可執行」不等於完成**：證明範本能編譯、測試能跑、或 mutation 能被套用，都只是前置條件，不構成該項已完成的證據。
+
+**抽樣的例外條件**：只有當 plan **明確把該表定義為 sampling** 時才可抽驗，且必須記錄 (a) 抽樣依據（為何這幾項具代表性）、(b) 未執行項的完整清單、(c) owner 對此抽樣的核准。三者缺一，該表視同未完成。
+
+**表與 checklist 的綁定**：acceptance table 必須有對應的 checkbox execution step，否則它只是敘述性文件，實作者跑完既有測試看到全綠即會結案，該表不會被執行。
 
 ## 7. Stage D：驗證（D1 pre-merge / D2 post-merge）
 
@@ -283,7 +301,7 @@ Security reviewer 審應用 code；這套 agent 系統本身另需治理：
 
 1. **規格與測試綁定的品質天花板即產出品質天花板**。AI 忠實實作已核准契約；規格漏想的邊界、測試綁定誤解的語意，流程不會自行發現（negative control 與 exploratory 只能補撈一部分）。
 2. **領域建模判斷不可全自動**。Aggregate 邊界、一致性取捨可由 agent 提案，正確性需領域知識驗證；模型變更永遠過人。
-3. **Reward hacking 風險降低但不消除**。oracle surface 保護 + 職責分離 + mutation 抽驗是縱深防禦，仍需定期人工抽查綠燈名副其實。
+3. **Reward hacking 風險降低但不消除**。oracle surface 保護 + 職責分離 + mutation 辨識力驗證（acceptance table 依 §6.7 為 N/N 全跑；抽樣僅限 plan 明確定義為 sampling 者）是縱深防禦，仍需定期人工抽查綠燈名副其實。
 4. **導入必須漸進**：AI 預審（全量人工 review 仍在）→ 單任務 implementer → 平行化 → 依核准政策縮減人工 review → 低風險自動發布。每階段以實測指標決定是否前進。
 5. **成本結構改變**。token / CI / 治理成本上升，換取人力轉向規格與審查；以 change lead time 與 change fail rate 前後對照實測，不假設必然更快。
 
@@ -305,6 +323,15 @@ Security reviewer 審應用 code；這套 agent 系統本身另需治理：
 - 本文所引用語檢查為 zhtw-mcp 的詞彙 lint，非 Markdown linter；reports 目錄目前非 git repo，無 commit / diff 可追溯（如需版本化請先 `git init`）。
 
 ## 13. 修訂記錄
+
+### v2.2（2026-09-01）— mutation acceptance table 執行門檻（doc-only 治理修正）
+
+起因：B6 implementation plan 的 Task 7 有完整 14 項 mutation 鑑別表，但 checklist 沒有任何 checkbox step 要求執行它，該表形同死文件；同 plan 的 Task 6b 雖有 execution step，門檻卻只要求「證明可執行、不要求逐項跑完紅綠」。owner 裁示把強門檻定為往後通則。
+
+1. **新增 §6.7**：plan 若列出有限且逐項編號的 mutation acceptance table，預設 N/N 全跑；每項四步完成定義（套用且 hash 改變 → 指定測試紅在正題 → 還原 byte-identical → 基準測試回綠）；「可執行」不等於完成；抽樣僅限 plan 明確定義為 sampling 且記錄抽樣依據／未執行項／owner 核准；acceptance table 必須綁 checkbox execution step。
+2. **同步校正措辭**：§4 negative control、§6.3 辨識力驗證、§11 誠實邊界三處的「抽驗」措辭補上與 §6.7 的關係，避免與新規則矛盾。§13 內 v2 條目的歷史措辭不改寫。
+
+本次為文件治理修正，**不改變任何既有 gate 設計、角色權限或階段順序**，亦不追溯改寫任何已結案票的驗收裁定。
 
 ### v2.1（2026-08-05）— 依第二輪審核修訂
 
