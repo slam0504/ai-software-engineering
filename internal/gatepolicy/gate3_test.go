@@ -271,12 +271,23 @@ func TestGate3BuildDecisionRejectsNonEmptyRiskSelections(t *testing.T) {
 	req := gate.GateRequest{Gate: "gate3_promotion", Subject: "taskrun:01ARZ3NDEKTSV4RRFFQ69G5FAV", Bindings: gate3Bindings()}
 	risk := gate.DecisionInput{RiskSelections: []gate.RiskSelection{{TaskID: "t1", SelectedRiskTier: "high"}}}
 
-	if _, err := p.BuildDecision(req, "approved", risk); err == nil {
-		t.Fatal("approved 分支非空 RiskSelections 應拒絕")
-	}
-	if _, err := p.BuildDecision(req, "rejected", risk); err == nil {
-		t.Fatal("rejected 分支非空 RiskSelections 應拒絕")
-	}
+	// approved／rejected 拆成兩個獨立 t.Run subtest（follow-up）：原本在同一
+	// 函式內順序斷言時，approved 的 t.Fatal 會先中止整個函式——移除共同的
+	// len(RiskSelections) > 0 guard 的 mutation 套用後，committed suite 只會
+	// 停在 approved，無法獨立證明 rejected 路徑也被守住。t.Run 內的 t.Fatal
+	// 只中止該 subtest，兩者各自獨立執行、各自可紅。
+	t.Run("approved", func(t *testing.T) {
+		_, err := p.BuildDecision(req, "approved", risk)
+		if err == nil || !strings.Contains(err.Error(), "risk selections not accepted") {
+			t.Fatalf("approved 分支非空 RiskSelections 應拒絕且訊息含 risk selections not accepted：%v", err)
+		}
+	})
+	t.Run("rejected", func(t *testing.T) {
+		_, err := p.BuildDecision(req, "rejected", risk)
+		if err == nil || !strings.Contains(err.Error(), "risk selections not accepted") {
+			t.Fatalf("rejected 分支非空 RiskSelections 應拒絕且訊息含 risk selections not accepted：%v", err)
+		}
+	})
 }
 
 func TestGate3BuildDecisionRejectedSkipsReverify(t *testing.T) {
