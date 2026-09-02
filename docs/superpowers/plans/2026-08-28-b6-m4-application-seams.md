@@ -3292,20 +3292,45 @@ git commit -m "feat(wsregistry): B6 Task 7——Entry TaskRun 綁定欄位＋Set
 
 ### Task 8: `appcore.Manager` turn-admission freeze 旗標
 
+**Task 8 preflight erratum（owner 2026-09-02 裁示，doc-only，Task 8 尚未實作）**：本段為施工事實核對後的訂正版，修正原範本 P1 測試不可編譯與遮蔽（`newTestManager` 簽章、`*tm` 遮蔽 `BeginSubmit`／`BeginNewSessionSubmit`、`reserveActive`／`reserveIdle` 不存在）、P2 違反本包 slot 解析慣例（裸 `m.slots[w]`）與 Interfaces 段自相矛盾（承諾具名 error 卻用 `fmt.Errorf` 臨時字串）、P3 斷言太弱與缺 negative control，並補完整可編譯的測試範本、`ErrTurnsFrozen` 哨兵、Step 4a 與五項 mutation 鑑別表。詳見修訂記錄 rev10 末尾 Task 8 preflight erratum 條目。
+
 **Files:**
-- Modify: `internal/appcore/manager.go`（slot 加欄位＋`FreezeTurns`＋`BeginSubmit` 檢查）
+- Modify: `internal/appcore/manager.go`（slot 加 `turnsFrozen` 欄位＋新增 `ErrTurnsFrozen` 哨兵＋`FreezeTurns`＋`BeginSubmit`／`BeginNewSessionSubmit` 皆加旗標檢查）
 - Test: `internal/appcore/manager_test.go`（追加；沿該包既有測試慣例）
 
 **Interfaces:**
-- Consumes: 既有 slot 結構與 `BeginSubmit(w WSID) (SubmissionID, error)`（manager.go:645）。
-- Produces: `func (m *Manager) FreezeTurns(w WSID, during func()) error`——於 `m.mu` 臨界區內設 slot 的 `turnsFrozen = true`（monotonic，無解除方法）並呼叫 `during()`（仍持 `m.mu`——B5 §4.2(2) 雙鎖同持的 manager 側；`during` 內由 App 取 `apprMu` 設 approval 旗標）。**兩種 turn admission 都檢查**（rev2 修——只擋 `BeginSubmit` 可被 NewSession→StartSession 繞過）：`BeginSubmit` 與 `BeginNewSessionSubmit` 對 frozen slot 皆回具名 error。Task 9 與 C1a 使用。
+- Consumes: 既有 slot 結構、`committedSlotLocked`（新入口唯一 slot 解析路徑——未 commit 或不存在一律 `ErrSessionNotFound`，現 manager.go:375）、`BeginSubmit(w WSID) (SubmissionID, error)`（manager.go:645）、`BeginNewSessionSubmit(w WSID, taskID string) (SubmissionID, error)`（manager.go:406）。
+- Produces（preflight 校正——原版 Step 3 用裸 `m.slots[w]` 繞過 `committedSlotLocked`、且 Step 3 錯誤處理用 `fmt.Errorf` 臨時字串與本段原「皆回具名 error」的承諾自相矛盾，owner 裁決二擇一：改採具名哨兵，二者對齊）：
+  - 新哨兵 `ErrTurnsFrozen = errors.New("appcore: turns frozen for this workspace session")`，沿本檔既有 14 個 `var ErrXxx = errors.New(...)` 慣例（manager.go:13-39）追加。
+  - `slot` struct 追加 `turnsFrozen bool` 欄位（zero value＝未凍結；沿 `committed` 等既有 bool 欄位慣例，manager.go:120-144）。
+  - `func (m *Manager) FreezeTurns(w WSID, during func()) error`——於 `m.mu` 臨界區內，經 `committedSlotLocked` 解析 slot（未知或未 commit 的 WSID 一律 `ErrSessionNotFound`，**不得**改用裸 `m.slots[w]`——否則「已 reserve 但未 CommitCreate」的 WSID 會被誤判存在並成功凍結）後設 `turnsFrozen = true`（monotonic，無解除方法、重複呼叫冪等成功）並呼叫 `during()`（仍持 `m.mu`——B5 §4.2(2) 雙鎖同持的 manager 側；`during` 內由 App 取 `apprMu` 設 approval 旗標，除此路徑外任何程式不得同時持有兩鎖）。
+  - **兩種 turn admission 都檢查**（rev2 修——只擋 `BeginSubmit` 可被 NewSession→StartSession 繞過）：`BeginSubmit` 與 `BeginNewSessionSubmit` 對 frozen slot 皆以 `%w` 包裝 `ErrTurnsFrozen` 並保留 WSID 脈絡；未知 WSID 維持不同錯誤（走既有 `committedSlotLocked` 分流回 `ErrSessionNotFound`，不受本次改動影響）。旗標檢查位於 manager 鎖內、admit（取得 ownership／轉入 `phaseStarting`）之前——線性化點對齊 B5 spec §4.2(3)「新 turn 的線性化點＝`Manager.BeginSubmit` 成功返回（manager 鎖內完成旗標檢查後才 admit）」。Task 9 與 C1a 使用。
 
 - [ ] **Step 1: 寫 failing tests**
 
+沿該包既有慣例，用 `newTestManager(t, &memSink{})`（回 `(*tm, *[]contract.Envelope, *sync.Mutex)`，現 manager_test.go:145）取得測試 manager；`*tm` 已對 `BeginSubmit`／`BeginNewSessionSubmit`／`RejectSubmit`／`AcceptSubmit` 提供 `Provider`（非 `WSID`）簽章的 wrapper（manager_test.go:74-89），測試一律呼叫這層 wrapper、不得直接對內嵌 `*Manager` 傳 `WSID`；需要 `WSID` 時用 `m.w(p)`（manager_test.go:66）。`FreezeTurns` 未被 `*tm` 遮蔽，直接呼叫 `m.FreezeTurns(w, during)` 即為 `*Manager.FreezeTurns`。`reserveActive`／`reserveIdle` 兩個 helper 全 repo 不存在，不採用——改用既有的 `startActive(t, m, p)`（帶 slot 進 `phaseActive`，manager_test.go:159）與剛建構完成的預設 `phaseIdle` slot：
+
 ```go
+// ---- 阻擋 BeginSubmit（active slot），含 negative control ----
 func TestFreezeTurnsBlocksBeginSubmit(t *testing.T) {
-	m := newTestManager(t) // 沿該包既有建構慣例（appcore.New + 最小 Config）
-	w := reserveActive(t, m) // 既有測試應有 reserve→active 流程 helper；無則內聯
+	m, _, _ := newTestManager(t, &memSink{})
+	p := contract.ProviderClaude
+	startActive(t, m, p)
+	w := m.w(p)
+
+	// negative control：凍結前 BeginSubmit 應成功——證明本測試量到的是
+	// freeze 造成的拒絕，不是「一律拒絕」的假陽性。
+	id, err := m.BeginSubmit(p)
+	if err != nil {
+		t.Fatalf("凍結前 BeginSubmit 應成功：%v", err)
+	}
+	// 收尾這筆 submit，讓 sl.submitting 回到 nil——否則下一次呼叫會先撞
+	// ErrSubmitActive，freeze 的鑑別力被這個更早的 guard 遮蔽（A 型遮蔽）。
+	if err := m.AcceptSubmit(p, id, "s1", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	m.Emit(contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")})
+
 	ran := false
 	if err := m.FreezeTurns(w, func() { ran = true }); err != nil {
 		t.Fatal(err)
@@ -3313,57 +3338,189 @@ func TestFreezeTurnsBlocksBeginSubmit(t *testing.T) {
 	if !ran {
 		t.Fatal("during 回呼必須在凍結時執行（雙鎖同持窗口）")
 	}
-	if _, err := m.BeginSubmit(w); err == nil {
-		t.Fatal("frozen slot 的 BeginSubmit 應拒絕")
+
+	if _, err := m.BeginSubmit(p); !errors.Is(err, ErrTurnsFrozen) {
+		t.Fatalf("frozen slot 的 BeginSubmit 應回 ErrTurnsFrozen，got %v", err)
 	}
 }
 
+// ---- 阻擋 BeginNewSessionSubmit（idle slot、StartSession 繞道），含 negative
+// control ----
 func TestFreezeTurnsBlocksBeginNewSessionSubmit(t *testing.T) {
 	// rev2（plan gate P1）：frozen WSID 走 NewSession→StartSession 的初始
 	// prompt 也是新 turn——BeginNewSessionSubmit 必須同樣被擋。
-	m := newTestManager(t)
-	w := reserveIdle(t, m) // idle slot（可走 BeginNewSessionSubmit 的 phase）
+	m, _, _ := newTestManager(t, &memSink{})
+	p := contract.ProviderClaude
+	w := m.w(p) // 剛 commit 完成、尚未使用的 slot：zero value phaseIdle
+
+	// negative control：凍結前 idle slot 的 BeginNewSessionSubmit 應成功。
+	id, err := m.BeginNewSessionSubmit(p, "task-negative-control")
+	if err != nil {
+		t.Fatalf("凍結前 BeginNewSessionSubmit 應成功：%v", err)
+	}
+	// 用 RejectSubmit 收尾（fromNewSession=true → phase 回 idle、submitting
+	// 回 nil），讓 slot 回到乾淨 idle，避免下一次呼叫被 ErrSubmitActive／
+	// ErrSessionActive 遮蔽 freeze 的鑑別力。
+	if err := m.RejectSubmit(p, id); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := m.FreezeTurns(w, func() {}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.BeginNewSessionSubmit(w, "task-1"); err == nil {
-		t.Fatal("frozen slot 的 BeginNewSessionSubmit 應拒絕（StartSession 繞道封死）")
+	if _, err := m.BeginNewSessionSubmit(p, "task-1"); !errors.Is(err, ErrTurnsFrozen) {
+		t.Fatalf("frozen slot 的 BeginNewSessionSubmit 應回 ErrTurnsFrozen（StartSession 繞道封死），got %v", err)
 	}
 }
 
+// ---- 未知 WSID／uncommitted reservation／monotonic 三個獨立情境，各自 subtest
+// 對應一個 mutation ----
 func TestFreezeTurnsMonotonicAndUnknownWSID(t *testing.T) {
-	m := newTestManager(t)
-	if err := m.FreezeTurns(WSID("nope"), func() {}); err == nil {
-		t.Fatal("未知 WSID 應回 error")
-	}
-	w := reserveActive(t, m)
-	if err := m.FreezeTurns(w, func() {}); err != nil {
-		t.Fatal(err)
-	}
-	// 重複凍結冪等成功（monotonic set-once）
-	if err := m.FreezeTurns(w, func() {}); err != nil {
-		t.Fatalf("重複凍結應冪等：%v", err)
-	}
+	m, _, _ := newTestManager(t, &memSink{})
+
+	t.Run("unknown_wsid_rejected", func(t *testing.T) {
+		if err := m.FreezeTurns(WSID("nope"), func() {}); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("完全未知的 WSID 應回 ErrSessionNotFound，got %v", err)
+		}
+	})
+
+	t.Run("uncommitted_reservation_rejected", func(t *testing.T) {
+		// 僅 ReserveSession、未 CommitCreate——slot 存在於 m.slots 但
+		// committed=false。裸 m.slots[w] 會誤判存在並成功凍結；正確路徑須走
+		// committedSlotLocked（現 manager.go:375）回 ErrSessionNotFound。
+		w2, _, err := m.Manager.ReserveSession(contract.ProviderClaude)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.FreezeTurns(w2, func() {}); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("未 CommitCreate 的 reservation 應回 ErrSessionNotFound，got %v", err)
+		}
+	})
+
+	t.Run("monotonic_idempotent_and_sticky", func(t *testing.T) {
+		p := contract.ProviderCodex
+		startActive(t, m, p)
+		w := m.w(p)
+
+		id, err := m.BeginSubmit(p) // 收尾殘留 submit，回到 sl.submitting == nil
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.AcceptSubmit(p, id, "s1", "hi"); err != nil {
+			t.Fatal(err)
+		}
+		m.Emit(contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")})
+
+		if err := m.FreezeTurns(w, func() {}); err != nil {
+			t.Fatal(err)
+		}
+		// 重複凍結冪等成功（monotonic set-once）
+		if err := m.FreezeTurns(w, func() {}); err != nil {
+			t.Fatalf("重複凍結應冪等：%v", err)
+		}
+		// monotonic 的鑑別力來自這裡：若實作被改成可解除（例如翻轉 bool 或
+		// 重複呼叫時清旗標），這裡會誤放行。
+		if _, err := m.BeginSubmit(p); !errors.Is(err, ErrTurnsFrozen) {
+			t.Fatalf("重複凍結後仍應維持凍結，BeginSubmit 應回 ErrTurnsFrozen，got %v", err)
+		}
+	})
 }
 ```
 
 - [ ] **Step 2: 跑 `go test -race ./internal/appcore/ -run FreezeTurns -count=1`，預期 FAIL**
 - [ ] **Step 3: 實作**
 
-slot struct 加 `turnsFrozen bool`（zero value＝未凍結，restart 後由 C1a startup repair 依 journal 重建——B5 §4.2(2)）：
+`slot` struct 追加欄位（現有欄位不動，只加最後一項；zero value＝未凍結，restart 後由 C1a startup repair 依 journal 重建——B5 §4.2(2)，latch 本身不持久化）：
+
+```go
+type slot struct {
+	reducer    *contract.Reducer
+	taskID     string
+	totalCost  float64
+	totalUsage contract.Usage
+
+	// M3b §3.1：slot identity。wsid 供 emit 路徑回填 Envelope.WorkspaceSessionID。
+	// Task 26 之後每個 slot 都由 ReserveSession 建立，wsid 必非空。
+	wsid      WSID
+	provider  contract.Provider
+	committed bool   // false = 只保留名額，尚未 CommitCreate；一律拒絕
+	createSeq uint64 // CreateToken 比對用
+
+	gen            uint64 // 換代遞增：舊 SubmissionID／SessionToken／ResetToken 全部失效
+	seq            uint64
+	submitting     *SubmissionID
+	fromNewSession bool
+	phase          sessionPhase
+	sessionGen     uint64
+	endSeq         uint64
+	endTok         *SessionToken
+	resetSeq       uint64
+	resetTok       *ResetToken
+	pendingBuf     []pendingEntry
+
+	// B6 Task 8（B5 spec §4.2(2)）：turn-admission freeze latch。monotonic
+	// set-once——僅由 FreezeTurns 寫 true，本檔無解除路徑；zero value＝未凍結。
+	// latch 為 runtime-only，重啟後由 C1a startup repair 依 TaskRun journal
+	// 重建，本欄位不持久化。
+	turnsFrozen bool
+}
+```
+
+`var (...)` 錯誤哨兵區塊追加 `ErrTurnsFrozen`（沿既有 14 個哨兵慣例）：
+
+```go
+var (
+	ErrSubmitActive    = errors.New("appcore: submission already in progress")
+	ErrSessionActive   = errors.New("appcore: session already active; end it first")
+	ErrStaleSubmission = errors.New("appcore: stale submission id")
+	ErrNoSession       = errors.New("appcore: no active session")
+	ErrStartInProgress = errors.New("appcore: session start in progress")
+	ErrEndInProgress   = errors.New("appcore: session end in progress")
+	ErrResetInProgress = errors.New("appcore: view reset in progress")
+	ErrStaleSession    = errors.New("appcore: stale session token")
+	ErrStaleReset      = errors.New("appcore: stale reset token")
+	ErrClosed          = errors.New("appcore: manager closed")
+
+	// M3b §3.1：per-WSID slot registry ＋三段建立交易的 sentinel。
+	ErrSessionLimit     = errors.New("appcore: session slot limit reached")
+	ErrSessionNotFound  = errors.New("appcore: unknown workspace session")
+	ErrStaleCreate      = errors.New("appcore: stale create token")
+	ErrProviderMismatch = errors.New("appcore: event provider != slot provider")
+
+	// M3b §3.6.2：移除＝釋放名額的最後一步。呼叫端必須先完成 teardown（slot 收
+	// 回 idle），才能呼叫 RemoveSession——非 idle 一律拒絕，不得把「還在收尾」
+	// 的 slot 直接砍掉。
+	ErrSessionNotIdle = errors.New("appcore: session must be idle to remove")
+
+	// M3b §1.1：每 session 至多一個進行中 turn。Codex 端 ThreadRunner 另有
+	// ErrTurnActive 擋在 wire 層，但那是 provider 專屬的；Claude 走 stream-json
+	// stdin，多送一筆不會被 CLI 拒絕。因此不變量統一由本層守（見 turnInFlight）。
+	ErrTurnInFlight = errors.New("appcore: a turn is already in flight for this session")
+
+	// B6 Task 8（B5 spec §4.2(2)(3)）：TaskRun STALE fail-closed 的 turn-
+	// admission freeze latch。BeginSubmit／BeginNewSessionSubmit 對 frozen
+	// slot 皆以 %w 包裝本哨兵並保留 WSID 脈絡；未知／未 commit 的 WSID 走
+	// committedSlotLocked 回 ErrSessionNotFound，不受本哨兵影響。
+	ErrTurnsFrozen = errors.New("appcore: turns frozen for this workspace session")
+)
+```
+
+`FreezeTurns`——沿 `committedSlotLocked`（現 manager.go:375）解析 slot，**不得**改用裸 `m.slots[w]`：
 
 ```go
 // FreezeTurns 設定該 WSID 的 turn-admission 凍結旗標（monotonic——B5 spec
 // §4.2(2)：set-once、生命週期內不清除；重啟後由 startup repair 自 TaskRun
 // journal 重建）。during 在仍持 m.mu 時執行——freeze 設定端的雙鎖同持
 // 窗口（manager 鎖→apprMu 固定順序）由呼叫端在 during 內取 apprMu 完成；
-// 除此路徑外任何程式不得同時持有兩鎖。
+// 除此路徑外任何程式不得同時持有兩鎖。slot 解析沿 committedSlotLocked（現
+// manager.go:375）——未 commit 或不存在一律 ErrSessionNotFound，不得繞過
+// 改用裸 m.slots[w]（否則已 reserve 未 commit 的 WSID 會被誤判存在）。
 func (m *Manager) FreezeTurns(w WSID, during func()) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sl, ok := m.slots[w]
-	if !ok {
-		return fmt.Errorf("appcore: FreezeTurns 未知 WSID %q", w)
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
 	}
 	sl.turnsFrozen = true
 	if during != nil {
@@ -3373,22 +3530,98 @@ func (m *Manager) FreezeTurns(w WSID, during func()) error {
 }
 ```
 
-`BeginSubmit`（manager.go:645）與 `BeginNewSessionSubmit`（新 session 初始 prompt 的 admission——rev2 補）於各自既有 phase 檢查後追加相同檢查：
+`beginSubmitLocked`（`BeginSubmit` 現 manager.go:645 的鎖內 helper）追加旗標檢查——置於既有 phase／`ErrSubmitActive`／`ErrTurnInFlight` 檢查之後、`sl.seq++`（admit）之前：
 
 ```go
-	if sl.turnsFrozen {
-		// rev3：SubmissionID 為 struct 非 string——零值用 SubmissionID{}
-		return SubmissionID{}, fmt.Errorf("appcore: session %q 已凍結（TaskRun STALE fail closed），拒絕新 turn", w)
+func (m *Manager) beginSubmitLocked(sl *slot) (SubmissionID, error) {
+	switch sl.phase {
+	case phaseIdle:
+		return SubmissionID{}, ErrNoSession
+	case phaseStarting:
+		return SubmissionID{}, ErrStartInProgress
+	case phaseEnding:
+		return SubmissionID{}, ErrEndInProgress
+	case phaseResetting:
+		return SubmissionID{}, ErrResetInProgress
 	}
+	if sl.submitting != nil {
+		return SubmissionID{}, ErrSubmitActive
+	}
+	// §1.1：每 session 至多一個進行中 turn。位置在**取得 ownership 之前**——先
+	// 佔住 sl.submitting 再回錯的話，這個 slot 從此永遠 ErrSubmitActive。
+	//
+	// 只擋 BeginSubmit，不擋 beginNewSessionSubmitLocked：後者是「開新對話」，
+	// newSessionLocked 會先 reducer.Reset()，上一代的殘留狀態依定義不再適用。
+	if turnInFlight(sl.reducer.Current()) {
+		return SubmissionID{}, ErrTurnInFlight
+	}
+	// B6 Task 8（B5 spec §4.2(2)(3)）：freeze latch 的線性化點——manager 鎖
+	// 內、admit（取得 ownership）之前完成檢查。
+	if sl.turnsFrozen {
+		return SubmissionID{}, fmt.Errorf("appcore: session %q turns frozen: %w", sl.wsid, ErrTurnsFrozen)
+	}
+	sl.seq++
+	id := SubmissionID{gen: sl.gen, seq: sl.seq}
+	sl.submitting = &id
+	return id, nil
+}
+```
+
+`beginNewSessionSubmitLocked`（`BeginNewSessionSubmit` 現 manager.go:406 的鎖內 helper——新 session 初始 prompt 的 admission，rev2 補）同樣追加，置於既有 phase／`ErrSubmitActive` 檢查之後、`newSessionLocked`（admit）之前：
+
+```go
+func (m *Manager) beginNewSessionSubmitLocked(sl *slot, taskID string) (SubmissionID, error) {
+	switch sl.phase {
+	case phaseActive, phaseEnding:
+		return SubmissionID{}, ErrSessionActive
+	case phaseStarting:
+		return SubmissionID{}, ErrSubmitActive
+	case phaseResetting:
+		return SubmissionID{}, ErrResetInProgress
+	}
+	if sl.submitting != nil {
+		return SubmissionID{}, ErrSubmitActive
+	}
+	// B6 Task 8（B5 spec §4.2(2)(3)）：StartSession 路徑同樣是新 turn 的
+	// admission，線性化點與 beginSubmitLocked 對齊——manager 鎖內、admit 之前。
+	if sl.turnsFrozen {
+		return SubmissionID{}, fmt.Errorf("appcore: session %q turns frozen: %w", sl.wsid, ErrTurnsFrozen)
+	}
+	m.newSessionLocked(sl, taskID)
+	sl.seq++
+	id := SubmissionID{gen: sl.gen, seq: sl.seq}
+	sl.submitting, sl.fromNewSession = &id, true
+	sl.phase = phaseStarting
+	return id, nil
+}
 ```
 
 - [ ] **Step 4: 跑 Step 2 指令預期 PASS；`go test -race ./internal/appcore/ -count=1` 全包**
+- [ ] **Step 4a: mutation 鑑別表逐項執行（5/5；owner 2026-09-02 裁示——兩條 admission 路徑＋monotonic freeze 屬 fail-closed 關鍵 seam，依 §6.7 全部逐項執行，不得抽驗）**
+
+下方「Mutation 鑑別表」的 5 項全部執行。每一項都必須完成以下四步並留下證據，缺任一步即該項未通過：
+
+1. **套用**：證明 mutation diff 已實際落到 production 檔（`git diff`／`diff` 顯示變更存在）且檔案內容 hash 已改變（變異前後 `shasum`／`sha256sum` 不同）。
+2. **轉紅**：表中指定的測試（含 subtest 名）確實 FAIL，且**紅在正題**——失敗訊息必須是該測試自己的斷言訊息，不是撞到其他 guard、或由其他測試連帶失敗。
+3. **還原**：還原後檔案 hash 與變異前一致（byte-identical），證明無殘留。
+4. **轉綠**：`go test -race ./internal/appcore/ -count=1` 全包回綠。
+
 - [ ] **Step 5: Commit**
 
 ```bash
 git add internal/appcore/
 git commit -m "feat(appcore): B6 Task 8——FreezeTurns monotonic 旗標＋BeginSubmit 拒絕（B5 §4.2(2)）"
 ```
+
+**Mutation 鑑別表（逐條一對一，preflight 補完）**：
+
+| # | Mutation（植入處／情境） | 預期紅燈斷言 | 對應測試 |
+|---|---|---|---|
+| 1 | `beginSubmitLocked` 的 `sl.turnsFrozen` guard 被移除 | frozen slot 的 `BeginSubmit` 應回 `ErrTurnsFrozen`（改寫入成功） | `TestFreezeTurnsBlocksBeginSubmit` |
+| 2 | `beginNewSessionSubmitLocked` 的 `sl.turnsFrozen` guard 被移除 | frozen slot 的 `BeginNewSessionSubmit` 應回 `ErrTurnsFrozen`（StartSession 繞道被封死改成放行） | `TestFreezeTurnsBlocksBeginNewSessionSubmit` |
+| 3 | `FreezeTurns` 對未知 WSID 誤放行（`committedSlotLocked` 的 `!ok` 分支被移除或誤判） | 完全未知的 WSID 應回 `ErrSessionNotFound` | `TestFreezeTurnsMonotonicAndUnknownWSID/unknown_wsid_rejected` |
+| 4 | `FreezeTurns` 改用裸 `m.slots[w]` 取代 `committedSlotLocked`（uncommitted reservation 誤放行） | 僅 `ReserveSession`、未 `CommitCreate` 的 WSID 應回 `ErrSessionNotFound` | `TestFreezeTurnsMonotonicAndUnknownWSID/uncommitted_reservation_rejected` |
+| 5 | monotonic 被實作成可解除（例如重複呼叫時翻轉 `turnsFrozen`，或提供解除路徑） | 重複凍結後仍應維持凍結，`BeginSubmit` 應回 `ErrTurnsFrozen`（不得因重複呼叫而翻回可放行） | `TestFreezeTurnsMonotonicAndUnknownWSID/monotonic_idempotent_and_sticky` |
 
 ---
 
@@ -3615,6 +3848,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **Task 6 測試強化 follow-up——risk selections 拒絕改兩個獨立 subtest（owner 2026-08-31 裁示，doc-only，Task 6 implementation 已完成於 `315a99c`）**：owner 直接核對出 `TestGate3BuildDecisionRejectsNonEmptyRiskSelections` 在單一函式內順序斷言 approved／rejected 兩個分支——approved 的 `t.Fatal` 會先中止整個函式，使「移除共同的 `len(RiskSelections) > 0` guard」的 mutation 套用後，committed suite 只會停在 approved，無法獨立證明 rejected 路徑也被守住；附帶問題是兩個斷言都只判斷 `err == nil`，沒有訊息斷言。改為兩個 `t.Run` subtest（`approved`／`rejected`）各自獨立執行，並各自斷言錯誤訊息含 `"risk selections not accepted"`。驗證：mutation 套用後兩個 subtest 皆紅（含獨立取得 rejected 的紅燈證據），還原後 production 檔案 hash byte-identical。**production contract 與 gate3.go 零變更、未重開完整 plan gate、估點未變**。詳見 follow-up 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6-followup-report.md`。
   - **Task 6b implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6b 尚未實作）**：實作前施工事實核對發現 Task 6b 段有一個結構性缺口與多處漂移，owner 裁示一次修完。**(A)** `project.go` 的狀態機改動原本只有散文、無程式碼範本，而它承載 Expired 只由 pending 進入、終態 precedence、`TerminalCause` 更新時機——補為採 `changed` 旗標的完整可重放範本（stale/superseded 不得覆寫 Rejected 與 Expired、同值不算改變；expired 僅 Pending→Expired；只有 `changed` 才寫 `TerminalCause`；Rejected 仍只由 `approval_record` 產生、原因留在 `Record.Reason`）；`types.go` 的 `Expired` 常數與 `GateEntry.TerminalCause`、`GateEntryDTO`／`gateEntriesToDTO` 的欄位映射一併補具體範本行。**(B)** 同值投影窮舉：`List` 自動帶、`ListDetectOnly` 手動補、`Lookup` 刻意不擴充（四個消費端皆查 gate2 record 且只用 `State` 判有效性，不顯示失效原因）——明文記成決定，避免下一輪被誤判為漏補；既有狀態判定全為對 `Active` 的正向比對、無窮舉 `switch`，新增 `Expired` 相容；前端 `resolveState` 對未知 key 原樣回傳，badge 樣式與 i18n 歸 **C1c**。**(C)** 漂移校正並改以函式／符號名為主要定位、行號只作當前輔助（`PrepareDecision`／`CommitDecision` 的 pending 判定現分別在 line 99／144，非同段 143-146；`gateDecide` 現 line 5829、`svc.PrepareDecision` 呼叫現 line 5852；`newGateTestApp`／`terminalCauseOf`／`journalTransitionCause` 等既有引用改對齊實際可用的 `newTestAppGit`，`submitGate3Request`／`assertGateState` 兩個測試 helper 補完整可編譯內容）；移除一組空的 ` ```go ``` ` code fence。**(D)** 補 16 項 mutation 鑑別表（Step 7a；preflight2 修正前初版誤植 14 項，見本條末尾追記），逐項標明對應鑑別測試，含新增的 `internal/gate/project_test.go` 直接投影測試（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a）。**(E)** mutation #12（`ExpirePending` 失敗時吞掉 `xerr`）補可編譯測試範本 `TestGateDecideExpirePendingAppendFailureIsNotSwallowed`（Step 5b）——在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，使 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定性失敗；另補 mutation #16（preflight2 重新編號前為 #14；DTO 未映射 `TerminalCause`）測試 `TestGateEntryDTOMapsTerminalCause`。Files 清單同步加入 `internal/gate/project_test.go`。**(F)** 範本落地驗證時另發現 Step 5 的 `TestGateDecideGate3MismatchExpiresPending` 在 `a.ensureGate()` 從未跑過的情況下對 `a.gateReg`（nil map）賦值，會 panic——補 `a.ensureGate()` 前置呼叫（與 Step 5a／5b 既有寫法一致）。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、未重開完整 plan gate、估點未變（0.35 pt）**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight-report.md`。**preflight2 修正（owner 2026-08-31 design re-review 後裁示，doc-only，Task 6b 仍未實作）**：**(A2)** mutation 鑑別表第 4 列「重複 stale／重複 superseded／重複 expired 不得覆寫既有 cause」塞了三個情境，但範本測試只有 `expired→expired` 一個——`changed` 旗標裡「排除自身值」的 `e.State != Stale`／`e.State != Superseded` 兩個子句因此無測試守護。補 `Stale→Stale`、`Superseded→Superseded` 兩個獨立 subtest（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a），原第 4 列拆成三列一對一對應，mutation 表**由 14 項改為 16 項並全表重新編號**（原 #5-14 依序遞補為 #7-16；本條前段 (D)(E) 提及的舊編號已同步更正）；檢查其餘各列未發現同型「一列多情境、測試只涵蓋其中一個」問題。**(B2)** brief 正典化（owner 裁定）：契約正典＝committed plan；Task 6b 派工正典＝`task-6b-brief.md`（須與 plan 本 Task 6b 段逐字一致）；`task-6-brief.md` 內的 Task 6b 段降為歷史合併快照、非正典、不得用於 Task 6b implementation（該檔案本身及其 Task 6 段不受影響，仍為已驗收的 Task 6 artifact）。往後一致性驗證只比較 plan Task 6b 段 ↔ `task-6b-brief.md`，不再以 `task-6-brief.md` 當同步證據。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、plan 維持 rev10、估點未變（0.35 pt）**。詳見 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight2-report.md`。
   - **Task 7 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 7 尚未實作）**：Task 7 沒有 brief，plan 是唯一可重放來源，實作前施工事實核對發現範本自相矛盾、假 helper 與失敗注入 placeholder，owner 裁示一次修完。**(A)** 漂移校正四項：①Interfaces 段原寫「Consumes: 既有 `mutate`」，但 Step 3 註解明寫「不能用 mutate（其 fn 看不到其他 entries）」，自相矛盾——改為「沿 `mutate`（現 store.go:359）骨架展開但不呼叫」；②Step 1 範本用的 `newTestStore(t)` 該包不存在——改用實際慣例 `openStore(t)`（回 `(*Store, string)`，fsync_test.go:53）或 `Open(filepath.Join(t.TempDir(), "ws.json"))`；③`hook func(fsyncStep) error` 行號原標「store.go:102-127」有漂移——改為「hook 欄位現 store.go:113、注入點 140-141、`fsyncStep` 常數 52-60、注入器為 `ForceStepHookForTest` ＋ `failAt` helper（fsync_test.go:44）」；④`persistOrRollback` 行號原有兩處寫法（「262-284」與「274」）——統一為現 store.go:274。全部改以「函式／符號名＋（現 line N）」形式定位，降低未來再漂移的機率。**(B)** 補完整可編譯的 committed 測試範本（原為散文 placeholder）：空 `taskRunID`／空 `snapshotDigest` 各自獨立負向案例；partial pair 兩方向（僅 TaskRunID／僅 SnapshotDigest，經 `Put` 繞過 `SetTaskRunBinding` 造出）；write-once 兩形狀（同 TaskRun 不同 digest 拒絕、不同 TaskRun 重綁拒絕，原範本只有同值冪等）；跨 WSID 測資改用「目標乾淨未綁＋同 TaskRun 不同 digest」（避免掩蓋「比較整個 pair」這種錯誤實作，因為跨 WSID 掃描排在「目標已綁」guard 之後，若目標已綁會先撞錯的 guard）；冪等不落盤（注入 `stepWrite` 錯誤仍應成功，證明冪等路徑未呼叫 persist）；reopen round-trip 與舊檔零遷移各自完整程式碼；failure matrix 兩列改寫為使用 `failAt`／`diskEntry`／`Uncertain()` 的可編譯測試（rename 前失敗回滾且不 latch、dir-sync 失敗 latch 且不回滾＋磁碟核對新值）；latch 枚舉表（`TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites`）新增 `SetTaskRunBinding` 一列，證明新 mutator 未繞過既有 latch——Files 清單同步加入 `internal/wsregistry/fsync_test.go`。**(C)** 補 14 項 mutation 鑑別表，逐條一對一對應到上述測試，並在表格與正文中明寫「跨 WSID mutation 測資不得先撞『目標已綁』guard」這條測資陷阱；「跨 WSID 掃描與寫入同鎖」本輪以程式結構（單一 `s.mu` 臨界區可讀碼證明）＋`-race` 驗證為準，明文排除機率性 concurrency mutation（若未來要另外宣稱鑑別力，須新設確定性觀測點，例如比照 `SetLayout` 的 `compareHook` 慣例）。**不建立 `task-7-brief.md`**（owner 明訂，避免新增第二來源——Task 7 目前 plan 是唯一可重放來源）。**production contract 不受影響（Task 7 未實作）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-7-preflight-report.md`。**design re-review 修正（owner 2026-09-01 裁示，doc-only，Task 7 仍未實作）**：獨立 re-review 對 `9396b13` 判 FAIL，三項一次修完——**(F1，阻擋項)** Task 7 的 checklist 只有 Step 1-5，14 項 mutation 鑑別表是 Step 5 之後的純敘述區塊，沒有任何 checkbox 要求 implementation 階段執行它（對照 Task 6b 有 Step 7a）；補 **Step 4a**，明訂 14/14 逐項執行、含第 14 項（繞過 latch，目前唯一已知的證據缺口），每項須完成「套用並證明 hash 已改變 → 指定測試因自己的斷言轉紅 → 還原後 hash byte-identical → 全包測試轉綠」四步，owner 明確否決比照 Task 6b Step 7a 只要求「可執行」與分級抽驗兩種較弱門檻。**(F2)** 本 commit 自己新增的 B7 子測試註解「沿 fsync_test.go:229 起既有斷言形狀」行號有誤——229 是 `failAt(s, stepDirSync, …)` 注入行，形狀相符的「(2) 不回滾」斷言實際在 243-245；改為符號名＋現行行號，與本 commit 宣稱的定位慣例一致。**(F3)** `TestSetTaskRunBindingCrossWSIDCardinality/tombstoned_occupancy_not_transferable` 原本只判 `err == nil`，補上與相鄰 subtest 對稱的「拒絕後 w3 不得被寫入」狀態斷言。**production contract 不受影響（Task 7 未實作）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**；Task 7 implementation base 改綁本次 plan-only commit，`9396b13` 不再作為 base。**implementation 中斷回饋修正（owner 2026-09-01 裁示，doc-only，Task 7 實作暫停中、尚未 commit）**：Step 4a 逐項執行進行到 mutation #5 時**該項存活**，實作者依 fail-loud 規則停手。根因：`taskrun_only` 測資的 `old.TaskRunID` 非空，partial-pair guard 被移除後會被緊接著的「已綁定」guard 順帶擋下而仍回錯，而該 subtest 只判 `err == nil`，分不出紅在正題或紅在別的 guard（同型於 Task 6 Crockford erratum 記過的「訊息斷言 vs 僅 `err != nil`」缺口）。owner 裁示暫停實作、先唯讀掃描 #6-#14 同型問題、一次修入 plan 後重新 gate。掃描結果與修正：**(1) #5／#6** 兩個 partial-pair subtest 改為斷言錯誤訊息含 `partial pair`（#5 是已確認缺陷；#6 本方向無遮蔽路徑，屬對稱防禦性補強），表格兩列同步註明遮蔽路徑之有無。**(2) #8／#9 mutation 標籤對調**——凍結的冪等條件為 `old.TaskRunID == taskRunID && old.SnapshotDigest == snapshotDigest`，其單欄位 mutation 中「只比對 TaskRunID」會被 `same_taskrun_different_digest_rejected` 抓到、「只比對 digest」會被 `different_taskrun_rebind_rejected` 抓到，與原表格標籤相反；兩列的括號症狀描述與對應測試本身正確，僅前導標籤寫反，故只對調標籤、不動症狀與測試歸屬。**(3) #9 測資缺陷**：`different_taskrun_rebind_rejected` 原用 `sha256:cc`，使 TaskRunID 與 digest **同時**不同，兩種單欄位比較 mutation 都會因被保留的欄位也不相等而落入拒絕分支、雙雙存活；改為 `sha256:aa`（與既有值相同）以孤立目標欄位，並在範本與表格加註測資陷阱。此為第三種失效形狀——**測資未隔離目標欄位**，強化斷言救不了（mutant 命中同一行 `return`、訊息逐字相同），只能改測資。**(4)** #7 的鑑別力成立但表格括號描述不精確，一併校正：原寫「並可見 mutation 存活於 `TestSetTaskRunBindingIdempotentDoesNotPersist`（會誤觸 persist）」——實際上冪等短路被移除後，函式會提前落入「已綁定、拒絕重綁」分支回錯，**不會進入 `persistOrRollback`**，注入的 `stepWrite` 也未被觸發；該測試是因收到非預期錯誤而紅，主證據仍為 `TestSetTaskRunBindingWriteOnce` 的冪等段。與 (2) 的 #8／#9 標籤同屬「表格文字與實際機制不符」，故同輪一併修完。**(5)** #10-#14 及 #1-#4 經逐列讀碼推導鑑別力成立，未修改；#1-#4 的既有紅燈證據不受本次修正影響（修正只觸及 `PartialPairCorruption` 與 `WriteOnce` 兩個測試函式，與 #1-#4 對應測試不共用測資或 Store 實例），予以保留。**production contract 不受影響（分支語意 (a)-(d) 與錯誤訊息維持凍結、`store.go` 範本零變更）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**；本 commit 只 stage plan，實作中的三個 Go 檔維持未提交。re-gate 通過後，契約基準與 implementation review base 改綁本次 plan-only commit。
+  - **Task 8 implementation preflight erratum（owner 2026-09-02 裁示，doc-only，Task 8 尚未實作）**：實作前唯讀 preflight 判定原範本施工依據不能直接用，owner 裁示兩項決定＋七項 findings 一次修完。**裁定一（具名 error）**：新增 `ErrTurnsFrozen` 哨兵（沿本檔既有 14 個 `var ErrXxx = errors.New(...)` 慣例），`BeginSubmit`／`BeginNewSessionSubmit` 皆以 `%w` 包裝並保留 WSID 脈絡；測試改用 `errors.Is`；未知 WSID 維持不同錯誤（走 `committedSlotLocked` 回 `ErrSessionNotFound`），修正原版 Interfaces 段「皆回具名 error」承諾與 Step 3 `fmt.Errorf` 臨時字串自相矛盾之處。**裁定二（5 項 mutation 全跑）**：新增 Step 4a（checkbox，位置與措辭比照 Task 7 Step 4a）＋5 列 mutation 鑑別表，依 §6.7 為 5/5 全跑，不精簡為 3 項。**findings 修法**：**(P1-a／P1-b)** Step 1 範本原寫 `newTestManager(t)`（單一回傳值）且 `m.BeginSubmit(w)` 直傳 `WSID`，與實際簽章 `newTestManager(t, sink) (*tm, *[]contract.Envelope, *sync.Mutex)`（manager_test.go:145）及 `*tm` 對 `BeginSubmit`／`BeginNewSessionSubmit` 提供的 `Provider` 簽章 wrapper（manager_test.go:74/78，會遮蔽內嵌 `*Manager` 同名方法）不符，編譯不過——改寫為呼叫 `*tm` wrapper（`m.BeginSubmit(p)`／`m.BeginNewSessionSubmit(p, taskID)`），`WSID` 需要時用 `m.w(p)`。**(P1-c)** `reserveActive`／`reserveIdle` 全 repo 不存在——改採既有 `startActive(t, m, p)`（manager_test.go:159）帶 slot 進 `phaseActive`；idle 情境改用剛建構完成、尚未使用的預設 `phaseIdle` slot，不新增 helper。**(P2-a)** Step 3 `FreezeTurns` 原用裸 `m.slots[w]` 繞過 `committedSlotLocked`（manager.go:375，全檔 22 處使用的唯一 slot 解析路徑），對「已 reserve 未 CommitCreate」的 WSID 會誤判存在並成功凍結——改為呼叫 `committedSlotLocked`，並新增對應 mutation（#4）與測試 subtest（`uncommitted_reservation_rejected`）鎖住這個分支。**(P2-b)** 已隨裁定一併同修正。**(P3-a／P3-b)** 三個測試原本只判 `err == nil`／`err != nil`，且缺「凍結前呼叫應成功」的 negative control——全部改用 `errors.Is` 斷言具名 error，並在 `TestFreezeTurnsBlocksBeginSubmit`／`TestFreezeTurnsBlocksBeginNewSessionSubmit` 各補一段凍結前成功呼叫、且以 `AcceptSubmit`／`RejectSubmit` 收尾清空 `sl.submitting`，避免 negative control 殘留的 pending submit 讓後續呼叫先撞 `ErrSubmitActive` 而遮蔽 freeze 本身的鑑別力（A 型遮蔽）；`TestFreezeTurnsMonotonicAndUnknownWSID` 拆成三個獨立 subtest（未知 WSID／uncommitted reservation／monotonic），monotonic subtest 額外補「重複凍結後 `BeginSubmit` 仍應回 `ErrTurnsFrozen`」，鎖住「monotonic 被實作成可解除」這個原本測不出的分支（mutation #5）。**漂移校正**：原版 Interfaces 段未附精確行號，本次校正並新增 `committedSlotLocked` 現 manager.go:375、`BeginSubmit` 現 manager.go:645、`BeginNewSessionSubmit` 現 manager.go:406 三個錨點；spec §4.2(2) 引用的「per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）」現況該行區間已是 `Removable`／`SlotCount`／`ProviderOf` 等其他方法（有漂移），plan 本段改直接引用 `committedSlotLocked`（manager.go:375）與 slot 既有 bool 欄位慣例（manager.go:120-144）作為施工錨點，不轉抄 spec 內已漂移的行號。**落地驗證**：已於隔離 worktree（`aeeb85f` 起、`~/scratch-worktrees/` 下、路徑不含 `tmp`）套用修好的範本，`go build`／`go vet` 通過、`go test -race ./internal/appcore/ -count=1` 基準綠燈。**`gofmt -l internal/appcore/` 於 `aeeb85f` 即有既存非零輸出**（`manager_test.go`、`manager_wsid_test.go` 兩個既有測試檔，與 Task 8 無關、非本票造成）——本票新增的範本內容本身 gofmt 乾淨；Step 4 與後續 review 不得把這兩個檔的既存 baseline 誤列為 Task 8 的回歸或未結項（比照 `internal/forge/` gofmt baseline 的處理方式，是否另開清理票由 owner 決定），5 項 mutation 逐項套用（hash 改變）→ 指定測試紅在正題 → 還原 byte-identical → 全包回綠，5/5 全殺；worktree 驗證後已移除。**production contract 不受影響（Task 8 未實作，production `.go` 檔零變更）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
