@@ -1,6 +1,7 @@
 # TaskRun／Gate 3／Forge 契約設計（B5）
 
-> 版本：rev9（2026-08-31，implementation 對照發現的 digest preimage 缺口——§5.1(6) `submitted_at` 未定值正規化，凍結為 UTC RFC3339Nano；同時澄清既有 permission 查詢 fail-closed 語意（非新增契約）；production 契約其餘部分未變）
+> 版本：rev10（2026-09-02，**錨點校正 only**——§4.2(2) 的 phase 狀態機定位誤用了 §3.6 段 `Removable()` 的行號區間，改為符號定位；**契約零變更**，引用本 spec 之 rev9 契約內容者不受影響）
+> 前版：rev9（2026-08-31，implementation 對照發現的 digest preimage 缺口——§5.1(6) `submitted_at` 未定值正規化，凍結為 UTC RFC3339Nano；同時澄清既有 permission 查詢 fail-closed 語意（非新增契約）；production 契約其餘部分未變）
 > 狀態：**design gate 通過**（2026-08-28 第八輪 Approved @ rev8／d5a18a9——歷經八輪：rev1 初版起算，7 輪 findings 全數收斂，第八輪零 P1／P2；B5 票依驗收條件即為完成，後續進 B6／C1）。rev9 為 B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示後走**窄幅 design re-review**收斂——**未重開完整 design gate、未重估**；`submitted_at` 正規化為新增 spec 級契約，permission 查詢 fail-closed 為既有 §6 語意之澄清（非新增）。
 > 來源：Pre-M4 Readiness Backlog B5（rev5 估點版）；owner 裁決 #3（session 自動綁定不可變 snapshot）、#4（GitHub-first）、#5（Gate 3 六件綁定）、#6（DomainSpec 僅 shadow／explain）
 > 範圍：**spec 級**——定義物件、生命週期與契約，不含實作；為 C1a／C1b／C1c 垂直切片與 B6 application seams 的設計依據。production 錨點以 2026-08-27 盤讀為準（rev3–rev5 新增錨點為 2026-08-28 盤讀），實作時引用前先驗 file:line 仍成立。
@@ -160,7 +161,7 @@ Resume **永遠只能回到原 TaskRun**：resume 時驗 `wsregistry.Entry` 的 
    - **同時命中兩類 cause**：採 gate-first；gate append 失敗／不確定時同上僅保留 runtime latch，**不**因 local cause 而先寫 `taskrun_stale`（保持單一排序不變式，收斂交 (4) repair）。
    - **原則凍結：凍結方向的 runtime 效果先於任何可失敗的 durable append、不以任何 append 成功為前置；放行方向（resume、Gate 3 決議、新 TaskRun 建立）必須以 durable 紀錄與重驗為前置。**任一 append 失敗或結果不確定（degraded 語意同上，evidence journal.go:23／125 同）→ freeze 維持、錯誤合併回傳呼叫端，journal 收斂延後至 (4) repair。detect-only 讀取路徑（非持鎖）不觸發本序列；偵測→凍結的收斂由 watcher 寫入路徑保證有界延遲。
 2. **Freeze latch（monotonic；rev5 補唯一 owner 與設定端鎖序）**：
-   - **唯一 owner**：App 層 per-WSID freeze state，寫入僅由持 `workflowMu` 的 freeze 序列執行（單一寫入者）；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）。set-once，於該 TaskRun 生命週期內永不清除。
+   - **唯一 owner**：App 層 per-WSID freeze state，寫入僅由持 `workflowMu` 的 freeze 序列執行（單一寫入者）；per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（`sessionPhase` 型別與 `phaseIdle`／`phaseStarting`／`phaseActive`／`phaseEnding`／`phaseResetting` 常數，現 manager.go:108-116；per-slot 狀態欄位掛在 `slot` struct 上，現 manager.go:120-144）。set-once，於該 TaskRun 生命週期內永不清除。
    - **設定端固定鎖序（rev6 改雙鎖同持——rev5 逐把釋放形狀作廢：釋放 manager 鎖後、取得 `apprMu` 前，resolveApproval 可先入 `apprMu` 見舊旗標並取出 pending，「仍被 approval 旗標擋下」不成立）**：`workflowMu`（已持）→ 取 manager 鎖 → 取 `apprMu` → 設 turn-admission 與 approval 兩旗標＋於 `apprMu` 內**原子 drain** 該 WSID 全部 pending approvals（自 pending map 取出並移除；此即 freeze 對 approval 的線性化點）→ **逆序釋放**兩鎖 → 鎖外逐筆 `resolve(false)`。latch 概念上一個、實作為兩個同源 monotonic 旗標（各在其鎖域）；設定端同持兩鎖，任何 admission／resolution 只能完整發生於 freeze 之前或之後，**無中間窗口**。**除 freeze 設定端外，禁止任何路徑同時持有 manager 鎖與 `apprMu`**（現況兩鎖無交疊持有：`SendMessage` 僅 manager 鎖 app.go:6930-6976、`resolveApproval` 僅 `apprMu` app.go:6783-6810——此不變式凍結；設定端為唯一雙持路徑、固定 manager 鎖→`apprMu` 順序，無死鎖形狀）。
    - **Deny 契約（rev6 凍結——「不可失敗」限定於記憶體操作；既有 deny helper 為 best-effort 合併錯誤形狀，app.go:7076-7080）**：不可回滾＝旗標設定＋pending drain（純記憶體，不可失敗、不可回滾）；鎖外逐筆 `resolve(false)` 為 **best-effort**——失敗回報合併錯誤＋audit event，但**不得解除 freeze、不得回滾旗標**。不得持 `apprMu` 呼叫既有 deny helper（其內部自取 `apprMu`，自我死鎖）。已 drain 的 pending 即使 resolve 失敗亦不可再被放行（已自 map 移除，後續 resolveApproval 查無此 ID）。
    - latch 為 runtime-only——重啟後於 startup repair 階段自 TaskRun journal＋detect-only currentness 重建（終態 `stale` ⇒ latch set），先於任何 resume 可能發生前完成。
@@ -280,6 +281,10 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 
 ## 修訂記錄
 
+- rev10（2026-09-02，**錨點校正 only，契約零變更**；B6 Task 8 implementation 前施工事實核對發現）：
+  - §4.2(2)「唯一 owner」條目原寫「per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）」——該行號區間實際對應 `Removable()`（即 §3.6 段同文件 line 133 正確引用的那一段），並非 phase 狀態機，屬撰寫時複製行號所致。改為符號定位：`sessionPhase` 型別與五個 phase 常數（現 manager.go:108-116）、per-slot 狀態欄位掛在 `slot` struct（現 manager.go:120-144）。
+  - §3.6 段（line 133）對 `Removable()`（manager.go:328-347）的引用**經核對仍正確**，不動。
+  - **契約零變更**：freeze latch 的 set-once／runtime-only／雙鎖同持／線性化點語意全部未動；B6 Task 8 的 plan 已於 `9343ecc` 改用穩定符號錨點，不依賴本次校正。未重開 design gate、未重估。
 - rev9（2026-08-31，B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示；走窄幅 design re-review，**未重開完整 design gate、未重估**；production 契約其餘部分未變）：
   - **新增契約**：§5.1(6) `submitted_at` 正規化——manifest 值固定為解析後時間之 UTC RFC3339Nano 表示（非 `time.RFC3339`，避免丟失 fractional seconds）；current-effective 收斂比較仍用解析後 `time.Time`；驗證須檢查欄位值等於重新格式化之 canonical value。失敗場景：未正規化時，`2026-08-28T01:00:00Z` 與 `2026-08-28T01:00:00+00:00` 表示同一時刻卻產生不同 digest，決議時重讀重算產生假 mismatch，pending Gate 3 request 被誤判失效（§4.3）。共同規則段補時間值正規化通則，並註記 §5.1(5) `required_check_manifest` 無時間值欄位、不受影響（Task 4 已完成內容不變）。
   - **澄清（非新增）**：§5.1(6) eligibility 查詢 fail-closed 語意——對 `state ∈ {APPROVED, CHANGES_REQUESTED, DISMISSED}` 之 review，permission 查無／查詢失敗不得等同 `none`，須 fail loud（沿既有 §6 語意）；permission 值須為已知列舉，未知值 fail loud；未知 review state 不得靜默跳過。
