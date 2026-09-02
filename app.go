@@ -405,6 +405,13 @@ type App struct {
 	// 在 apprMu 下與 apprPending 同步增刪（見 registerApproval／unregisterApproval）。
 	apprOrder []string
 
+	// apprFrozen：per-WSID approval 凍結旗標（B5 spec §4.2(2)——freeze latch
+	// 的 apprMu 鎖域側；monotonic set-once）。寫入唯一路徑＝
+	// freezeImplementationSession（持 workflowMu 的 freeze 序列，經
+	// manager.FreezeTurns 的 during 回呼在雙鎖同持下設定）。
+	// resolveApproval 對 allow=true 檢查；allow=false 永遠合法。
+	apprFrozen map[appcore.WSID]bool
+
 	// shutdown gate（第四輪 review P1）：shutdown 先拒新 StartSession、等已取得
 	// start ownership 的交易 accept／abort 完成，才 snapshot／teardown／Close／Take——
 	// 堵住「Take() 之後 Ensure() 重新回填 server」的窗口。
@@ -2040,6 +2047,7 @@ func (a *App) emit(name string, data any) {
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{apprPending: map[string]*pendingApproval{},
+		apprFrozen:     map[appcore.WSID]bool{},
 		assistActive:   map[string]*assistGen{},
 		preflightCache: map[string]assist.PreflightResult{},
 		evidenceActive: map[string]context.CancelFunc{}}
@@ -6826,17 +6834,57 @@ func (a *App) ResolveApproval(id string, allow bool, reason string) error {
 	return a.resolveApproval(id, allow, reason)
 }
 
+// freezeImplementationSession——B5 spec §4.2(1)(b)(2)：freeze latch 設定端。
+// caller 必須持有 workflowMu（單一寫入者）。鎖序固定：manager 鎖 →
+// apprMu（同持，FreezeTurns 的 during 窗口內取得）→ 設兩旗標＋原子 drain
+// → 逆序釋放 → 鎖外逐筆 resolve(false)（best-effort：失敗合併回傳＋不
+// 回滾旗標——旗標與 drain 是不可回滾的記憶體操作，resolve 失敗不解除
+// freeze）。除本路徑外，任何程式不得同時持有 manager 鎖與 apprMu。
+func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
+	var drained []*pendingApproval
+	err := a.manager.FreezeTurns(w, func() {
+		a.apprMu.Lock()
+		defer a.apprMu.Unlock()
+		a.apprFrozen[w] = true
+		for id, p := range a.apprPending {
+			if p.wsid != w {
+				continue
+			}
+			drained = append(drained, p)
+			delete(a.apprPending, id)
+			a.removeApprOrderLocked(id) // 與 apprPending 同鎖內同步刪除，避免 apprOrder 短暫不一致
+		}
+	})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, p := range drained {
+		if rerr := p.resolve(false, reason); rerr != nil { // 沿 denyApprovalsForRemove 鎖外逐筆呼叫的既有慣例
+			errs = append(errs, rerr)
+		}
+	}
+	return errors.Join(errs...) // 合併回報；不回滾旗標
+}
+
 func (a *App) resolveApproval(id string, allow bool, reason string) error {
 	a.apprMu.Lock()
 	p, ok := a.apprPending[id]
-	if ok {
-		delete(a.apprPending, id)
-		a.removeApprOrderLocked(id)
-	}
-	a.apprMu.Unlock()
 	if !ok {
-		return fmt.Errorf("no pending approval %s (timed out?)", id)
+		a.apprMu.Unlock()
+		return fmt.Errorf("no pending approval %s (timed out?)", id) // 既有 not-found 錯誤形狀不變
 	}
+	// B6 Task 9（B5 spec §4.2(2)(3)）：freeze latch 檢查——線性化點＝apprMu
+	// 臨界區內、p.resolve 呼叫前完成。旗標僅阻擋 allow=true；deny 永遠合
+	// 法，因此放在「找到 pending」與「自 map 移除」之間，且只在 allow 分
+	// 支短路。frozen-allow 分支刻意不移除 pending：同一筆之後仍可被 deny。
+	if allow && a.apprFrozen[p.wsid] {
+		a.apprMu.Unlock()
+		return fmt.Errorf("app: approval %s session frozen (fail closed)，僅可 deny", id)
+	}
+	delete(a.apprPending, id)
+	a.removeApprOrderLocked(id)
+	a.apprMu.Unlock()
 	err := p.resolve(allow, reason)
 	// 廣播 dismiss：dev 模式（原生視窗＋browser devserver）或多視窗下，
 	// 未按下按鈕的前端也要收掉彈窗
