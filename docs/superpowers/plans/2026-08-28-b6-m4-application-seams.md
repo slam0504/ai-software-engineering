@@ -3627,71 +3627,302 @@ git commit -m "feat(appcore): B6 Task 8——FreezeTurns monotonic 旗標＋Begi
 
 ### Task 9: App approval freeze 旗標＋雙鎖設定端＋resolveApproval 檢查
 
+**Task 9 implementation preflight erratum（owner 2026-09-02 裁示，doc-only，Task 9 尚未實作）**：本段為施工事實核對後的訂正版，修正原範本四個虛構符號（不可編譯）、drain 行為斷言缺失、目標 WSID 隔離未測、`apprOrder` 同步未測、best-effort 失敗路徑未測、`NewApp` 初始化漏列、行號漂移共七類 findings，並補完整九項 mutation 鑑別表。詳見修訂記錄 rev10 末尾 Task 9 preflight erratum 條目。
+
 **Files:**
-- Modify: `app.go`——`apprMu` 欄位群（app.go:401-406 附近加 `apprFrozen`）、`resolveApproval`（app.go:6783-6810）、新增 `freezeImplementationSession`
+- Modify: `app.go`——`apprMu` 欄位群旁加 `apprFrozen`（app.go:401 附近）、`NewApp` 加 `apprFrozen` map 初始化（現 app.go:2041-2046）、`resolveApproval`（現 app.go:6829）改旗標檢查、新增 `freezeImplementationSession`
 - Test: `app_freeze_test.go`（新檔，沿 app_*_test.go topic 檔慣例）
 
 **Interfaces:**
-- Consumes: Task 8 的 `manager.FreezeTurns(w, during)`；既有 `apprPending`／`apprOrder`（app.go:401-406）、`pendingApproval.resolve(allow bool, reason string)`（denyApprovalsForRemove 呼叫形狀，app.go:7076-7080）。
-- Produces: `func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error`——**caller 必須持 workflowMu**（單一寫入者）；內部 `manager.FreezeTurns(w, during)`，`during` 取 `apprMu` 設 `apprFrozen[w]`＋原子 drain 該 WSID pending；兩鎖釋放後鎖外逐筆 `resolve(false, reason)`（best-effort，合併錯誤回傳、不回滾旗標）。`resolveApproval` 對 `allow=true` 且 frozen 拒絕；`allow=false` 一律放行。C1a 的 STALE 觸發序列呼叫本方法。
+- Consumes: Task 8 的 `manager.FreezeTurns(w, during)`；既有 `apprPending`／`apprOrder`（app.go:401-406）、`registerApproval`（app.go:6782）、`removeApprOrderLocked`（app.go:6792）、`promotionOrder`（app.go:6803）、`pendingByID`（app.go:6812）、`pendingApproval.resolve(allow bool, reason string) error`（struct 定義 app.go:51-55；鎖外逐筆呼叫形狀沿 `denyApprovalsForRemove`，現 app.go:7114）。
+- Produces: `func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error`——**caller 必須持 workflowMu**（單一寫入者）；內部呼叫 `manager.FreezeTurns(w, during)`，`during` 在仍持 manager 鎖時取 `apprMu` 設 `apprFrozen[w]`＋於 `apprMu` 內原子 drain 該 WSID 全部 pending（自 map／`apprOrder` 移除），兩鎖逆序釋放後鎖外逐筆 `resolve(false, reason)`（best-effort：失敗合併回傳、**不回滾旗標、不放回 pending**）。`resolveApproval`（現 app.go:6829）對 `allow=true` 且該 WSID 已 frozen 一律拒絕（fail closed，pending 保留、可再 deny）；`allow=false` 不受旗標影響、永遠合法。C1a 的 STALE 觸發序列呼叫本方法。
 
-- [ ] **Step 1: 前置確認（读码，不改碼）**：`pendingApproval` struct 是否已有 WSID 歸屬欄位（`denyApprovalsForRemove` 能按 WSID 逐筆 deny，推定有——找到該欄位名）；`resolve` 的簽名與鎖外呼叫慣例（app.go:7076-7080 現行形狀）。以下步驟以欄位名 `wsid` 書寫，實作時對齊實名。
+- [ ] **Step 1: 前置確認（已核實，記錄供施工核對，不重複讀碼）**：`pendingApproval` 的 WSID 欄位名為 `wsid`（app.go:51-55 struct 定義，型別 `appcore.WSID`）；`resolveApproval` 現行三參數簽章 `(id string, allow bool, reason string) error`（app.go:6829）；查詢用 `pendingByID(id string) *pendingApproval`（app.go:6812，回指標、`nil` 表不存在）；`apprOrder` 同步由 `removeApprOrderLocked(id string)`（app.go:6792）負責，`unregisterApproval` 這個名字全 repo 不存在；既有 not-found 錯誤形狀為 `fmt.Errorf("no pending approval %s (timed out?)", id)`（app.go 現行 `resolveApproval` 內），無具名哨兵，本票不新增；`NewApp()`（app.go:2041-2046）目前只初始化 `apprPending`，`apprFrozen` map 若不同步加入初始化會在首次寫入時 nil map panic。
+
 - [ ] **Step 2: 寫 failing tests**
 
+測試建構走 **white-box**（owner 2026-09-02 裁示）：用 `newTestApp`（app_test.go:130）建 App，`mustCreate(t, a, "claude")`（app_claude_multi_test.go:26）建立 **committed WSID**，再透過 `registerApproval`（app.go:6782）直接注入一筆可觀測、可失敗的 pending approval——查詢與操作沿用既有 `pendingByID`／`promotionOrder`／`resolveApproval`。**不採用 `seedApproval`**（app_claude_multi_test.go）：它額外經真實 unix socket／broker／goroutine／timeout 建立 pending，會讓 mutation 的失敗來源不再單一，也不利於精準注入部分 resolve 失敗；`TestPartialDenyFailureKeepsDormantSlot`（app_remove_test.go）已是同款 `registerApproval` 直接注入 resolver stub 的既有先例，本票沿用同一慣例。
+
 ```go
-// app_freeze_test.go——B6 Task 9：freeze latch 的 approval 側（B5 §4.2(2)(3)）。
+// app_freeze_test.go——B6 Task 9：approval freeze latch 的 App 側（B5 spec
+// §4.2(2)(3)）。white-box in-package（package main）：owner 2026-09-02 裁示，
+// 走 mustCreate＋registerApproval 直接注入可觀測、可失敗的 resolver，不採
+// seedApproval（額外引入 host／socket／broker／goroutine／timeout，讓
+// mutation 的失敗來源不再單一）。
+
+package main
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/slam0504/sdlc-workbench/internal/appcore"
+)
+
+// resolveArgs：resolve stub 收到的一次呼叫參數，供斷言 drain／resolveApproval
+// 真的把 allow／reason 傳到底——原範本只驗 pending 已清空，測不到 p.resolve
+// 有沒有被正確呼叫（B 型斷言太弱）。
+type resolveArgs struct {
+	allow  bool
+	reason string
+}
+
+// newResolveStub 建立一個記錄呼叫參數的 pendingApproval.resolve stub；forceErr
+// 非 nil 時每次呼叫都回傳該錯誤（模擬 best-effort resolve 失敗）。calls 指標
+// 讓呼叫端事後檢視完整呼叫序列。
+func newResolveStub(forceErr error) (resolve func(bool, string) error, calls *[]resolveArgs) {
+	var got []resolveArgs
+	return func(allow bool, reason string) error {
+		got = append(got, resolveArgs{allow: allow, reason: reason})
+		return forceErr
+	}, &got
+}
+
+// startSessionWithPendingApproval：建立 committed WSID（mustCreate），並透過
+// registerApproval 直接注入一筆可觀測、可失敗的 pending approval。
+func startSessionWithPendingApproval(t *testing.T, a *App, id string, forceErr error) (appcore.WSID, *[]resolveArgs) {
+	t.Helper()
+	w := mustCreate(t, a, "claude")
+	resolve, calls := newResolveStub(forceErr)
+	a.registerApproval(id, w, "claude", resolve)
+	return w, calls
+}
+
+// assertNoApprovalDeadlock：在 goroutine 跑一個會取 apprMu 的操作，2 秒逾時未
+// 完成視為鎖洩漏。單純比對回傳值測不到死鎖，必須用逾時偵測。
+func assertNoApprovalDeadlock(t *testing.T, op func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { op(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("apprMu 疑似洩漏：後續 approval 操作卡死")
+	}
+}
+
+// TestFreezeImplementationSessionDrainsAndBlocksAllow（B5 §4.2(2)(3)）：freeze
+// 對目標 WSID 既有 pending 做原子 drain——map／apprOrder 同步移除，且真的以
+// allow=false＋正確 reason 呼叫 resolve；freeze 之後對同一 WSID 新註冊的
+// pending，allow 被擋、deny 仍合法、未知 id 維持既有 not-found 形狀不變。
 func TestFreezeImplementationSessionDrainsAndBlocksAllow(t *testing.T) {
-	a := newApprovalTestApp(t) // 沿 app_test.go 既有 approval 測試建構 helper
-	w := startSessionWithPendingApproval(t, a, "appr-1") // 造出一筆 pending
+	a, _ := newTestApp(t)
+	w, calls := startSessionWithPendingApproval(t, a, "appr-1", nil)
+
 	a.workflowMu.Lock()
 	err := a.freezeImplementationSession(w, "taskrun stale")
 	a.workflowMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// drained：pending 已不在，且已被 resolve(false)
-	if _, ok := a.lookupPendingForTest("appr-1"); ok {
-		t.Fatal("pending 應已 drain")
+
+	t.Run("pending_removed_from_map", func(t *testing.T) { // mutation #3
+		if pa := a.pendingByID("appr-1"); pa != nil {
+			t.Fatalf("pending 應已 drain：%+v", pa)
+		}
+	})
+
+	t.Run("appr_order_synced", func(t *testing.T) { // mutation #4
+		for _, id := range a.promotionOrder() {
+			if id == "appr-1" {
+				t.Fatal("drain 後 apprOrder 仍含已清空的 id（apprOrder 未同步）")
+			}
+		}
+	})
+
+	t.Run("resolve_called_with_deny_and_reason", func(t *testing.T) { // mutation #5
+		if len(*calls) != 1 {
+			t.Fatalf("drain 必須恰好呼叫一次 resolve，got %d 次", len(*calls))
+		}
+		if got := (*calls)[0]; got.allow != false || got.reason != "taskrun stale" {
+			t.Fatalf("drain 必須以 allow=false、reason=taskrun stale 呼叫 resolve，got %+v", got)
+		}
+	})
+
+	t.Run("late_pending_allow_blocked_deny_legal", func(t *testing.T) { // mutation #1
+		lateResolve, lateCalls := newResolveStub(nil)
+		a.registerApproval("appr-2-late", w, "claude", lateResolve)
+		if err := a.resolveApproval("appr-2-late", true, ""); err == nil {
+			t.Fatal("frozen 後 allow 應拒絕")
+		}
+		if len(*lateCalls) != 0 {
+			t.Fatal("allow 被拒絕時不應呼叫 resolve")
+		}
+		if err := a.resolveApproval("appr-2-late", false, "user deny"); err != nil {
+			t.Fatalf("同一筆 pending 的 deny 仍合法：%v", err)
+		}
+		if got := (*lateCalls)[0]; got.allow != false || got.reason != "user deny" {
+			t.Fatalf("deny 呼叫參數未正確傳遞：%+v", got)
+		}
+	})
+
+	t.Run("unknown_id_not_found_unchanged", func(t *testing.T) {
+		if err := a.resolveApproval("no-such-id", true, ""); err == nil ||
+			!strings.Contains(err.Error(), "no pending approval") {
+			t.Fatalf("未知 approval 應回既有 not-found 錯誤形狀，got %v", err)
+		}
+	})
+}
+
+// TestFreezeOnlyDrainsTargetWSID（B5 §4.2(2)）：drain 只能動到目標 WSID——用
+// 未凍結的第二個 WSID 當對照組，證明 freeze 不會波及其他 session 的 pending。
+func TestFreezeOnlyDrainsTargetWSID(t *testing.T) {
+	a, _ := newTestApp(t)
+	w1, calls1 := startSessionWithPendingApproval(t, a, "appr-w1", nil)
+	_, calls2 := startSessionWithPendingApproval(t, a, "appr-w2", nil)
+
+	a.workflowMu.Lock()
+	err := a.freezeImplementationSession(w1, "taskrun stale")
+	a.workflowMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// rev2：以真實登記的 late pending 測 frozen（不存在的 ID 走 not-found
-	// 路徑，測不到旗標）——模擬 latch 設定前已 admit 的 turn 之後續 approval
-	registerLatePending(t, a, w, "appr-2-late")
-	if err := a.resolveApprovalForTest("appr-2-late", true); err == nil {
-		t.Fatal("frozen 後 allow 應拒絕")
+
+	// mutation #2：drain 迴圈的 `p.wsid != w` 過濾被拿掉——對照組的 pending
+	// 也被誤 drain。
+	if pa := a.pendingByID("appr-w2"); pa == nil {
+		t.Fatal("未凍結的對照組 WSID 的 pending 不應被 drain")
 	}
-	if err := a.resolveApprovalForTest("appr-2-late", false); err != nil {
-		t.Fatalf("同一筆 pending 的 deny 仍合法：%v", err)
+	if len(*calls2) != 0 {
+		t.Fatal("未凍結的對照組 WSID 的 pending 不應被 resolve")
 	}
-	// 不存在的 ID：維持既有 not-found 行為（不因 frozen 改變錯誤形狀）
-	if err := a.resolveApprovalForTest("no-such-id", true); err == nil {
-		t.Fatal("未知 approval 應回 not-found 錯誤")
+	// 目標 WSID 仍照常被 drain（證明本測試量到的是「隔離」而非「freeze 整
+	// 個失效」）。
+	if pa := a.pendingByID("appr-w1"); pa != nil {
+		t.Fatal("目標 WSID 的 pending 應已 drain")
+	}
+	if len(*calls1) != 1 {
+		t.Fatalf("目標 WSID 應被 resolve 一次，got %d", len(*calls1))
 	}
 }
 
+// TestResolveApprovalDenyAlwaysLegalWhenFrozen（B5 §4.2(3)）：freeze latch
+// 僅阻擋 allow=true；deny 永遠合法、不受旗標阻擋。
 func TestResolveApprovalDenyAlwaysLegalWhenFrozen(t *testing.T) {
-	a := newApprovalTestApp(t)
-	w := startSessionWithPendingApproval(t, a, "appr-1")
-	// 凍結但故意留一筆晚註冊的 pending（模擬 latch 設定前已 admit 的 turn 之後續 approval）
+	a, _ := newTestApp(t)
+	w, _ := startSessionWithPendingApproval(t, a, "appr-1", nil)
+
+	a.workflowMu.Lock()
+	err := a.freezeImplementationSession(w, "stale")
+	a.workflowMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolve, calls := newResolveStub(nil)
+	a.registerApproval("appr-late", w, "claude", resolve)
+
+	// mutation #8：`if allow && a.apprFrozen[p.wsid]` 的 `&&` 被改成 `||`——
+	// deny（allow=false）在 frozen WSID 上也會被誤擋。
+	if err := a.resolveApproval("appr-late", false, "user deny"); err != nil {
+		t.Fatalf("deny 永遠合法（B5 §4.2(3)）：%v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0].allow != false {
+		t.Fatalf("deny 未正確送達 resolve：%+v", *calls)
+	}
+}
+
+// TestFrozenAllowLeavesLockAndPendingUsable（B5 §4.2(3)）：frozen-allow 分支
+// 拒絕時（1）不移除 pending——同筆之後仍可 deny；（2）apprMu 不得洩漏。
+func TestFrozenAllowLeavesLockAndPendingUsable(t *testing.T) {
+	a, _ := newTestApp(t)
+	w, _ := startSessionWithPendingApproval(t, a, "appr-1", nil)
+
 	a.workflowMu.Lock()
 	_ = a.freezeImplementationSession(w, "stale")
 	a.workflowMu.Unlock()
-	registerLatePending(t, a, w, "appr-late")
-	if err := a.resolveApprovalForTest("appr-late", false); err != nil {
-		t.Fatalf("deny 永遠合法（B5 §4.2(3)）：%v", err)
+
+	resolve, calls := newResolveStub(nil)
+	a.registerApproval("appr-x", w, "claude", resolve)
+	if err := a.resolveApproval("appr-x", true, ""); err == nil {
+		t.Fatal("frozen allow 應拒絕")
 	}
-	registerLatePending(t, a, w, "appr-late2") // rev2：真實登記後再測 allow 被擋
-	if err := a.resolveApprovalForTest("appr-late2", true); err == nil {
-		t.Fatal("allow 應被旗標擋下")
+	if len(*calls) != 0 {
+		t.Fatal("allow 被拒絕時不應呼叫 resolve")
+	}
+
+	// mutation #9：frozen-allow 分支漏 Unlock()——apprMu 洩漏，任何後續
+	// approval 操作（含同筆 deny）都會卡死。用 goroutine＋逾時偵測，避免鎖
+	// 真的洩漏時整條測試卡死到全域 test timeout 才失敗。
+	var denyErr error
+	assertNoApprovalDeadlock(t, func() {
+		denyErr = a.resolveApproval("appr-x", false, "later deny")
+	})
+	if denyErr != nil {
+		t.Fatalf("同筆 deny 應成功：%v", denyErr)
+	}
+}
+
+// TestResolveApprovalNotFoundDoesNotLeakLock：not-found 分支同樣須解鎖——與
+// frozen-allow 分支是不同的早退路徑，個別可能各自漏 Unlock，須分開驗證。
+func TestResolveApprovalNotFoundDoesNotLeakLock(t *testing.T) {
+	a, _ := newTestApp(t)
+	w := mustCreate(t, a, "claude") // 先建好 WSID：mustCreate 會呼叫 t.Fatalf，
+	// *testing.T 的 Fatal／FailNow 只能從跑該測試的 goroutine 呼叫，不能擺進下面
+	// 的逾時保護 goroutine 內。
+
+	if err := a.resolveApproval("never-registered", true, ""); err == nil {
+		t.Fatal("未知 approval 應回 not-found 錯誤")
+	}
+
+	// mutation #7：resolveApproval 的 not-found 分支漏 a.apprMu.Unlock()——
+	// apprMu 洩漏，後續任何取 apprMu 的操作（含 registerApproval 本身）都會
+	// 卡死。整段都要包進逾時偵測，不能只包最後一次 resolveApproval——否則
+	// 鎖真的洩漏時，卡死會先發生在 registerApproval，逾時偵測完全量不到。
+	// registerApproval 不呼叫 t.Fatal，可安全在背景 goroutine 執行。
+	resolve, calls := newResolveStub(nil)
+	assertNoApprovalDeadlock(t, func() {
+		a.registerApproval("appr-1", w, "claude", resolve)
+		_ = a.resolveApproval("appr-1", false, "ok")
+	})
+	if len(*calls) != 1 {
+		t.Fatal("鎖未洩漏時，deny 應正常送達 resolve")
+	}
+}
+
+// TestFreezeDrainBestEffortFailureIsJoinedWithoutRollback（B5 §4.2(2)：deny
+// 契約——不可回滾＝旗標＋drain；resolve(false) best-effort，失敗合併回傳但
+// 不解除 freeze、不放回 pending）。
+func TestFreezeDrainBestEffortFailureIsJoinedWithoutRollback(t *testing.T) {
+	a, _ := newTestApp(t)
+	injected := errors.New("resolve failed: injected test failure")
+	w, calls := startSessionWithPendingApproval(t, a, "appr-1", injected)
+
+	a.workflowMu.Lock()
+	err := a.freezeImplementationSession(w, "taskrun stale")
+	a.workflowMu.Unlock()
+
+	// mutation #6：errors.Join(errs...) 被改成永遠回 nil——best-effort 失敗
+	// 被吞掉。
+	if err == nil || !strings.Contains(err.Error(), "injected test failure") {
+		t.Fatalf("best-effort resolve 失敗必須合併回傳，got %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("即使失敗，drain 仍必須嘗試呼叫一次 resolve，got %d", len(*calls))
+	}
+
+	// 不可回滾：drain（map／apprOrder 已清空）與旗標設定即使 resolve 失敗也
+	// 不得回滾——pending 不得被放回、allow 仍必須被擋。
+	if pa := a.pendingByID("appr-1"); pa != nil {
+		t.Fatal("resolve 失敗不得讓 pending 被放回 map")
+	}
+	resolve2, calls2 := newResolveStub(nil)
+	a.registerApproval("appr-2", w, "claude", resolve2)
+	if err := a.resolveApproval("appr-2", true, ""); err == nil {
+		t.Fatal("resolve 失敗不得讓旗標被回滾——同 WSID 後續 allow 仍應被擋")
+	}
+	if len(*calls2) != 0 {
+		t.Fatal("allow 被擋時不應呼叫 resolve")
 	}
 }
 ```
 
-測試 helper（`newApprovalTestApp`／`startSessionWithPendingApproval`／`lookupPendingForTest`／`resolveApprovalForTest`／`registerLatePending`）沿 app_test.go 既有 approval 流程測試的建構方式抽取；white-box in-package（`package main` 測試檔）可直接操作 `apprPending`。
-
-- [ ] **Step 3: 跑 `go test -race -run 'Freeze|ResolveApprovalDeny' -count=1 .`，預期 FAIL**
+- [ ] **Step 3: 跑 `go test -race -run 'Freeze|Frozen|ResolveApproval' -count=1 .`，預期 FAIL**（regex 須含 `Frozen`——`TestFrozenAllowLeavesLockAndPendingUsable` 只有 `Frozen` 不含 `Freeze`，只用 `Freeze|ResolveApproval` 會漏跑）
 - [ ] **Step 4: 實作**
 
-App struct（apprMu 欄位群旁）加：
+App struct（`apprMu`／`apprPending`／`apprOrder` 欄位群旁，app.go:401-406 附近）加：
 
 ```go
 	// apprFrozen：per-WSID approval 凍結旗標（B5 spec §4.2(2)——freeze latch
@@ -3699,12 +3930,22 @@ App struct（apprMu 欄位群旁）加：
 	// freezeImplementationSession（持 workflowMu 的 freeze 序列，經
 	// manager.FreezeTurns 的 during 回呼在雙鎖同持下設定）。
 	// resolveApproval 對 allow=true 檢查；allow=false 永遠合法。
-	// key 用 appcore.WSID（rev2 修——rev1 的 map[string]bool 與
-	// appcore.WSID 索引不相容，無法編譯）。
 	apprFrozen map[appcore.WSID]bool
 ```
 
-（`NewApp` 初始化 `apprFrozen: map[appcore.WSID]bool{}`，沿 apprPending 慣例。）
+`NewApp()` 加入 `apprFrozen` 初始化（沿 `apprPending` 慣例，避免 nil map 寫入 panic）：
+
+```go
+func NewApp() *App {
+	return &App{apprPending: map[string]*pendingApproval{},
+		apprFrozen:     map[appcore.WSID]bool{},
+		assistActive:   map[string]*assistGen{},
+		preflightCache: map[string]assist.PreflightResult{},
+		evidenceActive: map[string]context.CancelFunc{}}
+}
+```
+
+新增 `freezeImplementationSession`：
 
 ```go
 // freezeImplementationSession——B5 spec §4.2(1)(b)(2)：freeze latch 設定端。
@@ -3720,12 +3961,12 @@ func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
 		defer a.apprMu.Unlock()
 		a.apprFrozen[w] = true
 		for id, p := range a.apprPending {
-			if p.wsid != w { // rev3：wsid 已是 appcore.WSID，直接比較，不做 string 轉換
+			if p.wsid != w {
 				continue
 			}
 			drained = append(drained, p)
 			delete(a.apprPending, id)
-			a.removeApprOrderLocked(id) // 沿 unregisterApproval 的 apprOrder 同步慣例
+			a.removeApprOrderLocked(id) // 與 apprPending 同鎖內同步刪除，避免 apprOrder 短暫不一致
 		}
 	})
 	if err != nil {
@@ -3733,7 +3974,7 @@ func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
 	}
 	var errs []error
 	for _, p := range drained {
-		if rerr := p.resolve(false, reason); rerr != nil { // 沿 denyApprovalsForRemove 形狀
+		if rerr := p.resolve(false, reason); rerr != nil { // 沿 denyApprovalsForRemove 鎖外逐筆呼叫的既有慣例
 			errs = append(errs, rerr)
 		}
 	}
@@ -3741,59 +3982,70 @@ func (a *App) freezeImplementationSession(w appcore.WSID, reason string) error {
 }
 ```
 
-`resolveApproval`（app.go:6783-6810）在 `apprMu` 臨界區內、**先處理 `!ok` 再檢查旗標**（rev2 修 nil dereference；**rev3 修鎖洩漏**——production 以手動 `Lock`／`Unlock` 管理 `apprMu`，早退分支必須先 `Unlock`，否則之後所有 approval 操作死鎖）：
+`resolveApproval`（現 app.go:6829）改為先處理 `!ok` 早退、再檢查旗標——兩個早退分支都必須手動 `Unlock`（本檔對 `apprMu` 一律手動 `Lock`／`Unlock` 管理，早退忘記解鎖會讓之後所有 approval 操作死鎖）；frozen-allow 分支刻意不移除 pending，讓同筆之後仍可被 deny 收尾：
 
 ```go
+func (a *App) resolveApproval(id string, allow bool, reason string) error {
 	a.apprMu.Lock()
 	p, ok := a.apprPending[id]
 	if !ok {
-		a.apprMu.Unlock() // rev3：手動鎖管理——早退必先解鎖
-		return errNotFoundExisting // 沿既有 not-found 錯誤路徑（原碼行為不變）
+		a.apprMu.Unlock()
+		return fmt.Errorf("no pending approval %s (timed out?)", id) // 既有 not-found 錯誤形狀不變
 	}
-	if allow && a.apprFrozen[p.wsid] { // rev3：p.wsid 已是 appcore.WSID，直接索引
-		a.apprMu.Unlock() // 早退解鎖；pending 保留在 map——同筆之後仍可 deny
-		return fmt.Errorf("approval %s：session 已凍結（fail closed），僅可 deny", id)
+	// B6 Task 9（B5 spec §4.2(2)(3)）：freeze latch 檢查——線性化點＝apprMu
+	// 臨界區內、p.resolve 呼叫前完成。旗標僅阻擋 allow=true；deny 永遠合
+	// 法，因此放在「找到 pending」與「自 map 移除」之間，且只在 allow 分
+	// 支短路。frozen-allow 分支刻意不移除 pending：同一筆之後仍可被 deny。
+	if allow && a.apprFrozen[p.wsid] {
+		a.apprMu.Unlock()
+		return fmt.Errorf("app: approval %s session frozen (fail closed)，僅可 deny", id)
 	}
-	// ……以下沿既有流程（自 map 移除、unregister、Unlock、鎖外 p.resolve）……
-```
-
-（檢查位置＝線性化點：`apprMu` 內、`p.resolve` 呼叫前——B5 §4.2(3)；`allow=false` 不檢查。frozen-allow 分支**不移除 pending**——同筆 deny 之後仍可完成。）
-
-補鎖不洩漏回歸測試：
-
-```go
-func TestFrozenAllowLeavesLockAndPendingUsable(t *testing.T) {
-	a := newApprovalTestApp(t)
-	w := startSessionWithPendingApproval(t, a, "appr-1")
-	a.workflowMu.Lock()
-	_ = a.freezeImplementationSession(w, "stale")
-	a.workflowMu.Unlock()
-	registerLatePending(t, a, w, "appr-x")
-	if err := a.resolveApprovalForTest("appr-x", true); err == nil {
-		t.Fatal("frozen allow 應拒絕")
-	}
-	// rev3：allow 失敗後——(1) 同筆 deny 仍可完成（pending 未被移除、鎖未洩漏）
-	if err := a.resolveApprovalForTest("appr-x", false); err != nil {
-		t.Fatalf("同筆 deny 應成功：%v", err)
-	}
-	// (2) 其他 approval 操作不卡死（apprMu 未洩漏）——not-found 路徑立即返回
-	done := make(chan struct{})
-	go func() { _ = a.resolveApprovalForTest("no-such", false); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("apprMu 疑似洩漏：後續 approval 操作卡死")
-	}
+	delete(a.apprPending, id)
+	a.removeApprOrderLocked(id)
+	a.apprMu.Unlock()
+	err := p.resolve(allow, reason)
+	// 廣播 dismiss：dev 模式（原生視窗＋browser devserver）或多視窗下，
+	// 未按下按鈕的前端也要收掉彈窗
+	// reason 一併帶出：§3.6.4 凍結的六種「恢復原釘選」觸發裡，remove 與 shutdown
+	// 都是經 denyApprovals → 這條 resolved 路徑出去的，只看 cause 分不出來。
+	a.emit("approval:dismiss", map[string]any{
+		"id": id, "wsid": string(p.wsid), "cause": "resolved", "reason": reason})
+	return err
 }
 ```
 
-- [ ] **Step 5: 跑 Step 3 指令預期 PASS；`go test -race -count=1 .` root 包全綠（特別確認既有 approval／remove 測試零回歸——`denyApprovalsForRemove` 不受影響：它走自己的 deny 路徑且 deny 永遠合法）**
+- [ ] **Step 5: 跑 Step 3 指令預期 PASS；`go test -race -count=1 .` root 包全綠（特別確認既有 approval／remove 測試零回歸——`denyApprovalsForRemove` 不受影響：它逐筆重新取 `apprMu` 呼叫 `resolveApproval`，deny 永遠合法不受本票影響）**
+- [ ] **Step 5a: mutation 鑑別表逐項執行（9/9；owner 2026-09-02 裁示——雙鎖設定、目標 WSID drain、FIFO order、allow/deny 分流、pending 保留、鎖釋放、best-effort 與不回滾九項皆須植入本票新增或修改的 production code，依 §6.7 全部逐項執行，不得抽驗）**
+
+下方「Mutation 鑑別表」的 9 項全部執行。每一項都必須完成以下四步並留下證據，缺任一步即該項未通過：
+
+1. **套用**：證明 mutation diff 已實際落到 production 檔（`git diff`／`diff` 顯示變更存在）且檔案內容 hash 已改變（變異前後 `shasum`／`sha256sum` 不同）。
+2. **轉紅**：表中指定的測試（含 subtest 名）確實 FAIL，且**紅在正題**——失敗訊息必須是該測試自己的斷言訊息，不是撞到其他 guard、或由其他測試連帶失敗。
+3. **還原**：還原後檔案 hash 與變異前一致（byte-identical），證明無殘留。
+4. **轉綠**：`go test -race -count=1 .` root 包全綠。
+
 - [ ] **Step 6: Commit**
 
 ```bash
 git add app.go app_freeze_test.go
 git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定端＋resolveApproval fail-closed 檢查（B5 §4.2(2)(3)）"
 ```
+
+**Mutation 鑑別表（逐條一對一，preflight 補完）**：
+
+| # | Mutation（植入處／情境；本票新增或修改的行） | 預期紅燈斷言 | 對應測試 |
+|---|---|---|---|
+| 1 | `freezeImplementationSession` 內 `a.apprFrozen[w] = true` 被移除 | frozen WSID 後新註冊的 pending，allow 應被拒絕（改成放行） | `TestFreezeImplementationSessionDrainsAndBlocksAllow/late_pending_allow_blocked_deny_legal` |
+| 2 | `freezeImplementationSession` 的 drain 迴圈中 `if p.wsid != w { continue }` 過濾被移除 | 未凍結的對照組 WSID 的 pending 不應被 drain／resolve | `TestFreezeOnlyDrainsTargetWSID` |
+| 3 | `freezeImplementationSession` 的 drain 迴圈中 `delete(a.apprPending, id)` 被移除 | drain 後 `pendingByID` 應查無該 id | `TestFreezeImplementationSessionDrainsAndBlocksAllow/pending_removed_from_map` |
+| 4 | `freezeImplementationSession` 的 drain 迴圈中 `a.removeApprOrderLocked(id)` 被移除 | drain 後 `promotionOrder()` 應已移除該 id | `TestFreezeImplementationSessionDrainsAndBlocksAllow/appr_order_synced` |
+| 5 | `freezeImplementationSession` 鎖外迴圈的 `p.resolve(false, reason)` 呼叫被移除、或 `allow` 參數改成 `true` | drain 必須恰好呼叫一次 resolve，且 `allow=false`、`reason` 為傳入值 | `TestFreezeImplementationSessionDrainsAndBlocksAllow/resolve_called_with_deny_and_reason` |
+| 6 | `freezeImplementationSession` 尾端 `return errors.Join(errs...)` 改成永遠回 `nil` | 注入 resolve 失敗後，`freezeImplementationSession` 必須回傳合併後的非 nil 錯誤（改成吞掉失敗） | `TestFreezeDrainBestEffortFailureIsJoinedWithoutRollback` |
+| 7 | `resolveApproval` 新增的 `if !ok { a.apprMu.Unlock(); ... }` 分支漏 `a.apprMu.Unlock()`（鎖洩漏） | 未知 id 觸發 not-found 後，後續任何 approval 操作（例如對另一筆真實 pending 的 deny）不得卡死 | `TestResolveApprovalNotFoundDoesNotLeakLock` |
+| 8 | `resolveApproval` 新增的 `if allow && a.apprFrozen[p.wsid]` 的 `&&` 被改成 `||` | frozen WSID 上的 deny（`allow=false`）仍應合法完成（改成被誤擋） | `TestResolveApprovalDenyAlwaysLegalWhenFrozen` |
+| 9 | `resolveApproval` 新增的 frozen-allow 分支（`if allow && a.apprFrozen[p.wsid] { ... }`）漏 `a.apprMu.Unlock()`（鎖洩漏） | frozen allow 被拒絕後，同一筆 pending 的後續 deny 不得卡死、且應成功 | `TestFrozenAllowLeavesLockAndPendingUsable` |
+
+**§6.7 變異目標校正**：#7／#8／#9 三項變異點都落在本票對既有共用函式 `resolveApproval` **新增或修改**的那幾行（`!ok` 早退分支的 `Unlock`、旗標檢查條件式、frozen-allow 早退分支的 `Unlock`）；`resolveApproval` 原有的 map 查找／刪除、`p.resolve` 鎖外呼叫、`approval:dismiss` emit 邏輯屬既有共用碼，本表不對其變異。
 
 ---
 
@@ -3849,6 +4101,7 @@ git commit -m "feat(app): B6 Task 9——approval freeze 旗標＋雙鎖設定�
   - **Task 6b implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 6b 尚未實作）**：實作前施工事實核對發現 Task 6b 段有一個結構性缺口與多處漂移，owner 裁示一次修完。**(A)** `project.go` 的狀態機改動原本只有散文、無程式碼範本，而它承載 Expired 只由 pending 進入、終態 precedence、`TerminalCause` 更新時機——補為採 `changed` 旗標的完整可重放範本（stale/superseded 不得覆寫 Rejected 與 Expired、同值不算改變；expired 僅 Pending→Expired；只有 `changed` 才寫 `TerminalCause`；Rejected 仍只由 `approval_record` 產生、原因留在 `Record.Reason`）；`types.go` 的 `Expired` 常數與 `GateEntry.TerminalCause`、`GateEntryDTO`／`gateEntriesToDTO` 的欄位映射一併補具體範本行。**(B)** 同值投影窮舉：`List` 自動帶、`ListDetectOnly` 手動補、`Lookup` 刻意不擴充（四個消費端皆查 gate2 record 且只用 `State` 判有效性，不顯示失效原因）——明文記成決定，避免下一輪被誤判為漏補；既有狀態判定全為對 `Active` 的正向比對、無窮舉 `switch`，新增 `Expired` 相容；前端 `resolveState` 對未知 key 原樣回傳，badge 樣式與 i18n 歸 **C1c**。**(C)** 漂移校正並改以函式／符號名為主要定位、行號只作當前輔助（`PrepareDecision`／`CommitDecision` 的 pending 判定現分別在 line 99／144，非同段 143-146；`gateDecide` 現 line 5829、`svc.PrepareDecision` 呼叫現 line 5852；`newGateTestApp`／`terminalCauseOf`／`journalTransitionCause` 等既有引用改對齊實際可用的 `newTestAppGit`，`submitGate3Request`／`assertGateState` 兩個測試 helper 補完整可編譯內容）；移除一組空的 ` ```go ``` ` code fence。**(D)** 補 16 項 mutation 鑑別表（Step 7a；preflight2 修正前初版誤植 14 項，見本條末尾追記），逐項標明對應鑑別測試，含新增的 `internal/gate/project_test.go` 直接投影測試（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a）。**(E)** mutation #12（`ExpirePending` 失敗時吞掉 `xerr`）補可編譯測試範本 `TestGateDecideExpirePendingAppendFailureIsNotSwallowed`（Step 5b）——在 `VerifyTaskRun` closure 內先關閉 `a.gateJournal`，使 mismatch 之後的 `ExpirePending` append 因檔案已關閉而確定性失敗；另補 mutation #16（preflight2 重新編號前為 #14；DTO 未映射 `TerminalCause`）測試 `TestGateEntryDTOMapsTerminalCause`。Files 清單同步加入 `internal/gate/project_test.go`。**(F)** 範本落地驗證時另發現 Step 5 的 `TestGateDecideGate3MismatchExpiresPending` 在 `a.ensureGate()` 從未跑過的情況下對 `a.gateReg`（nil map）賦值，會 panic——補 `a.ensureGate()` 前置呼叫（與 Step 5a／5b 既有寫法一致）。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、未重開完整 plan gate、估點未變（0.35 pt）**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight-report.md`。**preflight2 修正（owner 2026-08-31 design re-review 後裁示，doc-only，Task 6b 仍未實作）**：**(A2)** mutation 鑑別表第 4 列「重複 stale／重複 superseded／重複 expired 不得覆寫既有 cause」塞了三個情境，但範本測試只有 `expired→expired` 一個——`changed` 旗標裡「排除自身值」的 `e.State != Stale`／`e.State != Superseded` 兩個子句因此無測試守護。補 `Stale→Stale`、`Superseded→Superseded` 兩個獨立 subtest（`TestProjectExpiredAndTerminalCausePrecedence`，Step 1a），原第 4 列拆成三列一對一對應，mutation 表**由 14 項改為 16 項並全表重新編號**（原 #5-14 依序遞補為 #7-16；本條前段 (D)(E) 提及的舊編號已同步更正）；檢查其餘各列未發現同型「一列多情境、測試只涵蓋其中一個」問題。**(B2)** brief 正典化（owner 裁定）：契約正典＝committed plan；Task 6b 派工正典＝`task-6b-brief.md`（須與 plan 本 Task 6b 段逐字一致）；`task-6-brief.md` 內的 Task 6b 段降為歷史合併快照、非正典、不得用於 Task 6b implementation（該檔案本身及其 Task 6 段不受影響，仍為已驗收的 Task 6 artifact）。往後一致性驗證只比較 plan Task 6b 段 ↔ `task-6b-brief.md`，不再以 `task-6-brief.md` 當同步證據。**production contract 不受影響（Task 6b 未實作）、spec §4.3／backlog 不變、plan 維持 rev10、估點未變（0.35 pt）**。詳見 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-6b-preflight2-report.md`。
   - **Task 7 implementation preflight erratum（owner 2026-08-31 裁示，doc-only，Task 7 尚未實作）**：Task 7 沒有 brief，plan 是唯一可重放來源，實作前施工事實核對發現範本自相矛盾、假 helper 與失敗注入 placeholder，owner 裁示一次修完。**(A)** 漂移校正四項：①Interfaces 段原寫「Consumes: 既有 `mutate`」，但 Step 3 註解明寫「不能用 mutate（其 fn 看不到其他 entries）」，自相矛盾——改為「沿 `mutate`（現 store.go:359）骨架展開但不呼叫」；②Step 1 範本用的 `newTestStore(t)` 該包不存在——改用實際慣例 `openStore(t)`（回 `(*Store, string)`，fsync_test.go:53）或 `Open(filepath.Join(t.TempDir(), "ws.json"))`；③`hook func(fsyncStep) error` 行號原標「store.go:102-127」有漂移——改為「hook 欄位現 store.go:113、注入點 140-141、`fsyncStep` 常數 52-60、注入器為 `ForceStepHookForTest` ＋ `failAt` helper（fsync_test.go:44）」；④`persistOrRollback` 行號原有兩處寫法（「262-284」與「274」）——統一為現 store.go:274。全部改以「函式／符號名＋（現 line N）」形式定位，降低未來再漂移的機率。**(B)** 補完整可編譯的 committed 測試範本（原為散文 placeholder）：空 `taskRunID`／空 `snapshotDigest` 各自獨立負向案例；partial pair 兩方向（僅 TaskRunID／僅 SnapshotDigest，經 `Put` 繞過 `SetTaskRunBinding` 造出）；write-once 兩形狀（同 TaskRun 不同 digest 拒絕、不同 TaskRun 重綁拒絕，原範本只有同值冪等）；跨 WSID 測資改用「目標乾淨未綁＋同 TaskRun 不同 digest」（避免掩蓋「比較整個 pair」這種錯誤實作，因為跨 WSID 掃描排在「目標已綁」guard 之後，若目標已綁會先撞錯的 guard）；冪等不落盤（注入 `stepWrite` 錯誤仍應成功，證明冪等路徑未呼叫 persist）；reopen round-trip 與舊檔零遷移各自完整程式碼；failure matrix 兩列改寫為使用 `failAt`／`diskEntry`／`Uncertain()` 的可編譯測試（rename 前失敗回滾且不 latch、dir-sync 失敗 latch 且不回滾＋磁碟核對新值）；latch 枚舉表（`TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites`）新增 `SetTaskRunBinding` 一列，證明新 mutator 未繞過既有 latch——Files 清單同步加入 `internal/wsregistry/fsync_test.go`。**(C)** 補 14 項 mutation 鑑別表，逐條一對一對應到上述測試，並在表格與正文中明寫「跨 WSID mutation 測資不得先撞『目標已綁』guard」這條測資陷阱；「跨 WSID 掃描與寫入同鎖」本輪以程式結構（單一 `s.mu` 臨界區可讀碼證明）＋`-race` 驗證為準，明文排除機率性 concurrency mutation（若未來要另外宣稱鑑別力，須新設確定性觀測點，例如比照 `SetLayout` 的 `compareHook` 慣例）。**不建立 `task-7-brief.md`**（owner 明訂，避免新增第二來源——Task 7 目前 plan 是唯一可重放來源）。**production contract 不受影響（Task 7 未實作）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。詳見 preflight 報告 `.superpowers/sdd/2026-08-28-b6-m4-application-seams/task-7-preflight-report.md`。**design re-review 修正（owner 2026-09-01 裁示，doc-only，Task 7 仍未實作）**：獨立 re-review 對 `9396b13` 判 FAIL，三項一次修完——**(F1，阻擋項)** Task 7 的 checklist 只有 Step 1-5，14 項 mutation 鑑別表是 Step 5 之後的純敘述區塊，沒有任何 checkbox 要求 implementation 階段執行它（對照 Task 6b 有 Step 7a）；補 **Step 4a**，明訂 14/14 逐項執行、含第 14 項（繞過 latch，目前唯一已知的證據缺口），每項須完成「套用並證明 hash 已改變 → 指定測試因自己的斷言轉紅 → 還原後 hash byte-identical → 全包測試轉綠」四步，owner 明確否決比照 Task 6b Step 7a 只要求「可執行」與分級抽驗兩種較弱門檻。**(F2)** 本 commit 自己新增的 B7 子測試註解「沿 fsync_test.go:229 起既有斷言形狀」行號有誤——229 是 `failAt(s, stepDirSync, …)` 注入行，形狀相符的「(2) 不回滾」斷言實際在 243-245；改為符號名＋現行行號，與本 commit 宣稱的定位慣例一致。**(F3)** `TestSetTaskRunBindingCrossWSIDCardinality/tombstoned_occupancy_not_transferable` 原本只判 `err == nil`，補上與相鄰 subtest 對稱的「拒絕後 w3 不得被寫入」狀態斷言。**production contract 不受影響（Task 7 未實作）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**；Task 7 implementation base 改綁本次 plan-only commit，`9396b13` 不再作為 base。**implementation 中斷回饋修正（owner 2026-09-01 裁示，doc-only，Task 7 實作暫停中、尚未 commit）**：Step 4a 逐項執行進行到 mutation #5 時**該項存活**，實作者依 fail-loud 規則停手。根因：`taskrun_only` 測資的 `old.TaskRunID` 非空，partial-pair guard 被移除後會被緊接著的「已綁定」guard 順帶擋下而仍回錯，而該 subtest 只判 `err == nil`，分不出紅在正題或紅在別的 guard（同型於 Task 6 Crockford erratum 記過的「訊息斷言 vs 僅 `err != nil`」缺口）。owner 裁示暫停實作、先唯讀掃描 #6-#14 同型問題、一次修入 plan 後重新 gate。掃描結果與修正：**(1) #5／#6** 兩個 partial-pair subtest 改為斷言錯誤訊息含 `partial pair`（#5 是已確認缺陷；#6 本方向無遮蔽路徑，屬對稱防禦性補強），表格兩列同步註明遮蔽路徑之有無。**(2) #8／#9 mutation 標籤對調**——凍結的冪等條件為 `old.TaskRunID == taskRunID && old.SnapshotDigest == snapshotDigest`，其單欄位 mutation 中「只比對 TaskRunID」會被 `same_taskrun_different_digest_rejected` 抓到、「只比對 digest」會被 `different_taskrun_rebind_rejected` 抓到，與原表格標籤相反；兩列的括號症狀描述與對應測試本身正確，僅前導標籤寫反，故只對調標籤、不動症狀與測試歸屬。**(3) #9 測資缺陷**：`different_taskrun_rebind_rejected` 原用 `sha256:cc`，使 TaskRunID 與 digest **同時**不同，兩種單欄位比較 mutation 都會因被保留的欄位也不相等而落入拒絕分支、雙雙存活；改為 `sha256:aa`（與既有值相同）以孤立目標欄位，並在範本與表格加註測資陷阱。此為第三種失效形狀——**測資未隔離目標欄位**，強化斷言救不了（mutant 命中同一行 `return`、訊息逐字相同），只能改測資。**(4)** #7 的鑑別力成立但表格括號描述不精確，一併校正：原寫「並可見 mutation 存活於 `TestSetTaskRunBindingIdempotentDoesNotPersist`（會誤觸 persist）」——實際上冪等短路被移除後，函式會提前落入「已綁定、拒絕重綁」分支回錯，**不會進入 `persistOrRollback`**，注入的 `stepWrite` 也未被觸發；該測試是因收到非預期錯誤而紅，主證據仍為 `TestSetTaskRunBindingWriteOnce` 的冪等段。與 (2) 的 #8／#9 標籤同屬「表格文字與實際機制不符」，故同輪一併修完。**(5)** #10-#14 及 #1-#4 經逐列讀碼推導鑑別力成立，未修改；#1-#4 的既有紅燈證據不受本次修正影響（修正只觸及 `PartialPairCorruption` 與 `WriteOnce` 兩個測試函式，與 #1-#4 對應測試不共用測資或 Store 實例），予以保留。**production contract 不受影響（分支語意 (a)-(d) 與錯誤訊息維持凍結、`store.go` 範本零變更）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**；本 commit 只 stage plan，實作中的三個 Go 檔維持未提交。re-gate 通過後，契約基準與 implementation review base 改綁本次 plan-only commit。
   - **Task 8 implementation preflight erratum（owner 2026-09-02 裁示，doc-only，Task 8 尚未實作）**：實作前唯讀 preflight 判定原範本施工依據不能直接用，owner 裁示兩項決定＋七項 findings 一次修完。**裁定一（具名 error）**：新增 `ErrTurnsFrozen` 哨兵（沿本檔既有 16 個 `var ErrXxx = errors.New(...)` 慣例），`BeginSubmit`／`BeginNewSessionSubmit` 皆以 `%w` 包裝並保留 WSID 脈絡；測試改用 `errors.Is`；未知 WSID 維持不同錯誤（走 `committedSlotLocked` 回 `ErrSessionNotFound`），修正原版 Interfaces 段「皆回具名 error」承諾與 Step 3 `fmt.Errorf` 臨時字串自相矛盾之處。**裁定二（5 項 mutation 全跑）**：新增 Step 4a（checkbox，位置與措辭比照 Task 7 Step 4a）＋5 列 mutation 鑑別表，依 §6.7 為 5/5 全跑，不精簡為 3 項。**findings 修法**：**(P1-a／P1-b)** Step 1 範本原寫 `newTestManager(t)`（單一回傳值）且 `m.BeginSubmit(w)` 直傳 `WSID`，與實際簽章 `newTestManager(t, sink) (*tm, *[]contract.Envelope, *sync.Mutex)`（manager_test.go:145）及 `*tm` 對 `BeginSubmit`／`BeginNewSessionSubmit` 提供的 `Provider` 簽章 wrapper（manager_test.go:74/78，會遮蔽內嵌 `*Manager` 同名方法）不符，編譯不過——改寫為呼叫 `*tm` wrapper（`m.BeginSubmit(p)`／`m.BeginNewSessionSubmit(p, taskID)`），`WSID` 需要時用 `m.w(p)`。**(P1-c)** `reserveActive`／`reserveIdle` 全 repo 不存在——改採既有 `startActive(t, m, p)`（manager_test.go:159）帶 slot 進 `phaseActive`；idle 情境改用剛建構完成、尚未使用的預設 `phaseIdle` slot，不新增 helper。**(P2-a)** Step 3 `FreezeTurns` 原用裸 `m.slots[w]` 繞過 `committedSlotLocked`（manager.go:375，全檔 19 個呼叫點共用的唯一 slot 解析路徑），對「已 reserve 未 CommitCreate」的 WSID 會誤判存在並成功凍結——改為呼叫 `committedSlotLocked`，並新增對應 mutation（#4）與測試 subtest（`uncommitted_reservation_rejected`）鎖住這個分支。**(P2-b)** 已隨裁定一併同修正。**(P3-a／P3-b)** 三個測試原本只判 `err == nil`／`err != nil`，且缺「凍結前呼叫應成功」的 negative control——全部改用 `errors.Is` 斷言具名 error，並在 `TestFreezeTurnsBlocksBeginSubmit`／`TestFreezeTurnsBlocksBeginNewSessionSubmit` 各補一段凍結前成功呼叫、且以 `AcceptSubmit`／`RejectSubmit` 收尾清空 `sl.submitting`，避免 negative control 殘留的 pending submit 讓後續呼叫先撞 `ErrSubmitActive` 而遮蔽 freeze 本身的鑑別力（A 型遮蔽）；`TestFreezeTurnsMonotonicAndUnknownWSID` 拆成三個獨立 subtest（未知 WSID／uncommitted reservation／monotonic），monotonic subtest 額外補「重複凍結後 `BeginSubmit` 仍應回 `ErrTurnsFrozen`」，鎖住「monotonic 被實作成可解除」這個原本測不出的分支（mutation #5）。**漂移校正**：原版 Interfaces 段未附精確行號，本次校正並新增 `committedSlotLocked` 現 manager.go:375、`BeginSubmit` 現 manager.go:645、`BeginNewSessionSubmit` 現 manager.go:406 三個錨點；spec §4.2(2) 引用的「per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）」現況該行區間已是 `Removable`／`SlotCount`／`ProviderOf` 等其他方法（有漂移），plan 本段改直接引用 `committedSlotLocked`（manager.go:375）與 slot 既有 bool 欄位慣例（manager.go:120-144）作為施工錨點，不轉抄 spec 內已漂移的行號。**落地驗證**：已於隔離 worktree（`aeeb85f` 起、`~/scratch-worktrees/` 下、路徑不含 `tmp`）套用修好的範本，`go build`／`go vet` 通過、`go test -race ./internal/appcore/ -count=1` 基準綠燈。**`gofmt -l internal/appcore/` 於 `aeeb85f` 即有既存非零輸出**（`manager_test.go`、`manager_wsid_test.go` 兩個既有測試檔，與 Task 8 無關、非本票造成）——本票新增的範本內容本身 gofmt 乾淨；Step 4 與後續 review 不得把這兩個檔的既存 baseline 誤列為 Task 8 的回歸或未結項（比照 `internal/forge/` gofmt baseline 的處理方式，是否另開清理票由 owner 決定），5 項 mutation 逐項套用（hash 改變）→ 指定測試紅在正題 → 還原 byte-identical → 全包回綠，5/5 全殺；worktree 驗證後已移除。**production contract 不受影響（Task 8 未實作，production `.go` 檔零變更）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。**design gate 修正（owner 2026-09-02 裁示，doc-only，Task 8 仍未實作）**：獨立 design gate 對 `39fc159` 判 FAIL，兩項修完——**(G1，主因)** mutation #3 原寫「`committedSlotLocked` 的 `!ok` 分支被移除或誤判」，字面上要求變異**共用的既有基礎設施**（該函式為全檔 19 個呼叫點的唯一 slot 解析路徑，非本票新增碼）。reviewer 實測兩種落地皆有不可控連帶：拿掉 `!ok` 會在未知 WSID 時對 nil slot 取 `.committed` 而 nil deref panic、整個測試二進位崩潰；改為捏造 slot 雖使目標 subtest 紅在自身斷言，但同時波及 `TestRemoveSessionReleasesIdleSlot` 與 `TestUnknownWSIDNeverCreatesSlot` 兩個與本票無關的既有測試。改為 **Task 8 本地變異**——在新寫的 `FreezeTurns` 內把 `committedSlotLocked` 的回錯分支改成吞掉錯誤（`if err != nil { return nil }`），不動共用函式本體，無 panic、無跨範圍連帶。表格同步註明預期連帶：本變異會使 `uncommitted_reservation_rejected` 一併轉紅（兩條路徑共用 `FreezeTurns` 內同一句 error 傳遞，結構性必然），但鑑別力歸屬仍唯一——`unknown_wsid_rejected` 只有本列能讓它紅（#4 的裸 map 對未知 WSID 仍會回錯）。此為已知三型失效形狀（guard 遮蔽／斷言太弱／測資未隔離）之外的**第四型：變異目標選錯——打到共用既有基礎設施而非本票承載契約的碼**，治理通則另以獨立 doc-only commit 寫入 §6.7。**(G2)** 兩處事實數字誤植校正：既有哨兵「14 個」實測為 **16 個**；`committedSlotLocked`「全檔 22 處使用」實測為 **19 個呼叫點**（全檔 20 次出現，含定義本身）。**其餘 gate 項目全數通過**：範本逐字落地零手動修補即可編譯、#1／#2／#4／#5 四項乾淨命中紅在正題且還原 byte-identical、鎖語意（`during` 確實仍持 `m.mu`、`during == nil` 有防呆、無死鎖形狀）、兩條 admission 路徑插入位置皆在既有 guard 之後與 admit 之前（無「先佔 `sl.submitting` 再回錯」的卡死形狀）、`ErrTurnsFrozen`／`ErrSessionNotFound` 分流成立、Files／Steps 一致、spec 錨點校正逐行核對正確、「契約零變更」宣稱成立。**production contract 不受影響、spec／backlog 不變、plan 維持 rev10、估點未變**。**行號慣例修正（owner 2026-09-02 裁示，doc-only，Task 8 implementation 因此重做）**：Task 8 implementation review 發現 Step 3 的 `FreezeTurns` doc comment 內嵌「（現 manager.go:375）」，而 Task 8 自己新增的哨兵區塊與 `slot.turnsFrozen` 欄位都在 `committedSlotLocked` 上方——落地後該函式移至 387 行，**範本內嵌的行號被範本自己的改動作廢**。這是短期內第三次同型（Task 7 的 `fsync_test.go:229`、B5 spec 修訂記錄的 `line 133`、本次 375→387），共同形狀是「同檔案內嵌行號、而改動點就在它上方」。修法：Step 3 範本與成品的該處註解改為**純符號引用**（「slot 解析沿 `committedSlotLocked`——未 commit 或不存在一律 `ErrSessionNotFound`」），Step 1 測試範本內引用 `manager.go:375` 的註解同步移除行號。owner 另裁定把「生產碼註解不得內嵌同檔行號」寫成治理通則（見治理文件同輪修正）。**因本修正改變 `manager.go` 位元組，原 implementation commit `9a7c897` 作廢**——implementation 重做為新 SHA，5/5 mutation 須在新成品上重新取得，不得沿用舊 hash 的證據。plan 散文段（Interfaces `Consumes`、Step 3 前言）保留「符號名＋（現 line N）」形式，符合通則對文件的例外（行號僅作附帶的當下定位資訊、不取代符號錨點）。**production 契約語意零變更（僅註解文字）、spec／backlog 不變、plan 維持 rev10、估點未變**。**mutation 表 #1 補註預期連帶（owner 2026-09-02 裁示，doc-only）**：三方獨立實跑（`9a7c897` 輪的 reviewer、`d2aa1f5` 的 Step 4a 補跑、`d2aa1f5` 的最終 review）皆指出 #1 會讓 `monotonic_idempotent_and_sticky` 一併轉紅——兩個測試的斷言都呼叫 `BeginSubmit` 並期待 `ErrTurnsFrozen`，共用同一段被移除的 guard，屬結構性必然。依本 plan 對 #3 的既有處理慣例（預期連帶須寫進表格），#1 補上同型註記。**不改 Go 檔位元組，兩份 5/5 mutation 證據（實作端 Step 4a 與最終 review）均不受影響。**
+  - **Task 9 implementation preflight erratum（owner 2026-09-02 裁示，doc-only，Task 9 尚未實作）**：實作前唯讀 preflight 判定原範本施工依據不能直接用，owner 裁示兩項決定＋findings 一次修完。**裁定一（測試建構走 white-box）**：改用 `newTestApp`（app_test.go:130）＋`mustCreate`（app_claude_multi_test.go:26）建立 committed WSID，再透過 `registerApproval`（app.go:6782）直接注入可觀測、可失敗的 resolver；查詢與操作沿用既有 `pendingByID`／`promotionOrder`／`resolveApproval`，不創造不存在的 placeholder helper。**不採用 `seedApproval`**（owner 原話）：額外引入 host／socket／broker／goroutine／timeout，會讓 mutation 的失敗來源不再單一，也不利於精準注入部分 resolve 失敗；真實 socket flow 已有既有測試覆蓋，`TestPartialDenyFailureKeepsDormantSlot`（app_remove_test.go）已是同款 `registerApproval` 直接注入 resolver stub 的既有先例，本票沿用同一慣例。**裁定二（9 項 mutation 全跑）**：新增 Step 5a（checkbox，位置與措辭比照 Task 8 Step 4a——接在本票自己的「全包測試綠」步驟之後、Commit 之前，故沿用 Task 9 自身編號改稱 5a 而非沿用 Task 8 的 4a 字面）＋9 列 mutation 鑑別表，依 §6.7 為 9/9 全跑，不精簡。**findings 修法**：**(P1-a)** 原範本用的 `errNotFoundExisting`、`resolveApprovalForTest`、`lookupPendingForTest`、`startSessionWithPendingApproval` 四個符號全 repo 不存在、逐字落地必定編譯失敗——`errNotFoundExisting` 改為現行 not-found 錯誤形狀 `fmt.Errorf("no pending approval %s (timed out?)", id)`；`resolveApprovalForTest`／`lookupPendingForTest` 改直接呼叫既有三參數 `resolveApproval(id, allow, reason)` 與回指標的 `pendingByID(id)`；`startSessionWithPendingApproval` 在範本內給出完整可編譯定義（white-box 建構＋resolve stub）。**(P1-b)** drain 的行為斷言缺失——原範本只驗 pending map 已清空，測不到 `p.resolve(false, reason)` 真的被呼叫；補 `newResolveStub` 記錄呼叫參數，drain 後斷言恰呼叫一次、`allow=false`、`reason` 為傳入值。**(P2-a)** 補未凍結對照組 WSID 的隔離測試（`TestFreezeOnlyDrainsTargetWSID`），鎖住 drain 迴圈 `p.wsid != w` 過濾被移除的 mutation。**(P2-b)** 補 `apprOrder` 同步斷言——drain 後 `promotionOrder()` 須已移除該 id。**(P2-c)** 補 best-effort 失敗路徑測試（`TestFreezeDrainBestEffortFailureIsJoinedWithoutRollback`）：resolver 故意回錯，斷言 `freezeImplementationSession` 回傳合併後非 nil 錯誤、且旗標未回滾、pending 未放回 map。**(P2-d)** `NewApp`（app.go:2041-2046）補 `apprFrozen` map 初始化並列入 Files 清單，避免 nil map 寫入 panic。**(P2-e／P3，行號漂移)** `resolveApproval` plan／spec 標 6783-6810、實際現 app.go:6829；`denyApprovalsForRemove` spec 標 7076-7080、實際現 app.go:7114；spec §4.2(2) 引用的 `SendMessage` 行號區間（app.go:6930-6976）與現況（wrapper 現 6968-6973、`sendMessage` 現 6978-7011）不符，屬 spec 自身既有漂移、非本票承載內容，本票不動 spec、僅 plan 自身引用改「符號名＋（現 line N）」；範本內生產碼註解引用 `unregisterApproval`（不存在）改為 `removeApprOrderLocked`，且不內嵌同檔行號（§6.8）。**已查證仍成立、未變動**：`sendMessage` 全程不碰 `apprMu`（跨 package 存取不到，架構性成立）；`resolveApproval` 仍是「鎖區只做 map 查找／刪除 → `Unlock()` → 才 `p.resolve`」的既有形狀（本票只在其上插入旗標檢查與早退分支）；deny helper 鏈（`denyApprovalsForRemove`／`denyApprovals`）逐筆重新取 `apprMu` 呼叫 `resolveApproval`，不受本票影響；全 `app.go` 7 個 `apprMu.Lock()` 鎖區內 `a.manager.*` 零命中，雙鎖無交疊不變式成立。**§6.7 變異目標**：#7／#8／#9 三項變異落在 `resolveApproval` 本票新增或修改的行（`!ok` 早退分支的 `Unlock`、旗標檢查條件式、frozen-allow 早退分支的 `Unlock`），不變異該函式既有的 map 查找／刪除邏輯。**落地驗證**：已於隔離 worktree（`f5192ab` 起、`~/scratch-worktrees/` 下、路徑不含 `tmp`）套用修好的範本，`go vet .` 通過（root 套件 `go build ./...` 受既有 `frontend/dist` embed 缺失現象影響、與本票無關，worktree 內臨時補一個 `frontend/dist/index.html` 讓 `go vet`／`go test` 可過 embed 檢查，非落地內容、不進 commit）、`go test -race -run 'Freeze|Frozen|ResolveApproval' -count=1 .` 與全包 `go test -race -count=1 .` 基準綠燈，9 項 mutation 逐項套用（hash 改變）→ 指定測試（含 subtest 名）紅在正題 → 還原 byte-identical → 全包回綠，9/9 全殺；worktree 驗證後已移除。**範本迭代一輪**：落地時發現 `TestResolveApprovalNotFoundDoesNotLeakLock` 的逾時保護範圍不足——`startSessionWithPendingApproval`（內含 `registerApproval`）原寫在逾時保護 goroutine **之外**，mutation #7 觸發鎖洩漏後，卡死實際發生在這次 `registerApproval` 呼叫，2 秒逾時偵測完全量不到，整個測試指令卡死（已实測、非推測）。修法：改為先在觸發點之前用 `mustCreate` 建好 WSID（`t.Fatal` 只能從跑該測試的 goroutine 呼叫，不能擺進逾時保護 goroutine），touch `apprMu` 的 `registerApproval`／`resolveApproval` 兩次呼叫改一起包進逾時保護 goroutine；修正後重跑，mutation #7 於 2.01s 準時紅在自己的逾時斷言。此為本輪範本落地驗證發現並修正的唯一一處問題，其餘八項首次套用即紅在正題。**production contract 不受影響（Task 9 未實作，production `.go` 檔零變更）、spec／backlog 不變、未重開完整 plan gate、plan 維持 rev10、估點未變**。
 - rev9（2026-08-28，**implementation 對照 spec 發現的 verifier bijection erratum**——`VerifyRequiredCheckManifest` 未履行 §5.1(5) bijection 保證，**production contract、scope、估點均未變，未重開完整 plan gate**）：
   - 反例：`RequiredChecks=[{ci,42},{lint,42}]`、`Runs=[{ci,42,run1,success},{ci,42,run2,success}]`——`lint` 完全無覆蓋、`ci` 有兩筆重複候選，長度相等（2==2）且全部 success／head match，但明確違反 §5.1(5) 一對一 bijection（無缺漏／無多餘／一 run 至多歸屬一 required）。原版 `VerifyRequiredCheckManifest` 僅比對 `len(RequiredChecks)==len(Runs)` 判定 coverage，對此輸入會誤判通過，與 §5.3(3)「不得以『目前存在的 runs 剛好都綠』替代集合完整性」的措辭直接衝突。
   - 修正範圍：`VerifyRequiredCheckManifest` 改為自行完成六項檢查、**不依賴 `BuildRequiredCheckManifest` 已先執行**——(1) required key 唯一（Verify 自己拒絕重複）；(2) 每筆 run 的 required key 必須存在於 required 集合、且同一 key 恰一筆 run；(3) 每個 required key 最後必須被覆蓋（無缺漏）；(4) 同一 run_id 不得歸屬多個 required key；(5) attribution 重驗（`run_name == context`，`required_app_id == nil` 或 `run_app_id == required_app_id`）；(6) 保留既有 completed/success＋promotion head 驗證。新增 `TestVerifyRequiredCheckManifestBijection` 表格測試，涵蓋一個 owner 反例＋八個獨立負向案例（Verify 端重複 required key、run 多餘、重複覆蓋、缺漏、多個 required key 同時缺漏之排序輸出、run_id 多重歸屬、兩種 attribution 不符形狀）。
