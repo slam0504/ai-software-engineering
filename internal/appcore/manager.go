@@ -37,6 +37,12 @@ var (
 	// ErrTurnActive 擋在 wire 層，但那是 provider 專屬的；Claude 走 stream-json
 	// stdin，多送一筆不會被 CLI 拒絕。因此不變量統一由本層守（見 turnInFlight）。
 	ErrTurnInFlight = errors.New("appcore: a turn is already in flight for this session")
+
+	// B6 Task 8（B5 spec §4.2(2)(3)）：TaskRun STALE fail-closed 的 turn-
+	// admission freeze latch。BeginSubmit／BeginNewSessionSubmit 對 frozen
+	// slot 皆以 %w 包裝本哨兵並保留 WSID 脈絡；未知／未 commit 的 WSID 走
+	// committedSlotLocked 回 ErrSessionNotFound，不受本哨兵影響。
+	ErrTurnsFrozen = errors.New("appcore: turns frozen for this workspace session")
 )
 
 // turnInFlight：reducer 狀態是否代表「上一輪還沒收尾」。
@@ -141,6 +147,12 @@ type slot struct {
 	resetSeq       uint64
 	resetTok       *ResetToken
 	pendingBuf     []pendingEntry
+
+	// B6 Task 8（B5 spec §4.2(2)）：turn-admission freeze latch。monotonic
+	// set-once——僅由 FreezeTurns 寫 true，本檔無解除路徑；zero value＝未凍結。
+	// latch 為 runtime-only，重啟後由 C1a startup repair 依 TaskRun journal
+	// 重建，本欄位不持久化。
+	turnsFrozen bool
 }
 
 func newSlot() *slot { return &slot{reducer: contract.NewReducer()} }
@@ -380,6 +392,27 @@ func (m *Manager) committedSlotLocked(w WSID) (*slot, error) {
 	return sl, nil
 }
 
+// FreezeTurns 設定該 WSID 的 turn-admission 凍結旗標（monotonic——B5 spec
+// §4.2(2)：set-once、生命週期內不清除；重啟後由 startup repair 自 TaskRun
+// journal 重建）。during 在仍持 m.mu 時執行——freeze 設定端的雙鎖同持
+// 窗口（manager 鎖→apprMu 固定順序）由呼叫端在 during 內取 apprMu 完成；
+// 除此路徑外任何程式不得同時持有兩鎖。slot 解析沿 committedSlotLocked——未
+// commit 或不存在一律 ErrSessionNotFound，不得繞過改用裸 m.slots[w]（否則
+// 已 reserve 未 commit 的 WSID 會被誤判存在）。
+func (m *Manager) FreezeTurns(w WSID, during func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sl, err := m.committedSlotLocked(w)
+	if err != nil {
+		return err
+	}
+	sl.turnsFrozen = true
+	if during != nil {
+		during()
+	}
+	return nil
+}
+
 // newSessionLocked：flush 該 slot 殘留 queue（掛舊 task）→ 換代 → 重設。
 func (m *Manager) newSessionLocked(sl *slot, taskID string) {
 	m.flushLocked(sl)
@@ -427,6 +460,11 @@ func (m *Manager) beginNewSessionSubmitLocked(sl *slot, taskID string) (Submissi
 	}
 	if sl.submitting != nil {
 		return SubmissionID{}, ErrSubmitActive
+	}
+	// B6 Task 8（B5 spec §4.2(2)(3)）：StartSession 路徑同樣是新 turn 的
+	// admission，線性化點與 beginSubmitLocked 對齊——manager 鎖內、admit 之前。
+	if sl.turnsFrozen {
+		return SubmissionID{}, fmt.Errorf("appcore: session %q turns frozen: %w", sl.wsid, ErrTurnsFrozen)
 	}
 	m.newSessionLocked(sl, taskID)
 	sl.seq++
@@ -676,6 +714,11 @@ func (m *Manager) beginSubmitLocked(sl *slot) (SubmissionID, error) {
 	// newSessionLocked 會先 reducer.Reset()，上一代的殘留狀態依定義不再適用。
 	if turnInFlight(sl.reducer.Current()) {
 		return SubmissionID{}, ErrTurnInFlight
+	}
+	// B6 Task 8（B5 spec §4.2(2)(3)）：freeze latch 的線性化點——manager 鎖
+	// 內、admit（取得 ownership）之前完成檢查。
+	if sl.turnsFrozen {
+		return SubmissionID{}, fmt.Errorf("appcore: session %q turns frozen: %w", sl.wsid, ErrTurnsFrozen)
 	}
 	sl.seq++
 	id := SubmissionID{gen: sl.gen, seq: sl.seq}

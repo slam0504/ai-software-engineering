@@ -1366,3 +1366,118 @@ func TestResetBlocksAllLifecycleEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---- 阻擋 BeginSubmit（active slot），含 negative control ----
+func TestFreezeTurnsBlocksBeginSubmit(t *testing.T) {
+	m, _, _ := newTestManager(t, &memSink{})
+	p := contract.ProviderClaude
+	startActive(t, m, p)
+	w := m.w(p)
+
+	// negative control：凍結前 BeginSubmit 應成功——證明本測試量到的是
+	// freeze 造成的拒絕，不是「一律拒絕」的假陽性。
+	id, err := m.BeginSubmit(p)
+	if err != nil {
+		t.Fatalf("凍結前 BeginSubmit 應成功：%v", err)
+	}
+	// 收尾這筆 submit，讓 sl.submitting 回到 nil——否則下一次呼叫會先撞
+	// ErrSubmitActive，freeze 的鑑別力被這個更早的 guard 遮蔽（A 型遮蔽）。
+	if err := m.AcceptSubmit(p, id, "s1", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	m.Emit(contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")})
+
+	ran := false
+	if err := m.FreezeTurns(w, func() { ran = true }); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("during 回呼必須在凍結時執行（雙鎖同持窗口）")
+	}
+
+	if _, err := m.BeginSubmit(p); !errors.Is(err, ErrTurnsFrozen) {
+		t.Fatalf("frozen slot 的 BeginSubmit 應回 ErrTurnsFrozen，got %v", err)
+	}
+}
+
+// ---- 阻擋 BeginNewSessionSubmit（idle slot、StartSession 繞道），含 negative
+// control ----
+func TestFreezeTurnsBlocksBeginNewSessionSubmit(t *testing.T) {
+	// rev2（plan gate P1）：frozen WSID 走 NewSession→StartSession 的初始
+	// prompt 也是新 turn——BeginNewSessionSubmit 必須同樣被擋。
+	m, _, _ := newTestManager(t, &memSink{})
+	p := contract.ProviderClaude
+	w := m.w(p) // 剛 commit 完成、尚未使用的 slot：zero value phaseIdle
+
+	// negative control：凍結前 idle slot 的 BeginNewSessionSubmit 應成功。
+	id, err := m.BeginNewSessionSubmit(p, "task-negative-control")
+	if err != nil {
+		t.Fatalf("凍結前 BeginNewSessionSubmit 應成功：%v", err)
+	}
+	// 用 RejectSubmit 收尾（fromNewSession=true → phase 回 idle、submitting
+	// 回 nil），讓 slot 回到乾淨 idle，避免下一次呼叫被 ErrSubmitActive／
+	// ErrSessionActive 遮蔽 freeze 的鑑別力。
+	if err := m.RejectSubmit(p, id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.FreezeTurns(w, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.BeginNewSessionSubmit(p, "task-1"); !errors.Is(err, ErrTurnsFrozen) {
+		t.Fatalf("frozen slot 的 BeginNewSessionSubmit 應回 ErrTurnsFrozen（StartSession 繞道封死），got %v", err)
+	}
+}
+
+// ---- 未知 WSID／uncommitted reservation／monotonic 三個獨立情境，各自 subtest
+// 對應一個 mutation ----
+func TestFreezeTurnsMonotonicAndUnknownWSID(t *testing.T) {
+	m, _, _ := newTestManager(t, &memSink{})
+
+	t.Run("unknown_wsid_rejected", func(t *testing.T) {
+		if err := m.FreezeTurns(WSID("nope"), func() {}); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("完全未知的 WSID 應回 ErrSessionNotFound，got %v", err)
+		}
+	})
+
+	t.Run("uncommitted_reservation_rejected", func(t *testing.T) {
+		// 僅 ReserveSession、未 CommitCreate——slot 存在於 m.slots 但
+		// committed=false。裸 m.slots[w] 會誤判存在並成功凍結；正確路徑須走
+		// committedSlotLocked 回 ErrSessionNotFound。
+		w2, _, err := m.Manager.ReserveSession(contract.ProviderClaude)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.FreezeTurns(w2, func() {}); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("未 CommitCreate 的 reservation 應回 ErrSessionNotFound，got %v", err)
+		}
+	})
+
+	t.Run("monotonic_idempotent_and_sticky", func(t *testing.T) {
+		p := contract.ProviderCodex
+		startActive(t, m, p)
+		w := m.w(p)
+
+		id, err := m.BeginSubmit(p) // 收尾殘留 submit，回到 sl.submitting == nil
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.AcceptSubmit(p, id, "s1", "hi"); err != nil {
+			t.Fatal(err)
+		}
+		m.Emit(contract.Event{Provider: p, Kind: contract.KindResult, Raw: []byte("{}")})
+
+		if err := m.FreezeTurns(w, func() {}); err != nil {
+			t.Fatal(err)
+		}
+		// 重複凍結冪等成功（monotonic set-once）
+		if err := m.FreezeTurns(w, func() {}); err != nil {
+			t.Fatalf("重複凍結應冪等：%v", err)
+		}
+		// monotonic 的鑑別力來自這裡：若實作被改成可解除（例如翻轉 bool 或
+		// 重複呼叫時清旗標），這裡會誤放行。
+		if _, err := m.BeginSubmit(p); !errors.Is(err, ErrTurnsFrozen) {
+			t.Fatalf("重複凍結後仍應維持凍結，BeginSubmit 應回 ErrTurnsFrozen，got %v", err)
+		}
+	})
+}
