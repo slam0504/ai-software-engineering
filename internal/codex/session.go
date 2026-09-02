@@ -32,13 +32,13 @@ func StartAppServer(ctx context.Context, cfg Config) (*Server, error) {
 	return &Server{p: p, conn: NewConn(p.Stdin, p.Stdout), argv: []string{cfg.Binary, "app-server"}}, nil
 }
 
-func (s *Server) Conn() *Conn          { return s.conn }
-func (s *Server) Argv() []string       { return append([]string(nil), s.argv...) }
-func (s *Server) Terminate() error     { return s.p.Terminate() }
-func (s *Server) Wait() proc.Exit      { return s.p.Wait() }
-func (s *Server) PGID() int            { return s.p.PGID() }
+func (s *Server) Conn() *Conn            { return s.conn }
+func (s *Server) Argv() []string         { return append([]string(nil), s.argv...) }
+func (s *Server) Terminate() error       { return s.p.Terminate() }
+func (s *Server) Wait() proc.Exit        { return s.p.Wait() }
+func (s *Server) PGID() int              { return s.p.PGID() }
 func (s *Server) StderrSnapshot() string { return s.p.StderrSnapshot() } // v1.6：長駐 server live 證據
-func (s *Server) Done() <-chan struct{} { return s.p.Done() }            // v1.7：非阻塞死亡判定
+func (s *Server) Done() <-chan struct{}  { return s.p.Done() }           // v1.7：非阻塞死亡判定
 
 // ProbeTarget 薄委派（Task 8 Step 5b）
 func (s *Server) BeginRecording(sink func([]byte) error) error { return s.conn.BeginRecording(sink) }

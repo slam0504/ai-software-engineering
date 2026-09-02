@@ -1035,7 +1035,12 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	close(done)
 	var finExit ports.Exit
 	ex, err := CloseSequence(log("close"), done, time.Second, time.Second, log("terminate"),
-		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 0} },
+		func() ports.Exit {
+			mu.Lock()
+			calls = append(calls, "wait")
+			mu.Unlock()
+			return ports.Exit{Exited: true, Code: 0}
+		},
 		fin(&finExit), RealAfter)
 	if err != nil || !ex.Exited || ex.Code != 0 || !finExit.Exited || finExit.Code != 0 {
 		t.Fatalf("normal: %v %+v %+v", err, ex, finExit)
@@ -1050,7 +1055,12 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	go func() { time.Sleep(100 * time.Millisecond); close(hung) }()
 	ex, err = CloseSequence(log("close"), hung, 30*time.Millisecond, 5*time.Second,
 		func() error { mu.Lock(); calls = append(calls, "terminate"); mu.Unlock(); return nil },
-		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true, Code: 143} },
+		func() ports.Exit {
+			mu.Lock()
+			calls = append(calls, "wait")
+			mu.Unlock()
+			return ports.Exit{Exited: true, Code: 143}
+		},
 		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "quiesce timeout") { // timeout 不被吞
 		t.Fatalf("quiesce timeout must surface: %v", err)
@@ -1068,7 +1078,12 @@ func TestCloseSequenceOrderTimeoutAndStuck(t *testing.T) {
 	start := time.Now()
 	_, err = CloseSequence(log("close"), stuck, 20*time.Millisecond, 30*time.Millisecond,
 		log("terminate"),
-		func() ports.Exit { mu.Lock(); calls = append(calls, "wait"); mu.Unlock(); return ports.Exit{Exited: true} },
+		func() ports.Exit {
+			mu.Lock()
+			calls = append(calls, "wait")
+			mu.Unlock()
+			return ports.Exit{Exited: true}
+		},
 		fin(&finExit), RealAfter)
 	if err == nil || !strings.Contains(err.Error(), "did not quiesce") {
 		t.Fatalf("stuck path must error: %v", err)

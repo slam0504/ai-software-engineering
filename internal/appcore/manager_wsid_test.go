@@ -165,4 +165,3 @@ func TestEmitFillsWSIDAndRejectsProviderMismatch(t *testing.T) {
 		t.Fatalf("provider 不符必須 fail loud：%v", err)
 	}
 }
-

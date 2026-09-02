@@ -2,9 +2,10 @@
 //
 // 驗證前提：單一 codex app-server 能同時承載多個 thread 的並行 turn。
 // 判定範圍（凍結）：
-//   (a) 兩 thread 並行 turn 是否真並行（turn 生命期重疊，非 A 全部完成才出現 B）
-//   (b) notification 與 approval request 是否帶足以歸屬的 thread／turn identity
-//   (c) 自然與強制（-force）兩種收尾是否 bounded 收斂且錄到最後一筆 frame
+//
+//	(a) 兩 thread 並行 turn 是否真並行（turn 生命期重疊，非 A 全部完成才出現 B）
+//	(b) notification 與 approval request 是否帶足以歸屬的 thread／turn identity
+//	(c) 自然與強制（-force）兩種收尾是否 bounded 收斂且錄到最後一筆 frame
 //
 // completed-before-response 不列入本 probe（改由 Task 9 fake-wire 測試鎖住）。
 //

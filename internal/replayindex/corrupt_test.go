@@ -227,7 +227,7 @@ func TestMidCorruptionWithConsecutiveBadLinesIsStillDetected(t *testing.T) {
 	lines := []string{
 		validTurnRecordLine(t, "e0"),
 		"{not json 1",
-		"{not json 2", // 壞行的下一行仍是壞行
+		"{not json 2",                // 壞行的下一行仍是壞行
 		validTurnRecordLine(t, "e1"), // 再下一行才是 valid：整體仍是中段
 	}
 	writeRawTurnFile(t, dir, "w1", lines)
