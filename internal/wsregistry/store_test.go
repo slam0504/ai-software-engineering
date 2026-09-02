@@ -580,3 +580,272 @@ func TestClearLegacyTranscript(t *testing.T) {
 		t.Fatalf("tombstone 應回 ErrTombstoned：%v", err)
 	}
 }
+
+// ---- B3：write-once 兩形狀（同值冪等、同 TaskRun 不同 digest 拒絕、不同
+// TaskRun 重綁拒絕）----
+func TestSetTaskRunBindingWriteOnce(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Get("w1")
+	if e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" || e.SnapshotDigest != "sha256:aa" {
+		t.Fatalf("綁定欄位未落：%+v", e)
+	}
+	// 冪等：同值再寫成功（resume 依 journal 回填）
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatalf("同值應冪等：%v", err)
+	}
+
+	t.Run("same_taskrun_different_digest_rejected", func(t *testing.T) {
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:bb"); err == nil {
+			t.Fatal("同 TaskRun、不同 digest 應拒絕")
+		}
+		if e, _ := s.Get("w1"); e.SnapshotDigest != "sha256:aa" {
+			t.Fatalf("拒絕後不得改動既有欄位，got %+v", e)
+		}
+	})
+
+	t.Run("different_taskrun_rebind_rejected", func(t *testing.T) {
+		// **測資陷阱**：digest 刻意與 w1 既有值相同。若這裡用不同的 digest，
+		// 「只比對 TaskRunID」與「只比對 digest」兩種單欄位比較 mutation 都會
+		// 因為被保留的那個欄位也不相等而落入拒絕分支，兩者皆存活（本列與上一
+		// 個 subtest 合起來才覆蓋兩種方向）。
+		if err := s.SetTaskRunBinding("w1", "01BX5ZZKBKACTAV9WEVGEMMVRZ", "sha256:aa"); err == nil {
+			t.Fatal("不同 TaskRun 重綁應拒絕")
+		}
+		if e, _ := s.Get("w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("拒絕後不得改動既有欄位，got %+v", e)
+		}
+	})
+}
+
+// ---- B1：空輸入，各自獨立的負向案例 ----
+func TestSetTaskRunBindingRejectsEmptyTaskRunID(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "", "sha256:aa"); err == nil {
+		t.Fatal("空 taskRunID 應拒絕")
+	}
+	if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("拒絕後不得寫入任何欄位：%+v", e)
+	}
+}
+
+func TestSetTaskRunBindingRejectsEmptySnapshotDigest(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", ""); err == nil {
+		t.Fatal("空 snapshotDigest 應拒絕")
+	}
+	if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("拒絕後不得寫入任何欄位：%+v", e)
+	}
+}
+
+func TestSetTaskRunBindingNotFound(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.SetTaskRunBinding("nope", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("不存在的 wsid 應回 ErrEntryNotFound，got %v", err)
+	}
+}
+
+func TestSetTaskRunBindingTombstoned(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("w1", "user_removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); !errors.Is(err, ErrTombstoned) {
+		t.Fatalf("tombstoned entry 應回 ErrTombstoned，got %v", err)
+	}
+}
+
+// ---- B4：跨 WSID 1:1 基數。測資陷阱（owner 明訂）：跨 WSID 掃描排在「目標
+// 已綁」guard 之後——若目標 entry 本身已綁，會先被前一個 guard 攔下，鑑別
+// 力落在錯的 guard。這裡的目標 entry（w2／w3）必須乾淨未綁；且刻意用「同
+// TaskRunID、不同 digest」而非同值 pair，避免錯誤實作把檢查寫成「比較整個
+// pair」也能通過（同值 pair 在錯誤實作下會被誤判成不同綁定而放行）。----
+func TestSetTaskRunBindingCrossWSIDCardinality(t *testing.T) {
+	s, _ := openStore(t)
+	for _, w := range []string{"w1", "w2", "w3"} {
+		if err := s.Put(Entry{WSID: w, Provider: "claude", CreatedAt: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("duplicate_taskrun_different_digest_rejected", func(t *testing.T) {
+		// w2 目標乾淨未綁；同 TaskRunID、不同 digest。
+		if err := s.SetTaskRunBinding("w2", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:cc"); err == nil {
+			t.Fatal("duplicate TaskRunID 跨 WSID 應拒絕（1:1 雙向），即使 digest 不同")
+		}
+		if e, ok := s.Get("w2"); ok && e.TaskRunID != "" {
+			t.Fatalf("拒絕後 w2 不得被寫入：%+v", e)
+		}
+	})
+
+	t.Run("tombstoned_occupancy_not_transferable", func(t *testing.T) {
+		if err := s.Remove("w1", "user_removed"); err != nil {
+			t.Fatal(err)
+		}
+		// w3 目標乾淨未綁；佔用方（w1）已 tombstoned——abandoned 綁定仍不可
+		// 轉移（B5 §3.6）。同樣用不同 digest 避免同值 pair 掩蓋鑑別力。
+		if err := s.SetTaskRunBinding("w3", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:dd"); err == nil {
+			t.Fatal("tombstoned 佔用的 TaskRunID 不可轉移")
+		}
+		if e, ok := s.Get("w3"); ok && e.TaskRunID != "" {
+			t.Fatalf("拒絕後 w3 不得被寫入：%+v", e)
+		}
+	})
+}
+
+// ---- B2：partial pair 兩個方向。繞過 SetTaskRunBinding 本身、用 Put 直接
+// 塞欄位造出 partial pair（Put 不驗證綁定欄位配對，寫得進去）。----
+func TestSetTaskRunBindingPartialPairCorruption(t *testing.T) {
+	t.Run("taskrun_only", func(t *testing.T) {
+		s, _ := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t",
+			TaskRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAV"}); err != nil { // SnapshotDigest 缺
+			t.Fatal(err)
+		}
+		// 必須由訊息斷言命中 corruption：partial-pair guard 之後緊接著
+		// 「已綁定」guard，本測資 old.TaskRunID 非空、digest 不等，guard
+		// 移除後會被「已綁定」順帶擋下而仍回錯——只判 err == nil 抓不到。
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil ||
+			!strings.Contains(err.Error(), "partial pair") {
+			t.Fatalf("partial pair（僅 TaskRunID）應視為 corruption 拒絕，不得靜默補全，也不得由「已綁定」guard 順帶擋下：%v", err)
+		}
+	})
+
+	t.Run("digest_only", func(t *testing.T) {
+		s, _ := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t",
+			SnapshotDigest: "sha256:aa"}); err != nil { // TaskRunID 缺
+			t.Fatal(err)
+		}
+		// 對稱補強：本方向目前沒有遮蔽路徑（old.TaskRunID 為空，不會進
+		// 「已綁定」guard），但斷言形狀與 taskrun_only 對齊，防禦未來 guard
+		// 順序調整造成的迴歸。
+		if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err == nil ||
+			!strings.Contains(err.Error(), "partial pair") {
+			t.Fatalf("partial pair（僅 SnapshotDigest）應視為 corruption 拒絕，不得靜默補全：%v", err)
+		}
+	})
+}
+
+// ---- B5：冪等不落盤。注入 stepWrite 錯誤，同值重寫仍應成功——證明冪等
+// 路徑沒有呼叫 persist（若呼叫了，這裡會因注入的錯誤而失敗）。----
+func TestSetTaskRunBindingIdempotentDoesNotPersist(t *testing.T) {
+	s, _ := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	failAt(s, stepWrite, errors.New("disk full"))
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatalf("冪等路徑不應呼叫 persist，got %v", err)
+	}
+}
+
+// ---- B6：reopen round-trip ＋ 舊檔零遷移 ----
+func TestSetTaskRunBindingRoundTripAcrossOpen(t *testing.T) {
+	s, path := openStore(t)
+	if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := reopened.Get("w1")
+	if !ok || e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" || e.SnapshotDigest != "sha256:aa" {
+		t.Fatalf("重新 Open 後綁定欄位必須仍在：%+v ok=%v", e, ok)
+	}
+}
+
+func TestSetTaskRunBindingLegacyFileZeroMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ws.json")
+	legacy := `{
+  "schema_version": 2,
+  "entries": {
+    "w1": {"wsid": "w1", "provider": "claude", "created_at": "t"}
+  }
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("舊檔（無新欄位）Open 不應報錯：%v", err)
+	}
+	e, ok := s.Get("w1")
+	if !ok || e.TaskRunID != "" || e.SnapshotDigest != "" {
+		t.Fatalf("舊檔零遷移：新欄位應為空，got %+v ok=%v", e, ok)
+	}
+}
+
+// ---- B7：failure matrix，改寫為可編譯測試（原為散文註解）----
+func TestSetTaskRunBindingPersistFailureMatrix(t *testing.T) {
+	t.Run("pre_rename_failure_rolls_back", func(t *testing.T) {
+		s, path := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		failAt(s, stepWrite, errors.New("disk full"))
+		err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa")
+		if err == nil {
+			t.Fatal("stepWrite 失敗必須回錯")
+		}
+		if errors.Is(err, ErrRegistryUncertain) || s.Uncertain() {
+			t.Fatalf("rename 前失敗不得 latch：%v", err)
+		}
+		if e, _ := s.Get("w1"); e.TaskRunID != "" || e.SnapshotDigest != "" {
+			t.Fatalf("記憶體必須回滾（無綁定欄位），got %+v", e)
+		}
+		if e, _ := diskEntry(t, path, "w1"); e.TaskRunID != "" {
+			t.Fatalf("磁碟必須維持舊值，got %+v", e)
+		}
+	})
+
+	t.Run("dir_sync_failure_latches_uncertain", func(t *testing.T) {
+		s, path := openStore(t)
+		if err := s.Put(Entry{WSID: "w1", Provider: "claude", CreatedAt: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		failAt(s, stepDirSync, errors.New("dir fsync EIO"))
+		err := s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa")
+		if !errors.Is(err, ErrRegistryUncertain) {
+			t.Fatalf("directory sync 失敗必須回 ErrRegistryUncertain，got %v", err)
+		}
+		if !s.Uncertain() {
+			t.Fatal("directory sync 失敗必須 latch uncertain")
+		}
+		// 不回滾：rename 已成功，退回舊值等於宣稱一個 process 內無法證明的事實
+		// （沿 TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites 的
+		// 「(2) 不回滾」既有斷言形狀，現 fsync_test.go:243-245）。
+		if e, _ := s.Get("w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("記憶體不得退回舊值，got %+v", e)
+		}
+		if e, _ := diskEntry(t, path, "w1"); e.TaskRunID != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+			t.Fatalf("rename 已成功，磁碟應為新值，got %+v", e)
+		}
+	})
+}

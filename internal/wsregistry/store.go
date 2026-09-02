@@ -74,6 +74,8 @@ type Entry struct {
 	CreatedAt        string `json:"created_at"`
 	RemovedAt        string `json:"removed_at"`
 	RemoveReason     string `json:"remove_reason"`
+	TaskRunID        string `json:"task_run_id,omitempty"`
+	SnapshotDigest   string `json:"snapshot_digest,omitempty"`
 }
 
 // Layout：pinned／focused workspace 排列（durable，非 runtime state）。
@@ -672,4 +674,61 @@ func (s *Store) Sync() error {
 		return s.uncertain
 	}
 	return s.persistLocked()
+}
+
+// SetTaskRunBinding 寫入 implementation session 的 TaskRun 綁定（B5 spec
+// §3.1 雙向 1:1 基數）。單一 s.mu 臨界區內完成全部檢查與寫入：
+//
+//	(a) 目標 entry 不存在／tombstoned → 拒絕（沿 mutate 語意）；
+//	(b) 目標 entry 已綁不同值 → 拒絕（不允許重綁）；同值冪等成功、不觸發 persist；
+//	(c) partial pair（TaskRunID 與 SnapshotDigest 僅其一非空）→ corruption，拒絕；
+//	(d) taskRunID 已出現在任何其他 entry（含 tombstoned——abandoned 綁定
+//	    不可轉移，B5 §3.6）→ 拒絕。
+//
+// 權威階層（B5 §3.2(2)）：本欄位是 TaskRun journal 的 derived cache——
+// 衝突一律以 journal 為準修復，不得反向補寫 journal。
+//
+// 實作骨架：**不能用 mutate**（其 fn 看不到其他 entries，見 Interfaces 段
+// Consumes 校正）——沿 `mutate`（現 store.go:359）的 lock→檢查→改欄位→
+// persistOrRollback 骨架展開，於同一 s.mu 臨界區先跨全 entries 掃描
+// `s.file.Entries`，再寫目標 entry 並呼叫 `persistOrRollback`（現 store.go:274）。
+func (s *Store) SetTaskRunBinding(wsid, taskRunID, snapshotDigest string) error {
+	if taskRunID == "" || snapshotDigest == "" {
+		return fmt.Errorf("wsregistry: task_run_id 與 snapshot_digest 不得為空")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 所有欄位 mutation 必須走 persistOrRollback（現 store.go:274）：rename
+	// 前失敗 → 記憶體回滾 old；directory sync 後不確定 → ErrRegistryUncertain
+	// latch（不回滾）。entry 取得與集合迭代對齊 s.file 的實際欄位名。
+	old, ok := s.file.Entries[wsid]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrEntryNotFound, wsid)
+	}
+	if old.RemovedAt != "" {
+		return fmt.Errorf("%w: %q", ErrTombstoned, wsid)
+	}
+	if (old.TaskRunID == "") != (old.SnapshotDigest == "") {
+		return fmt.Errorf("wsregistry: %q 綁定欄位 partial pair（corruption），拒絕寫入", wsid)
+	}
+	if old.TaskRunID != "" {
+		if old.TaskRunID == taskRunID && old.SnapshotDigest == snapshotDigest {
+			return nil // 冪等（resume 回填）——零變更不觸發 persist
+		}
+		return fmt.Errorf("wsregistry: %q 已綁定 taskrun %s，拒絕重綁", wsid, old.TaskRunID)
+	}
+	for w, e := range s.file.Entries {
+		if w != wsid && e.TaskRunID == taskRunID {
+			return fmt.Errorf("wsregistry: taskrun %s 已綁定於 %q（1:1 基數），拒絕", taskRunID, w)
+		}
+	}
+	next := old
+	next.TaskRunID = taskRunID
+	next.SnapshotDigest = snapshotDigest
+	s.file.Entries[wsid] = next
+	// persistOrRollback 實際簽章接 rollback closure（現 store.go:274）——
+	// rename 前失敗時由 closure 還原記憶體；dir-sync 不確定進 latch 不回滾。
+	return s.persistOrRollback(func() {
+		s.file.Entries[wsid] = old
+	})
 }

@@ -264,6 +264,7 @@ func TestDirectorySyncFailureLatchesUncertainAndRefusesAllWrites(t *testing.T) {
 		"BackfillResume":           func() error { return s.BackfillResume(map[string]string{"w1": "z"}) },
 		"BackfillLegacyTranscript": func() error { return s.BackfillLegacyTranscript([]string{"w1"}) },
 		"MarkMigrated":             func() error { return s.MarkMigrated([]Entry{{WSID: "w9"}}) },
+		"SetTaskRunBinding":        func() error { return s.SetTaskRunBinding("w1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "sha256:aa") },
 		"Sync":                     func() error { return s.Sync() },
 	}
 	for name, fn := range writes {
