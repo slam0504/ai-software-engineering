@@ -282,8 +282,8 @@ Gate 3 決議面可掛 DomainSpec shadow evaluator 之 explain 輸出作為**顯
 ## 修訂記錄
 
 - rev10（2026-09-02，**錨點校正 only，契約零變更**；B6 Task 8 implementation 前施工事實核對發現）：
-  - §4.2(2)「唯一 owner」條目原寫「per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）」——該行號區間實際對應 `Removable()`（即 §3.6 段同文件 line 133 正確引用的那一段），並非 phase 狀態機，屬撰寫時複製行號所致。改為符號定位：`sessionPhase` 型別與五個 phase 常數（現 manager.go:108-116）、per-slot 狀態欄位掛在 `slot` struct（現 manager.go:120-144）。
-  - §3.6 段（line 133）對 `Removable()`（manager.go:328-347）的引用**經核對仍正確**，不動。
+  - §4.2(2)「唯一 owner」條目原寫「per-WSID 狀態掛點沿 `appcore.Manager` phase 狀態機先例（manager.go:328-347）」——該行號區間實際對應 `Removable()`（即 §3.6 段引用的同一符號），並非 phase 狀態機，屬撰寫時複製行號所致。改為符號定位：`sessionPhase` 型別與五個 phase 常數（現 manager.go:108-116）、per-slot 狀態欄位掛在 `slot` struct（現 manager.go:120-144）。
+  - §3.6 段對 `Removable()`（manager.go:328-347）的引用**經核對仍正確**，不動。
   - **契約零變更**：freeze latch 的 set-once／runtime-only／雙鎖同持／線性化點語意全部未動；B6 Task 8 的 plan 已於 `9343ecc` 改用穩定符號錨點，不依賴本次校正。未重開 design gate、未重估。
 - rev9（2026-08-31，B6 Task 5 implementation 前施工事實核對發現的契約缺口，owner 逐條裁示；走窄幅 design re-review，**未重開完整 design gate、未重估**；production 契約其餘部分未變）：
   - **新增契約**：§5.1(6) `submitted_at` 正規化——manifest 值固定為解析後時間之 UTC RFC3339Nano 表示（非 `time.RFC3339`，避免丟失 fractional seconds）；current-effective 收斂比較仍用解析後 `time.Time`；驗證須檢查欄位值等於重新格式化之 canonical value。失敗場景：未正規化時，`2026-08-28T01:00:00Z` 與 `2026-08-28T01:00:00+00:00` 表示同一時刻卻產生不同 digest，決議時重讀重算產生假 mismatch，pending Gate 3 request 被誤判失效（§4.3）。共同規則段補時間值正規化通則，並註記 §5.1(5) `required_check_manifest` 無時間值欄位、不受影響（Task 4 已完成內容不變）。
