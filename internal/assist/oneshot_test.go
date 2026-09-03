@@ -60,8 +60,17 @@ func TestCodexAssistTurnParamsEnforceReadOnlyNoApproval(t *testing.T) {
 func TestClaudeAssistFailsLoudOnOversizedLine(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fakeclaude.sh")
+	// 15s context 是卡死保險，不是成功判準（成功判準是 sawStreamErr）。preflight
+	// 實測 fixture 生成 1.5–1.7s，餘裕約 9 倍。本輪未重現過任何誤紅；已知的唯一
+	// 風險方向是「環境慢 → context 先到 → 誤紅」，不存在假通過路徑：ctx 取消後
+	// oneshot.Run 只排乾 events、不再呼叫 sink，取消後產生的事件改不動 sawStreamErr。
 	// 讀掉 prompt 行後吐一條 >16MB 的行（超過 scanner 上限）。
-	script := "#!/bin/sh\nread -r _line\nhead -c 17000000 /dev/zero | tr '\\0' 'a'\necho\n"
+	//
+	// 刻意直接吐 raw NUL byte、不再 `| tr '\0' 'a'`：Scanner 的 token 上限只看
+	// **byte 長度**，與 byte 內容無關，17MB 的 NUL 單行撞的是同一個 ErrTooLong，
+	// 契約不變。省掉的 tr 是一個額外程序與一次全量資料轉換——本條實測成本因此
+	// 由約 2.38s 降到約 1.38s。
+	script := "#!/bin/sh\nread -r _line\nhead -c 17000000 /dev/zero\necho\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
