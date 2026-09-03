@@ -307,6 +307,16 @@ func TestSecondInFlightTurnRejected(t *testing.T) {
 // 卡住的 session 從此無法復原——上一條測試完全看不到這個形狀。
 func TestInFlightTurnDoesNotBlockNewSession(t *testing.T) {
 	a, _ := newTestApp(t)
+	// 受控時鐘：NewSession 會走 claudeTeardown → appcore.CloseSequence 的 5s
+	// quiesce 逾時，那是本測試裡唯一會參與 production 決策的牆鐘。改注入
+	// fakeAfter 之後，逾時分支不再由真實時鐘決定——本測試驗的是「卡住的 turn
+	// 不擋新對話」，不是「pump 能在 5 秒內收乾淨」。
+	// 先例：app_shutdown_multi_test.go:353-354、app_lease_boundary_test.go:168-169。
+	timers := newFakeAfter()
+	a.afterFn = timers.After
+	// 驗證邊界：fakeAfter 的 timer 除非測試自己 fireAll 否則永不觸發，因此真正的
+	// pump 卡死不再有 5 秒的局部快速失敗，會一路落到 go test -timeout 才收場。
+	// 這是本票接受的取捨（owner 2026-09-03 裁定），**不宣稱卡死診斷延遲已消除**。
 	a.wsReg = &stubRegistry{}
 	writeSilentClaude(t, a)
 	w := mustCreate(t, a, "claude")
@@ -319,6 +329,13 @@ func TestInFlightTurnDoesNotBlockNewSession(t *testing.T) {
 
 	if err := a.NewSession(string(w)); err != nil {
 		t.Fatalf("卡住的 turn 不得擋住「開新對話」：%v", err)
+	}
+	// 接線鑑別：CloseSequence 一定會呼叫 WaitQuiesce(done, 5s, after)，而 Go 的
+	// select 在挑分支前會先求值每個 case 的 channel 運算元——因此 after(5s) 必被
+	// 呼叫一次，與 done 是否已關無關。這一行是「seam 真的被接上」的確定性證據：
+	// 拿掉上面的 a.afterFn = timers.After，這裡立刻紅，不需要慢 fixture。
+	if n := timers.totalCreated(); n == 0 {
+		t.Fatal("afterFn seam 未被接上：CloseSequence 應至少向注入時鐘要過一次 timer")
 	}
 	if a.manager.IsActive(w) {
 		t.Fatal("開新對話之後 slot 必須回到 idle（不再 active）")
