@@ -57,6 +57,51 @@ type Proc struct {
 	termSent bool           // Terminate 路徑真的送出過 group SIGTERM
 	killSent bool           // grace 逾時升級真的送出過 group SIGKILL（退出後的清掃 KILL 不算：影響不了已定案的死因）
 	fatalSig syscall.Signal // 子程序被訊號致死時的那個訊號；0 = 正常退出
+	// after／onSignal：backlog B1a-1 的未匯出 timer／signal-event seam，僅同套件
+	// white-box 測試可注入（proc_test.go）。讀寫一律經 seamAfter／seamOnSignal 在
+	// p.mu 下完成；回傳值本身在解鎖後才被呼叫／使用，避免 observer 持鎖呼叫、也
+	// 避免與測試注入的欄位寫入產生 -race。nil 時分別退回 real timer（time.After）
+	// 與 no-op。
+	after    afterFunc
+	onSignal signalObserverFunc
+}
+
+// afterFunc 是 Terminate() 的計時器 seam；型別對齊 internal/appcore/pump.go 的
+// After／RealAfter 慣例。nil 時退回 time.After（見 seamAfter）。
+type afterFunc func(time.Duration) <-chan time.Time
+
+// signalEvent 區分 Proc 內部三個「實際送出過訊號」的時刻——只在對應的
+// SignalGroup 呼叫成功後才發出。
+type signalEvent int
+
+const (
+	sigEventTermSent              signalEvent = iota // Terminate() 的 group SIGTERM 送出成功
+	sigEventEscalationKill                           // Terminate() grace 逾時升級的 group SIGKILL 送出成功
+	sigEventSupervisorCleanupKill                    // supervisor 收尾管線的清孫程序 group SIGKILL 送出成功
+)
+
+// signalObserverFunc 是訊號事件的 seam；nil 時退回 no-op（見 seamOnSignal）。
+// 呼叫規約：不得在持有 p.mu 時呼叫，也不參與任何 production 判定——純觀察用途。
+type signalObserverFunc func(signalEvent)
+
+// seamAfter／seamOnSignal：nil-safe 存取子。欄位讀取在 p.mu 下完成，但回傳值
+// 本身在解鎖後才被呼叫／使用。
+func (p *Proc) seamAfter() afterFunc {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.after != nil {
+		return p.after
+	}
+	return time.After
+}
+
+func (p *Proc) seamOnSignal() signalObserverFunc {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.onSignal != nil {
+		return p.onSignal
+	}
+	return func(signalEvent) {}
 }
 
 const stderrCap = 64 * 1024
@@ -143,8 +188,11 @@ func Start(ctx context.Context, cfg Config) (*Proc, error) {
 		p.exited = true // 先記錄事實，再開放觀察（見 exited 欄位 doc）
 		p.mu.Unlock()
 		close(p.exitedCh)
-		_ = p.SignalGroup(syscall.SIGKILL) // 子程序已退出 → 立即清整組殘存孫程序
-		wg.Wait()                          // stderr 讀到 EOF（group kill 保證）
+		cleanupErr := p.SignalGroup(syscall.SIGKILL) // 子程序已退出 → 立即清整組殘存孫程序
+		if cleanupErr == nil {
+			p.seamOnSignal()(sigEventSupervisorCleanupKill) // 只在 SignalGroup 成功後、鎖外才發
+		}
+		wg.Wait() // stderr 讀到 EOF（group kill 保證）
 		errR.Close()
 		ex := Exit{Code: cmd.ProcessState.ExitCode(), StderrTail: p.stderrTail(), Err: werr}
 		var fatal syscall.Signal // 0 = 正常退出
@@ -259,17 +307,25 @@ func (p *Proc) Terminate() error { // group SIGTERM → grace 內未退出 → g
 	if err != nil {
 		return err // group 已不可達：不記錄、也不排 KILL 升級（pgid 重用風險）
 	}
+	// 事件只在 SignalGroup 成功後、解鎖後才發。
+	p.seamOnSignal()(sigEventTermSent)
+	after := p.seamAfter() // 在 goroutine 啟動前固定，避免與後續欄位寫入產生 -race
 	go func() {
 		select {
 		case <-p.exitedCh:
-		case <-time.After(p.grace):
+		case <-after(p.grace):
 			p.mu.Lock()
+			killed := false
 			if !p.exited {
 				if p.SignalGroup(syscall.SIGKILL) == nil {
 					p.killSent = true
+					killed = true
 				}
 			}
 			p.mu.Unlock()
+			if killed {
+				p.seamOnSignal()(sigEventEscalationKill)
+			}
 		}
 	}()
 	return nil

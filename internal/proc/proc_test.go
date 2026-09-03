@@ -462,3 +462,175 @@ func TestCancelBeforeExitMarksCanceled(t *testing.T) {
 		t.Fatal("取消發生在子程序結束之前，必須記成 canceled")
 	}
 }
+
+// ---- backlog B1a-1：Terminate() 未匯出 timer／signal-event seam 的白箱測試 ----
+
+// killAndReap：white-box 測試的收尾 helper。在 p.mu 下確認「退出尚未被記錄」才
+// 對 group 送 KILL——程序退出後 pgid 可能已被 OS 回收並重用，無條件送 KILL 有打
+// 到其他 process group 的風險（與 cancelRequested 的既有理由同源）；解鎖後等
+// supervisor 收尾完成，確保任何失敗路徑都不留下子程序，也不留下卡在注入 timer
+// 上的 escalation goroutine。僅適用於經 Start／bashProc 啟動、有 supervisor 的
+// Proc；手工部分建構的 Proc 沒有 doneCh 可等，也沒有真實程序要清。
+func killAndReap(t *testing.T, p *Proc) {
+	t.Helper()
+	p.mu.Lock()
+	if !p.exited {
+		_ = p.SignalGroup(syscall.SIGKILL)
+	}
+	p.mu.Unlock()
+	p.Wait() // 等 supervisor 收尾（stderr EOF ＋ Exit 快取）
+}
+
+func TestTerminateEscalatesViaInjectedTimerInOrder(t *testing.T) {
+	p := bashProc(t, context.Background(), `trap '' TERM HUP; echo ready; sleep 3600`, time.Hour)
+	t.Cleanup(func() { killAndReap(t, p) }) // 失敗路徑一律清組並等收尾
+	buf := make([]byte, 8)
+	if _, err := p.Stdout.Read(buf); err != nil { // 等 trap 生效
+		t.Fatal(err)
+	}
+	go func() { _, _ = io.ReadAll(p.Stdout) }()
+
+	events := make(chan signalEvent, 8)
+	timerCh := make(chan time.Time, 1)
+	durCh := make(chan time.Duration, 1) // channel 而非共用變數：避免 -race
+	p.mu.Lock()
+	p.onSignal = func(ev signalEvent) { events <- ev }
+	p.after = func(d time.Duration) <-chan time.Time { durCh <- d; return timerCh }
+	p.mu.Unlock()
+
+	if err := p.Terminate(); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	select { // TERM 事件在 Terminate() 返回前同步發出；此刻 leader 已 trap TERM
+	case ev := <-events: // 仍活著，不可能有其他事件搶先入列
+		if ev != sigEventTermSent {
+			t.Fatalf("第一個事件 = %v, want sigEventTermSent", ev)
+		}
+	default:
+		t.Fatal("Terminate() 返回時必須已經送出 sigEventTermSent")
+	}
+	select {
+	case d := <-durCh:
+		if d != p.grace {
+			t.Fatalf("注入的 timer 收到的 duration = %v, want p.grace = %v", d, p.grace)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("卡死保險：escalation goroutine 未呼叫注入的 after()")
+	}
+	select {
+	case <-p.exitedCh:
+		t.Fatal("leader 不該在 escalation timer 觸發前就退出（腳本已 trap TERM/HUP）")
+	default:
+	}
+	timerCh <- time.Now() // 測試觸發：模擬 grace 逾時
+
+	// escalation KILL 事件與 supervisor 收尾 KILL 事件之間沒有 happens-before：
+	// escalation 是在 p.mu 解鎖之後才通知觀察者，這段空窗足以讓 leader 死亡、
+	// supervisor 送出自己的 cleanup 事件並搶先入列。因此只要求 escalation 事件
+	// 「會出現」，容許 cleanup 事件夾在它前面，不斷言它必為佇列第二筆。
+	deadline := time.After(10 * time.Second)
+	for got := false; !got; {
+		select {
+		case ev := <-events:
+			switch ev {
+			case sigEventEscalationKill:
+				got = true
+			case sigEventSupervisorCleanupKill: // 容許：與 escalation 事件無順序保證
+			default:
+				t.Fatalf("非預期事件 %v", ev)
+			}
+		case <-deadline:
+			t.Fatal("卡死保險：未收到 sigEventEscalationKill 事件")
+		}
+	}
+
+	ex := p.Wait()
+	if ex.Code == 0 {
+		t.Fatal("escalation KILL 收場不得是 exit 0")
+	}
+	if !groupGone(p.PGID()) {
+		t.Fatal("escalation KILL 之後 process group 必須完全消失")
+	}
+}
+
+// 本測試手工部分建構 Proc、不啟動任何長駐程序（probe 已 Wait 收屍），因此不註冊
+// killAndReap——它沒有 supervisor，也沒有 doneCh 可等。
+func TestTerminateDoesNotEmitTermSentEventWhenSignalGroupFails(t *testing.T) {
+	probe := exec.Command("/usr/bin/true")
+	if err := probe.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan signalEvent, 4)
+	p := &Proc{pgid: probe.Process.Pid, grace: time.Second, exitedCh: make(chan struct{})}
+	p.mu.Lock()
+	p.onSignal = func(ev signalEvent) { events <- ev }
+	p.mu.Unlock()
+	if err := p.Terminate(); err == nil {
+		t.Fatal("對已消失的 process group 送 TERM 必須回報錯誤")
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("SignalGroup 失敗時不得發出任何事件，收到 %v", ev)
+	default:
+	}
+}
+
+func TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned(t *testing.T) {
+	cases := []struct {
+		name      string
+		script    string
+		wantEvent bool
+	}{
+		{name: "orphan_present_event_fires",
+			script:    `bash -c 'trap "" TERM; sleep 30' & echo ready; read -r _; echo out; echo err >&2; exit 5`,
+			wantEvent: true},
+		{name: "no_orphan_no_event",
+			script:    `echo ready; read -r _; exit 5`,
+			wantEvent: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := bashProc(t, context.Background(), c.script, time.Second)
+			t.Cleanup(func() { killAndReap(t, p) }) // 前段斷言失敗也要清乾淨
+			buf := make([]byte, 8)
+			if _, err := p.Stdout.Read(buf); err != nil {
+				t.Fatal(err)
+			}
+			events := make(chan signalEvent, 8)
+			p.mu.Lock()
+			p.onSignal = func(ev signalEvent) { events <- ev }
+			p.mu.Unlock()
+			out, rd := drainStdout(p)
+			if _, err := p.Stdin.Write([]byte("\n")); err != nil {
+				t.Fatal(err)
+			}
+			ex := p.Wait()
+			if ex.Code != 5 {
+				t.Fatalf("code = %d, want 5", ex.Code)
+			}
+			rd.Wait()
+			if c.wantEvent && !strings.Contains(out.String(), "out") {
+				t.Fatalf("stdout = %q", out.String())
+			}
+			select {
+			case ev := <-events:
+				if !c.wantEvent {
+					t.Fatalf("no_orphan 案例不該有 cleanup KILL 事件，收到 %v", ev)
+				}
+				if ev != sigEventSupervisorCleanupKill {
+					t.Fatalf("事件 = %v, want sigEventSupervisorCleanupKill", ev)
+				}
+			default:
+				if c.wantEvent {
+					t.Fatal("orphan_present 案例必須發出 sigEventSupervisorCleanupKill")
+				}
+			}
+			if !groupGone(p.PGID()) {
+				t.Fatal("process group 必須完全消失（含孫程序，若有）")
+			}
+		})
+	}
+}
