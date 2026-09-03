@@ -28,6 +28,11 @@ func drain(s *Session) []contract.Kind {
 var _ ports.Turns = (*Session)(nil)       // 編譯期介面契約
 var _ ports.Diagnostics = (*Session)(nil) // Argv 診斷能力
 
+// 牆鐘相依處置（backlog B1a-2）：waitResult 的局部 deadline 由 5s 放寬到 15s。
+// preflight 240 筆量測（單獨 -count=20 共 60 筆：max 383ms；./internal/... 並行
+// 負載下 ×3 輪共 180 筆：max 29ms）**沒有**證明 5s 不足，也沒有觀察到任何逾時。
+// 383ms 是本輪唯一觀察到的冷啟動樣本，**CI runner 仍未驗證**——這個缺口留給
+// B1a-4 的整合負載矩陣，本票不宣稱已消除。
 func TestMultiTurnSendAndTurnBoundaries(t *testing.T) {
 	cfg := fakeCfg(t, "FAKE_MULTI=1")
 	cfg.MultiTurn = true
@@ -36,10 +41,24 @@ func TestMultiTurnSendAndTurnBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// failure-safe 回收：waitResult 的 deadline t.Fatal 會跳過函式尾端的
+	// Close／drain／Wait，殘存的 fake CLI 會污染同套件後續測試（mutation 3a 就是
+	// 刻意走這條路）。Terminate 在退出已記錄時是 no-op（proc.Terminate 的
+	// `if p.exited` 守衛，避免對已回收、可能被重用的 pgid 再送訊號），Wait 回傳
+	// supervisor 快取值、可重複呼叫——因此正常路徑既有的 graceful close 不受影響。
+	t.Cleanup(func() {
+		_ = s.Terminate()
+		s.Wait()
+	})
 	var results int
 	events := s.Events()
 	waitResult := func() {
-		deadline := time.After(5 * time.Second)
+		// 15s 只是卡死診斷的保險絲，成功判準是收到 KindResult 事件，不是「跑得夠快」。
+		// 沿用 app_test.go 的 waitFor 先例（同一種 fake CLI spawn 壓力下，5s 在
+		// -race 全套並行時實測會偶發逾時）。維持局部 deadline、不退回只靠
+		// `go test -timeout`：局部失敗能指出「卡在第幾輪的哪個等待」，package
+		// timeout 只會丟出整包 goroutine dump。
+		deadline := time.After(15 * time.Second)
 		for {
 			select {
 			case ev, ok := <-events:
@@ -51,7 +70,7 @@ func TestMultiTurnSendAndTurnBoundaries(t *testing.T) {
 					return
 				}
 			case <-deadline:
-				t.Fatal("no result within 5s")
+				t.Fatal("no result within 15s")
 			}
 		}
 	}
