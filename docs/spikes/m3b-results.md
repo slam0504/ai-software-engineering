@@ -485,6 +485,26 @@ FAIL	github.com/slam0504/sdlc-workbench/internal/codex	33.229s
 4. root package `TestInFlightTurnDoesNotBlockNewSession`
 5. `internal/codex` `TestAppServerMidStreamDeath`
 
+### 7.1 處置結果（2026-09-04，B1a 收尾，整合 HEAD `583387d`）
+
+本節為 **B1a-4 整合驗收**追加；§7 上文為 2026-08-21 的歷史觀察，**原文一字未動**。上文的操作規則——「這幾條紅了先單獨重跑再判定、不計入回歸；它們的綠燈也不作為任何修正的通過證據」——**自本節起對下列六條不再適用**：六條之一在 `-race`／併行／負載下 FAIL，**先依 B1a-4 plan D1 分類**——命中該測試的契約／oracle 斷言、或 goroutine dump 可歸因於其契約路徑的卡死（panic／`-timeout`），才是**契約回歸**，不得以單獨重跑吸收；命中 setup／前提校驗、可證明的資源失效、或可歸因於其他測試的 panic／`-timeout`，標為**該次無效**並揭露，不算紅也不算綠。目前有效名單與規則改由 living 文件 `docs/architecture/wall-clock-test-register.md` 承載。
+
+| # | 測試（套件） | 處置 | commit | 修正方式 | 整合負載重驗（B1a-4，本機 8 核） |
+|---|---|---|---|---|---|
+| 1 | `TestAppServerTerminateKillsGroup`（`internal/codex`） | resolved（B1a-1） | `82caf8b`、`f7ad1ed` | `Proc` 新增未匯出 timer／signal-event seam＋三條白箱測試，各驗一種契約：`TestTerminateEscalatesViaInjectedTimerInOrder` 以注入 timer 確定性驗 TERM → grace 到期 → escalation KILL 的順序；`TestTerminateDoesNotEmitTermSentEventWhenSignalGroupFails` 驗 TERM 送出失敗時不得發 term-sent 事件；`TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned` 驗 supervisor 收尾的 cleanup-kill 事件只在 group 實際被清除時發出。codex 端改寫為驗 supervisor 收尾，不再宣稱驗到 escalation | 27 次有效指定執行全 PASS |
+| 2 | `TestClaudeAssistFailsLoudOnOversizedLine`（`internal/assist`） | resolved（B1a-2） | `7b1bb0c` | 移除 fixture 的 `tr` 轉換、保留 15 秒 context | 27 次全 PASS；三份併發下最長 8.02s |
+| 3 | `TestMultiTurnSendAndTurnBoundaries`（`internal/claude`） | resolved（B1a-2） | `05069e2` | `waitResult` 局部 deadline 5s→15s（卡死保險絲，非成功判準） | 27 次全 PASS |
+| 4 | `TestInFlightTurnDoesNotBlockNewSession`（root） | resolved（B1a-2） | `b0a8404` | `afterFn` 接上既有 `newFakeAfter()`，quiesce 逾時不再由真實時鐘決定 | 27 次全 PASS |
+| 5 | `TestAppServerMidStreamDeath`（`internal/codex`） | **no-change disposition**（B1a-3） | **無**（不存在 implementation 或 resolved commit，不得虛構） | preflight 未證實存在可修的牆鐘缺陷（非宣稱它完全不含牆鐘）；兩個 Handshake 植入點皆屬既有 production code、不進 mutation 分母 | 27 次全 PASS |
+| 6 | `TestOutputCancellationKillsGrandchildren`（`internal/proc`；**§7 原具名清單之外**——原為 backlog 候選，於 backlog rev11 轉正） | resolved（B1a-3） | `39aa732` | 第二段輪詢 `deadline` 重設＋fixture 改由父 shell 寫 `$!`＋`pid != pgid` oracle 斷言 | 27 次全 PASS；三份併發下最長 9.3s |
+
+**整合負載矩陣**（B1a-4 plan Gate A，`docs/superpowers/plans/2026-09-04-b1a-4-integration-acceptance.md`）：對整合 HEAD `583387d` 於隔離 worktree 執行 M1 逐包單跑、M2 五套件併行 ×3、M3 三份 M2 併發 ×1、M4 背景負載下六條 focused ×20；全部 `-race -p=8`。18 個 `-json` artifact 頂層 FAIL 事件 0；root 422 PASS＋1 SKIP（`UPDATE_CORPUS` env gate）、`internal/codex` 47、`internal/assist` 20、`internal/claude` 22、`internal/proc` 18。B1a preflight（backlog rev8）未涵蓋的 root 與 `internal/proc` 兩包本輪均在負載下跑完。
+
+**仍未消除的缺口（誠實標註）**：
+- **CI runner 冷啟動分布未取得**——所有量測來自本機 8 核；移交 **B2**（CI 建立後首批 required check 跑批時補量 #2／#3／#6）。
+- **#6 的自然誤紅從未在本機重現**——只有 B1a-3 的人工延遲證明機制（21 秒 sleep）與本輪負載下 27/27 全綠；結論是「本機負載下未重現」，不是「不可能發生」。
+- **#2／#6 餘裕觀察（本機 8 核、M3 三份併發下，不外推至 CI）**：#2 最長 8.02s／預算 15s（約 1.9 倍）、#6 最長 9.3s／deadline 20s（約 2.2 倍），遠低於單跑時的約 30 倍；CI runner 若比本機弱，這兩條最先逼近預算。
+
 ---
 
 ## 8. 驗收過程打紅的第二條既有測試競態（已修，root cause 已定位）
