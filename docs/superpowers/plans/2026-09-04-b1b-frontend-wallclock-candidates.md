@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev3（2026-09-04，第二輪 owner CHANGES_REQUIRED 後修訂：一項 P1——`run3` launcher 改為 fail loud（子 shell 帶 Node PATH 並以 vitest rc 結束、父層逐一 `wait "$pid"` 並比對 `.exit`、artifact 缺件或無重疊即非零返回），Gate A 明列 P 三份 exit 0、N1／N2 非零且只失敗於指定候選；非阻斷：Architecture 與註解模板改為「目前假設」語氣；前版：rev2（第一輪 CHANGES_REQUIRED 後修訂：三項 P1——preflight 表格 F1／F2 三格寫反已更正並補齊 artifact、Gate A 三份併發改用可逐字執行的 launcher 與重疊區間判準、register 規則 7 具名 F1／F2 的 FAIL 分類契約——與一項 P2——Task 2 scope check 時機；D1–D3 裁定回寫；前版：rev1）
-> 狀態：**design gate 待審（rev3 短複審）——preflight 已完成（唯讀量測，主工作區零異動），兩條候選在現行 HEAD 已重現；尚未修改任何檔案、未 commit**。D1–D3 已裁定，Task 1 待 rev3 複審通過後開始
+> 版本：rev7（2026-09-04，rev6 短複審 CHANGES_REQUIRED 後修訂：P1 Gate A 的 manifest 驗證改為在 `$B1B` 內執行（manifest 只含 basename），Step 0 開頭補「已存在即 exit 1」讓不得重產 fail loud；P2 Task 1 前置與版本摘要的「rev5 通過後」改 rev7；前版：rev6（rev5 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪開始前先對 83 個既有 artifact 建立 `legacy-artifacts-sha256.txt`（目錄外建立再移入、不得重產），Gate A 改為 `shasum -a 256 -c` 該 manifest；P2 狀態列改「rev5 通過後」、Step 1 的 `shasum -c` 改用 `$B1B` 絕對路徑；前版：rev5（rev4 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪 artifact 全部改 `v4-` 前綴（`v4-single-*`／`v4-P-r1`／`v4-P-r2`／`v4-seq-r1..3`／`v4-N1`／`v4-N2`），既有 `P-r1-*`、`SPIKE-P-*` 不得覆寫；P2 Task 1 殘留的 (a) 契約與「約 50ms」預設值統一為 (a′) 與只記錄；P2 補 `B1B` 沿用 `/tmp/b1b.RHppZ0` 的 rev4 例外；前版：rev4（Task 1 Step 4 依停下條件中止後修訂：(a) 純 import 預熱的 positive control **不成立**（F1 仍 timeout 2/3），owner 裁定選項 1、經未提交 spike 驗證後，模板改為 **(a′) import 預熱＋一次 `EditorView` 建構預熱**；spike 證據只作設計依據、不算 Gate A；正式 P／N1／N2 依新模板重跑；前版：rev3（第二輪 CHANGES_REQUIRED 後修訂：一項 P1——`run3` launcher 改為 fail loud（子 shell 帶 Node PATH 並以 vitest rc 結束、父層逐一 `wait "$pid"` 並比對 `.exit`、artifact 缺件或無重疊即非零返回），Gate A 明列 P 三份 exit 0、N1／N2 非零且只失敗於指定候選；非阻斷：Architecture 與註解模板改為「目前假設」語氣；前版：rev2（第一輪 CHANGES_REQUIRED 後修訂：三項 P1——preflight 表格 F1／F2 三格寫反已更正並補齊 artifact、Gate A 三份併發改用可逐字執行的 launcher 與重疊區間判準、register 規則 7 具名 F1／F2 的 FAIL 分類契約——與一項 P2——Task 2 scope check 時機；D1–D3 裁定回寫；前版：rev1）
+> 狀態：**design gate 待審（rev7 短複審）——rev3 已 APPROVED 並提交（`ec9addc`）；Task 1 以 (a) 執行到 Step 4 P-r1 後依停下條件中止，spike 已完成並還原；worktree `b1b-1` 目前為 (a) import-only golden 狀態、主工作區只有本 plan 修改**。rev7 通過後，Task 1 自 Step 0（legacy manifest）與 Step 1 的「rev4 重做」起以 (a′) 重做
 > 票源：Pre-M4 Readiness Backlog **B1b**（rev14 票面 0.3 pt；**owner 於本 plan gate 裁定改為 0.4 pt**，見 D3）。B1 驗收條件 (4)：「剩餘兩條前端候選須以現行 HEAD 重現——成立者補入 living 文件後併入本票或開續票，不成立者除名（裁決 #9）」
 > 基準 commit：**`92719fba41c3402daed44140a280d32a90510c36`**（backlog rev14，已推送、`git ls-remote` 核實相符）
 > 前置：B1a aggregate 已關閉（rev14）。本票關票後 **B1 票整體關閉**，B2 驗收條件 (3)「race＋全套測試升 required 前置 B1 完成」的前置成立
 
 **Goal:** 依裁決 #9 對兩條前端候選做出可稽核的處置：兩條**已在現行 HEAD 重現**（preflight 三份併發 3/3），因此走「成立者併入本票」路徑——修掉測試的牆鐘相依（**production 零變更**），以測試側 negative／positive control 證明修正改變了鑑別力，補入 living 文件，關閉 B1。
 
-**Architecture:** 兩條候選的失效形狀相同（同一 `Test timed out in 5000ms`、同在三份併發下出現），**根因目前為同一假設**（CodeMirror 動態 import 成本落在執行中的測試，待 Task 1 N1／N2 確認），因此一起處置。修法在測試檔而非元件：把 CodeMirror 動態 `import()` 的模組載入成本從測試本體移到 `beforeAll`，測試本體只剩它們真正要驗的契約（loading 顯示與輸出累積；換檔後丟棄過期 assist 結果）。**不動 `vitest.config.ts` 的 `testTimeout`**——放寬 timeout 是 B1a 系列明確拒絕的牆鐘式修法。
+**Architecture:** 兩條候選的失效形狀相同（同一 `Test timed out in 5000ms`、同在三份併發下出現），**根因目前為同一假設**——rev4 修正為：CodeMirror 的**模組動態載入＋首次 `EditorView` 建構**兩筆一次性成本落在執行中的測試（rev3 只假設前者，Task 1 (a) 的 P-r1 證明前者不足：F2 轉綠但成本移到 SpecWorkspace 第一條、F1 仍 timeout），待 N1／N2 確認。修法在測試檔而非元件：在 `beforeAll` 內完成 import **並建構一次即銷毀的 `EditorView`**，把兩筆一次性成本都移出測試本體，測試本體只剩它們真正要驗的契約（loading 顯示與輸出累積；換檔後丟棄過期 assist 結果）。**不動 `vitest.config.ts` 的 `testTimeout`**——放寬 timeout 是 B1a 系列明確拒絕的牆鐘式修法。
 
 **Tech Stack:** Vitest 4.1.10（jsdom）、Node v26.8.1（`~/.nvm/versions/node/v26.8.1/bin`，本 shell PATH 預設不含，指令須顯式加入）、`@vue/test-utils`；無新依賴。
 
@@ -52,7 +52,17 @@
 4. （推論）全套並行（每檔一個 worker）時放大到約 2s，三份併發時放大到 6–8s > 5s。若假設成立，這是**測試量到了牆鐘**（模組載入時間），不是它們要驗的契約（loading 顯示／換檔丟棄）失效。
 5. 唯一其他使用同樣 pending-promise 寫法的 `TcaWorkspace.test.ts` 不動態載入 CodeMirror，三份併發下最慢 787ms，未失敗——與根因一致。
 
-**未驗證（Task 1 要做）**：把 import 成本移出測試本體後，三份併發下兩條是否穩定轉綠；以及移除修法後是否穩定轉紅（differential）。**只有 N1／N2 differential 成立，上述根因假設才升格為已確認。**
+**未驗證（Task 1 正式輪要做）**：以 (a′) 把 import 與首次 `EditorView` 建構兩筆成本移出測試本體後，三份併發下兩條是否穩定轉綠（P 兩輪）；以及逐檔移除 (a′) 後是否穩定只有該檔候選轉紅（N1／N2 differential）。**只有 N1／N2 differential 成立，上述根因假設才升格為已確認。**
+
+**Task 1 (a) 執行結果（2026-09-04，worktree `b1b-1` @ `92719fb`，證據目錄 `/tmp/b1b.RHppZ0`）——positive control 不成立，依停下條件中止**：
+- 基準 397 PASS（`base-r1`）；原始 hash `db31bc91…`／`ef218eff…`；(a) 套用後 golden `83a946fa…`（Plan）／`86293572…`（Spec），diff 各 +9／−1。
+- 單檔 ×3（`single-*`）：PlanWorkspace 第 1 條 **344／433／436ms**（其餘 46–70ms）；SpecWorkspace 第 1／2 條 **352／144、332／129、302／149ms**——成本自 F2 移到同檔第一條，未消失。
+- `run3 P-r1`：rc=0（overlap 83.14s，wait／exit 相符）；**c1、c2 各 1 failed／396 passed，c3 397 passed**。失敗者恰為 F1（5523／5393ms `Test timed out in 5000ms`，c3 4607ms 險過）；F2 三份 1475／1737／1746ms PASS；SpecWorkspace 第 1 條 4209–4732ms。→ **import 預熱只解掉一部分，剩餘一次性成本落在首次建構 `EditorView` 的測試上**（新假設）。N1／N2 未執行。
+
+**Spike（owner 裁定選項 1；未提交、只作 rev4 設計證據、不算 Gate A）**：在 (a) 之上，`beforeAll` 內以暫時 host 建構一次 `EditorState`＋`EditorView` 隨即 `destroy()` 並移除 host，不 catch。spike hash `db90d0d9…`（Plan）／`c3a7adc3…`（Spec）。
+- 單檔 ×3（`spike-single-*`）：PlanWorkspace 第 1 條 **157／158／162ms**；SpecWorkspace 第 1／2 條 **61／108、66／131、76／139ms**。
+- `run3 SPIKE-P`：rc=0（overlap 87.00s）；**三份皆 397 PASS**；F1 2317／2246／2427ms、F2 1302／1549／1318ms、SpecWorkspace 第 1 條 1073／1064／1116ms。
+- 完成後還原到 (a) golden（`shasum -c hash-golden.txt` 兩檔 OK）。spike 的 P 只跑一輪、未跑 N1／N2，因此**只證明方向可行**，正式證據由 rev4 的 Task 1 重取。
 
 ---
 
@@ -74,7 +84,7 @@
 | (b) `vi.mock('codemirror')` 打樁 | 在兩檔 mock 掉 CodeMirror | 最快 | 元件從此在測試中不建構真實 `EditorView`，降低這兩檔所有測試的保真度；超出兩條候選的範圍 |
 | (c) 兩條加 `{ timeout: 15_000 }` | 放寬單測 timeout | 一行 | 正是 B1a 拒絕的牆鐘式修法，負載更大時再度偽陽；三份併發已到 7.7s，餘裕不到 2 倍 |
 
-**owner 裁定：採 (a)**；根因仍需由 Gate A control 最終確認。hook 顯式 `30_000` 而非依賴預設，理由同 B1a-2 #3：它是卡死保險絲、不是成功判準，本 plan 不把「hook 跑得夠快」寫成通過條件。
+**owner 裁定（第一輪）：採 (a)**。**Task 1 實測 (a) 不足（見上），owner 第二輪裁定採選項 1 ＝ (a′)：import 預熱＋一次 `EditorView` 建構預熱**，spike 已證明方向可行；正式 P／N1／N2 以 (a′) 重跑。若 (a′) 的正式 P 仍有任一 F1／F2 timeout，立即停止，屆時再裁定是否接受 (b) 的保真度代價；元件載入策略仍屬另一張票。hook 顯式 `30_000` 而非依賴預設，理由同 B1a-2 #3：它是卡死保險絲、不是成功判準，本 plan 不把「hook 跑得夠快」寫成通過條件。
 
 **D2 living 文件的落法**——**owner 裁定：直接更新 register B 段，不新增 D 段，並補具名 FAIL 分類規則。** B 段兩條由「待重現（B1b）」改為「**已重現並處置**（B1b，commit）」並補根因與修法。規則段新增**規則 7（具名 F1／F2）**：
 
@@ -90,7 +100,7 @@
 
 - 所有 vitest 指令以 `PATH="$HOME/.nvm/versions/node/v26.8.1/bin:$PATH"` 前置，並用 `./node_modules/.bin/vitest`；`node --version` 記入證據。
 - **Task 1 一律在隔離 worktree 執行**：`git worktree add --detach /Users/eason_tseng/scratch-worktrees/b1b-1 92719fb`；`frontend/node_modules` 不在 git 內，worktree 需 `cp -R`（或 symlink）主 repo 的 `frontend/node_modules`，複製方式與其後 `vitest run` 首次結果記入證據。主工作區 Task 1 期間零異動。
-- 每個工具呼叫以三行前置開頭（`cd` worktree 絕對路徑、`B1B=<mktemp 實際絕對路徑>` 並 `test -d`、HEAD 核對 `92719fb…`），fail loud（沿 B1a-4）。
+- 每個工具呼叫以三行前置開頭（`cd` worktree 絕對路徑、`B1B=<mktemp 實際絕對路徑>` 並 `test -d`、HEAD 核對 `92719fb…`），fail loud（沿 B1a-4）。**rev4 起的例外**：證據目錄**不再 `mktemp`**，沿用 rev3 Task 1 已建立的 `/tmp/b1b.RHppZ0`，前置行固定為 `B1B=/tmp/b1b.RHppZ0; test -d "$B1B" || exit 1`；既有 (a) 輪 artifact（`base-r1`、`single-*`、`P-r1-*`、`hash-original.txt`、`hash-golden.txt`）與 spike artifact（`spike-single-*`、`SPIKE-P-*`、`hash-spike.txt`）**一律不得覆寫或刪除**，正式輪全部使用 `v4-` 前綴。
 - 每次 vitest 都保存 stdout（`--reporter=verbose`）、stderr、exit code。**三份併發（P、N1、N2 共用）一律用下列可逐字執行的 launcher**，每份保存 PID、`monotonic_ns` start／end、stdout、stderr、exit，父程序保存 `wait` 結果：
 
   ```sh
@@ -134,16 +144,31 @@
 
   **有效三份併發的判準：`run3` 回傳 0**（artifact 齊全、每份 `wait` rc 與 `.exit` 相符、`max(start) < min(end)`）；非零即該輪無效、artifact 保留並揭露、重跑。overlap 秒數與三份 exit 記入證據。**每次呼叫 `run3` 後必須立刻 `echo "run3 rc=$?"` 並抄錄。**
 - **紅燈語意**：negative control 必須紅在兩條候選的 `Test timed out in 5000ms`（逐字抄錄）；其他測試若在三份併發下失敗，依 B1a-4 D1 分類並揭露，不吸收。
-- **時間常數不得成為成功判準**：候選在修法後的耗時只作觀察記錄（預期由約 400ms 降至約 50ms），不設門檻。
+- **時間常數不得成為成功判準**：候選在修法後的耗時只作觀察記錄，不預設數值、不設門檻。
 - 三份併發若因環境失效（OOM、worker 啟動失敗）→ 該輪無效、揭露、降為兩份 ×2 輪（沿 B1a-4 M3 降級規則）。
 
 ---
 
-## Task 1: 隔離 worktree 落地 (a) ＋ 三組 control（不 commit）
+## Task 1: 隔離 worktree 落地 (a′) ＋ 三組 control（不 commit）
 
-**前置：D1 裁定為 (a)。**
+**前置：D1 第二輪裁定為 (a′)；rev7 通過後自 Step 0 與 Step 1 的「rev4 重做」開始。**
 
-- [ ] **Step 1: worktree 與環境**：建 worktree、複製 `frontend/node_modules`、`mktemp -d /tmp/b1b.XXXXXX`、記 `node --version`／`vitest --version`／HEAD；**基準**：全套單跑 ×1 → 預期 397 PASS；記兩檔原始 SHA-256（`shasum -a 256 frontend/src/components/PlanWorkspace.test.ts frontend/src/components/SpecWorkspace.test.ts`）。
+- [ ] **Step 0（rev6 新增，正式輪任何 `v4-*` 輸出之前）：既有 artifact 的 checksum manifest**。目的：事後能證明 (a) 輪與 spike 的證據在正式輪期間未被覆寫。
+
+```sh
+B1B=/tmp/b1b.RHppZ0; test -d "$B1B" || exit 1
+test ! -e "$B1B/legacy-artifacts-sha256.txt" || { echo "manifest already exists: refusing to regenerate"; exit 1; }
+ls "$B1B" | wc -l                                   # 預期 83（建立前）
+( cd "$B1B" && ls | LC_ALL=C sort | xargs shasum -a 256 ) > /tmp/b1b-legacy-manifest.tmp   # 先寫在目錄外
+wc -l /tmp/b1b-legacy-manifest.tmp                  # 預期 83 筆
+mv /tmp/b1b-legacy-manifest.tmp "$B1B/legacy-artifacts-sha256.txt"
+ls "$B1B" | wc -l                                   # 預期 84（建立後）
+shasum -a 256 "$B1B/legacy-artifacts-sha256.txt"    # manifest 自身 hash 記入證據段
+```
+
+  **manifest 之後不得重產或覆寫**；建立前 83 檔、建立後 84 檔兩個數字記入證據。之後每個 `v4-*` 檔案都是新增，不觸碰清單內任何檔案。
+
+- [ ] **Step 1: worktree 與環境**：建 worktree、複製 `frontend/node_modules`、`mktemp -d /tmp/b1b.XXXXXX`、記 `node --version`／`vitest --version`／HEAD；**基準**：全套單跑 ×1 → 預期 397 PASS；記兩檔原始 SHA-256。**rev4 重做時**：既有 worktree `b1b-1` 與證據目錄 `/tmp/b1b.RHppZ0` 沿用（HEAD、node、vitest、基準、原始 hash 皆已記錄），先把兩檔還原到原始 hash `db31bc91…`／`ef218eff…`（在 worktree 的 `frontend/` 目錄執行 `shasum -a 256 -c "$B1B/hash-original.txt"`，兩檔須 OK）再自 Step 2 開始；正式輪的 artifact 一律加 `v4-` 前綴（golden hash 檔為 `v4-hash-golden.txt`），與 (a)／spike 的 artifact 區隔、不得覆寫（`shasum -a 256 frontend/src/components/PlanWorkspace.test.ts frontend/src/components/SpecWorkspace.test.ts`）。
 - [ ] **Step 2: 套用模板（兩檔各一段，放在既有 `describe` 內第一個 `it` 之前；import 行併入既有 `vitest` import）**
 
 ```ts
@@ -151,22 +176,31 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 ```
 
 ```ts
-  // CodeMirror 由元件 onMounted 內動態 import。B1b preflight 觀察：本檔一條測試在
-  // 全套並行下約 2s、三份併發下約 7s > 5s 預設 timeout，其餘測試僅數十 ms；差額與
-  // 模組載入成本量級一致（假設由 B1b Task 1 的 differential control 驗證）。先在
-  // hook 內載入一次，讓測試本體只量契約、不量模組載入。30s 是卡死保險絲，不是成功判準。
+  // CodeMirror 由元件 onMounted 內動態 import 並建構 EditorView。B1b 觀察：本檔一條測試在
+  // 全套並行下約 2s、三份併發下約 7s > 5s 預設 timeout，其餘測試僅數十 ms；只預熱 import
+  // 時成本會移到同檔另一條測試而不消失（假設：剩餘為 jsdom 首次建構 EditorView 的一次性
+  // 成本，由 B1b Task 1 的 differential control 驗證）。先在 hook 內 import 並建構一次即銷毀，
+  // 讓測試本體只量契約。不 catch：建構或清理失敗就讓 hook 失敗。30s 是卡死保險絲，不是成功判準。
   beforeAll(async () => {
-    await Promise.all([import('codemirror'), import('@codemirror/state')])
+    const [{ EditorView, basicSetup }, { EditorState }] = await Promise.all([
+      import('codemirror'),
+      import('@codemirror/state'),
+    ])
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const view = new EditorView({ state: EditorState.create({ doc: '', extensions: [basicSetup] }), parent: host })
+    view.destroy()
+    host.remove()
   }, 30_000)
 ```
 
-  套用後 `git diff --stat` 預期兩檔各 +8 行左右（含 import 補字）；記 **golden SHA-256**（兩檔）。
+  套用後 `git diff --stat` 預期兩檔各約 +18／−1（含 import 補字）；記 **golden SHA-256**（兩檔）。**rev3 的 (a) golden `83a946fa…`／`86293572…` 與 spike hash `db90d0d9…`／`c3a7adc3…` 均作廢，不得用作比對基準**（spike 註解含「SPIKE」字樣，與本模板不同）。
 
-- [ ] **Step 3: 單檔觀察**：兩檔各獨跑 ×3 `--reporter=verbose`，記錄前三條耗時（預期候選降到與鄰近測試同量級，約 25–60ms；只記錄不設門檻）。
-- [ ] **Step 4: positive control（P）**：`run3 P-r1`、`run3 P-r2`（兩輪 `run3` rc 皆須為 0；且六份 `.exit` 皆 0）→ 預期六份全部 397 PASS，F1／F2 耗時（名稱錨定抽取）記錄；另全套依序 ×3（`seq-r1..3`）→ 397 PASS ×3。
+- [ ] **Step 3: 單檔觀察**：兩檔各獨跑 ×3 `--reporter=verbose`，artifact `v4-single-<檔>-r1..3.{out,err,exit}`，記錄前三條耗時（只記錄，不預設數值、不設門檻）。
+- [ ] **Step 4: positive control（P）**：`run3 v4-P-r1`、`run3 v4-P-r2`（兩輪 `run3` rc 皆須為 0；且六份 `.exit` 皆 0）→ 預期六份全部 397 PASS，F1／F2 耗時（名稱錨定抽取）記錄；另全套依序 ×3（artifact `v4-seq-r1..3.{out,err,exit}`）→ 397 PASS ×3。
 - [ ] **Step 5: negative control（N1、N2，differential）**：
-  - N1：只還原 `PlanWorkspace.test.ts` 到原始 hash（`SpecWorkspace.test.ts` 保留修法），`run3 N1`（`run3` rc 須為 0；三份 `.exit` 皆非零）→ 預期三份都**只有 F1** `Test timed out in 5000ms`（`1 failed | 396 passed`），F2 PASS。
-  - N2：只還原 `SpecWorkspace.test.ts`（PlanWorkspace 保留修法），`run3 N2`（`run3` rc 須為 0；三份 `.exit` 皆非零）→ 預期三份都**只有 F2** timeout（`1 failed | 396 passed`），F1 PASS。
+  - N1：只還原 `PlanWorkspace.test.ts` 到原始 hash（`SpecWorkspace.test.ts` 保留 (a′)），`run3 v4-N1`（`run3` rc 須為 0；三份 `.exit` 皆非零）→ 預期三份都**只有 F1** `Test timed out in 5000ms`（`1 failed | 396 passed`），F2 PASS。
+  - N2：只還原 `SpecWorkspace.test.ts`（PlanWorkspace 保留 (a′)），`run3 v4-N2`（`run3` rc 須為 0；三份 `.exit` 皆非零）→ 預期三份都**只有 F2** timeout（`1 failed | 396 passed`），F1 PASS。
   - 每項四步：套用前後 hash、編譯／載入正常（vitest 能跑）、紅在指定訊息（逐字）、還原後 hash 回 golden。**分母 2/2（N1、N2）。** 若三份併發下某輪未轉紅（負載不足），加到四份併發重試一次並揭露；仍不紅則本票停下回報（根因假設需重審）。
 - [ ] **Step 6: 還原到 golden**、全套單跑 ×1 回綠、hash 三時點（套用後／N 還原後／結束時）皆命中 golden；`git worktree remove --force`；主工作區零異動。
 
@@ -182,17 +216,18 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 
 ## Task 3: living 文件更新＋backlog rev15（B1 關閉）
 
-- [ ] `wall-clock-test-register.md` v2：B 段兩條就地改「已重現並處置（B1b，`<commit>`）」，附根因一句（經 N1／N2 確認後才寫「已確認」）與修法；規則段新增 **D2 裁定的規則 7 全文**（具名 F1／F2 的 FAIL 分類契約）；修訂記錄 v2。
+- [ ] `wall-clock-test-register.md` v2：B 段兩條就地改「已重現並處置（B1b，`<commit>`）」，附根因一句（模組載入＋首次 `EditorView` 建構兩筆一次性成本；經 N1／N2 確認後才寫「已確認」）與修法 (a′)；規則段新增 **D2 裁定的規則 7 全文**（具名 F1／F2 的 FAIL 分類契約）；修訂記錄 v2。
 - [ ] backlog rev15：B1b 已完成（plan／implementation commit）；**B1 票整體關閉**；B2 驗收條件 (3) 前置成立；**估點 0.3 → 0.4 pt（D3）**，B 軌 117.05 hr → 11.71 pt、合計 182.05 hr → 18.21 pt（以 hr 推導）；修訂記錄含 preflight 重現數字（名稱錨定值）、control 2/2、三份併發重疊區間、production 零變更。
 - [ ] Task 3 一個 commit；Gate B range diff `92719fb..HEAD` 只含 plan＋兩測試檔＋register＋backlog。
 
 ---
 
 ## Gate A（Task 1 完成條件，隔離 worktree）
-- [ ] 基準 397 PASS；golden hash 記錄。
-- [ ] P：`run3 P-r1`／`P-r2` 回傳 **0**（抄錄 `run3 rc=0`）；**六份 `.exit` 皆 0**、各 397 PASS；依序 ×3 全綠。
-- [ ] N1、N2：`run3` 回傳 **0**；**三份 `.exit` 皆非零**，且每份 `.out` 為 `1 failed | 396 passed`、失敗者恰為指定候選並紅在 `Test timed out in 5000ms`、另一條候選 PASS；四步齊備，2/2。
-- [ ] 任何 `run3` 非零（2 缺件／3 wait≠exit／4 無重疊）的輪次已標無效、artifact 保留、重跑並揭露。
+- [ ] 基準 397 PASS；(a′) golden hash 記錄，且與 (a) golden、spike hash 三者互異。
+- [ ] P：`run3 v4-P-r1`／`v4-P-r2` 回傳 **0**（抄錄 `run3 rc=0`）；**六份 `.exit` 皆 0**、各 397 PASS；`v4-seq-r1..3` 全綠。
+- [ ] `v4-N1`、`v4-N2`：`run3` 回傳 **0**；**三份 `.exit` 皆非零**，且每份 `.out` 為 `1 failed | 396 passed`、失敗者恰為指定候選並紅在 `Test timed out in 5000ms`、另一條候選 PASS；四步齊備，2/2。
+- [ ] 任何 `run3` 非零（2 缺件／3 wait≠exit／4 無重疊）的輪次已標無效、artifact 保留、重跑（新 tag 如 `v4-P-r1b`）並揭露。
+- [ ] Step 0 的 `legacy-artifacts-sha256.txt`（83 筆）於正式輪開始前建立、其後未重產；Gate A 結束時 **在 `$B1B` 內**執行 `(cd "$B1B" && shasum -a 256 -c legacy-artifacts-sha256.txt)`（manifest 只含 basename，從其他目錄執行會全部 `No such file`）**83/83 OK**（含 `P-r1-*`、`SPIKE-P-*`、`hash-*.txt`、`run3.sh`），證明舊證據未被覆寫；正式輪與舊輪可逐字對照。
 - [ ] 每份併發子程序的 `.pid`／`.start`／`.end`／`.out`／`.err`／`.exit` 與父程序 `-wait.txt` 齊全，overlap 秒數記錄。
 - [ ] hash 三時點命中 golden；worktree 移除；主工作區零異動。
 
@@ -208,11 +243,16 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 2. **只處理兩條候選**：其他前端測試在三份併發下最慢 1.3s（`binds the draft…`、`驗證錯誤…`），未達 5s，但未逐一評估動態 import 影響；不在本票範圍。
 3. **修法依賴 vitest 的 `beforeAll` 先於同檔第一條測試執行**：屬 vitest 文件化語意，本票以 control 實證，不另證明。
 4. **preflight 的三份併發（`con-c1..3`）未保存各份 start／end**：重疊區間無法事後證明，只作重現依據；Gate A 一律改用 launcher。
+5. **(a′) 預熱後 F1 在三份併發下仍約 2.3s**（spike 觀察），高於同檔其他測試（<1s）；剩餘差額來源未定位，本票不追（不影響 5s 判準，且時間常數不是成功判準），記入 register 觀察欄。
 
 ## 尚未完成
-- design gate 待審（rev3 短複審；D1–D3 已裁定）。Task 1–3 未執行。本 plan 未 commit。
+- design gate 待審（rev7 短複審）。Task 1 (a) 版已中止，(a′) 正式輪未執行；Task 2–3 未執行。rev3 已 commit（`ec9addc`），rev4 未 commit。
 
 ## 修訂記錄
+- rev7（2026-09-04，rev6 短複審 CHANGES_REQUIRED）：P1 Gate A manifest 驗證改為 `(cd "$B1B" && shasum -a 256 -c legacy-artifacts-sha256.txt)`（manifest 只含 basename；owner 實證從 `frontend/` 執行為 rc 1 `No such file`、切入 `$B1B` 為 rc 0）；Step 0 開頭補 `test ! -e` 已存在即 exit 1。P2 Task 1 前置與狀態列的舊 rev 字樣改 rev7。未重跑 spike、未修改原始碼、未 commit。
+- rev6（2026-09-04，rev5 短複審 CHANGES_REQUIRED）：P1 新增 Task 1 Step 0——正式輪任何 `v4-*` 輸出前，對 `/tmp/b1b.RHppZ0` 現有 83 個檔案建立排序後的 `legacy-artifacts-sha256.txt`（先寫到目錄外再 `mv` 入，避免自含；記建立前 83／後 84 檔；不得重產），Gate A 改為 `shasum -a 256 -c` 該 manifest 83/83 OK。P2 狀態列「rev4 通過後」改「rev6 通過後」；Step 1 還原檢查改為 `shasum -a 256 -c "$B1B/hash-original.txt"`。未重跑 spike、未修改原始碼、未 commit。
+- rev5（2026-09-04，rev4 短複審 CHANGES_REQUIRED）：P1 正式輪 artifact 全部明定 `v4-` 前綴（`v4-single-*`／`v4-P-r1`／`v4-P-r2`／`v4-seq-r1..3`／`v4-N1`／`v4-N2`／`v4-hash-golden.txt`），Gate A 同步並新增「既有 `P-r1-*`、`SPIKE-P-*` 完整保留、hash 未變」勾選項。P2 Task 1 標題、前置、未驗證段、N1／N2 措辭統一為 (a′) 與「import＋首次 `EditorView` 建構」；「約 50ms」等預設值移除，時間只記錄。P2 Global Constraints 補 rev4 例外：`B1B=/tmp/b1b.RHppZ0; test -d`，不再 `mktemp`，舊 artifact 不得覆寫或刪除。未重跑 spike、未修改原始碼、未 commit。
+- rev4（2026-09-04，Task 1 中止後修訂）：Task 1 以 (a) 執行到 Step 4：`run3 P-r1` 有效（overlap 83.14s）但 c1／c2 F1 timeout（5523／5393ms）、F2 轉綠、SpecWorkspace 第 1 條升至 4.2–4.7s，依停下條件中止、未跑 N1／N2。owner 裁定選項 1，未提交 spike（import＋一次 `EditorView` 建構預熱，不 catch）：單檔 F1 157–162ms、`run3 SPIKE-P` rc=0 三份 397 PASS（F1 2.2–2.4s、F2 1.3–1.5s）；還原到 (a) golden。rev4：Architecture 與根因假設改為「模組載入＋首次 `EditorView` 建構」兩筆成本；D1 改採 (a′) 並保留「正式 P 仍 timeout 即停、再裁定 (b)」；Step 2 模板換成 (a′)，(a) golden 與 spike hash 作廢；Step 1 沿用既有 worktree 與證據目錄、先還原原始 hash、正式 artifact 加 `v4-` 前綴；已知缺口新增 F1 殘餘約 2.3s 未定位。未 commit。
 - rev3（2026-09-04，第二輪 owner CHANGES_REQUIRED）：P1 `run3` 改 fail loud——函式內 `export` Node v26 PATH；子 shell 寫完 `.end`／`.exit` 後以 vitest rc `exit`；父層逐一 `wait "$pid"` 並把 wait rc 與 `.exit` 寫入 `-wait.txt`；後置 python 檢查 artifact 齊全（缺件 exit 2）、wait 與 exit 相符（exit 3）、`max(start) < min(end)`（不成立 exit 4），`run3` 回傳非零即該輪無效。Gate A 明列 P 六份 `.exit` 皆 0、N1／N2 三份 `.exit` 皆非零且 `1 failed | 396 passed` 只失敗於指定候選。非阻斷：Architecture 與 beforeAll 註解模板改為「目前假設、待 N1／N2 驗證」語氣。未修改原始碼、未 commit。
 - rev2（2026-09-04，第一輪 owner CHANGES_REQUIRED）：P1-1 preflight 表格依測試名稱錨定重抽 artifact，更正 seq-r2／seq-r3／con-c3 三格 F1／F2 寫反；補跑並落檔全套基準 ×1（`base-r1`）與兩檔單跑 ×3（`single-*`），26 個 artifact 加 `SHA256SUMS.txt`；根因改稱「目前假設，待 Task 1 differential control 驗證」，推論項明標。P1-2 新增可逐字執行的 `run3` launcher（每份 PID／`monotonic_ns` start／end／stdout／stderr／exit、父程序 wait），Gate A 明定 `max(start) < min(end)` 才是有效三份併發，P／N1／N2 共用。P1-3 D2 補規則 7 全文：具名 F1／F2 的 FAIL 分類（契約斷言或契約路徑卡死→回歸阻擋；setup／資源失效／他測試中斷→該次無效）。P2 Task 2 scope check 拆為提交前（工作樹 `git status`＋`git diff --name-only <plan-commit>`）與提交後（`git show --stat`＋range diff）。D1 採 (a)、D2 就地更新 B 段、D3 改 0.4 pt（B 軌 11.71、合計 18.21）回寫。本輪未修改任何原始碼、未 commit。
 - rev1（2026-09-04）：初稿。preflight 唯讀量測：兩條候選在 HEAD `92719fb` 三份併發下 3/3 重現（6.3–7.7s > 5s），依序全綠；根因定位為 CodeMirror 動態 import 成本落在執行中的測試；提出 (a) 預熱 import 為建議處置，N1／N2 differential control 2/2；估點核對 0.35–0.45 pt 待裁定。主工作區零異動，未 commit。
