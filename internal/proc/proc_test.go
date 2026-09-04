@@ -144,8 +144,13 @@ func TestOutputCancellationKillsGrandchildren(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "grandchild.pid")
 	// child：spawn 一個忽略 TERM/HUP 的孫行程（繼承 stdout），自己也不退出。
+	//
+	// pid 必須由父 shell 以 $! 寫入：POSIX sh 的 $$ 在 subshell 內展開為
+	// 父 shell 的 PID，先前寫法記錄到的是 leader 自己，測試因此反覆探測
+	// 錯誤對象（leader 同樣 trap TERM/HUP，所以看起來一直是綠的）。
 	script := "#!/bin/sh\n" +
-		"( trap '' TERM HUP; echo $$ > " + pidFile + "; while true; do sleep 0.05; done ) &\n" +
+		"( trap '' TERM HUP; while true; do sleep 0.05; done ) &\n" +
+		"echo $! > " + pidFile + "\n" +
 		"trap '' TERM HUP\n" +
 		"while true; do sleep 0.05; done\n"
 	sh := filepath.Join(dir, "spawn.sh")
@@ -171,6 +176,9 @@ func TestOutputCancellationKillsGrandchildren(t *testing.T) {
 	if pid == 0 {
 		t.Fatal("測試前提不成立：孫行程沒有起來")
 	}
+	// 趁孫行程還活著先取 PGID；斷言延後到 Output 收斂之後才發（見下），
+	// 否則 fixture 契約一旦失敗就會在取消之前 t.Fatal，留下整組程序。
+	pgid, pgidErr := syscall.Getpgid(pid)
 
 	cancel()
 	select {
@@ -178,6 +186,20 @@ func TestOutputCancellationKillsGrandchildren(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("取消之後 Output 沒有返回——孫行程持有的 pipe 把它卡住了")
 	}
+	// fixture 契約：pid 檔必須記錄孫行程，不是 group leader。leader 由
+	// Setpgid 成為 group leader（PGID 等於自身 PID），孫行程同組但 PID 必不同，
+	// 因此 pid == pgid 即代表記錄錯了對象——第二段輪詢會探測 leader 而非孫行程。
+	if pgidErr != nil {
+		t.Fatalf("測試前提不成立：取不到 pid %d 的 PGID：%v", pid, pgidErr)
+	}
+	if pid == pgid {
+		t.Fatalf("測試前提不成立：pid 檔記錄到 group leader、不是孫行程（pid=%d == pgid=%d）", pid, pgid)
+	}
+	// 第二段輪詢必須拿到屬於自己的預算。上面的 deadline 建立於第一段輪詢之前，
+	// 而中間那個 select 的逾時上限（30s）大於 deadline 的總預算（20s）——若
+	// <-done 耗時超過 20s，下面的迴圈條件首次求值就是 false，一次都不探測便落到
+	// t.Fatal，宣稱一件它沒有量過的事。重設後成功判準不變（孫行程已不存在）。
+	deadline = time.Now().Add(20 * time.Second)
 	// 孫行程必須已經被 group KILL 收掉（signal 0 ＝ 存活探測）。
 	for time.Now().Before(deadline) {
 		if err := syscall.Kill(pid, 0); err != nil {
