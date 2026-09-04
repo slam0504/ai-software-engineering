@@ -1,8 +1,8 @@
-# Pre-M4 Readiness Backlog（rev10·估點版）
+# Pre-M4 Readiness Backlog（rev11·估點版）
 
-> 版本：rev10（2026-09-04，**B1a-2 實作完成並關票**——狀態更新，估點與票面範圍不變）
-> 前版：rev9（2026-09-03，B1a-1 實作完成並關票——狀態更新，估點與票面範圍不變）；rev8（2026-09-03，B1a preflight 實測落地——`TestAppServerTerminateKillsGroup` 未進入 escalation 分支之事實修正、#1 判類 2 並釘死邊界、B1a 逐條 bottom-up 重估後拆為三張施工票＋一張整合驗收票）；rev7（2026-08-31，C1 驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例）；rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
-> 狀態：**B1a-1 已完成（2026-09-03，Gate 3 APPROVED，`82caf8b`／`f7ad1ed`）；B1a-2 已完成（2026-09-04，Gate B APPROVED，`7b1bb0c`／`05069e2`／`b0a8404`）；B1a-3／B1a-4 仍未完成，B1a aggregate 尚未關閉**——B1a 四票估點已於 rev8 通過 owner review（2026-09-03）；**A 軌五票（A1a／A1b／A2／A3／A4）、B 軌未完成之其餘票（B1b／B2／B3a-1／B3a-2／B3b／B4）、C 軌四票（C1a／C1b／C1c／C2）之估點仍待 owner review**（B5／B6a／B6b 已完成，不列入待估 review）——D 軌待立項後估（rev4 凍結）
+> 版本：rev11（2026-09-04，**B1a-3 preflight 裁定——#5 改判 no-change disposition、#6 一行修法確認、B1a-3 重估 0.66→0.48 pt**）
+> 前版：rev10（2026-09-04，B1a-2 實作完成並關票——狀態更新，估點與票面範圍不變）；rev9（2026-09-03，B1a-1 實作完成並關票——狀態更新，估點與票面範圍不變）；rev8（2026-09-03，B1a preflight 實測落地——`TestAppServerTerminateKillsGroup` 未進入 escalation 分支之事實修正、#1 判類 2 並釘死邊界、B1a 逐條 bottom-up 重估後拆為三張施工票＋一張整合驗收票）；rev7（2026-08-31，C1 驗收條件補「Forge 回傳 eligible CR 不得經篩除後假綠」案例）；rev6（2026-08-28，B6 依 owner 於 B6 plan gate 第三輪裁決拆為 B6a/B6b——1.45／0.6 pt；C1 相依同步改 B6a＋B6b；其餘票面不變）
+> 狀態：**B1a-1 已完成（2026-09-03，Gate 3 APPROVED，`82caf8b`／`f7ad1ed`）；B1a-2 已完成（2026-09-04，Gate B APPROVED，`7b1bb0c`／`05069e2`／`b0a8404`）；B1a-3／B1a-4 仍未完成，B1a aggregate 尚未關閉**——**B1a-1／B1a-2／B1a-4 估點於 rev8 通過 owner review（2026-09-03）；B1a-3 已於 rev11 重估（0.66 → 0.48 pt）並取代 rev8 原值**；**A 軌五票（A1a／A1b／A2／A3／A4）、B 軌未完成之其餘票（B1b／B2／B3a-1／B3a-2／B3b／B4）、C 軌四票（C1a／C1b／C1c／C2）之估點仍待 owner review**（B5／B6a／B6b 已完成，不列入待估 review）——D 軌待立項後估（rev4 凍結）
 > 盤點基準：`9be0f4d`（rev1 起始時之 main＝origin/main；後續 rev 修訂 commit 不改變盤點內容之基準）
 > 來源：外部審核（網頁版 ChatGPT，基準 `4cb19b2`）經逐項核實後，與既有待辦合併；分軌依 owner 2026-08-27 裁決，不使用「M3b Closure」命名（多數項目源自 M2／M3a 缺口、M4 基礎建設與長期治理，非 M3b 失敗）
 
@@ -61,15 +61,15 @@
 
 ## 軌道 B：M4 entry blockers
 
-### B1 五條 wall-clock 測試確定性化
+### B1 wall-clock 名單處置與確定性化
 
-- **背景**：具名五條測試量的是排程與牆鐘而非同步契約，紅了須人工單獨重跑判定——與 fail-closed 的 required check 語意衝突，是 CI（B2）升 required 的硬前置。
+- **背景**：`m3b-results.md` §7 曾將五條測試列為 wall-clock 名單——量的是排程與牆鐘而非同步契約，紅了須人工單獨重跑判定，與 fail-closed 的 required check 語意衝突，是 CI（B2）升 required 的硬前置。**rev11 更正**：其中 #5 `internal/codex/TestAppServerMidStreamDeath` 經 B1a-3 preflight 查明**未證實存在可修的牆鐘缺陷**（非宣稱它完全不含牆鐘），改判 no-change disposition；因此本票**不預設五條全部需要修改**。
 - **HEAD 證據**：`docs/spikes/m3b-results.md` §7 權威具名五條——`internal/codex/TestAppServerTerminateKillsGroup`、`internal/assist/TestClaudeAssistFailsLoudOnOversizedLine`、`internal/claude/TestMultiTurnSendAndTurnBoundaries`、root `TestInFlightTurnDoesNotBlockNewSession`、`internal/codex/TestAppServerMidStreamDeath`；§7 並記錄負載下 150 倍延遲的實測。
-- **驗收條件**：(1) 五條改為 channel／barrier／process-exit event 等確定性同步或 fake clock＋可注入 timeout policy；(2) 併行＋`-race`＋負載下重複執行不偽陽（次數於估點時定）；(3)（rev3 更正——**不得刪改 m3b-results.md §7 的歷史驗收紀錄**）§7 原始觀察保留，於各條**追加** resolved commit、修正方式與重驗證據；「目前有效名單」另立 living 狀態文件（或本 backlog 附錄）承載；(4) 三條候選以現行 HEAD 重現——成立者補入 living 文件後併入本票或開續票，不成立者除名（#9）。候選具名（rev2，原始紀錄 2026-08-21 session 首錄、2026-08-25 更新，未落正式文件）：
-  - `internal/proc/TestOutputCancellationKillsGrandchildren`
-  - 前端 `PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積`
-  - 前端 `SpecWorkspace draft accept > discards spec-assist result if the file switches during the call`
-- **建議模組**：`internal/codex`、`internal/assist`、`internal/claude`、root tests、`internal/proc`（候選）、frontend vitest（候選）。
+- **驗收條件**（rev11 依處置分流，不再要求五條一律改寫）：(1) **#1–#4** 改為 channel／barrier／process-exit event 等確定性同步或 fake clock＋可注入 timeout policy；**#5** 僅記錄 **no-change disposition** 與 preflight 證據，**不要求 implementation commit 或 resolved commit**（該修改並不存在，不得為湊格式而虛構）；**#6**（候選轉正）依 rev11 裁定完成一行 `deadline` 重設並通過 6a／6b negative／positive control；(2) 併行＋`-race`＋負載下重複執行不偽陽（次數於估點時定）；(3)（rev3 更正——**不得刪改 m3b-results.md §7 的歷史驗收紀錄**）§7 原始觀察保留，於**有修改的各條**追加 resolved commit、修正方式與重驗證據，**#5 則追加 no-change disposition 與其證據**；「目前有效名單」另立 living 狀態文件（或本 backlog 附錄）承載；(4) **`internal/proc/TestOutputCancellationKillsGrandchildren`（#6）已依 rev11 轉正並移入 (1)，不再受本項的「須先重現才決定納入」約束**；**剩餘兩條前端候選**須以現行 HEAD 重現——成立者補入 living 文件後併入本票或開續票，不成立者除名（#9）。候選具名（rev2，原始紀錄 2026-08-21 session 首錄、2026-08-25 更新，未落正式文件）：
+  - ~~`internal/proc/TestOutputCancellationKillsGrandchildren`~~ —— **已於 rev11 轉正**（改由 (1) 的 #6 承接，B1a-3 執行），此列僅保留作來源紀錄，**不是**待處置候選
+  - **仍待重現**：前端 `PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積`
+  - **仍待重現**：前端 `SpecWorkspace draft accept > discards spec-assist result if the file switches during the call`
+- **建議模組**：`internal/codex`、`internal/assist`、`internal/claude`、root tests、`internal/proc`（**rev11 已轉正，非候選**）、frontend vitest（候選）。
 - **preflight 實測修正與 #1 裁定（rev8，owner 2026-09-03 裁示；證據綁 `aa55413`）**：
   - **現有 `TestAppServerTerminateKillsGroup` 根本沒有進入 escalation 分支**（已實測，非推論）——`testdata/fake-codex-appserver.sh` 的 `FAKE_ORPHAN` 只讓孫程序 `trap "" TERM`、leader 自身不 trap，收到 group SIGTERM 即退出，`Proc.Terminate()` 內的 `select` 永遠走 `<-p.exitedCh`，`time.After(p.grace)` 升級分支不執行。preflight 先依原假設對 grace timer 套 mutation，測試維持綠燈；改標的到 supervisor 收尾管線（`cmd.Wait()` 返回後）才紅在自身斷言 `kill escalation too slow`。**後續 plan 以此事實重寫，不得保留「驗得不夠確定」的原前提**——現況是該條測試從未驗過 escalation。
   - **#1 判為類 2（局部注入），不拆票，但邊界釘死**：不新增或修改 exported `Config` 與公開簽章；只在 `Proc` 加未匯出的 timer 與 signal-event seam，由同套件 white-box 測試注入；事件必須**區分 Terminate 升級與 supervisor 收尾**，避免把收尾管線送出的 SIGKILL 誤認成 escalation。**若實作需要改動七個呼叫端、公開 API 或死因仲裁，立即升為類 3、停止施工並拆票重估。**
@@ -226,7 +226,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 
 對應 spec、plan、production 與測試均在 repo（`docs/superpowers/specs/2026-08-24-replay-reliability-design.md`、`rebuild_orchestrator.go`）。錯誤盤點根因：auto-memory 索引行過期（本文已正確標「勿再列為待辦」）——索引已同步更正。
 
-## 估點（rev5 制定、rev6 更新 B6 拆票、rev8 更新 B1a 拆四票重估；A／B／C 軌；0.1 pt＝1 hr 實際工作，不含等候）
+## 估點（rev5 制定、rev6 更新 B6 拆票、rev8 更新 B1a 拆四票重估、**rev11 更新 B1a-3 重估**；A／B／C 軌；0.1 pt＝1 hr 實際工作，不含等候）
 
 拆票依規則執行（>2.0 pt 或混合性質必拆）；「假設」欄記載估點成立前提，前提破壞時該票重估。等候時間（design gate 往返、CI runner 排隊）不計工時、拉長日曆時間，已標注於備註。
 
@@ -239,7 +239,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | A4 | 1.25／1.26.5 比較矩陣＋go.mod toolchain＋README | 0.4 | 兩腳全套執行屬監督型等候（約 1 hr 內），計入；建議 B1a 後執行 |
 | B1a-1 | #1 `TestAppServerTerminateKillsGroup`——`Proc` 未匯出 timer／signal-event seam＋(a) codex 端契約改寫＋(b) `internal/proc` 新增 deterministic white-box 測試 | **1.13**（0.90-1.35） | **已完成（2026-09-03，Gate 3 APPROVED；plan `efdc82c`、implementation `82caf8b`＋`f7ad1ed`）**。原估點維持不變作為歷史記錄。理解 1.0-1.5／production seam 1.5-2.5／測試改寫 2.5-3.5／mutation 2.5-3.5／獨立 design gate＋implementation review 1.5-2.5。**(a)(b) 必須同票**——兩者共同界定同一個 `Proc.Terminate()` seam，拆開會使 production 修改與契約驗證失去原子性。負載驗證移入 B1a-4 |
 | B1a-2 | #2 `TestClaudeAssistFailsLoudOnOversizedLine`、#3 `TestMultiTurnSendAndTurnBoundaries`、#4 `TestInFlightTurnDoesNotBlockNewSession`——非 process 類純測試確定性化 | **1.01**（0.81-1.21） | **已完成**（2026-09-04 Gate B APPROVED；plan `6dd8edf`、implementation `7b1bb0c`＋`05069e2`＋`b0a8404`）。production 零改動已由 range diff 機械確認。負載驗證仍在 B1a-4 |
-| B1a-3 | #5 `TestAppServerMidStreamDeath`、#6 `TestOutputCancellationKillsGrandchildren`——process lifecycle 純測試修正 | **0.66**（0.51-0.80） | **未完成**。production 零改動。#5 鑑別力不唯一（`Server.Handshake` 被同檔三條測試共用），mutation 連帶清單須實跑取得；#6 為一行 `deadline` 重設，工時集中在 mutation 驗收而非修改本身。負載驗證移入 B1a-4 |
+| B1a-3 | #5 `TestAppServerMidStreamDeath`、#6 `TestOutputCancellationKillsGrandchildren`——**#5 no-change disposition ＋ #6 一行 `deadline` 重設（純測試修正）** | **0.48**（0.38-0.57）<br>（rev8 原估 0.66／0.51-0.80，前提已破壞，見 rev11） | **未完成**。production 零改動。**#5 不改測試碼、不列 mutation**——preflight 未證實存在可修的牆鐘缺陷（非宣稱它完全不含牆鐘）；兩個 Handshake 植入點皆不得進 acceptance table（`Conn.Handshake` 連帶 19 條、破壞廣泛共用前置；`Server.Handshake` 雖只連帶 3 條，但只讓測試在 handshake 前置失敗，未鑑別 mid-stream death／exit code／`Done()`／death-after-call 契約；兩者皆為本票未修改的既有 production code，違反 §6.7 mutation target 規則）。19／3 清單作 diagnostic evidence 留在 plan，不進分母。**#6** 修的是第二段輪詢可能零次探測的明確測試 bug；驗收採 **B1a-3 專屬例外**的測試側 negative control（6a／6b）。負載驗證移入 B1a-4 |
 | B1a-4 | B1a 整合驗收——三張施工票完成後的整合負載跑批、§7 追加 resolved 證據、living 有效名單文件、aggregate closure review | **0.95**（0.75-1.15） | **未完成**。整合負載跑批 4.0-6.0（對整合 HEAD 一次跑完 root／`internal/codex`／`internal/assist`／`internal/claude`／`internal/proc` 矩陣；六條原分列合計 9.0-13.5 hr，**此為唯一保留的共用**，省約 5.0-7.5 hr——**推估值，非實測**，見下方證據缺口）／§7 追加證據 1.0-1.5／living 文件 1.5-2.5／closure review 1.0-1.5。§7 與 living 文件集中於本票，避免三張施工票同時改同一份文件 |
 | B1b | 前端兩條候選重現與處置＋living 有效名單文件 | 0.3 | — |
 | B2 | 最小 CI workflows＋ruleset＋enforcement 實證五項＋政策文件 | 1.2 | macOS runner 可用；CI 迭代的 runner 等候不計工時（日曆另計）；測試 PR 驗畢即清 |
@@ -255,15 +255,15 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | C1c | Gate 3 決議面（UI＋決議＋evidence 顯示）＋切片串接走查 | 1.2 | 沿既有 gate UI 慣例 |
 | C2 | SC4 authoring-to-Gate-3 端到端驗收走查 | 0.3 | 驗收性質；依賴 A1a／A1b／C1a-c 全部完成 |
 
-**小計（rev8 更新——B1a 拆四票重估）**：A 軌 3.0 pt（30 hr）｜B 軌 **11.49 pt（114.9 hr）**｜C 軌 3.5 pt（35 hr）｜**合計 17.99 pt（約 179.9 hr 實際工作）**。排程換算（團隊 throughput 約 0.6 pt／day）為另一維度，於排程時另算，不與工程量混用。
+**小計（rev11 更新——B1a-3 重估）**：A 軌 3.0 pt（30 hr）｜B 軌 **11.31 pt（113.1 hr）**｜C 軌 3.5 pt（35 hr）｜**合計 17.81 pt（約 178.1 hr 實際工作）**。排程換算（團隊 throughput 約 0.6 pt／day）為另一維度，於排程時另算，不與工程量混用。
 
 **B1a 進度（rev10）**：**B1a-1 與 B1a-2 皆已完成並關票**——B1a-1（2026-09-03 Gate 3 APPROVED；plan `efdc82c`、implementation `82caf8b`＋`f7ad1ed`）、B1a-2（2026-09-04 Gate B APPROVED；plan `6dd8edf`、implementation `7b1bb0c`＋`05069e2`＋`b0a8404`）。**B1a-3、B1a-4 仍未完成，B1a aggregate 尚未關閉。** 下列項目一律仍由 **B1a-4** 承擔，B1a-1／B1a-2 的完成**不代表**其中任何一項已達成：(i) 對整合 HEAD 一次跑完的五套件整合負載矩陣（root／`internal/codex`／`internal/assist`／`internal/claude`／`internal/proc`）——**注意該矩陣包含 B1a-1 的 `internal/codex`／`internal/proc` 與 B1a-2 的 root／`internal/assist`／`internal/claude`，B1a-4 須於整合 HEAD 重跑，不得以任一施工票的 focused 結果取代**；(ii) §7 追加 resolved 證據；(iii) living 有效名單文件；(iv) aggregate closure review。本次狀態更新**不提前修改 §7 或 living 文件**。
 
-**單位與捨入規則（rev8 新增，避免兩組答案）**：**hr 為權威單位，pt 一律由 hr ÷ 10 衍生**。估點表各票的 pt 為顯示用值、四捨五入至小數點後兩位；**合計一律以未捨入的 hr 總和換算，不得由各票顯示值相加**。B1a 四票中位 hr 為 11.25／10.10／6.55／9.50，**總和 37.40 hr → 3.74 pt**；若改以四個顯示值（1.13＋1.01＋0.66＋0.95）相加則得 3.75 pt，該 0.01 pt 差額純為捨入誤差、**非另一個估點**。B 軌與合計均採前者（9.25 − 1.5 ＋ 3.74 = 11.49；15.75 − 1.5 ＋ 3.74 = 17.99）。逐條原始數字見附錄 C。
+**單位與捨入規則（rev8 新增，避免兩組答案）**：**hr 為權威單位，pt 一律由 hr ÷ 10 衍生**。估點表各票的 pt 為顯示用值、四捨五入至小數點後兩位；**合計一律以未捨入的 hr 總和換算，不得由各票顯示值相加**。B1a 四票中位 hr 為 11.25／10.10／**4.75**／9.50，**總和 35.60 hr → 3.56 pt**（rev11 更新；rev8 為 37.40 hr → 3.74 pt）；若改以四個顯示值（1.13＋1.01＋0.48＋0.95）相加則得 3.57 pt，該 0.01 pt 差額純為捨入誤差、**非另一個估點**。B 軌與合計均採前者（9.25 − 1.5 ＋ 3.56 = 11.31；15.75 − 1.5 ＋ 3.56 = 17.81）。逐條原始數字見附錄 C。
 
 **B1a 估點膨脹的歸因（rev8）**：1.5 pt→3.74 pt 的差額主要**不是**範圍蔓延，而是治理要求演進。原估訂於 rev5（2026-08-27），而 §6.7 的 mutation acceptance N/N 全跑門檻於治理文件 v2.2（`09751d9`，2026-09-01）才寫入、變異目標規則 v2.3（2026-09-02）；owner 另於 2026-09-03 裁示「design gate 須在 mutation 套用期間實跑受影響套件取得實際連帶清單」。重估表中 mutation 與負載驗證兩個維度即佔總數一半以上。**A 軌與 B 軌其他票的估點同樣訂於 rev5、同樣早於 §6.7**，若其驗收將列有限編號的 mutation table，會有同型低估——**本輪不重估它們**，依 owner 裁示於各票進入 plan gate、且實際建立 mutation table 時，再依當時的 §6.7 重新檢查原估點前提。
 
-## 附錄 C：B1a 逐條 bottom-up 重估原始資料（rev8，證據綁 `aa55413`）
+## 附錄 C：B1a 逐條 bottom-up 重估原始資料（rev8 建立、證據綁 `aa55413`；**B1a-3 一列於 rev11 重估取代，證據綁 `d03922e`**）
 
 保留三輪 preflight 後的完整重估輸入，供未來 session 由 commit 重建估點。單位 hr（低-高）；pt 由 hr ÷ 10 衍生，捨入規則見估點段。
 
@@ -300,9 +300,10 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 |---|---|---|---|---|---|
 | B1a-1 | #1 四維度（扣負載）7.5-11.0 ＋ gate／review 1.5-2.5 | 9.00 | 11.25 | 13.50 | 0.90-1.35 |
 | B1a-2 | #2＋#3＋#4 四維度（扣負載）6.6-9.6 ＋ gate／review 1.5-2.5 | 8.10 | 10.10 | 12.10 | 0.81-1.21 |
-| B1a-3 | #5＋#6 四維度（扣負載）3.6-5.5 ＋ gate／review 1.5-2.5 | 5.10 | 6.55 | 8.00 | 0.51-0.80 |
+| B1a-3（rev8 原估，**已失效、留作歷史記錄**） | #5＋#6 四維度（扣負載）3.6-5.5 ＋ gate／review 1.5-2.5 | 5.10 | 6.55 | 8.00 | 0.51-0.80 |
+| **B1a-3（rev11 重估，權威值）** | #5 調查／兩植入點辨析／no-change disposition 0.8-1.2 ＋ #6 理解＋一行修改＋6a／6b 驗收 1.5-2.0 ＋ gate／review 1.5-2.5 | **3.80** | **4.75** | **5.70** | **0.38-0.57** |
 | B1a-4 | 整合負載 4.0-6.0 ＋ §7 1.0-1.5 ＋ living 1.5-2.5 ＋ closure review 1.0-1.5 | 7.50 | 9.50 | 11.50 | 0.75-1.15 |
-| **合計** | | **29.70** | **37.40** | **45.10** | **2.97-4.51** |
+| **合計（rev11，採 B1a-3 重估值）** | | **28.40** | **35.60** | **42.80** | **2.84-4.28** |
 
 **四票高估端均低於 2.0 pt**，故三張施工票＋一張整合票的切分成立，不需再拆。拆票代價（失去跨票共用跑批與多出兩輪 gate／review）已含在上表，未另行折扣。
 
@@ -310,6 +311,14 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 
 ## 修訂記錄
 
+- rev11（2026-09-04，B1a-3 preflight 裁定與重估）：**票面性質與估點皆有變動**，非純狀態更新。preflight（read-only 為原則，diagnostic mutation 於隔離 worktree 執行並完整還原，主工作區全程零 `.go` 異動，證據綁 `d03922e`）產出兩項裁定——
+  - **#5 `TestAppServerMidStreamDeath` 改判 no-change disposition**：不改測試碼、不列 mutation。精確結論是「**未證實存在可修的牆鐘缺陷**」，**不是**宣稱它完全不含牆鐘——測試內仍有 5 秒 Handshake 保險，但沒有以完成時間作功能判準（`TermGrace 200ms` 因本測試從不呼叫 `Terminate()` 而不生效；`srv.Wait()` 無時間上限，繫於 `p.doneCh`），且無自然誤紅證據（owner focused `-race -count=20` 20/20 全綠、整批 2.356s；preflight 另有 focused ×20＋`./internal/...` 負載 ×8＋三份併發 ×3 共 31 次全綠）。**兩個 Handshake 植入點皆不得進 acceptance table**：`Conn.Handshake`（`rpc.go`）實測連帶 **19 條**（`rpc_test.go` 的 `doHandshake` helper 被 9 條測試共用），破壞廣泛共用前置，19 條連帶不是 #5 的鑑別力；`Server.Handshake`（`session.go`）實測連帶 **3 條**（`TestAppServerMidStreamDeath`／`TestAppServerStderrCaptured`／`TestAppServerTerminateKillsGroup`），但只讓測試在 handshake 前置失敗，未鑑別 mid-stream death、exit code、`Done()` 或 death-after-call 契約。兩者皆為**本票未修改的既有 production code**，違反 §6.7 的 mutation target 規則。19／3 清單作 **diagnostic evidence** 留在 plan，**不進 mutation 分母**。另兩個被否決的選項：抽 Handshake 前置為 helper 不增加驗收力；加一條死亡路徑測試是在沒有缺口證據時擴大範圍。**更正 rev8 記載**：rev8 寫「`Server.Handshake` 被同檔三條測試共用」僅在植入點為 `Server.Handshake` 時成立，植入 `Conn.Handshake` 時實際連帶為 19 條。
+  - **#6 `TestOutputCancellationKillsGrandchildren` 一行修法確認**：在 `cancel()` 後的 30 秒等待結束、第二段輪詢開始前加入 `deadline = time.Now().Add(20 * time.Second)`。修的是明確的測試 bug——`deadline` 建立於第一段輪詢之前並被第二段原封不動重用，而兩段之間的 `select` 逾時為 **30 秒、大於 20 秒 deadline**，因此 `<-done` 若耗時超過 20 秒，第二段輪詢**一次都不會執行**即 `t.Fatal` 宣稱孫程序仍存活。owner focused `-race -count=5` 五次全綠、整批 5.286s。**驗收採 owner 核准的 B1a-3 專屬例外**：本票 production 零變更，以測試側 negative control 取代 production mutation，**不得寫成符合 §6.7 原文**——6a negative control（移除重設行並在原位置前加 `time.Sleep(21 * time.Second)`，必須紅在既有「孫行程仍存活」斷言）、6b positive control（保留同一段 21 秒延遲並恢復重設行，必須轉綠）；21 秒刻意大於舊 deadline，避免沿用 19.9 秒的邊界敏感性；最後移除延遲、以 hash 證明 `proc_test.go` 回到 golden，再跑 `internal/proc` 完整回歸。
+  - **重估**：**0.66 → 0.48 pt**（0.38-0.57），為整張票的總工程量（含已完成的 preflight），不是剩餘工時。維度：#5 調查／兩植入點辨析／no-change disposition 0.8-1.2；#6 理解＋一行修改＋6a／6b 驗收 1.5-2.0；獨立 plan gate＋implementation review 1.5-2.5。連帶更新：B1a 合計 37.40 → **35.60 hr（3.56 pt）**、區間 28.4-42.8 hr（2.84-4.28 pt）；B 軌 11.49 → **11.31 pt**；全部合計 17.99 → **17.81 pt**。附錄 C 保留 rev8 原估列作歷史記錄。
+  - **B1 驗收條件依處置分流**（否則 B1a-4 會遇到無法同時滿足的關票條件）：B1 標題由「五條 wall-clock 測試確定性化」改為「wall-clock 名單處置與確定性化」，不再預設五條全部需要修改；背景改述為「§7 曾列五條，rev11 查明 #5 未證實有可修缺陷」；驗收條件 (1) 與 (3) 分流為——**#1–#4** 完成確定性化並於 §7 追加 resolved commit 與修正方式；**#5** 僅記錄 no-change disposition 與 preflight 證據，**不要求 implementation／resolved commit**（該修改並不存在，不得為湊格式而虛構）；**#6** 依 rev11 裁定修正並通過 6a／6b。
+  - **#6 候選狀態同步轉正**（否則同一條驗收條件會自相矛盾）：驗收條件第 (4) 項原要求「三條候選以現行 HEAD 重現，不成立者除名」，而 #6 的自然誤紅本輪並未重現——若沿用該門檻可能導出「除名」，與 (1) 已要求實作 #6 直接衝突。rev11 改為：**#6 已轉正並移入 (1)，不再受「須先重現才決定納入」約束**；候選清單中該列刪除線標記為「已轉正、僅保留作來源紀錄」，另兩條前端候選標為「仍待重現」（由 B1b 承接）；建議模組的 `internal/proc` 候選標記同步移除。
+  - **估點權威版本索引同步更正**：頂部狀態行由「B1a 四票估點已於 rev8 通過」改為「**B1a-1／B1a-2／B1a-4 於 rev8 通過；B1a-3 於 rev11 重估並取代 rev8 原值**」；估點章節標題補列 rev11；附錄 C 標題註明「rev8 建立、B1a-3 一列於 rev11 重估取代，證據綁 `d03922e`」。**「B1a 進度（rev10）」段維持不動**——該段是完成狀態快照，rev11 未新增關票，與估點權威版本不同、不構成矛盾。
+  - **仍未取得、不得宣稱涵蓋**：#6 的**自然誤紅未重現**（本機 8 核下 `./internal/...` 全跑 1.49-2.60s、三份併發 7.36-10.41s，皆遠低於 20s deadline；只有人工注入延遲能 100% 重現）——plan 必須把「人工延遲證明機制存在」與「CI／整合負載尚未驗證」**分開寫**；CI runner 冷啟動分布未取得；五套件整合負載矩陣仍屬 B1a-4。preflight 另報三份併發時 `internal/evidence` 兩條無關測試因固定 ULID 臨時路徑衝突而 FAIL，**維持未驗證、範圍外，不併入本票**。
 - rev10（2026-09-04，B1a-2 實作完成並關票）：純狀態更新，**估點與票面範圍不變**。B1a-2（#2 `TestClaudeAssistFailsLoudOnOversizedLine`、#3 `TestMultiTurnSendAndTurnBoundaries`、#4 `TestInFlightTurnDoesNotBlockNewSession`）經 design gate 三輪 owner CHANGES_REQUIRED 後 APPROVED，plan 提交為 `6dd8edf`（rev5）；implementation 為 `7b1bb0c`（`internal/assist` 移除 oversized-line fixture 的 `tr` 轉換）、`05069e2`（`internal/claude` `waitResult` 局部 deadline 5s→15s）、`b0a8404`（root package #4 接上 `afterFn`／`newFakeAfter()` 並加 `totalCreated()` 接線鑑別斷言）。**production 零變更**已由 range diff 機械確認（`a5a3cab..b0a8404` 只含 plan 文件＋三個測試檔；`internal/assist/oneshot.go`／`internal/claude/session.go`／`internal/appcore/pump.go`／`app.go`／`testdata/fake-claude.sh` 零異動）。**§6.7 的處置須註明**：本票 production 零變更，無法套用 §6.7 的 production-target mutation 原文，owner 核准**僅限 B1a-2** 的例外——以測試側 negative control（3/3：2a／3a／4a，三項全紅在測試自身斷言）代替，並保留 N/N 全跑、hash 前後比對、byte-identical 還原與完整回歸強度；另跑 3a 的 positive control 3b（同一 6 秒 fake CLI 延遲下 15 秒版本 PASS 18.05s），證明常數變更確實改變鑑別力。關票證據：三個測試檔的 golden SHA-256 由 owner 從基準 `a5a3cab` 建立全新 worktree 逐字重建後精確命中，Gate A→Gate B 的四項轉移條件全數成立；驗證分層（避免虛增證據強度）：**(i) Gate B 於主 repo** 跑完整三包 `-race`（`internal/assist` 20／`internal/claude` 22／root 422 PASS＋1 既有 env-gated SKIP＝423，0 FAIL；**executor 與 reviewer 各跑過一次、結果一致**——此重跑次數僅適用於三包 `-race`）；另於 Gate B 確認 `go build ./...`／`go vet ./...`／`gofmt -l`／`git diff --check` 全數乾淨；**(ii) owner 的關票 review 獨立重跑的是三條受影響的 focused `-race`**（非完整三包），另核對三個 golden hash、兩條 range diff 與 production 零異動；**(iii) Gate A 的完整三包結果屬執行者證據**，不得改稱 reviewer 的獨立複驗。**已知缺口（不得宣稱消除）**：#3 的 CI runner 冷啟動分布未取得（383ms 為本機唯一冷啟動樣本，缺口留給 B1a-4）；#2 本輪未重現過誤紅，只量得約 9 倍餘裕；#4 注入 fake timer 後真正的 pump 卡死會落到 `go test -timeout`，失去原本 5 秒的局部快速失敗。**B1a-3／B1a-4 仍未完成，B1a aggregate 未關閉**；五套件整合負載矩陣、§7 resolved 證據、living 有效名單與 aggregate closure review 仍全數由 B1a-4 承擔，本 rev 不提前修改 §7 或 living 文件。
 - rev2（2026-08-27，backlog review 第一輪 5 P1＋4 P2 收斂）：
   - P1：A4 更正 go／toolchain 非二選一——先以 1.25 跑完整 gate 決定 minimum，toolchain 為獨立 reproducibility 決策。
