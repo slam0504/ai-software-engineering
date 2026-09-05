@@ -8,7 +8,7 @@
 // TestOrphanDoesNotHangNormalExit 的實際順序重演，取代 layer 2b（自製 proc
 // 探針＋真正 fixture）與原 layer 2（自製 proc 探針＋自製 fixture）之間仍未定位
 // 的差異——本層涵蓋 claude.Session 所增加的完整路徑（stdin JSON 寫法、pump／
-// Decode／channel、Wait 包裝），與真實測試逐位元組相同的收斂形狀。本檔只忠實
+// Decode／channel、Wait 包裝），與真實測試控制流程順序相同的收斂形狀。本檔只忠實
 // 記錄原始時序與快照，不下判斷；歸因由 plan 的解析器對 iter-records.jsonl 逐輪
 // 套用。
 //
@@ -25,7 +25,7 @@
 //   - DIAG_FAKE_HANG=1（正式 CI 不設）：多加 FAKE_HANG=1 進 fixture Env，讓
 //     leader 收尾前 sleep 30——唯一用途是製造確定性的 pending 控制樣本。
 //
-// 排序契約（與 TestOrphanDoesNotHangNormalExit 逐位元組相同）：
+// 排序契約（與 TestOrphanDoesNotHangNormalExit 控制流程順序相同）：
 //   - 同一 worker goroutine 先 `for ev := range s.Events()` drain 至關閉，
 //     再呼叫 `s.Wait()`；worker 不持有、不修改 record，也不設任何自己的期限，
 //     只透過 cap-1 channel（eventsCh／waitCh）各送一筆不可變結果。
@@ -242,6 +242,7 @@ type diagEventsResult struct {
 	tFirstEvent   time.Time
 	tLastResult   time.Time
 	tEventsClosed time.Time
+	streamErrors  []string // KindStreamError 的錯誤字串（scanner／rpc）；非空＝該輪取證失敗（invalidEvidence）
 }
 
 type diagWaitResult struct {
@@ -305,7 +306,9 @@ type diagFullRecord struct {
 	WaitSeenAtCheckpoint   bool              `json:"waitSeenAtCheckpoint"`
 	Kill0                  []diagKill0Sample `json:"kill0"`
 	Ps                     []diagPsSample    `json:"ps"`
-	FinalStatus            string            `json:"finalStatus"` // converged | pending | finalConverged | aborted
+	StreamErrorCount       int               `json:"streamErrorCount"`
+	StreamErrors           []string          `json:"streamErrors,omitempty"` // KindStreamError 內容；計入 invalidEvidence，不得算有效收斂
+	FinalStatus            string            `json:"finalStatus"`            // converged | pending | finalConverged | aborted
 	FinalWaitMs            *float64          `json:"finalWaitMs,omitempty"`
 	Errors                 []string          `json:"errors,omitempty"`
 
@@ -319,6 +322,8 @@ func (rec *diagFullRecord) applyEvents(er *diagEventsResult) {
 	rec.TFirstEventMs = diagMsSince(rec.t0, er.tFirstEvent)
 	rec.TLastResultMs = diagMsSince(rec.t0, er.tLastResult)
 	rec.TEventsClosedMs = diagMsSince(rec.t0, er.tEventsClosed)
+	rec.StreamErrorCount = len(er.streamErrors)
+	rec.StreamErrors = append([]string(nil), er.streamErrors...)
 }
 
 func (rec *diagFullRecord) applyWait(wr *diagWaitResult) {
@@ -331,7 +336,7 @@ func (rec *diagFullRecord) applyWait(wr *diagWaitResult) {
 }
 
 // TestDiagOrphanFullPath：layer 3——full path（claude.Start → drain → Wait），
-// 與 TestOrphanDoesNotHangNormalExit 逐位元組相同的收斂順序。只做取證，不以
+// 與 TestOrphanDoesNotHangNormalExit 控制流程順序相同的收斂順序。只做取證，不以
 // 時間作為通過條件（除既有測試本身的 5 秒 checkpoint 只取證不 t.Fatal）。
 func TestDiagOrphanFullPath(t *testing.T) {
 	n := 3
@@ -352,6 +357,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		runner = "local"
 	}
 	fakeHang := os.Getenv("DIAG_FAKE_HANG") == "1"
+	fakeBadLine := os.Getenv("DIAG_FAKE_BADLINE") == "1" // 診斷專用控制：驗證 KindStreamError → invalidEvidence 路徑；正式 CI 不設
 	reportDeadlineDur := diagEnvDur("DIAG_REPORT_DEADLINE", 60*time.Second)
 
 	var evMu sync.Mutex
@@ -377,8 +383,8 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		}
 	}
 
-	t.Logf("diag(full-path): iterations=%d outDir=%s runner=%s goos=%s fakeHang=%v reportDeadline=%s ambientFakeVars=%v",
-		n, outDir, runner, runtime.GOOS, fakeHang, reportDeadlineDur, ambientFakeVars)
+	t.Logf("diag(full-path): iterations=%d outDir=%s runner=%s goos=%s fakeHang=%v fakeBadLine=%v reportDeadline=%s ambientFakeVars=%v",
+		n, outDir, runner, runtime.GOOS, fakeHang, fakeBadLine, reportDeadlineDur, ambientFakeVars)
 
 	type bgItem struct {
 		rec        *diagFullRecord
@@ -424,7 +430,13 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		if fakeHang {
 			env = append(env, "FAKE_HANG=1")
 		}
+		if fakeBadLine {
+			env = append(env, "FAKE_BADLINE=1")
+		}
 		cfg := fakeCfg(t, env...)
+		if fakeBadLine {
+			cfg.MaxLineBytes = 1024 // 與 TestScannerErrorSurfaced 相同：4096 位元組行 → scanner error → KindStreamError
+		}
 
 		// 1. Start；失敗即 invalid + aborted，不進入取樣。
 		s, err := Start(context.Background(), cfg)
@@ -459,6 +471,13 @@ func TestDiagOrphanFullPath(t *testing.T) {
 				}
 				if ev.Kind == contract.KindResult {
 					er.tLastResult = now
+				}
+				if ev.Kind == contract.KindStreamError { // 傳輸層錯誤：帶回主 goroutine 計入 invalidEvidence，worker 繼續 drain
+					msg := string(ev.Raw)
+					if ev.Err != nil {
+						msg = ev.Err.Error()
+					}
+					er.streamErrors = append(er.streamErrors, msg)
 				}
 			}
 			er.tEventsClosed = time.Now()
@@ -505,6 +524,9 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		}
 		rec.applyEvents(er)
 		rec.applyWait(wr)
+		for _, se := range rec.StreamErrors {
+			invalid("iter %d stream error: %s", i, se)
+		}
 
 		// 4. oracle 取樣：kill0 與 ps 各自獨立 goroutine，互不等待，結果經 channel
 		// 回主 goroutine（唯一寫入 record 者）。以報告期限風格的單一 timer 界定
@@ -563,6 +585,9 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		_, _, pending, er, wr := diagReportAggregate(reportDeadline, w.eventsCh, w.waitCh, w.eventsSeen, w.waitSeen)
 		w.rec.applyEvents(er)
 		w.rec.applyWait(wr)
+		for _, se := range w.rec.StreamErrors {
+			invalid("iter %d stream error(late): %s", w.rec.Iter, se)
+		}
 		if !pending {
 			w.rec.FinalStatus = "finalConverged"
 		} else {
@@ -636,6 +661,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		"goos":                              runtime.GOOS,
 		"fixture":                           "fake-claude(full-path)",
 		"fakeHang":                          fakeHang,
+		"fakeBadLine":                       fakeBadLine,
 		"ambientFakeVars":                   ambientFakeVars,
 		"reportDeadline":                    reportDeadlineDur.String(),
 		"counts":                            counts,
