@@ -1,0 +1,157 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+      - name: vitest
+        shell: bash
+        run: |
+          set +e
+          npm --prefix frontend run test -- --reporter=verbose 2>&1 | tee vitest.out
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > vitest.rc
+          exit "$rc"
+      - name: build (vue-tsc + vite)
+        shell: bash
+        run: |
+          set +e
+          npm --prefix frontend run build 2>&1 | tee frontend-build.out
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > frontend-build.rc
+          exit "$rc"
+      - name: verify dist
+        run: test -f frontend/dist/index.html
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: vitest-output
+          if-no-files-found: error
+          path: |
+            vitest.out
+            vitest.rc
+            frontend-build.out
+            frontend-build.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+  go:
+    name: go
+    needs: frontend
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: frontend-dist
+          path: frontend/dist
+      - run: test -f frontend/dist/index.html
+      - run: go version && test -z "$(gofmt -l .)"
+      - run: go build ./...
+      - run: go vet ./...
+      - name: go test -race
+        shell: bash
+        run: |
+          set +e
+          go test -race ./... -count=1 -timeout 30m -json 2>&1 | tee go-test.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > go-test.rc
+          exit "$rc"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: go-test-json
+          if-no-files-found: error
+          path: |
+            go-test.json
+            go-test.rc
+  wails-build:
+    name: wails-build
+    needs: frontend
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: frontend-dist
+          path: frontend/dist
+      - run: test -f frontend/dist/index.html
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 && wails version
+      - run: wails build -s
+      - run: npm --prefix tools/claude-cli ci && npm --prefix tools/codex-cli ci
+      - run: scripts/check-cli.sh
+      - run: scripts/bundle-clis.sh
+      - run: test -x build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench
+      - run: tar -C build/bin -czf sdlc-workbench.app.tgz sdlc-workbench.app
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wails-app-tar
+          path: sdlc-workbench.app.tgz
+          if-no-files-found: error
+  checksums:
+    name: checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: (cd schemas/codex && shasum -a 256 -c SHA256SUMS)
+      - run: (cd docs/architecture && shasum -a 256 -c SHA256SUMS)
+      - name: git diff --check (by event; Actions values passed via env)
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request)
+              git diff --check "$PR_BASE_SHA" "$PR_HEAD_SHA" ;;
+            push)
+              if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+                echo "first push / new ref: no before SHA, checking HEAD commit diff (whole tree only for a root commit)"; git diff-tree -r --check --root "$SHA"
+              else
+                git diff --check "$BEFORE_SHA" "$SHA"
+              fi ;;
+            workflow_dispatch)
+              echo "manual dispatch: no PR base; checking HEAD commit diff against its parent (whole tree only for a root commit)"; git diff-tree -r --check --root "$SHA" ;;
+            *) echo "unsupported event: $EVENT_NAME"; exit 1 ;;
+          esac
