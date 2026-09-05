@@ -327,15 +327,14 @@ func (rec *diagFullRecord) applyEvents(er *diagEventsResult) {
 
 // flagStreamErrors：只對「本次」拿到的 er 計數——er==nil（該 channel 早已在 checkpoint 讀走並套用過）
 // 時不重複計入。immediate 與 report 兩條路徑都經此函式，確保同一 stream error 只計一次。
-func (rec *diagFullRecord) flagStreamErrors(er *diagEventsResult, tag string, invalid func(string, ...any)) {
+func (rec *diagFullRecord) flagStreamErrors(er *diagEventsResult, tag string, invalidate func(*diagFullRecord, string, ...any)) {
 	if er == nil {
 		return
 	}
 	for _, se := range er.streamErrors {
 		rec.StreamErrors = append(rec.StreamErrors, se)
 		rec.StreamErrorCount = len(rec.StreamErrors)
-		rec.EvidenceValid = false
-		invalid("iter %d stream error%s: %s", rec.Iter, tag, se)
+		invalidate(rec, "iter %d stream error%s: %s", rec.Iter, tag, se)
 	}
 }
 
@@ -379,6 +378,15 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		evMu.Lock()
 		invalidEvidence = append(invalidEvidence, fmt.Sprintf(format, a...))
 		evMu.Unlock()
+	}
+	// invalidateRecord：所有「可歸屬單輪」的取證失敗（Start 失敗、stream error、ps 取樣錯誤、kill0／ps
+	// sampler 逾界）統一經此：設 evidenceValid=false、寫入 rec.Errors、並計入整批 invalidEvidence。
+	// 整批層級的輸出錯誤（artifact 寫檔、record／summary 編碼、JSONL 開關）仍直接 invalid(...)，
+	// 由 summary 的 invalidEvidenceCount 判定整次 run 無效；Task 4 以 evidenceValid 篩選單筆樣本。
+	invalidateRecord := func(rec *diagFullRecord, format string, a ...any) {
+		rec.EvidenceValid = false
+		rec.Errors = append(rec.Errors, fmt.Sprintf(format, a...))
+		invalid(format, a...)
 	}
 	mustWrite := func(path string, b []byte) {
 		if err := os.WriteFile(path, b, 0o644); err != nil {
@@ -454,9 +462,8 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		// 1. Start；失敗即 invalid + aborted，不進入取樣。
 		s, err := Start(context.Background(), cfg)
 		if err != nil {
-			rec.Errors = append(rec.Errors, "start: "+err.Error())
 			rec.FinalStatus = "aborted"
-			invalid("iter %d Start failed: %v", i, err)
+			invalidateRecord(rec, "iter %d Start failed: %v", i, err)
 			writeFinal(rec)
 			t.Logf("iter %d: aborted (start failed): %v", i, err)
 			continue
@@ -537,7 +544,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		}
 		rec.applyEvents(er)
 		rec.applyWait(wr)
-		rec.flagStreamErrors(er, "", invalid)
+		rec.flagStreamErrors(er, "", invalidateRecord)
 
 		// 4. oracle 取樣：kill0 與 ps 各自獨立 goroutine，互不等待，結果經 channel
 		// 回主 goroutine（唯一寫入 record 者）。以報告期限風格的單一 timer 界定
@@ -551,18 +558,17 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		if v, ok := diagBoundedRecv(kill0Ch, kill0Deadline); ok {
 			rec.Kill0 = v
 		} else {
-			invalid("iter %d kill0 sampling goroutine did not return within bound", i)
+			invalidateRecord(rec, "iter %d kill0 sampling goroutine did not return within bound", i)
 		}
 		if v, ok := diagBoundedRecv(psCh, psDeadline); ok {
 			rec.Ps = v
 			for _, p := range v {
 				if p.Err != "" {
-					rec.EvidenceValid = false
-					invalid("iter %d ps@%s: %s", i, p.Offset, p.Err)
+					invalidateRecord(rec, "iter %d ps@%s: %s", i, p.Offset, p.Err)
 				}
 			}
 		} else {
-			invalid("iter %d ps sampling goroutine did not return within bound", i)
+			invalidateRecord(rec, "iter %d ps sampling goroutine did not return within bound", i)
 		}
 
 		if !rec.CheckpointHit {
@@ -597,7 +603,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		_, _, pending, er, wr := diagReportAggregate(reportDeadline, w.eventsCh, w.waitCh, w.eventsSeen, w.waitSeen)
 		w.rec.applyEvents(er)
 		w.rec.applyWait(wr)
-		w.rec.flagStreamErrors(er, "(late)", invalid)
+		w.rec.flagStreamErrors(er, "(late)", invalidateRecord)
 		if !pending {
 			w.rec.FinalStatus = "finalConverged"
 		} else {
@@ -702,7 +708,11 @@ func TestDiagOrphanFullPath(t *testing.T) {
 // immediate 路徑已計入 stream error，report 路徑拿到 er==nil 時不得重複計入；同一錯誤只計一次。
 func TestDiagFullPathStreamErrorCountedOnce(t *testing.T) {
 	var calls []string
-	invalid := func(format string, a ...any) { calls = append(calls, fmt.Sprintf(format, a...)) }
+	invalid := func(rec *diagFullRecord, format string, a ...any) {
+		rec.EvidenceValid = false
+		rec.Errors = append(rec.Errors, fmt.Sprintf(format, a...))
+		calls = append(calls, fmt.Sprintf(format, a...))
+	}
 	rec := &diagFullRecord{Iter: 7, EvidenceValid: true}
 	er := &diagEventsResult{streamErrors: []string{"bufio.Scanner: token too long"}}
 	rec.applyEvents(er)
