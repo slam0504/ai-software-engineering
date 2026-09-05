@@ -135,17 +135,23 @@ wails build                  # → build/bin/sdlc-workbench.app
 
 ### 測試
 
+從乾淨 checkout 依序執行（順序有意義：root 套件 `go:embed` 需要 `frontend/dist`，所以 frontend 先建）。每條對應 CI（`.github/workflows/ci.yml`）的同名 job，任何人 checkout 同一 SHA 執行下列指令即可重現 CI 的同等證據：
+
 ```bash
-go vet ./...
-go test -race ./... -count=1     # 所有 package，含 production path 的同步與競態測試
-npm --prefix frontend run test   # vitest（store／scroll／sanitizer／i18n／元件）
-npm --prefix frontend run build  # vue-tsc typecheck + vite build
+npm --prefix frontend ci
+npm --prefix frontend run test                          # CI job: frontend — vitest（store／scroll／sanitizer／i18n／元件）
+npm --prefix frontend run build                         # CI job: frontend — vue-tsc typecheck + vite build → frontend/dist
+go build ./...                                          # CI job: go
+go vet ./...                                            # CI job: go
+go test -race ./... -count=1                            # CI job: go — 所有 package，含 production path 的同步與競態測試
+(cd schemas/codex && shasum -a 256 -c SHA256SUMS)       # CI job: checksums — Codex app-server schema 凍結
+(cd docs/architecture && shasum -a 256 -c SHA256SUMS)   # CI job: checksums — 里程碑 plan 凍結（m0／m1／m1.5）
 ```
 
-> **這三個 package 要分開跑，不要併跑**：`internal/codex`（`TestAppServerTerminateKillsGroup`）、
-> `internal/assist`、`internal/claude` 有三處**以實際經過時間（wall clock）判定**的既有測試，
-> 機器負載高時會出現偽陽性（實測：單獨跑 0.02s、負載下 30s 逾時）。這三處紅了先單獨重跑該 package 再判定，
-> 詳見 [`docs/spikes/m3b-results.md`](docs/spikes/m3b-results.md) §7。
+> **牆鐘相依測試的紅燈怎麼判**：Go 六條與前端兩條具名測試已由 Pre-M4 B1 系列處置完畢，有效名單與規則以
+> [`docs/architecture/wall-clock-test-register.md`](docs/architecture/wall-clock-test-register.md) 為準——
+> 這八條紅燈**先分類**（命中契約斷言或契約路徑卡死＝回歸，不得單獨重跑吸收；setup／資源失效＝該次無效並揭露），
+> 其他前端測試依同文件 B 段的一般規則。`docs/spikes/m3b-results.md` §7 為 2026-08-21 的歷史觀察，§7.1 為處置快照。
 
 ---
 
@@ -377,7 +383,7 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外） |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（以 OpenCode 作為第一個目標）、保留 Claude／Codex 原生 adapter、能力協商（capability negotiation）（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 
-每個里程碑的執行計畫經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`SHA256SUMS` 可驗證），
+里程碑執行計畫（m0／m1／m1.5）經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`cd docs/architecture && shasum -a 256 -c SHA256SUMS` 可驗證；app-plan 與治理文件為 living 文件，版本見各自 header 與修訂記錄，不在凍結清單），
 實作偏差與殘餘風險記錄於對應的驗收結果文件。
 
 ---
