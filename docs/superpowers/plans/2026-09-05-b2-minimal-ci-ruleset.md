@@ -260,7 +260,21 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
 ## Task 1 證據（進行中，2026-09-05）
 
 - **Action pin（`gh api` GET：`releases/latest` → `git/ref/tags/<tag>`，annotated tag 再解 `git/tags/<sha>`）**：`actions/checkout` v7.0.1 `3d3c42e5aac5ba805825da76410c181273ba90b1`；`actions/setup-node` v7.0.0 `820762786026740c76f36085b0efc47a31fe5020`；`actions/setup-go` v7.0.0 `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e`；`actions/upload-artifact` v7.0.1 `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`；`actions/download-artifact` v8.0.1 `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`。
-- 本機分支 `b2a/ci-workflows`（自 `c6f8099`）；`.github/workflows/ci.yml` 已寫入並以 YAML 解析器核對四個 job／needs；Step 0 的 push／開 PR 待 owner 授權。
+- 本機分支 `b2a/ci-workflows`（自 `c6f8099`）；`.github/workflows/ci.yml` 已寫入並以 YAML 解析器核對四個 job／needs。
+- **Step 0**：owner 授權（綁定 HEAD `109b407`、遠端 main `c6f8099`）後 `git push -u origin b2a/ci-workflows`（新分支），**PR #1** 建立：https://github.com/slam0504/ai-software-engineering/pull/1（base main、head `109b407`）。
+- **首次 PR run `33952217785`（pull_request，2026-09-05 07:19Z）——四個 job 第一次即全綠**：
+
+  | job | runner image | 起訖（UTC） | 耗時 | 關鍵輸出 |
+  |---|---|---|---|---|
+  | `checksums` | ubuntu-24.04 | 07:19:17–07:19:23 | 6s | 兩份 SHA256SUMS `-c` OK；`git diff --check`（pull_request 路徑）綠 |
+  | `frontend` | ubuntu-24.04 | 07:19:16–07:20:00 | 44s | node v26.8.1；vitest **40 檔 397 passed**；`vitest.rc`=0、`frontend-build.rc`=0；npm cache 首次未命中、post 已存 key `node-cache-Linux-x64-npm-9dcd67fe…` |
+  | `go` | macos-15（`macos-15-intel` 標籤，`go version go1.26.5 darwin/amd64`） | 07:20:04–07:26:27 | 6m23s | gofmt 空；build／vet 綠；`go test -race -json`：root **422 pass＋1 skip**、`internal/codex` 47、`assist` 20、`claude` 22、`proc` 18、其餘套件全 pass、另 `internal/domainspec` 1 skip（env gate）；`go-test.rc`=0 |
+  | `wails-build` | macos-15（同上） | 07:20:03–07:26:18 | 6m15s | Wails CLI v2.13.0；`wails build -s` Built in 1m25s；`check-cli.sh`：claude 2.1.223 sha256 `350e6574…`、codex 0.146.1 sha256 `134063e1…`、OK；`.app` tar 上傳（306.6 MB） |
+
+  六條 Go wall-clock 測試在 CI 單跑 elapsed（補充資料，非 D6 樣本）：#1 0.06s、#2 0.61s、#3 0.05s、#4 0.03s、#5 0.06s、#6 0.34s；F1 157ms、F2 95ms。
+- **artifact 本機驗證**（`gh run download 33952217785`）：`vitest-output`（`vitest.rc`／`frontend-build.rc` 皆 0）、`go-test-json`（`go-test.rc` 0，18 個 pass 計數如上）、`frontend-dist`（`index.html` 存在）、`wails-app-tar`（解開後 `Contents/MacOS/sdlc-workbench` 可執行、`Contents/Resources/tools/` 含 `claude-cli`／`codex-cli`）。
+- **check-runs 預檢**（head `109b407`）：`frontend`／`go`／`wails-build`／`checksums` 四個 context，app `github-actions`，**app id 15368**，皆 success。權威版本待 Task 3 的 main run 再抄。
+- **Step 2b failure-path control**：待 owner 授權推送（見下方 control commit）。
 
 ## Gate A（B2a 完成條件）
 - [ ] PR 內四個 job 全綠；implementation main run 全綠；**final B2a HEAD（含 closure commit）的 main run 全綠**；各 run ID、SHA、耗時、runner image、工具版本、cache hit 記錄。
