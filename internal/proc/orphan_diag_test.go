@@ -24,10 +24,14 @@
 //
 // B2c-2 Task 1（fixture-only differential 參數化，本檔新增）：
 //   - DIAG_FIXTURE=diag|fake-claude（預設 diag）：diag＝上述既有行為，語意與先前完全相同；
-//     fake-claude＝Binary 換成 repo-root testdata/fake-claude.sh，Env 只給 FAKE_ORPHAN=1（不給
-//     token／PID 檔），所有身分欄位不可用，rescueDecide 恆為 skipped-no-target（不讀 PID 檔、
-//     不送任何訊號）；DIAG_MODE 對 fake-claude 無意義，一律忽略並記 modeIgnored=true，也不會
-//     被傳進子程序 Env。
+//     fake-claude＝Binary 換成 repo-root testdata/fake-claude.sh；proc.Start 會把 os.Environ()
+//     整份傳給子程序（proc.go:133），因此 fake 路徑以尾端覆寫明確清空所有 FAKE_*（FAKE_MULTI／
+//     FAKE_STDERR／FAKE_DIE／FAKE_BADLINE／FAKE_HANG／FAKE_EXIT；os/exec 去重保留最後一筆），
+//     再設 FAKE_ORPHAN=1，父環境原有的 FAKE_* 名稱記入 record.ambientFakeVars 揭露。所有身分
+//     欄位不可用，rescueDecide 恆為 skipped-no-target（不讀 PID 檔、不送任何訊號）；DIAG_MODE
+//     對 fake-claude 無意義（fixture 不使用；環境變數仍會被子程序繼承），記 modeIgnored=true。
+//   - DIAG_PS_TIMEOUT（預設 5s；僅本機控制用）：每次 ps 取樣的 CommandContext 期限，逾時保留
+//     起訖時刻並計入 invalidEvidence（測試非零），避免 ps 卡住讓 iteration 無界。
 //   - DIAG_FAKE_HANG=1（僅 DIAG_FIXTURE=fake-claude 生效；正式 CI 不設）：多加 FAKE_HANG=1 進
 //     fixture Env，讓 leader 收尾前 sleep 30——唯一用途是製造確定性的 pending 控制樣本。
 //   - pending 與 invalidEvidence 分開計數且都會讓測試非零結束：pending＝彙報階段（整批共用
@@ -108,7 +112,8 @@ type diagRecord struct {
 	Fixture              string          `json:"fixture"` // diag | fake-claude
 	FakeHang             bool            `json:"fakeHang"`
 	Mode                 string          `json:"mode"`
-	ModeIgnored          bool            `json:"modeIgnored,omitempty"` // fake-claude 不支援 DIAG_MODE，恆為 true
+	ModeIgnored          bool            `json:"modeIgnored,omitempty"`     // fake-claude 不支援 DIAG_MODE，恆為 true
+	AmbientFakeVars      []string        `json:"ambientFakeVars,omitempty"` // 父環境原有的 FAKE_* 名稱（已被尾端覆寫清空，僅揭露）
 	Token                string          `json:"token"`
 	OrphanPid            int             `json:"orphanPid"`
 	ChildPid             int             `json:"childPid"`
@@ -146,9 +151,16 @@ func diagMs(d time.Duration) *float64 { v := float64(d.Microseconds()) / 1000.0;
 // tCleanupKill 判先後（afterCleanupKill／straddle／before／unknown，見 diagClassifyCleanupRelation）。
 // 以 Go 端依 pgid 過濾（見 diagSummarize），不依賴 `ps -g`，`-eo` 已在 macOS／Linux 兩種 ps
 // 上驗證可用，維持可攜。
+var diagPsTimeout = diagEnvDur("DIAG_PS_TIMEOUT", 5*time.Second)
+
 func diagPs(path string) (rows []diagPsRow, start, end time.Time, err error) {
 	start = time.Now()
-	out, cmdErr := exec.Command("ps", "-eo", "pgid,pid,ppid,stat,etime,command").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), diagPsTimeout)
+	defer cancel()
+	out, cmdErr := exec.CommandContext(ctx, "ps", "-eo", "pgid,pid,ppid,stat,etime,command").CombinedOutput()
+	if ctx.Err() != nil {
+		cmdErr = fmt.Errorf("ps timeout after %s: %w", diagPsTimeout, ctx.Err())
+	}
 	if path != "" {
 		if werr := os.WriteFile(path, out, 0o644); werr != nil {
 			end = time.Now()
@@ -635,9 +647,19 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		// 沒有 token／PID 檔；diag 維持既有 DIAG_TOKEN／DIAG_PIDFILE／DIAG_CHILDPIDFILE／DIAG_MODE。
 		var startEnv []string
 		if fixtureKind == "fake-claude" {
-			startEnv = []string{"FAKE_ORPHAN=1"}
+			// proc.Start 以 append(os.Environ(), cfg.Env...) 傳環境，os/exec 去重保留最後一筆：
+			// 先以尾端覆寫清空所有 FAKE_*（fixture 皆以 -n 判斷，空值＝未設），再設 FAKE_ORPHAN=1，
+			// 只有 DIAG_FAKE_HANG=1 才覆寫 FAKE_HANG=1；父環境原有的 FAKE_* 名稱記入 record 揭露。
+			startEnv = []string{"FAKE_MULTI=", "FAKE_STDERR=", "FAKE_DIE=", "FAKE_BADLINE=", "FAKE_HANG=", "FAKE_EXIT=", "FAKE_ORPHAN=1"}
 			if fakeHang {
 				startEnv = append(startEnv, "FAKE_HANG=1")
+			}
+			for _, kv := range os.Environ() {
+				if strings.HasPrefix(kv, "FAKE_") {
+					if k, _, ok := strings.Cut(kv, "="); ok {
+						rec.AmbientFakeVars = append(rec.AmbientFakeVars, k)
+					}
+				}
 			}
 		} else {
 			startEnv = []string{"DIAG_TOKEN=" + token, "DIAG_PIDFILE=" + pidfile, "DIAG_CHILDPIDFILE=" + childfile, "DIAG_MODE=" + mode}
@@ -897,6 +919,8 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 		if b, jerr := json.Marshal(w.rec); jerr == nil {
 			mustWrite(filepath.Join(outDir, fmt.Sprintf("iter-%d-final.json", w.rec.Iter)), b)
+		} else {
+			invalid("iter %d marshal final: %v", w.rec.Iter, jerr)
 		}
 	}
 
