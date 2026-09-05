@@ -10,17 +10,17 @@
 //	(c)  孫程序已消失但 stdout EOF 延遲
 //	(a′) 最後輸出至 supervisor 記錄退出的延遲——只是 (a) cmd.Wait 延遲的代理，不確認也不排除 (a)
 //
-// 歸因統計由 plan 的 Python 解析對 iter-records.jsonl 逐輪套用；本檔只忠實記錄原始時序與快照。
+// 歸因統計由 plan 的解析器對 iter-records.jsonl 逐輪套用；本檔只忠實記錄原始時序與快照。
 //
-// 契約（plan rev5）：
-//   - 單一 stdout reader，同一 goroutine 記 tLastLine 與 tEOF。
-//   - tExited 當下建立絕對 deadline D1 = tExited+10s；ps 快照 goroutine 與 EOF 等待並行。
-//   - EOF 到達後的 Done() 等待有界（5s）。任一逾時 → rescue 判定 → guard 2（5s）。
-//   - rescue 前先取當下 ps：本輪孫程序（DIAG_PIDFILE 的 PID，命令列含 token）或其 sleep 子程序
-//     仍在且 pgid==p.PGID() 才對群組 SIGKILL（mode=group）；pgid 不符只對已驗明 PID 個別 kill
-//     （mode=targeted-pid）；找不到即 skipped-no-target，不送任何訊號。
-//   - 未收斂的 iteration 不呼叫 p.Wait()，交背景；測試結束前整體最多等 30s，逾時記 pending。
-//   - record 於彙報完成後每輪只序列化一次到 iter-records.jsonl；逐輪另寫 partial 檔保底。
+// 契約（plan rev6 之後、owner 第二輪 P1）：
+//   - 所有等待皆有界：exitedCh（DIAG_EXITED_TIMEOUT，預設 10s）、EOF（D1=tExited+10s）、Done（5s）、guard 2（單一絕對 deadline 迴圈，5s）。
+//   - onSignal 依既有白箱測試的鎖定契約於 p.mu 內寫入。
+//   - 單一 stdout reader，同一 goroutine 記 tLastLine 與 tEOF（mutex 保護）。
+//   - 兩階段身分：先以 DIAG_PIDFILE 的 PID＋命令列含 token 驗明父 bash，再接受同一份快照中 ppid==父 PID 且 PID==DIAG_CHILDPIDFILE 的 sleep。
+//   - rescue 只對已驗明目標：父與子皆在 p.PGID() → group；否則只對已驗明 PID 個別 kill → targeted-pid；無目標 → skipped-no-target。
+//   - 證據完整性：任何 artifact 寫入／編碼／Start／stdin／scanner 錯誤都累積到 invalidEvidence，最後讓測試非零結束。
+//   - 強制控制（只用於本機驗證分支，CI 不設）：DIAG_MODE=hang（exitedTimeout 路徑）、DIAG_MODE=escape（eofTimeout→targeted-pid→guard 2）、
+//     DIAG_FORCE_EOF_TIMEOUT=1（跳過 guard 1 等待→skipped-no-target 路徑）。
 package proc
 
 import (
@@ -52,18 +52,21 @@ type diagPsSummary struct {
 	Offset            string `json:"offset"`
 	At                int64  `json:"atNs"`
 	GroupMembers      int    `json:"groupMembers"`
-	OrphanPresent     bool   `json:"orphanPresent"`
+	OrphanPresent     bool   `json:"orphanPresent"` // 父 bash：PID==DIAG_PIDFILE 且命令列含 token
 	OrphanPgid        int    `json:"orphanPgid"`
 	OrphanPgidMatches bool   `json:"orphanPgidMatches"`
 	OrphanZombie      bool   `json:"orphanZombie"`
-	SleepChildPresent bool   `json:"sleepChildPresent"`
-	SleepChildPgid    int    `json:"sleepChildPgid"`
+	ChildPresent      bool   `json:"childPresent"` // sleep：PID==DIAG_CHILDPIDFILE 且 ppid==已驗明父 PID
+	ChildPgid         int    `json:"childPgid"`
+	ChildPgidMatches  bool   `json:"childPgidMatches"`
+	LeaderPresent     bool   `json:"leaderPresent"` // leader（pid==p.pgid）仍在：hang 模式／exitedTimeout 診斷用
 	File              string `json:"file"`
 	Err               string `json:"err,omitempty"`
 }
 
 type diagRescue struct {
 	Mode     string            `json:"mode"` // none | group | targeted-pid | skipped-no-target
+	Reason   string            `json:"reason,omitempty"`
 	Err      string            `json:"err,omitempty"`
 	AtNs     int64             `json:"atNs,omitempty"`
 	PerPID   map[string]string `json:"perPid,omitempty"`
@@ -75,26 +78,30 @@ type diagRecord struct {
 	Iter                int             `json:"iter"`
 	Runner              string          `json:"runner"`
 	GOOS                string          `json:"goos"`
+	Mode                string          `json:"mode"`
 	Token               string          `json:"token"`
 	OrphanPid           int             `json:"orphanPid"`
+	ChildPid            int             `json:"childPid"`
 	PGID                int             `json:"pgid"`
 	StartToExitedMs     *float64        `json:"startToExitedMs"`
 	LastLineToExitedMs  *float64        `json:"lastLineToExitedMs"`
 	ExitedToCleanupKill *float64        `json:"exitedToCleanupKillMs"`
 	ExitedToEOFMs       *float64        `json:"exitedToEOFMs"`
 	ExitedToDoneMs      *float64        `json:"exitedToDoneMs"`
+	ExitedTimeout       bool            `json:"exitedTimeout"`
 	EOFTimeout          bool            `json:"eofTimeout"`
 	DoneTimeout         bool            `json:"doneTimeout"`
+	ForcedEOFTimeout    bool            `json:"forcedEofTimeout"`
 	AfterRescue         bool            `json:"afterRescue"`
 	Converged           bool            `json:"converged"`
-	FinalStatus         string          `json:"finalConverged"` // 彙報後填入：converged | finalConverged | pending
+	FinalStatus         string          `json:"finalConverged"` // 彙報後填入：converged | finalConverged | pending | aborted
 	FinalWaitMs         *float64        `json:"finalWaitMs,omitempty"`
 	Anomaly             bool            `json:"anomaly"`
 	Snapshots           []diagPsSummary `json:"ps"`
 	Rescue              diagRescue      `json:"rescue"`
 	NewPidsAfterIter    int             `json:"newPidsAfterIter"`
 	ExitCode            *int            `json:"exitCode,omitempty"`
-	Note                string          `json:"note,omitempty"`
+	Errors              []string        `json:"errors,omitempty"`
 }
 
 func diagMs(d time.Duration) *float64 { v := float64(d.Microseconds()) / 1000.0; return &v }
@@ -102,7 +109,9 @@ func diagMs(d time.Duration) *float64 { v := float64(d.Microseconds()) / 1000.0;
 func diagPs(path string) ([]diagPsRow, error) {
 	out, err := exec.Command("ps", "-eo", "pgid,pid,ppid,stat,etime,command").CombinedOutput()
 	if path != "" {
-		_ = os.WriteFile(path, out, 0o644)
+		if werr := os.WriteFile(path, out, 0o644); werr != nil {
+			return nil, fmt.Errorf("write %s: %w", path, werr)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -127,22 +136,48 @@ func diagPs(path string) ([]diagPsRow, error) {
 	return rows, nil
 }
 
-func diagSummarize(rows []diagPsRow, groupPgid, orphanPid int, token string) diagPsSummary {
+// diagIdentity 兩階段身分：先驗父（PID＋token），再驗子（PID＋ppid==父）。回傳已驗明的 rows。
+func diagIdentity(rows []diagPsRow, orphanPid, childPid int, token string) (parent, child *diagPsRow) {
+	for i := range rows {
+		r := &rows[i]
+		if orphanPid > 0 && r.PID == orphanPid && strings.Contains(r.Command, token) {
+			parent = r
+			break
+		}
+	}
+	if parent != nil {
+		for i := range rows {
+			r := &rows[i]
+			if childPid > 0 && r.PID == childPid && r.PPID == parent.PID && strings.Contains(r.Command, "sleep") {
+				child = r
+				break
+			}
+		}
+	}
+	return parent, child
+}
+
+func diagSummarize(rows []diagPsRow, groupPgid, orphanPid, childPid int, token string) diagPsSummary {
 	s := diagPsSummary{}
 	for _, r := range rows {
 		if r.PGID == groupPgid {
 			s.GroupMembers++
 		}
-		if orphanPid > 0 && r.PID == orphanPid && strings.Contains(r.Command, token) {
-			s.OrphanPresent = true
-			s.OrphanPgid = r.PGID
-			s.OrphanPgidMatches = r.PGID == groupPgid
-			s.OrphanZombie = strings.HasPrefix(r.Stat, "Z")
+		if r.PID == groupPgid {
+			s.LeaderPresent = true
 		}
-		if orphanPid > 0 && r.PPID == orphanPid && strings.Contains(r.Command, "sleep") {
-			s.SleepChildPresent = true
-			s.SleepChildPgid = r.PGID
-		}
+	}
+	parent, child := diagIdentity(rows, orphanPid, childPid, token)
+	if parent != nil {
+		s.OrphanPresent = true
+		s.OrphanPgid = parent.PGID
+		s.OrphanPgidMatches = parent.PGID == groupPgid
+		s.OrphanZombie = strings.HasPrefix(parent.Stat, "Z")
+	}
+	if child != nil {
+		s.ChildPresent = true
+		s.ChildPgid = child.PGID
+		s.ChildPgidMatches = child.PGID == groupPgid
 	}
 	return s
 }
@@ -165,7 +200,44 @@ func diagToken(i int) string {
 	return fmt.Sprintf("iter-%d-%s", i, hex.EncodeToString(b))
 }
 
-// TestDiagOrphanTimeline 只做取證，不以時間作為通過條件；任何 iteration 的異常都記錄而不 t.Fatal。
+func diagEnvDur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
+// diagWaitConverge：單一絕對 deadline 迴圈，同時追蹤 EOF 與 Done；每次以剩餘時間建立新 timer。
+func diagWaitConverge(deadline time.Time, eofCh <-chan struct{}, doneCh <-chan struct{}, eofSeen, doneSeen bool) (bool, bool, time.Time, time.Time) {
+	var tEOFSeen, tDoneSeen time.Time
+	for time.Now().Before(deadline) && !(eofSeen && doneSeen) {
+		remaining := time.Until(deadline)
+		if !eofSeen {
+			select {
+			case <-eofCh:
+				eofSeen = true
+				tEOFSeen = time.Now()
+			case <-doneCh:
+				doneSeen = true
+				tDoneSeen = time.Now()
+			case <-time.After(remaining):
+			}
+			continue
+		}
+		select {
+		case <-doneCh:
+			doneSeen = true
+			tDoneSeen = time.Now()
+		case <-time.After(remaining):
+		}
+	}
+	return eofSeen, doneSeen, tEOFSeen, tDoneSeen
+}
+
+// TestDiagOrphanTimeline 只做取證，不以時間作為通過條件；iteration 內的異常只記錄。
+// 測試以非零結束的唯一原因是「證據不完整」（invalidEvidence > 0）。
 func TestDiagOrphanTimeline(t *testing.T) {
 	fixture, err := filepath.Abs("testdata/diag-orphan.sh")
 	if err != nil {
@@ -191,7 +263,33 @@ func TestDiagOrphanTimeline(t *testing.T) {
 	if runner == "" {
 		runner = "local"
 	}
-	t.Logf("diag: iterations=%d outDir=%s runner=%s goos=%s", n, outDir, runner, runtime.GOOS)
+	mode := os.Getenv("DIAG_MODE")
+	if mode == "" {
+		mode = "normal"
+	}
+	forceEOFTimeout := os.Getenv("DIAG_FORCE_EOF_TIMEOUT") == "1"
+	exitedTimeout := diagEnvDur("DIAG_EXITED_TIMEOUT", 10*time.Second)
+	t.Logf("diag: iterations=%d outDir=%s runner=%s goos=%s mode=%s forceEOFTimeout=%v exitedTimeout=%s", n, outDir, runner, runtime.GOOS, mode, forceEOFTimeout, exitedTimeout)
+
+	var evMu sync.Mutex
+	var invalidEvidence []string
+	invalid := func(format string, a ...any) {
+		evMu.Lock()
+		invalidEvidence = append(invalidEvidence, fmt.Sprintf(format, a...))
+		evMu.Unlock()
+	}
+	mustWrite := func(path string, b []byte) {
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			invalid("write %s: %v", filepath.Base(path), err)
+		}
+	}
+	writePartial := func(rec *diagRecord) {
+		if b, jerr := json.Marshal(rec); jerr == nil {
+			mustWrite(filepath.Join(outDir, fmt.Sprintf("iter-%d-partial.json", rec.Iter)), b)
+		} else {
+			invalid("iter %d marshal partial: %v", rec.Iter, jerr)
+		}
+	}
 
 	records := make([]*diagRecord, 0, n)
 	type bgWait struct {
@@ -201,29 +299,103 @@ func TestDiagOrphanTimeline(t *testing.T) {
 	var bg []bgWait
 	offsets := []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond, time.Second, 5 * time.Second}
 
+	// rescueDecide：以當下快照做兩階段身分驗證後決定 rescue 模式；只對已驗明目標送訊號。
+	rescueDecide := func(rec *diagRecord, p *Proc, orphanPid, childPid int, token, reason string, i int, leaderRow *diagPsRow) {
+		rows, perr := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-rescue-before.txt", i)))
+		if perr != nil {
+			invalid("iter %d rescue-before ps: %v", i, perr)
+		}
+		sb := diagSummarize(rows, p.PGID(), orphanPid, childPid, token)
+		sb.Offset = "rescue-before"
+		sb.At = time.Now().UnixNano()
+		rec.Rescue.PsBefore = &sb
+		rec.Rescue.Reason = reason
+		parent, child := diagIdentity(rows, orphanPid, childPid, token)
+		var targets []diagPsRow
+		if parent != nil {
+			targets = append(targets, *parent)
+		}
+		if child != nil {
+			targets = append(targets, *child)
+		}
+		// exitedTimeout 路徑：leader 也是已驗明目標（pid==p.PGID() 且命令列含 fixture 名）。
+		if leaderRow != nil {
+			for _, r := range rows {
+				if r.PID == leaderRow.PID && strings.Contains(r.Command, "diag-orphan.sh") {
+					targets = append(targets, r)
+				}
+			}
+		}
+		allInGroup := true
+		for _, tr := range targets {
+			if tr.PGID != p.PGID() {
+				allInGroup = false
+			}
+		}
+		switch {
+		case len(targets) == 0:
+			rec.Rescue.Mode = "skipped-no-target"
+		case allInGroup:
+			// 所有已驗明目標都在預期群組：對群組送 KILL（唯一允許使用 p.PGID() 的情況）。
+			rec.Rescue.Mode = "group"
+			rec.Rescue.AtNs = time.Now().UnixNano()
+			if err := p.SignalGroup(syscall.SIGKILL); err != nil {
+				rec.Rescue.Err = err.Error()
+			}
+		default:
+			// 有已驗明目標不在預期群組：先固定 psBefore 的目標清單，再逐一送訊號並記錄每個結果。
+			rec.Rescue.Mode = "targeted-pid"
+			rec.Rescue.AtNs = time.Now().UnixNano()
+			rec.Rescue.PerPID = map[string]string{}
+			for _, tr := range targets {
+				if err := syscall.Kill(tr.PID, syscall.SIGKILL); err != nil {
+					rec.Rescue.PerPID[strconv.Itoa(tr.PID)] = err.Error()
+				} else {
+					rec.Rescue.PerPID[strconv.Itoa(tr.PID)] = "ok"
+				}
+			}
+		}
+		rows2, perr2 := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-rescue-after.txt", i)))
+		if perr2 != nil {
+			invalid("iter %d rescue-after ps: %v", i, perr2)
+		}
+		sa := diagSummarize(rows2, p.PGID(), orphanPid, childPid, token)
+		sa.Offset = "rescue-after"
+		sa.At = time.Now().UnixNano()
+		rec.Rescue.PsAfter = &sa
+	}
+
 	for i := 0; i < n; i++ {
-		rec := &diagRecord{Iter: i, Runner: runner, GOOS: runtime.GOOS, FinalStatus: "pending"}
+		rec := &diagRecord{Iter: i, Runner: runner, GOOS: runtime.GOOS, Mode: mode, FinalStatus: "pending", ForcedEOFTimeout: forceEOFTimeout}
+		rec.Rescue.Mode = "none"
 		records = append(records, rec)
 		token := diagToken(i)
 		rec.Token = token
 		pidfile := filepath.Join(outDir, fmt.Sprintf("iter-%d-orphan.pid", i))
-		before, _ := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-before.txt", i)))
+		childfile := filepath.Join(outDir, fmt.Sprintf("iter-%d-child.pid", i))
+		before, perr := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-before.txt", i)))
+		if perr != nil {
+			invalid("iter %d before ps: %v", i, perr)
+		}
 		beforePids := map[int]bool{}
 		for _, r := range before {
 			beforePids[r.PID] = true
 		}
 
-		ctx := context.Background()
-		p, err := Start(ctx, Config{Binary: fixture, Env: []string{"DIAG_TOKEN=" + token, "DIAG_PIDFILE=" + pidfile}, TermGrace: 200 * time.Millisecond})
+		p, err := Start(context.Background(), Config{Binary: fixture, Env: []string{"DIAG_TOKEN=" + token, "DIAG_PIDFILE=" + pidfile, "DIAG_CHILDPIDFILE=" + childfile, "DIAG_MODE=" + mode}, TermGrace: 200 * time.Millisecond})
 		if err != nil {
-			rec.Note = "start failed: " + err.Error()
+			rec.Errors = append(rec.Errors, "start: "+err.Error())
+			rec.FinalStatus = "aborted"
+			invalid("iter %d Start failed: %v", i, err)
+			writePartial(rec)
 			continue
 		}
 		rec.PGID = p.PGID()
 		t0 := time.Now()
 
-		// seam：Start 返回後、送 prompt 前設定；leader 收到 prompt 前不會退出，事件不會漏。
+		// seam：依既有白箱測試的鎖定契約，於 p.mu 內寫入；在送 prompt 前完成，leader 收到 prompt 前不會退出。
 		killCh := make(chan time.Time, 1)
+		p.mu.Lock()
 		p.onSignal = func(ev signalEvent) {
 			if ev == sigEventSupervisorCleanupKill {
 				select {
@@ -232,11 +404,12 @@ func TestDiagOrphanTimeline(t *testing.T) {
 				}
 			}
 		}
+		p.mu.Unlock()
 
-		// 單一 stdout reader：同一 goroutine 記 tLastLine 與 tEOF；兩個時刻以 mutex 保護，
-		// 主 goroutine 只透過 getters 讀取（race detector 要求明確的 happens-before）。
+		// 單一 stdout reader：同一 goroutine 記 tLastLine 與 tEOF（mutex 保護）。
 		var tsMu sync.Mutex
 		var tLastLine, tEOF time.Time
+		var scanErr error
 		getLastLine := func() time.Time { tsMu.Lock(); defer tsMu.Unlock(); return tLastLine }
 		getEOF := func() time.Time { tsMu.Lock(); defer tsMu.Unlock(); return tEOF }
 		eofCh := make(chan struct{})
@@ -251,18 +424,78 @@ func TestDiagOrphanTimeline(t *testing.T) {
 				}
 			}
 			tsMu.Lock()
+			scanErr = sc.Err()
 			tEOF = time.Now()
 			tsMu.Unlock()
 			close(eofCh)
 		}()
-		_, _ = p.Stdin.Write([]byte("x\n"))
-		_ = p.Stdin.Close()
+		if _, werr := p.Stdin.Write([]byte("x\n")); werr != nil {
+			rec.Errors = append(rec.Errors, "stdin write: "+werr.Error())
+			invalid("iter %d stdin write: %v", i, werr)
+		}
+		if cerr := p.Stdin.Close(); cerr != nil {
+			rec.Errors = append(rec.Errors, "stdin close: "+cerr.Error())
+		}
 
-		<-p.exitedCh
-		tExited := time.Now() // 觀察時刻：主 goroutine 自 exitedCh 醒來；supervisor 的 cleanup KILL 事件可能早它數微秒，故 exitedToCleanupKillMs 可為極小負值。
-		d1 := tExited.Add(10 * time.Second)
+		// 有界等待 exitedCh（候選機制 (a) 若發生，這裡是第一個會逾時的點）。
+		var tExited time.Time
+		select {
+		case <-p.exitedCh:
+			tExited = time.Now() // 觀察時刻：supervisor 的 cleanup KILL 事件可早數微秒，故 exitedToCleanupKillMs 可為極小負值。
+		case <-time.After(exitedTimeout):
+			rec.ExitedTimeout = true
+		}
 		orphanPid := diagReadPid(pidfile)
-		rec.OrphanPid = orphanPid
+		childPid := diagReadPid(childfile)
+		rec.OrphanPid, rec.ChildPid = orphanPid, childPid
+
+		if rec.ExitedTimeout {
+			// (a) 代理命中：leader 在 exitedTimeout 內未被 supervisor 記錄退出。取快照、身分驗證後 cleanup，有界等收斂，記錄並結束本輪。
+			snapAt := time.Now()
+			file := fmt.Sprintf("iter-%d-ps-exited-timeout.txt", i)
+			rows, perr := diagPs(filepath.Join(outDir, file))
+			if perr != nil {
+				invalid("iter %d exited-timeout ps: %v", i, perr)
+			}
+			sum := diagSummarize(rows, p.PGID(), orphanPid, childPid, token)
+			sum.Offset = "exited-timeout"
+			sum.At = snapAt.UnixNano()
+			sum.File = file
+			rec.Snapshots = append(rec.Snapshots, sum)
+			if ll := getLastLine(); !ll.IsZero() {
+				v := float64(snapAt.Sub(ll).Microseconds()) / 1000.0
+				rec.LastLineToExitedMs = &v // 下界：至 exitedTimeout 觀察時刻仍未記錄退出
+			}
+			var leaderRow *diagPsRow
+			for k := range rows {
+				if rows[k].PID == p.PGID() {
+					leaderRow = &rows[k]
+				}
+			}
+			rescueDecide(rec, p, orphanPid, childPid, token, "exitedTimeout", i, leaderRow)
+			eofSeen, doneSeen, tE, tD := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), false, false)
+			if eofSeen && !tE.IsZero() {
+				rec.ExitedToEOFMs = nil // 無 tExited 基準，不填
+			}
+			_ = tD
+			rec.Converged = eofSeen && doneSeen
+			rec.AfterRescue = rec.Converged
+			if rec.Converged {
+				ex := p.Wait()
+				code := ex.Code
+				rec.ExitCode = &code
+				rec.FinalStatus = "converged"
+			} else {
+				ch := make(chan time.Time, 1)
+				go func(pp *Proc) { pp.Wait(); ch <- time.Now() }(p)
+				bg = append(bg, bgWait{rec: rec, done: ch})
+			}
+			writePartial(rec)
+			t.Logf("iter %d: exitedTimeout rescue=%s converged=%v", i, rec.Rescue.Mode, rec.Converged)
+			continue
+		}
+
+		d1 := tExited.Add(10 * time.Second)
 		rec.StartToExitedMs = diagMs(tExited.Sub(t0))
 		if ll := getLastLine(); !ll.IsZero() {
 			rec.LastLineToExitedMs = diagMs(tExited.Sub(ll))
@@ -278,12 +511,13 @@ func TestDiagOrphanTimeline(t *testing.T) {
 				time.Sleep(time.Until(tExited.Add(off)))
 				file := filepath.Join(outDir, fmt.Sprintf("iter-%d-ps-%s.txt", i, off.String()))
 				rows, perr := diagPs(file)
-				sum := diagSummarize(rows, p.PGID(), orphanPid, token)
+				sum := diagSummarize(rows, p.PGID(), orphanPid, childPid, token)
 				sum.Offset = off.String()
 				sum.At = time.Now().UnixNano()
 				sum.File = filepath.Base(file)
 				if perr != nil {
 					sum.Err = perr.Error()
+					invalid("iter %d ps@%s: %v", i, off, perr)
 				}
 				snapMu.Lock()
 				rec.Snapshots = append(rec.Snapshots, sum)
@@ -291,12 +525,16 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			}
 		}()
 
-		// guard 1：EOF 以 D1 為絕對 deadline。
+		// guard 1：EOF 以 D1 為絕對 deadline（DIAG_FORCE_EOF_TIMEOUT=1 時直接視為逾時，用於強制 skipped-no-target 路徑）。
 		var tDone time.Time
-		select {
-		case <-eofCh:
-		case <-time.After(time.Until(d1)):
+		if forceEOFTimeout {
 			rec.EOFTimeout = true
+		} else {
+			select {
+			case <-eofCh:
+			case <-time.After(time.Until(d1)):
+				rec.EOFTimeout = true
+			}
 		}
 		if !rec.EOFTimeout {
 			select {
@@ -313,78 +551,41 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 
 		needRescue := rec.EOFTimeout || rec.DoneTimeout
+		reason := ""
+		switch {
+		case rec.EOFTimeout:
+			reason = "eofTimeout"
+		case rec.DoneTimeout:
+			reason = "doneTimeout"
+		}
 		if !needRescue {
-			// anomaly：EOF 已到但 5s 快照仍見本輪孫程序。
 			snapWg.Wait()
+			snapMu.Lock()
 			for _, s := range rec.Snapshots {
-				if s.Offset == "5s" && (s.OrphanPresent || s.SleepChildPresent) {
+				if s.Offset == "5s" && (s.OrphanPresent || s.ChildPresent) {
 					rec.Anomaly = true
 					needRescue = true
+					reason = "anomaly@5s"
 				}
 			}
+			snapMu.Unlock()
 		}
-		rec.Rescue.Mode = "none"
 		if needRescue {
-			rows, _ := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-rescue-before.txt", i)))
-			sb := diagSummarize(rows, p.PGID(), orphanPid, token)
-			sb.Offset = "rescue-before"
-			sb.At = time.Now().UnixNano()
-			rec.Rescue.PsBefore = &sb
-			switch {
-			case (sb.OrphanPresent && sb.OrphanPgidMatches) || (sb.SleepChildPresent && sb.SleepChildPgid == p.PGID()):
-				rec.Rescue.Mode = "group"
-				rec.Rescue.AtNs = time.Now().UnixNano()
-				if err := p.SignalGroup(syscall.SIGKILL); err != nil {
-					rec.Rescue.Err = err.Error()
-				}
-			case sb.OrphanPresent || sb.SleepChildPresent:
-				rec.Rescue.Mode = "targeted-pid"
-				rec.Rescue.AtNs = time.Now().UnixNano()
-				// 先固定 psBefore 中已驗明的 PID 清單，再逐一送訊號並記錄每個結果。
-				targets := []int{}
-				for _, r := range rows {
-					if (r.PID == orphanPid && strings.Contains(r.Command, token)) || (r.PPID == orphanPid && strings.Contains(r.Command, "sleep")) {
-						targets = append(targets, r.PID)
-					}
-				}
-				rec.Rescue.PerPID = map[string]string{}
-				for _, pid := range targets {
-					if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-						rec.Rescue.PerPID[strconv.Itoa(pid)] = err.Error()
-					} else {
-						rec.Rescue.PerPID[strconv.Itoa(pid)] = "ok"
-					}
-				}
-			default:
-				rec.Rescue.Mode = "skipped-no-target"
+			rescueDecide(rec, p, orphanPid, childPid, token, reason, i, nil)
+			eofSeen, doneSeen, _, tD := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), !getEOF().IsZero(), !tDone.IsZero())
+			if doneSeen && tDone.IsZero() && !tD.IsZero() {
+				tDone = tD
 			}
-			rows2, _ := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-rescue-after.txt", i)))
-			sa := diagSummarize(rows2, p.PGID(), orphanPid, token)
-			sa.Offset = "rescue-after"
-			sa.At = time.Now().UnixNano()
-			rec.Rescue.PsAfter = &sa
-			// guard 2：5s 內並行等 EOF 與 Done。
-			g2 := time.After(5 * time.Second)
-			if rec.EOFTimeout {
-				select {
-				case <-eofCh:
-					rec.AfterRescue = true
-				case <-g2:
-				}
-			}
-			if !getEOF().IsZero() || !rec.EOFTimeout {
-				select {
-				case <-p.Done():
-					if tDone.IsZero() {
-						tDone = time.Now()
-						rec.AfterRescue = true
-					}
-				case <-g2:
-				}
+			if (eofSeen && rec.EOFTimeout) || (doneSeen && (rec.DoneTimeout || rec.EOFTimeout)) {
+				rec.AfterRescue = true
 			}
 		}
 		snapWg.Wait()
 
+		if serr := func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }(); serr != nil {
+			rec.Errors = append(rec.Errors, "scanner: "+serr.Error())
+			invalid("iter %d scanner: %v", i, serr)
+		}
 		eofAt := getEOF()
 		if !eofAt.IsZero() {
 			rec.ExitedToEOFMs = diagMs(eofAt.Sub(tExited))
@@ -404,15 +605,16 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			bg = append(bg, bgWait{rec: rec, done: ch})
 		}
 
-		after, _ := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-after.txt", i)))
+		after, perr := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-after.txt", i)))
+		if perr != nil {
+			invalid("iter %d after ps: %v", i, perr)
+		}
 		for _, r := range after {
 			if !beforePids[r.PID] {
 				rec.NewPidsAfterIter++
 			}
 		}
-		if b, err := json.Marshal(rec); err == nil {
-			_ = os.WriteFile(filepath.Join(outDir, fmt.Sprintf("iter-%d-partial.json", i)), b, 0o644)
-		}
+		writePartial(rec)
 		if rec.EOFTimeout || rec.DoneTimeout || rec.Anomaly || !rec.Converged {
 			t.Logf("iter %d: eofTimeout=%v doneTimeout=%v anomaly=%v converged=%v rescue=%s", i, rec.EOFTimeout, rec.DoneTimeout, rec.Anomaly, rec.Converged, rec.Rescue.Mode)
 		}
@@ -431,16 +633,21 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 	}
 
-	// 每輪只序列化一次。
+	// 每輪只序列化一次；任何寫入／編碼錯誤都計入 invalidEvidence。
 	f, err := os.Create(filepath.Join(outDir, "iter-records.jsonl"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("create iter-records.jsonl: %v", err)
 	}
 	enc := json.NewEncoder(f)
 	counts := map[string]int{}
 	for _, rec := range records {
-		_ = enc.Encode(rec)
+		if err := enc.Encode(rec); err != nil {
+			invalid("encode iter %d: %v", rec.Iter, err)
+		}
 		counts[rec.FinalStatus]++
+		if rec.ExitedTimeout {
+			counts["exitedTimeout"]++
+		}
 		if rec.EOFTimeout {
 			counts["eofTimeout"]++
 		}
@@ -454,9 +661,23 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			counts["cleanupKillObserved"]++
 		}
 	}
-	_ = f.Close()
-	if b, err := json.MarshalIndent(map[string]any{"iterations": n, "runner": runner, "goos": runtime.GOOS, "counts": counts}, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(outDir, "summary.json"), b, 0o644)
+	if err := f.Close(); err != nil {
+		invalid("close iter-records.jsonl: %v", err)
 	}
-	t.Logf("diag summary: %v", counts)
+	evMu.Lock()
+	inv := append([]string(nil), invalidEvidence...)
+	evMu.Unlock()
+	summary := map[string]any{"iterations": n, "runner": runner, "goos": runtime.GOOS, "mode": mode, "forceEOFTimeout": forceEOFTimeout, "exitedTimeout": exitedTimeout.String(), "counts": counts, "invalidEvidence": inv}
+	if b, err := json.MarshalIndent(summary, "", "  "); err == nil {
+		mustWrite(filepath.Join(outDir, "summary.json"), b)
+	} else {
+		invalid("marshal summary: %v", err)
+	}
+	evMu.Lock()
+	inv = append([]string(nil), invalidEvidence...)
+	evMu.Unlock()
+	t.Logf("diag summary: %v invalidEvidence=%d", counts, len(inv))
+	if len(inv) > 0 {
+		t.Fatalf("evidence incomplete (%d issues); artifacts kept in %s: %v", len(inv), outDir, inv)
+	}
 }
