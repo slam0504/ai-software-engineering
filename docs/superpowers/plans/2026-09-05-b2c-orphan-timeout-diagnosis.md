@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev8（2026-09-06，第三輪 owner 對探針的 P1 修正後回填：`diagWaitConverge` 觀察後設 nil channel＋單一絕對 deadline timer 並加 Done-before-EOF helper control；背景彙報同時等 EOF 與 Done、稍後 scanner error 計入；正常與逾時路徑共用 `finalizeIter`；stdin close 與父 PID 檔缺失計入 `invalidEvidence`（child PID 為 optional）；控制與 100 輪基準重做；前版：rev7（第二輪 owner 對探針的 P1 修正後回填：有界 exitedCh／guard 2 單一絕對 deadline 迴圈、`onSignal` 於 `p.mu` 內寫入、兩階段身分（父 token＋`DIAG_CHILDPIDFILE`）、rescue 只對已驗明目標、證據完整性計數以非零結束；新增 hang／escape／force-eof 強制控制與 RO 目錄控制證據；重做 100 輪基準；契約未動；前版：rev6（design gate APPROVED 後執行 Task 1（本機）與 Task 2 Step 1 並回填證據；契約未動；前版：rev5（rev4 短複審 CHANGES_REQUIRED 後修訂：P1 rescue 不再無條件對舊 PGID 發 SIGKILL——rescue 前以當下 token／PID 快照確認目標仍屬 `p.PGID()`，無佐證記 `rescue=skipped-no-target`，(b2) 只對已驗明 PID 做窗口後清理，`ps@5s` anomaly 路徑同；P1 新 fixture 明定 mode 100755，推送前 `test -x`；P2 JSONL 改為 iteration record 於彙報完成後每輪只序列化一次，`finalConverged|pending` 於彙報階段填入；前版：rev4（rev3 短複審 CHANGES_REQUIRED 後修訂：P1 有界收斂——guard 1 以 `tExited` 為絕對 deadline、快照與 EOF 等待並行、所有 `Done()` 等待有界、逾時即 rescue 再進 guard 2、背景 `p.Wait()` 彙報設期限逾時記 pending；P1 Goal／Gate 改為只可直接歸因 (b1)／(b2)／(c)，(a′) 只是代理證據、命中時維持未定位並要求下一票取得獨立退出時點；P2 刪除「Start 之前設定 onSignal」矛盾句；P2 已知缺口改寫為「不同 fixture、相同 orphan 語意」；前版：rev3（rev2 短複審 CHANGES_REQUIRED 後修訂：P1 EOF 逾時後改為「立即 rescue → 第二段有界 guard 等 EOF／Done → 最後 `p.Wait()`，仍未收斂即記錄並停止該 iteration」（`doneCh` 要等 stderr EOF，同一孫程序可同時卡住 EOF 與 Done）；P1 孫程序身分改以暫時性 fixture 寫出 `$!` PID 與每輪唯一 token，否則「不在群組」只能記未定位；Gate A 歸因邊界：不在預期 PGID 只支持 fixture／PGID 契約問題，只有「cleanup KILL 已成功送往正確群組但程序仍未及時消失」才支持 production 收尾缺陷；P2 分支基準改 `81af8f2`；P2 `tExited − tLastLine` 改稱「最後輸出至 supervisor 記錄退出的延遲」；前版：rev2（第一輪 owner CHANGES_REQUIRED 後修訂：探針改採 **D1(c′) 不合併的白箱診斷測試檔**（公開 API 量不到 supervisor 收尾窗口）；時序點改為 `tExited`／`tCleanupKill`／`tEOF`／`tDone`，`p.Wait()` 只作最終收斂；單一 stdout reader；第二次 SIGKILL 只作窗口後 rescue 並分開記錄；cleanup event 缺席時只能標未定位；workflow 改為 `push` 限定 `b2c/diag`＋matrix runner × replica 四個獨立 job、`fail-fast: false`、檔案齊備後一次推送；新增殘留程序前後快照與受限清理；D2 ubuntu 對照、D3 每 runner 兩 replica 每層 100 次、D4 維持 0.4 pt 皆已裁定；前版：rev1）
-> 狀態：**探針 P1 修正已提交（`380afe1`、`d207788`），helper control 與四種強制控制皆已本機實證；100 輪基準於最終探針重做（未重現 100/100、cleanup KILL 100/100）；四個檔案在本機分支 `b2c/diag`，待 owner 授權一次推送（Task 2 Step 2）**。未做任何外部寫入、GitHub 設定面零變更
+> 版本：rev9（2026-09-06，Task 2 Step 2 一次推送與四 job 結果回填：layer 1 高重現（macOS 36／45 次 5 秒 guard；ubuntu 98／99 次紅在另一條斷言 `orphan must be reaped`）、layer 2 四 job 400 輪全部未重現；探針未捕捉到真實測試的機制，提出 round 2 設計待裁定；前版：rev8（第三輪 owner 對探針的 P1 修正後回填：`diagWaitConverge` 觀察後設 nil channel＋單一絕對 deadline timer 並加 Done-before-EOF helper control；背景彙報同時等 EOF 與 Done、稍後 scanner error 計入；正常與逾時路徑共用 `finalizeIter`；stdin close 與父 PID 檔缺失計入 `invalidEvidence`（child PID 為 optional）；控制與 100 輪基準重做；前版：rev7（第二輪 owner 對探針的 P1 修正後回填：有界 exitedCh／guard 2 單一絕對 deadline 迴圈、`onSignal` 於 `p.mu` 內寫入、兩階段身分（父 token＋`DIAG_CHILDPIDFILE`）、rescue 只對已驗明目標、證據完整性計數以非零結束；新增 hang／escape／force-eof 強制控制與 RO 目錄控制證據；重做 100 輪基準；契約未動；前版：rev6（design gate APPROVED 後執行 Task 1（本機）與 Task 2 Step 1 並回填證據；契約未動；前版：rev5（rev4 短複審 CHANGES_REQUIRED 後修訂：P1 rescue 不再無條件對舊 PGID 發 SIGKILL——rescue 前以當下 token／PID 快照確認目標仍屬 `p.PGID()`，無佐證記 `rescue=skipped-no-target`，(b2) 只對已驗明 PID 做窗口後清理，`ps@5s` anomaly 路徑同；P1 新 fixture 明定 mode 100755，推送前 `test -x`；P2 JSONL 改為 iteration record 於彙報完成後每輪只序列化一次，`finalConverged|pending` 於彙報階段填入；前版：rev4（rev3 短複審 CHANGES_REQUIRED 後修訂：P1 有界收斂——guard 1 以 `tExited` 為絕對 deadline、快照與 EOF 等待並行、所有 `Done()` 等待有界、逾時即 rescue 再進 guard 2、背景 `p.Wait()` 彙報設期限逾時記 pending；P1 Goal／Gate 改為只可直接歸因 (b1)／(b2)／(c)，(a′) 只是代理證據、命中時維持未定位並要求下一票取得獨立退出時點；P2 刪除「Start 之前設定 onSignal」矛盾句；P2 已知缺口改寫為「不同 fixture、相同 orphan 語意」；前版：rev3（rev2 短複審 CHANGES_REQUIRED 後修訂：P1 EOF 逾時後改為「立即 rescue → 第二段有界 guard 等 EOF／Done → 最後 `p.Wait()`，仍未收斂即記錄並停止該 iteration」（`doneCh` 要等 stderr EOF，同一孫程序可同時卡住 EOF 與 Done）；P1 孫程序身分改以暫時性 fixture 寫出 `$!` PID 與每輪唯一 token，否則「不在群組」只能記未定位；Gate A 歸因邊界：不在預期 PGID 只支持 fixture／PGID 契約問題，只有「cleanup KILL 已成功送往正確群組但程序仍未及時消失」才支持 production 收尾缺陷；P2 分支基準改 `81af8f2`；P2 `tExited − tLastLine` 改稱「最後輸出至 supervisor 記錄退出的延遲」；前版：rev2（第一輪 owner CHANGES_REQUIRED 後修訂：探針改採 **D1(c′) 不合併的白箱診斷測試檔**（公開 API 量不到 supervisor 收尾窗口）；時序點改為 `tExited`／`tCleanupKill`／`tEOF`／`tDone`，`p.Wait()` 只作最終收斂；單一 stdout reader；第二次 SIGKILL 只作窗口後 rescue 並分開記錄；cleanup event 缺席時只能標未定位；workflow 改為 `push` 限定 `b2c/diag`＋matrix runner × replica 四個獨立 job、`fail-fast: false`、檔案齊備後一次推送；新增殘留程序前後快照與受限清理；D2 ubuntu 對照、D3 每 runner 兩 replica 每層 100 次、D4 維持 0.4 pt 皆已裁定；前版：rev1）
+> 狀態：**Task 2 Step 2 已完成（owner 授權推送 `d12b13b`，run `33968040444` 四 job 結束）；Task 2 Step 3 解析完成；Task 3 結論待 owner 裁定——探針層 0/400 未重現、測試層 197/200（ubuntu）＋81/200（macOS）重現，兩者分歧，round 2 設計見 D5**。未 rerun、未 dispatch、GitHub 設定面零變更
 > 票源：Pre-M4 Readiness Backlog **B2c**（rev16 新增，**0.4 pt**，owner 於 plan gate 維持）。承接 `wall-clock-test-register.md` v3 Go 表 **#7** 候選
 > 基準 commit：**`81af8f287ee19d59e916f84f7b416b17eb21260d`**＝`origin/main`（register v3／backlog rev16 已推送；`internal/proc`、`internal/claude`、`testdata/fake-claude.sh` 自 `05069e2` 後未變）
 > 上游阻擋關係：B2a Gate A 因本票標的停止；本票結論經 owner 裁定後才解除 B2a 的合併阻擋。**B2a 分支的 `bd6a102` 依裁定留在本機**（推進 PR head 會觸發新的 pull_request run，等同重跑已停止的 Gate A），待本票結論後與正式恢復 run 一起推送
@@ -200,7 +200,40 @@
 - **第三輪 P1 修正（見版本行）與控制重跑**：helper control ×3 皆 0.30s 準時返回、不空轉；normal／hang／escape／force-eof 各 ×2 與 RO 目錄控制結果與前輪相同（hang→`exitedTimeout`＋`group`、escape→`eofTimeout`＋`targeted-pid`＋guard 2 收斂＋cleanup 事件缺席、force-eof→`skipped-no-target`、RO→rc 1），0 DATA RACE、`invalidEvidence` 0、`errors` 皆空、殘留 0。artifact：hang `71f540efb8c5e051`、escape `868fd65915b3a34a`、force-eof `e6f144f6b3cf6046`、normal `48f69de123446120`、RO log `e37328eebbb70b29`。
 - **100 輪基準重做（第三輪修正後，`d207788`，`-race`，8 核 x86_64，證據目錄 `/tmp/b2c-baseline3.eyEwTc`，907 檔）**：PASS（534.73s）、0 DATA RACE、`invalidEvidence` 0、`errors` 0；歸因**未重現 100/100**；cleanup KILL 100/100；`exitedTimeout` 0；rescue 全 `none`；final 全 `converged`。分布（ms，min／p50／p95／max）：`startToExited` 6.8／8.9／16.3／27.7；`lastLineToExited` 0.18／0.31／0.48／0.67；`exitedToCleanupKill` −0.03／−0.01／0.02／0.06；`exitedToEOF` 0.06／0.73／1.12／**6.96**；`exitedToDone` 0.66／1.33／3.18／11.31。父 PID 檔 100/100 存在；child PID 檔 0/100（normal 模式預期）；`orphanPresent@0s` 0/100。殘留：run 內 PID 結束時 0 存活；起訖新增 PID 無 `DIAG_TOKEN`／`sleep 30`。hash：`iter-records.jsonl` `a3e2335bba0dadc1`、`summary.json` `9aaaa6b5e7602f9d`、`run.log` `18ade467a692a196`。
 - **100 輪基準重做（`380afe1`，`-race`，8 核 x86_64，證據目錄 `/tmp/b2c-baseline2.AND6CM`，908 檔）**：PASS、0 DATA RACE、`invalidEvidence` 0；歸因**未重現 100/100**；cleanup KILL 100/100；`exitedTimeout` 0；rescue 全 `none`。分布（ms）：`startToExited` 6.2／8.9／19.5／34.0（min／p50／p95／max）；`lastLineToExited` 0.22／0.31／0.46／0.59；`exitedToCleanupKill` −0.04／−0.01／0.03／0.05；`exitedToEOF` 0.04／0.83／1.52／**5.57**；`exitedToDone` 0.66／1.46／2.87／5.69。`orphanPresent@0s` 0/100。**`childPid` 只有 1/100 被記錄**：normal 模式下孫程序在寫出 `sleep` PID 前就被 supervisor 的 group KILL 清掉，屬預期；若 CI 上 KILL 未及時生效，孫程序會活得夠久寫出 child pid 檔，兩階段身分即可用；child pid 缺席時只能驗父（token），不影響 (b1)／(b2) 的父級判定。殘留：run 內 orphan／child PID 結束時 0 存活；run 起訖新增 20 PID 皆無 `DIAG_TOKEN`／`sleep 30`。hash：`iter-records.jsonl` `f1295f027898e0df`、`summary.json` `c1810da5315f1c81`、`run.log` `cca3d73a82ebd57d`。
-- **CI 執行（Task 2 Step 2）**：待 owner 授權一次 `git push -u origin b2c/diag`。
+- **CI 執行（Task 2 Step 2，owner 授權後 `git push -u origin b2c/diag`，HEAD `d12b13b`）**：run **`33968040444`**（push，2026-09-05 13:08Z），四個 matrix job 皆 `failure`（皆因 layer 1 rc=1；**layer 2 rc 全為 0**）。artifact 本機下載至 `/tmp/b2c-ci.XbqHOZ`（每 job 8 檔＋`diag-out/` 902 檔，hash 見 `HASHES.txt`）。runner：macos-15-intel（Darwin 24.6.0 x86_64，go1.26.5 darwin/amd64）×2、ubuntu-latest（Linux 6.17 azure x86_64，go1.26.5 linux/amd64）×2；fixture executable 皆 yes。
+
+## Task 2 Step 3 解析（2026-09-06）
+
+**Layer 1（既有測試 `TestOrphanDoesNotHangNormalExit` ×100，`internal/claude`，`-race`）**：
+
+| job | fail／100 | 失敗斷言（逐字） | 失敗 elapsed | pass elapsed |
+|---|---|---|---|---|
+| macos-15-intel r1 | **36** | `session_test.go:207: drain/Wait hung on orphan-held pipes` | 5.00–5.01s | 0.01–0.04s |
+| macos-15-intel r2 | **45** | 同上 | 5.01–5.02s | 0.01–0.04s |
+| ubuntu-latest r1 | **98** | **`session_test.go:210: orphan must be reaped by supervisor on parent exit`** | 0.00s（97）／0.01s（1） | 0.00s |
+| ubuntu-latest r2 | **99** | 同上 | 0.00–0.01s | 0.00s |
+
+macOS 為**二值分布**：要嘛 ≤0.04s 過，要嘛卡滿 5s（沒有 0.05–4.9s 的中間樣本）。ubuntu 幾乎每次都在 `drain`／`Wait` **立即返回後**、`groupDead(s.PGID())` 為 false 時失敗——即 stdout／stderr EOF 都已到、supervisor 已收尾，但 `kill(-pgid, 0)` 仍成功。
+
+**Layer 2（白箱探針 ×100，`internal/proc` 直呼 `proc.Start`＋暫時性 fixture）**：四 job **未重現 100/100**，`invalidEvidence` 0、`errors` 0；cleanup KILL 事件 100/100；`exitedToEOF` p50 0.12–0.37ms、max 0.35–2.92ms；`exitedToDone` max 10.26ms（**毫秒**，非離群）；`exitedTimeout`／`eofTimeout`／`doneTimeout`／anomaly 皆 0；rescue 全 `none`；`ps@0s` 起群組成員（含 zombie）0。
+
+**分歧解讀（事實與假設分開）**：
+- **事實**：同一批 runner、同一時段、同一 `proc` 收尾路徑，探針 0/400，既有測試 278/400 紅。因此**機制不在探針所覆蓋的路徑**（proc 直呼＋本 fixture）；差異只剩兩處——(i) 真實測試走 `claude.Session`（`fmt.Fprintf(p.Stdin, JSON 行)` 後 `Close`、`bufio.Scanner` pump 把事件送進容量 64 的 channel、`drain` 消費、`s.Wait()`；探針則直接讀 `p.Stdout` 並寫 `"x\n"`），(ii) 真實 fixture `fake-claude.sh` 的 orphan 為 `bash -c 'trap "" TERM; sleep 30' &` 且 leader **立即**印三行退出；探針 fixture 的 orphan 為 `bash -c "…; sleep 30 & echo $! > file; wait"`（多一次 fork／寫檔，時序不同）。
+- **假設 H-mac（未驗證）**：macOS 的二值分布符合「某個持有 stdout／stderr 的程序在 group KILL 時漏殺（例如 orphan bash 正在 fork `sleep` 的窗口）」——存活者持有 pipe 直到 `sleep 30` 結束，EOF 永不在 5 秒內到達；與 (c) EOF 延遲的連續分布不符，與 (b1) 的「KILL 已送出但程序未消失」形狀相符但探針未觀察到。leader 的極短存活（<1ms）使窗口機率高；探針 fixture 的額外操作可能改變了時序而避開。
+- **假設 H-ubuntu（未驗證）**：ubuntu 的 0 秒失敗符合「orphan 已被 KILL 但仍為 zombie、尚未被 subreaper／init 回收，`kill(-pgid, 0)` 對含 zombie 的群組仍回 0」——即測試 oracle `groupDead` 把 zombie 算成存活；這是**測試 oracle 問題，不是 production 收尾缺陷**。探針的 `ps@0s`（約 10–30ms 後）已看不到 zombie，無法在微秒級驗證。
+- **排除**：在探針覆蓋的路徑上，(b2)（孫程序不在預期 PGID）0/400；(c) 0/400；(a′) 代理 0/400。**這些排除不能直接套用到真實測試路徑**。
+
+**Task 3 結論（三選一）**：屬第二種——「排除一種以上、其餘未定」**但附帶限定**：排除只成立於探針路徑；真實測試在 CI 上**高重現**且有兩種依 OS 不同的失敗形狀，機制未定位。register #7 維持 candidate 並補本輪資料；**不宣稱 production defect**（唯一支持 (b1) 的樣本型未在探針出現）。
+
+## 待 owner 裁定（rev9 新增）
+
+**D5 round 2 探針設計（需另一次推送授權）**——把探針拉到與真實測試同一條路徑，兩層都保留：
+1. **layer 2b**：探針改用**真實 fixture** `testdata/fake-claude.sh`（`FAKE_ORPHAN=1`，唯讀使用，不改檔）＋與 `claude.Start` 相同的 stdin 寫法（JSON 行後 `Close`），其餘時序點與 rescue 契約不變；另在 `Done()` 後**立即**執行與測試 oracle 相同的 `syscall.Kill(-pgid, 0)` 並記錄結果與時刻（微秒級驗證 H-ubuntu）；再於 +1ms／+10ms／+100ms 重試記錄 zombie 回收時間。真實 fixture 沒有 token／PID 檔，身分改以「命令列含 `trap "" TERM; sleep 30` 且 pgid==p.PGID() 或 ppid 鏈可追」判定，rescue 仍只對已驗明目標。
+2. **layer 3（需 owner 明示例外）**：在 `internal/claude` 新增暫時性 `orphan_diag_test.go`（同樣不合併、結案刪除），以 `claude.Start`＋`drain`＋`Wait` 完整重演既有測試，並加上同樣的立即 `kill(-pgid,0)`／`ps` 取證——這是唯一能直接對真實路徑打點的方法。
+3. 若 owner 不同意 layer 3，僅做 layer 2b；若 2b 仍 0 重現，結論改為「機制位於 `claude.Session` 層，需 layer 3」。
+4. 估點：round 2 約 2.0–3.0 hr（0.2–0.3 pt），超出 B2c 0.4 pt 中位的剩餘餘裕；建議 B2c 重估為 0.6 pt 或拆 B2c-2，由 owner 決定。
+
+**D6**：ubuntu 的 layer 1 結果是新事實——既有測試在 Linux 上幾乎必紅（197/200）。B2a 的 Go job 釘 macOS 所以未曾看到；是否登記為 register #7 的附註（「Linux 下另一失敗形狀：oracle 疑似計入 zombie」）並在 round 2 一併驗證，由 owner 裁定。
 
 ## Gate A（診斷完成條件）
 - [x] 本機基準（Task 1 Step 2）分布已記錄；本機殘留檢查前後快照齊全、無需清理（0 alive）。
@@ -221,9 +254,10 @@
 4. 若四 job 皆未重現，只能維持 candidate；B2a 是否可帶著 candidate 合併由 owner 另裁。
 
 ## 尚未完成
-- Task 1 與 Task 2 Step 1 完成（本機，含第二、三輪 P1 修正與強制控制）；Task 2 Step 2 待 owner 授權推送；Task 2 Step 3、Task 3 未執行。plan rev5／rev6／rev7 已 commit（`a48018c`／`6ae5624`／`438e80e`），rev8 待 commit。
+- Task 1、Task 2 Step 1–3 完成；Task 3 結論已寫（限定式「排除一種以上、其餘未定」），register／backlog 回寫與 round 2 待 owner 裁定 D5／D6。plan rev5–rev8 已 commit，rev9 待 commit。`b2c/diag` 遠端 head `d12b13b`。
 
 ## 修訂記錄
+- rev9（2026-09-06，CI 結果回填）：run `33968040444` 四 job——layer 1 macOS 36／45 次紅在 5 秒 guard（二值分布）、ubuntu 98／99 次紅在 `orphan must be reaped`（0 秒）；layer 2 四 job 400 輪未重現、cleanup KILL 100%、EOF 亞毫秒。結論：探針路徑上排除 (b2)／(c)／(a′)，但真實測試路徑機制未定位；提出 H-mac（fork 窗口漏殺）與 H-ubuntu（oracle 計入 zombie）兩個未驗證假設；新增 D5 round 2 設計（真實 fixture＋立即 `kill(-pgid,0)` 取證；layer 3 需 owner 例外）與 D6（Linux 形狀登記）。未 rerun、未修改原始碼、未 commit 前之 GitHub 寫入。
 - rev8（2026-09-06，探針第三輪 P1 修正回填）：`d207788`——`diagWaitConverge` 觀察後設 nil channel＋單一絕對 deadline timer，新增 helper control `TestDiagWaitConvergeDoneBeforeEOF`；背景彙報同時等 EOF 與 Done、稍後 scanner error 計入；`finalizeIter` 共用；stdin close／父 PID 檔缺失計入 `invalidEvidence`。helper ×3、四種控制、RO 控制皆通過；100 輪基準重做全部收斂。「尚未完成」補 rev7 `438e80e`。契約未動。
 - rev7（2026-09-06，探針第二輪 P1 修正回填）：`380afe1`——有界 `exitedCh`（`DIAG_EXITED_TIMEOUT`）、guard 2 單一絕對 deadline 迴圈、`onSignal` 於 `p.mu` 內寫入、兩階段身分（父 token＋`DIAG_CHILDPIDFILE`）、rescue 只對已驗明目標（group／targeted-pid／skipped-no-target）、`invalidEvidence` 非零結束；fixture 新增 child pid 檔與 hang／escape 控制模式（escape 需 leader 等 child pid 檔以避開 group KILL 競態）。強制控制四種分支與 RO 目錄皆實證；100 輪基準重做全部收斂。Gate A 本機項改 `[x]`。契約未動。
 - rev6（2026-09-05，Task 1 證據回填）：本機分支 `b2c/diag`（`81af8f2`）新增三個診斷檔並提交 `a103d57`；`-race` smoke 與 100 輪基準全部收斂、cleanup KILL 100/100、`exitedToEOF` max 13.87ms、殘留 0；修正一處 reader／主 goroutine 資料競態（mutex）。契約未動。
