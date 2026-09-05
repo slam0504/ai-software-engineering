@@ -307,7 +307,8 @@ type diagFullRecord struct {
 	Kill0                  []diagKill0Sample `json:"kill0"`
 	Ps                     []diagPsSample    `json:"ps"`
 	StreamErrorCount       int               `json:"streamErrorCount"`
-	StreamErrors           []string          `json:"streamErrors,omitempty"` // KindStreamError 內容；計入 invalidEvidence，不得算有效收斂
+	StreamErrors           []string          `json:"streamErrors,omitempty"` // KindStreamError 內容；計入 invalidEvidence（流程仍可收斂，但該樣本證據無效）
+	EvidenceValid          bool              `json:"evidenceValid"`          // false＝該樣本有 stream error 或 ps 取樣錯誤；finalStatus 只描述流程收斂
 	FinalStatus            string            `json:"finalStatus"`            // converged | pending | finalConverged | aborted
 	FinalWaitMs            *float64          `json:"finalWaitMs,omitempty"`
 	Errors                 []string          `json:"errors,omitempty"`
@@ -322,8 +323,20 @@ func (rec *diagFullRecord) applyEvents(er *diagEventsResult) {
 	rec.TFirstEventMs = diagMsSince(rec.t0, er.tFirstEvent)
 	rec.TLastResultMs = diagMsSince(rec.t0, er.tLastResult)
 	rec.TEventsClosedMs = diagMsSince(rec.t0, er.tEventsClosed)
-	rec.StreamErrorCount = len(er.streamErrors)
-	rec.StreamErrors = append([]string(nil), er.streamErrors...)
+}
+
+// flagStreamErrors：只對「本次」拿到的 er 計數——er==nil（該 channel 早已在 checkpoint 讀走並套用過）
+// 時不重複計入。immediate 與 report 兩條路徑都經此函式，確保同一 stream error 只計一次。
+func (rec *diagFullRecord) flagStreamErrors(er *diagEventsResult, tag string, invalid func(string, ...any)) {
+	if er == nil {
+		return
+	}
+	for _, se := range er.streamErrors {
+		rec.StreamErrors = append(rec.StreamErrors, se)
+		rec.StreamErrorCount = len(rec.StreamErrors)
+		rec.EvidenceValid = false
+		invalid("iter %d stream error%s: %s", rec.Iter, tag, se)
+	}
 }
 
 func (rec *diagFullRecord) applyWait(wr *diagWaitResult) {
@@ -419,7 +432,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 	}
 
 	for i := 0; i < n; i++ {
-		rec := &diagFullRecord{Iter: i, Runner: runner, GOOS: runtime.GOOS, Fixture: "fake-claude(full-path)",
+		rec := &diagFullRecord{Iter: i, Runner: runner, GOOS: runtime.GOOS, Fixture: "fake-claude(full-path)", EvidenceValid: true,
 			FakeHang: fakeHang, AmbientFakeVars: ambientFakeVars, FinalStatus: "pending"}
 		records = append(records, rec)
 
@@ -524,9 +537,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		}
 		rec.applyEvents(er)
 		rec.applyWait(wr)
-		for _, se := range rec.StreamErrors {
-			invalid("iter %d stream error: %s", i, se)
-		}
+		rec.flagStreamErrors(er, "", invalid)
 
 		// 4. oracle 取樣：kill0 與 ps 各自獨立 goroutine，互不等待，結果經 channel
 		// 回主 goroutine（唯一寫入 record 者）。以報告期限風格的單一 timer 界定
@@ -546,6 +557,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 			rec.Ps = v
 			for _, p := range v {
 				if p.Err != "" {
+					rec.EvidenceValid = false
 					invalid("iter %d ps@%s: %s", i, p.Offset, p.Err)
 				}
 			}
@@ -585,9 +597,7 @@ func TestDiagOrphanFullPath(t *testing.T) {
 		_, _, pending, er, wr := diagReportAggregate(reportDeadline, w.eventsCh, w.waitCh, w.eventsSeen, w.waitSeen)
 		w.rec.applyEvents(er)
 		w.rec.applyWait(wr)
-		for _, se := range w.rec.StreamErrors {
-			invalid("iter %d stream error(late): %s", w.rec.Iter, se)
-		}
+		w.rec.flagStreamErrors(er, "(late)", invalid)
 		if !pending {
 			w.rec.FinalStatus = "finalConverged"
 		} else {
@@ -688,6 +698,36 @@ func TestDiagOrphanFullPath(t *testing.T) {
 }
 
 // TestDiagFullPathReportAggregator：diagReportAggregate 的 helper control。
+// TestDiagFullPathStreamErrorCountedOnce：helper control——「Events 已於 checkpoint seen、Wait 延後」的輪次，
+// immediate 路徑已計入 stream error，report 路徑拿到 er==nil 時不得重複計入；同一錯誤只計一次。
+func TestDiagFullPathStreamErrorCountedOnce(t *testing.T) {
+	var calls []string
+	invalid := func(format string, a ...any) { calls = append(calls, fmt.Sprintf(format, a...)) }
+	rec := &diagFullRecord{Iter: 7, EvidenceValid: true}
+	er := &diagEventsResult{streamErrors: []string{"bufio.Scanner: token too long"}}
+	rec.applyEvents(er)
+	rec.flagStreamErrors(er, "", invalid)        // immediate（checkpoint 非阻塞讀到 eventsCh）
+	rec.flagStreamErrors(nil, "(late)", invalid) // report：eventsSeen=true → aggregator 回 er=nil
+	if len(calls) != 1 || rec.StreamErrorCount != 1 || len(rec.StreamErrors) != 1 || rec.EvidenceValid {
+		t.Fatalf("expected exactly one invalid call and one stored stream error, got calls=%v count=%d stored=%v valid=%v",
+			calls, rec.StreamErrorCount, rec.StreamErrors, rec.EvidenceValid)
+	}
+	// 對照：report 路徑本次才拿到 er（checkpoint 未 seen）→ 計一次。
+	calls = nil
+	rec2 := &diagFullRecord{Iter: 8, EvidenceValid: true}
+	rec2.flagStreamErrors(nil, "", invalid)
+	rec2.flagStreamErrors(er, "(late)", invalid)
+	if len(calls) != 1 || rec2.StreamErrorCount != 1 || rec2.EvidenceValid {
+		t.Fatalf("expected one late invalid call, got calls=%v count=%d valid=%v", calls, rec2.StreamErrorCount, rec2.EvidenceValid)
+	}
+	// 無錯誤輪：evidenceValid 維持 true。
+	rec3 := &diagFullRecord{Iter: 9, EvidenceValid: true}
+	rec3.flagStreamErrors(&diagEventsResult{}, "", invalid)
+	if !rec3.EvidenceValid || len(calls) != 1 {
+		t.Fatalf("clean round must stay valid: valid=%v calls=%v", rec3.EvidenceValid, calls)
+	}
+}
+
 func TestDiagFullPathReportAggregator(t *testing.T) {
 	t.Run("never delivers, deadline pending, no spin", func(t *testing.T) {
 		eventsCh := make(chan *diagEventsResult)
