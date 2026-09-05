@@ -1,6 +1,6 @@
 import { flushPromises } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import SpecWorkspace from './SpecWorkspace.vue'
 import { useAssist } from '../stores/assist'
 import { mountWithI18n } from '../test/i18n'
@@ -26,6 +26,23 @@ describe('SpecWorkspace draft accept', () => {
     mocks.SpecList.mockResolvedValue([])
     mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
   })
+
+  // CodeMirror 由元件 onMounted 內動態 import 並建構 EditorView。B1b 觀察：本檔一條測試在
+  // 全套並行下約 2s、三份併發下約 7s > 5s 預設 timeout，其餘測試僅數十 ms；只預熱 import
+  // 時成本會移到同檔另一條測試而不消失。B1b Gate A（2026-09-05）以 differential control
+  // 2/2 確認：剩餘為 jsdom 首次建構 EditorView 的一次性成本。先在 hook 內 import 並建構一次
+  // 即銷毀，讓測試本體只量契約。不 catch：建構或清理失敗就讓 hook 失敗。30s 是卡死保險絲，不是成功判準。
+  beforeAll(async () => {
+    const [{ EditorView, basicSetup }, { EditorState }] = await Promise.all([
+      import('codemirror'),
+      import('@codemirror/state'),
+    ])
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const view = new EditorView({ state: EditorState.create({ doc: '', extensions: [basicSetup] }), parent: host })
+    view.destroy()
+    host.remove()
+  }, 30_000)
 
   it('accept writes draft via SpecWrite, not before', async () => {
     const write = vi.fn().mockResolvedValue('sha256:x')
