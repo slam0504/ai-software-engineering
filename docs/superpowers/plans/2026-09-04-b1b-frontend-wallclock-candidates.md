@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev17（2026-09-05，rev16 短複審 CHANGES_REQUIRED 後修訂：P1 Step 3 舊字樣探針跨行、對真 golden 必失敗——改為兩個單行探針（`（假設：剩餘為` 與 `成本，由 B1b Task 1 的 differential control 驗證`），並以 `$B1B/v4-golden-*.test.ts` 實測正確替換案例通過；前版：rev16（rev15 短複審 CHANGES_REQUIRED 後修訂：P1 Task 2 全部步驟固定自 repo root 執行、golden checkpoint 改 `shasum -c`、補明確 `cp`、`$T2` 每呼叫重設並 `test -d`；P1 Step 3 依 `diff` rc 分流（只接受 rc=1）、增刪行數 >0 且全為 `//`、舊「假設」文字須消失、D4 最終註解須逐字完整存在；P2 D4 標題改「owner 裁定（rev15）」；前版：rev15（D4 裁定後修訂：Task 2 改為「單一 implementation commit＋提交前 golden checkpoint」——先逐字套用 golden 並驗 hash，再於未 commit 狀態只改註解為已確認版本，以 fail loud 比對證明相對 archived golden 僅 comment-only，對最終 bytes 跑全套與 build 後建立唯一 commit；Gate B 同步；comment-only diff 證據不寫入已封存的 `$B1B`；前版：rev14（rev13 短複審 CHANGES_REQUIRED 後修訂：P2 章節標題改「owner 裁定紀錄（design gate）」；P1 註解模板過期狀態——**與 golden hash 轉移契約衝突，提為 D4 待裁定**，模板本文暫不改；前版：rev13（rev12 短複審 CHANGES_REQUIRED 後修訂：P1 現況段落與 Gate A 證據同步——Architecture、根因段、驗證狀態、Task 1 前置改為「已確認／已完成」，preflight 推論保留並明標為當時狀態；Task 1 與 Gate A checkbox 改 `[x]`，Task 2／3 與 Gate B 維持 `[ ]`；前版：rev12（rev11 design gate APPROVED 後執行 Step 5 file-confirm 兩輪與 Step 6 並回填證據；plan 契約未動；前版：rev11（rev10 短複審 CHANGES_REQUIRED 後修訂：P2 兩處非歷史狀態的「rev9 通過後」改為不帶版號的「本 plan design gate 通過後」，Task 3 的「不因 rev8 放寬」改為「不因本次 file-confirm pre-merge control 例外放寬」；前版：rev10（rev9 短複審 CHANGES_REQUIRED 後修訂：P1 file-confirm 判準改以「計入的命中子程序」計數（exit 非零＋唯一 FAIL 在還原檔＋指定 timeout 訊息＋`1 failed | 396 passed` 四者同時成立才算命中；單一非相關失敗只揭露不計；任一子程序 ≥2 FAIL 整輪無效停下），launcher 註解同步；P2 尚未完成段 rev 字樣、非歷史段落去版號；前版：rev9（rev8 短複審 CHANGES_REQUIRED 後修訂：P1 Global Constraints 與 launcher 註解仍是 rev7 契約——為 file-confirm 明列狹義例外（至少兩份非零、唯一 timeout 可落在還原檔任一測試、其他檔案／setup／資源失效不計入、環境失效直接停下不降兩份），並重申不放寬 living 契約；P2 四處狀態文字同步；前版：rev8（正式 (a′) 輪 N1／N2 不符 rev7 候選層級判準後修訂：owner 裁定 negative control 改採**檔案層級**判準，但不得以既有 `v4-N1`／`v4-N2` 資料回填 Gate——保留為「candidate-level Gate 失敗、file-level 診斷證據」，rev8 通過後以新 tag `v4-N1-file-confirm`／`v4-N2-file-confirm` 各重跑一輪；P 兩輪與 seq 三輪不重跑；Task 3 把 pre-merge control 判準與 living 契約回歸規則分開；前版：rev7（rev6 短複審 CHANGES_REQUIRED 後修訂：P1 Gate A 的 manifest 驗證改為在 `$B1B` 內執行（manifest 只含 basename），Step 0 開頭補「已存在即 exit 1」讓不得重產 fail loud；P2 Task 1 前置與版本摘要的「rev5 通過後」改 rev7；前版：rev6（rev5 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪開始前先對 83 個既有 artifact 建立 `legacy-artifacts-sha256.txt`（目錄外建立再移入、不得重產），Gate A 改為 `shasum -a 256 -c` 該 manifest；P2 狀態列改「rev5 通過後」、Step 1 的 `shasum -c` 改用 `$B1B` 絕對路徑；前版：rev5（rev4 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪 artifact 全部改 `v4-` 前綴（`v4-single-*`／`v4-P-r1`／`v4-P-r2`／`v4-seq-r1..3`／`v4-N1`／`v4-N2`），既有 `P-r1-*`、`SPIKE-P-*` 不得覆寫；P2 Task 1 殘留的 (a) 契約與「約 50ms」預設值統一為 (a′) 與只記錄；P2 補 `B1B` 沿用 `/tmp/b1b.RHppZ0` 的 rev4 例外；前版：rev4（Task 1 Step 4 依停下條件中止後修訂：(a) 純 import 預熱的 positive control **不成立**（F1 仍 timeout 2/3），owner 裁定選項 1、經未提交 spike 驗證後，模板改為 **(a′) import 預熱＋一次 `EditorView` 建構預熱**；spike 證據只作設計依據、不算 Gate A；正式 P／N1／N2 依新模板重跑；前版：rev3（第二輪 CHANGES_REQUIRED 後修訂：一項 P1——`run3` launcher 改為 fail loud（子 shell 帶 Node PATH 並以 vitest rc 結束、父層逐一 `wait "$pid"` 並比對 `.exit`、artifact 缺件或無重疊即非零返回），Gate A 明列 P 三份 exit 0、N1／N2 非零且只失敗於指定候選；非阻斷：Architecture 與註解模板改為「目前假設」語氣；前版：rev2（第一輪 CHANGES_REQUIRED 後修訂：三項 P1——preflight 表格 F1／F2 三格寫反已更正並補齊 artifact、Gate A 三份併發改用可逐字執行的 launcher 與重疊區間判準、register 規則 7 具名 F1／F2 的 FAIL 分類契約——與一項 P2——Task 2 scope check 時機；D1–D3 裁定回寫；前版：rev1）
-> 狀態：**Gate A 已完成（2026-09-05）——`v4-N1-file-confirm` 2/3 命中、`v4-N2-file-confirm` 3/3 命中（分母 2/2 成立），Step 6 還原 golden、`v4-restore-r2` 397 PASS、legacy manifest 83/83、worktree 已移除；plan rev11 已提交（`63d2a97`）。D4 已裁定；rev17 短複審通過後進 Task 2–3；本 plan rev17 未 commit**
+> 版本：rev18（2026-09-05，rev17 APPROVED 後執行 Task 2／Task 3 並回填證據；契約未動；前版：rev17（rev16 短複審 CHANGES_REQUIRED 後修訂：P1 Step 3 舊字樣探針跨行、對真 golden 必失敗——改為兩個單行探針（`（假設：剩餘為` 與 `成本，由 B1b Task 1 的 differential control 驗證`），並以 `$B1B/v4-golden-*.test.ts` 實測正確替換案例通過；前版：rev16（rev15 短複審 CHANGES_REQUIRED 後修訂：P1 Task 2 全部步驟固定自 repo root 執行、golden checkpoint 改 `shasum -c`、補明確 `cp`、`$T2` 每呼叫重設並 `test -d`；P1 Step 3 依 `diff` rc 分流（只接受 rc=1）、增刪行數 >0 且全為 `//`、舊「假設」文字須消失、D4 最終註解須逐字完整存在；P2 D4 標題改「owner 裁定（rev15）」；前版：rev15（D4 裁定後修訂：Task 2 改為「單一 implementation commit＋提交前 golden checkpoint」——先逐字套用 golden 並驗 hash，再於未 commit 狀態只改註解為已確認版本，以 fail loud 比對證明相對 archived golden 僅 comment-only，對最終 bytes 跑全套與 build 後建立唯一 commit；Gate B 同步；comment-only diff 證據不寫入已封存的 `$B1B`；前版：rev14（rev13 短複審 CHANGES_REQUIRED 後修訂：P2 章節標題改「owner 裁定紀錄（design gate）」；P1 註解模板過期狀態——**與 golden hash 轉移契約衝突，提為 D4 待裁定**，模板本文暫不改；前版：rev13（rev12 短複審 CHANGES_REQUIRED 後修訂：P1 現況段落與 Gate A 證據同步——Architecture、根因段、驗證狀態、Task 1 前置改為「已確認／已完成」，preflight 推論保留並明標為當時狀態；Task 1 與 Gate A checkbox 改 `[x]`，Task 2／3 與 Gate B 維持 `[ ]`；前版：rev12（rev11 design gate APPROVED 後執行 Step 5 file-confirm 兩輪與 Step 6 並回填證據；plan 契約未動；前版：rev11（rev10 短複審 CHANGES_REQUIRED 後修訂：P2 兩處非歷史狀態的「rev9 通過後」改為不帶版號的「本 plan design gate 通過後」，Task 3 的「不因 rev8 放寬」改為「不因本次 file-confirm pre-merge control 例外放寬」；前版：rev10（rev9 短複審 CHANGES_REQUIRED 後修訂：P1 file-confirm 判準改以「計入的命中子程序」計數（exit 非零＋唯一 FAIL 在還原檔＋指定 timeout 訊息＋`1 failed | 396 passed` 四者同時成立才算命中；單一非相關失敗只揭露不計；任一子程序 ≥2 FAIL 整輪無效停下），launcher 註解同步；P2 尚未完成段 rev 字樣、非歷史段落去版號；前版：rev9（rev8 短複審 CHANGES_REQUIRED 後修訂：P1 Global Constraints 與 launcher 註解仍是 rev7 契約——為 file-confirm 明列狹義例外（至少兩份非零、唯一 timeout 可落在還原檔任一測試、其他檔案／setup／資源失效不計入、環境失效直接停下不降兩份），並重申不放寬 living 契約；P2 四處狀態文字同步；前版：rev8（正式 (a′) 輪 N1／N2 不符 rev7 候選層級判準後修訂：owner 裁定 negative control 改採**檔案層級**判準，但不得以既有 `v4-N1`／`v4-N2` 資料回填 Gate——保留為「candidate-level Gate 失敗、file-level 診斷證據」，rev8 通過後以新 tag `v4-N1-file-confirm`／`v4-N2-file-confirm` 各重跑一輪；P 兩輪與 seq 三輪不重跑；Task 3 把 pre-merge control 判準與 living 契約回歸規則分開；前版：rev7（rev6 短複審 CHANGES_REQUIRED 後修訂：P1 Gate A 的 manifest 驗證改為在 `$B1B` 內執行（manifest 只含 basename），Step 0 開頭補「已存在即 exit 1」讓不得重產 fail loud；P2 Task 1 前置與版本摘要的「rev5 通過後」改 rev7；前版：rev6（rev5 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪開始前先對 83 個既有 artifact 建立 `legacy-artifacts-sha256.txt`（目錄外建立再移入、不得重產），Gate A 改為 `shasum -a 256 -c` 該 manifest；P2 狀態列改「rev5 通過後」、Step 1 的 `shasum -c` 改用 `$B1B` 絕對路徑；前版：rev5（rev4 短複審 CHANGES_REQUIRED 後修訂：P1 正式輪 artifact 全部改 `v4-` 前綴（`v4-single-*`／`v4-P-r1`／`v4-P-r2`／`v4-seq-r1..3`／`v4-N1`／`v4-N2`），既有 `P-r1-*`、`SPIKE-P-*` 不得覆寫；P2 Task 1 殘留的 (a) 契約與「約 50ms」預設值統一為 (a′) 與只記錄；P2 補 `B1B` 沿用 `/tmp/b1b.RHppZ0` 的 rev4 例外；前版：rev4（Task 1 Step 4 依停下條件中止後修訂：(a) 純 import 預熱的 positive control **不成立**（F1 仍 timeout 2/3），owner 裁定選項 1、經未提交 spike 驗證後，模板改為 **(a′) import 預熱＋一次 `EditorView` 建構預熱**；spike 證據只作設計依據、不算 Gate A；正式 P／N1／N2 依新模板重跑；前版：rev3（第二輪 CHANGES_REQUIRED 後修訂：一項 P1——`run3` launcher 改為 fail loud（子 shell 帶 Node PATH 並以 vitest rc 結束、父層逐一 `wait "$pid"` 並比對 `.exit`、artifact 缺件或無重疊即非零返回），Gate A 明列 P 三份 exit 0、N1／N2 非零且只失敗於指定候選；非阻斷：Architecture 與註解模板改為「目前假設」語氣；前版：rev2（第一輪 CHANGES_REQUIRED 後修訂：三項 P1——preflight 表格 F1／F2 三格寫反已更正並補齊 artifact、Gate A 三份併發改用可逐字執行的 launcher 與重疊區間判準、register 規則 7 具名 F1／F2 的 FAIL 分類契約——與一項 P2——Task 2 scope check 時機；D1–D3 裁定回寫；前版：rev1）
+> 狀態：**Gate A 已完成（2026-09-05）——`v4-N1-file-confirm` 2/3 命中、`v4-N2-file-confirm` 3/3 命中（分母 2/2 成立），Step 6 還原 golden、`v4-restore-r2` 397 PASS、legacy manifest 83/83、worktree 已移除；plan rev11 已提交（`63d2a97`）。Task 2 implementation `8aee222`、Task 3 register v2＋backlog rev15 已落地；停在 Gate B 關票 review，未推送**
 > 票源：Pre-M4 Readiness Backlog **B1b**（rev14 票面 0.3 pt；**owner 於本 plan gate 裁定改為 0.4 pt**，見 D3）。B1 驗收條件 (4)：「剩餘兩條前端候選須以現行 HEAD 重現——成立者補入 living 文件後併入本票或開續票，不成立者除名（裁決 #9）」
 > 基準 commit：**`92719fba41c3402daed44140a280d32a90510c36`**（backlog rev14，已推送、`git ls-remote` 核實相符）
 > 前置：B1a aggregate 已關閉（rev14）。本票關票後 **B1 票整體關閉**，B2 驗收條件 (3)「race＋全套測試升 required 前置 B1 完成」的前置成立
@@ -240,7 +240,7 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 
 **執行目錄與變數生命週期**：Task 2 所有步驟一律從 **repo root** `/Users/eason_tseng/playground/project/ai-software-engineering` 執行；`$T2` 於 Step 1 以 `mktemp -d` 建立一次並記錄實際絕對路徑，其後**每個工具呼叫**都以 `T2=/tmp/b1b-t2.<實際>; test -d "$T2" || exit 1` 重設（同 `B1B=/tmp/b1b.RHppZ0; test -d "$B1B" || exit 1`）。
 
-- [ ] **Step 1 golden checkpoint**：依 Step 2 模板**逐字**套用到主 repo 兩檔（`beforeAll` 註解為 golden 版本），然後：
+- [x] **Step 1 golden checkpoint**：依 Step 2 模板**逐字**套用到主 repo 兩檔（`beforeAll` 註解為 golden 版本），然後：
 
   ```sh
   cd /Users/eason_tseng/playground/project/ai-software-engineering || exit 1
@@ -253,8 +253,8 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
   ```
 
   `shasum -c` 兩檔須皆 `OK`（非零即停）。**此時不 commit。** `$T2` **不得**放在已封存的 `$B1B` 內（維持 238／239 manifest 邊界）。
-- [ ] **Step 2 註解改為已確認版本（仍未 commit）**：只把兩檔 `beforeAll` 上方那段註解替換為 D4 所列「最終落地的註解文字」（5 行 `//`），其他任何字元不動。先把 D4 的 5 行逐字存成 `$T2/expected-comment.txt`（供 Step 3 比對）。
-- [ ] **Step 3 comment-only 比對（fail loud，每檔獨立判定）**：
+- [x] **Step 2 註解改為已確認版本（仍未 commit）**：只把兩檔 `beforeAll` 上方那段註解替換為 D4 所列「最終落地的註解文字」（5 行 `//`），其他任何字元不動。先把 D4 的 5 行逐字存成 `$T2/expected-comment.txt`（供 Step 3 比對）。
+- [x] **Step 3 comment-only 比對（fail loud，每檔獨立判定）**：
 
   ```sh
   cd /Users/eason_tseng/playground/project/ai-software-engineering || exit 1
@@ -290,16 +290,16 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
   ```
 
   任一檢查失敗即停止；**單純新增其他註解、只改一檔、或註解未替換都不通過**。`$T2` 內各檔的行數／hash 與最終兩檔 SHA-256 記入證據段；`$T2` 不進 repo。
-- [ ] **Step 4 對最終 bytes 驗證**：`frontend`：`vitest run` 全套 **397 PASS**；`npm run build`（`vue-tsc --noEmit && vite build`）exit 0。輸出摘要與 exit code 記入證據段。
-- [ ] **Step 5 提交前 scope check**（工作樹）：`git status --short` 只列兩個測試檔為 ` M`；`git diff --name-only <plan-commit>`（不帶 `..HEAD`，含工作樹）只含兩個測試檔；`git diff --check` 乾淨。
-- [ ] **Step 6 唯一一個 implementation commit**（訊息註明：golden checkpoint 命中＋comment-only 更新為已確認版本）。
-- [ ] **Step 7 提交後**：`git show --stat --format= <implementation-commit>` 只含兩個測試檔；`git diff --name-only 92719fb..HEAD` 只含本 plan＋兩個測試檔（Task 3 文件 commit 之前）。零 `.vue`／零 `.go`／`vitest.config.ts` 未動。
+- [x] **Step 4 對最終 bytes 驗證**：`frontend`：`vitest run` 全套 **397 PASS**；`npm run build`（`vue-tsc --noEmit && vite build`）exit 0。輸出摘要與 exit code 記入證據段。
+- [x] **Step 5 提交前 scope check**（工作樹）：`git status --short` 只列兩個測試檔為 ` M`；`git diff --name-only <plan-commit>`（不帶 `..HEAD`，含工作樹）只含兩個測試檔；`git diff --check` 乾淨。
+- [x] **Step 6 唯一一個 implementation commit**（訊息註明：golden checkpoint 命中＋comment-only 更新為已確認版本）。
+- [x] **Step 7 提交後**：`git show --stat --format= <implementation-commit>` 只含兩個測試檔；`git diff --name-only 92719fb..HEAD` 只含本 plan＋兩個測試檔（Task 3 文件 commit 之前）。零 `.vue`／零 `.go`／`vitest.config.ts` 未動。
 
 ## Task 3: living 文件更新＋backlog rev15（B1 關閉）
 
-- [ ] `wall-clock-test-register.md` v2：B 段兩條就地改「已重現並處置（B1b，`<commit>`）」，附根因一句（模組載入＋首次 `EditorView` 建構兩筆一次性成本；經 `v4-N1-file-confirm`／`v4-N2-file-confirm` 2/2 確認後才寫「已確認」）與修法 (a′)；規則段新增 **D2 裁定的規則 7 全文**（具名 F1／F2 的 FAIL 分類契約）——**此為 living 契約，不因本次 file-confirm pre-merge control 例外放寬**：F1／F2 日後任一 FAIL 仍先分類、契約回歸不得重跑吸收；另於 B 段處置紀錄中**分開**註明「本次 pre-merge negative control 採檔案層級判準（移除預熱後成本落在該檔任一條測試），與規則 7 的具名分類無關」；修訂記錄 v2。
-- [ ] backlog rev15：B1b 已完成（plan／implementation commit）；**B1 票整體關閉**；B2 驗收條件 (3) 前置成立；**估點 0.3 → 0.4 pt（D3）**，B 軌 117.05 hr → 11.71 pt、合計 182.05 hr → 18.21 pt（以 hr 推導）；修訂記錄含 preflight 重現數字（名稱錨定值）、control 2/2、三份併發重疊區間、production 零變更。
-- [ ] Task 3 一個 commit；Gate B range diff `92719fb..HEAD` 只含 plan＋兩測試檔＋register＋backlog。
+- [x] `wall-clock-test-register.md` v2：B 段兩條就地改「已重現並處置（B1b，`<commit>`）」，附根因一句（模組載入＋首次 `EditorView` 建構兩筆一次性成本；經 `v4-N1-file-confirm`／`v4-N2-file-confirm` 2/2 確認後才寫「已確認」）與修法 (a′)；規則段新增 **D2 裁定的規則 7 全文**（具名 F1／F2 的 FAIL 分類契約）——**此為 living 契約，不因本次 file-confirm pre-merge control 例外放寬**：F1／F2 日後任一 FAIL 仍先分類、契約回歸不得重跑吸收；另於 B 段處置紀錄中**分開**註明「本次 pre-merge negative control 採檔案層級判準（移除預熱後成本落在該檔任一條測試），與規則 7 的具名分類無關」；修訂記錄 v2。
+- [x] backlog rev15：B1b 已完成（plan／implementation commit）；**B1 票整體關閉**；B2 驗收條件 (3) 前置成立；**估點 0.3 → 0.4 pt（D3）**，B 軌 117.05 hr → 11.71 pt、合計 182.05 hr → 18.21 pt（以 hr 推導）；修訂記錄含 preflight 重現數字（名稱錨定值）、control 2/2、三份併發重疊區間、production 零變更。
+- [x] Task 3 一個 commit；Gate B range diff `92719fb..HEAD` 只含 plan＋兩測試檔＋register＋backlog。
 
 ---
 
@@ -314,12 +314,12 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 - [x] hash 三時點命中 golden；worktree 移除；主工作區零異動。
 
 ## Gate B（主 repo）
-- [ ] **註解修改前**兩檔 hash 命中 golden `ccd8264a…`／`8095da7d…`（Task 2 Step 1 checkpoint，紀錄於證據段）。
-- [ ] **最終檔相對 archived golden（`$T2/golden-*`）僅 comment-only**（Step 3 檢查通過，`comment-only-*.diff` 內所有 `<`／`>` 行皆為 `//` 註解行）；**不要求最終 hash 命中舊 golden**。
-- [ ] 對最終 bytes：全套 397 PASS；`npm run build` exit 0。
-- [ ] 唯一一個 implementation commit；comment-only diff 證據保存於 `$T2` 與 plan 證據段，未寫入 `$B1B`（238／239 manifest 邊界未變）。
-- [ ] range diff 只含 plan＋兩測試檔（＋Task 3 的 register、backlog）；零 `.vue`／`.go`／config。
-- [ ] `git diff --check` 乾淨；停在關票 review，不推送。
+- [x] **註解修改前**兩檔 hash 命中 golden `ccd8264a…`／`8095da7d…`（Task 2 Step 1 checkpoint，紀錄於證據段）。
+- [x] **最終檔相對 archived golden（`$T2/golden-*`）僅 comment-only**（Step 3 檢查通過，`comment-only-*.diff` 內所有 `<`／`>` 行皆為 `//` 註解行）；**不要求最終 hash 命中舊 golden**。
+- [x] 對最終 bytes：全套 397 PASS；`npm run build` exit 0。
+- [x] 唯一一個 implementation commit；comment-only diff 證據保存於 `$T2` 與 plan 證據段，未寫入 `$B1B`（238／239 manifest 邊界未變）。
+- [x] range diff 只含 plan＋兩測試檔（＋Task 3 的 register、backlog）；零 `.vue`／`.go`／config。
+- [x] `git diff --check` 乾淨；停在關票 review，不推送。
 
 ---
 
@@ -341,6 +341,18 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
   - 兩輪皆無子程序出現 ≥2 FAIL、無其他檔案／setup／資源失效；**分母 2/2 成立**，根因假設（模組載入＋首次 `EditorView` 建構的一次性成本落在該檔執行中的測試）升格為**已確認**。
 - **Step 6**：兩檔自 `v4-golden-*.test.ts` 還原，`shasum -a 256 -c v4-hash-golden.txt` 兩檔 OK；`v4-restore-r2` 397 PASS；`(cd "$B1B" && shasum -a 256 -c legacy-artifacts-sha256.txt)` **83/83 OK**（manifest 自身 hash 仍為 `fdd81c3c…`）；`git worktree remove --force` 後 `git worktree list` 只剩主 repo；主工作區乾淨。證據目錄 238 個 artifact 的最終清單存 `v4-final-artifacts-sha256.txt`（238 筆，自身 SHA-256 `3bd42d3a6e8257d2d03e5d805f51b57097c7ce9820d5c3c32780370a95a2184f`，目錄共 239 檔）。關鍵 artifact：`v4-N1-file-confirm-c1..3.out` `bdedc8a8…`／`eeea6d93…`／`ec80db91…`；`v4-N2-file-confirm-c1..3.out` `fcc0a305…`／`08c5ba74…`／`d692849e…`；`v4-restore-r2.out` `ae6f1f5b…`。這些檔案不進 repo。
 
+## Task 2 證據（2026-09-05，主 repo，plan-commit `57ae345`）
+
+- **Step 1 golden checkpoint**：模板逐字套用後 `(cd frontend && shasum -a 256 -c "$B1B/v4-hash-golden.txt")` 兩檔 OK（`ccd8264a…`／`8095da7d…`）；`T2=/tmp/b1b-t2.N0EUJp`；`golden-PlanWorkspace.test.ts`／`golden-SpecWorkspace.test.ts` 備份 hash 與 golden 逐字相同。
+- **Step 2／3**：`expected-comment.txt`（5 行，`e8377ee6…`）；兩檔 comment-only diff 各 **6 行**、全為 `//`（`comment-only-PlanWorkspace.diff` `5b18acd3…`、`comment-only-SpecWorkspace.diff` `40918371…`，各 8 行）；兩個舊字樣探針自最終檔消失、存在於 golden；最終註解各恰一次。最終 hash（`hash-final.txt`）：Plan `11190eb12b4b1d6790d8fd9e62530fd3cdc1e3a1c34371c1da730f17a63b9e0c`、Spec `fe880d52eb382aa234e5b1df64e303e4c703fa95280cf6af7699dbc62e826087`。`$T2` 未寫入 `$B1B`。
+- **Step 4（最終 bytes）**：`vitest run` **40 檔 397 PASS**（F1 595ms、F2 394ms，單跑）；`npm run build` **exit 0**（`vue-tsc --noEmit && vite build`，built in 14.54s；stderr 僅既有 chunk 大小警告 5 行）。
+- **Step 5–7**：提交前 `git status --short` 只列兩檔 ` M`、`git diff --name-only 57ae345` 只含兩檔、`git diff --check` 乾淨；implementation commit **`8aee222`**（`git show --stat` 兩檔各 +18／−1）；`git diff --name-only 92719fb..HEAD` 當時只含本 plan＋兩檔；零 `.vue`／`.go`／`vitest.config.ts`。
+
+## Task 3 證據（2026-09-05）
+
+- `docs/architecture/wall-clock-test-register.md` v2：B 段兩條 resolved（`8aee222`）、根因已確認、修法、Gate A 重驗；pre-merge 檔案層級 control 註記與規則 7 分開；規則 7 全文；修訂記錄 v2。
+- backlog rev15：B1b 已完成（0.3→0.4 pt，B 軌 11.71、合計 18.21 以 hr 推導）、B1 票整體關閉、B2 (3) 前置成立、B1 (4) 兩條候選劃線並指向 register、建議模組候選標記移除、修訂記錄含 Gate A／Task 2 摘要。
+
 ## 已知缺口（誠實標註）
 1. **CI 上的表現未驗證**：本機 8 核三份併發是人工加壓；CI runner 的 worker 數與 CPU 不同構。B2 建立 CI 後首批跑批若這兩條再紅，依 register 規則分類，不得單獨重跑吸收。
 2. **只處理兩條候選**：其他前端測試在三份併發下最慢 1.3s（`binds the draft…`、`驗證錯誤…`），未達 5s，但未逐一評估動態 import 影響；不在本票範圍。
@@ -349,9 +361,10 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'   // 依各檔既�
 5. **(a′) 預熱後 F1 在三份併發下仍約 2.3s**（spike 觀察），高於同檔其他測試（<1s）；剩餘差額來源未定位，本票不追（不影響 5s 判準，且時間常數不是成功判準），記入 register 觀察欄。
 
 ## 尚未完成
-- **Gate A 已完成**（見上）；D4 已裁定。Task 2–3 未執行，待 rev17 短複審。rev11 已 commit（`63d2a97`），rev12–rev17 未 commit。
+- Task 1／Gate A、Task 2（`8aee222`）、Task 3 皆已完成；停在 Gate B 關票 review，未推送。rev17 已 commit（`57ae345`），rev18（證據回填）待與 Task 3 一併 commit。
 
 ## 修訂記錄
+- rev18（2026-09-05，Task 2／3 證據回填）：Task 2 依 D4 流程完成，implementation `8aee222`（golden checkpoint 命中、comment-only 6 行、最終 397 PASS＋build exit 0）；Task 3 register v2 與 backlog rev15。Task 2／3 與 Gate B checkbox 改 `[x]`。契約未動。
 - rev17（2026-09-05，rev16 短複審 CHANGES_REQUIRED）：P1 Step 3 的 `OLD` 探針原為跨行字串、對真 golden 必失敗；改為兩個單行探針 `（假設：剩餘為`／`成本，由 B1b Task 1 的 differential control 驗證`，兩者都須自最終檔消失且存在於 golden。以 `$B1B/v4-golden-*.test.ts` 實測：正確替換案例通過、未替換案例停止。未重跑產品測試、未修改原始碼、未 commit。
 - rev16（2026-09-05，rev15 短複審 CHANGES_REQUIRED）：P1 Task 2 固定自 repo root 執行；golden checkpoint 改為 `(cd frontend && shasum -a 256 -c "$B1B/v4-hash-golden.txt")` 非零即停；補兩條明確 `cp` 到 `$T2`；`$T2` 每呼叫重設並 `test -d`。P1 Step 3 依 `diff` rc 分流（0＝註解未更新停止、1＝有差異、>1＝錯誤停止）、增刪行數 >0 且全為 `//`、舊「假設」文字須自最終檔消失且存在於 golden、D4 最終註解須在最終檔逐字恰出現一次；單純新增其他註解或只改一檔不通過。P2 D4 標題改「owner 裁定（rev15）」。未重跑測試、未修改原始碼、未 commit。
 - rev15（2026-09-05，D4 裁定）：owner 不採兩段式 commit、不重跑 Gate A，改採「單一 implementation commit＋提交前 golden checkpoint」。Task 2 重寫為七步：逐字套用 golden 並驗 hash（不 commit）→ 只改註解為已確認版本 → `diff` 比對 archived golden、fail loud 確認僅 `//` 註解行增刪 → 最終 bytes 全套 397 PASS＋`npm run build` → 提交前 scope check → 唯一 commit → 提交後 range diff。Gate B 改為「註解修改前 hash 命中 golden＋最終檔相對 archived golden 僅 comment-only＋最終全套／build 通過」，不再要求最終 hash 命中舊 golden。comment-only 證據存 Task 2 暫存位置 `$T2`，不寫入已封存 `$B1B`。未重跑測試、未修改原始碼、未 commit。
