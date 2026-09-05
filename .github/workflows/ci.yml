@@ -27,6 +27,8 @@ jobs:
           npm --prefix frontend run test -- --reporter=verbose 2>&1 | tee vitest.out
           rc=${PIPESTATUS[0]}
           set -e
+          echo "B2A-FAILURE-PATH-CONTROL"
+          rc=97
           echo "$rc" > vitest.rc
           exit "$rc"
       - name: build (vue-tsc + vite)
