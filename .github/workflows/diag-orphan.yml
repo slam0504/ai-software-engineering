@@ -1,6 +1,8 @@
 name: diag-orphan
-# B2c 暫時性診斷 workflow——只存在於 b2c/diag 分支，不得合併進 main，B2c 結案後隨分支刪除。
+# B2c／B2c-2 暫時性診斷 workflow——只存在於 b2c/diag 分支，不得合併進 main，B2c-2 結案後隨分支刪除。
 # workflow_dispatch 對非 default branch 不會觸發，故以 push 限定分支觸發；matrix 展開 runner × replica 四個獨立 job。
+# round 2（B2c-2）：layer 2b（fixture-only differential x100）、layer 3（full path x100）、layer 2 parity（x20，不入分母）。
+# 不設定任何本機控制專用入口（FAKE_HANG／FAKE_BADLINE 的診斷開關）；各 step 的 go test -timeout 與 job 的 90 分鐘共同構成硬上限。
 on:
   push:
     branches: [b2c/diag]
@@ -16,7 +18,7 @@ jobs:
         runner: [macos-15-intel, ubuntu-latest]
         replica: [1, 2]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -26,31 +28,54 @@ jobs:
       - name: env
         shell: bash
         run: |
-          (uname -a; sw_vers 2>/dev/null || cat /etc/os-release; sysctl -n hw.ncpu 2>/dev/null || nproc; go version; test -x internal/proc/testdata/diag-orphan.sh && echo "fixture executable: yes") | tee env.txt
+          (uname -a; sw_vers 2>/dev/null || cat /etc/os-release; sysctl -n hw.ncpu 2>/dev/null || nproc; go version; test -x internal/proc/testdata/diag-orphan.sh && echo "diag fixture executable: yes"; test -x testdata/fake-claude.sh && echo "fake-claude fixture executable: yes"; env | grep -c '^FAKE_' | sed 's/^/ambient FAKE_* count: /') | tee env.txt
           ps -eo pgid,pid,ppid,stat,etime,command > ps-job-start.txt
-      - name: layer 1 — existing test x100
-        shell: bash
-        run: |
-          set +e
-          go test -race -run '^TestOrphanDoesNotHangNormalExit$' ./internal/claude -count=100 -timeout 30m -v -json 2>&1 | tee layer1-test.json
-          rc=${PIPESTATUS[0]}
-          set -e
-          echo "$rc" > layer1-test.rc
-          exit "$rc"
-      - name: layer 2 — whitebox diag x100
+      - name: layer 2b — fixture-only differential (fake-claude.sh) x100
         if: always()
         shell: bash
         env:
+          DIAG_FIXTURE: fake-claude
           DIAG_ITER: '100'
-          DIAG_OUT: ${{ github.workspace }}/diag-out
+          DIAG_OUT: ${{ github.workspace }}/diag-out-2b
           DIAG_RUNNER: ${{ matrix.runner }}-r${{ matrix.replica }}
         run: |
           set +e
           mkdir -p "$DIAG_OUT"
-          go test -tags diag_orphan -race -run '^TestDiagOrphanTimeline$' ./internal/proc -count=1 -timeout 40m -v -json 2>&1 | tee layer2-diag.json
+          go test -tags diag_orphan -race -run '^TestDiagOrphanTimeline$' ./internal/proc -count=1 -timeout 35m -v -json 2>&1 | tee layer2b.json
           rc=${PIPESTATUS[0]}
           set -e
-          echo "$rc" > layer2-diag.rc
+          echo "$rc" > layer2b.rc
+          exit "$rc"
+      - name: layer 3 — full path (claude.Start → drain → Wait) x100
+        if: always()
+        shell: bash
+        env:
+          DIAG_ITER: '100'
+          DIAG_OUT: ${{ github.workspace }}/diag-out-3
+          DIAG_RUNNER: ${{ matrix.runner }}-r${{ matrix.replica }}
+        run: |
+          set +e
+          mkdir -p "$DIAG_OUT"
+          go test -tags diag_orphan -race -run '^TestDiagOrphanFullPath$' ./internal/claude -count=1 -timeout 20m -v -json 2>&1 | tee layer3.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > layer3.rc
+          exit "$rc"
+      - name: layer 2 parity — instrumented fixture x20 (not in denominator)
+        if: always()
+        shell: bash
+        env:
+          DIAG_FIXTURE: diag
+          DIAG_ITER: '20'
+          DIAG_OUT: ${{ github.workspace }}/diag-out-parity
+          DIAG_RUNNER: ${{ matrix.runner }}-r${{ matrix.replica }}
+        run: |
+          set +e
+          mkdir -p "$DIAG_OUT"
+          go test -tags diag_orphan -race -run '^TestDiagOrphanTimeline$' ./internal/proc -count=1 -timeout 10m -v -json 2>&1 | tee parity.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > parity.rc
           exit "$rc"
       - name: residue snapshot (passive)
         if: always()
@@ -58,14 +83,18 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: diag-${{ matrix.runner }}-r${{ matrix.replica }}
+          name: diag2-${{ matrix.runner }}-r${{ matrix.replica }}
           if-no-files-found: error
           path: |
             env.txt
             ps-job-start.txt
             ps-job-end.txt
-            layer1-test.json
-            layer1-test.rc
-            layer2-diag.json
-            layer2-diag.rc
-            diag-out/**
+            layer2b.json
+            layer2b.rc
+            layer3.json
+            layer3.rc
+            parity.json
+            parity.rc
+            diag-out-2b/**
+            diag-out-3/**
+            diag-out-parity/**
