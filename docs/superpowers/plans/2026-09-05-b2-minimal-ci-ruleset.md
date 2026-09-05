@@ -274,7 +274,8 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
   六條 Go wall-clock 測試在 CI 單跑 elapsed（補充資料，非 D6 樣本）：#1 0.06s、#2 0.61s、#3 0.05s、#4 0.03s、#5 0.06s、#6 0.34s；F1 157ms、F2 95ms。
 - **artifact 本機驗證**（`gh run download 33952217785`）：`vitest-output`（`vitest.rc`／`frontend-build.rc` 皆 0）、`go-test-json`（`go-test.rc` 0，18 個 pass 計數如上）、`frontend-dist`（`index.html` 存在）、`wails-app-tar`（解開後 `Contents/MacOS/sdlc-workbench` 可執行、`Contents/Resources/tools/` 含 `claude-cli`／`codex-cli`）。
 - **check-runs 預檢**（head `109b407`）：`frontend`／`go`／`wails-build`／`checksums` 四個 context，app `github-actions`，**app id 15368**，皆 success。權威版本待 Task 3 的 main run 再抄。
-- **Step 2b failure-path control**：待 owner 授權推送（見下方 control commit）。
+- **Step 2b failure-path control（已實證）**：control commit **`776c196`**（`ci.yml` 僅 +2 行：`echo "B2A-FAILURE-PATH-CONTROL"`、`rc=97`，位於寫 `.rc` 之前），owner 授權後推送（`109b407..776c196`）。PR run **`33952896114`**（pull_request，07:33Z）：`frontend` **failure**（vitest step `Process completed with exit code 97`，job log 含標記 2 次）、`checksums` success、`go`／`wails-build` **skipped**（`needs: frontend`，steps=0）；step 序列：`npm ci` success → `vitest` failure → `build`／`verify dist` skipped → **第一個 `upload-artifact`（`if: always()`）success** → 第二個（`frontend-dist`）skipped。本機 `gh run download 33952896114`：只有 `vitest-output`（`vitest.out`＋`vitest.rc`；`frontend-build.*` 因 build step 未執行而不存在，upload 對部分路徑缺失只警告不失敗），**`vitest.rc` 內容 `97`**、`vitest.out` 顯示 40 檔 397 passed（測試本身全過，紅燈純由 control 造成）。→ 測試 rc 不被 `tee`／upload 掩蓋、失敗時 log 與 `.rc` 仍上傳、下游 job 被 `needs` 擋住，三項皆成立。
+- **revert**：`d7cd55c`（`git revert 776c196`），`git diff --exit-code 776c196^ d7cd55c -- .github/workflows/ci.yml` **rc 0**；YAML 可解析。推送待 owner 授權；推送後的 PR run 為正式綠燈候選。
 
 ## Gate A（B2a 完成條件）
 - [ ] PR 內四個 job 全綠；implementation main run 全綠；**final B2a HEAD（含 closure commit）的 main run 全綠**；各 run ID、SHA、耗時、runner image、工具版本、cache hit 記錄。
