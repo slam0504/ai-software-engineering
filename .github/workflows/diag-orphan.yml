@@ -28,7 +28,19 @@ jobs:
       - name: env
         shell: bash
         run: |
-          (uname -a; sw_vers 2>/dev/null || cat /etc/os-release; sysctl -n hw.ncpu 2>/dev/null || nproc; go version; test -x internal/proc/testdata/diag-orphan.sh && echo "diag fixture executable: yes"; test -x testdata/fake-claude.sh && echo "fake-claude fixture executable: yes"; env | grep -c '^FAKE_' | sed 's/^/ambient FAKE_* count: /') | tee env.txt
+          # fixture 檢查以獨立命令執行（set -e 下失敗即中止 step）；ambient 計數用 awk（零筆時 rc 0，不用 grep -c）。
+          (
+            uname -a
+            sw_vers 2>/dev/null || cat /etc/os-release
+            sysctl -n hw.ncpu 2>/dev/null || nproc
+            go version
+            test -x internal/proc/testdata/diag-orphan.sh
+            echo "diag fixture executable: yes"
+            test -x testdata/fake-claude.sh
+            echo "fake-claude fixture executable: yes"
+            fake_count=$(env | awk 'BEGIN { n = 0 } /^FAKE_/ { n++ } END { print n }')
+            echo "ambient FAKE_* count: $fake_count"
+          ) | tee env.txt
           ps -eo pgid,pid,ppid,stat,etime,command > ps-job-start.txt
       - name: layer 2b — fixture-only differential (fake-claude.sh) x100
         if: always()
