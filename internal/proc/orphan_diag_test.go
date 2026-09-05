@@ -209,31 +209,61 @@ func diagEnvDur(key string, def time.Duration) time.Duration {
 	return def
 }
 
-// diagWaitConverge：單一絕對 deadline 迴圈，同時追蹤 EOF 與 Done；每次以剩餘時間建立新 timer。
-func diagWaitConverge(deadline time.Time, eofCh <-chan struct{}, doneCh <-chan struct{}, eofSeen, doneSeen bool) (bool, bool, time.Time, time.Time) {
+// diagWaitConverge：單一絕對 deadline timer；同時追蹤 EOF 與 Done。已觀察到的 channel 設為 nil（已關閉的
+// channel 永遠 ready，不設 nil 會讓迴圈空轉），因此每個 channel 最多被選中一次；回傳 select 次數供 helper control 檢查不空轉。
+func diagWaitConverge(deadline time.Time, eofCh <-chan struct{}, doneCh <-chan struct{}, eofSeen, doneSeen bool) (bool, bool, time.Time, time.Time, int) {
 	var tEOFSeen, tDoneSeen time.Time
-	for time.Now().Before(deadline) && !(eofSeen && doneSeen) {
-		remaining := time.Until(deadline)
-		if !eofSeen {
-			select {
-			case <-eofCh:
-				eofSeen = true
-				tEOFSeen = time.Now()
-			case <-doneCh:
-				doneSeen = true
-				tDoneSeen = time.Now()
-			case <-time.After(remaining):
-			}
-			continue
-		}
+	if eofSeen {
+		eofCh = nil
+	}
+	if doneSeen {
+		doneCh = nil
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	loops := 0
+	for eofCh != nil || doneCh != nil {
+		loops++
 		select {
+		case <-eofCh:
+			eofSeen = true
+			tEOFSeen = time.Now()
+			eofCh = nil
 		case <-doneCh:
 			doneSeen = true
 			tDoneSeen = time.Now()
-		case <-time.After(remaining):
+			doneCh = nil
+		case <-timer.C:
+			return eofSeen, doneSeen, tEOFSeen, tDoneSeen, loops
 		}
 	}
-	return eofSeen, doneSeen, tEOFSeen, tDoneSeen
+	return eofSeen, doneSeen, tEOFSeen, tDoneSeen, loops
+}
+
+// TestDiagWaitConvergeDoneBeforeEOF：helper control——Done 立即關閉、EOF 永不到達，必須在 deadline 準時回傳
+// (eof=false, done=true)，且不空轉（select 次數 ≤ 2：一次選中 done、一次選中 timer）。
+func TestDiagWaitConvergeDoneBeforeEOF(t *testing.T) {
+	eofCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	close(doneCh)
+	deadline := time.Now().Add(300 * time.Millisecond)
+	start := time.Now()
+	eof, done, _, tD, loops := diagWaitConverge(deadline, eofCh, doneCh, false, false)
+	elapsed := time.Since(start)
+	if eof || !done || tD.IsZero() {
+		t.Fatalf("expected eof=false done=true, got eof=%v done=%v", eof, done)
+	}
+	if loops > 2 {
+		t.Fatalf("busy loop detected: %d selects", loops)
+	}
+	if elapsed < 250*time.Millisecond || elapsed > 600*time.Millisecond {
+		t.Fatalf("did not return at deadline: elapsed=%s", elapsed)
+	}
+	// 對照：兩者皆已 seen 時不得阻塞。
+	e2, d2, _, _, l2 := diagWaitConverge(time.Now().Add(time.Second), eofCh, doneCh, true, true)
+	if !(e2 && d2) || l2 != 0 {
+		t.Fatalf("pre-seen path wrong: eof=%v done=%v loops=%d", e2, d2, l2)
+	}
 }
 
 // TestDiagOrphanTimeline 只做取證，不以時間作為通過條件；iteration 內的異常只記錄。
@@ -291,10 +321,32 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 	}
 
+	// finalizeIter：正常與逾時路徑共用的收尾證據檢查——scanner error、逐輪 after 快照、partial 寫檔。
+	finalizeIter := func(rec *diagRecord, i int, getScanErr func() error, beforePids map[int]bool) {
+		if getScanErr != nil {
+			if serr := getScanErr(); serr != nil {
+				rec.Errors = append(rec.Errors, "scanner: "+serr.Error())
+				invalid("iter %d scanner: %v", i, serr)
+			}
+		}
+		after, perr := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-after.txt", i)))
+		if perr != nil {
+			invalid("iter %d after ps: %v", i, perr)
+		}
+		for _, r := range after {
+			if !beforePids[r.PID] {
+				rec.NewPidsAfterIter++
+			}
+		}
+		writePartial(rec)
+	}
+
 	records := make([]*diagRecord, 0, n)
 	type bgWait struct {
-		rec  *diagRecord
-		done chan time.Time
+		rec     *diagRecord
+		eofCh   <-chan struct{}
+		doneCh  <-chan struct{}
+		scanErr func() error
 	}
 	var bg []bgWait
 	offsets := []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond, time.Second, 5 * time.Second}
@@ -435,6 +487,7 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 		if cerr := p.Stdin.Close(); cerr != nil {
 			rec.Errors = append(rec.Errors, "stdin close: "+cerr.Error())
+			invalid("iter %d stdin close: %v", i, cerr)
 		}
 
 		// 有界等待 exitedCh（候選機制 (a) 若發生，這裡是第一個會逾時的點）。
@@ -446,8 +499,13 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			rec.ExitedTimeout = true
 		}
 		orphanPid := diagReadPid(pidfile)
-		childPid := diagReadPid(childfile)
+		childPid := diagReadPid(childfile) // optional：normal 模式下孫程序常在寫出前即被清掉
 		rec.OrphanPid, rec.ChildPid = orphanPid, childPid
+		if orphanPid <= 0 {
+			// 父 PID 檔是必要證據（fixture 在印出任何 JSON 行前就寫出）；缺失或格式錯誤即證據不完整。
+			rec.Errors = append(rec.Errors, "orphan pid file missing or invalid")
+			invalid("iter %d orphan pid file missing/invalid: %s", i, filepath.Base(pidfile))
+		}
 
 		if rec.ExitedTimeout {
 			// (a) 代理命中：leader 在 exitedTimeout 內未被 supervisor 記錄退出。取快照、身分驗證後 cleanup，有界等收斂，記錄並結束本輪。
@@ -473,12 +531,8 @@ func TestDiagOrphanTimeline(t *testing.T) {
 				}
 			}
 			rescueDecide(rec, p, orphanPid, childPid, token, "exitedTimeout", i, leaderRow)
-			eofSeen, doneSeen, tE, tD := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), false, false)
-			if eofSeen && !tE.IsZero() {
-				rec.ExitedToEOFMs = nil // 無 tExited 基準，不填
-			}
-			_ = tD
-			rec.Converged = eofSeen && doneSeen
+			eofSeen, doneSeen, _, _, _ := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), false, false)
+			rec.Converged = eofSeen && doneSeen // 無 tExited 基準，不填 exitedToEOF／exitedToDone
 			rec.AfterRescue = rec.Converged
 			if rec.Converged {
 				ex := p.Wait()
@@ -486,11 +540,9 @@ func TestDiagOrphanTimeline(t *testing.T) {
 				rec.ExitCode = &code
 				rec.FinalStatus = "converged"
 			} else {
-				ch := make(chan time.Time, 1)
-				go func(pp *Proc) { pp.Wait(); ch <- time.Now() }(p)
-				bg = append(bg, bgWait{rec: rec, done: ch})
+				bg = append(bg, bgWait{rec: rec, eofCh: eofCh, doneCh: p.Done(), scanErr: func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }})
 			}
-			writePartial(rec)
+			finalizeIter(rec, i, func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }, beforePids)
 			t.Logf("iter %d: exitedTimeout rescue=%s converged=%v", i, rec.Rescue.Mode, rec.Converged)
 			continue
 		}
@@ -572,7 +624,7 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 		if needRescue {
 			rescueDecide(rec, p, orphanPid, childPid, token, reason, i, nil)
-			eofSeen, doneSeen, _, tD := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), !getEOF().IsZero(), !tDone.IsZero())
+			eofSeen, doneSeen, _, tD, _ := diagWaitConverge(time.Now().Add(5*time.Second), eofCh, p.Done(), !getEOF().IsZero(), !tDone.IsZero())
 			if doneSeen && tDone.IsZero() && !tD.IsZero() {
 				tDone = tD
 			}
@@ -582,10 +634,6 @@ func TestDiagOrphanTimeline(t *testing.T) {
 		}
 		snapWg.Wait()
 
-		if serr := func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }(); serr != nil {
-			rec.Errors = append(rec.Errors, "scanner: "+serr.Error())
-			invalid("iter %d scanner: %v", i, serr)
-		}
 		eofAt := getEOF()
 		if !eofAt.IsZero() {
 			rec.ExitedToEOFMs = diagMs(eofAt.Sub(tExited))
@@ -600,36 +648,35 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			rec.ExitCode = &code
 			rec.FinalStatus = "converged"
 		} else {
-			ch := make(chan time.Time, 1)
-			go func(pp *Proc) { pp.Wait(); ch <- time.Now() }(p)
-			bg = append(bg, bgWait{rec: rec, done: ch})
+			bg = append(bg, bgWait{rec: rec, eofCh: eofCh, doneCh: p.Done(), scanErr: func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }})
 		}
 
-		after, perr := diagPs(filepath.Join(outDir, fmt.Sprintf("iter-%d-after.txt", i)))
-		if perr != nil {
-			invalid("iter %d after ps: %v", i, perr)
-		}
-		for _, r := range after {
-			if !beforePids[r.PID] {
-				rec.NewPidsAfterIter++
-			}
-		}
-		writePartial(rec)
+		finalizeIter(rec, i, func() error { tsMu.Lock(); defer tsMu.Unlock(); return scanErr }, beforePids)
 		if rec.EOFTimeout || rec.DoneTimeout || rec.Anomaly || !rec.Converged {
 			t.Logf("iter %d: eofTimeout=%v doneTimeout=%v anomaly=%v converged=%v rescue=%s", i, rec.EOFTimeout, rec.DoneTimeout, rec.Anomaly, rec.Converged, rec.Rescue.Mode)
 		}
 	}
 
-	// 彙報階段：整體最多 30s。
+	// 彙報階段：整體最多 30s（絕對期限）；EOF 與 Done 兩者皆到才是 finalConverged；稍後出現的 scanner error 也計入。
 	deadline := time.Now().Add(30 * time.Second)
 	for _, w := range bg {
 		start := time.Now()
-		select {
-		case at := <-w.done:
+		eofSeen, doneSeen, _, _, _ := diagWaitConverge(deadline, w.eofCh, w.doneCh, false, false)
+		if eofSeen && doneSeen {
 			w.rec.FinalStatus = "finalConverged"
-			w.rec.FinalWaitMs = diagMs(at.Sub(start))
-		case <-time.After(time.Until(deadline)):
+			w.rec.FinalWaitMs = diagMs(time.Since(start))
+		} else {
 			w.rec.FinalStatus = "pending"
+			w.rec.Errors = append(w.rec.Errors, fmt.Sprintf("pending at report: eof=%v done=%v", eofSeen, doneSeen))
+		}
+		if w.scanErr != nil {
+			if serr := w.scanErr(); serr != nil {
+				w.rec.Errors = append(w.rec.Errors, "scanner(late): "+serr.Error())
+				invalid("iter %d scanner(late): %v", w.rec.Iter, serr)
+			}
+		}
+		if b, jerr := json.Marshal(w.rec); jerr == nil {
+			mustWrite(filepath.Join(outDir, fmt.Sprintf("iter-%d-final.json", w.rec.Iter)), b)
 		}
 	}
 
