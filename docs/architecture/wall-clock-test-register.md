@@ -1,8 +1,8 @@
 # Wall-clock 測試有效名單（living）
 
-> 版本：v3（2026-09-05，B2a 登記 Go 表 #7 候選 `TestOrphanDoesNotHangNormalExit`；前版 v2 2026-09-05 B1b 更新、v1 2026-09-04 B1a-4 建立）
+> 版本：v4（2026-09-06，B2c 診斷 round 1 結果回寫 #7；前版 v3 2026-09-05 B2a 登記 #7、v2 B1b、v1 B1a-4）
 > 性質：**living 文件**——「目前有效名單」與規則以本文件為準。`docs/spikes/m3b-results.md` §7 保留為 2026-08-21 的歷史觀察與具名來源，§7.1 為 B1a 收尾時的處置結果快照；兩者原文不再更新。
-> 更新責任：B1b 已於 v2 更新前端兩條候選；B2a 於 v3 登記 #7 候選；**B2c** 承接 #7 的診斷並回寫；B2b 於 CI ruleset 啟用後回寫 #2／#3／#6 的 CI 量測（版本順延為 **v4**）。任何新候選的登記與除名都在本文件的修訂記錄留痕。
+> 更新責任：B1b 已於 v2 更新前端兩條候選；B2a 於 v3 登記 #7 候選；**B2c** round 1 已於 v4 回寫 #7（結論：自製 proc 探針路徑未重現、真實路徑機制未定位）；**B2c-2** 承接 round 2；B2b 於 CI ruleset 啟用後回寫 #2／#3／#6 的 CI 量測（版本＝當時最新＋1）。任何新候選的登記與除名都在本文件的修訂記錄留痕。
 
 ---
 
@@ -16,7 +16,7 @@
 | 4 | `TestInFlightTurnDoesNotBlockNewSession` | root | **resolved**（B1a-2，2026-09-04） | `b0a8404` | `afterFn` 接上 `newFakeAfter()`，quiesce 逾時不由真實時鐘決定 | 同上，27/27 |
 | 5 | `TestAppServerMidStreamDeath` | `internal/codex` | **no-change disposition**（B1a-3，2026-09-04） | 無（不存在 implementation／resolved commit） | preflight 未證實存在可修的牆鐘缺陷（非宣稱它完全不含牆鐘） | 同上，27/27 |
 | 6 | `TestOutputCancellationKillsGrandchildren` | `internal/proc` | **resolved**（B1a-3，2026-09-04） | `39aa732` | 第二段輪詢 `deadline` 重設＋fixture 父 shell 寫 `$!`＋`pid != pgid` oracle 斷言 | 同上，27/27；三份併發下最長 9.3s（見 C.4） |
-| 7 | `TestOrphanDoesNotHangNormalExit` | `internal/claude` | **candidate**——CI-only；**現行 HEAD `ffcd161` 上 2/2 重現**；本機 bounded stress 未重現；根因未確認（B2a 登記，2026-09-05；B2c 承接診斷） | 無 | 無（不得以放寬 5 秒 guard 或加 retry 作修法；B2c 診斷後另決） | **CI 證據**：PR #1 run `33953144191` attempt 1（07:39Z）與 attempt 2（08:00Z，owner 一次性診斷例外、只重跑 `go`）皆紅，HEAD `ffcd16140e13399451b69833fa106f0c7fa5980b`，runner `macos-15-intel`（image macos-15 `20260824.0482.1`），Go 1.26.5，指令 `go test -race ./... -count=1 -timeout 30m -json`，artifact `go-test-json` id 9965561717／9965826248（`go-test.rc`=1），逐字失敗 `session_test.go:207: drain/Wait hung on orphan-held pipes`、`--- FAIL: TestOrphanDoesNotHangNormalExit (5.01s)`；同套件其餘 34 條 0–0.06s。**跨 SHA 對照**：`109b407`（`internal/claude` 與 workflow 相關 bytes 相同）run `33952217785` 一次綠（0.04s）。**本機反證**（2026-09-05，8 核 x86_64）：focused `-race -count=30` 全過 2.02s；三份 `./internal/...` `-race` 併發下 focused `-count=20` 最慢 0.02s；B1a-4 各層 0.01–0.03s |
+| 7 | `TestOrphanDoesNotHangNormalExit` | `internal/claude` | **candidate**——CI-only；現行 HEAD `ffcd161` 上 2/2 重現；B2c round 1（2026-09-06）：既有測試在 CI 高重現（macOS 81/200 於 5 秒 guard；**ubuntu-latest 上 197/200 次於 drain／Wait 返回後立即失敗，`kill(-pgid, 0)` 顯示該 process group 當下仍存在。原因未確認；zombie／oracle race 為待驗假設，不判定為 production defect**）；自製 proc 探針路徑 0/400 未重現；對真正 `claude.Session`＋`fake-claude.sh` 路徑尚未排除任何候選機制；本機 bounded stress 未重現；根因未確認（B2c-2 承接 round 2） | 無 | 無（不得以放寬 5 秒 guard 或加 retry 作修法；B2c 診斷後另決） | **CI 證據（B2a）**：PR #1 run `33953144191` attempt 1（07:39Z）與 attempt 2（08:00Z，owner 一次性診斷例外、只重跑 `go`）皆紅，HEAD `ffcd16140e13399451b69833fa106f0c7fa5980b`，runner `macos-15-intel`（image macos-15 `20260824.0482.1`），Go 1.26.5，指令 `go test -race ./... -count=1 -timeout 30m -json`，artifact `go-test-json` id 9965561717／9965826248（`go-test.rc`=1），逐字失敗 `session_test.go:207: drain/Wait hung on orphan-held pipes`、`--- FAIL: TestOrphanDoesNotHangNormalExit (5.01s)`；同套件其餘 34 條 0–0.06s。**跨 SHA 對照**：`109b407`（`internal/claude` 與 workflow 相關 bytes 相同）run `33952217785` 一次綠（0.04s）。**本機反證**（2026-09-05，8 核 x86_64）：focused `-race -count=30` 全過 2.02s；三份 `./internal/...` `-race` 併發下 focused `-count=20` 最慢 0.02s；B1a-4 各層 0.01–0.03s。**B2c round 1 CI 證據**（`b2c/diag` head `d12b13b`，run `33968040444`，2026-09-05 13:08Z，四 job）：layer 1 既有測試 ×100——macos-15-intel r1 36 紅／r2 45 紅（皆 `session_test.go:207: drain/Wait hung on orphan-held pipes`，5.00–5.02s；pass 皆 ≤0.04s）、ubuntu-latest r1 98 紅／r2 99 紅（皆 `session_test.go:210: orphan must be reaped by supervisor on parent exit`，0.00–0.01s）；layer 2 白箱探針（`proc.Start` 直呼＋暫時性 fixture）×100 四 job 0 重現、cleanup KILL 100/100、EOF 亞毫秒、`invalidEvidence` 0。artifact `layer1-test.json` SHA-256 前 16：`876f5612e09c9364`／`ae76e6e2ffb72236`／`133377869e418668`／`fd7ffb30e3a112e9`（macOS r1／r2、ubuntu r1／r2） |
 
 負載重驗定義：B1a-4 plan（`docs/superpowers/plans/2026-09-04-b1a-4-integration-acceptance.md`）Gate A 的四層矩陣——M1 逐包單跑、M2 五套件併行 ×3、M3 三份併發 ×1、M4 背景負載下 focused ×20，全部 `-race -p=8`，整合 HEAD `583387d`，本機 8 核 16 GB。每條 27 次「有效、指定執行」（背景負載中的執行不計）全 PASS；18 個 `-json` artifact 頂層 FAIL 為 0。
 
@@ -44,6 +44,7 @@
 
 ## 修訂記錄
 
+- v4（2026-09-06）：B2c round 1 結果回寫 #7——既有測試 CI 高重現（macOS 81/200 於 5 秒 guard；ubuntu 197/200 於 `orphan must be reaped`，`kill(-pgid,0)` 顯示群組當下仍存在，原因未確認、zombie／oracle race 為待驗假設、不判定 production defect）；自製 proc 探針路徑 0/400 未重現；對真實路徑尚未排除任何候選機制；狀態維持 candidate，B2c-2 承接 round 2。
 - v3（2026-09-05）：B2a 登記 Go 表 **#7** `TestOrphanDoesNotHangNormalExit` 為 candidate（CI-only、現行 HEAD `ffcd161` 2/2 重現、本機 bounded stress 未重現、根因未確認），附 run／attempt／HEAD／指令／artifact／逐字訊息／跨 SHA 對照／本機反證；候選不因後續 attempt 轉綠而除名或改寫為誤紅。#7 為 owner 明示的一次性診斷例外下取得的 attempt 2 證據，**不構成**「非八條 Go 測試可重跑」通則；處置由 B2c 承接。B2b 回填版本順延 v4。
 - v2（2026-09-05）：B1b 更新。B 段兩條由「待重現（B1b）」改為 resolved（`8aee222`），附已確認根因、修法與 Gate A 重驗摘要；註明 pre-merge control 採檔案層級判準且與規則 7 無關；前端一般規則改為適用於 F1／F2 以外；新增規則 7（具名 F1／F2 的 FAIL 分類契約）。
 - v1（2026-09-04）：B1a-4 建立。A 段六條處置狀態自 B1a-1／B1a-2／B1a-3 關票紀錄與 B1a-4 Gate A 帳表轉錄；B 段兩條前端候選自 backlog B1 驗收條件 (4) 轉錄，標「待重現（B1b）」；C 段規則 1–6 依 B1a-4 plan D1／D4 與 owner 裁定寫入；規則 1 於 closure review 依 owner 要求改為「先分類、僅契約回歸不得重跑吸收」，與 §7.1 及 plan D1 一致。
