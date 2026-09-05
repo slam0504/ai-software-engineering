@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > 版本：rev4（2026-09-05，rev3 短複審 CHANGES_REQUIRED 後修訂：P1 Step 2b control 的 `rc=97` 改在寫 `.rc` 之前設定（原順序會讓 job exit 97 但 artifact `.rc` 為 0，owner 已重現）；P2 revert 檢查改 `git diff --exit-code <control>^ <revert> -- .github/workflows/ci.yml`；P2 `checksums` 的 diff-check step 改由 `env:` 傳入 Actions 值、shell 只讀環境變數，使同一段可在本機以 shell control 執行；前版：rev3（rev2 短複審 CHANGES_REQUIRED 後修訂：P1 三段測試 wrapper 改為 `set +e` → pipeline → 立即存 `PIPESTATUS[0]` → `set -e` → 寫 `.rc` → `exit`（GitHub `shell: bash` 實為 `bash -eo pipefail`，原寫法失敗時寫不出 `.rc`，owner 已重現）；P1 新增 Task 1 的暫時性 failure-path control；P2 final B2a HEAD 須再跑全綠並分開記錄兩次 main run、check-runs 抄 `app.id` 並以 main SHA 為權威、Gate A 事件覆蓋語意修正；前版：rev2（第一輪 owner CHANGES_REQUIRED 後修訂：D1–D6 裁定回寫（拆 B2a／B2b、`macos-15-intel`＋Go 1.26.5、SHA256SUMS 只留 m0／m1／m1.5、`ci-merge-policy.md`、0.6／0.7 pt、n=5 clean PR run attempts）；五項 P1——artifact 建置鏈閉合、README 可重現順序納入 scope、失敗時仍保存 artifact 且不假綠、checksums／`git diff --check` 可逐字執行、B2b closure PR 與外部寫入授權路徑；兩項 P2——required check context 以實際 run 讀取、量測樣本來源；前版：rev1）
-> 狀態：**design gate APPROVED（rev4，2026-09-05）——Task 1 進行中；GitHub 外部寫入（push／PR／merge／刪分支）逐步取得 owner 授權；GitHub 設定面零變更**。B2b 另開 plan
+> 狀態：**Gate A 停止（2026-09-05）——run `33953144191` attempt 1／2 於 `internal/claude/TestOrphanDoesNotHangNormalExit` 連續紅燈（非八條具名測試、本機不可重現、根因未確認），依 owner 規則停止；Go 表 #7 候選待登記 register v3（B2b 回填順延 v4），續票 B2c 承接診斷；PR #1 開啟未合併、GitHub 設定面零變更**。B2b 另開 plan
 > 票源：Pre-M4 Readiness Backlog **B2**（rev15，1.2 pt）→ owner 於本 plan gate 裁定拆為 **B2a 0.6 pt**（本 plan）與 **B2b 0.7 pt**（另開），合計 1.3 pt；backlog rev16 於 Task 3 落地。B2 驗收條件 (1)(4) 與 (3) 前置屬 B2a；(2)(5)(6) 屬 B2b
 > 基準 commit：**`c6f8099c906f25deb43bfe0d859b1b10e0826a79`**（backlog rev15，已推送、與 `origin/main` 相同）
 > 裁決：GitHub-first（backlog 裁決 #4）
@@ -249,13 +249,14 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
   並把「三個 package 牆鐘測試紅了先單獨重跑」那段**改為**指向 `docs/architecture/wall-clock-test-register.md` 規則 1／7（八條具名測試紅燈先分類、契約回歸不得重跑吸收；其他前端測試依規則 B 段一般規則）。
 - [ ] 這兩個檔案的變更各自獨立 commit；`checksums` job 在 PR 內轉綠。
 
-## Task 3（B2a）: 合併、main run、backlog rev16
+## Task 3（B2a）: 合併、main run、backlog 關票——**目前被 B2c 阻擋，禁止執行**
 
-- [ ] owner 授權後合併 PR（本 repo 慣例線性 fast-forward；若 GitHub 端只提供 merge/squash/rebase，選 **rebase and merge** 保持線性並記錄）；owner 授權後刪遠端分支。
-- [ ] **implementation main run**：合併後 main 上 `push` 觸發跑一次全綠；抄錄 run ID、四個 job 耗時與 check-runs（Step 5 同樣指令，對該 main SHA，含 `app.id`）——此為 B2b 建 ruleset 的權威 context 清單。
-- [ ] backlog rev16：B2 拆為 B2a（已完成，0.6 pt，plan／commit）／B2b（未完成，0.7 pt，範圍 (2)(5)(6)）；合計由 1.2 → 1.3 pt，B 軌與合計以 hr 重算；A4 互動註記（CI Go 釘 1.26.5，A4 落地後改讀 go.mod）；D3 落地註記（SHA256SUMS 只留三份）；B3b 前置（`wails-app-tar` artifact）成立。backlog 變更以另一個 PR 或直接 push？——**依既有慣例 backlog 修訂為 docs commit 直接 push main；但 B2a 合併後 main 已有 CI，任何 push 都會觸發 workflow**：直接 push 仍可（B2a 未建 ruleset），owner 授權後執行。**closure-commit main run**：plan／backlog closure commit push 後，**final B2a HEAD 必須再跑四個 job 全綠**，與 implementation main run 分開記錄（run ID、SHA、耗時）；Gate A 綁定 final HEAD，不得只綁上一個 SHA。
+**狀態（2026-09-05 owner 裁定）**：Gate A 於 run `33953144191` attempt 1／2 連續紅燈後停止，**B2a 未完成**。在 B2c 診斷給出結論並經 owner 裁定前：**禁止合併 PR #1、禁止進入 implementation main run／closure-commit main run 步驟、禁止再重跑**。下列步驟保留為 B2c 解除阻擋後的執行序，不得提前。
 
----
+- [ ] （阻擋中）owner 授權後合併 PR（線性；GitHub 端若只有 merge／squash／rebase，選 **rebase and merge** 並記錄）；owner 授權後刪遠端分支。
+- [ ] （阻擋中）**implementation main run**：合併後 main 上 `push` 觸發跑一次全綠；抄錄 run ID、四個 job 耗時與 check-runs（含 `app.id`）——B2b 建 ruleset 的權威 context 清單。
+- [ ] （阻擋中）**closure-commit main run**：plan／backlog closure commit push 後，final B2a HEAD 再跑四個 job 全綠，與 implementation main run 分開記錄；Gate A 綁 final HEAD。
+- [x] **改走 docs-only（owner 2026-09-05 裁定，不依附 PR #1）**：register **v3**（Go 表新增 **#7** `TestOrphanDoesNotHangNormalExit` 候選）＋ backlog **rev16**（新增 **B2c** 0.4 pt；B2a 標「Gate A 停止，待 B2c」，不得寫完成；B2 合計 1.7 pt、B 軌 122.05 hr／12.21 pt、總計 187.05 hr／18.71 pt）以獨立 commit 從當時最新 `origin/main` 建立，另行申請 push 授權。B2b 原訂的 register 回填版本順延為 **v4**。
 
 ## Task 1 證據（進行中，2026-09-05）
 
@@ -275,7 +276,14 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
 - **artifact 本機驗證**（`gh run download 33952217785`）：`vitest-output`（`vitest.rc`／`frontend-build.rc` 皆 0）、`go-test-json`（`go-test.rc` 0，18 個 pass 計數如上）、`frontend-dist`（`index.html` 存在）、`wails-app-tar`（解開後 `Contents/MacOS/sdlc-workbench` 可執行、`Contents/Resources/tools/` 含 `claude-cli`／`codex-cli`）。
 - **check-runs 預檢**（head `109b407`）：`frontend`／`go`／`wails-build`／`checksums` 四個 context，app `github-actions`，**app id 15368**，皆 success。權威版本待 Task 3 的 main run 再抄。
 - **Step 2b failure-path control（已實證）**：control commit **`776c196`**（`ci.yml` 僅 +2 行：`echo "B2A-FAILURE-PATH-CONTROL"`、`rc=97`，位於寫 `.rc` 之前），owner 授權後推送（`109b407..776c196`）。PR run **`33952896114`**（pull_request，07:33Z）：`frontend` **failure**（vitest step `Process completed with exit code 97`，job log 含標記 2 次）、`checksums` success、`go`／`wails-build` **skipped**（`needs: frontend`，steps=0）；step 序列：`npm ci` success → `vitest` failure → `build`／`verify dist` skipped → **第一個 `upload-artifact`（`if: always()`）success** → 第二個（`frontend-dist`）skipped。本機 `gh run download 33952896114`：只有 `vitest-output`（`vitest.out`＋`vitest.rc`；`frontend-build.*` 因 build step 未執行而不存在，upload 對部分路徑缺失只警告不失敗），**`vitest.rc` 內容 `97`**、`vitest.out` 顯示 40 檔 397 passed（測試本身全過，紅燈純由 control 造成）。→ 測試 rc 不被 `tee`／upload 掩蓋、失敗時 log 與 `.rc` 仍上傳、下游 job 被 `needs` 擋住，三項皆成立。
-- **revert**：`d7cd55c`（`git revert 776c196`），`git diff --exit-code 776c196^ d7cd55c -- .github/workflows/ci.yml` **rc 0**；YAML 可解析。推送待 owner 授權；推送後的 PR run 為正式綠燈候選。
+- **revert**：`d7cd55c`（`git revert 776c196`），`git diff --exit-code 776c196^ d7cd55c -- .github/workflows/ci.yml` **rc 0**；YAML 可解析。owner 授權後推送 `776c196..ffcd161`（含證據回填 `ffcd161`）。
+- **正式綠燈候選 run `33953144191`（head `ffcd161`，workflow bytes 與 run 1 相同）——Gate A 停止**：
+  - **attempt 1**（07:39Z）：`checksums`／`frontend`／`wails-build` 成功（`vitest.rc`、`frontend-build.rc` 0；`.app` 可執行）；**`go` 失敗**（`go-test.rc`=1）。唯一 FAIL：`internal/claude` **`TestOrphanDoesNotHangNormalExit`** 5.01s，逐字 `session_test.go:207: drain/Wait hung on orphan-held pipes`（測試自身 `select`＋`time.After(5 * time.Second)` guard）；同套件其餘 34 條 0–0.06s；root 144.9s、`internal/proc` 38.2s 正常；無 `-timeout` panic、無 DATA RACE。artifact `go-test-json`（id 9965561717）本機保存，hash 見 `/tmp/b2a-attempt1-artifacts-sha256.txt`（`go-test.json` `46d5466e…`）。**此測試不在 register 八條內**（§7／register／backlog 皆無）。
+  - **本機反證（同日，8 核 x86_64）**：focused `-race -count=30` 全過 2.02s；三份 `./internal/...` `-race` 併發負載下 focused `-count=20` 最慢 0.02s；B1a-4 各層 0.01–0.03s；run 1（`33952217785`）0.04s。
+  - **attempt 2**（owner 一次性診斷例外，`gh run rerun 33953144191 --failed`，08:00Z，只重跑 `go`）：**同一測試、同一訊息再紅**（5.01s，`go-test.rc`=1；artifact id 9965826248，`go-test.json` `1c0ff62e…`）；同名 artifact 第二次上傳成功（無 409）；其餘套件全過。→ **現行 HEAD `ffcd161` 上 CI 2/2 重現**；`109b407`（`internal/claude` 與 workflow 相關 bytes 相同）的 run 1 一次綠燈另列為跨 SHA 對照，不併入主要狀態。
+  - **runner 對照**：run 1 綠與 run 3 兩次紅皆為 `macos-15-intel`、Image macos-15 **Version 20260824.0482.1**（同一 image，不同 VM：runner 1000000827／834／835）；Go 1.26.5、Node 26.8.1 相同。排除 image 漂移。
+  - **機制事實（唯讀）**：`proc.go:152` stdout／stderr 皆為 `os.Pipe` write end（無 copy goroutine），`cmd.Wait()` 於 leader 退出即返回；`proc.go:191` 隨即 `SignalGroup(SIGKILL)` 清孫程序，不經 grace；fixture `testdata/fake-claude.sh:16` 孫程序為 `bash -c 'trap "" TERM; sleep 30' &`（持有 stdout 30 秒）。故 CI 上 5 秒內無 EOF ＝ 該次 group KILL 未及時使孫程序放開 stdout（或 `cmd.Wait` 延遲、或 EOF 傳遞延遲）——三者未區分，**根因未確認**。
+  - **裁定執行**：依 owner 規則「attempt 2 再紅則 Gate A 停止」，**B2a Gate A 停止於此**；不再重跑。此測試登記為 register Go 表 **#7**（狀態：candidate；**現行 HEAD `ffcd161` 上 CI 2/2 重現**；`109b407`（相同相關 bytes）的一次綠燈另列為跨 SHA 對照；本機 bounded stress 未重現；根因未確認），續票 **B2c**（診斷／preflight，0.4 pt）承接；不得以放寬 5 秒或加 retry 作修法。PR #1 維持開啟、未合併；GitHub 設定面零變更。
 
 ## Gate A（B2a 完成條件）
 - [ ] PR 內四個 job 全綠；implementation main run 全綠；**final B2a HEAD（含 closure commit）的 main run 全綠**；各 run ID、SHA、耗時、runner image、工具版本、cache hit 記錄。
@@ -289,7 +297,7 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
 
 ## B2b 承接事項（另開 plan 時的已裁定輸入，本 plan 不執行）
 
-- **範圍**：(2) main ruleset（required contexts 以 B2a 抄錄的 check-runs 為準；require PR、線性歷史、禁 direct push；**不設常駐 bypass actor**）；(5a) probe PR 故意讓 `checksums` 紅→不可合併；(5a′) probe 改 job 名使 required context 缺席→永遠 pending（＝(5d) fail loud 實證）；(5b) 修正後全綠→`mergeStateStatus: CLEAN`；(5c)(5e) `docs/architecture/ci-merge-policy.md`＋automation plan §12 指向；(6) n=5 clean PR run attempts 量測 #2／#3／#6／F1／F2，回寫 register v3；backlog rev17 關票。
+- **範圍**：(2) main ruleset（required contexts 以 B2a 抄錄的 check-runs 為準；require PR、線性歷史、禁 direct push；**不設常駐 bypass actor**）；(5a) probe PR 故意讓 `checksums` 紅→不可合併；(5a′) probe 改 job 名使 required context 缺席→永遠 pending（＝(5d) fail loud 實證）；(5b) 修正後全綠→`mergeStateStatus: CLEAN`；(5c)(5e) `docs/architecture/ci-merge-policy.md`＋automation plan §12 指向；(6) n=5 clean PR run attempts 量測 #2／#3／#6／F1／F2，回寫 register **v4**（v3 由 B2a 的 #7 候選登記占用）；backlog rev17 關票。
 - **兩條分支路徑（P1-5）**：`ci-probe/<日期>-<目的>` 分支**只做 enforcement 驗證**，驗完關閉 PR、刪分支、不合併；**另設 `b2b/closure` PR** 提交政策文件、automation plan 指標、register v3、backlog rev17，required checks 全綠後才合併——Gate B 文件不得只存在工作區。
 - **外部寫入授權清單**：建立／修改／刪除 ruleset；push 任一分支；開／關 PR；merge；刪遠端分支；每一步逐次授權並抄錄前後狀態（ruleset 以 JSON）。
 - **D6 樣本定義**：ruleset 啟用後、workflow 檔未修改、四個 required contexts 都出現的 clean PR run attempts，n=5；記錄 run ID、attempt、runner image、cache hit、五條 elapsed；main／dispatch 為補充；紅燈依 register 分類。
@@ -304,7 +312,7 @@ B2a 不改任何 `.go`／`.ts`／`.vue`／`vitest.config.ts`／`go.mod`。新增
 4. **CI 上八條 wall-clock 測試的表現**：B2a 只記補充資料，不作結論；正式量測在 B2b D6。
 
 ## 尚未完成
-- design gate 待審（rev4 短複審）。Task 1–3 未執行。本 plan 未 commit。
+- Task 1 Step 0–2b 完成（首次全綠 run、failure-path control 實證），**正式綠燈候選 run 於 `go` job 連續紅燈，Gate A 停止**；Task 2 的兩個 commit 已在 PR #1 內；Task 3 被 B2c 阻擋（禁止合併與 main-run 步驟）。register v3／backlog rev16 改走 docs-only 直接更新 main。B2c 為下一工作單元（diagnosis-only plan，先過 design gate；不得先改 production／測試或加 retry／timeout）。
 
 ## 修訂記錄
 - rev4（2026-09-05，rev3 短複審 CHANGES_REQUIRED）：P1 Step 2b control 尾段固定為「存 `PIPESTATUS` → `set -e` → 印標記 → `rc=97` → 寫 `.rc` → `exit`」，job exit 與 artifact `.rc` 一致為 97（本機重現舊順序 artifact_rc=0、新順序 97）。P2 revert 檢查改 `git diff --exit-code <control>^ <revert> -- .github/workflows/ci.yml`。P2 `checksums` diff-check step 改為 `env:` 傳入 `EVENT_NAME`／`SHA`／`BEFORE_SHA`／`PR_BASE_SHA`／`PR_HEAD_SHA`，shell 只讀環境變數，Gate A 的 dispatch shell control 改為以環境變數驅動同一段。未新增檔案、未動 GitHub 設定、未 commit。
