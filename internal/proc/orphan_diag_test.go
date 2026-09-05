@@ -643,7 +643,7 @@ func TestDiagOrphanTimeline(t *testing.T) {
 			beforePids[r.PID] = true
 		}
 
-		// Env 依 fixtureKind 分岔：fake-claude 只給 FAKE_ORPHAN=1（+ 診斷用 FAKE_HANG=1），
+		// Env 依 fixtureKind 分岔：fake-claude 有效的非空 fixture 開關僅 FAKE_ORPHAN=1（+ 診斷用 FAKE_HANG=1），cfg.Env 另含六個空值以遮蔽 ambient FAKE_*；
 		// 沒有 token／PID 檔；diag 維持既有 DIAG_TOKEN／DIAG_PIDFILE／DIAG_CHILDPIDFILE／DIAG_MODE。
 		var startEnv []string
 		if fixtureKind == "fake-claude" {
