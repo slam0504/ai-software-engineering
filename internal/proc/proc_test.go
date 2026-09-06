@@ -546,10 +546,11 @@ func TestTerminateEscalatesViaInjectedTimerInOrder(t *testing.T) {
 	}
 	timerCh <- time.Now() // 測試觸發：模擬 grace 逾時
 
-	// escalation KILL 事件與 supervisor 收尾 KILL 事件之間沒有 happens-before：
-	// escalation 是在 p.mu 解鎖之後才通知觀察者，這段空窗足以讓 leader 死亡、
-	// supervisor 送出自己的 cleanup 事件並搶先入列。因此只要求 escalation 事件
-	// 「會出現」，容許 cleanup 事件夾在它前面，不斷言它必為佇列第二筆。
+	// escalation KILL 事件與 supervisor 收尾 KILL／rekill 事件之間沒有
+	// happens-before：escalation 是在 p.mu 解鎖之後才通知觀察者，這段空窗足以讓
+	// leader 死亡、supervisor 的有界清理送出自己的 cleanup／rekill 事件並搶先
+	// 入列。因此只要求 escalation 事件「會出現」，容許 cleanup／rekill 事件夾在
+	// 它前面，不斷言它必為佇列第二筆（B2c-4 D6(ii)）。
 	deadline := time.After(10 * time.Second)
 	for got := false; !got; {
 		select {
@@ -557,7 +558,7 @@ func TestTerminateEscalatesViaInjectedTimerInOrder(t *testing.T) {
 			switch ev {
 			case sigEventEscalationKill:
 				got = true
-			case sigEventSupervisorCleanupKill: // 容許：與 escalation 事件無順序保證
+			case sigEventSupervisorCleanupKill, sigEventSupervisorCleanupRekill: // 容許：與 escalation 事件無順序保證（B2c-4 D6(ii)）
 			default:
 				t.Fatalf("非預期事件 %v", ev)
 			}
@@ -600,7 +601,11 @@ func TestTerminateDoesNotEmitTermSentEventWhenSignalGroupFails(t *testing.T) {
 	}
 }
 
-func TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned(t *testing.T) {
+// TestSupervisorFirstCleanupSignalEventFiresOnlyWhenSent（B2c-4 D5／D6：改名自
+// TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned，語意改為
+// 「第一次 cleanup signal 成功」，不再宣稱恰一次 KILL 就能保證群組清乾淨——真實
+// 排程之下 rekill 事件次數不確定，逐事件種類斷言精確次數／範圍）。
+func TestSupervisorFirstCleanupSignalEventFiresOnlyWhenSent(t *testing.T) {
 	cases := []struct {
 		name      string
 		script    string
@@ -621,7 +626,7 @@ func TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned(t *testing.
 			if _, err := p.Stdout.Read(buf); err != nil {
 				t.Fatal(err)
 			}
-			events := make(chan signalEvent, 8)
+			events := make(chan signalEvent, 32)
 			p.mu.Lock()
 			p.onSignal = func(ev signalEvent) { events <- ev }
 			p.mu.Unlock()
@@ -637,17 +642,34 @@ func TestSupervisorCleanupKillEventFiresOnlyWhenGroupActuallyCleaned(t *testing.
 			if c.wantEvent && !strings.Contains(out.String(), "out") {
 				t.Fatalf("stdout = %q", out.String())
 			}
-			select {
-			case ev := <-events:
-				if !c.wantEvent {
-					t.Fatalf("no_orphan 案例不該有 cleanup KILL 事件，收到 %v", ev)
+			var cleanupKill, rekill, other int
+			close(events)
+			for ev := range events {
+				switch ev {
+				case sigEventSupervisorCleanupKill:
+					cleanupKill++
+				case sigEventSupervisorCleanupRekill:
+					rekill++
+				default:
+					other++
 				}
-				if ev != sigEventSupervisorCleanupKill {
-					t.Fatalf("事件 = %v, want sigEventSupervisorCleanupKill", ev)
+			}
+			if other != 0 {
+				t.Fatalf("非預期事件種類數 = %d", other)
+			}
+			if c.wantEvent {
+				if cleanupKill != 1 {
+					t.Fatalf("orphan_present 案例 sigEventSupervisorCleanupKill = %d, want 1", cleanupKill)
 				}
-			default:
-				if c.wantEvent {
-					t.Fatal("orphan_present 案例必須發出 sigEventSupervisorCleanupKill")
+				if rekill < 0 || rekill > 10 {
+					t.Fatalf("orphan_present 案例 rekill 次數超出真實程序排程上限：%d", rekill)
+				}
+			} else {
+				if cleanupKill != 0 {
+					t.Fatalf("no_orphan 案例不該有 sigEventSupervisorCleanupKill，收到 %d", cleanupKill)
+				}
+				if rekill != 0 {
+					t.Fatalf("no_orphan 案例不該有 sigEventSupervisorCleanupRekill，收到 %d", rekill)
 				}
 			}
 			if !groupGone(p.PGID()) {

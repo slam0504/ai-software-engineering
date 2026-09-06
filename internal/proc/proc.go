@@ -2,6 +2,8 @@ package proc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -22,11 +24,22 @@ type Exit struct {
 	Code       int
 	StderrTail string
 	Err        error
+	// CleanupIncomplete：supervisor 的有界清理在 1 s 預算內未能確認 process group
+	// 消失（B2c-4 §3 O1）。true 時 stdout／stderr 的本端 read end 已被強制關閉，
+	// Err 維持既有「子程序死因」語意、不混入 cleanup 狀態。
+	CleanupIncomplete bool
 }
 
-// Proc 以獨立 process group 啟動子程序，背景 supervisor 是唯一收尾路徑：
-// 子程序一退出即 group SIGKILL（清掉持有 pipe 的孫程序 → reader 的 EOF 保證到來）
-// → 收完 stderr → 快取 Exit。Wait() 只回傳快取結果，與汲取「完成」無順序依賴。
+// ErrCleanupIncomplete：supervisor 強制解除本端 pipe 等待時，p.Stdout 的讀取錯誤
+// 以此包裝，讓呼叫端能用 errors.Is 分辨「supervisor 放棄清理」與其他 I/O 錯誤
+// （B2c-4 D3／D8）。
+var ErrCleanupIncomplete = errors.New("proc: cleanup incomplete: process group not confirmed dead within 1s budget; stdout/stderr force-closed")
+
+// Proc 以獨立 process group 啟動子程序，背景 supervisor 是唯一收尾路徑：子程序
+// 一退出即送 group SIGKILL，並在固定時間表內重送與確認（有界清理，B2c-4 §3
+// O1）——不保證單次或有限次 KILL 就讓群組終止；1 s 預算內無法確認消失時，強制
+// 解除本端對 stdout／stderr 的等待並以 Exit.CleanupIncomplete 揭露，讓 Wait()／
+// Done() 有界收斂。
 // 契約（v1.6）：呼叫端必須在 Start 後並行持續汲取 Stdout——supervisor 不做 stdout
 // spool，若無人讀，子程序輸出超過 pipe buffer 會卡在 write、永不退出。
 type Proc struct {
@@ -64,20 +77,70 @@ type Proc struct {
 	// 與 no-op。
 	after    afterFunc
 	onSignal signalObserverFunc
+	// cleanupAfter／groupProbe／cleanupSignal：B2c-5 有界清理狀態機的三個 nil-safe
+	// seam（沿 B1a-1 seamAfter／seamOnSignal 慣例），僅同套件 white-box 測試可
+	// 注入。cleanupAfter 與 after 分離，避免與 Terminate() 的 escalation timer
+	// 注入互相干擾。cleanupSignal 只用於 cleanupGroup 路徑；Terminate／escalation
+	// 仍走 SignalGroup。nil 時分別退回 time.After／syscall.Kill(-pgid, 0)／
+	// syscall.Kill(-pgid, sig)。
+	cleanupAfter  afterFunc
+	groupProbe    func(pgid int) error
+	cleanupSignal func(pgid int, sig syscall.Signal) error
+	// forcedClosed／callerClosedStdout：B2c-4 D8 的薄包裝旗標，皆在 p.mu 下讀寫。
+	// forcedClosed 由 supervisor 在有界清理預算耗盡時設定；callerClosedStdout 由
+	// stdoutReader.Close() 設定，先設旗標再關底層，讓「呼叫端先 Close()」的意圖
+	// 優先於強制關閉的錯誤映射。
+	forcedClosed       bool
+	callerClosedStdout bool
+}
+
+// stdoutReader 是 p.Stdout 的薄包裝（型別對外仍為 io.ReadCloser，B2c-4 D2）：
+// Read 只有在 supervisor 已設定 forcedClosed 且呼叫端尚未自行 Close() 時，才把
+// 底層的 os.ErrClosed 映射為 ErrCleanupIncomplete；Close 先在 p.mu 下設
+// callerClosedStdout，再關底層，並把 os.ErrClosed 正規化為 nil（其他錯誤照常
+// 回傳），讓連續兩次 Close() 皆成功。
+type stdoutReader struct {
+	f *os.File
+	p *Proc
+}
+
+func (r *stdoutReader) Read(b []byte) (int, error) {
+	n, err := r.f.Read(b)
+	if err != nil && errors.Is(err, os.ErrClosed) {
+		r.p.mu.Lock()
+		forced, callerClosed := r.p.forcedClosed, r.p.callerClosedStdout
+		r.p.mu.Unlock()
+		if forced && !callerClosed {
+			return n, fmt.Errorf("%w: %v", ErrCleanupIncomplete, err)
+		}
+	}
+	return n, err
+}
+
+func (r *stdoutReader) Close() error {
+	r.p.mu.Lock()
+	r.p.callerClosedStdout = true
+	r.p.mu.Unlock()
+	err := r.f.Close()
+	if err != nil && errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // afterFunc 是 Terminate() 的計時器 seam；型別對齊 internal/appcore/pump.go 的
 // After／RealAfter 慣例。nil 時退回 time.After（見 seamAfter）。
 type afterFunc func(time.Duration) <-chan time.Time
 
-// signalEvent 區分 Proc 內部三個「實際送出過訊號」的時刻——只在對應的
-// SignalGroup 呼叫成功後才發出。
+// signalEvent 區分 Proc 內部「實際送出過訊號」的時刻——只在對應的 SignalGroup／
+// cleanupSignal 呼叫成功後才發出。
 type signalEvent int
 
 const (
-	sigEventTermSent              signalEvent = iota // Terminate() 的 group SIGTERM 送出成功
-	sigEventEscalationKill                           // Terminate() grace 逾時升級的 group SIGKILL 送出成功
-	sigEventSupervisorCleanupKill                    // supervisor 收尾管線的清孫程序 group SIGKILL 送出成功
+	sigEventTermSent                signalEvent = iota // Terminate() 的 group SIGTERM 送出成功
+	sigEventEscalationKill                             // Terminate() grace 逾時升級的 group SIGKILL 送出成功
+	sigEventSupervisorCleanupKill                      // supervisor 收尾管線的第一次清孫程序 group SIGKILL 送出成功
+	sigEventSupervisorCleanupRekill                    // 有界清理排程中的重送 group SIGKILL 送出成功（只在實際成功送出時發；B2c-4 D9：不新增 gave-up 事件）
 )
 
 // signalObserverFunc 是訊號事件的 seam；nil 時退回 no-op（見 seamOnSignal）。
@@ -102,6 +165,112 @@ func (p *Proc) seamOnSignal() signalObserverFunc {
 		return p.onSignal
 	}
 	return func(signalEvent) {}
+}
+
+// seamCleanupAfter／seamGroupProbe／seamCleanupSignal：B2c-5 有界清理狀態機的
+// nil-safe 存取子，規約同 seamAfter／seamOnSignal——欄位讀取在 p.mu 下完成，
+// 回傳值在解鎖後才被呼叫。
+func (p *Proc) seamCleanupAfter() afterFunc {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cleanupAfter != nil {
+		return p.cleanupAfter
+	}
+	return time.After
+}
+
+func (p *Proc) seamGroupProbe() func(int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.groupProbe != nil {
+		return p.groupProbe
+	}
+	return func(pgid int) error { return syscall.Kill(-pgid, 0) }
+}
+
+func (p *Proc) seamCleanupSignal() func(int, syscall.Signal) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cleanupSignal != nil {
+		return p.cleanupSignal
+	}
+	return func(pgid int, sig syscall.Signal) error { return syscall.Kill(-pgid, sig) }
+}
+
+// classifyKillErr 把 kill(-pgid, ...) 的回傳值分類為 B2c-4 §3 O1 狀態機的三路：
+// esrch（群組已消失）、eperm（可能是 P_REF_NEW 建立窗口，見 B2c-4 假設 A3，非
+// 終止）、nilErr（送出／探測成功）。其他 errno 三者皆為 false，與 eperm 同樣視
+// 為非終止、繼續排程。用 errors.Is 而非型別斷言，涵蓋 wrap 過的錯誤。
+func classifyKillErr(err error) (esrch, eperm, nilErr bool) {
+	if err == nil {
+		return false, false, true
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return true, false, false
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return false, true, false
+	}
+	return false, false, false
+}
+
+// cleanupOffsets／cleanupFinalConfirm：B2c-4 D2 凍結的固定絕對偏移時間表，
+// 不開放 Config 覆寫。
+var cleanupOffsets = []time.Duration{
+	1 * time.Millisecond, 2 * time.Millisecond, 4 * time.Millisecond, 8 * time.Millisecond,
+	16 * time.Millisecond, 32 * time.Millisecond, 64 * time.Millisecond, 128 * time.Millisecond,
+	256 * time.Millisecond, 512 * time.Millisecond,
+}
+
+const cleanupFinalConfirm = time.Second
+
+// cleanupGroup 實作 B2c-4 §3 O1 凍結的有界清理狀態機：第一次 cleanup KILL
+// **返回**的 monotonic 時刻為 base（不限成功），依 base 的固定絕對偏移探測群組
+// 是否消失並視情況重送，最後於 1 s 做不送訊號的確認。回傳 incomplete=true 代表
+// 預算耗盡、呼叫端須強制解除本端 pipe 等待（fail-loud，B2c-4 D3）。事件只在
+// 對應的 cleanupSignal 呼叫**成功**（nilErr）時發、且在鎖外發。
+func (p *Proc) cleanupGroup() (incomplete bool) {
+	signal := p.seamCleanupSignal()
+	probe := p.seamGroupProbe()
+	after := p.seamCleanupAfter()
+
+	firstErr := signal(p.pgid, syscall.SIGKILL)
+	base := time.Now()
+	esrch, _, nilErr := classifyKillErr(firstErr)
+	if esrch {
+		return false // 群組確定不存在：完成，不啟動排程
+	}
+	if nilErr {
+		p.seamOnSignal()(sigEventSupervisorCleanupKill)
+	}
+	// EPERM／其他 errno：不發事件，仍啟動排程。
+
+	for _, off := range cleanupOffsets {
+		<-after(time.Until(base.Add(off)))
+		perr := probe(p.pgid)
+		pesrch, _, pnilErr := classifyKillErr(perr)
+		if pesrch {
+			return false
+		}
+		if !pnilErr {
+			continue // EPERM／其他 errno：本輪不送 KILL，繼續下一個偏移
+		}
+		rerr := signal(p.pgid, syscall.SIGKILL)
+		resrch, _, rnilErr := classifyKillErr(rerr)
+		switch {
+		case rnilErr:
+			p.seamOnSignal()(sigEventSupervisorCleanupRekill)
+		case resrch:
+			return false
+		default:
+			// rekill 回 EPERM／其他 errno：不發事件，繼續下一個偏移。
+		}
+	}
+
+	<-after(time.Until(base.Add(cleanupFinalConfirm)))
+	finalErr := probe(p.pgid)
+	fesrch, _, _ := classifyKillErr(finalErr)
+	return !fesrch // 非 ESRCH（nil／EPERM／其他 errno）一律 CleanupIncomplete
 }
 
 const stderrCap = 64 * 1024
@@ -164,8 +333,9 @@ func Start(ctx context.Context, cfg Config) (*Proc, error) {
 	if grace == 0 {
 		grace = 5 * time.Second
 	}
-	p := &Proc{cmd: cmd, pgid: cmd.Process.Pid, grace: grace, Stdin: stdin, Stdout: outR,
+	p := &Proc{cmd: cmd, pgid: cmd.Process.Pid, grace: grace, Stdin: stdin,
 		exitedCh: make(chan struct{}), doneCh: make(chan struct{})}
+	p.Stdout = &stdoutReader{f: outR, p: p}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -188,13 +358,19 @@ func Start(ctx context.Context, cfg Config) (*Proc, error) {
 		p.exited = true // 先記錄事實，再開放觀察（見 exited 欄位 doc）
 		p.mu.Unlock()
 		close(p.exitedCh)
-		cleanupErr := p.SignalGroup(syscall.SIGKILL) // 子程序已退出 → 立即清整組殘存孫程序
-		if cleanupErr == nil {
-			p.seamOnSignal()(sigEventSupervisorCleanupKill) // 只在 SignalGroup 成功後、鎖外才發
+		incomplete := p.cleanupGroup() // 有界清理狀態機（B2c-4 §3 O1）：子程序已退出 → 清整組殘存孫程序
+		if incomplete {
+			// 預算耗盡：fail-loud——強制解除本端對 stdout／stderr 的等待，讓
+			// wg.Wait() 與呼叫端的 reader 有界收斂（B2c-4 D3／D8）。
+			p.mu.Lock()
+			p.forcedClosed = true
+			p.mu.Unlock()
+			_ = errR.Close() // 強制解除等待：底層 close 錯誤與 fail-loud 判斷無關
+			_ = outR.Close()
 		}
-		wg.Wait() // stderr 讀到 EOF（group kill 保證）
-		errR.Close()
-		ex := Exit{Code: cmd.ProcessState.ExitCode(), StderrTail: p.stderrTail(), Err: werr}
+		wg.Wait()        // stderr 讀到 EOF（group kill 保證，或強制關閉造成的 closed error）
+		_ = errR.Close() // 冪等：已被上面的強制關閉路徑關過時，Close 只回已忽略的 os.ErrClosed
+		ex := Exit{Code: cmd.ProcessState.ExitCode(), StderrTail: p.stderrTail(), Err: werr, CleanupIncomplete: incomplete}
 		var fatal syscall.Signal // 0 = 正常退出
 		if ws, isWS := cmd.ProcessState.Sys().(syscall.WaitStatus); isWS && ws.Signaled() {
 			fatal = ws.Signal()
@@ -285,7 +461,8 @@ func (p *Proc) CanceledByContext() bool {
 	}
 }
 
-// Done 在 supervisor 收尾完成（Exit 已快取）後關閉；select-default 即為非阻塞存活判定（v1.7）。
+// Done 在 Exit 已快取（stderr EOF 或有界清理強制解除本端 pipe 等待其一，B2c-4
+// D8）後關閉；select-default 即為非阻塞存活判定（v1.7）。
 func (p *Proc) Done() <-chan struct{} { return p.doneCh }
 
 func (p *Proc) Terminate() error { // group SIGTERM → grace 內未退出 → group SIGKILL
