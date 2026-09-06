@@ -34,8 +34,6 @@ func drainStdout(p *Proc) (*bytes.Buffer, *sync.WaitGroup) {
 	return &buf, &wg
 }
 
-func groupGone(pgid int) bool { return syscall.Kill(-pgid, 0) != nil } // ESRCH = 整組已消失
-
 // 孫程序忽略 SIGTERM 且繼承 stdout/stderr pipe——第五輪 P0 的核心情境。
 const orphanScript = `bash -c 'trap "" TERM; sleep 30' & echo out; echo err >&2; exit 5`
 
@@ -55,9 +53,7 @@ func TestNormalExitReapsOrphanAndCachesExit(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Wait hung: supervisor must reap group while reader is still draining")
 	}
-	if !groupGone(p.PGID()) {
-		t.Fatal("orphan must be killed when parent exits")
-	}
+	requireGroupGone(t, p.PGID(), "orphan must be killed when parent exits")
 	select { // v1.7：Wait 返回後 Done 必已關閉（非阻塞存活判定的依據）
 	case <-p.Done():
 	default:
@@ -102,9 +98,7 @@ func TestTerminateEscalatesToGroupKill(t *testing.T) {
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("kill escalation too slow")
 	}
-	if !groupGone(p.PGID()) {
-		t.Fatal("group must be fully dead")
-	}
+	requireGroupGone(t, p.PGID(), "group must be fully dead")
 	rd.Wait()
 }
 
@@ -125,9 +119,7 @@ func TestCtxCancelKillsWholeGroup(t *testing.T) { // v1.6：獨立 script、不�
 	case <-time.After(5 * time.Second):
 		t.Fatal("ctx cancel must terminate whole group")
 	}
-	if !groupGone(p.PGID()) {
-		t.Fatal("group must be dead after ctx cancel")
-	}
+	requireGroupGone(t, p.PGID(), "group must be dead after ctx cancel")
 	rd.Wait()
 }
 
@@ -571,9 +563,7 @@ func TestTerminateEscalatesViaInjectedTimerInOrder(t *testing.T) {
 	if ex.Code == 0 {
 		t.Fatal("escalation KILL 收場不得是 exit 0")
 	}
-	if !groupGone(p.PGID()) {
-		t.Fatal("escalation KILL 之後 process group 必須完全消失")
-	}
+	requireGroupGone(t, p.PGID(), "escalation KILL 之後 process group 必須完全消失")
 }
 
 // 本測試手工部分建構 Proc、不啟動任何長駐程序（probe 已 Wait 收屍），因此不註冊
@@ -672,9 +662,7 @@ func TestSupervisorFirstCleanupSignalEventFiresOnlyWhenSent(t *testing.T) {
 					t.Fatalf("no_orphan 案例不該有 sigEventSupervisorCleanupRekill，收到 %d", rekill)
 				}
 			}
-			if !groupGone(p.PGID()) {
-				t.Fatal("process group 必須完全消失（含孫程序，若有）")
-			}
+			requireGroupGone(t, p.PGID(), "process group 必須完全消失（含孫程序，若有）")
 		})
 	}
 }
