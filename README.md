@@ -148,6 +148,8 @@ go test -race ./... -count=1                            # CI job: go — 所有 
 (cd docs/architecture && shasum -a 256 -c SHA256SUMS)   # CI job: checksums — 里程碑 plan 凍結（m0／m1／m1.5）
 ```
 
+上述四個 job 是 `main` 的 required checks：合併規則（ruleset、rebase-only、紅燈處置與維護程序）見 [`docs/architecture/ci-merge-policy.md`](docs/architecture/ci-merge-policy.md)。
+
 > **牆鐘相依測試的紅燈怎麼判**：Go 六條與前端兩條具名測試已由 Pre-M4 B1 系列處置完畢，有效名單與規則以
 > [`docs/architecture/wall-clock-test-register.md`](docs/architecture/wall-clock-test-register.md) 為準——
 > 這八條紅燈**先分類**（命中契約斷言或契約路徑卡死＝回歸，不得單獨重跑吸收；setup／資源失效＝該次無效並揭露），

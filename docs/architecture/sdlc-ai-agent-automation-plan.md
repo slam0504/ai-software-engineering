@@ -1,7 +1,7 @@
 # AI Agent 協作自動化規劃：規格定案後的實作、驗證與部署流程
 
-> 版本：v2.4（2026-09-02，治理修正——新增 §6.8「錨點與行號慣例」：生產碼註解引用同檔案內的宣告／函式／欄位時不得嵌入行號，應使用符號名或程式結構定位；文件中的行號僅作附帶的當下定位資訊）
-> 前版：v2.3（2026-09-02，§6.7 新增「變異目標」規則）；v2.2（2026-09-01，治理修正——mutation acceptance table 預設 N/N 全跑門檻，新增 §6.7；同步校正 §4／§6.3／§11 的「抽驗」措辭以免與新規則矛盾）；v2.1（2026-08-05）
+> 版本：v2.5（2026-09-07，§12 前置條件 1 補一句指向 `ci-merge-policy.md`：本 repo 的 ruleset 已落地並實證；其餘不變）
+> 前版：v2.4（2026-09-02，治理修正——新增 §6.8「錨點與行號慣例」：生產碼註解引用同檔案內的宣告／函式／欄位時不得嵌入行號，應使用符號名或程式結構定位；文件中的行號僅作附帶的當下定位資訊）；v2.3（2026-09-02，§6.7 新增「變異目標」規則）；v2.2（2026-09-01，治理修正——mutation acceptance table 預設 N/N 全跑門檻，新增 §6.7；同步校正 §4／§6.3／§11 的「抽驗」措辭以免與新規則矛盾）；v2.1（2026-08-05）
 > 狀態：架構規劃稿（第二輪審核：v2 可接受為架構規劃稿）；已依第二輪審核（3 P1 / 2 P2）修訂為 v2.1，目標升為 pilot-ready 執行契約前仍需完成 §12 的前置條件與實際演練。
 > 配套文件：`sdlc-bdd-ddd-tdd-reference.md`（參考型 SDLC v2）
 > 範圍：自動化 Phase 3（迭代開發）至 Phase 4（發布）；Phase 0–2 的需求分析、提問確認與定案仍由人主導，AI 僅輔助。
@@ -324,7 +324,7 @@ Security reviewer 審應用 code；這套 agent 系統本身另需治理：
 
 **升 pilot 前必須完成**（依審核意見）：
 
-1. 選定低風險 repo，補齊地基：Gherkin 活文件進 CI、分層測試、branch protection / ruleset 實際啟用並驗證阻擋效力。
+1. 選定低風險 repo，補齊地基：Gherkin 活文件進 CI、分層測試、branch protection / ruleset 實際啟用並驗證阻擋效力。 本 repo（sdlc-workbench）已於 2026-09-07 以 ruleset 落地並以三狀態 probe PR 實證阻擋效力，規則、required contexts 與維護程序見 `ci-merge-policy.md`。
 2. 風險政策規則檔 v1（人維護）與 gate hash 綁定的落地機制（CI 檢查實作）。
 3. Red test 的三 PR 生命週期（test → integration、impl → integration、promotion → main）在該 repo 實際演練一輪，含 Test Contract Approval 與 merge queue 的 oracle-surface digest 驗證。
 4. Agent 權限矩陣落地：各角色獨立身分、短效 token、egress 控制，並驗證「未核准的 oracle-surface 變更無法進入受保護分支」；若採 path allowlist / 獨立 test repo，一併驗證其實際效力。
@@ -338,6 +338,10 @@ Security reviewer 審應用 code；這套 agent 系統本身另需治理：
 - 本文所引用語檢查為 zhtw-mcp 的詞彙 lint，非 Markdown linter；reports 目錄目前非 git repo，無 commit / diff 可追溯（如需版本化請先 `git init`）。
 
 ## 13. 修訂記錄
+
+### v2.5（2026-09-07）— §12 前置條件 1 指向 `ci-merge-policy.md`（doc-only）
+
+本 repo（sdlc-workbench）於 2026-09-07 以 ruleset `22394412` 保護 `main`（四個 required checks、必須經 PR、線性歷史、禁 direct push、無 bypass actor），並以三狀態 probe PR 實證阻擋效力（紅燈 BLOCKED、required context 缺席 BLOCKED、與 base 相同 CLEAN）。§12 前置條件 1 補一句指向 `docs/architecture/ci-merge-policy.md`；該文件是 ruleset、合併方式與維護程序的權威說明。其餘章節不變。
 
 ### v2.4（2026-09-02）— §6.8 錨點與行號慣例（doc-only 治理修正）
 
