@@ -159,6 +159,7 @@ func (o *GenerationOwner) FinalizeWith(stage error) error {
 		meta.Argv = o.Server.Argv()
 		meta.ExitCode = &ex.Code
 		meta.StderrTail = ex.StderrTail
+		meta.CleanupIncomplete = ex.CleanupIncomplete // 清理狀態，不是收尾原因，FinalizeCause 不動
 	}
 	if drainErr != nil {
 		meta.FinalizeCause = appendCause(meta.FinalizeCause, drainErr)

@@ -303,6 +303,25 @@ func TestHandoffKeepsRecorderOpenAndIDBeforeAttach(t *testing.T) {
 	}
 }
 
+// D5(a)：CleanupIncomplete（B2c-4 §3 O1 的有界清理揭露）經 FinalizeWith 傳進
+// meta，且不混入 FinalizeCause（清理狀態不是收尾原因）。
+func TestFinalizeWithPropagatesCleanupIncomplete(t *testing.T) {
+	stub := newStubServer()
+	stub.exit = proc.Exit{Code: 9, StderrTail: "stub-stderr", CleanupIncomplete: true}
+	gen := newTestGeneration(t)
+	o := &GenerationOwner{Server: stub, Generation: gen, attached: true}
+	if err := o.FinalizeWith(errServerDied); err != nil {
+		t.Fatal(err)
+	}
+	m := gen.FinalMeta()
+	if !m.CleanupIncomplete {
+		t.Fatalf("CleanupIncomplete 必須傳進 meta：%+v", m)
+	}
+	if strings.Contains(m.FinalizeCause, "cleanup") {
+		t.Fatalf("FinalizeCause 不得混入 cleanup 措辭：%q", m.FinalizeCause)
+	}
+}
+
 func TestFinalizeWithIsIdempotent(t *testing.T) { // 死亡 reaper／受控 restart／shutdown 多路徑
 	stub := newStubServer()
 	o := &GenerationOwner{Server: stub, Generation: newTestGeneration(t), attached: true}

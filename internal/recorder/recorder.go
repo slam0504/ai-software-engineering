@@ -26,6 +26,10 @@ type Meta struct {
 	// stderr 的原文，混入我方敘述會讓前端／診斷顯示出並不存在的 stderr 行；也不能
 	// 借用 recorder_error，那是錄流寫入失敗的欄位，兩者會互相覆寫。
 	FinalizeCause string `json:"finalize_cause,omitempty"`
+	// CleanupIncomplete 反映 proc supervisor 的有界清理是否在預算內未能確認
+	// process group 消失（B2c-4 §3 O1）。這是清理狀態，不是收尾原因，刻意與
+	// FinalizeCause 分離、不寫入其中。
+	CleanupIncomplete bool `json:"cleanup_incomplete,omitempty"`
 }
 
 type Recorder struct {

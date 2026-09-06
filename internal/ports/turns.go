@@ -16,6 +16,10 @@ type Exit struct {
 	Exited     bool // true = Code 有效（process 已回收）
 	Code       int
 	StderrTail string
+	// CleanupIncomplete：proc supervisor 的有界清理在預算內未能確認 process
+	// group 消失，已強制解除本端 stdout／stderr 等待（B2c-4 §3 O1；來源
+	// proc.Exit.CleanupIncomplete，經 provider adapter 映射至此）。
+	CleanupIncomplete bool
 }
 
 // Turns 是多輪 provider 抽象。

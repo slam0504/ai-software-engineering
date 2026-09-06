@@ -125,6 +125,20 @@ func NewClaudePlanner(bin, cwd string, env []string) Runner {
 	return &claudeAssist{bin: bin, cwd: cwd, env: env, args: ClaudePlannerArgs()}
 }
 
+// finishRun 統整 EOF 收尾時的錯誤語意（D3／D5(c)）：CleanupIncomplete 時包成
+// proc.ErrCleanupIncomplete（ex.Err 非 nil 時 errors.Join 兩者，呼叫端以
+// errors.Is 各自可判）；否則原樣回傳 ex.Err（可能為 nil）。
+func finishRun(ex proc.Exit) error {
+	if !ex.CleanupIncomplete {
+		return ex.Err
+	}
+	wrapped := fmt.Errorf("assist: %w", proc.ErrCleanupIncomplete)
+	if ex.Err != nil {
+		return errors.Join(ex.Err, wrapped)
+	}
+	return wrapped
+}
+
 func (c *claudeAssist) Run(ctx context.Context, prompt string, sink func(contract.Envelope)) error {
 	p, err := proc.Start(ctx, proc.Config{Binary: c.bin, Args: c.args, Dir: c.cwd, Env: c.env})
 	if err != nil {
@@ -160,15 +174,17 @@ func (c *claudeAssist) Run(ctx context.Context, prompt string, sink func(contrac
 		select {
 		case ev, ok := <-events:
 			if !ok { // stdout EOF：process 已收尾
-				ex := p.Wait()
-				return ex.Err
+				return finishRun(p.Wait())
 			}
 			sink(contract.Wrap(ev, ""))
 		case <-ctx.Done(): // cancel／timeout／shutdown reclaim：terminate 整組並排乾
 			_ = p.Terminate()
 			for range events {
 			}
-			p.Wait()
+			ex := p.Wait()
+			if ex.CleanupIncomplete { // 有界清理失敗優先揭露，與 ctx.Err() 併呈（皆可 errors.Is）
+				return errors.Join(ctx.Err(), proc.ErrCleanupIncomplete)
+			}
 			return ctx.Err()
 		}
 	}

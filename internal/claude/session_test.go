@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
 	"github.com/slam0504/sdlc-workbench/internal/ports"
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 func fakeCfg(t *testing.T, env ...string) Config {
@@ -224,5 +226,108 @@ func TestScannerErrorSurfaced(t *testing.T) { // v1.4：超長行 → KindStream
 	s.Wait()
 	if !sawStreamErr {
 		t.Fatal("oversized line must surface KindStreamError")
+	}
+}
+
+// D5(a)：toPortsExit 三態——一般結束、非零 exit 帶 stderr、有界清理未完成
+// （B2c-4 CleanupIncomplete 揭露）。
+func TestToPortsExitThreeStates(t *testing.T) {
+	cases := []struct {
+		name string
+		in   proc.Exit
+		want ports.Exit
+	}{
+		{"normal-exit", proc.Exit{Code: 0}, ports.Exit{Exited: true, Code: 0}},
+		{"nonzero-with-stderr", proc.Exit{Code: 7, StderrTail: "boom"},
+			ports.Exit{Exited: true, Code: 7, StderrTail: "boom"}},
+		{"cleanup-incomplete", proc.Exit{Code: 1, CleanupIncomplete: true},
+			ports.Exit{Exited: true, Code: 1, CleanupIncomplete: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := toPortsExit(c.in); got != c.want {
+				t.Fatalf("toPortsExit(%+v) = %+v, want %+v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// lineThenErrReader 送出一行資料後，之後每次 Read 都回傳固定錯誤——用來在不
+// 啟真實 process 的情況下驗證 pump 的 scanner 錯誤路徑（D5(b)）。
+type lineThenErrReader struct {
+	data []byte
+	err  error
+	sent bool
+}
+
+func (r *lineThenErrReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.data), nil
+	}
+	return 0, r.err
+}
+
+// D5(b) 揭露契約：fake reader 回傳 proc.ErrCleanupIncomplete，證明 supervisor
+// 有界清理的 sentinel 錯誤真的會沿 pump 傳到 Claude 既有的 KindStreamError 路徑
+// （B2c-4 CleanupIncomplete → B2c-5 supervisor sentinel）。events channel 用
+// production 的 `defer close(events); pump(...)` 型態驅動，而非測試手動 close，
+// 確保驗到的是實際呼叫端會走的收尾順序。
+func TestPumpFakeReaderEmitsStreamErrorThenCallsOnStreamErr(t *testing.T) {
+	wantErr := proc.ErrCleanupIncomplete
+	r := &lineThenErrReader{data: []byte("hello\n"), err: wantErr}
+	events := make(chan contract.Event, 8)
+	onStreamErrCalls := 0
+
+	func() {
+		defer close(events)
+		pump(r, 1024, events, func() { onStreamErrCalls++ })
+	}()
+
+	var kinds []contract.Kind
+	var streamErrRaw string
+	var streamErrErr error
+	for ev := range events {
+		kinds = append(kinds, ev.Kind)
+		if ev.Kind == contract.KindStreamError {
+			streamErrRaw = string(ev.Raw)
+			streamErrErr = ev.Err
+		}
+	}
+	if len(kinds) == 0 || kinds[len(kinds)-1] != contract.KindStreamError {
+		t.Fatalf("KindStreamError 必須是最後一個事件（先發事件再呼叫 onStreamErr）：%v", kinds)
+	}
+	if !strings.Contains(streamErrRaw, "cleanup incomplete") {
+		t.Fatalf("KindStreamError 的 Raw 必須含 proc.ErrCleanupIncomplete 文字：%q", streamErrRaw)
+	}
+	if !errors.Is(streamErrErr, proc.ErrCleanupIncomplete) {
+		t.Fatalf("KindStreamError 的 Err 必須滿足 errors.Is(ErrCleanupIncomplete)：%v", streamErrErr)
+	}
+	if onStreamErrCalls != 1 {
+		t.Fatalf("onStreamErr 必須恰呼叫一次：got %d", onStreamErrCalls)
+	}
+	// events channel 必須在 stream-error 事件之後、production 的 defer close 生效時關閉。
+	if _, ok := <-events; ok {
+		t.Fatal("events channel 必須在 KindStreamError 之後關閉")
+	}
+}
+
+// 正常路徑（無 scanner 錯誤）不得呼叫 onStreamErr——對照案例，避免上面那條
+// 測試的斷言只是巧合。
+func TestPumpFakeReaderNormalEOFDoesNotCallOnStreamErr(t *testing.T) {
+	r := strings.NewReader("hello\nworld\n")
+	events := make(chan contract.Event, 8)
+	onStreamErrCalls := 0
+
+	pump(r, 1024, events, func() { onStreamErrCalls++ })
+	close(events)
+
+	for ev := range events {
+		if ev.Kind == contract.KindStreamError {
+			t.Fatalf("正常 EOF 不應出現 KindStreamError：%+v", ev)
+		}
+	}
+	if onStreamErrCalls != 0 {
+		t.Fatalf("正常 EOF 不得呼叫 onStreamErr：got %d", onStreamErrCalls)
 	}
 }

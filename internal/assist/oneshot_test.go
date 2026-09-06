@@ -3,6 +3,7 @@ package assist
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/slam0504/sdlc-workbench/internal/contract"
+	"github.com/slam0504/sdlc-workbench/internal/proc"
 )
 
 // enforcement 證據（argv／wire 建構斷言，非 behavioral）：Claude one-shot argv 含
@@ -142,4 +144,33 @@ func TestCodexAssistThreadParamsEnforceNever(t *testing.T) {
 	if _, hasThread := got["threadId"]; hasThread {
 		t.Fatalf("fresh ephemeral thread must not carry threadId, got: %s", b)
 	}
+}
+
+// D3／D5(c)：finishRun 三態——一般成功、僅 CleanupIncomplete、Err 與
+// CleanupIncomplete 併存（errors.Join 後兩個識別各自成立）。
+func TestFinishRunThreeStates(t *testing.T) {
+	t.Run("normal-success", func(t *testing.T) {
+		if err := finishRun(proc.Exit{Code: 0}); err != nil {
+			t.Fatalf("normal EOF must return nil, got %v", err)
+		}
+	})
+	t.Run("cleanup-incomplete-only", func(t *testing.T) {
+		err := finishRun(proc.Exit{Code: 0, CleanupIncomplete: true})
+		if err == nil {
+			t.Fatal("CleanupIncomplete must surface an error, got nil")
+		}
+		if !errors.Is(err, proc.ErrCleanupIncomplete) {
+			t.Fatalf("must be errors.Is proc.ErrCleanupIncomplete: %v", err)
+		}
+	})
+	t.Run("err-and-cleanup-incomplete", func(t *testing.T) {
+		procErr := errors.New("child died abnormally")
+		err := finishRun(proc.Exit{Code: 1, Err: procErr, CleanupIncomplete: true})
+		if !errors.Is(err, procErr) {
+			t.Fatalf("must be errors.Is the original proc.Exit.Err: %v", err)
+		}
+		if !errors.Is(err, proc.ErrCleanupIncomplete) {
+			t.Fatalf("must also be errors.Is proc.ErrCleanupIncomplete: %v", err)
+		}
+	})
 }

@@ -96,24 +96,32 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	go func() {
 		defer close(s.events)
-		sc := bufio.NewScanner(p.Stdout)
-		// bufio.Scanner 的 max token = max(maxLine, cap(buf))：初始 cap 必須
-		// 不大於 maxLine，否則小的 MaxLineBytes 會被 64KB 初始容量蓋掉。
-		initCap := 64 * 1024
-		if maxLine < initCap {
-			initCap = maxLine
-		}
-		sc.Buffer(make([]byte, 0, initCap), maxLine)
-		for sc.Scan() {
-			s.events <- Decode(sc.Bytes())
-		}
-		if err := sc.Err(); err != nil { // 傳輸層錯誤是驗收證據，不可吞
-			s.events <- contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindStreamError,
-				Raw: []byte(err.Error()), Err: err}
-			_ = p.Terminate() // stream 已不可信，收掉整組
-		}
+		pump(p.Stdout, maxLine, s.events, func() { _ = p.Terminate() }) // stream 已不可信，收掉整組
 	}()
 	return s, nil
+}
+
+// pump 掃描 stdout 逐行解碼並送進 events；scanner 回傳錯誤（傳輸層錯誤，不可
+// 吞）時送一則 KindStreamError 事件、再呼叫 onStreamErr。抽成套件內函式（D5(b)）
+// 讓 fake reader 能單測這條錯誤路徑，不必啟真實 process；production 呼叫端
+// 傳入 p.Terminate（若行程已退出即為既有的 no-op）。
+func pump(r io.Reader, maxLine int, events chan<- contract.Event, onStreamErr func()) {
+	sc := bufio.NewScanner(r)
+	// bufio.Scanner 的 max token = max(maxLine, cap(buf))：初始 cap 必須
+	// 不大於 maxLine，否則小的 MaxLineBytes 會被 64KB 初始容量蓋掉。
+	initCap := 64 * 1024
+	if maxLine < initCap {
+		initCap = maxLine
+	}
+	sc.Buffer(make([]byte, 0, initCap), maxLine)
+	for sc.Scan() {
+		events <- Decode(sc.Bytes())
+	}
+	if err := sc.Err(); err != nil { // 傳輸層錯誤是驗收證據，不可吞
+		events <- contract.Event{Provider: contract.ProviderClaude, Kind: contract.KindStreamError,
+			Raw: []byte(err.Error()), Err: err}
+		onStreamErr()
+	}
 }
 
 func (s *Session) Events() <-chan contract.Event { return s.events }
@@ -124,8 +132,13 @@ func (s *Session) PGID() int                     { return s.p.PGID() }
 // Wait 回傳 supervisor 快取的收尾值（任意時點可呼叫）；Session 由 supervisor
 // 回收後才返回，故恆為 Exited=true。
 func (s *Session) Wait() ports.Exit {
-	ex := s.p.Wait()
-	return ports.Exit{Exited: true, Code: ex.Code, StderrTail: ex.StderrTail}
+	return toPortsExit(s.p.Wait())
+}
+
+// toPortsExit 把 proc.Exit 映射為 ports 的 provider 中立收尾值（D5(a)）；恆為
+// Exited=true（呼叫端只在 supervisor 已回收後才拿得到 proc.Exit）。
+func toPortsExit(ex proc.Exit) ports.Exit {
+	return ports.Exit{Exited: true, Code: ex.Code, StderrTail: ex.StderrTail, CleanupIncomplete: ex.CleanupIncomplete}
 }
 
 // Send 寫入一則 user message（stream-json 格式同首輪）；stdin 已關或寫入失敗

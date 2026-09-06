@@ -7477,7 +7477,8 @@ func (a *App) startClaude(w appcore.WSID, prompt, resume, recordCase string) (fu
 			func(ex ports.Exit) recorder.Meta {
 				m := recorder.Meta{Provider: "claude", CLIVersion: a.cliVersion("claude"),
 					Argv: sess.Argv(), CWD: cwd,
-					RecordedAt: time.Now().UTC().Format(time.RFC3339), StderrTail: ex.StderrTail}
+					RecordedAt: time.Now().UTC().Format(time.RFC3339), StderrTail: ex.StderrTail,
+					CleanupIncomplete: ex.CleanupIncomplete}
 				if ex.Exited { // 未知結局不偽裝 exit code（meta ExitCode 維持 nil）
 					code := ex.Code
 					m.ExitCode = &code
@@ -7590,6 +7591,9 @@ func (a *App) claudeTeardown(host *sessionHost) func() error {
 			"stderrTail": ex.StderrTail, "recorderError": recErrText}
 		if ex.Exited {
 			payload["exitCode"] = ex.Code
+		}
+		if ex.CleanupIncomplete {
+			payload["cleanupIncomplete"] = true
 		}
 		a.emit("session:done", payload)
 		return err
