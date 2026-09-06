@@ -122,8 +122,8 @@ jobs:
           name: wails-app-tar
           path: sdlc-workbench.app.tgz
           if-no-files-found: error
-  checksums-renamed:
-    name: checksums-renamed
+  checksums:
+    name: checksums
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
