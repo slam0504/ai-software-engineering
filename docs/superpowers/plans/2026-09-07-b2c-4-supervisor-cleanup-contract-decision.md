@@ -1,9 +1,9 @@
 # B2c-4 supervisor cleanup 契約裁定與 register #7 處置（決策票，不改 code）
 
 > 版本：rev3（2026-09-07，rev2 複核修正：P1——第一次 cleanup KILL 的錯誤路徑納入迴圈，凍結完整狀態機（base＝第一次 KILL **返回**時刻不限成功；ESRCH 完成不排程；nil 發原事件並排程；EPERM／其他 errno 不發事件但排程；每次 rekill 依回傳值處理；1 s 確認非 ESRCH 一律 `CleanupIncomplete`）、B2c-5 增加 cleanup signal seam 與「第一次 EPERM→nil→ESRCH」確定性測試；D8 通過（薄包裝只在 supervisor 設定強制關閉狀態後才映射、支援 `errors.Is`、呼叫端自行 `Close()` 不誤標）；D9 不採（移除 gave-up 事件）；D10 通過；四處一致性修正（基準三份文件、EPERM 誤判「可能誤判」、Linux「本輪未觀察到相同缺口」、D10 引用改「§7.3 XNU 段落」）；前版：rev2（2026-09-07，決策 gate 第一輪 CHANGES_REQUIRED 後修訂：兩項 P1——EPERM 不得視為終止（`P_REF_NEW` 亦會造成 EPERM）、預算耗盡須有強制解除 pipe 等待的 fail-loud 路徑並把 `CleanupIncomplete` 傳到 `ports.Exit`／codex meta／assist；D1–D7 裁定回寫（固定絕對偏移 1–512 ms＋1 s 確認、`Exit.Err` 不混入、oracle 只以 ESRCH 為消失、rekill 事件與既有測試改名、估點 0.6／0.3／0.2、`b2c7/verify`、#7 resolved 完整條件）；三處措辭限縮；同分支附 main diagnosis-record／register 的 EPERM 勘誤；前版：rev1）
-> 狀態：**待 owner 複核 rev3**。本票不修改任何 code；產出為裁定記錄、implementation 票面與估點、register #7 處置路徑。本文件在 owner 核准後即為 B2c-4 的裁定記錄（backlog rev20 落地時引用）；EPERM 勘誤隨本票 docs-only 推送落地，不等 B2c-7。
+> 狀態：**owner APPROVED（2026-09-07，rev3 `e847faf`）——本文件即 B2c-4 的裁定記錄**：D1–D10 與 B2c-5／6／7 票面凍結，無 blocking finding；owner 確認第一次 cleanup KILL、排程探測、rekill 與最終確認的所有 errno 路徑已閉合，估點 0.6／0.3／0.2 pt 與總計重算正確。本票不修改任何 code。backlog rev20 立項 B2c-5／6／7 並引用本文件；EPERM 勘誤（record v2／register v6）隨本票 docs-only 推送落地，不等 B2c-7。
 > 票源：Pre-M4 Readiness Backlog **B2c-4**（rev18 新增，決策票，**0.2 pt**＝1.5–2.5 hr，owner 2026-09-06 採用；rev19 依賴 B2c-3 已成立）
-> 基準：`main`＝`origin/main`＝`a0966cc`（register v6、backlog rev19、diagnosis-record v2）；程式碼 `internal/proc/proc.go` 自 `82caf8b`（B1a-1）後未變。分支 `b2c4/decision`（本機，自 `a0966cc`）目前含三份文件：本文件、`orphan-timeout-diagnosis-record.md`（v2 勘誤）、`wall-clock-test-register.md`（v6 勘誤）。
+> 基準：`main`＝`origin/main`＝`a0966cc`（register v6、backlog rev19、diagnosis-record v2）；程式碼 `internal/proc/proc.go` 自 `82caf8b`（B1a-1）後未變。分支 `b2c4/decision`（本機，自 `a0966cc`）目前含四份文件：本文件、`orphan-timeout-diagnosis-record.md`（v2 勘誤）、`wall-clock-test-register.md`（v6 勘誤＋同版本補記：責任邊界已裁定、現行後續 B2c-5／6／7、規則 8 擴充）、`pre-m4-readiness-backlog.md`（rev20：B2c-4 關票、立項 B2c-5／6／7）。
 > 事實來源：`docs/architecture/orphan-timeout-diagnosis-record.md` v2 §7（B2c-3）、§3–§4（B2c／B2c-2）；`internal/proc/proc.go:27-31,185-203,291-331`；呼叫端 `internal/claude/session.go:73-121`、`internal/codex/session.go:27-41`、`internal/codex/owner.go:98-230`、`internal/assist/oneshot.go:129-175`；既有 oracle `internal/proc/proc_test.go:37`、`internal/claude/session_test.go:180`、`internal/codex/session_test.go:84`、`internal/evidence/runner_test.go:106`。
 
 ---
@@ -33,7 +33,7 @@
 
 ## 3. 方案
 
-### O1（owner D1 通過，rev2 修正版）：有界清理——cleanup KILL 後以固定絕對偏移確認並重送，無法確認時強制解除本端 pipe 等待並揭露未完成
+### O1（owner D1 通過，rev3 凍結版）：有界清理——cleanup KILL 後以固定絕對偏移確認並重送，無法確認時強制解除本端 pipe 等待並揭露未完成
 
 - **契約（新）**：supervisor 提供**有界清理**：子程序退出後送 group SIGKILL，並在固定時間表內重送與確認；**不再宣稱單次或有限次 KILL 絕對保證群組終止**。預算內未能確認群組消失時，supervisor **強制解除本端對 stdout／stderr 的等待**（關閉 proc 持有的 read end），讓 `Wait()`、`Done()` 與呼叫端的 `Events()` 有界收斂，並以 `Exit.CleanupIncomplete=true` 揭露；`Exit.Err` 維持既有「子程序死因」語意，不混入 cleanup 狀態。
 - **狀態機（D2 固定、不開放 `Config` 覆寫；rev3 凍結）**：

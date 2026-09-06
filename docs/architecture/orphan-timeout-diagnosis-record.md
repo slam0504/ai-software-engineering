@@ -129,6 +129,6 @@
 
 ## 修訂記錄
 
-- v2 勘誤（2026-09-07，B2c-4 決策 gate）：§7.2／§7.3 (f)／§7.5 (4) 的 EPERM 語意補正——除 zombie／`P_REF_DEAD` 外，建立中的 `P_REF_NEW` 成員同樣使 `proc_find` 失敗而回 EPERM；EPERM 不能代表群組已消失或已終止。版本號不變。
+- v2 勘誤（2026-09-07，B2c-4 決策 gate）：§7.2／§7.3 XNU 段落／§7.5 (4) 的 EPERM 語意補正——除 zombie／`P_REF_DEAD` 外，建立中的 `P_REF_NEW` 成員同樣使 `proc_find` 失敗而回 EPERM；EPERM 不能代表群組已消失或已終止。版本號不變。
 - v2（2026-09-07）：新增 §7 B2c-3（證據指標、結果、D3 原始碼對照、結論、B2c-4 事實清單）；§5 更新（機制解讀已定位、新增未定位項）；§6 更新（register v6、backlog rev19、B2c-4 依賴成立、`b2c/diag` 已刪除、`b2c3/diag` 待刪）；標題與對應文件版本更新。
 - v1（2026-09-06）：建立（結案複審後修正「持有 stdout pipe」為推論措辭）；彙整 B2c round 1 與 B2c-2 round 2 證據、結果、結論與後續。
