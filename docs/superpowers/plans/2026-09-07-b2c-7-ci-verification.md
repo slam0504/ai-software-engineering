@@ -2,8 +2,8 @@
 
 > **For agentic workers:** workflow 與文件回寫須依本 plan 分階段執行；驗證分支只推送一次，不 rerun、不 dispatch。
 
-> 版本：rev1（2026-09-07，建立；D1–D5 待 owner 裁定）
-> 狀態：**停在 design gate；已建立本機分支 `b2c7/verify` 與 backlog rev22，尚未新增 workflow、未推送驗證分支。**
+> 版本：rev2（2026-09-07，D1–D5 通過；Task 1 workflow `54b596c` 完成並經結構化 parser、三條本機 focused race 命令與 scope 檢查；本機未安裝 `actionlint`，已明列驗證邊界；前版：rev1）
+> 狀態：**Task 1 完成；待 owner 對精確 HEAD 授權一次推送 `b2c7/verify`。尚未推送驗證分支。**
 > 票源：Pre-M4 Readiness Backlog **B2c-7**（0.2 pt＝1.5–2.5 hr，owner 2026-09-07 採用）。
 > 基準：`main`＝`origin/main`＝`852c28730139041732d02f639f55a18196c77775`；B2c-5／B2c-6 已落地。驗證分支 `b2c7/verify` 自該 SHA 建立。
 > 授權邊界：一次性 workflow 只存在於驗證分支，不進 `main` 歷史；驗證分支只推送一次，不 rerun、不 `workflow_dispatch`；CI 結果出來前不改 register #7 狀態。
@@ -22,13 +22,13 @@
 
 ---
 
-## 待 owner 裁定（D1–D5）
+## Design gate 裁定（D1–D5）
 
-- **D1（workflow 與工具鏈）**：採單一 branch-only push trigger、四個 matrix job、Go `1.26.5`，沿用先前診斷 workflow 已鎖定的 `actions/checkout`／`actions/setup-go` commit SHA；三個測試 step 分開保存 rc，後續 step 與 artifact upload 均 `if: always()`。是否核准。
-- **D2（artifact 完整性）**：每個 job 固定保存 `env.txt`、`ps-job-start.txt`、`ps-job-end.txt`、`implementation-base.sha`（固定為 `852c287…` 並驗證為 workflow HEAD 祖先）、`workflow-head.sha`、三份 `*.json`、三份 `*.rc`、job-local `SHA256SUMS.txt`；下載後另產生涵蓋四份 artifact 的 `HASHES.txt`，以 `shasum -c` 全 OK 為完整性門檻。是否核准。
-- **D3（逐輪分類）**：以 JSON 中四個精確 test name 的 terminal `pass`／`fail`／`skip` event 計數；每個 runner 每條須恰 100 個 terminal event 且全為 pass。terminal fail、package-level FAIL、沒有對應 terminal event、非零 rc、`WARNING: DATA RACE`、`panic`、`timed out`、setup／runner 中斷均依 register 規則 8 檢視原始輸出，分為契約回歸或 setup／資源失效；另統計 invalid/setup/race/timeout，任何一項皆不得吸收到 #7 已知形狀，也不得 rerun。任一門檻不成立即維持 unresolved，依 backlog 回到 B2c-5。是否核准。
-- **D4（分支與落地隔離）**：`b2c7/verify` 可含 backlog rev22、plan 與一次性 workflow，完成 design gate 後只推送一次；run 後以新的 docs 分支自 `main=852c287` 建立，僅 cherry-pick／重建文件 commit，確保 workflow commit 不進 `main` 歷史。成功時回寫 register v7、diagnosis-record v3、backlog rev23；失敗時三份文件保留 unresolved 與逐輪分類。是否核准。
-- **D5（backlog rev22）**：本分支先以獨立 docs commit 關閉 B2c-6（main `852c287`、兩個實作 commit、全套 race、三條有效 mutation、7 檔範圍），並把 B2c-7 改為進行中；估點、小計與 register #7 狀態不變。是否核准。
+- **D1（通過；workflow 與工具鏈）**：採單一 branch-only push trigger、四個 matrix job、Go `1.26.5`，沿用先前診斷 workflow 已鎖定的 action commit SHA；checkout 設 `fetch-depth: 0`，讓 runner 能以本機 object 驗證 `852c287` 為 workflow HEAD 祖先；三個測試 step 分開保存 rc，後續 step 與 artifact upload 均 `if: always()`。
+- **D2（通過；artifact 完整性）**：每個 job 固定保存 `env.txt`、`ps-job-start.txt`、`ps-job-end.txt`、`implementation-base.sha`（固定為 `852c287…` 並驗證為 workflow HEAD 祖先）、`workflow-head.sha`、三份 `*.json`、三份 `*.rc`、job-local `SHA256SUMS.txt`；下載後另產生涵蓋四份 artifact 的 `HASHES.txt`，以 `shasum -c` 全 OK 為完整性門檻。
+- **D3（通過；逐輪分類）**：以 JSON 中四個精確 test name 的 terminal `pass`／`fail`／`skip` event 計數；每個 runner 每條須恰 100 個 terminal event 且全為 pass。terminal fail、package-level FAIL、沒有對應 terminal event、非零 rc、`WARNING: DATA RACE`、`panic`、`timed out`、setup／runner 中斷均依 register 規則 8 檢視原始輸出，分為契約回歸或 setup／資源失效；另統計 invalid/setup/race/timeout，任何一項皆不得吸收到 #7 已知形狀，也不得 rerun。任一門檻不成立即維持 unresolved，依 backlog 回到 B2c-5。
+- **D4（通過；分支與落地隔離）**：`b2c7/verify` 可含 backlog rev22、plan 與一次性 workflow，完成 design gate 後只推送一次；run 後以新的 docs 分支自 `main=852c287` 建立，僅 cherry-pick／重建文件 commit，確保 workflow commit 不進 `main` 歷史。成功時回寫 register v7、diagnosis-record v3、backlog rev23；失敗時三份文件保留 unresolved 與逐輪分類。
+- **D5（通過；backlog rev22）**：本分支先以獨立 docs commit 關閉 B2c-6（main `852c287`、兩個實作 commit、全套 race、三條有效 mutation、7 檔範圍），並把 B2c-7 改為進行中；估點、小計與 register #7 狀態不變。
 
 ## Global Constraints
 
@@ -41,9 +41,9 @@
 
 ## Task 1：一次性 workflow
 
-- [ ] 新增 `.github/workflows/verify-b2c7.yml`；鎖定 branch、matrix、action SHA、Go 版本、三個命令、timeout 與 `if: always()`。
-- [ ] 本機用 YAML parser／結構檢查確認 trigger、四 job 展開資料、命令與 artifact 路徑；`git diff --check`；確認除 workflow 與 docs 外零變更。
-- [ ] 主 agent 讀碼審查，核對四條測試名稱在 exact base `852c287` 存在，且 workflow 沒有 mutation、retry、dispatch 或 main trigger。
+- [x] 新增 `.github/workflows/verify-b2c7.yml`（`54b596c`）；鎖定 branch、matrix、action SHA、Go 版本、三個命令、timeout 與 `if: always()`。
+- [x] 本機 YAML parser／結構檢查確認 push-only trigger、2×2 matrix、三個 `-count=100` 命令、四個精確測試名稱、三個 action pin、`fetch-depth: 0` 與 artifact 路徑；三條對應命令各以 `-race -count=1` PASS；manifest 的 `shasum -c` 形狀本機 PASS；`git diff --check` 乾淨。`actionlint` 未安裝，未執行。
+- [x] 主 agent 讀碼審查：四條測試名稱在 exact base `852c287` 存在；workflow 沒有 mutation、retry、dispatch、schedule、pull_request 或 main trigger；既有 test／fixture 沒有任何變更。
 
 ## Task 2：一次推送與 CI 證據
 
@@ -53,7 +53,7 @@
 
 ## Task 3：register #7 與文件落地
 
-- [ ] 只有四條測試各 400/400 PASS、零 invalid/setup/race/timeout、manifest 全 OK 時，register v7 才將 #7 改 resolved；commit 欄填 B2c-5／B2c-6 已落地 commit，負載重驗欄填本次 run id。任一條件不成立則維持 unresolved。
+- [ ] 只有四條測試各 400/400 PASS、invalid/setup/race/timeout 計數皆為 0、manifest 全 OK 時，register v7 才將 #7 改 resolved；commit 欄填 B2c-5／B2c-6 已落地 commit，負載重驗欄填本次 run id。任一條件不成立則維持 unresolved。
 - [ ] diagnosis-record v3 記錄 exact implementation base、workflow head、run／artifact、逐輪分類與證據限制；backlog rev23 關閉或續開 B2c-7，並依結果更新 B2a 依賴。
 - [ ] 從 `main=852c287` 建立 docs 分支，只帶文件，不帶 workflow commit；完成文件 design gate 後另申請 fast-forward 推送 main。驗證分支待 docs 落地並核對後再申請刪除。
 
@@ -71,9 +71,10 @@ Task 1 約 0.5 hr、Task 2 約 0.8 hr、Task 3 約 0.7 hr，合計約 2.0 hr，�
 ## Gate A（B2c-7 完成條件）
 
 - [ ] workflow 只推送一次，run head 與核准 SHA 相同，四份 artifact 與 manifest 完整。
-- [ ] 四條測試各 400/400 PASS，零 invalid/setup/race/timeout；沒有 rerun。
+- [ ] 四條測試各 400/400 PASS，invalid/setup/race/timeout 計數皆為 0；沒有 rerun。
 - [ ] register v7、diagnosis-record v3、backlog rev23 已在不含 workflow commit 的 docs 分支落地；#7 與 B2a 狀態符合實際結果。
 
 ## 修訂記錄
 
+- rev2（2026-09-07）：D1–D5 通過；Task 1 workflow `54b596c` 完成；記錄 parser、focused race、manifest、scope 與 `actionlint` 未安裝的驗證邊界；待精確 HEAD 一次推送授權。
 - rev1（2026-09-07）：建立；D1 workflow／工具鏈、D2 artifact、D3 分類、D4 分支隔離、D5 backlog rev22；三 Task；估點核對 2.0 hr。
