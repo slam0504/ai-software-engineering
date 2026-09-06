@@ -1,8 +1,8 @@
 # `TestOrphanDoesNotHangNormalExit` CI-only 逾時診斷記錄（B2c／B2c-2／B2c-3，權威版）
 
-> 版本：v2（2026-09-07，B2c-3 結案時新增 §7；owner 結案裁定：B2c-3 關閉、register #7 維持未解決（機制解讀已定位為 fork 窗口，責任邊界仍待 B2c-4）、B2a 維持 blocked；前版 v1 2026-09-06 B2c-2 結案）
-> 性質：**權威診斷記錄**。診斷 plan（B2c rev1–rev13、B2c-2 rev1 至結案版本 rev21、B2c-3 rev1 至結案版本 rev6）與探針程式只存在於診斷分支（`b2c/diag` 已刪除；`b2c3/diag` 結案後將刪除）；本文件保存三輪的證據指標、結果與依證據強度收斂的結論，供 B2c-4 與 register #7 後續處置引用。
-> 對應文件：`wall-clock-test-register.md` v6（#7 unresolved，補機制欄）、`pre-m4-readiness-backlog.md` rev19（B2c-3 關票、B2c-4 依賴成立）。
+> 版本：v3（2026-09-07，B2c-7 結案時新增 §8：B2c-4 裁定、B2c-5／B2c-6 修法落地、B2c-7 CI 驗證 run `34039387868` 四 runner × 四測試各 400/400；register v7 #7 → resolved；B2a 解除 blocked；前版 v2 2026-09-07 B2c-3 結案新增 §7（含 EPERM 勘誤）、v1 2026-09-06 B2c-2 結案）
+> 性質：**權威診斷記錄**。診斷 plan（B2c rev1–rev13、B2c-2 rev1 至結案版本 rev21、B2c-3 rev1 至結案版本 rev6）與探針程式只存在於診斷分支（`b2c/diag`、`b2c3/diag` 皆已刪除）；B2c-7 的一次性驗證 workflow 只存在於 `b2c7/verify`（docs 落地核對後另申請刪除）。本文件保存三輪診斷（§2–§7）與裁定、修法、CI 驗證（§8）的證據指標、結果與依證據強度收斂的結論；B2c 系列（B2c 至 B2c-7）已全部關票，register #7 已 resolved。
+> 對應文件（v3 現行）：`wall-clock-test-register.md` **v7**（#7 resolved）、`pre-m4-readiness-backlog.md` **rev23**（B2c-7 關票、B2a 解除 blocked）；B2c-4 裁定記錄 `docs/superpowers/plans/2026-09-07-b2c-4-supervisor-cleanup-contract-decision.md` rev3。（v2 當時對應 register v6／backlog rev19，屬歷史。）
 
 ---
 
@@ -63,12 +63,13 @@
 - Start 失敗與 sampler 逾界兩條 `invalidateRecord` 路徑只以讀碼確認，未以執行驗證。
 - （v2 新增）B2c-3 macOS 8 個 `observedBeforeReturn` 存活者未定位；ubuntu 可控延遲層 d≤1 ms 幾乎全數 `unverified` 跳過，Linux differential 在該區間只有 3–19 輪有效。
 
-## 6. 後續（v2 更新）
+## 6. 後續（v3 更新；v2 當時的後續已由 §8 承接）
 
-- register #7 維持 **unresolved**（v6，補機制欄）。
-- backlog **B2c-3** 關票（rev19，估點 0.5 pt）；**B2c-4**（supervisor cleanup 契約裁定與 #7 處置，決策票，0.2 pt）依賴成立，事實清單見 §7.5。
-- **B2a 維持 blocked**。
-- `b2c/diag` 已刪除（2026-09-07）；`b2c3/diag`（五個 branch-only 檔：三個探針檔、workflow、B2c-3 plan）於本文件 v2／register v6／backlog rev19 推送並驗證後，另申請授權刪除。
+- register #7 **resolved**（v7，B2c-7）。
+- backlog：B2c-3（rev19）、B2c-4（rev20）、B2c-5（rev21）、B2c-6（rev22）、B2c-7（rev23）皆已關票；B2c 系列結束。
+- **B2a 解除 blocked**：PR #1 須 rebase 到含 B2c-5／B2c-6 的 main 並重新完成 Gate A（既有 run 不沿用）。
+- 診斷／驗證分支：`b2c/diag`、`b2c3/diag` 已刪除；`b2c7/verify`（一次性 workflow，不進 main）於本文件 v3／register v7／backlog rev23 推送並核對後另申請刪除。
+- 修法後若 `TestOrphanDoesNotHangNormalExit` 或兩層 fork 案例在新 HEAD 再度紅，依 register 規則 3 以現行 HEAD 重現並登記為新候選，不得沿用 #7。
 
 ## 7. B2c-3：macOS 群組 KILL 後成員存活窗口定位（2026-09-07）
 
@@ -127,8 +128,45 @@
 7. 取樣器 on／off 重現率 46／54 vs 36／41 per 100，本輪未見 200 µs 取樣器壓低重現率。
 8. 本輪未處理 ubuntu 的 oracle timing race（B2c-2 `kill0=nil` 97/100 於 `Wait` 返回瞬間），本探針的 `kill0@0` 因 `/proc` 掃描延遲不可比。
 
+## 8. B2c-4～B2c-7：裁定、修法與 CI 驗證（2026-09-07）
+
+### 8.1 B2c-4 裁定（決策票；裁定記錄 `docs/superpowers/plans/2026-09-07-b2c-4-supervisor-cleanup-contract-decision.md` rev3，owner APPROVED）
+
+- **契約**：supervisor 提供**有界清理**——子程序退出後送 group SIGKILL，以第一次 KILL 返回時刻（不限成功）為 base，於絕對偏移 1／2／4／8／16／32／64／128／256／512 ms 探測 `kill(-pgid, 0)`（`nil` 即重送、`ESRCH` 完成、`EPERM`／其他 errno 不送但繼續），1 s 做不送訊號的最終確認，非 `ESRCH` 一律 `Exit.CleanupIncomplete=true` 並強制解除本端 stdout／stderr 等待（`Wait()`／`Done()`／`Events()` 有界收斂）；`CleanupIncomplete` 傳到 `ports.Exit`、codex `recorder.Meta`、assist；`Exit.Err` 不混入；不再宣稱單次或有限次 KILL 絕對保證群組終止。
+- **形狀歸屬**：macOS 形狀＝production 契約缺口（非 fixture 特有、非 oracle 誤紅）→ B2c-5；ubuntu 形狀＝測試 oracle 取樣（zombie 殘留）→ B2c-6。兩者皆不放寬 5 秒 guard、不加 retry 於被測路徑。
+- **EPERM 語意**（本文件 v2 勘誤）：macOS 在走訪時沒有可取得 ref 的成員即回 EPERM——zombie、exit transition、**建立中（`P_REF_NEW`）**皆然，不能當作群組已消失；只有 `ESRCH` 代表群組確定不存在。
+
+### 8.2 修法落地
+
+| 票 | main commit | 內容 |
+|---|---|---|
+| B2c-5 | `b2efb1c`（proc 核心）、`b9c74e8`（揭露傳遞）；main `61c2201` | `internal/proc` `cleanupGroup` 狀態機、nil-safe seam `cleanupAfter`／`groupProbe`／`cleanupSignal`、`sigEventSupervisorCleanupRekill`、`Exit.CleanupIncomplete`、`ErrCleanupIncomplete`、`stdoutReader` 薄包裝（只在強制關閉後映射）、強制關閉；`ports.Exit.CleanupIncomplete`、claude `pump`／`toPortsExit`、codex `recorder.Meta.cleanup_incomplete`、assist `finishRun`、app.go wire log meta 與 payload；白箱六案＋errno subcases＋barrier 案例；新增兩層 fork 真實程序測試 `TestSupervisorCleanupTwoLayerForkOrphan`。mutation：Sonnet 五條＋owner 兩條＋主 agent 兩條各自紅。 |
+| B2c-6 | `1b5e54c`（proc）、`dad85cf`（claude／codex／evidence）；main `852c287` | 四套件 oracle 改為 `pollGroupGone(probe, deadline, now, sleep)` 有界輪詢：只有 `ESRCH` 算 gone、`EPERM` 計數續跑、2 s deadline、退避 1→64 ms、失敗附 `ps -Ao` 篩選快照；`proc_cleanup_test.go` 不動。mutation「EPERM 視為 gone」→ 對應案例紅。 |
+
+### 8.3 B2c-7 CI 驗證（run `34039387868`）
+
+| 項目 | 值 |
+|---|---|
+| 驗證分支 | `b2c7/verify` head `a679fcd66adc1190cc3076f155a42a5f8440a57c`（一次性 workflow `verify-b2c7.yml`＋docs；不進 main） |
+| implementation base | `852c28730139041732d02f639f55a18196c77775`（每 job 以 `git merge-base --is-ancestor` 驗證，記入 artifact） |
+| run | `34039387868`，event push，2026-09-06 14:30:46–14:33:51Z，四 job 全 success，未 rerun、未 dispatch |
+| matrix | `macos-15-intel`×2、`ubuntu-latest`×2，Go 1.26.5，`-race`，`timeout-minutes: 60` |
+| 測試 | 每 job 三個 `-count=100 -json` step：`TestOrphanDoesNotHangNormalExit`（claude）、`TestSupervisorCleanupTwoLayerForkOrphan`（proc）、`TestCtxCancelKillsWholeGroup`＋`TestTerminateEscalatesToGroupKill`（proc escalation） |
+| 結果 | 四條測試於四 runner 各 100/100 terminal pass（合計各 **400/400**）；三個 step rc 皆 0；JSON 無 `DATA RACE`／`panic`／timeout／套件級 FAIL；最長單次 0.24 s |
+| runner | macOS 15.7.9 `xnu-11417.140.69.711.44`（與 B2c-2／B2c-3 重現時相同 kernel）、`/bin/bash` 3.2.57、4 vCPU；ubuntu 24.04.4 `6.17.0-1022-azure`、bash 5.2.21 |
+| artifact | `b2c7-<runner>-r<n>`（各 12 檔）；每 job `SHA256SUMS.txt` 11 條 `shasum -c` 全 OK；總 manifest 48 條 SHA-256 `79ea4c880b5c37434e6303e02bcc804267a50936c496eff51d3e93efcb17e85c` |
+
+對照修法前同 kernel：B2c round 1 既有測試 macOS 36–45%、ubuntu 98–99% 紅；B2c-3 production 順序探針 macOS 36–54% 存活。修法後 0/400。
+
+### 8.4 結論與限制
+
+1. D7 完整條件全部成立（exact implementation SHA、artifact 完整性、每條核心／escalation 測試各 400/400、零 invalid／setup／race／timeout、register v7 落地）→ #7 **resolved**。
+2. **限制**：CI 未記錄 rekill 次數，也未觀察到 `CleanupIncomplete` 曾為 true（測試只斷言結果；兩層 fork 案例斷言 `CleanupIncomplete=false`）；修法生效的直接證據為 B2c-5 白箱測試（seam 注入六案＋mutation）與本次跨平台 0/400 紅。escalation 路徑窗口（B2c-4 假設 A6）以 ×400 未紅作經驗支持，未單獨量測。
+3. 不得把本次綠燈外推為「所有 fork 時序皆已涵蓋」；修法後若再紅，依 register 規則 3 登記新候選。
+
 ## 修訂記錄
 
+- v3（2026-09-07）：新增 §8（B2c-4 裁定、B2c-5／B2c-6 落地、B2c-7 CI 驗證與限制）；§6 更新為 v3 後續；標題版本更新。
 - v2 勘誤（2026-09-07，B2c-4 決策 gate）：§7.2／§7.3 XNU 段落／§7.5 (4) 的 EPERM 語意補正——除 zombie／`P_REF_DEAD` 外，建立中的 `P_REF_NEW` 成員同樣使 `proc_find` 失敗而回 EPERM；EPERM 不能代表群組已消失或已終止。版本號不變。
 - v2（2026-09-07）：新增 §7 B2c-3（證據指標、結果、D3 原始碼對照、結論、B2c-4 事實清單）；§5 更新（機制解讀已定位、新增未定位項）；§6 更新（register v6、backlog rev19、B2c-4 依賴成立、`b2c/diag` 已刪除、`b2c3/diag` 待刪）；標題與對應文件版本更新。
 - v1（2026-09-06）：建立（結案複審後修正「持有 stdout pipe」為推論措辭）；彙整 B2c round 1 與 B2c-2 round 2 證據、結果、結論與後續。
