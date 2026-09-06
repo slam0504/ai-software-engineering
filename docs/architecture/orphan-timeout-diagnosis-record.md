@@ -96,7 +96,7 @@
 | ubuntu r1 | 0 | — | 0 | 0 有效（38 輪 `unverified` 跳過） | 38 | 0 |
 | ubuntu r2 | 0 | — | 0 | 0 有效（43 輪 `unverified` 跳過） | 43 | 0 |
 
-- **macOS layer 4**：存活形狀以 `bash`（ppid 1，run）＋`sleep`（run）pair 為主，另有 2 輪單獨 `sleep`（ppid 1）；存活輪的群組於 `tCleanupKillReturned` 後 **30.0–30.4 s** 消失（**直接觀察**，與 `sleep 30` 自然結束一致；B2c-2 未觀察）；非存活輪約 2 ms（on）／約 224 ms（off，250 ms poller 粒度）內消失。198 個存活者中 158 個（80%）`firstObservedAfterReturn`（首次觀察起點晚於 callback 45 µs–73 ms）、**8 個 `observedBeforeReturn`（首次觀察區間結束於 callback 前 20 µs–2.8 ms，分開列示、未定位）**、32 個 `straddledOrUnknown`。取樣器 on／off 為 46／54 vs 36／41 per 100：**本輪未見 200 µs 取樣器壓低重現率**。`kill0`：存活輪六個偏移皆 nil；非存活輪 ≥1 ms 皆 ESRCH；`@0` 另有 EPERM 列（同時點快照仍列出 1–3 個非 zombie 成員）。
+- **macOS layer 4**：存活形狀以 `bash`（ppid 1，run）＋`sleep`（run）pair 為主，另有 2 輪單獨 `sleep`（ppid 1）；存活輪的群組於 `tCleanupKillReturned` 後 **30.0–30.4 s** 消失（**直接觀察**，與 `sleep 30` 自然結束一致；B2c-2 未觀察）；非存活輪約 2 ms（on）／約 224 ms（off，250 ms poller 粒度）內消失。198 個存活者中 158 個（80%）`firstObservedAfterReturn`（首次觀察起點晚於 callback 45 µs–73 ms）、**8 個 `observedBeforeReturn`（首次觀察區間結束於 callback 前 20 µs–2.8 ms，分開列示、未定位）**、32 個 `straddledOrUnknown`。取樣器 on／off 為 46／54 vs 36／41 per 100：**本輪未見 200 µs 取樣器壓低重現率**。`kill0`：存活輪六個偏移皆 nil；非存活輪 ≥1 ms 皆 ESRCH；`@0` 另有 EPERM 列（同時點快照仍列出 1–3 個非 zombie 成員；v2 勘誤：EPERM 只代表走訪時沒有可取得 ref 的成員，可能是 zombie、exit transition 或**建立中的 `P_REF_NEW` 成員**，本資料未區分）。
 - **macOS layer 5**：窗口曲線 d＝0–1 ms 為主，2 ms 為 0，5／10 ms 各有單獨 `sleep`（C1 fork C2 窗口）；`unverified` 0；**經身分驗證的第二次群組 KILL 於 109／109 存活輪清除**（`after2Live` 0）。
 - **ubuntu layer 4**：0／400；`kill0` 六個偏移 400/400 ESRCH（`@0` 在 `/proc` 掃描之後呼叫，不可與 B2c-2 的 `Wait` 返回瞬間比較）。
 - **ubuntu layer 5**：38／43 輪於 +300 ms 有非 zombie 成員，但**全部**是第一次 KILL 因 1 ms 取樣序列尚未收錄 S1／C1 而 `unverified` 跳過（fail-safe 依設計運作），**非逃脫、不得歸入 fork 窗口**；第一次 KILL 實際送出的 199 輪（r1 102、r2 97）0 存活。
@@ -105,7 +105,7 @@
 
 版本：本機與 runner 的完整 kernel build 字串相同（`xnu-11417.140.69.711.44~1`）；對照來源為公開 tag `xnu-11417.140.69`（commit `43a90889846e00bfb5cf1d255cdc0a701a1e05a4`），**僅為前綴相符的最接近公開版本**，不能證明 `.711.44` build 與 tag 原始碼等價；Linux 為 v6.17（commit `e5f0a698b34ed76002dc5cff3804a61c80233a7a`）`kernel/fork.c`，runner 為 `6.17.0-1022-azure`（含發行版補丁）。
 
-- **XNU（與觀察一致）**：`bsd/kern/kern_fork.c:1012` `forkproc()` 在 `proc_list_lock` 內 `pgrp_enter_locked` → `kern_proc.c:2364 pgrp_add_member` `LIST_INSERT_HEAD(&pgrp->pg_members, …)`——子程序在建立早期已在 pg_members，此時 `p_stat = SIDL`（`:1027`）、`proc_signalstart(child_proc, 0)`（`:1151`）；建立完成點 `kern_proc.c:2542` `pinsertchild` 清除 `P_REF_NEW`。`kern_sig.c:1669 killpg1` → `:1703 pgrp_iterate`（`kern_proc.c:4037`：鎖內收集 pid 快照，解鎖後逐 pid `proc_find`，`if (!p) continue;` 靜默略過）；`kern_proc.c:2162 proc_find` → `proc_ref_try_fast`（`:620–631`，`os_ref_retain_try_mask(…, P_REF_NEW | P_REF_DEAD, NULL)`，「unless it is in flux (being made, or dead)」）——**`P_REF_NEW` 未清除的建立中子程序取 ref 失敗 → 不被 `psignal`**；其他成員使 `nfound>0`（`:1713`），`kill(-pgid, SIGKILL)` 仍回 0。fork 路徑無 fatal signal 中止或延後補送機制。副觀察對照：`kern_sysctl.c:917` `kern.proc.pgrp` 走 `proc_iterate` → `kern_proc.c:3828` 略過 `SIDL`（「ignore processes that are being forked」），取樣器與 `killpg1` 一樣看不到建立中的成員；`killpg1` 過濾 SZOMB、`kill()` 走 posix 路徑 → 只剩 zombie 或成員皆在 exit transition（`P_REF_DEAD`）的群組回 **EPERM**。
+- **XNU（與觀察一致）**：`bsd/kern/kern_fork.c:1012` `forkproc()` 在 `proc_list_lock` 內 `pgrp_enter_locked` → `kern_proc.c:2364 pgrp_add_member` `LIST_INSERT_HEAD(&pgrp->pg_members, …)`——子程序在建立早期已在 pg_members，此時 `p_stat = SIDL`（`:1027`）、`proc_signalstart(child_proc, 0)`（`:1151`）；建立完成點 `kern_proc.c:2542` `pinsertchild` 清除 `P_REF_NEW`。`kern_sig.c:1669 killpg1` → `:1703 pgrp_iterate`（`kern_proc.c:4037`：鎖內收集 pid 快照，解鎖後逐 pid `proc_find`，`if (!p) continue;` 靜默略過）；`kern_proc.c:2162 proc_find` → `proc_ref_try_fast`（`:620–631`，`os_ref_retain_try_mask(…, P_REF_NEW | P_REF_DEAD, NULL)`，「unless it is in flux (being made, or dead)」）——**`P_REF_NEW` 未清除的建立中子程序取 ref 失敗 → 不被 `psignal`**；其他成員使 `nfound>0`（`:1713`），`kill(-pgid, SIGKILL)` 仍回 0。fork 路徑無 fatal signal 中止或延後補送機制。副觀察對照：`kern_sysctl.c:917` `kern.proc.pgrp` 走 `proc_iterate` → `kern_proc.c:3828` 略過 `SIDL`（「ignore processes that are being forked」），取樣器與 `killpg1` 一樣看不到建立中的成員；`killpg1` 過濾 SZOMB、`kill()` 走 posix 路徑 → 走訪時沒有任何可取得 ref 的成員即回 **EPERM**：只剩 zombie、成員皆在 exit transition（`P_REF_DEAD`），**或成員仍在建立中（`P_REF_NEW`，即本輪的建立窗口）**三種情況皆然（v2 勘誤，B2c-4）；因此 **EPERM 不能代表群組已消失或已終止**。
 - **Linux v6.17 `copy_process`**：`:1986–2000` fork 期間送達的多程序訊號被收集延後（`multiprocess`／`delayed`）、`task_sigpending` → `-ERESTARTNOINTR`；`:2321` `tasklist_lock` 內 `:2353` `fatal_signal_pending` → 中止 fork；`:2381` `shared_pending.signal = delayed.signal` 補給子程序；`:2393` 才 `attach_pid(p, PIDTYPE_PGID)`。與 ubuntu 0 存活一致。
 
 ### 7.4 結論（依證據強度）
@@ -121,7 +121,7 @@
 1. macOS 上 production supervisor 的單次 `kill(-pgid, SIGKILL)` 成功返回**不蘊含**群組成員全數終止：CI ×400 有 36–54% 輪次留下以 `bash`＋`sleep` pair 為主的存活者，持有繼承的 stdout pipe 直到 `sleep 30` 自然結束（消失時刻已直接觀察）。
 2. 逃脫者繼承 PGID；經身分驗證的第二次群組 KILL 在 CI 109／109、本機 preflight 43／43（未驗證身分）清除——「有界重送直到群組消失」在**本探針條件下可行**，能否作為 production 修法待 B2c-4 裁定；任何重送都需要身分驗證（PGID 重用）與「群組消失」判準（見 4）。
 3. **候選觸發條件（機制解讀，送達瞬間未直接觀察）**：成員在 KILL 送達時正處於建立中（fixture 於 leader 退出前約 1 ms 才 fork 的兩層 orphan 鏈）；XNU `killpg1` 對 `P_REF_NEW` 成員 `proc_find` 失敗而靜默略過且無延後補送；production Claude CLI 是否會在退出前瞬間 fork 子程序**未知**，屬契約層面問題。
-4. 兩平台 `kill(-pgid, 0)` 語意不同：macOS 只剩 zombie 或成員皆在 exit transition 的群組回 **EPERM**（CI `kill0@0` 8–47/100、本機 89/89），Linux 於 B2c-2 `Wait` 返回瞬間回 0；既有 oracle `groupDead = err != nil` 在 macOS 會把 EPERM 當「已消失」、在 Linux 會把 zombie 殘留當「存在」——任何以 `kill(-pgid,0)` 為終止判準的修法都要明定 EPERM／ESRCH／0 三種結果的語意。
+4. 兩平台 `kill(-pgid, 0)` 語意不同：macOS 在走訪時沒有可取得 ref 的成員即回 **EPERM**——只剩 zombie、成員皆在 exit transition，**或成員仍在建立中（`P_REF_NEW`）**（v2 勘誤；CI `kill0@0` 8–47/100、本機 89/89 未區分三者），故 EPERM 不能當作群組已消失；Linux 於 B2c-2 `Wait` 返回瞬間回 0；既有 oracle `groupDead = err != nil` 在 macOS 會把 EPERM 當「已消失」、在 Linux 會把 zombie 殘留當「存在」——任何以 `kill(-pgid,0)` 為終止判準的修法都要明定 EPERM／ESRCH／0 三種結果的語意。
 5. Linux（`6.17.0-1022-azure`）：production 順序 0／400，可控延遲層實際送出第一次 KILL 的 199 輪 0 存活；v6.17 `copy_process` 有中止 fork／補送機制。
 6. 窗口位置：CI macOS d＝0–1 ms 為主、5／10 ms 另有 C1 fork C2 的單獨 `sleep`；本機 0.25–1.75 ms 與 4–7 ms。
 7. 取樣器 on／off 重現率 46／54 vs 36／41 per 100，本輪未見 200 µs 取樣器壓低重現率。
@@ -129,5 +129,6 @@
 
 ## 修訂記錄
 
+- v2 勘誤（2026-09-07，B2c-4 決策 gate）：§7.2／§7.3 (f)／§7.5 (4) 的 EPERM 語意補正——除 zombie／`P_REF_DEAD` 外，建立中的 `P_REF_NEW` 成員同樣使 `proc_find` 失敗而回 EPERM；EPERM 不能代表群組已消失或已終止。版本號不變。
 - v2（2026-09-07）：新增 §7 B2c-3（證據指標、結果、D3 原始碼對照、結論、B2c-4 事實清單）；§5 更新（機制解讀已定位、新增未定位項）；§6 更新（register v6、backlog rev19、B2c-4 依賴成立、`b2c/diag` 已刪除、`b2c3/diag` 待刪）；標題與對應文件版本更新。
 - v1（2026-09-06）：建立（結案複審後修正「持有 stdout pipe」為推論措辭）；彙整 B2c round 1 與 B2c-2 round 2 證據、結果、結論與後續。
