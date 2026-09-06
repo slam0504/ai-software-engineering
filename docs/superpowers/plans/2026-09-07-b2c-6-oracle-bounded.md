@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev2（2026-09-07，design gate 第一輪 CHANGES_REQUIRED 後修訂：D1 核心加可注入時鐘 `now`，fake sleep 同步推進 fake clock，每輪先 probe 再判 deadline、sleep 取 `min(backoff, remaining)`，table test 斷言 1,2,4,…,64,64… 與最後截短值；D2 快照改 `ps -Ao pid=,pgid=,stat=,command=` 於 Go 內依第二欄篩選，命令失敗保留 combined output＋error、無相符列明寫 `<no rows for pgid N>`；D3 evidence 既有 20 ms 外層迴圈整段換成一次 `pollGroupGone`、失敗維持 `t.Errorf`，並明確排除 `proc_cleanup_test.go`；D4 通過；前版：rev1）
-> 狀態：**待 owner 極窄複核 rev2 三項修正**。尚未修改任何 code、未委派。
+> 版本：rev3（2026-09-07，rev2 design gate 通過；Task 1 `1b5e54c`、Task 2 `dad85cf` 由 Sonnet 實作，主 agent 完成讀碼審查、獨立 mutation 與整合驗證；全套 `go test -race ./... -count=1` rc 0；申請一次 fast-forward 推送；前版：rev2）
+> 狀態：**rev2 design gate 通過；Task 1–3 完成；待 owner 授權一次 fast-forward 推送 `main`（tests＋docs）**。
 > 票源：Pre-M4 Readiness Backlog **B2c-6**（rev20 新增，**0.3 pt**＝2.5–3.5 hr，owner 2026-09-07 採用）。依 **B2c-4 裁定記錄** rev3 D4：oracle 有界輪詢，**只有 `ESRCH` 算群組消失**；`EPERM` 繼續輪詢並記錄；逾 2 s 仍為 `nil`／`EPERM` 皆失敗並附快照，不把 `EPERM` 偽裝成 gone。
 > 基準：`main`＝`origin/main`＝`61c2201`（B2c-5 已落地）。分支 **`b2c6/oracle-bounded`**（本機，自 `61c2201`）。
 > 授權邊界：只改四個測試檔的 oracle 與其呼叫點；**不改 production、不改 fixture／`testdata/**`、不放寬 5 秒 combined-completion guard、不在被測路徑加 retry**（register 規則 8）；有界輪詢只作用於 `Wait()` 返回之後的 oracle 取樣。合併 main 需 owner 授權（fast-forward push）。
@@ -37,18 +37,18 @@
 
 ## Task 1: proc 套件（Sonnet 實作；主 agent 審查）
 
-- [ ] **Step 1**：新增 `internal/proc/proc_group_oracle_test.go`：`pollGroupGone(probe, deadline, now, sleep)` 核心、`requireGroupGone(t, pgid, context string)` 外層（含 `ps -Ao` 篩選快照）、table test 五案（D1）；`proc_test.go:37 groupGone` 移除或改為呼叫外層；`proc_test.go` 五個呼叫點改 `requireGroupGone`。**不動 `proc_cleanup_test.go`**（D3 (ii)）。
-- [ ] **Step 2 本機控制**：`go test -race ./internal/proc -count=3` PASS；mutation「EPERM 視為 gone」→ (c) 紅（逐字）；`gofmt`／`go vet`。
+- [x] **Step 1**（`1b5e54c`）：新增 `internal/proc/proc_group_oracle_test.go`：`pollGroupGone(probe, deadline, now, sleep)` 核心、`requireGroupGone(t, pgid, context string)` 外層（含 `ps -Ao` 篩選快照）、table test 五案（D1）；移除 `proc_test.go` 的 `groupGone`，五個呼叫點改用 `requireGroupGone`。`proc_cleanup_test.go` byte hash 與 `eac88ee` 相同（D3 (ii)）。
+- [x] **Step 2 本機控制**：Sonnet `go test -race ./internal/proc -count=3` PASS、mutation「EPERM 視為 gone」使 (c) 以 `want gone=false` 失敗、還原前後 SHA-256 相同；`gofmt`／`go vet`／新增程式碼 lint 通過。證據：`/tmp/b2c6-t1.*`。
 
 ## Task 2: claude／codex／evidence 套件（Sonnet 實作；主 agent 審查）
 
-- [ ] **Step 1**：三套件各放一份相同核心＋外層（註解指向 B2c-4 D4）與 table test；呼叫點：claude `session_test.go:197,211`（`TestTerminateKillsProcessGroup`、`TestOrphanDoesNotHangNormalExit`——**5 秒 combined-completion guard 與 `t.Fatal("drain/Wait hung on orphan-held pipes")` 形狀不變**）、codex `session_test.go:140`、evidence `runner_test.go:258-264`（整段換成一次 `pollGroupGone`，失敗 `t.Errorf`＋快照，後續 `assertNoZombieWorktrees` 照跑；D3 (i)）。
-- [ ] **Step 2 本機控制**：三套件 `-race -count=3` PASS；`TestOrphanDoesNotHangNormalExit` `-count=30` PASS；`gofmt`／`go vet`。
+- [x] **Step 1**（`dad85cf`）：claude／codex／evidence 各放一份相同核心與 table test；claude／codex 使用外層 `requireGroupGone`，evidence 依 D3 (i) 保留 `t.Errorf` 並在單次核心呼叫後繼續 `assertNoZombieWorktrees`。Claude 的 5 秒 combined-completion guard 與 `t.Fatal("drain/Wait hung on orphan-held pipes")` 形狀不變。四份核心與 table test 的機械雜湊分別完全相同。
+- [x] **Step 2 本機控制**：Sonnet 三套件 `-race -count=3` PASS；`TestOrphanDoesNotHangNormalExit -count=30` PASS；`gofmt`／`go vet`／新增程式碼 lint 通過。證據：`/tmp/b2c6-t2.*`。
 
 ## Task 3: 整合與交付
 
-- [ ] 全套 `go test -race ./... -count=1` PASS（rc 記錄）；主 agent 獨立重跑四個 table test 與 proc mutation；scope 三點 diff 只含四個測試檔＋新 helper 檔＋backlog＋本 plan；production 檔零變更（`git diff --stat origin/main...HEAD -- ':!*_test.go' ':!docs'` 為空）。
-- [ ] backlog rev21 commit（B2c-5 關票：commits `b2efb1c`／`b9c74e8`、plan rev3、全套 `-race` rc 0、mutation；B2c-6 依賴成立）備妥；申請 owner 授權一次 fast-forward 推送（tests＋docs）。
+- [x] 全套 `go test -race ./... -count=1` PASS（rc 0；最長 root 套件 243.880 s）；主 agent 獨立重跑四套 table test `-race -count=3`、四個受影響套件 `-race -count=1`、Claude orphan `-race -count=30` 均 PASS；獨立 mutation「EPERM 視為 gone」使 (c) 以 `want gone=false` 失敗，還原後 SHA-256 相同。gofmt 空、`go vet` 無輸出、lint 0 issues、無殘留程序。
+- [x] scope 只含四個既有測試檔、新增的 proc helper 測試檔、backlog 與本 plan；production、`frontend/`、`testdata/**`、`.github/`、`go.mod`／`go.sum` 零變更。backlog rev21 commit 已備妥；申請 owner 授權一次 fast-forward 推送（tests＋docs）。
 - [ ] 落地後：backlog rev22（B2c-6 關票、B2c-7 依賴成立）併入 B2c-7 的 docs。
 
 ## 驗證策略
@@ -63,11 +63,12 @@ Task 1 約 1.2 hr、Task 2 約 1.0 hr、Task 3 約 0.8 hr → 約 3.0 hr，在 0
 
 ## Gate A（B2c-6 完成條件）
 
-- [ ] 四套件 table test PASS、proc mutation (c) 紅並逐字記錄；呼叫點全部改用有界 oracle，斷言形狀不變。
-- [ ] 全套 `-race` PASS；production 檔零變更；scope 如上。
+- [x] 四套件 table test PASS、proc mutation (c) 紅並逐字記錄；呼叫點全部改用有界 oracle，斷言形狀不變。
+- [x] 全套 `-race` PASS；production 檔零變更；scope 如上。
 - [ ] owner 授權推送並落地。
 
 ## 修訂記錄
 
+- rev3（2026-09-07）：rev2 design gate 通過；Task 1 `1b5e54c`、Task 2 `dad85cf` 完成；記錄 Sonnet 與主 agent 的 focused、mutation、全套 race、靜態檢查與 scope 證據；申請一次 fast-forward 推送。
 - rev2（2026-09-07）：design gate 第一輪三項 blocking 修正——D1 核心加 `now` 注入、每輪先 probe 再判 deadline、`sleep(min(backoff, remaining))`、table test 五案含 sleep 序列與截短值斷言；D2 快照改 `ps -Ao pid=,pgid=,stat=,command=` Go 內篩選（`ps -g` 於 Linux 為 session 語意）、失敗與無列的固定格式；D3 evidence 迴圈整段替換＋`t.Errorf`、明確排除 `proc_cleanup_test.go`。D4 通過。
 - rev1（2026-09-07）：建立；D1–D4；三 Task；估點核對 3.0 hr。
