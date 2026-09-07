@@ -1067,7 +1067,7 @@ describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
 
     await findFileButton(w, 'b.yaml').trigger('click')
     await flushPromises()
-    w.find('[data-test=unsaved-guard]')
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true)
 
     await w.find('[data-test=save]').trigger('click') // 確認框開著時按儲存
     await flushPromises()
@@ -1075,13 +1075,52 @@ describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
     await w.find('[data-test=unsaved-discard]').trigger('click')
     await flushPromises()
     expect(store.read).not.toHaveBeenCalledWith('plan/b.yaml') // 寫入中不得切檔
-    w.find('[data-test=unsaved-guard]') // 確認框保留
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true) // 確認框保留（明確斷言）
 
     resolveWrite('sha256:a1')
     await flushPromises()
     await w.find('[data-test=unsaved-discard]').trigger('click')
     await flushPromises()
     expect(store.read).toHaveBeenCalledWith('plan/b.yaml') // 寫入結束後才切
+  })
+
+  it('H1-P-bump：確認框開啟後才開始 confirmBump——此時點捨棄不得切檔；bump 回應後才可切', async () => {
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'plan_id: a\n', digest: 'sha256:a0' },
+      'plan/b.yaml': { content: 'plan_id: b\n', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    typeText(getView(w), 'plan_id: a edited\n') // dirty
+    await flushPromises()
+
+    await findFileButton(w, 'b.yaml').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true)
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // 確認框開著時開始 bump
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('bump')
+
+    await w.find('[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).not.toHaveBeenCalledWith('plan/b.yaml') // bump 等待中不得切檔
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true)
+
+    resolveConfirm('plan_id: a bumped\n')
+    await flushPromises()
+    await w.find('[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).toHaveBeenCalledWith('plan/b.yaml') // bump 結束後才切
   })
 
 })

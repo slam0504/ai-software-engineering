@@ -721,4 +721,37 @@ describe('SpecWorkspace 切檔守衛（A1a-2，expected-red）', () => {
     expect(store.read).toHaveBeenCalledWith('spec/b.feature') // 寫入結束後才切
   })
 
+  it('H1-S-accept：確認框開啟後才開始接受草稿——此時點捨棄不得切檔；寫入回應後才可切', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: 'a original', digest: 'sha256:a0' },
+      'spec/b.feature': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    typeText(getView(w), 'a edited')
+    await flushPromises()
+
+    await findFileButton(w, 'b.feature').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true)
+
+    await mustFind(w, '[data-test=accept-draft]').trigger('click') // 確認框開著時接受草稿
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('accept')
+
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).not.toHaveBeenCalledWith('spec/b.feature') // accept 等待中不得切檔
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(true)
+
+    resolveWrite('sha256:a1')
+    await flushPromises()
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).toHaveBeenCalledWith('spec/b.feature') // accept 結束後才切
+  })
+
 })
