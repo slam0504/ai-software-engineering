@@ -166,24 +166,34 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
     Then 已儲存快照與持有的 digest 都不變
     And 受控 buffer 保留接受草稿後的內容，錯誤依其種類呈現
 
-  Scenario: bump 確認等待期間的正常操作限制
+  Scenario: bump 確認等待期間的操作限制
     Given 我在 plan 確認 analysis_base bump，該次回應尚未到達
-    And 該次確認送出時已凍結當時的文件與 buffer 版本
-    Then 我仍可以繼續編輯內容
+    And 該次確認送出時已凍結當時的文件識別與 buffer 版本
+    Then 我仍可以繼續打字
     And 切換檔案、切換分頁與其他會替換編輯器內容的操作被阻止
-    When 該次確認的回應到達且版本相符
-    Then 編輯器內容與受控 buffer 更新為 bump 結果，上述操作恢復可用
+    When 我沒有繼續打字，且該次確認的回應到達時版本仍相符
+    Then 編輯器內容與受控 buffer 更新為 bump 結果
+    And 操作封鎖解除
 
-  Scenario: bump 舊回應不套用——防禦性驗證
+  Scenario: bump 等待期間續打使版本過期——回應不套用
+    Given 我在 plan 確認 analysis_base bump，該次回應尚未到達
+    When 我在等待期間繼續打字
+    And 該次確認的回應才到達
+    Then 回應不被套用，我續打的內容原樣保留
+    And 顯示「內容已變更，請重新預覽」這類明確訊息，而不是後端錯誤原文
+    And 操作封鎖解除
+
+  Scenario: bump 等待期間文件識別被替換——防禦性驗證
     Given 我在 plan 確認 analysis_base bump
-    And 以測試注入使該次確認的送出版本與目前的文件或 buffer 版本不符
+    And 正常導覽在等待期間已被阻止，因此以測試注入替換該次確認的文件識別
     When 該次確認的回應到達
     Then 回應不被套用，編輯器內容不被覆蓋
-    And 顯示「內容已變更，請重新預覽」這類明確訊息，而不是後端錯誤原文
-    And 系統要求重新預覽
+    And 顯示「內容已變更，請重新預覽」這類明確訊息
+    And 操作封鎖解除
 
   Scenario: bump 真正的後端錯誤仍保留原訊息
     Given 我在 plan 確認 analysis_base bump
     When 後端回傳錯誤（例如 token 過期）
     Then 錯誤訊息原樣呈現，不被換成版本已變更的訊息
     And 系統要求重新預覽
+    And 操作封鎖解除
