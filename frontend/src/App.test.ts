@@ -38,6 +38,11 @@ vi.mock('../wailsjs/runtime/runtime', () => ({ EventsOn: vi.fn() }))
 import App from './App.vue'
 import DualPane from './components/DualPane.vue'
 import SessionList from './components/SessionList.vue'
+import SpecWorkspace from './components/SpecWorkspace.vue'
+import PlanWorkspace from './components/PlanWorkspace.vue'
+import GateConsole from './components/GateConsole.vue'
+import PreviewPane from './components/PreviewPane.vue'
+import FileTree from './components/FileTree.vue'
 import { makeI18n } from './test/i18n'
 
 describe('App shell 接線（Task 28 review round 1：SessionList／DualPane 真的掛上去了嗎）', () => {
@@ -71,5 +76,72 @@ describe('App shell 接線（Task 28 review round 1：SessionList／DualPane 真
     expect(err.exists(), '啟動失敗必須渲染').toBe(true)
     expect(err.text()).toContain('session registry load failed')
     expect(err.text()).toContain('/x/workspace-sessions.json')
+  })
+})
+
+// A1a-1 缺口 2 修正：onGoResubmit／FileTree select handler 原本直接改 tab／
+// planFocusPath／selectedFile，沒有經過 workspaceBusy 檢查——SpecWorkspace／
+// PlanWorkspace 儲存中若被切走，會把進行中的寫入連同元件一起卸載（v-if）。
+// 這裡在 App.vue 層級證明：busy 時兩個入口都被攔截、且不留下部分狀態變更；
+// 非 busy 時兩者仍正常運作（避免只證明「永遠拒絕」）。
+describe('App 寫入安全攔截（A1a-1 缺口 2）', () => {
+  it('workspaceBusy 時 go-resubmit 不改變 tab／planFocusPath；解除後正常導航', async () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const w = shallowMount(App, { global: { plugins: [pinia, makeI18n()] } })
+    await flushPromises()
+
+    const planTabBtn = w.findAll('nav button').find(b => b.text() === '計畫')
+    expect(planTabBtn, '找不到 plan tab 按鈕').toBeTruthy()
+    await planTabBtn!.trigger('click') // 切到 plan tab（此時非 busy，允許）
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(true)
+    expect(w.findComponent(PlanWorkspace).props('path')).toBeUndefined() // planFocusPath 初始未設
+
+    w.findComponent(PlanWorkspace).vm.$emit('busy', true) // 工作區回報 busy（例如儲存中）
+    await flushPromises()
+
+    w.findComponent(GateConsole).vm.$emit('go-resubmit', { gate: 'gate2', subject: 'plan:P9' })
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).props('path')).toBeUndefined() // planFocusPath 未被改動
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(false) // tab 未被切走
+
+    w.findComponent(GateConsole).vm.$emit('go-resubmit', { gate: 'gate1', subject: '' })
+    await flushPromises()
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(false) // busy 時 gate1 目標也不導航到 spec
+
+    w.findComponent(PlanWorkspace).vm.$emit('busy', false) // 解除 busy
+    await flushPromises()
+    w.findComponent(GateConsole).vm.$emit('go-resubmit', { gate: 'gate2', subject: 'plan:P9' })
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).props('path')).toBe('plan/P9.yaml') // 非 busy 時正常導航
+  })
+
+  it('workspaceBusy 時 FileTree select 不改變 selectedFile／tab；解除後正常運作', async () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const w = shallowMount(App, { global: { plugins: [pinia, makeI18n()] } })
+    await flushPromises()
+
+    const planTabBtn = w.findAll('nav button').find(b => b.text() === '計畫')
+    await planTabBtn!.trigger('click') // 切到 plan tab（非 busy，允許）
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(true)
+    expect(w.findComponent(PreviewPane).props('path')).toBe('') // selectedFile 初始為空字串
+
+    w.findComponent(PlanWorkspace).vm.$emit('busy', true) // 工作區回報 busy
+    await flushPromises()
+
+    w.findComponent(FileTree).vm.$emit('select', 'spec/a.feature')
+    await flushPromises()
+    expect(w.findComponent(PreviewPane).props('path')).toBe('') // selectedFile 未被改動
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(true) // tab 未被切到 preview（PlanWorkspace 仍掛著）
+
+    w.findComponent(PlanWorkspace).vm.$emit('busy', false) // 解除 busy
+    await flushPromises()
+    w.findComponent(FileTree).vm.$emit('select', 'spec/a.feature')
+    await flushPromises()
+    expect(w.findComponent(PreviewPane).props('path')).toBe('spec/a.feature') // 非 busy 時正常選檔
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(false) // tab 已切到 preview
   })
 })
