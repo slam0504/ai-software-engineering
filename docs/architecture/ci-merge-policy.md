@@ -1,6 +1,6 @@
 # CI 合併政策（`main` ruleset、required checks、維護程序）
 
-> 版本：v1（2026-09-07，B2b 落地：ruleset `22394412` 建立、repo 改為 rebase-only、enforcement 三狀態實證完成；plan `docs/superpowers/plans/2026-09-08-b2b-ruleset-enforcement.md`）
+> 版本：v1.1（2026-09-07，owner 複核修正：§5 恢復基準改為「停用前、已核准的現行設定」而非建立時附錄；§7 重建改用最新核准的建立 payload；§1／§6 指向附錄 C；§9 register v8 標明待回填）；前版：v1（2026-09-07，B2b 落地：ruleset `22394412` 建立、repo 改為 rebase-only、enforcement 三狀態實證完成；plan `docs/superpowers/plans/2026-09-08-b2b-ruleset-enforcement.md`）
 > 性質：**living 文件**。任何 ruleset 或 repo 合併設定的變更都必須在本文件留下「變更前後完整 JSON」與授權紀錄；設定本身在 GitHub，本文件是它的權威說明與稽核依據。
 > 讀者：對本 repo 有 push 或 admin 權限的人、以及代為操作 GitHub 設定的 agent。
 
@@ -18,7 +18,7 @@
 
 **效果**：`main` 上的每一個變更（包含只改文件的變更）都必須經由 PR，且 PR 的 head SHA 上四個 required contexts 全部成功、分支與 `main` 同步（strict）後，才能以 rebase 合併。合併後刪除分支仍逐次授權（不自動刪）。
 
-**設定證據與阻擋實證分開**：ruleset 存在與有效規則以 `GET rulesets/22394412` 與 `GET rules/branches/main` 為證（附錄 A、B）；「不可合併」以 probe PR 的 merge state 為證（§7）。**direct push 被拒絕未實測**——B2b 不對 `main` 做任何推送嘗試（dry-run 也不能證明），列為已知未實測項。
+**設定證據與阻擋實證分開**：ruleset 存在與有效規則以 `GET rulesets/22394412` 與 `GET rules/branches/main` 為證（附錄 A、B）；「不可合併」以 probe PR 的 merge state 為證（附錄 C）。**direct push 被拒絕未實測**——B2b 不對 `main` 做任何推送嘗試（dry-run 也不能證明），列為已知未實測項。
 
 ## 2. required contexts 權威清單
 
@@ -43,10 +43,12 @@ ruleset 的 `bypass_actors` 為空，`current_user_can_bypass: never`。
 
 ## 5. 緊急例外
 
-唯一途徑：owner 以 API 將 ruleset 暫時設為 `enforcement: disabled`，執行必要操作，**立即恢復為 `active` 並以 GET 核對**（附錄 A 的內容須完全一致）。
+唯一途徑：owner 以 API 將 ruleset 暫時設為 `enforcement: disabled`，執行必要操作，**立即恢復為 `active` 並以 GET 核對**。
+
+- **恢復基準＝停用前、已核准的現行設定**，不是建立時的附錄 A：停用前先保存 `GET rulesets/<id>` 與 `GET rules/branches/main`；恢復後再 GET 一次，核對**設定欄位**（name、target、enforcement、conditions、bypass_actors、rules 的 type 與 parameters）與**有效規則**（required contexts、app、strict 與其他規則）逐項相同。完整 JSON 前後皆留存，但不要求 `updated_at` 等回應欄位相同。
 
 - 適用範圍僅限「CI 基礎設施本身故障」（例如 GitHub Actions 全面停擺導致 required checks 無法產生）；測試紅燈不是例外事由，紅燈依 §8 處理。
-- 恢復失敗（GET 不符或 API 錯誤）→ **停止所有後續外部寫入並回報**，直到人工修復並重新 GET 核對為止。
+- 恢復失敗（設定欄位或有效規則與停用前不符，或 API 錯誤）→ **停止所有後續外部寫入並回報**，直到人工修復並重新 GET 核對為止。
 - 每次例外都要在本文件留下：時間、理由、停用前後 JSON、期間執行的操作、恢復後 GET。
 
 ## 6. required-check 改名程序（不會卡住的順序）
@@ -58,11 +60,11 @@ ruleset 的 `bypass_actors` 為空，`current_user_can_bypass: never`。
 3. **先從 required 清單移除舊名**，並以 GET 確認新名仍為 required；保存前後 GET。
 4. **再以另一 PR 移除舊 job**；此時該 PR 只需滿足新名，required checks 全綠後合併。
 
-若先移除舊 job 再移除舊 required，該 PR 的新 SHA 會缺少仍被要求的舊 check，而 `main` 上先前的成功紀錄不能滿足新 SHA，PR 會永遠 BLOCKED（§7 狀態 B 就是這個形狀）。每次 ruleset 更新分別授權並保存前後 GET。
+若先移除舊 job 再移除舊 required，該 PR 的新 SHA 會缺少仍被要求的舊 check，而 `main` 上先前的成功紀錄不能滿足新 SHA，PR 會永遠 BLOCKED（附錄 C 狀態 B 就是這個形狀）。每次 ruleset 更新分別授權並保存前後 GET。
 
 ## 7. ruleset 誤刪重建
 
-以附錄 A 的建立 payload 重新 `POST rulesets` → 記錄新 id → `GET rulesets/<新 id>` 核對 name／enforcement／conditions／bypass_actors／rules → `GET rules/branches/main` 核對有效規則含四個 contexts → 以 PR 更新本文件 §1 的 id 與版本。
+以**最新核准的建立 payload** 重新 `POST rulesets`——即本文件當前版本 §1／§2 所述設定；每次合法變更 ruleset（例如 §6 改名）都必須同步更新 §1／§2 與附錄 A 的 payload，附錄 A 的舊版只是歷史，不能拿來重建，否則會復原成舊的 required 清單 → 記錄新 id → `GET rulesets/<新 id>` 核對 name／enforcement／conditions／bypass_actors／rules 與最新核准設定相同 → `GET rules/branches/main` 核對有效規則與 §2 的 contexts 相同 → 以 PR 更新本文件 §1 的 id 與版本。
 
 ## 8. 紅燈處置
 
@@ -71,11 +73,11 @@ required check 紅燈依 `docs/architecture/wall-clock-test-register.md` 規則 
 ## 9. 量測資料出處
 
 - probe 三狀態的 PR run 從建立到最後一個 job 結束：A 397 s、B 357 s、C 389 s（§附錄 C）。這三筆只是**補充耗時**，不納入 B2b (6) 的正式 n=5 樣本。
-- 正式樣本（`b2b/closure` PR 的前五次合格 pull_request run、D6 欄位）與五條具名測試的 `Elapsed` 回寫於 register v8；本文件不重複。
+- 正式樣本（`b2b/closure` PR 的前五次合格 pull_request run、D6 欄位）與五條具名測試的 `Elapsed` **待五樣本完成後**回寫於 `wall-clock-test-register.md` v8（本文件 v1.1 時 register 仍為 v7）；本文件不重複。
 
 ---
 
-## 附錄 A：ruleset 建立 payload 與 GET 快照（2026-09-07）
+## 附錄 A：ruleset 建立 payload 與 GET 快照（2026-09-07 建立時；§7 重建須用最新核准版本，見該節）
 
 建立前：`GET rulesets` → `[]`；`GET rules/branches/main` → `[]`；main `1bbb47a`。
 
@@ -140,4 +142,5 @@ GitHub 對缺席 required context 的實際呈現（狀態 B）：GraphQL `statu
 
 ## 修訂記錄
 
+- v1.1（2026-09-07）：owner 複核修正——§5 恢復基準改為停用前已核准的現行設定（核對設定欄位與有效規則，不要求時間戳欄位相同）；§7 重建改用最新核准 payload 並要求變更後同步更新 §1／§2／附錄 A；§1／§6 的「§7」更正為「附錄 C」；§9 register v8 標明待五樣本完成後回填、目前 v7。
 - v1（2026-09-07）：建立。§1–§9 依 B2b plan rev3 D4 (i)–(ix)；附錄 A／B 為 ruleset 建立與 repo PATCH 的實際 JSON；附錄 C 為 PR #2 三狀態實證。
