@@ -1052,4 +1052,36 @@ describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
     expect(seen().at(-1)).toBe(false)
   })
 
+  it('H1-P：確認框開啟後才開始寫入——此時點捨棄不得切檔；寫入結束後才可切', async () => {
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'a original', digest: 'sha256:a0' },
+      'plan/b.yaml': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    typeText(getView(w), 'a edited')
+    await flushPromises()
+
+    await findFileButton(w, 'b.yaml').trigger('click')
+    await flushPromises()
+    w.find('[data-test=unsaved-guard]')
+
+    await w.find('[data-test=save]').trigger('click') // 確認框開著時按儲存
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('save')
+    await w.find('[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).not.toHaveBeenCalledWith('plan/b.yaml') // 寫入中不得切檔
+    w.find('[data-test=unsaved-guard]') // 確認框保留
+
+    resolveWrite('sha256:a1')
+    await flushPromises()
+    await w.find('[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).toHaveBeenCalledWith('plan/b.yaml') // 寫入結束後才切
+  })
+
 })

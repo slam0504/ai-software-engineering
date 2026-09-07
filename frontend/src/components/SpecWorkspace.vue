@@ -279,6 +279,10 @@ function checkOracleCoverage() {
 function unsavedKeep() { pendingPath.value = null } // 保留：停留原檔，新檔不載入
 
 function unsavedDiscard() {
+  // 確認框開啟後才開始的寫入也要擋（確認框不阻止按儲存／接受草稿／確認 bump）：
+  // 執行前重新檢查，且在確定切檔前不改 selectedPath、不動 buffer；pendingPath
+  // 保留，寫入結束後可再按一次捨棄。
+  if (busyReason.value !== '') return
   const p = pendingPath.value
   pendingPath.value = null
   if (!p) return

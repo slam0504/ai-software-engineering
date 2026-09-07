@@ -98,20 +98,30 @@ const workspaceBusy = ref(false)
 // 由各元件自己的守衛處理，兩條路徑互斥，同一次導覽不會出現兩次確認。
 const workspaceDirty = ref(false)
 const pendingNav = ref<null | (() => void)>(null)
-function guardedNav(action: () => void) {
+function guardedNav(action: () => void, isNoop?: () => boolean) {
   if (workspaceBusy.value) return // A1a-1 優先：寫入／bump 期間直接拒絕，不跳確認
+  if (isNoop?.()) { action(); return } // 不會改變目標的導覽不設守衛（點目前分頁／選同一個檔）
   if (workspaceDirty.value) { pendingNav.value = action; return }
   action()
 }
 function unsavedKeep() { pendingNav.value = null }
 function unsavedDiscard() {
+  // 確認框開啟**之後**才開始的寫入也要擋：確認框不阻止使用者按儲存，因此
+  // 「未儲存 → 觸發導覽確認 → 開始儲存 → 點捨棄」這個順序可達。執行前重新
+  // 檢查 busy，且在確定要離開之前不改路徑、不清 dirty；pendingNav 保留，
+  // 寫入結束後使用者可再按一次捨棄。
+  if (workspaceBusy.value) return
   const a = pendingNav.value
   pendingNav.value = null
-  workspaceDirty.value = false // 捨棄後原工作區會被 v-if 卸載，旗標一併歸零
   a?.()
 }
+// workspaceDirty 不在捨棄時自行清除——捨棄不必然導致工作區卸載（例如目標就是
+// 目前分頁）。改由「離開工作區分頁」與工作區自己的 dirty 事件維持：切到非
+// spec／plan 分頁時沒有工作區掛載，dirty 必為 false；切到另一個工作區時，新
+// 元件的 immediate emit 會覆寫成它自己的狀態。
+watch(tab, t => { if (t !== 'spec' && t !== 'plan') workspaceDirty.value = false })
 function switchTab(next: typeof tab.value) {
-  guardedNav(() => { tab.value = next })
+  guardedNav(() => { tab.value = next }, () => next === tab.value)
 }
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
@@ -147,7 +157,16 @@ function onGoResubmit(payload: { gate: string; subject: string }) {
   // 忙碌攔截（A1a-1 缺口 2 修正）與未儲存守衛（A1a-2）都在 guardedNav 內，早於
   // goResubmitError 的清空與所有賦值——拒絕或等待確認時整個函式不留下任何部分
   // 狀態變更，避免繞過寫入互斥或靜默丟棄未儲存內容。
-  guardedNav(() => doGoResubmit(payload))
+  // 重新送核導向也可能不會實際導覽（目標分頁就是目前分頁且不改焦點），該情形
+  // 不設守衛，避免捨棄一個不存在的離開動作。
+  guardedNav(() => doGoResubmit(payload), () => isGoResubmitNoop(payload))
+}
+function isGoResubmitNoop(payload: { gate: string; subject: string }): boolean {
+  const target = resolveResubmitTarget(payload.gate, payload.subject)
+  if (!target) return true // 解析失敗只會顯示錯誤、不導覽
+  if (target.kind === 'gate1') return tab.value === 'spec'
+  if (target.kind === 'gate2') return tab.value === 'plan' && planFocusPath.value === `plan/${target.planId}.yaml`
+  return tab.value === 'tca' && tcaFocusTaskId.value === target.taskId
 }
 function doGoResubmit(payload: { gate: string; subject: string }) {
   goResubmitError.value = ''
@@ -188,7 +207,8 @@ const selectedFile = ref('')
 // 「selectedFile 已換但 tab 沒切」的部分狀態。改為先檢查再改任何狀態，busy 時
 // 整個函式不做事——與 switchTab／onGoResubmit 的攔截順序一致。
 function selectPreviewFile(p: string) {
-  guardedNav(() => { selectedFile.value = p; tab.value = 'preview' })
+  guardedNav(() => { selectedFile.value = p; tab.value = 'preview' },
+    () => tab.value === 'preview' && selectedFile.value === p)
 }
 const cliInfo = ref<Record<string, string>>({})
 watch(timelineOpen, v => save('wb.tl.open', v))
