@@ -27,7 +27,7 @@ const props = defineProps<{
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
 }>()
-const emit = defineEmits<{ (e: 'busy', v: boolean): void }>()
+const emit = defineEmits<{ (e: 'busy', v: boolean): void; (e: 'dirty', v: boolean): void }>()
 
 const s = useSession()
 const assist = useAssist()
@@ -54,6 +54,12 @@ const busyReason = ref<'' | 'save' | 'load' | 'accept'>('')
 const saveError = ref('')
 const saveConflict = ref(false)
 watch(busyReason, v => emit('busy', v !== ''))
+// A1a-2：dirty 對外回報，供 App.vue 的跨分頁導覽守衛判斷。immediate 讓掛載當下
+// 的狀態也送出，避免 App 端停留在預設值。
+watch(dirty, v => emit('dirty', v), { immediate: true })
+// pendingPath：工作區「內部清單切檔」的守衛目標。A1a-2 只攔這條路徑；由 App
+// 變更 props.path 觸發的載入不再攔（App 已確認過，同一次導覽不得出現兩次確認）。
+const pendingPath = ref<string | null>(null)
 
 // loadGen：每次 loadFile() 呼叫遞增的載入世代——<script setup> 頂層程式碼每個
 // 元件實例各跑一次，這裡是「模組內」但屬於該實例，不會跨元件實例互相污染。
@@ -195,7 +201,8 @@ function resetDraft() {
 }
 
 function selectFile(p: string) {
-  if (busyReason.value === 'save' || busyReason.value === 'accept') return
+  if (busyReason.value === 'save' || busyReason.value === 'accept') return // A1a-1 優先於 A1a-2 守衛
+  if (dirty.value) { pendingPath.value = p; return } // 未儲存 → 先確認，不得靜默覆蓋
   selectedPath.value = p
   resetDraft()
   void loadFile() // selectedPath 是唯一權威來源，選檔一律觸發載入（同 PlanWorkspace）
@@ -269,6 +276,17 @@ function checkOracleCoverage() {
 // Accept：草稿寫入檔案的唯一入口（spec §5.1 不變量——AI 輸出不直接寫檔）。只取
 // draft 裡 ```gherkin/```feature（或退而求其次的通用 ``` code fence）的內容，
 // 不把 assistant 的整段 prose（例如「我沒辦法直接讀寫檔案…」）一起寫進 .feature。
+function unsavedKeep() { pendingPath.value = null } // 保留：停留原檔，新檔不載入
+
+function unsavedDiscard() {
+  const p = pendingPath.value
+  pendingPath.value = null
+  if (!p) return
+  selectedPath.value = p
+  resetDraft()
+  void loadFile()
+}
+
 async function acceptDraft() {
   if (busyReason.value !== '') return
   acceptError.value = ''
@@ -381,6 +399,12 @@ async function confirmCommit() {
       :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
     />
     <p v-if="loadError" class="err">{{ loadError }}</p>
+
+    <div v-if="pendingPath" class="unsaved-guard" data-test="unsaved-guard">
+      <p>{{ t('unsaved.message') }}</p>
+      <button data-test="unsaved-keep" @click="unsavedKeep">{{ t('unsaved.action.keep') }}</button>
+      <button data-test="unsaved-discard" @click="unsavedDiscard">{{ t('unsaved.action.discard') }}</button>
+    </div>
 
     <div class="save-area">
       <button data-test="save" :disabled="busyReason !== '' || !dirty" @click="saveFile">{{ t('spec.action.save') }}</button>
