@@ -1,0 +1,18 @@
+stateDiagram-v2
+  %% A1a：受控 buffer 的儲存狀態機（單一檔案的生命週期）
+  %% baseline＝載入時的內容快照；dirty 判定＝buffer ≠ baseline（見 plan D4）
+  [*] --> empty
+  empty --> clean : loadFile 成功（buffer＝baseline＝磁碟內容，持有 digest）
+  clean --> dirty : 編輯器真實輸入（updateListener → buffer）
+  dirty --> clean : 輸入使 buffer 回到 baseline（內容相等）
+  dirty --> saving : 按下儲存（送出 buffer＋持有的 digest）
+  saving --> clean : 寫入成功（digest ← newDigest，baseline ← buffer）
+  saving --> conflict : ErrSpecWriteConflict／ErrPlanWriteConflict
+  saving --> dirty : 其他寫入錯誤（原樣揭露，buffer 與 digest 皆不變）
+  conflict --> dirty : 使用者確認錯誤（buffer 保留，digest 仍為過期值）
+  clean --> empty : 切檔／卸載
+  dirty --> guard : 切檔／切分頁（D3）
+  guard --> dirty : 選擇保留（停留原檔）
+  guard --> empty : 選擇捨棄
+  note right of conflict : A1a 只保證「衝突可被辨識並揭露」；<br/>reload／compare／保留本地的選擇流程屬 A1b
+  note right of saving : 送出的必須是 buffer 目前值；<br/>HEAD 現況送出的是 baseline（缺陷所在）
