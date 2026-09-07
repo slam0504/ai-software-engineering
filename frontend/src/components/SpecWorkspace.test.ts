@@ -337,6 +337,15 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     resolveWrite('sha256:new')
     await flushPromises()
     expect(w.attributes('data-busy')).toBe('')
+
+    // 歸屬斷言（缺口 3 修正）：儲存中把 props.path 換成 B 被拒絕，effectivePath
+    // 解封後仍須維持 A（不得被切檔期間的 props.path 污染）——再次編輯並儲存，
+    // write 收到的 path／content／digest 都必須屬於 A。
+    typeText(view, 'v1 continued after unblock')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenNthCalledWith(2, 'spec/a.feature', 'v1 continued after unblock', 'sha256:new')
   })
 
   it('T8-S：過期世代丟棄——切檔後先前的延遲回應到達時整筆丟棄', async () => {
@@ -394,15 +403,38 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(view.state.doc.toString()).toBe('A content (second load)') // 不被第一次的過期回應覆蓋
   })
 
-  it('T8c-S：載入中編輯器暫停——[data-test=editor-host] 帶 data-editing-suspended=true', async () => {
+  it('T8c-S：載入中編輯器真正暫停——裝飾性標記＋CM6 實際 contenteditable＋load 期間 dispatch 不回寫 buffer', async () => {
+    // 先讓第一次載入正常完成，CM6 才會初始化（同 T8-S：onMounted 內 initEditor
+    // 排在 loadFile 之後），才能拿到可觀察的 view 來斷言載入中的 contenteditable。
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushEditor()
+    const view = getView(w)
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 初始載入完成後可編輯
+
     let resolveRead: (v: { content: string; digest: string }) => void = () => {}
     mocks.SpecRead.mockImplementationOnce(() => new Promise(r => { resolveRead = r }))
-    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await w.setProps({ path: 'spec/b.feature' }) // 觸發第二次（延遲）載入
     await flushPromises()
-    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true')
-    resolveRead({ content: '', digest: 'sha256:stub' })
+
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true') // 既有裝飾性標記
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('false') // CM6 實際可編輯狀態，不是我們自己掛的標記
+
+    // 載入期間程式化 dispatch 改文件：EditorView.editable 只擋使用者輸入，仍要
+    // 靠 updateListener 的 busyReason 檢查擋住回寫，buffer 才不會被污染。
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'injected during load' } })
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // buffer 未變→仍等於 saved(A)→dirty 假
+
+    resolveRead({ content: 'B content', digest: 'sha256:b' })
     await flushEditor()
+
     expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 載入完成後回到可編輯
+
+    // 載入完成後再 dispatch 一次：buffer 應正常更新
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'edited after load' } })
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // buffer 已更新→dirty 真
   })
 
   it('T9-S：衝突——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {

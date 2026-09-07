@@ -565,6 +565,9 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(w.attributes('data-busy')).toBe('save')
 
     await w.find('[data-test=save]').trigger('click') // 再次儲存
+    const contentDuringSave = usePlan().currentContent
+    await w.find('[data-test=apply-draft]').trigger('click') // 缺口 4：儲存中實際點擊套用草稿
+    expect(usePlan().currentContent).toBe(contentDuringSave) // 內容未被替換，不只是斷言按鈕 disabled
     await w.setProps({ path: 'plan/b.yaml' }) // 切檔
     await flushPromises()
 
@@ -628,15 +631,40 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(view.state.doc.toString()).toBe('A content (second load)') // 不被第一次的過期回應覆蓋
   })
 
-  it('T8c-P：載入中編輯器暫停——[data-test=editor-host] 帶 data-editing-suspended=true', async () => {
+  it('T8c-P：載入中編輯器真正暫停——裝飾性標記＋CM6 實際 contenteditable＋load 期間 dispatch 不回寫 buffer', async () => {
+    // 先讓第一次載入正常完成，CM6 才會初始化（同 T8-P），才能拿到可觀察的 view
+    // 來斷言載入中的 contenteditable。
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const view = getView(w)
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 初始載入完成後可編輯
+
     let resolveRead: (v: { content: string; digest: string }) => void = () => {}
     mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveRead = r }))
-    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await w.setProps({ path: 'plan/b.yaml' }) // 觸發第二次（延遲）載入
     await flushPromises()
-    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true')
-    resolveRead({ content: '', digest: 'sha256:stub' })
+
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true') // 既有裝飾性標記
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('false') // CM6 實際可編輯狀態，不是我們自己掛的標記
+
+    // 載入期間程式化 dispatch 改文件：EditorView.editable 只擋使用者輸入，仍要
+    // 靠 updateListener 的 busyReason 檢查擋住回寫，buffer（plan.currentContent）
+    // 才不會被污染。
+    const bufferBeforeDispatch = usePlan().currentContent
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'injected during load' } })
+    await flushPromises()
+    expect(usePlan().currentContent).toBe(bufferBeforeDispatch) // buffer 未變
+
+    resolveRead({ content: 'B content', digest: 'sha256:b' })
     await flushEditor()
+
     expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 載入完成後回到可編輯
+
+    // 載入完成後再 dispatch 一次：buffer 應正常更新
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'edited after load' } })
+    await flushPromises()
+    expect(usePlan().currentContent).toBe('edited after load')
   })
 
   it('T9-P：衝突——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {
@@ -721,11 +749,15 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
     let resolveConfirm: (v: string) => void = () => {}
     mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
-    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'draft during bump wait' } })
     await flushEditor()
 
     await w.find('[data-test=bump-toggle]').trigger('click')
     await w.find('[data-test=bump-confirm]').trigger('click') // 等待中，尚未 resolve
+
+    // 缺口 4：bump 等待期間實際點擊套用草稿——內容不得被替換
+    await w.find('[data-test=apply-draft]').trigger('click')
+    expect(usePlan().currentContent).toBe(bufferText)
 
     await w.setProps({ path: 'plan/b.yaml' }) // 切檔理應被阻止
     await flushPromises()

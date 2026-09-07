@@ -127,6 +127,11 @@ const planFocusPath = ref<string | undefined>(undefined)
 const tcaFocusTaskId = ref('')
 const goResubmitError = ref('')
 function onGoResubmit(payload: { gate: string; subject: string }) {
+  // 忙碌攔截（A1a-1 缺口 2 修正）：放在函式最前面，早於 goResubmitError 的清空
+  // 與 resolveResubmitTarget 之後的所有賦值——workspaceBusy 時整個函式不留下
+  // 任何部分狀態變更，避免繞過 SpecWorkspace／PlanWorkspace 的寫入互斥直接改
+  // tab／planFocusPath／tcaFocusTaskId。
+  if (workspaceBusy.value) return
   goResubmitError.value = ''
   const target = resolveResubmitTarget(payload.gate, payload.subject)
   if (!target) {
@@ -160,6 +165,15 @@ const timelineOpen = ref(load('wb.tl.open', true)) // VS Code panel 慣例：可
 const timelineHeight = ref(load('wb.tl.height', 180)) // 拖高＋記憶（M1.5 T5）
 const gateWidth = ref(load('wb.gate.width', 280)) // gate 面板拖寬＋記憶（同 timeline 拖高 pattern）
 const selectedFile = ref('')
+// selectPreviewFile（A1a-1 缺口 2 修正）：FileTree 的 @select handler 原本先設
+// selectedFile 才呼叫 switchTab（switchTab 內才擋 busy），忙碌時被拒絕仍會留下
+// 「selectedFile 已換但 tab 沒切」的部分狀態。改為先檢查再改任何狀態，busy 時
+// 整個函式不做事——與 switchTab／onGoResubmit 的攔截順序一致。
+function selectPreviewFile(p: string) {
+  if (workspaceBusy.value) return
+  selectedFile.value = p
+  tab.value = 'preview'
+}
 const cliInfo = ref<Record<string, string>>({})
 watch(timelineOpen, v => save('wb.tl.open', v))
 watch(timelineHeight, v => save('wb.tl.height', v))
@@ -317,7 +331,7 @@ onMounted(async () => {
     <div class="body">
       <aside class="side">
         <div class="side-sessions"><SessionList /></div>
-        <div class="side-files"><FileTree @select="(p: string) => { selectedFile = p; switchTab('preview') }" /></div>
+        <div class="side-files"><FileTree @select="selectPreviewFile" /></div>
       </aside>
       <main>
         <nav>

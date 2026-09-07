@@ -102,6 +102,18 @@ const bumpStale = ref(false)
 const editorHost = ref<HTMLElement | null>(null)
 let cmView: { destroy(): void; dispatch(spec: unknown): void; state: { doc: { length: number } } } | null = null
 let loadGen = 0
+// editableComp／EditorViewRef：CM6 可編輯狀態的 Compartment（缺口 1 修正，同
+// SpecWorkspace）——`EditorView.editable` 只擋使用者輸入，程式化 dispatch 仍會
+// 改文件，「載入期間 buffer 不被污染」另外靠 updateListener 的 busyReason 檢查
+// 保證（見 initEditor）。setEditable() 在 cmView／editableComp 尚未就緒（第一次
+// 載入完成前）時是 no-op。
+let editableComp: { reconfigure(effect: unknown): unknown } | null = null
+let EditorViewRef: { editable: { of(v: boolean): unknown } } | null = null
+
+function setEditable(v: boolean) {
+  if (!cmView || !editableComp || !EditorViewRef) return
+  cmView.dispatch({ effects: editableComp.reconfigure(EditorViewRef.editable.of(v)) })
+}
 
 async function loadFileList() {
   try {
@@ -125,6 +137,7 @@ async function loadFile() {
   if (!effectivePath.value) return
   const gen = ++loadGen
   busyReason.value = 'load'
+  setEditable(false)
   try {
     const pf = await PlanRead(effectivePath.value)
     if (gen !== loadGen) return // 過期世代：整筆丟棄，不動 buffer／saved／digest／編輯器／busy
@@ -132,11 +145,13 @@ async function loadFile() {
     planIdInput.value = deriveDefaultPlanId(effectivePath.value)
     syncEditorDoc()
     busyReason.value = ''
+    setEditable(true) // 只有贏得世代的那次才解除暫停
     await checkBump()
   } catch (e) {
     if (gen !== loadGen) return
     loadError.value = String(e)
     busyReason.value = ''
+    setEditable(true)
   }
 }
 
@@ -221,19 +236,25 @@ function syncEditorDoc() {
 async function initEditor() {
   if (!editorHost.value) return
   try {
-    const [{ EditorView, basicSetup }, { EditorState }] = await Promise.all([
+    const [{ EditorView, basicSetup }, { EditorState, Compartment }] = await Promise.all([
       import('codemirror'),
       import('@codemirror/state'),
     ])
+    EditorViewRef = EditorView
+    const compartment = new Compartment()
+    editableComp = compartment
     cmView = new EditorView({
       state: EditorState.create({
         doc: plan.currentContent,
         extensions: [
           basicSetup,
+          // 可編輯狀態（缺口 1 修正，同 SpecWorkspace）：包在 Compartment 內才能
+          // 之後用 setEditable() 動態切換。初始值以目前 busyReason 決定。
+          compartment.of(EditorView.editable.of(busyReason.value !== 'load')),
           // editor → buffer：唯一新增的同步方向（同 SpecWorkspace）。syncEditorDoc()
-          // （buffer → editor）維持不變。
+          // （buffer → editor）維持不變。load 期間不回寫，理由同 SpecWorkspace。
           EditorView.updateListener.of(u => {
-            if (u.docChanged) plan.currentContent = u.state.doc.toString()
+            if (u.docChanged && busyReason.value !== 'load') plan.currentContent = u.state.doc.toString()
           }),
         ],
       }),
@@ -355,6 +376,10 @@ async function runAssist() {
 // 落地是「儲存」的職責（見下方 saveFile）。同 SpecWorkspace acceptDraft，只取
 // fenced code block 內容，不把整段 prose 一起帶進 buffer。
 function applyDraft() {
+  // 忙碌（save／load／bump）期間禁止套用草稿——缺口 4 修正：儲存／bump 等待期間
+  // 若替換 plan.currentContent，會讓進行中的寫入送出「按下當下凍結的快照」與
+  // 「使用者實際在畫面上看到、以為已套用」的內容不一致。
+  if (busyReason.value !== '') return
   const content = extractDraftContent(draftText.value)
   plan.currentContent = content
   syncEditorDoc()
@@ -476,7 +501,7 @@ async function confirmCommit() {
     <div class="draft-area">
       <p v-if="assistBusy" class="assist-busy" data-test="assist-busy">{{ t('planWorkspace.assist.drafting') }}</p>
       <pre class="draft-text" data-test="draft-text">{{ draftText }}</pre>
-      <button data-test="apply-draft" :disabled="!draftText" @click="applyDraft">{{ t('planWorkspace.action.applyDraft') }}</button>
+      <button data-test="apply-draft" :disabled="!draftText || busyReason !== ''" @click="applyDraft">{{ t('planWorkspace.action.applyDraft') }}</button>
     </div>
 
     <div class="save-area">
