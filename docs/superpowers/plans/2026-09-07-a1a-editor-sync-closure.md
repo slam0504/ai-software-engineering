@@ -1,8 +1,8 @@
 # A1a Spec／Plan 編輯器同步閉環 Implementation Plan
 
 > **For agentic workers:** 本票為前端佈線與測試，無外部寫入。實作前須通過 owner design gate；push、開 PR、CI 另案授權。Steps use checkbox (`- [ ]`) syntax for tracking.
-> 版本：rev5（2026-09-07，**窄複核修正（僅一處契約與三處引用；設計、估點、拆票不重開）**：`confirmBump` 改為四條結束路徑——等待期間被阻止的是切檔／切分頁而**不是打字**；**(a) 正常續打造成 buffer 版本過期改以實際編輯器輸入驗證**（不再誤稱只能注入），(b) 文件識別被替換才用測試注入，(c) 未續打且版本相符則套用，(d) 真正的後端錯誤保留原訊息，**四條路徑結束時一律解除封鎖**；feature 與 T14f／T14g／T14h 同步（未新增測試編號、未改架構、未重估）；同批同步引用：A1a-1 分攤表改為 T14a–T14h、Gate A1a-1 的版本檢查改指 T14g 並納入 T14h、backlog 的 plan 引用改為 rev5。場景 33 → 34 個可執行案例。**待 owner 最終窄複核**）；前版：版本：rev4（2026-09-07，**窄幅一致性修正（設計選項不重開）**：(1) `confirmBump` 等待期間的限制與測試情境分為兩層——正常操作允許繼續輸入但阻止切檔／切分頁與衝突操作，「送出版本已過期」改以**測試注入**的防禦性驗證表達，不再描述成 UI 可繞過；本機判定過期時顯示「內容已變更，請重新預覽」，**真正的後端錯誤仍保留原訊息**；(2) 兩張圖改正——載入循序圖以 `alt` 區分過期丟棄與最新才更新，狀態圖補「Plan 套用結果等於 `saved` 留在 clean」「Spec 自 clean 接受草稿進入寫入流程」，並把衝突／失敗改為經 `recompute` 依內容比較決定 dirty，不無條件轉 dirty；(3) D6 撤除「15 項」舊數字改指逐元件展開的實際清單；**核定估點回填**（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt）並同批更新 backlog 小計。**待 owner 窄複核**）；前版：版本：rev3（2026-09-07，**design gate 第二輪 CHANGES_REQUIRED 後修訂**：(1) 草稿語意分流——Plan `applyDraft`／`confirmBump` 只更新 buffer，**Spec `acceptDraft` 保留立即寫入語意**並納入送出快照與寫入互斥，feature／測試／變異同步改寫；(2) 載入回應歸屬改為**請求世代**（補 A→B→A 亂序案例、載入進行中暫停編輯）、`confirmBump` 回應以「文件＋buffer 版本」檢查，不新增通用並行框架；(3) 測試補 M6 的**重載前**斷言、切分頁補捨棄後成功導覽、所有測試與變異標明 Spec／Plan 實際目標且**不預先固定項數**；(4) D9 拆票通過並修正分攤——寫入期間封鎖（含其 `App.vue` 攔截點）留在 A1a-1，A1a-2 只負責非儲存期間的保留／捨棄導覽；重估 25.6 hr（兩票 19.1／6.5）。**待 owner 複核**）；前版：版本：rev2（2026-09-07，**design gate 第一輪 CHANGES_REQUIRED 後修訂**：D1–D8 裁定回寫；新增第三節「非同步儲存與載入契約」（送出快照、等待期間輸入、封鎖重疊、延遲載入回應、草稿／bump 同步、衝突後不自動重載）；場景表改寫並更正條數（12 條 Scenario＋1 條 Scenario Outline／6 例＝18 個可執行案例）；切檔的保留／捨棄拆為兩條獨立情境；新增切分頁保護（Spec／Plan × 三個入口）；T3／T4 改用有狀態讀寫替身並斷言重載後的 `EditorView` 文件；mutation 由 9 項增為 15 項；Gate A 納入 Spec／Plan 各一次實際 Wails 人工驗收；速記展開為正式說明；重估後 **21.6 hr／2.16 pt 超過拆票門檻，提出 A1a-1／A1a-2 拆分（D9）**。**待 owner 複核**）；前版：rev1（2026-09-07，建立）
-> 狀態：**待 owner 最終窄複核 rev5**。設計已通過，估點已核定（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt）。尚未撰寫任何 production 或測試程式碼；未 push、未開 PR。A1a 為 aggregate，**兩張子票都完成才關票**；拆票不要求製造兩個 PR。
+> 版本：rev6（2026-09-07，**實作啟動回填（設計不變）**：狀態改為 design gate APPROVED（綁定 `7860d75`）、A1a-1 實作進行中；新增第十一節「A1a-1 執行 checklist」（30 個測試識別項目、31 項變異、expected-red 分類規則、人工驗收資料隔離、失敗分類規則）；**測試計數更正 33 → 30**（明列 13 Spec ＋ 16 Plan ＋ 1 Go；不為湊數新增測試）；**前端基準更正 397 → 399 條**（本機實測 40 檔／399 全綠）；**D5 可行性已實測**：jsdom 下 `beforeinput`／`input` 不改變 CM6 文件（doc 未變），採 `view.dispatch` 退路並標明邊界。設計、估點、拆票不變）；前版：版本：rev5（2026-09-07，**窄複核修正（僅一處契約與三處引用；設計、估點、拆票不重開）**：`confirmBump` 改為四條結束路徑——等待期間被阻止的是切檔／切分頁而**不是打字**；**(a) 正常續打造成 buffer 版本過期改以實際編輯器輸入驗證**（不再誤稱只能注入），(b) 文件識別被替換才用測試注入，(c) 未續打且版本相符則套用，(d) 真正的後端錯誤保留原訊息，**四條路徑結束時一律解除封鎖**；feature 與 T14f／T14g／T14h 同步（未新增測試編號、未改架構、未重估）；同批同步引用：A1a-1 分攤表改為 T14a–T14h、Gate A1a-1 的版本檢查改指 T14g 並納入 T14h、backlog 的 plan 引用改為 rev5。場景 33 → 34 個可執行案例。**待 owner 最終窄複核**）；前版：版本：rev4（2026-09-07，**窄幅一致性修正（設計選項不重開）**：(1) `confirmBump` 等待期間的限制與測試情境分為兩層——正常操作允許繼續輸入但阻止切檔／切分頁與衝突操作，「送出版本已過期」改以**測試注入**的防禦性驗證表達，不再描述成 UI 可繞過；本機判定過期時顯示「內容已變更，請重新預覽」，**真正的後端錯誤仍保留原訊息**；(2) 兩張圖改正——載入循序圖以 `alt` 區分過期丟棄與最新才更新，狀態圖補「Plan 套用結果等於 `saved` 留在 clean」「Spec 自 clean 接受草稿進入寫入流程」，並把衝突／失敗改為經 `recompute` 依內容比較決定 dirty，不無條件轉 dirty；(3) D6 撤除「15 項」舊數字改指逐元件展開的實際清單；**核定估點回填**（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt）並同批更新 backlog 小計。**待 owner 窄複核**）；前版：版本：rev3（2026-09-07，**design gate 第二輪 CHANGES_REQUIRED 後修訂**：(1) 草稿語意分流——Plan `applyDraft`／`confirmBump` 只更新 buffer，**Spec `acceptDraft` 保留立即寫入語意**並納入送出快照與寫入互斥，feature／測試／變異同步改寫；(2) 載入回應歸屬改為**請求世代**（補 A→B→A 亂序案例、載入進行中暫停編輯）、`confirmBump` 回應以「文件＋buffer 版本」檢查，不新增通用並行框架；(3) 測試補 M6 的**重載前**斷言、切分頁補捨棄後成功導覽、所有測試與變異標明 Spec／Plan 實際目標且**不預先固定項數**；(4) D9 拆票通過並修正分攤——寫入期間封鎖（含其 `App.vue` 攔截點）留在 A1a-1，A1a-2 只負責非儲存期間的保留／捨棄導覽；重估 25.6 hr（兩票 19.1／6.5）。**待 owner 複核**）；前版：版本：rev2（2026-09-07，**design gate 第一輪 CHANGES_REQUIRED 後修訂**：D1–D8 裁定回寫；新增第三節「非同步儲存與載入契約」（送出快照、等待期間輸入、封鎖重疊、延遲載入回應、草稿／bump 同步、衝突後不自動重載）；場景表改寫並更正條數（12 條 Scenario＋1 條 Scenario Outline／6 例＝18 個可執行案例）；切檔的保留／捨棄拆為兩條獨立情境；新增切分頁保護（Spec／Plan × 三個入口）；T3／T4 改用有狀態讀寫替身並斷言重載後的 `EditorView` 文件；mutation 由 9 項增為 15 項；Gate A 納入 Spec／Plan 各一次實際 Wails 人工驗收；速記展開為正式說明；重估後 **21.6 hr／2.16 pt 超過拆票門檻，提出 A1a-1／A1a-2 拆分（D9）**。**待 owner 複核**）；前版：rev1（2026-09-07，建立）
+> 狀態：**design gate APPROVED（2026-09-07，綁定 `7860d754e4960481046284cf75a89140201e8728`）；A1a-1 本機實作與驗證進行中（已授權）**。設計驗收通過不代表功能或測試已通過。A1a-2 未授權；push、開 PR、CI 未授權。A1a 為 aggregate，**兩張子票都完成才關票**；拆票不要求製造兩個 PR。
 > 票源：Pre-M4 Readiness Backlog **A1a**（P1，原始估計 **1.4 pt**，未經 gate 核准）：A1 驗收條件 (1)(2)(3)(4)(6)。**(5) 外部檔案變更 reload／compare／保留本地屬 A1b，不在本票。**
 > 基準：`main`＝`origin/main`＝`3ea31ea`（B2b 關票）。分支 **`a1a/editor-sync`**（本機，自 `3ea31ea`）。
 > 相關產出：`docs/architecture/features/spec-plan-editing.feature`、`docs/architecture/diagrams/a1a-editor-buffer-state.mmd`、`docs/architecture/diagrams/a1a-seq-save.mmd`。
@@ -60,7 +60,7 @@
 - **D2 採 (b)**：使用明確的 sentinel 文字契約，配 Go 訊息契約測試與前端衝突／非衝突測試；未知錯誤保留原訊息。不改 backend API。
 - **D3 納入**：切檔與切分頁都須保護未儲存內容；必要的 `App.vue` 修改屬本票範圍，但不重構整個分頁架構。
 - **D4 採內容比較**：`dirty = buffer !== saved`；`saved` 的更新時機依第三節第 1 條。
-- **D5 有條件接受**：`view.dispatch` 退路可用於證明「編輯器文件變更會回寫 buffer」，**不得**當成真實鍵盤與 Wails 儲存流程的完整證據（故 Gate A 另列人工驗收）。
+- **D5 有條件接受**：`view.dispatch` 退路可用於證明「編輯器文件變更會回寫 buffer」，**不得**當成真實鍵盤與 Wails 儲存流程的完整證據（故 Gate A 另列人工驗收）。**rev6 實測結果（`/tmp/a1a-1/evidence/d5-spike.txt`）**：jsdom 下 `contenteditable` 節點存在，但派發 `beforeinput`＋`input`（`inputType: insertText`）後 `view.state.doc` **未改變**（仍為 `hello`）——CM6 依賴 DOM mutation 觀測，jsdom 的合成事件不會驅動它；`view.dispatch({changes})` 則正常生效。**故一律採 `view.dispatch` 退路**，並在報告標明不涵蓋真實鍵盤事件層。
 - **D6 接受 N/N 全跑原則**，項數不預先固定（rev3 起）：第七節列的是**變異目標**，實際執行清單依 Spec／Plan 逐元件展開，於各子票實作前在該票的執行 checklist 中編號列出。（rev2 曾寫「15 項」，rev3 已撤回；歷史見修訂記錄。）
 - **D7 通過**：保留 Spec local ref／Plan store，不做對稱化重構。
 - **D8 暫留為提案**：算式正確；補入新增驗證工作後重估（見第七節），不要求維持原數字。
@@ -191,7 +191,7 @@
 
 ## 九、驗證策略
 
-- **自動化**：前端全套 `npx vitest run`（現況 40 檔／397 條）須全綠；`npm run build` exit 0；Go 訊息契約測試所屬套件綠。
+- **自動化**：前端全套 `npx vitest run`（本機基準 **40 檔／399 條**全綠，2026-09-07 實測；plan 舊文寫的 397 為 B2b 取樣期舊值）須全綠；`npm run build` exit 0；Go 訊息契約測試所屬套件綠。
 - **辨識力**：mutation table N/N（第七節），另對需要真實輸入的測試先做 expected-red。**驗收表列出逐元件展開後的實際執行項目**，不以「通用」敘述或單邊執行代替兩個元件。
 - **人工驗收（不可省略）**：實際建置並執行 Wails app，Spec 與 Plan 各做一次「輸入 → 儲存 → 重新開啟檔案確認內容」。可人工執行、不建整套 E2E 基建；**若無法執行則該項保留為未完成，不得以 jsdom 綠燈替代**。
 - **未接線掃描**：對本票新增的每個匯出符號與新動作，機械掃描其 production 呼叫端；零命中即視為未接線，不得標記完成（這是 grep，不是判斷）。
@@ -221,8 +221,103 @@
 
 - [ ] Gate A1a-1 與 Gate A1a-2 皆通過（拆票不要求兩個 PR，但兩票的證據需分別齊備）。
 
+## 十一、A1a-1 執行 checklist（rev6 新增；owner 2026-09-07 授權本機實作與驗證）
+
+**起點**：`main`＝`3ea31ea`，分支 `a1a/editor-sync` HEAD `7860d75`，工作樹乾淨。**授權範圍**：前端修改、`App.vue` 的寫入／bump 等待期間攔截、Go 訊息契約測試、plan rev6、本機測試與 build、mutation 驗證、一次實機 Wails 人工驗收。**不含** A1a-2、push、開 PR、遠端 CI、任何設定變更。
+
+### 11.1 expected-red 分類規則
+
+每個測試在實作前先於未修改的 production code 上執行，並依實際結果如實歸類：
+
+- **R（新增修正目標）**：必須**因該測試自己的目標斷言**而失敗。撞到其他 guard、setup 失敗或前置檢查失敗**不算**。
+- **G（既有行為保全／契約釘字）**：本來就會通過是正常的，**如實記錄為綠，不得刻意製造失敗**。
+- **M（混合）**：既有斷言綠、新增斷言紅；須指明哪一條斷言紅。
+- **編譯失敗、模組解析失敗或測試環境未就緒一律不算行為證據**，須修正後重跑再記錄。
+
+### 11.2 測試識別項目（30 項；13 Spec ＋ 16 Plan ＋ 1 Go）
+
+若實作時發現某項需展開為多個子案例，**在本節分別列出後重算總數**，不為符合數字新增測試。
+
+| # | 元件 | 測試 | 預期分類 |
+|---|---|---|---|
+| 1 | Spec | T1 輸入回寫 `fileContent`、dirty 為真 | R |
+| 2 | Spec | T4 存後重載（含重載前 `saved`／digest／dirty 斷言、送出非草稿萃取） | R |
+| 3 | Spec | T5-S 改回等於 `saved` → dirty 為假 | R |
+| 4 | Spec | T6-S 儲存中續打，成功後 `saved`＝送出內容 | R |
+| 5 | Spec | T7-S 儲存中封鎖再次儲存／接受草稿／切檔／切分頁 | R |
+| 6 | Spec | T8-S 過期世代回應丟棄 | R |
+| 7 | Spec | T8b-S A→B→A 舊世代丟棄 | R |
+| 8 | Spec | T8c-S 載入中暫停編輯 | R |
+| 9 | Spec | T9-S 衝突辨識、三者不變、不自動重載、dirty 依內容比較 | M |
+| 10 | Spec | T10-S 非衝突錯誤原訊息、不判為衝突、dirty 依內容比較 | M |
+| 11 | Spec | T14c `acceptDraft` 仍立即寫檔（接受前不寫） | **G** |
+| 12 | Spec | T14d `acceptDraft` 等待期間續打→內容保留、`saved`＝草稿 | R |
+| 13 | Spec | T14e `acceptDraft` 失敗→`saved`／digest 不變 | M |
+| 14 | Plan | T2 輸入回寫 `plan.currentContent`、dirty 為真 | R |
+| 15 | Plan | T3 存後重載（含重載前斷言） | R |
+| 16 | Plan | T5-P 改回等於 `saved` → dirty 為假 | R |
+| 17 | Plan | T6-P 儲存中續打，成功後 `saved`＝送出內容 | R |
+| 18 | Plan | T7-P 儲存中封鎖 | R |
+| 19 | Plan | T8-P 過期世代回應丟棄 | R |
+| 20 | Plan | T8b-P A→B→A 舊世代丟棄 | R |
+| 21 | Plan | T8c-P 載入中暫停編輯 | R |
+| 22 | Plan | T9-P 衝突（同 #9） | M |
+| 23 | Plan | T10-P 非衝突錯誤（同 #10） | M |
+| 24 | Plan | T14a `applyDraft`／`confirmBump` 只更新 buffer、不寫檔 | M |
+| 25 | Plan | T14b 套用結果等於 `saved` → dirty 為假 | R |
+| 26 | Plan | T14f bump 等待期間可打字、阻止切換；版本相符則套用並解封 | R |
+| 27 | Plan | T14g(a) 續打使 buffer 版本過期（**實際 `view.dispatch` 輸入**）→ 不套用、內容保留、專屬訊息、解封 | R |
+| 28 | Plan | T14g(b) 文件識別被替換（**測試注入**）→ 同上處置 | R |
+| 29 | Plan | T14h bump 後端真錯誤保留原訊息、解封 | M |
+| 30 | Go | T15 `ErrSpecWriteConflict`／`ErrPlanWriteConflict` 訊息含前端判別片語 | **G** |
+
+- [ ] 30 項全部完成 expected-red 分類並留下輸出
+
+### 11.3 Mutation 執行（31 項；`MU-guard-*` 8 項屬 A1a-2，不在本票）
+
+逐元件各算一項，每項留四格證據（套用＋hash 改變／紅在正題／還原 byte-identical／回綠）：
+
+- [ ] MU-input-S、MU-input-P
+- [ ] MU-send-S、MU-send-P
+- [ ] MU-dirty-S、MU-dirty-P
+- [ ] MU-saved-miss-S、MU-saved-miss-P
+- [ ] MU-saved-late-S、MU-saved-late-P
+- [ ] MU-lock-S、MU-lock-P
+- [ ] MU-gen-path-S、MU-gen-path-P
+- [ ] MU-gen-none-S、MU-gen-none-P
+- [ ] MU-load-edit-S、MU-load-edit-P
+- [ ] MU-conflict-all-S、MU-conflict-all-P
+- [ ] MU-conflict-digest-S、MU-conflict-digest-P
+- [ ] MU-fail-dirty-S、MU-fail-dirty-P
+- [ ] MU-draft-plan-P、MU-draft-dirty-P、MU-bump-ver-P、MU-bump-lock-P、MU-bump-msg-P
+- [ ] MU-draft-spec-S、MU-draft-spec-late-S
+
+### 11.4 人工 Wails 驗收（資料隔離）
+
+- [ ] 使用**專用暫存工作區與 fixture**，不得改動正式 `spec/`／`plan/` 內容、核可紀錄或既有使用者資料；驗收後不留殘檔
+- [ ] Spec 一次「輸入 → 儲存 → 重新開啟」通過並留操作紀錄
+- [ ] Plan 一次「輸入 → 儲存 → 重新開啟」通過並留操作紀錄
+- [ ] 未執行或無法執行即記為**未完成**，不得以 jsdom 綠燈替代
+
+### 11.5 失敗處置
+
+測試失敗一律**先分類**再處置：本票新行為缺陷／既有行為破壞／環境問題／`wall-clock-test-register.md` 已登記的既有不穩定測試（依該文件規則處理）。**不得以反覆執行取得綠燈代替判定**；契約回歸不得重跑吸收。
+
+### 11.6 執行順序
+
+- [ ] (1) 本節 checklist 落地（本 rev）
+- [ ] (2) expected-red：先寫測試並記錄分類
+- [ ] (3) 分段實作 T-1 → T-2 → T-3 → T-4，每段跑全套
+- [ ] (4) mutation 31 項 N/N
+- [ ] (5) 人工 Wails 驗收
+- [ ] (6) 回報 diff、測試／變異證據與人工驗收結果，等 owner 裁定是否進 A1a-2
+
+**範圍或估計超出核定（19.1 hr／1.91 pt）時先回報，不自行擴張。**
+
+
 ## 修訂記錄
 
+- rev6（2026-09-07）：實作啟動回填，設計不變——狀態改為 design gate APPROVED（綁定 `7860d75`）／A1a-1 實作進行中；新增第十一節執行 checklist（expected-red 分類規則、30 個測試識別項目與預期分類、31 項變異、人工驗收資料隔離、失敗分類、執行順序）；**測試計數更正 33 → 30**（13 Spec ＋ 16 Plan ＋ 1 Go；不為湊數新增測試）；**前端基準更正 397 → 399 條**（本機實測 40 檔／399 全綠）；**D5 可行性實測回填**——jsdom 下派發 `beforeinput`＋`input` 後 CM6 `doc` 未改變，`view.dispatch` 正常，故採退路並標明不涵蓋真實鍵盤事件層（證據 `/tmp/a1a-1/evidence/d5-spike.txt`）。
 - rev5（2026-09-07）：窄複核修正——契約第 7 條改為四條結束路徑。原文把「buffer 版本過期」與「文件識別被替換」一併歸為「正常 UI 已擋住、只以注入驗證」，但**等待期間允許打字，續打本身就會使 buffer 版本過期**，該狀態正常可達：(a) 續打造成的版本過期改以**實際編輯器輸入**驗證且續打內容須保留；(b) 只有文件識別被替換才用測試注入；(c) 未續打且版本相符則套用；(d) 真正的後端錯誤保留原訊息；四條路徑結束時一律解除操作封鎖並重算 dirty。feature 對應改為四條場景（33 → **34 個可執行案例**），沿用 T14f／T14g／T14h，未新增測試編號、未改架構、未重估。同批同步引用：A1a-1 分攤表 T14a–T14f → **T14a–T14h**、Gate A1a-1 的版本檢查由 T14f 改指 **T14g** 並納入 T14h、backlog 的 plan 引用改為 rev5。
 - rev4（2026-09-07）：窄幅一致性修正，設計選項不重開——(1) `confirmBump` 分為正常操作（可續打、阻止切檔／切分頁與衝突操作）與防禦性驗證（送出版本已過期只以測試注入驗證，不描述成 UI 可繞過），並規定本機判定過期時顯示「內容已變更，請重新預覽」、真正的後端錯誤保留原訊息（T14f／T14g／T14h、MU-bump-lock／MU-bump-ver／MU-bump-msg）；(2) 兩張圖改正：載入循序圖以 `alt` 區分過期丟棄與最新才更新（丟棄後不再順序畫更新），狀態圖補「Plan 套用結果等於 `saved` 留在 clean」與「Spec 自 clean 接受草稿進入寫入流程」，衝突與失敗改經 `recompute` 依內容比較決定 dirty（新增 MU-fail-dirty 與 T9／T10 的 dirty 斷言）；(3) D6 撤除「15 項」舊數字改指逐元件展開的實際清單；核定估點回填（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt），backlog rev31 同批更新 A 軌 41.6 hr／4.16 pt、合計 220.65 hr／22.07 pt。場景 31 → **33 個可執行案例**。
 - rev3（2026-09-07）：design gate 第二輪 CHANGES_REQUIRED 後修訂——(1) 草稿語意分流：Plan `applyDraft`／`confirmBump` 只更新 buffer 且結果等於 `saved` 時不標未儲存，**Spec `acceptDraft` 保留立即寫入**並納入送出快照與寫入互斥，明定接受時的 buffer 替換與等待期間新輸入的保留（feature、T14a–T14e、MU-draft-* 同步）；(2) 載入回應歸屬改為請求世代並補 A→B→A 案例與載入中暫停編輯，`confirmBump` 以「文件＋buffer 版本」檢查（第三節第 4、7 條；T8b／T8c／T14f、MU-gen-*／MU-load-edit／MU-bump-ver）；(3) T3／T4 補**重載前**的 `saved`／digest／dirty 斷言（避免重載重設 `saved` 掩蓋 MU-saved-miss）、切分頁補捨棄後成功導覽（T13b、MU-guard-block）、測試與變異表加「元件」欄並撤回「15 項」的預先固定（實際清單於各票執行 checklist 展開）；(4) D9 拆票通過並修正分攤——寫入期間封鎖（含其 `App.vue` 攔截點）與 MU-lock 留在 A1a-1，A1a-2 只負責非儲存期間導覽；新增 D10／D11 記錄第二輪裁定；場景 18 → **31 個可執行案例**；重估 21.6 → **25.6 hr**（A1a-1 19.1／1.91、A1a-2 6.5／0.65）；Gate 改為兩張子票各自驗收。
