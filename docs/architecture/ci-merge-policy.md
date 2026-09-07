@@ -1,6 +1,6 @@
 # CI 合併政策（`main` ruleset、required checks、維護程序）
 
-> 版本：v1.1（2026-09-07，owner 複核修正：§5 恢復基準改為「停用前、已核准的現行設定」而非建立時附錄；§7 重建改用最新核准的建立 payload；§1／§6 指向附錄 C；§9 register v8 標明待回填）；前版：v1（2026-09-07，B2b 落地：ruleset `22394412` 建立、repo 改為 rebase-only、enforcement 三狀態實證完成；plan `docs/superpowers/plans/2026-09-08-b2b-ruleset-enforcement.md`）
+> 版本：v1.2（2026-09-07，§9 量測出處改為 B2b-2 的規則：樣本自 ruleset 啟用後正常開發 PR 的合格 run 累積、受測版本指紋相同才混算、每組標 n；不再限定 `b2b/closure`）；前版：v1.1（2026-09-07，owner 複核修正：§5 恢復基準改為「停用前、已核准的現行設定」而非建立時附錄；§7 重建改用最新核准的建立 payload；§1／§6 指向附錄 C；§9 register v8 標明待回填）；前版：v1（2026-09-07，B2b 落地：ruleset `22394412` 建立、repo 改為 rebase-only、enforcement 三狀態實證完成；plan `docs/superpowers/plans/2026-09-08-b2b-ruleset-enforcement.md`）
 > 性質：**living 文件**。任何 ruleset 或 repo 合併設定的變更都必須在本文件留下「變更前後完整 JSON」與授權紀錄；設定本身在 GitHub，本文件是它的權威說明與稽核依據。
 > 讀者：對本 repo 有 push 或 admin 權限的人、以及代為操作 GitHub 設定的 agent。
 
@@ -73,7 +73,7 @@ required check 紅燈依 `docs/architecture/wall-clock-test-register.md` 規則 
 ## 9. 量測資料出處
 
 - probe 三狀態的 PR run 從建立到最後一個 job 結束：A 397 s、B 357 s、C 389 s（§附錄 C）。這三筆只是**補充耗時**，不納入 B2b (6) 的正式 n=5 樣本。
-- 正式樣本（`b2b/closure` PR 的前五次合格 pull_request run、D6 欄位）與五條具名測試的 `Elapsed` **待五樣本完成後**回寫於 `wall-clock-test-register.md` v8（本文件 v1.1 時 register 仍為 v7）；本文件不重複。
+- 正式樣本歸 backlog **B2b-2**（B2b plan rev6 D5／D6）：ruleset 啟用後任何正常開發 PR 的 `pull_request` run，attempt 1、`ci.yml` 與當時 main 相同、四個 required contexts 皆出現；保留 PR #3 的兩個 run 為樣本 1／2，後續按 run 建立時間選取，不回溯、不挑綠燈、不為取樣製造 PR 或 rerun。每樣本記錄**受測版本指紋**（`internal`／`testdata`／`go.mod`／`go.sum`／`frontend`／`ci.yml` 的 git hash），指紋相同者才混算、各組標自己的 n；npm cache hit 的樣本不稱為冷啟動。五條具名測試的 `Elapsed` 與 job 耗時分布由 B2b-2 在五個合格樣本固定後回寫 `wall-clock-test-register.md` v8（本文件 v1.2 時 register 仍為 v7）；本文件不重複。
 
 ---
 
@@ -142,5 +142,6 @@ GitHub 對缺席 required context 的實際呈現（狀態 B）：GraphQL `statu
 
 ## 修訂記錄
 
+- v1.2（2026-09-07）：§9 量測出處改為 B2b-2 規則（來源、選樣順序、受測版本指紋、分組各標 n、cache 語意），移除 `b2b/closure` 限定。
 - v1.1（2026-09-07）：owner 複核修正——§5 恢復基準改為停用前已核准的現行設定（核對設定欄位與有效規則，不要求時間戳欄位相同）；§7 重建改用最新核准 payload 並要求變更後同步更新 §1／§2／附錄 A；§1／§6 的「§7」更正為「附錄 C」；§9 register v8 標明待五樣本完成後回填、目前 v7。
 - v1（2026-09-07）：建立。§1–§9 依 B2b plan rev3 D4 (i)–(ix)；附錄 A／B 為 ruleset 建立與 repo PATCH 的實際 JSON；附錄 C 為 PR #2 三狀態實證。
