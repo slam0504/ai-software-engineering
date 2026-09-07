@@ -1,0 +1,31 @@
+sequenceDiagram
+  %% A1a：真實輸入 → 儲存 → 重載（含 digest 衝突分支）
+  actor U as 使用者
+  participant CM as CodeMirror EditorView
+  participant C as Workspace 元件（Spec／Plan）
+  participant B as 受控 buffer（Spec: local ref／Plan: plan store）
+  participant W as Wails binding（SpecWrite／PlanWrite）
+  participant FS as 磁碟（暫存檔＋rename）
+
+  U->>CM: 鍵入文字
+  CM->>C: updateListener（docChanged）
+  C->>B: 寫入目前 document（HEAD 現況：此線不存在）
+  C->>C: dirty ← (buffer ≠ baseline)
+
+  U->>C: 按下儲存
+  C->>W: write(rel, buffer, heldDigest)
+  W->>FS: 驗證 expectedDigest 後暫存檔＋rename
+  alt digest 相符
+    FS-->>W: 寫入完成
+    W-->>C: newDigest
+    C->>B: baseline ← buffer；heldDigest ← newDigest；dirty ← false
+  else digest 不符
+    W-->>C: ErrSpecWriteConflict／ErrPlanWriteConflict（跨邊界後僅為訊息字串）
+    C->>C: 依判別片語辨識為衝突（D2）；buffer、baseline、heldDigest 均不變
+  end
+
+  U->>C: 重新載入
+  C->>W: read(rel)
+  W-->>C: {content, digest}
+  C->>B: buffer ← content；baseline ← content；heldDigest ← digest
+  C->>CM: syncEditorDoc（buffer → editor，單向）
