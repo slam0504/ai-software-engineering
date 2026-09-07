@@ -36,7 +36,7 @@
 
 | # | 條目 | 狀態 | 重現指令 | 受測 SHA | 失敗形狀 | 重現計數 |
 |---|---|---|---|---|---|---|
-| C1 | `T8b-S：A→B→A——先前 A 回應延遲，經過 B 後回到 A，該延遲回應仍須丟棄`（`frontend/src/components/SpecWorkspace.test.ts`） | **候選**（待處置） | `npx vitest run src/components/SpecWorkspace.test.ts src/components/PlanWorkspace.test.ts -t "T8b-S"` | `2bd48902829899b4819560a2288c8ad1023a5346` | (i) 測試自身 fail-loud：`Error: CM6 view 未在 jsdom 下成功掛載——這是環境前置條件失敗，不是行為證據，應先修好再重跑`；(ii) `Test timed out in 5000ms` | 現行 HEAD **2/4 重現**（2026-09-07 16:2x）；同命令緊接著 4/4 未重現 → 間歇、疑與機器負載相關 |
+| C1 | `T8b-S：A→B→A——先前 A 回應延遲，經過 B 後回到 A，該延遲回應仍須丟棄`（`frontend/src/components/SpecWorkspace.test.ts`） | **候選**（待處置） | `npx vitest run src/components/SpecWorkspace.test.ts src/components/PlanWorkspace.test.ts -t "T8b-S"` | `2bd48902829899b4819560a2288c8ad1023a5346` | (i) 測試自身 fail-loud：`Error: CM6 view 未在 jsdom 下成功掛載——這是環境前置條件失敗，不是行為證據，應先修好再重跑`；(ii) `Test timed out in 5000ms` | 現行 HEAD **2/4 重現**（2026-09-07 16:2x）；同命令緊接著 4/4 未重現 → **間歇。原因未確認**（機器負載只是推測，未經實驗證實，不得寫成已確認原因） |
 
 **範圍**：A1a-1 於 `SpecWorkspace.test.ts`／`PlanWorkspace.test.ts` 新增的 CM6 相關測試（T1–T14 系列）皆可能落入同一機制；本表目前只具名有現行 HEAD 重現證據的 `T8b-S`，其餘依規則 3 不得直接視為名單成員。
 
@@ -47,7 +47,9 @@
 3. **全檔／全套的通過只能寫「這些批次未重現」**，不得寫成「已證明穩定」：實測 `SpecWorkspace`＋`PlanWorkspace` 全檔連跑 3 次皆 55/55、`PlanWorkspace` 單檔 3 次皆 37/37、全套 3 次皆 429/429——**這些批次未重現**。
 4. **待補**：現行 HEAD 的失敗**原文**尚未擷取（2/4 那次只記錄了訊息計數，未保存輸出）；失敗形狀取自 A1a-1 mutation 的紅燈日誌（較早 SHA）。補齊前本條維持「候選（待處置）」，不得升格。
 
-**與 A1a-1 mutation 證據的關係**：mutation 的紅在正題判定已排除本形狀——分類器對「CM6 未掛載／逾時」一律判 `ENV_FAIL`，不計為紅在正題；38 份紅燈日誌經複核皆為目標測試的斷言失敗。惟**多數紅燈日誌仍含 `getClientRects is not a function` 的 jsdom 量測 stderr 雜訊**（38 份中 35 份），該雜訊不是失敗原因。
+**與 A1a-1 mutation 證據的關係**：mutation 的紅在正題判定已排除本形狀——分類器對「CM6 未掛載／逾時」一律判 `ENV_FAIL`，不計為紅在正題；38 份紅燈日誌經複核皆為目標測試的斷言失敗。惟**多數紅燈日誌仍含 `getClientRects is not a function` 的 jsdom 量測 stderr 雜訊**（38 份中 **36 份**；不含的兩份是 `MU-nav-resubmit`／`MU-nav-filetree`，測 `App.test.ts`、不掛載 CM6），該雜訊不是失敗原因。
+
+**與 B2b-2 回填的關係**：B2b-2 的 register 回填（#2／#3／#6、F1／F2、規則 5）採用**回填當時的最新版本號**，與本段 C1 並存，**不得覆蓋或除名 C1**；C1 的狀態轉換只能由其自身的處置票決定。
 
 
 ## C. 規則
