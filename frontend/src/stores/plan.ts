@@ -11,6 +11,10 @@ interface State {
   currentPath: string
   currentContent: string
   currentDigest: string
+  // savedContent（A1a-1）：最近一次成功寫入所送出的內容——bufferDirty 由此與
+  // currentContent 的內容比較推導，取代舊有的手動旗標（PlanWorkspace.vue 不再
+  // 手動賦值 bufferDirty，改用 computed）。
+  savedContent: string
   drafts: Record<string, AssistDraft>
   errorEntries: ErrorEntry[]
 }
@@ -27,6 +31,7 @@ export const usePlan = defineStore('plan', {
     currentPath: '',
     currentContent: '',
     currentDigest: '',
+    savedContent: '',
     drafts: {},
     errorEntries: [],
   }),
@@ -52,6 +57,7 @@ export const usePlan = defineStore('plan', {
       this.currentPath = path
       this.currentContent = content
       this.currentDigest = digest
+      this.savedContent = content
     },
     // pushError／clearErrors 的 kind 參數（A2）：kind 讓呼叫端（PlanWorkspace 的
     // 各個寫入操作——save／submit／previewCommit／confirmCommit／createNewFile）

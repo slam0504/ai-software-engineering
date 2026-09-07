@@ -88,6 +88,14 @@ function onEscalate(payload: { sourceRef: string; blockScope: string }) {
 // mount。
 const escalationBadgeState = computed(() => escalationBadge(escalation.unavailable, escalation.unresolvedCount))
 const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'>('chat')
+// A1a-1：SpecWorkspace／PlanWorkspace 在 busyReason 變化時 emit('busy', ...)——
+// 寫入（save）／bump 進行中時不切換分頁，避免 v-if 把工作區元件連同進行中的寫入
+// 一起卸載。只加這個攔截點，不重構分頁 v-if 結構。
+const workspaceBusy = ref(false)
+function switchTab(next: typeof tab.value) {
+  if (workspaceBusy.value) return
+  tab.value = next
+}
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
 // 本身是常駐側欄，不是分頁，故「導航」在此語意上就是高亮＋不動 tab）。查不到對應
@@ -309,22 +317,22 @@ onMounted(async () => {
     <div class="body">
       <aside class="side">
         <div class="side-sessions"><SessionList /></div>
-        <div class="side-files"><FileTree @select="(p: string) => { selectedFile = p; tab = 'preview' }" /></div>
+        <div class="side-files"><FileTree @select="(p: string) => { selectedFile = p; switchTab('preview') }" /></div>
       </aside>
       <main>
         <nav>
-          <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">{{ t('app.tab.chat') }}</button>
-          <button :class="{ active: tab === 'preview' }" @click="tab = 'preview'">{{ t('app.tab.preview') }}</button>
-          <button :class="{ active: tab === 'spec' }" @click="tab = 'spec'">{{ t('app.tab.spec') }}</button>
-          <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">{{ t('app.tab.plan') }}</button>
-          <button :class="{ active: tab === 'diagram' }" @click="tab = 'diagram'">{{ t('app.tab.diagram') }}</button>
-          <button :class="{ active: tab === 'dag' }" @click="tab = 'dag'">{{ t('app.tab.dag') }}</button>
-          <button :class="{ active: tab === 'tca' }" @click="tab = 'tca'">{{ t('app.tab.tca') }}</button>
+          <button :class="{ active: tab === 'chat' }" @click="switchTab('chat')">{{ t('app.tab.chat') }}</button>
+          <button :class="{ active: tab === 'preview' }" @click="switchTab('preview')">{{ t('app.tab.preview') }}</button>
+          <button :class="{ active: tab === 'spec' }" @click="switchTab('spec')">{{ t('app.tab.spec') }}</button>
+          <button :class="{ active: tab === 'plan' }" @click="switchTab('plan')">{{ t('app.tab.plan') }}</button>
+          <button :class="{ active: tab === 'diagram' }" @click="switchTab('diagram')">{{ t('app.tab.diagram') }}</button>
+          <button :class="{ active: tab === 'dag' }" @click="switchTab('dag')">{{ t('app.tab.dag') }}</button>
+          <button :class="{ active: tab === 'tca' }" @click="switchTab('tca')">{{ t('app.tab.tca') }}</button>
         </nav>
         <DualPane v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
-        <SpecWorkspace v-if="tab === 'spec'" />
-        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" />
+        <SpecWorkspace v-if="tab === 'spec'" @busy="workspaceBusy = $event" />
+        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" @busy="workspaceBusy = $event" />
         <TcaWorkspace
           v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
           :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"

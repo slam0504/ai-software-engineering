@@ -9,6 +9,7 @@ import { useSession } from '../stores/session'
 import { useAssist } from '../stores/assist'
 import { extractGherkin } from '../lib/gherkin'
 import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
+import { isWriteConflict } from '../lib/writeConflict'
 
 const { t } = useI18n()
 
@@ -26,6 +27,7 @@ const props = defineProps<{
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
 }>()
+const emit = defineEmits<{ (e: 'busy', v: boolean): void }>()
 
 const s = useSession()
 const assist = useAssist()
@@ -37,6 +39,23 @@ const effectivePath = computed(() => props.path ?? selectedPath.value)
 const fileContent = ref('')
 const fileDigest = ref('')
 const loadError = ref('')
+
+// A1a-1 非同步儲存契約：savedContent＝最近一次成功寫入所送出的內容，
+// dirty＝buffer（fileContent，CM6 編輯器目前內容）與 saved 是否不同（純內容
+// 比較，不靠手動旗標）。busyReason 是寫入／載入互斥旗標，''｜'save'｜'load'｜
+// 'accept' 四態，同時驅動 [data-busy] 呈現與 [data-editing-suspended]。
+const savedContent = ref('')
+const dirty = computed(() => fileContent.value !== savedContent.value)
+const busyReason = ref<'' | 'save' | 'load' | 'accept'>('')
+const saveError = ref('')
+const saveConflict = ref(false)
+watch(busyReason, v => emit('busy', v !== ''))
+
+// loadGen：每次 loadFile() 呼叫遞增的載入世代——<script setup> 頂層程式碼每個
+// 元件實例各跑一次，這裡是「模組內」但屬於該實例，不會跨元件實例互相污染。
+// await 期間若世代已被更新的載入蓋過，回應到達時整筆丟棄（不寫 fileContent／
+// savedContent／fileDigest、不動編輯器、不清 busy——由「贏得世代」的那次載入
+// 自行清 busy）。
 
 const currentCorrelationId = ref<string | null>(null)
 const draftText = computed(() => props.draft ?? assist.draftOf(currentCorrelationId.value ?? '').text)
@@ -57,6 +76,7 @@ const commitError = ref('')
 
 const editorHost = ref<HTMLElement | null>(null)
 let cmView: { destroy(): void; dispatch(spec: unknown): void; state: { doc: { length: number } } } | null = null
+let loadGen = 0
 
 async function loadFileList() {
   try {
@@ -69,13 +89,20 @@ async function loadFileList() {
 async function loadFile() {
   loadError.value = ''
   if (!effectivePath.value) return
+  const gen = ++loadGen
+  busyReason.value = 'load'
   try {
     const sf = await SpecRead(effectivePath.value)
+    if (gen !== loadGen) return // 過期世代：整筆丟棄，不動 buffer／saved／digest／編輯器／busy
     fileContent.value = sf.content
+    savedContent.value = sf.content
     fileDigest.value = sf.digest
     syncEditorDoc()
+    busyReason.value = ''
   } catch (e) {
+    if (gen !== loadGen) return
     loadError.value = String(e)
+    busyReason.value = ''
   }
 }
 
@@ -92,7 +119,18 @@ async function initEditor() {
       import('@codemirror/state'),
     ])
     cmView = new EditorView({
-      state: EditorState.create({ doc: fileContent.value, extensions: [basicSetup] }),
+      state: EditorState.create({
+        doc: fileContent.value,
+        extensions: [
+          basicSetup,
+          // editor → buffer：唯一新增的同步方向。syncEditorDoc()（buffer → editor）
+          // 維持不變，兩者不會互相形成迴圈——docChanged 只在使用者輸入／外部
+          // dispatch 造成文件實際改變時觸發。
+          EditorView.updateListener.of(u => {
+            if (u.docChanged) fileContent.value = u.state.doc.toString()
+          }),
+        ],
+      }),
       parent: editorHost.value,
     })
   } catch (e) {
@@ -109,6 +147,9 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => cmView?.destroy())
 watch(() => props.path, () => {
+  // 寫入互斥（save／accept 進行中）才擋切檔——'load' busy 不擋：新的載入世代
+  // 本來就該蓋過舊的（見 loadFile 的 gen 丟棄邏輯），擋掉會讓過期載入卡死畫面。
+  if (busyReason.value === 'save' || busyReason.value === 'accept') return
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免 accept 把 A 的草稿寫進 B（見 fix round 1）
   void loadFile()
 })
@@ -121,6 +162,7 @@ function resetDraft() {
 }
 
 function selectFile(p: string) {
+  if (busyReason.value === 'save' || busyReason.value === 'accept') return
   selectedPath.value = p
   resetDraft()
   if (!props.path) void loadFile()
@@ -195,17 +237,49 @@ function checkOracleCoverage() {
 // draft 裡 ```gherkin/```feature（或退而求其次的通用 ``` code fence）的內容，
 // 不把 assistant 的整段 prose（例如「我沒辦法直接讀寫檔案…」）一起寫進 .feature。
 async function acceptDraft() {
+  if (busyReason.value !== '') return
   acceptError.value = ''
   const writer = props.write ?? SpecWrite
-  const content = extractGherkin(draftText.value)
+  fileContent.value = extractGherkin(draftText.value)
+  syncEditorDoc()
+  const P = { path: effectivePath.value, content: fileContent.value, digest: fileDigest.value }
+  busyReason.value = 'accept'
   try {
-    const newDigest = await writer(effectivePath.value, content, fileDigest.value)
+    const newDigest = await writer(P.path, P.content, P.digest)
+    savedContent.value = P.content // 送出時內容，不是回應到達當下的 fileContent（等待期間可能已續打）
     fileDigest.value = newDigest
-    fileContent.value = content
-    syncEditorDoc()
     currentCorrelationId.value = null
   } catch (e) {
+    // 失敗：savedContent／fileDigest 不變；fileContent 保留接受後（送出前）內容，
+    // 即使使用者等待期間又續打，續打結果也不還原——buffer 是使用者目前看到的
+    // 內容，不因失敗而回捲。
     acceptError.value = String(e)
+  } finally {
+    busyReason.value = ''
+  }
+}
+
+// saveFile：手動儲存——buffer（fileContent，CM6 目前內容）＋目前 digest 於按下當下
+// 凍結成送出快照 P，成功後 savedContent／fileDigest 更新為 P 的值（不是回應到達
+// 當下可能已被續打改變的 fileContent／fileDigest）；失敗三者皆不變、不自動重載。
+async function saveFile() {
+  if (busyReason.value !== '') return
+  saveError.value = '' // A2：新操作開始清同類舊 transient error（與 acceptDraft 一致）
+  saveConflict.value = false
+  const writer = props.write ?? SpecWrite
+  const P = { path: effectivePath.value, content: fileContent.value, digest: fileDigest.value }
+  busyReason.value = 'save'
+  try {
+    const newDigest = await writer(P.path, P.content, P.digest)
+    savedContent.value = P.content
+    fileDigest.value = newDigest
+    saveError.value = ''
+    saveConflict.value = false
+  } catch (e) {
+    saveError.value = String(e)
+    saveConflict.value = isWriteConflict(e)
+  } finally {
+    busyReason.value = ''
   }
 }
 
@@ -253,7 +327,7 @@ async function confirmCommit() {
 </script>
 
 <template>
-  <div class="spec-workspace">
+  <div class="spec-workspace" :data-busy="busyReason">
     <div class="new-file">
       <input v-model="newFilePath" data-test="new-file-path" :placeholder="t('newFile.path.placeholder')" />
       <button
@@ -269,8 +343,16 @@ async function confirmCommit() {
         @click="selectFile(f.path)">{{ f.name }}</button>
     </div>
 
-    <div ref="editorHost" class="editor" data-test="editor-host" />
+    <div
+      ref="editorHost" class="editor" data-test="editor-host"
+      :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
+    />
     <p v-if="loadError" class="err">{{ loadError }}</p>
+
+    <div class="save-area">
+      <button data-test="save" :disabled="busyReason !== '' || !dirty" @click="saveFile">{{ t('spec.action.save') }}</button>
+    </div>
+    <p v-if="saveError" class="err" data-test="save-error" :data-conflict="saveConflict ? 'true' : undefined">{{ saveError }}</p>
 
     <div class="assist-buttons">
       <button data-test="assist-draft" :disabled="assistBusy" @click="draftGherkin">{{ t('spec.action.draftGherkin') }}</button>

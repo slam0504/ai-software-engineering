@@ -142,6 +142,7 @@ export default {
       detectAmbiguity: 'Detect ambiguity',
       checkOracle: 'Oracle coverage check',
       acceptDraft: 'Accept',
+      save: 'Save',
       submit: 'Submit for Approval',
       previewCommit: 'Preview commit',
       confirmCommit: 'Confirm commit',
@@ -421,5 +422,6 @@ export default {
       confirm: 'Confirm update',
     },
     warning: 'Confirming means you have reviewed this code change and confirm the current plan still applies',
+    staleVersion: 'Content has changed — please re-run the preview',
   },
 }

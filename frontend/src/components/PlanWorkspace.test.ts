@@ -1,6 +1,8 @@
 import { flushPromises } from '@vue/test-utils'
+import type { VueWrapper } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EditorView } from '@codemirror/view'
 import PlanWorkspace from './PlanWorkspace.vue'
 import { usePlan } from '../stores/plan'
 import { mountWithI18n } from '../test/i18n'
@@ -410,5 +412,416 @@ describe('PlanWorkspace analysis_base bump 引導 UI', () => {
     expect(w.find('[data-test=bump-banner]').exists()).toBe(false)
     expect(w.find('[data-test=bump-no-bump-needed]').exists()).toBe(false)
     expect(usePlan().errors).toEqual([])
+  })
+})
+
+// A1a-1 expected-red 階段：非同步儲存契約（buffer／saved／digest／dirty 依內容比較、
+// data-busy、載入世代、confirmBump 四條結束路徑、樂觀鎖衝突）尚未實作，本 describe
+// 內的測試針對「將來會提供」的可觀察介面斷言——多數預期失敗（R），這是 TDD 紅燈階段
+// 的正常狀態。Plan 已有 [data-test=save] 按鈕與 bufferDirty 手動旗標，但 dirty 目前
+// 不是內容比較（見 PlanWorkspace.vue applyDraft／confirmBump／saveFile），部分測試
+// 因此仍可能通過（例如未涉及續打／世代競態的存後重載）——結果如實回報，不強行製造
+// 失敗。
+//
+// CM6 view 取得方式：同 SpecWorkspace.test.ts——用 @codemirror/view 匯出的
+// `EditorView.findFromDOM(dom)`（官方靜態方法）從 [data-test=editor-host] 反查目前
+// 掛載的 view instance，再用 `view.dispatch({changes})` 直接改動 CM6 文件（已實測
+// beforeinput／input 在 jsdom 下不會改變 CM6 文件）。
+async function flushEditor() {
+  await flushPromises()
+  await new Promise(r => setTimeout(r, 0))
+  await flushPromises()
+}
+
+function getView(w: VueWrapper<any>): EditorView {
+  const host = w.find('[data-test=editor-host]').element as HTMLElement
+  const view = EditorView.findFromDOM(host)
+  if (!view) throw new Error('CM6 view 未在 jsdom 下成功掛載——這是環境前置條件失敗，不是行為證據，應先修好再重跑')
+  return view
+}
+
+function typeText(view: EditorView, text: string) {
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } })
+}
+
+// makeFileStore：有狀態讀寫替身（in-memory），取代「手動安排 read 回傳值」的自己
+// 餵答案做法。write 用 digest 做樂觀鎖（不符即 reject 帶衝突訊息），成功時產生新
+// digest 並寫入內容；read 永遠回傳目前實際內容。用來證明「重載讀到的就是剛才
+// 寫進去的」，而不是測試自己安排好的答案。
+function makeFileStore(initial: Record<string, { content: string; digest: string }>) {
+  const store = new Map<string, { content: string; digest: string }>(Object.entries(initial))
+  let seq = 0
+  const read = vi.fn((path: string) => {
+    const entry = store.get(path)
+    return entry
+      ? Promise.resolve({ ...entry })
+      : Promise.reject(new Error(`makeFileStore: no such file ${path}`))
+  })
+  const write = vi.fn((path: string, content: string, expectedDigest: string) => {
+    const entry = store.get(path)
+    const currentDigest = entry?.digest ?? ''
+    if (expectedDigest !== currentDigest) {
+      return Promise.reject(new Error('plan write conflict: expected_digest does not match current file'))
+    }
+    seq += 1
+    const digest = `sha256:seq${seq}`
+    store.set(path, { content, digest })
+    return Promise.resolve(digest)
+  })
+  return { read, write }
+}
+
+describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.PlanList.mockResolvedValue([])
+    mocks.PlanRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('T2-P：編輯器文件改變→buffer 等於編輯器內容、dirty 為真', async () => {
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited content')
+    await flushPromises()
+
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeUndefined() // dirty 為真
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('plan/a.yaml', 'edited content', 'sha256:stub') // buffer 即送出內容
+  })
+
+  it('T3-P：存後重載——重載前 saved／digest／dirty 斷言', async () => {
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'plan a original content', digest: 'sha256:stub' },
+      'plan/b.yaml': { content: 'plan b content', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write: store.write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'plan a edited via real input') // 真實編輯器輸入，不是套用草稿
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    expect(store.write).toHaveBeenCalledWith('plan/a.yaml', 'plan a edited via real input', 'sha256:stub')
+    const newDigest = await store.write.mock.results[0].value // 替身實際回傳的新 digest
+    expect(usePlan().currentDigest).toBe(newDigest)
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // 重載前：saved==buffer→dirty 假
+
+    await w.setProps({ path: 'plan/b.yaml' }) // 切到別的檔，走替身 read
+    await flushEditor()
+    await w.setProps({ path: 'plan/a.yaml' }) // 切回來，走替身 read——讀到的必須是剛才寫入的內容
+    await flushEditor()
+
+    expect(getView(w).state.doc.toString()).toBe('plan a edited via real input') // 重載後文件等於已儲存內容
+  })
+
+  it('T5-P：編輯回原內容→dirty 為假', async () => {
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeUndefined() // 編輯後 dirty 真
+
+    typeText(view, '') // 改回原本 saved 內容（初始 content 為空字串）
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // 回到與 saved 相同→dirty 假
+  })
+
+  it('T6-P：儲存中續打——成功後 saved 為送出時內容，續打後仍 dirty', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'v1', write } })
+    await flushEditor()
+    await w.find('[data-test=apply-draft]').trigger('click') // buffer=v1，dirty 真
+    await w.find('[data-test=save]').trigger('click') // 送出 v1，尚未 resolve
+    expect(write).toHaveBeenCalledWith('plan/a.yaml', 'v1', 'sha256:stub')
+
+    const view = getView(w)
+    typeText(view, 'v2') // 儲存中續打
+    await flushPromises()
+    resolveWrite('sha256:v1')
+    await flushPromises()
+
+    // saved 應為送出時的內容 v1；目前 buffer 是 v2 → dirty 應為真
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('T7-P：儲存中封鎖——再次儲存／切檔皆不執行，data-busy 反映', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'v1', write } })
+    await flushEditor()
+    await w.find('[data-test=apply-draft]').trigger('click')
+    await w.find('[data-test=save]').trigger('click')
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(w.attributes('data-busy')).toBe('save')
+
+    await w.find('[data-test=save]').trigger('click') // 再次儲存
+    await w.setProps({ path: 'plan/b.yaml' }) // 切檔
+    await flushPromises()
+
+    expect(write).toHaveBeenCalledTimes(1) // 未再被呼叫
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 只有 mount 那次，切檔未觸發重載
+
+    resolveWrite('sha256:new')
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('')
+  })
+
+  it('T8-P：過期世代丟棄——切檔後先前的延遲回應到達時整筆丟棄', async () => {
+    // 先讓第一次載入正常完成，CM6 才會初始化（onMounted 內 initEditor 排在
+    // loadFile 之後，見 PlanWorkspace.vue）。
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const view = getView(w)
+
+    let resolveDelayed: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveDelayed = r }))
+    await w.setProps({ path: 'plan/delayed.yaml' }) // 觸發一次延遲載入
+    await flushPromises()
+
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'B content', digest: 'sha256:b' })
+    await w.setProps({ path: 'plan/b.yaml' }) // 切到 B（世代較新），B 立即 resolve
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('B content')
+
+    resolveDelayed({ content: 'STALE delayed content', digest: 'sha256:stale' }) // 過期回應現在才到
+    await flushPromises()
+    expect(view.state.doc.toString()).toBe('B content') // 過期回應被整筆丟棄，不覆蓋 B
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // 未被寫入→仍等於 saved(B)→dirty 假
+  })
+
+  it('T8b-P：A→B→A——先前 A 回應延遲，經過 B 後回到 A，該延遲回應仍須丟棄', async () => {
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/seed.yaml' } })
+    await flushEditor()
+    const view = getView(w)
+
+    const resolvers: Record<string, (v: { content: string; digest: string }) => void> = {}
+    mocks.PlanRead.mockImplementation((path: string) => new Promise(r => { resolvers[path] = r }))
+
+    await w.setProps({ path: 'plan/a.yaml' }) // 第一次選 A（延遲）
+    await flushPromises()
+    const firstAResolve = resolvers['plan/a.yaml']
+
+    await w.setProps({ path: 'plan/b.yaml' }) // 切到 B（延遲）
+    await flushPromises()
+    resolvers['plan/b.yaml']({ content: 'B content', digest: 'sha256:b' })
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('B content')
+
+    await w.setProps({ path: 'plan/a.yaml' }) // 再切回 A（新世代，延遲）
+    await flushPromises()
+    resolvers['plan/a.yaml']({ content: 'A content (second load)', digest: 'sha256:a2' }) // 第二次 A 的回應先到
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('A content (second load)')
+
+    firstAResolve({ content: 'STALE first A', digest: 'sha256:a-stale' }) // 第一次 A 的延遲回應現在才到
+    await flushPromises()
+    expect(view.state.doc.toString()).toBe('A content (second load)') // 不被第一次的過期回應覆蓋
+  })
+
+  it('T8c-P：載入中編輯器暫停——[data-test=editor-host] 帶 data-editing-suspended=true', async () => {
+    let resolveRead: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveRead = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushPromises()
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true')
+    resolveRead({ content: '', digest: 'sha256:stub' })
+    await flushEditor()
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
+  })
+
+  it('T9-P：衝突——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {
+    const write = vi.fn().mockRejectedValue(new Error('write conflict: expected_digest does not match current file'))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'v1', write } })
+    await flushEditor()
+    await w.find('[data-test=apply-draft]').trigger('click')
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    const err = w.find('[data-test=save-error]')
+    expect(err.exists()).toBe(true) // 目前錯誤只進 plan-errors，沒有專屬 save-error
+    expect(err.text()).toContain('write conflict: expected_digest does not match current file')
+    expect(err.attributes('data-conflict')).toBe('true')
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 未自動重新載入
+
+    const view = getView(w)
+    typeText(view, '') // 改回 saved 原內容（初始 content 為空字串）
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // dirty 依內容比較→假
+  })
+
+  it('T10-P：非衝突錯誤——原文顯示且無 data-conflict，三者不變，dirty 依內容比較', async () => {
+    const write = vi.fn().mockRejectedValue(new Error('boom: disk full'))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'v1', write } })
+    await flushEditor()
+    await w.find('[data-test=apply-draft]').trigger('click')
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    const err = w.find('[data-test=save-error]')
+    expect(err.exists()).toBe(true)
+    expect(err.text()).toContain('boom: disk full')
+    expect(err.attributes('data-conflict')).toBeUndefined()
+
+    const view = getView(w)
+    typeText(view, '')
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined()
+  })
+
+  it('T14a：confirmBump 只更新 buffer 與編輯器，不呼叫 PlanWrite，saved／digest 不變', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    const updated = 'plan_id: a\nanalysis_base_commit: "head111"\n'
+    mocks.ConfirmAnalysisBaseBump.mockResolvedValue(updated)
+    const write = vi.fn()
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click')
+    await flushPromises()
+
+    expect(write).not.toHaveBeenCalled()
+    expect(usePlan().currentDigest).toBe('sha256:stub') // digest 未變
+    const view = getView(w)
+    expect(view.state.doc.toString()).toBe(updated) // 編輯器也要反映（syncEditorDoc 已呼叫）
+  })
+
+  it('T14b：applyDraft 套用結果恰等於 saved 時→dirty 為假', async () => {
+    mocks.PlanRead.mockResolvedValue({ content: 'same content', digest: 'sha256:stub' })
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'same content' } })
+    await flushEditor()
+    await w.find('[data-test=apply-draft]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // 套用結果等於 saved→dirty 假
+  })
+
+  it('T14f：confirmBump 等待期間切檔被阻止，未續打且版本相符→套用結果並解除封鎖', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // 等待中，尚未 resolve
+
+    await w.setProps({ path: 'plan/b.yaml' }) // 切檔理應被阻止
+    await flushPromises()
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 未因切檔重新載入
+
+    resolveConfirm('plan_id: a\nanalysis_base_commit: "head111"\n')
+    await flushPromises()
+    expect(usePlan().currentContent).toBe('plan_id: a\nanalysis_base_commit: "head111"\n') // 版本相符→套用結果
+    expect(w.attributes('data-busy')).toBe('') // 解除封鎖
+  })
+
+  it('T14g(a)：confirmBump 等待期間續打使 buffer 版本過期→回應不套用、續打內容保留、data-stale=true', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // 等待中
+
+    const view = getView(w)
+    typeText(view, 'plan_id: a\nanalysis_base_commit: "old000"\nextra: line\n') // 續打使 buffer 版本過期
+    await flushPromises()
+
+    resolveConfirm('plan_id: a\nanalysis_base_commit: "head111"\n')
+    await flushPromises()
+
+    const err = w.find('[data-test=bump-error]')
+    expect(err.exists()).toBe(true) // 目前錯誤走 bump-confirm-error，非契約要求的 bump-error
+    expect(err.attributes('data-stale')).toBe('true')
+    expect(view.state.doc.toString()).toContain('extra: line') // 續打內容保留，回應不套用
+  })
+
+  it('T14g(b)：confirmBump 等待期間文件識別被替換→同版本過期處置', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockImplementation((path: string) =>
+      Promise.resolve(path === 'plan/a.yaml'
+        ? { content: bufferText, digest: 'sha256:stub' }
+        : { content: 'other file content', digest: 'sha256:other' }))
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // 針對 a 檔發起 confirmBump，尚未 resolve
+
+    // 注入：等待期間文件識別被替換。正常導覽（setProps／selectFile）在 bump 等待
+    // 期間已被封鎖（契約第 7 條），因此這條防禦性驗證直接改 store 的文件識別與
+    // buffer，不經被封鎖的導覽路徑。
+    usePlan().currentPath = 'plan/other.yaml'
+    usePlan().currentContent = 'other file content'
+    await flushPromises()
+
+    resolveConfirm('plan_id: a\nanalysis_base_commit: "head111"\n') // a 檔的回應現在才到
+    await flushPromises()
+
+    expect(usePlan().currentPath).toBe('plan/other.yaml') // 識別已替換
+    const err = w.find('[data-test=bump-error]')
+    expect(err.exists()).toBe(true)
+    expect(err.attributes('data-stale')).toBe('true')
+    expect(usePlan().currentContent).toBe('other file content') // 回應不得覆蓋目前（other）檔的 buffer
+  })
+
+  it('T14h：confirmBump 後端真正錯誤——原訊息保留在 bump-error 且無 data-stale，解除封鎖', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    mocks.ConfirmAnalysisBaseBump.mockRejectedValue(new Error('plan: bump: token expired'))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click')
+    await flushPromises()
+
+    const err = w.find('[data-test=bump-error]')
+    expect(err.exists()).toBe(true)
+    expect(err.text()).toContain('plan: bump: token expired')
+    expect(err.attributes('data-stale')).toBeUndefined()
+    expect(w.attributes('data-busy')).toBe('') // 解除封鎖
   })
 })

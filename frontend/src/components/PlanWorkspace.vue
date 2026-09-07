@@ -12,6 +12,7 @@ import { usePlan } from '../stores/plan'
 // domain 耦合（沿用既有、已測試涵蓋的 fence 擷取邏輯，不重複實作）。
 import { extractGherkin as extractDraftContent } from '../lib/gherkin'
 import { templateFor, inScope, PLAN_SCOPE_PATTERNS } from '../lib/planTemplates'
+import { isWriteConflict } from '../lib/writeConflict'
 
 const { t } = useI18n()
 
@@ -31,7 +32,10 @@ const props = defineProps<{
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
 }>()
-const emit = defineEmits<{ (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void }>()
+const emit = defineEmits<{
+  (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
+  (e: 'busy', v: boolean): void
+}>()
 
 const plan = usePlan()
 
@@ -58,8 +62,15 @@ const assistError = ref('')
 const provider = ref<'claude' | 'codex'>('claude')
 const promptInput = ref('')
 
-const bufferDirty = ref(false)
-const saveBusy = ref(false)
+// A1a-1 非同步儲存契約：bufferDirty 改為內容比較（plan.currentContent／
+// plan.savedContent），不再是手動旗標——applyDraft／confirmBump／saveFile 皆
+// 不再手動賦值。busyReason 是寫入互斥旗標，''｜'save'｜'load'｜'bump' 四態，
+// 同時驅動 [data-busy] 與 [data-editing-suspended]。
+const bufferDirty = computed(() => plan.currentContent !== plan.savedContent)
+const busyReason = ref<'' | 'save' | 'load' | 'bump'>('')
+const saveError = ref('')
+const saveConflict = ref(false)
+watch(busyReason, v => emit('busy', v !== ''))
 
 const planIdInput = ref('')
 
@@ -81,11 +92,16 @@ const commitBusy = ref(false)
 // 處理的問題（模板本就把這欄位留空，見 planTemplates.ts planSkeleton）。
 const bumpPreview = ref<main.BumpPreview | null>(null)
 const bumpPanelOpen = ref(false)
-const bumpConfirmBusy = ref(false)
 const bumpConfirmError = ref('')
+// bumpError／bumpStale（A1a-1）：confirmBump 四條結束路徑共用的新呈現點
+// （[data-test=bump-error][data-stale]）——與既有 bumpConfirmError／
+// [data-test=bump-confirm-error] 並存，既有測試依賴後者故不移除。
+const bumpError = ref('')
+const bumpStale = ref(false)
 
 const editorHost = ref<HTMLElement | null>(null)
 let cmView: { destroy(): void; dispatch(spec: unknown): void; state: { doc: { length: number } } } | null = null
+let loadGen = 0
 
 async function loadFileList() {
   try {
@@ -107,15 +123,20 @@ function deriveDefaultPlanId(path: string): string {
 async function loadFile() {
   loadError.value = ''
   if (!effectivePath.value) return
+  const gen = ++loadGen
+  busyReason.value = 'load'
   try {
     const pf = await PlanRead(effectivePath.value)
+    if (gen !== loadGen) return // 過期世代：整筆丟棄，不動 buffer／saved／digest／編輯器／busy
     plan.setCurrentFile(effectivePath.value, pf.content, pf.digest)
-    bufferDirty.value = false
     planIdInput.value = deriveDefaultPlanId(effectivePath.value)
     syncEditorDoc()
+    busyReason.value = ''
     await checkBump()
   } catch (e) {
+    if (gen !== loadGen) return
     loadError.value = String(e)
+    busyReason.value = ''
   }
 }
 
@@ -149,20 +170,39 @@ function resetBump() {
 // （brief：「要求重新預覽」）。
 async function confirmBump() {
   if (!bumpPreview.value || bumpPreview.value.no_bump_needed) return
-  bumpConfirmBusy.value = true
+  if (busyReason.value !== '') return
+  const frozen = { path: effectivePath.value, buf: plan.currentContent }
+  const token = bumpPreview.value.token
+  busyReason.value = 'bump'
+  bumpError.value = '' // A2：新操作開始清同類舊 transient error
+  bumpStale.value = false
   try {
-    const updated = await ConfirmAnalysisBaseBump(bumpPreview.value.token, effectivePath.value, plan.currentContent)
+    const updated = await ConfirmAnalysisBaseBump(token, frozen.path, frozen.buf)
+    if (effectivePath.value !== frozen.path || plan.currentPath !== frozen.path || plan.currentContent !== frozen.buf) {
+      // 版本過期：等待期間 buffer 續打或文件識別被替換，回應不套用——維持既有
+      // （文件識別同時比對 effectivePath 與 store 的 currentPath：currentContent
+      // 屬於 currentPath 那一份文件，只比內容不比它所屬路徑會漏掉識別已換的情形）
+      // 「要求重新預覽」流程刷新面板，原續打內容／目前檔案 buffer 不受影響。
+      bumpError.value = t('bump.staleVersion')
+      bumpStale.value = true
+      await checkBump({ keepConfirmError: true })
+      return
+    }
     bumpConfirmError.value = ''
+    bumpError.value = ''
+    bumpStale.value = false
     plan.currentContent = updated
-    bufferDirty.value = true
     syncEditorDoc()
     bumpPreview.value = null
     bumpPanelOpen.value = false
   } catch (e) {
+    // 後端真正 reject（token 過期／HEAD 變動等）：原訊息保留，不被版本過期訊息換掉。
+    bumpError.value = String(e)
+    bumpStale.value = false
     bumpConfirmError.value = String(e)
     await checkBump({ keepConfirmError: true })
   } finally {
-    bumpConfirmBusy.value = false
+    busyReason.value = ''
   }
 }
 
@@ -186,7 +226,17 @@ async function initEditor() {
       import('@codemirror/state'),
     ])
     cmView = new EditorView({
-      state: EditorState.create({ doc: plan.currentContent, extensions: [basicSetup] }),
+      state: EditorState.create({
+        doc: plan.currentContent,
+        extensions: [
+          basicSetup,
+          // editor → buffer：唯一新增的同步方向（同 SpecWorkspace）。syncEditorDoc()
+          // （buffer → editor）維持不變。
+          EditorView.updateListener.of(u => {
+            if (u.docChanged) plan.currentContent = u.state.doc.toString()
+          }),
+        ],
+      }),
       parent: editorHost.value,
     })
   } catch (e) {
@@ -221,6 +271,8 @@ onBeforeUnmount(() => {
 // 只要 path prop 還留著非空值，selectFile 點擊會被完全蓋掉——清單看起來能點，
 // 實際檔案永遠不換）。
 watch(() => props.path, (p) => {
+  // 寫入互斥（save／bump 進行中）才擋切檔——'load' busy 不擋，理由同 SpecWorkspace。
+  if (busyReason.value === 'save' || busyReason.value === 'bump') return
   if (p) selectedPath.value = p
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免套用草稿把 A 的草稿寫進 B（同 SpecWorkspace fix round 1）
   resetBump()
@@ -232,6 +284,7 @@ function resetDraft() {
 }
 
 function selectFile(p: string) {
+  if (busyReason.value === 'save' || busyReason.value === 'bump') return
   selectedPath.value = p
   resetDraft()
   resetBump()
@@ -304,26 +357,35 @@ async function runAssist() {
 function applyDraft() {
   const content = extractDraftContent(draftText.value)
   plan.currentContent = content
-  bufferDirty.value = true
   syncEditorDoc()
 }
 
-// saveFile：PlanWrite 樂觀鎖——buffer 內容＋目前 digest 送出，成功後用新 digest
-// 覆蓋，失敗（含 ErrPlanWriteConflict）原樣推進 plan.errors，不吞。
+// saveFile：PlanWrite 樂觀鎖——buffer（plan.currentContent，CM6 目前內容）＋目前
+// digest 於按下當下凍結成送出快照 P，成功後 plan.savedContent／plan.currentDigest
+// 更新為 P 的值（不是回應到達當下可能已被續打改變的內容）；失敗三者皆不變、
+// 不自動重載。
 async function saveFile() {
+  if (busyReason.value !== '') return
   const writer = props.write ?? PlanWrite
-  saveBusy.value = true
+  const P = { path: effectivePath.value, content: plan.currentContent, digest: plan.currentDigest }
+  busyReason.value = 'save'
   plan.clearErrors('save') // A2：新操作開始清同類（save）舊 transient error
+  saveError.value = '' // 同上，新的呈現點也要清
+  saveConflict.value = false
   try {
-    const newDigest = await writer(effectivePath.value, plan.currentContent, plan.currentDigest)
+    const newDigest = await writer(P.path, P.content, P.digest)
+    plan.savedContent = P.content
     plan.currentDigest = newDigest
-    bufferDirty.value = false
     plan.clearErrors('save') // A2：操作成功清該操作既有錯誤
+    saveError.value = ''
+    saveConflict.value = false
     await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
   } catch (e) {
     plan.pushError(String(e), 'save')
+    saveError.value = String(e)
+    saveConflict.value = isWriteConflict(e)
   } finally {
-    saveBusy.value = false
+    busyReason.value = ''
   }
 }
 
@@ -379,7 +441,7 @@ async function confirmCommit() {
 </script>
 
 <template>
-  <div class="plan-workspace">
+  <div class="plan-workspace" :data-busy="busyReason">
     <div class="new-file">
       <input v-model="newFilePath" data-test="new-file-path" :placeholder="t('newFile.path.placeholder')" />
       <button
@@ -395,7 +457,10 @@ async function confirmCommit() {
         @click="selectFile(f.path)">{{ f.name }}</button>
     </div>
 
-    <div ref="editorHost" class="editor" data-test="editor-host" />
+    <div
+      ref="editorHost" class="editor" data-test="editor-host"
+      :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
+    />
     <p v-if="loadError" class="err">{{ loadError }}</p>
 
     <div class="assist-area">
@@ -415,10 +480,11 @@ async function confirmCommit() {
     </div>
 
     <div class="save-area">
-      <button data-test="save" :disabled="saveBusy || !bufferDirty" @click="saveFile">{{ t('planWorkspace.action.save') }}</button>
+      <button data-test="save" :disabled="busyReason !== '' || !bufferDirty" @click="saveFile">{{ t('planWorkspace.action.save') }}</button>
     </div>
+    <p v-if="saveError" class="err" data-test="save-error" :data-conflict="saveConflict ? 'true' : undefined">{{ saveError }}</p>
 
-    <div v-if="bumpPreview || bumpConfirmError" class="bump-area">
+    <div v-if="bumpPreview || bumpConfirmError || bumpError" class="bump-area">
       <div v-if="bumpPreview && bumpPreview.no_bump_needed" class="bump-no-bump-needed" data-test="bump-no-bump-needed">
         {{ t('bump.noBumpNeeded') }}
       </div>
@@ -440,13 +506,16 @@ async function confirmCommit() {
         </ul>
         <p class="bump-warning" data-test="bump-warning">{{ t('bump.warning') }}</p>
         <button type="button" data-test="bump-rerun-assist" @click="onBumpRerunAssist">{{ t('bump.action.rerunAssist') }}</button>
-        <button type="button" data-test="bump-confirm" :disabled="bumpConfirmBusy" @click="confirmBump">{{ t('bump.action.confirm') }}</button>
+        <button type="button" data-test="bump-confirm" :disabled="busyReason !== ''" @click="confirmBump">{{ t('bump.action.confirm') }}</button>
       </div>
       <!-- bumpConfirmError 獨立於面板外層——Confirm 失敗後觸發的重新預覽
            （checkBump keepConfirmError）若把狀態翻成 no_bump_needed 或本身也
            失敗（bumpPreview 變 null），錯誤訊息仍要留著，不能因為面板收合／
            消失就跟著靜默不見（Fail Loud）。 -->
       <p v-if="bumpConfirmError" class="err" data-test="bump-confirm-error">{{ bumpConfirmError }}</p>
+      <!-- bumpError／bumpStale（A1a-1）：confirmBump 四條結束路徑共用的呈現點，
+           與上面既有的 bumpConfirmError 並存（既有測試依賴後者，不移除）。 -->
+      <p v-if="bumpError" class="err" data-test="bump-error" :data-stale="bumpStale ? 'true' : undefined">{{ bumpError }}</p>
     </div>
 
     <div class="approval">

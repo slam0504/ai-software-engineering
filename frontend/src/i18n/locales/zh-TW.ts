@@ -142,6 +142,7 @@ export default {
       detectAmbiguity: '檢查規格歧義',
       checkOracle: '檢查驗收條件涵蓋度',
       acceptDraft: '套用草稿',
+      save: '儲存',
       submit: '送核',
       previewCommit: '預覽 commit',
       confirmCommit: '建立 commit',
@@ -421,5 +422,6 @@ export default {
       confirm: '確認更新',
     },
     warning: '更新代表你已檢視這段 code 變更，並確認現有計畫仍適用',
+    staleVersion: '內容已變更，請重新預覽',
   },
 }
