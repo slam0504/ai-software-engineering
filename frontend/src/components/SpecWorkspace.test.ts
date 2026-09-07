@@ -1,6 +1,8 @@
 import { flushPromises } from '@vue/test-utils'
+import type { VueWrapper } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EditorView } from '@codemirror/view'
 import SpecWorkspace from './SpecWorkspace.vue'
 import { useAssist } from '../stores/assist'
 import { mountWithI18n } from '../test/i18n'
@@ -44,7 +46,7 @@ describe('SpecWorkspace draft accept', () => {
     host.remove()
   }, 30_000)
 
-  it('accept writes draft via SpecWrite, not before', async () => {
+  it('T14c：accept writes draft via SpecWrite, not before（既有測試，預期本來就綠）', async () => {
     const write = vi.fn().mockResolvedValue('sha256:x')
     const w = mountWithI18n(SpecWorkspace, { props: {
       path: 'spec/glossary.md', draft: 'AI draft content', write,
@@ -159,5 +161,317 @@ describe('SpecWorkspace 新增檔案', () => {
 
     expect(w.find('[data-test=new-file-error]').text()).toContain('write conflict: expected_digest does not match current file')
     expect(mocks.SpecList).toHaveBeenCalledTimes(1) // 只有 mount 那次，失敗後不重載
+  })
+})
+
+// A1a-1 expected-red 階段：非同步儲存契約（buffer／saved／digest／dirty／data-busy／
+// 載入世代／樂觀鎖衝突）尚未實作，本 describe 內的測試針對「將來會提供」的可觀察介面
+// 斷言——現在大多預期失敗（R），這是 TDD 紅燈階段的正常狀態，不是測試寫錯。
+//
+// CM6 view 取得方式：production 沒有把 view 掛在任何可從外部拿到的地方，且不得為了
+// 測試新增這種介面（不得改 production code）。改用 @codemirror/view 匯出的
+// `EditorView.findFromDOM(dom)`（CM6 官方 API，靜態方法，逐一在內部登記表用 WeakMap
+// 記錄「DOM 元素 → view instance」，見其原始實作）從 [data-test=editor-host] 反查
+// 目前掛載的 view instance，取得後即可用 `view.dispatch({changes})` 直接改動 CM6
+// 文件（已實測 beforeinput／input 不會改變 CM6 文件，dispatch 是唯一可靠手段）。
+//
+// flushEditor：CM6 是動態 import()（`await Promise.all([import('codemirror'), ...])`），
+// 光呼叫 flushPromises() 不足以讓它 resolve——已實測需要至少一次真正的 macrotask
+// （setTimeout(0)）才會讓 dynamic import 完成，純 microtask flush 對它沒用。
+async function flushEditor() {
+  await flushPromises()
+  await new Promise(r => setTimeout(r, 0))
+  await flushPromises()
+}
+
+function getView(w: VueWrapper<any>): EditorView {
+  const host = w.find('[data-test=editor-host]').element as HTMLElement
+  const view = EditorView.findFromDOM(host)
+  if (!view) throw new Error('CM6 view 未在 jsdom 下成功掛載——這是環境前置條件失敗，不是行為證據，應先修好再重跑')
+  return view
+}
+
+function typeText(view: EditorView, text: string) {
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } })
+}
+
+// makeFileStore：有狀態讀寫替身（in-memory），取代「手動安排 read 回傳值」的自己
+// 餵答案做法。write 用 digest 做樂觀鎖（不符即 reject 帶衝突訊息），成功時產生新
+// digest 並寫入內容；read 永遠回傳目前實際內容。用來證明「重載讀到的就是剛才
+// 寫進去的」，而不是測試自己安排好的答案。
+function makeFileStore(initial: Record<string, { content: string; digest: string }>) {
+  const store = new Map<string, { content: string; digest: string }>(Object.entries(initial))
+  let seq = 0
+  const read = vi.fn((path: string) => {
+    const entry = store.get(path)
+    return entry
+      ? Promise.resolve({ ...entry })
+      : Promise.reject(new Error(`makeFileStore: no such file ${path}`))
+  })
+  const write = vi.fn((path: string, content: string, expectedDigest: string) => {
+    const entry = store.get(path)
+    const currentDigest = entry?.digest ?? ''
+    if (expectedDigest !== currentDigest) {
+      return Promise.reject(new Error('path write conflict: expected_digest does not match current file'))
+    }
+    seq += 1
+    const digest = `sha256:seq${seq}`
+    store.set(path, { content, digest })
+    return Promise.resolve(digest)
+  })
+  return { read, write }
+}
+
+// mustFind：Spec 目前沒有 [data-test=save] 等契約要求的元素，直接 .trigger() 在
+// 找不到的 wrapper 上會丟出 VTU 內部錯誤、訊息不易讀。先用明確的 exists 斷言讓
+// 「這個契約要求的介面還沒做」這件事本身就是最先失敗、訊息最清楚的那一條。
+function mustFind(w: VueWrapper<any>, selector: string) {
+  const el = w.find(selector)
+  expect(el.exists(), `找不到 ${selector}——尚未實作（expected-red）`).toBe(true)
+  return el
+}
+
+describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('T1：編輯器文件改變→buffer 等於編輯器內容、dirty 為真', async () => {
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited content')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // dirty 為真
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'edited content', 'sha256:stub') // buffer 即送出內容
+  })
+
+  it('T4：存後重載——重載前 saved／digest／dirty 斷言，送出內容非草稿萃取結果', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: '', digest: 'sha256:stub' },
+      'spec/b.feature': { content: 'spec b content', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write: store.write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, '```gherkin\nFeature: raw edit\n```') // 直接編輯，非透過 acceptDraft
+    await flushPromises()
+
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    // 重載前斷言：送出的是編輯器原始內容（含 fence），不是 extractGherkin 萃取結果
+    expect(store.write).toHaveBeenCalledWith('spec/a.feature', '```gherkin\nFeature: raw edit\n```', 'sha256:stub')
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // saved==buffer→dirty 假
+
+    await w.setProps({ path: 'spec/b.feature' }) // 切到別的檔，走替身 read
+    await flushEditor()
+    await w.setProps({ path: 'spec/a.feature' }) // 切回來，走替身 read——讀到的必須是剛才寫入的內容
+    await flushEditor()
+
+    expect(getView(w).state.doc.toString()).toBe('```gherkin\nFeature: raw edit\n```') // 重載後文件等於先前儲存內容
+  })
+
+  it('T5-S：編輯回原內容→dirty 為假', async () => {
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // 編輯後 dirty 真
+
+    typeText(view, '') // 改回原本 saved 內容（初始 content 為空字串）
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // 回到與 saved 相同→dirty 假
+  })
+
+  it('T6-S：儲存中續打——成功後 saved 為送出時內容，續打後仍 dirty', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'v1')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click') // 送出 v1，尚未 resolve
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'v1', 'sha256:stub')
+
+    typeText(view, 'v2') // 儲存中續打
+    await flushPromises()
+    resolveWrite('sha256:v1')
+    await flushPromises()
+
+    // saved 應為送出時的內容 v1；目前 buffer 是 v2 → dirty 應為真
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('T7-S：儲存中封鎖——再次儲存／接受草稿／切檔皆不執行，data-busy 反映', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'v1')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(w.attributes('data-busy')).toBe('save')
+
+    await mustFind(w, '[data-test=save]').trigger('click') // 再次儲存
+    await mustFind(w, '[data-test=accept-draft]').trigger('click') // 接受草稿
+    await w.setProps({ path: 'spec/b.feature' }) // 切檔
+    await flushPromises()
+
+    expect(write).toHaveBeenCalledTimes(1) // 未再被呼叫
+    expect(mocks.SpecRead).toHaveBeenCalledTimes(1) // 只有 mount 那次，切檔未觸發重載
+
+    resolveWrite('sha256:new')
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('')
+  })
+
+  it('T8-S：過期世代丟棄——切檔後先前的延遲回應到達時整筆丟棄', async () => {
+    // 先讓第一次載入正常完成，CM6 才會初始化（onMounted 內 initEditor 排在
+    // loadFile 之後，見 SpecWorkspace.vue）——用一個「已完成」的初始載入建立
+    // 可觀察的 view，再另外製造一次延遲載入來測世代丟棄，避免把「CM6 尚未就緒」
+    // 和「過期世代該不該套用」這兩件事混在一起斷言。
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushEditor()
+    const view = getView(w)
+
+    let resolveDelayed: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead.mockImplementationOnce(() => new Promise(r => { resolveDelayed = r }))
+    await w.setProps({ path: 'spec/delayed.feature' }) // 觸發一次延遲載入
+    await flushPromises()
+
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'B content', digest: 'sha256:b' })
+    await w.setProps({ path: 'spec/b.feature' }) // 切到 B（世代較新），B 立即 resolve
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('B content')
+
+    resolveDelayed({ content: 'STALE delayed content', digest: 'sha256:stale' }) // 過期回應現在才到
+    await flushPromises()
+    expect(view.state.doc.toString()).toBe('B content') // 過期回應被整筆丟棄，不覆蓋 B
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // 未被寫入→仍等於 saved(B)→dirty 假
+  })
+
+  it('T8b-S：A→B→A——先前 A 回應延遲，經過 B 後回到 A，該延遲回應仍須丟棄', async () => {
+    // 同 T8-S：先用一次立即完成的初始載入讓 CM6 就緒，再開始 A→B→A 的世代競態。
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/seed.feature' } })
+    await flushEditor()
+    const view = getView(w)
+
+    const resolvers: Record<string, (v: { content: string; digest: string }) => void> = {}
+    mocks.SpecRead.mockImplementation((path: string) => new Promise(r => { resolvers[path] = r }))
+
+    await w.setProps({ path: 'spec/a.feature' }) // 第一次選 A（延遲）
+    await flushPromises()
+    const firstAResolve = resolvers['spec/a.feature']
+
+    await w.setProps({ path: 'spec/b.feature' }) // 切到 B（延遲）
+    await flushPromises()
+    resolvers['spec/b.feature']({ content: 'B content', digest: 'sha256:b' })
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('B content')
+
+    await w.setProps({ path: 'spec/a.feature' }) // 再切回 A（新世代，延遲）
+    await flushPromises()
+    resolvers['spec/a.feature']({ content: 'A content (second load)', digest: 'sha256:a2' }) // 第二次 A 的回應先到
+    await flushEditor()
+    expect(view.state.doc.toString()).toBe('A content (second load)')
+
+    firstAResolve({ content: 'STALE first A', digest: 'sha256:a-stale' }) // 第一次 A 的延遲回應現在才到
+    await flushPromises()
+    expect(view.state.doc.toString()).toBe('A content (second load)') // 不被第一次的過期回應覆蓋
+  })
+
+  it('T8c-S：載入中編輯器暫停——[data-test=editor-host] 帶 data-editing-suspended=true', async () => {
+    let resolveRead: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead.mockImplementationOnce(() => new Promise(r => { resolveRead = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushPromises()
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBe('true')
+    resolveRead({ content: '', digest: 'sha256:stub' })
+    await flushEditor()
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
+  })
+
+  it('T9-S：衝突——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {
+    const write = vi.fn().mockRejectedValue(new Error('write conflict: expected_digest does not match current file'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    const err = mustFind(w, '[data-test=save-error]')
+    expect(err.text()).toContain('write conflict: expected_digest does not match current file')
+    expect(err.attributes('data-conflict')).toBe('true')
+    expect(mocks.SpecRead).toHaveBeenCalledTimes(1) // 未自動重新載入
+
+    typeText(view, '') // 等待期間（此時已回應）把內容改回 saved 原內容
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save-error]').exists()).toBe(true) // 錯誤仍顯示
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // dirty 依內容比較→假
+  })
+
+  it('T10-S：非衝突錯誤——原文顯示且無 data-conflict，三者不變，dirty 依內容比較', async () => {
+    const write = vi.fn().mockRejectedValue(new Error('boom: disk full'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    const err = mustFind(w, '[data-test=save-error]')
+    expect(err.text()).toContain('boom: disk full')
+    expect(err.attributes('data-conflict')).toBeUndefined()
+
+    typeText(view, '')
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined()
+  })
+
+  it('T14d：acceptDraft 等待期間續打——回應後 buffer 是續打內容、saved 是草稿內容→dirty 為真', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    await mustFind(w, '[data-test=accept-draft]').trigger('click') // 接受草稿：buffer 先被替換為草稿萃取結果並送出
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'AI draft', 'sha256:stub')
+
+    const view = getView(w)
+    typeText(view, 'continued typing after accept') // 等待期間續打
+    await flushPromises()
+    resolveWrite('sha256:accepted')
+    await flushPromises()
+
+    // 回應後：buffer 是續打內容，saved 是草稿內容（AI draft）→ 兩者不同 → dirty 為真
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('T14e：acceptDraft 失敗——saved／digest 不變、buffer 保留接受後內容', async () => {
+    const write = vi.fn().mockRejectedValue(new Error('boom'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    await mustFind(w, '[data-test=accept-draft]').trigger('click')
+    await flushPromises()
+
+    const view = getView(w)
+    expect(view.state.doc.toString()).toBe('AI draft') // buffer（編輯器內容）保留接受後內容，即使失敗
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // buffer≠saved(原內容'')→ dirty 真
   })
 })
