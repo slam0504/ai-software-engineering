@@ -54,7 +54,21 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
     Given 我選取檔案一，其載入回應被延遲
     When 我在回應到達前改為選取檔案二，且檔案二已完成載入
     And 檔案一的載入回應才到達
-    Then 編輯器內容、受控 buffer、已儲存快照與持有的 digest 仍屬於檔案二
+    Then 該回應因請求世代已過期而被整筆丟棄
+    And 編輯器內容、受控 buffer、已儲存快照與持有的 digest 仍屬於檔案二
+
+  Scenario: 同一檔案的舊世代回應不得覆蓋最新一次載入
+    Given 我選取檔案一，其載入回應被延遲
+    And 我改為選取檔案二，再改回選取檔案一，最後這次載入已完成
+    When 第一次選取檔案一的延遲回應才到達
+    Then 該回應因請求世代已過期而被整筆丟棄，即使它的路徑與目前檔案相同
+    And 編輯器內容為最後一次載入的結果
+
+  Scenario: 載入進行中不得讓回應覆蓋新輸入
+    Given 我選取一個檔案，其載入尚未回應
+    Then 編輯在該次載入回應前為暫停狀態
+    When 該次載入回應且屬於最新世代
+    Then 編輯恢復，且編輯器內容為該次載入的結果
 
   Scenario: 儲存失敗——digest 衝突
     Given 我使編輯器文件改變
@@ -104,9 +118,58 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
       | plan      | 檔案樹選取     |
       | plan      | 重新送核導向   |
 
-  Scenario: 套用草稿與 bump 後三者同步
-    Given 我使編輯器文件改變，該檔顯示為未儲存
+  Scenario Outline: 選擇捨棄後導覽到正確目標——<workspace>／<entry>
+    Given 我在 <workspace> 編輯器中使文件改變，該檔顯示為未儲存
+    When 我以 <entry> 觸發離開目前工作區
+    And 我選擇捨棄
+    Then 導覽完成並到達該入口指定的目標
+    And 原未儲存內容不再保留
+
+    Examples:
+      | workspace | entry          |
+      | spec      | 分頁按鈕       |
+      | spec      | 檔案樹選取     |
+      | spec      | 重新送核導向   |
+      | plan      | 分頁按鈕       |
+      | plan      | 檔案樹選取     |
+      | plan      | 重新送核導向   |
+
+  Scenario: Plan 套用草稿或確認 bump——只更新 buffer，不寫檔
+    Given 我在 plan 編輯器中使文件改變
     When 我套用 AI 草稿或確認 analysis_base bump
     Then 編輯器內容與受控 buffer 更新為該操作的結果
-    And 該檔顯示為未儲存，直到我按下儲存為止
-    And 持有的 digest 與已儲存快照只在寫入成功後才更新
+    And 該次操作不寫入磁碟，已儲存快照與持有的 digest 都不變
+    And 未儲存狀態依內容比較決定——結果與已儲存快照不同才是未儲存
+
+  Scenario: Plan 操作結果恰等於已儲存快照時不算未儲存
+    Given 我在 plan 編輯器中使文件改變，該檔顯示為未儲存
+    When 我套用的草稿內容恰好與已儲存快照完全相同
+    Then 該檔不顯示為未儲存
+
+  Scenario: Spec 接受草稿——立即寫入並更新快照
+    Given spec 工作區有一份 AI 草稿，且草稿在我按下接受前不會被寫入磁碟
+    When 我按下接受草稿
+    Then 受控 buffer 先被替換為草稿萃取結果，該內容即為此次寫入的送出快照
+    And 該次寫入納入寫入互斥，等待期間不得再次儲存或接受、不得切檔或切分頁
+    And 寫入成功後已儲存快照更新為送出的草稿內容，持有的 digest 更新為新值
+
+  Scenario: Spec 接受草稿等待期間的新輸入不被丟棄
+    Given 我按下接受草稿，該次寫入尚未回應
+    When 我在等待期間繼續編輯內容
+    And 該次寫入成功回應
+    Then 受控 buffer 仍是我等待期間編輯後的內容
+    And 已儲存快照為送出的草稿內容，因此該檔仍顯示為未儲存
+
+  Scenario: Spec 接受草稿失敗不更新快照
+    Given 我按下接受草稿
+    When 該次寫入失敗
+    Then 已儲存快照與持有的 digest 都不變
+    And 受控 buffer 保留接受草稿後的內容，錯誤依其種類呈現
+
+  Scenario: bump 確認回應不得覆蓋等待期間的新編輯或新檔案
+    Given 我在 plan 確認 analysis_base bump，該次回應尚未到達
+    And 該次確認送出時已凍結當時的 buffer 版本
+    When 我在等待期間編輯內容或切換到另一個檔案
+    And 該次確認的回應才到達
+    Then 回應因文件或 buffer 版本已改變而不被套用
+    And 系統要求重新預覽，不覆蓋目前編輯器內容
