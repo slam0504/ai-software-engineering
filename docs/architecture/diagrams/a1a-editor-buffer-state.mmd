@@ -1,18 +1,25 @@
 stateDiagram-v2
-  %% A1a：受控 buffer 的儲存狀態機（單一檔案的生命週期）
-  %% baseline＝載入時的內容快照；dirty 判定＝buffer ≠ baseline（見 plan D4）
+  %% A1a rev2：單一檔案的儲存狀態機
+  %% saved＝已儲存快照（最近一次成功寫入所「送出」的內容），載入成功時等於磁碟內容
+  %% dirty 判定＝buffer ≠ saved（內容比較，D4）
   [*] --> empty
-  empty --> clean : loadFile 成功（buffer＝baseline＝磁碟內容，持有 digest）
-  clean --> dirty : 編輯器真實輸入（updateListener → buffer）
-  dirty --> clean : 輸入使 buffer 回到 baseline（內容相等）
-  dirty --> saving : 按下儲存（送出 buffer＋持有的 digest）
-  saving --> clean : 寫入成功（digest ← newDigest，baseline ← buffer）
-  saving --> conflict : ErrSpecWriteConflict／ErrPlanWriteConflict
-  saving --> dirty : 其他寫入錯誤（原樣揭露，buffer 與 digest 皆不變）
-  conflict --> dirty : 使用者確認錯誤（buffer 保留，digest 仍為過期值）
-  clean --> empty : 切檔／卸載
-  dirty --> guard : 切檔／切分頁（D3）
-  guard --> dirty : 選擇保留（停留原檔）
+  empty --> clean : loadFile 成功且回應仍屬目前選取的檔案<br/>（buffer＝saved＝磁碟內容，持有 digest）
+  empty --> empty : 延遲的 loadFile 回應屬於已被取代的檔案 → 整筆丟棄
+  clean --> dirty : 編輯器文件改變（updateListener → buffer）
+  dirty --> clean : buffer 被改回等於 saved
+  dirty --> saving : 按下儲存（凍結該次 path／content／digest 為送出快照 P）
+  saving --> saving : 期間可繼續輸入（buffer 改變，但 P 不變）
+  saving --> settled : 寫入成功（saved ← P.content；digest ← newDigest）
+  settled --> clean : buffer 等於 saved
+  settled --> dirty : buffer 不等於 saved（等待期間輸入的內容仍未儲存）
+  saving --> conflict : sentinel 判為 digest 衝突
+  saving --> failed : 非衝突錯誤（原訊息保留）
+  conflict --> dirty : buffer、saved、digest 皆不變；不自動重新載入
+  failed --> dirty : buffer、saved、digest 皆不變
+  clean --> empty : 切檔／離開工作區
+  dirty --> guard : 切檔／切分頁／其他替換內容的入口（D3）
+  guard --> dirty : 選擇保留（停留原檔，新檔不載入）
   guard --> empty : 選擇捨棄
-  note right of conflict : A1a 只保證「衝突可被辨識並揭露」；<br/>reload／compare／保留本地的選擇流程屬 A1b
-  note right of saving : 送出的必須是 buffer 目前值；<br/>HEAD 現況送出的是 baseline（缺陷所在）
+  note right of saving : 期間封鎖：再次儲存、切檔、切分頁、<br/>套用草稿／bump 等會替換內容的操作
+  note right of settled : 過渡狀態，只做 saved／digest 更新；<br/>不得以「回應到達當下的 buffer」當作已儲存
+  note right of guard : 選擇前工作區元件不得被切走或卸載
