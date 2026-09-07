@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 本票的外部寫入（ruleset 建立／修改／刪除、repo 設定 PATCH、push、開／關 PR、merge、刪分支）**每一步逐次由 owner 授權**，並抄錄前後狀態（ruleset 與 repo 設定以完整 JSON）。Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> 版本：rev4（2026-09-07，執行回填：Task 1 完成——ruleset `22394412` 建立、repo PATCH 為 rebase-only；Task 2 完成——PR #2 三狀態 A `eda9f25`／B `1c41d81`／C `b699d0b`，run `34047792759`／`34065893254`／`34066286258`，BLOCKED／BLOCKED（required `checksums` 缺席）／CLEAN，PR 已關、分支已刪、未合併；Task 3 本機落地 `ci-merge-policy.md` v1、automation plan v2.5 §12、README 一句；owner 釐清 probe 耗時只作補充不入 n=5。註：rev1–rev3 標題日期寫為 2026-09-08，依 GitHub 時間戳實際日曆日為 2026-09-07，前版文字不改）；前版：rev3（2026-09-08，rev2 複核修正：D4 (vi) required-check 改名順序改為「新舊並存合併並確認新 context → required 加新名 → 先移除舊 required 並確認新名仍 required → 再以另一 PR 移除舊 job」；前版：rev2（2026-09-08，design gate 第一輪 CHANGES_REQUIRED 後修訂：D3 probe 改為三個獨立狀態（A 錯 checksum／B 只改 job 名且 checksum 已恢復／C 與 base 相同），缺席判準改為「required 清單 vs 該 HEAD 實際 check-runs」並保存 GitHub 實際回應；移除 Task 1 的 dry-run 拒絕說法，改為「有效規則已核對、未實測 direct-push 拒絕」，並要求完整 ruleset GET（enforcement／conditions／bypass_actors）而非只看 branch rules；D4 補 required-check 改名可執行順序、ruleset 誤刪重建、暫停後恢復失敗處置、「無 bypass 不等於 admin 無法改設定」；D5／D6 固定五個樣本的識別欄位、失敗與排除保留、彙整 commit 不入樣本、不足五次回報缺口、Elapsed 與 job 耗時分開、冷啟動結論邊界；D7 順序改為 push A→開 PR→A 證據→push B→B 證據→push C→C 證據…，刪除 B2a 清理項，closure 合併授權含自動 main run；D8 合計補足為 7.0 hr；前版：rev1）
+> 版本：rev4（2026-09-07，執行回填：Task 1 完成——ruleset `22394412` 建立、repo PATCH 為 rebase-only；Task 2 完成——PR #2 三狀態 A `eda9f25`／B `1c41d81`／C `b699d0b`，run `34047792759`／`34065893254`／`34066286258`，BLOCKED／BLOCKED（required `checksums` 缺席）／CLEAN，PR 已關、分支已刪、未合併；Task 3 本機落地 `ci-merge-policy.md` v1→v1.1（複核修正）、automation plan v2.5 §12、README 一句；owner 釐清 probe 耗時只作補充不入 n=5。註：rev1–rev3 標題日期寫為 2026-09-08，依 GitHub 時間戳實際日曆日為 2026-09-07，前版文字不改）；前版：rev3（2026-09-08，rev2 複核修正：D4 (vi) required-check 改名順序改為「新舊並存合併並確認新 context → required 加新名 → 先移除舊 required 並確認新名仍 required → 再以另一 PR 移除舊 job」；前版：rev2（2026-09-08，design gate 第一輪 CHANGES_REQUIRED 後修訂：D3 probe 改為三個獨立狀態（A 錯 checksum／B 只改 job 名且 checksum 已恢復／C 與 base 相同），缺席判準改為「required 清單 vs 該 HEAD 實際 check-runs」並保存 GitHub 實際回應；移除 Task 1 的 dry-run 拒絕說法，改為「有效規則已核對、未實測 direct-push 拒絕」，並要求完整 ruleset GET（enforcement／conditions／bypass_actors）而非只看 branch rules；D4 補 required-check 改名可執行順序、ruleset 誤刪重建、暫停後恢復失敗處置、「無 bypass 不等於 admin 無法改設定」；D5／D6 固定五個樣本的識別欄位、失敗與排除保留、彙整 commit 不入樣本、不足五次回報缺口、Elapsed 與 job 耗時分開、冷啟動結論邊界；D7 順序改為 push A→開 PR→A 證據→push B→B 證據→push C→C 證據…，刪除 B2a 清理項，closure 合併授權含自動 main run；D8 合計補足為 7.0 hr；前版：rev1）
 > 狀態：**D7 (1)–(8) 已完成（每步 owner 逐次授權）；Task 3 文件已於本機落地，待 owner 複核後申請 D7 (9) push `b2b/closure` 與 (10) 開 closure PR**。ruleset 啟用後 main 的一切變更（含 docs-only）走 PR＋required checks。
 > 票源：Pre-M4 Readiness Backlog **B2b**（rev16 拆自 B2，**0.7 pt**＝6.0–8.5 hr）：驗收條件 (2) main ruleset、(5a)–(5e) enforcement 實證、`ci-merge-policy.md`、(6) CI 冷啟動量測 n=5；承接 B2a plan rev7「B2b 承接事項」。
 > 基準：`main`＝`origin/main`＝`1bbb47a`（B2a 關票，含 `ci.yml`）。分支 **`b2b/ruleset`**（本機，自 `1bbb47a`）放本 plan；enforcement 驗證用 **`ci-probe/2026-09-08-enforcement`**（驗完關 PR、刪分支、不合併）；政策文件、樣本與回寫用 **`b2b/closure`** PR（required checks 全綠後 rebase and merge）。
@@ -14,7 +14,7 @@
 
 ---
 
-## owner 裁定（design gate 第一輪，rev2 回寫）與待複核項
+## owner 裁定（design gate 第一輪，rev2 回寫；rev3 全部通過，rev4 起下列「待複核」與「尚未授權」字樣為歷史狀態，執行結果見 Task 1／Task 2）
 
 - **D1（方向通過）**：main、`strict`、四 contexts／app 15368、無 bypass、PR 必須、0 approvals、線性歷史、禁 force-push／刪除；接受啟用後 docs-only 也走 PR。**0 approvals 不代表系統強制人工審查，owner 裁定仍靠流程執行**；**無 bypass actor 不等於 admin 無法修改設定**——admin 仍可改／刪 ruleset，只能由政策文件與 JSON 留痕約束（D4）。完整建立 payload（提交建立申請時逐字附上）：
 
@@ -33,17 +33,17 @@
    ]}
   ```
   建立後以 `GET rulesets/<id>` 核對 name／enforcement／conditions／bypass_actors／rules 完整內容，再以 `GET rules/branches/main` 核對**有效規則**；兩者皆保存。
-- **D2（方向通過）**：repo 設定改為只允許 rebase merge（`allow_merge_commit: false`、`allow_squash_merge: false`、`allow_rebase_merge: true`），`delete_branch_on_merge` 維持 false（刪分支仍逐次授權）；PATCH 前後完整 JSON 保存。**外部 PATCH 尚未授權。**
-- **D3（rev2 修正，待複核）**：三個獨立狀態，各自 push 一次、各自取證，**不合併 A／B 的驗證**：
+- **D2（方向通過；rev4 註：PATCH 已於 2026-09-07 授權並完成，見 Task 1 Step 2）**：repo 設定改為只允許 rebase merge（`allow_merge_commit: false`、`allow_squash_merge: false`、`allow_rebase_merge: true`），`delete_branch_on_merge` 維持 false（刪分支仍逐次授權）；PATCH 前後完整 JSON 保存。**外部 PATCH 尚未授權（rev2 時的狀態，歷史）。**
+- **D3（rev2 修正；rev3 通過，rev4 已執行）**：三個獨立狀態，各自 push 一次、各自取證，**不合併 A／B 的驗證**：
   - **A**：只改 `docs/architecture/SHA256SUMS` 一筆 hash 最後一碼 → 預期實際 checks：`checksums` failure、其餘三 job success；`mergeStateStatus: BLOCKED`。
   - **B**：**先恢復 checksum 為正確**（與 base 相同），再把 `ci.yml` 的 `checksums` job `name:` 改為 `checksums-renamed`（其餘不變）→ 預期實際 checks：`go`／`frontend`／`wails-build`／`checksums-renamed` 全 success，**required 的 `checksums` 缺席**；`mergeStateStatus: BLOCKED`。
   - **C**：恢復原 job 名稱；workflow、checksum 與 base 完全相同（`git diff origin/main...C` 為空）→ 四個 required checks success，`mergeStateStatus: CLEAN`、`mergeable: MERGEABLE`。
   - **缺席判準**：以 `GET rules/branches/main` 取得 required 清單，與 `GET commits/<HEAD>/check-runs` 的實際 check 名稱比對；**不假設** `statusCheckRollup` 必定產生 expected／pending 項目，GitHub 實際回應逐字保存（若 rollup 有 expected 項目也一併記錄）。
   - probe PR 不合併；C 取證後關閉 PR、刪分支（各自授權）。
-- **D4（rev2 補齊，待複核）**：`ci-merge-policy.md` 骨架——(i) 保護對象、ruleset name／id、建立 payload 與 GET 快照路徑；(ii) required contexts 權威清單與來源（B2a plan rev7，main `ee30055`／`19422bc` check-runs，app 15368）；(iii) direct push：禁止（含 admin），一律 PR；(iv) bypass：不設 bypass actor；**admin 仍能修改／刪除 ruleset，屬政策而非技術阻擋**，任何修改須以前後 JSON 留痕並走 PR 記錄；(v) 緊急例外：唯一途徑是 owner 以 API 暫時 `enforcement: disabled` → 執行 → **立即恢復並 GET 核對**；恢復失敗（GET 不符或 API 錯誤）→ **停止所有後續外部寫入並回報**，直到人工修復；僅限「CI 基礎設施本身故障」；(vi) **required-check 改名程序（不會卡住；rev3 修正順序）**：(1) 新舊 job 並存的 PR 合併後，確認 main 上新 context 成功；(2) ruleset required 清單加入新名（核對新舊名稱與 app 皆為 15368）；(3) **先從 required 清單移除舊名**，並確認新名仍為 required；(4) **再以另一 PR 移除舊 job**——此時該 PR 只需滿足新名，required checks 全綠後合併。順序不得顛倒：若先移除舊 job 再移除舊 required，該 PR 的新 SHA 缺少仍被要求的舊 check（main 上先前的成功紀錄不能滿足新 SHA）而無法合併。每次 ruleset 更新分別授權並保存前後 GET；(vii) **ruleset 誤刪重建**：以本文件保存的建立 payload 重新 POST → 記錄新 id → `GET rules/branches/main` 核對有效規則與四 contexts → 更新政策文件的 id；(viii) 紅燈處置指向 register 規則 1／7／8（不得重跑吸收）；(ix) 量測資料出處。
+- **D4（rev2 補齊；rev3 通過，rev4 已落地為 `ci-merge-policy.md` v1.1）**：`ci-merge-policy.md` 骨架——(i) 保護對象、ruleset name／id、建立 payload 與 GET 快照路徑；(ii) required contexts 權威清單與來源（B2a plan rev7，main `ee30055`／`19422bc` check-runs，app 15368）；(iii) direct push：禁止（含 admin），一律 PR；(iv) bypass：不設 bypass actor；**admin 仍能修改／刪除 ruleset，屬政策而非技術阻擋**，任何修改須以前後 JSON 留痕並走 PR 記錄；(v) 緊急例外：唯一途徑是 owner 以 API 暫時 `enforcement: disabled` → 執行 → **立即恢復並 GET 核對**；恢復失敗（GET 不符或 API 錯誤）→ **停止所有後續外部寫入並回報**，直到人工修復；僅限「CI 基礎設施本身故障」；(vi) **required-check 改名程序（不會卡住；rev3 修正順序）**：(1) 新舊 job 並存的 PR 合併後，確認 main 上新 context 成功；(2) ruleset required 清單加入新名（核對新舊名稱與 app 皆為 15368）；(3) **先從 required 清單移除舊名**，並確認新名仍為 required；(4) **再以另一 PR 移除舊 job**——此時該 PR 只需滿足新名，required checks 全綠後合併。順序不得顛倒：若先移除舊 job 再移除舊 required，該 PR 的新 SHA 缺少仍被要求的舊 check（main 上先前的成功紀錄不能滿足新 SHA）而無法合併。每次 ruleset 更新分別授權並保存前後 GET；(vii) **ruleset 誤刪重建**：以本文件保存的建立 payload 重新 POST → 記錄新 id → `GET rules/branches/main` 核對有效規則與四 contexts → 更新政策文件的 id；(viii) 紅燈處置指向 register 規則 1／7／8（不得重跑吸收）；(ix) 量測資料出處。
 - **D5（rev2 固定取樣與收尾規則；rev4 補：probe PR #2 三次 run 的耗時只作補充資料，不入正式 n=5）**：樣本＝`b2b/closure` PR 上、ruleset 啟用後、`ci.yml` 未修改（workflow hash 與 main 相同）、四個 required contexts 皆出現的 pull_request run，**前五次有效者**；每次 push 產生不同 run ID（通常 attempt 1）。**保留所有失敗與排除**（含理由），不能只挑五次綠燈；**五次有效樣本固定後**，另做**一次**彙整 commit 回填 register v8／backlog rev27／plan，其 CI 作合併驗證，**不再計入樣本、不循環回填自身**。真實修訂不足五次 → 回報缺口，**不為湊數製造修訂、不 rerun**。
-- **D6（rev2 補欄位與邊界，待複核）**：每樣本記 run ID／attempt、PR head／base SHA、`ci.yml` SHA-256、runner image 版本字串（四 job）、npm cache 狀態（hit／miss／未確認）、artifact id、四 job 起訖與 elapsed、五條精確測試名稱的 `Elapsed`／ms（`TestClaudeAssistFailsLoudOnOversizedLine`、`TestMultiTurnSendAndTurnBoundaries`、`TestOutputCancellationKillsGrandchildren`、`PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積`、`SpecWorkspace draft accept > discards spec-assist result if the file switches during the call`）。**缺值記「缺」不記 0**；個別測試 Elapsed 與 job 耗時**分開報告**；**未確認 cache miss 的樣本不稱為冷啟動**，結論只寫「n=5 clean PR attempts 的分布」。register v8：A 段 #2／#3／#6、B 段 F1／F2 補 CI 量測欄（min／median／max、樣本 run ID）、規則 5 標完成；backlog rev27 關票。
-- **D7（rev2 順序，待複核）**：(1) `POST rulesets`（前 `[]`／後完整 JSON）；(2) `PATCH repos/...` merge 設定（前後 JSON）；(3) push A → (4) 開 probe PR → A 證據 → (5) push B → B 證據 → (6) push C → C 證據 → (7) 關 probe PR → (8) 刪 probe 分支；(9) push `b2b/closure` 首次（政策文件等）→ (10) 開 closure PR → 樣本 1；(11)…每次真實修訂 push → 樣本 2–5；(12) 彙整 commit push（不入樣本）；(13) rebase merge closure PR（**授權含自動 main run**，其結果依有限次回填原則只保存於 GitHub run 與結案回報）；(14) 刪 `b2b/closure` 分支。每步分開授權、前後狀態抄錄。（B2a 分支清理已完成，不列。）
+- **D6（rev2 補欄位與邊界；rev3 通過，待 closure PR 取樣）**：每樣本記 run ID／attempt、PR head／base SHA、`ci.yml` SHA-256、runner image 版本字串（四 job）、npm cache 狀態（hit／miss／未確認）、artifact id、四 job 起訖與 elapsed、五條精確測試名稱的 `Elapsed`／ms（`TestClaudeAssistFailsLoudOnOversizedLine`、`TestMultiTurnSendAndTurnBoundaries`、`TestOutputCancellationKillsGrandchildren`、`PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積`、`SpecWorkspace draft accept > discards spec-assist result if the file switches during the call`）。**缺值記「缺」不記 0**；個別測試 Elapsed 與 job 耗時**分開報告**；**未確認 cache miss 的樣本不稱為冷啟動**，結論只寫「n=5 clean PR attempts 的分布」。register v8：A 段 #2／#3／#6、B 段 F1／F2 補 CI 量測欄（min／median／max、樣本 run ID）、規則 5 標完成；backlog rev27 關票。
+- **D7（rev2 順序；rev3 通過；rev4 時 (1)–(8) 已完成，(9) 起待授權）**：(1) `POST rulesets`（前 `[]`／後完整 JSON）；(2) `PATCH repos/...` merge 設定（前後 JSON）；(3) push A → (4) 開 probe PR → A 證據 → (5) push B → B 證據 → (6) push C → C 證據 → (7) 關 probe PR → (8) 刪 probe 分支；(9) push `b2b/closure` 首次（政策文件等）→ (10) 開 closure PR → 樣本 1；(11)…每次真實修訂 push → 樣本 2–5；(12) 彙整 commit push（不入樣本）；(13) rebase merge closure PR（**授權含自動 main run**，其結果依有限次回填原則只保存於 GitHub run 與結案回報）；(14) 刪 `b2b/closure` 分支。每步分開授權、前後狀態抄錄。（B2a 分支清理已完成，不列。）
 - **D8（暫維持 0.7 pt）**：工程量——ruleset＋設定＋雙重 GET 核對 1.0 hr、probe 三狀態與證據 1.5 hr、政策文件（含維護程序）1.5 hr、closure PR 五樣本量測 1.5 hr、register v8／backlog rev27／plan 回寫 1.0 hr、**證據逐字抄錄與 JSON 前後快照整理 0.5 hr**，合計 **7.0 hr**；CI 等候不計。
 
 ---
@@ -75,7 +75,7 @@
 
 ## Task 3：政策文件與指標（D4）
 
-- [x] 新增 `docs/architecture/ci-merge-policy.md` v1（§1–§9 對應 D4 (i)–(ix)；附錄 A payload＋GET、附錄 B 有效規則＋PATCH 前後、附錄 C 三狀態證據）。
+- [x] 新增 `docs/architecture/ci-merge-policy.md` v1.1（§1–§9 對應 D4 (i)–(ix)；附錄 A payload＋GET、附錄 B 有效規則＋PATCH 前後、附錄 C 三狀態證據）。
 - [x] automation plan v2.5：§12 第 1 點補一句；README §測試程式碼區塊後補一句指向 `ci-merge-policy.md`。
 - [x] 本機：純文件（無 `.go`／`.ts`／`.vue`／workflow 變更）；用語掃描；`git diff --check` 乾淨。
 
@@ -102,7 +102,7 @@
 
 ## 修訂記錄
 
-- rev4（2026-09-07）：執行回填——Task 1／Task 2 全部勾選並附 id／SHA／run／merge state；Task 3 本機落地；Gate B 前兩項勾選；D5 依 owner 釐清補「probe 耗時只作補充，不入 n=5」；狀態行更新。設計內容（D1–D8）不變。
+- rev4（2026-09-07）：執行回填（含 owner 對 417791a 的複核修正：政策 §5 恢復基準、§7 重建 payload、§1／§6 指向附錄 C、§9 register 待回填；plan D2–D7 的「待複核」「尚未授權」標為歷史）——Task 1／Task 2 全部勾選並附 id／SHA／run／merge state；Task 3 本機落地；Gate B 前兩項勾選；D5 依 owner 釐清補「probe 耗時只作補充，不入 n=5」；狀態行更新。設計內容（D1–D8）不變。
 - rev3（2026-09-08）：rev2 複核修正——D4 (vi) required-check 改名順序：先從 required 清單移除舊名並確認新名仍 required，再以另一 PR 移除舊 job；其餘不變。
 - rev2（2026-09-08）：design gate 第一輪修正——D3 三個獨立狀態與缺席判準；移除 dry-run、要求完整 ruleset GET；D4 改名／重建／恢復失敗處置與「無 bypass ≠ admin 無法改設定」；D5／D6 取樣識別、失敗保留、彙整不入樣本、缺口回報、Elapsed 與 job 耗時分開、冷啟動邊界；D7 順序與清單；D8 合計 7.0 hr。
 - rev1（2026-09-08）：建立；唯讀前置；D1–D8；四 Task；Gate B。
