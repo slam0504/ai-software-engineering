@@ -1,5 +1,6 @@
 sequenceDiagram
-  %% A1a rev2：真實輸入 → 儲存（含等待期間繼續輸入）→ 衝突分支 → 重新載入
+  %% A1a rev3：真實輸入 → 儲存（含等待期間繼續輸入）→ 衝突分支 → 重新載入（請求世代）
+  %% Spec acceptDraft 走同一條寫入路徑：先以草稿萃取結果替換 buffer，該內容即為送出快照 P
   actor U as 使用者
   participant CM as CodeMirror EditorView
   participant C as Workspace 元件（Spec／Plan）
@@ -12,7 +13,7 @@ sequenceDiagram
   C->>B: buffer ← A
   C->>C: dirty ← (buffer ≠ saved)
 
-  U->>C: 按下儲存
+  U->>C: 按下儲存（Spec 接受草稿亦走此路徑，<br/>先以草稿萃取結果替換 buffer 後再凍結）
   C->>C: 凍結送出快照 P＝{path, content:A, digest:held}
   C->>C: 封鎖再次儲存、切檔、切分頁、草稿／bump 套用
   C->>W: write(P.path, P.content, P.digest)
@@ -38,8 +39,9 @@ sequenceDiagram
   C->>C: 解除封鎖
 
   U->>C: 明確要求重新載入（或選取其他檔案並選擇捨棄）
+  C->>C: 配發新的請求世代 g；載入期間暫停編輯
   C->>W: read(rel)
   W-->>C: {content, digest}
-  C->>C: 檢查回應是否仍屬目前選取的檔案；否則整筆丟棄
+  C->>C: 回應世代 ≠ 最新 g（含路徑相同的 A→B→A 舊回應）→ 整筆丟棄
   C->>B: buffer ← content；saved ← content；heldDigest ← digest
   C->>CM: syncEditorDoc（buffer → editor，單向）
