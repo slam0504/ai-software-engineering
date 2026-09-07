@@ -465,6 +465,14 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     await flushPromises()
     expect(mustFind(w, '[data-test=save-error]').exists()).toBe(true) // 錯誤仍顯示
     expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // dirty 依內容比較→假
+
+    // 持有的 digest 不得被衝突分支動到。Spec 沒有可直接讀的 store，改以行為驗證：
+    // 再編輯一次並儲存，第二次送出的 expectedDigest 必須仍是衝突前持有的原值。
+    typeText(view, 'after conflict edit')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenNthCalledWith(2, 'spec/a.feature', 'after conflict edit', 'sha256:stub')
   })
 
   it('T10-S：非衝突錯誤——原文顯示且無 data-conflict，三者不變，dirty 依內容比較', async () => {

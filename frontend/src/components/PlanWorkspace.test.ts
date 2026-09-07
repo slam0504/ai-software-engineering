@@ -566,7 +566,11 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
 
     await w.find('[data-test=save]').trigger('click') // 再次儲存
     const contentDuringSave = usePlan().currentContent
-    await w.find('[data-test=apply-draft]').trigger('click') // 缺口 4：儲存中實際點擊套用草稿
+    // 缺口 4：儲存中實際點擊套用草稿。草稿必須與目前 buffer **不同**，否則即使
+    // 兩層防護（函式 guard＋按鈕 disabled）都被拿掉，套用同樣內容也觀察不到差異，
+    // 這條斷言就沒有鑑別力（MU-draft-busy-P 首輪 NOT_RED 的原因）。
+    await w.setProps({ draft: 'v2 different from buffer' })
+    await w.find('[data-test=apply-draft]').trigger('click')
     expect(usePlan().currentContent).toBe(contentDuringSave) // 內容未被替換，不只是斷言按鈕 disabled
     await w.setProps({ path: 'plan/b.yaml' }) // 切檔
     await flushPromises()
@@ -685,6 +689,7 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     typeText(view, '') // 改回 saved 原內容（初始 content 為空字串）
     await flushPromises()
     expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // dirty 依內容比較→假
+    expect(usePlan().currentDigest).toBe('sha256:stub') // 持有的 digest 不得被衝突分支動到
   })
 
   it('T10-P：非衝突錯誤——原文顯示且無 data-conflict，三者不變，dirty 依內容比較', async () => {
@@ -728,10 +733,22 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(usePlan().currentDigest).toBe('sha256:stub') // digest 未變
     const view = getView(w)
     expect(view.state.doc.toString()).toBe(updated) // 編輯器也要反映（syncEditorDoc 已呼叫）
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeUndefined() // saved 未動→內容已異動→dirty 真
   })
 
-  it('T14b：applyDraft 套用結果恰等於 saved 時→dirty 為假', async () => {
+  it('T14b：applyDraft 只更新 buffer——不同於 saved→dirty 真；恰等於 saved→dirty 假', async () => {
+    // 前半段（不同於 saved）同時證明 applyDraft 不得一併更新 saved：若它更新了，
+    // dirty 會變成假，這條就會紅。後半段是「結果恰等於 saved 不得誤報未儲存」。
     mocks.PlanRead.mockResolvedValue({ content: 'same content', digest: 'sha256:stub' })
+    const wDiff = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'different content' } })
+    await flushEditor()
+    await wDiff.find('[data-test=apply-draft]').trigger('click')
+    await flushPromises()
+    expect(usePlan().currentContent).toBe('different content')
+    expect(usePlan().savedContent).toBe('same content') // saved 不動
+    expect(wDiff.find('[data-test=save]').attributes('disabled')).toBeUndefined() // dirty 真
+
+    setActivePinia(createPinia())
     const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'same content' } })
     await flushEditor()
     await w.find('[data-test=apply-draft]').trigger('click')
