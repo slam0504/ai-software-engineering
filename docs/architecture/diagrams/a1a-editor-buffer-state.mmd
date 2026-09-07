@@ -1,27 +1,31 @@
 stateDiagram-v2
-  %% A1a rev3：單一檔案的儲存狀態機（含請求世代與 Spec 接受草稿的寫入路徑）
+  %% A1a rev4：單一檔案的儲存狀態機（請求世代、Spec 接受草稿的寫入路徑、失敗後依內容比較）
   %% saved＝已儲存快照（最近一次成功寫入所「送出」的內容），載入成功時等於磁碟內容
-  %% dirty 判定＝buffer ≠ saved（內容比較，D4）
+  %% dirty 判定＝buffer ≠ saved（內容比較，D4）——任何路徑結束後都重新比較，不無條件轉 dirty
   [*] --> empty
   empty --> loading : 發出 loadFile（配發新的請求世代 g，載入期間暫停編輯）
-  loading --> clean : 回應世代＝最新 g（buffer＝saved＝磁碟內容，持有 digest）
+  loading --> recompute : 回應世代＝最新 g（buffer＝saved＝磁碟內容，持有 digest）
   loading --> loading : 回應世代過期 → 整筆丟棄（含路徑相同的 A→B→A 舊回應）
   clean --> dirty : 編輯器文件改變（updateListener → buffer）
-  clean --> dirty : Plan 套用草稿／確認 bump（只更新 buffer；<br/>結果等於 saved 時留在 clean）
+  clean --> clean : Plan 套用草稿／確認 bump 且結果等於 saved（只更新 buffer，不寫檔）
+  clean --> dirty : Plan 套用草稿／確認 bump 且結果不等於 saved
+  dirty --> dirty : Plan 套用草稿／確認 bump（同上，仍依內容比較）
   dirty --> clean : buffer 被改回等於 saved
+  clean --> saving : Spec 接受草稿（先以草稿萃取結果替換 buffer 再凍結 P）
   dirty --> saving : 按下儲存，或 Spec 接受草稿<br/>（凍結該次 path／content／digest 為送出快照 P）
   saving --> saving : 期間可繼續輸入（buffer 改變，但 P 不變）
   saving --> settled : 寫入成功（saved ← P.content；digest ← newDigest）
-  settled --> clean : buffer 等於 saved
-  settled --> dirty : buffer 不等於 saved（等待期間輸入的內容仍未儲存）
+  settled --> recompute : 更新完成
   saving --> conflict : sentinel 判為 digest 衝突
   saving --> failed : 非衝突錯誤（原訊息保留）
-  conflict --> dirty : buffer、saved、digest 皆不變；不自動重新載入
-  failed --> dirty : buffer、saved、digest 皆不變
+  conflict --> recompute : buffer、saved、digest 皆不變；不自動重新載入
+  failed --> recompute : buffer、saved、digest 皆不變
+  recompute --> clean : buffer 等於 saved
+  recompute --> dirty : buffer 不等於 saved
   clean --> empty : 切檔／離開工作區
-  dirty --> guard : 切檔／切分頁／其他替換內容的入口（D3）
+  dirty --> guard : 切檔／切分頁／其他替換內容的入口（A1a-2）
   guard --> dirty : 選擇保留（停留原檔，新檔不載入）
-  guard --> empty : 選擇捨棄
+  guard --> empty : 選擇捨棄（導覽到該入口指定的目標）
   note right of saving : 期間封鎖：再次儲存、Spec 接受草稿、切檔、切分頁、<br/>套用草稿／bump 等會替換內容的操作<br/>（此封鎖屬 A1a-1；非儲存期間的導覽守衛屬 A1a-2）
-  note right of settled : 過渡狀態，只做 saved／digest 更新；<br/>不得以「回應到達當下的 buffer」當作已儲存
+  note right of recompute : 過渡節點：只重算 dirty＝(buffer ≠ saved)。<br/>衝突與失敗都不無條件轉 dirty——<br/>使用者可能在等待期間把內容改回 saved，錯誤仍顯示
   note right of guard : 選擇前工作區元件不得被切走或卸載

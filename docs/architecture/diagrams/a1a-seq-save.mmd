@@ -1,11 +1,11 @@
 sequenceDiagram
-  %% A1a rev3：真實輸入 → 儲存（含等待期間繼續輸入）→ 衝突分支 → 重新載入（請求世代）
+  %% A1a rev4：真實輸入 → 儲存（含等待期間繼續輸入）→ 衝突分支 → 重新載入（請求世代）
   %% Spec acceptDraft 走同一條寫入路徑：先以草稿萃取結果替換 buffer，該內容即為送出快照 P
   actor U as 使用者
   participant CM as CodeMirror EditorView
   participant C as Workspace 元件（Spec／Plan）
   participant B as 受控 buffer＋已儲存快照 saved
-  participant W as Wails binding（SpecWrite／PlanWrite）
+  participant W as Wails binding（SpecWrite／PlanWrite／SpecRead／PlanRead）
   participant FS as 磁碟（暫存檔＋rename）
 
   U->>CM: 使文件改變（內容 A）
@@ -15,7 +15,7 @@ sequenceDiagram
 
   U->>C: 按下儲存（Spec 接受草稿亦走此路徑，<br/>先以草稿萃取結果替換 buffer 後再凍結）
   C->>C: 凍結送出快照 P＝{path, content:A, digest:held}
-  C->>C: 封鎖再次儲存、切檔、切分頁、草稿／bump 套用
+  C->>C: 封鎖再次儲存、Spec 接受草稿、切檔、切分頁、草稿／bump 套用
   C->>W: write(P.path, P.content, P.digest)
   W->>FS: 驗證 expectedDigest 後暫存檔＋rename
 
@@ -27,7 +27,6 @@ sequenceDiagram
     FS-->>W: 寫入完成
     W-->>C: newDigest
     C->>B: saved ← P.content（＝A，非 B）；heldDigest ← newDigest
-    C->>C: dirty ← (buffer ≠ saved) → B≠A 時仍為 dirty
   else digest 不符
     W-->>C: ErrSpecWriteConflict／ErrPlanWriteConflict（跨邊界後僅為訊息字串）
     C->>C: 依 sentinel 文字契約辨識為衝突；buffer、saved、heldDigest 皆不變
@@ -36,12 +35,16 @@ sequenceDiagram
     W-->>C: 原始錯誤訊息
     C->>C: 原樣揭露，不判為衝突；三者皆不變
   end
-  C->>C: 解除封鎖
+  C->>C: 重算 dirty ← (buffer ≠ saved)；解除封鎖
 
-  U->>C: 明確要求重新載入（或選取其他檔案並選擇捨棄）
+  U->>C: 明確要求重新載入（或在守衛中選擇捨棄後導覽）
   C->>C: 配發新的請求世代 g；載入期間暫停編輯
   C->>W: read(rel)
   W-->>C: {content, digest}
-  C->>C: 回應世代 ≠ 最新 g（含路徑相同的 A→B→A 舊回應）→ 整筆丟棄
-  C->>B: buffer ← content；saved ← content；heldDigest ← digest
-  C->>CM: syncEditorDoc（buffer → editor，單向）
+  alt 回應世代＝最新 g
+    C->>B: buffer ← content；saved ← content；heldDigest ← digest
+    C->>CM: syncEditorDoc（buffer → editor，單向）
+    C->>C: 恢復編輯；dirty ← false
+  else 回應世代過期（含路徑相同的 A→B→A 舊回應）
+    C->>C: 整筆丟棄——不寫 buffer／saved／digest、不動編輯器
+  end
