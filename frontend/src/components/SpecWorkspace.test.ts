@@ -411,8 +411,13 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     const view = getView(w)
     expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 初始載入完成後可編輯
 
-    let resolveRead: (v: { content: string; digest: string }) => void = () => {}
-    mocks.SpecRead.mockImplementationOnce(() => new Promise(r => { resolveRead = r }))
+    // 這次載入刻意「失敗」收尾：Spec 沒有像 Plan 那樣可直接讀的 store buffer，
+    // 而 [data-test=save] 的 disabled 條件是 `busyReason !== '' || !dirty`——載入
+    // 進行中必然 disabled，拿它斷言 buffer 保全會被 busy 遮蔽。失敗路徑會清掉
+    // busy 但**不覆蓋 buffer**，因此解除遮蔽後 disabled 才是純粹的 dirty 訊號；
+    // 也不能等成功載入覆蓋 buffer 後才驗，那會掩蓋載入中途的污染。
+    let rejectRead: (e: unknown) => void = () => {}
+    mocks.SpecRead.mockImplementationOnce(() => new Promise((_, rej) => { rejectRead = rej }))
     await w.setProps({ path: 'spec/b.feature' }) // 觸發第二次（延遲）載入
     await flushPromises()
 
@@ -423,13 +428,17 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     // 靠 updateListener 的 busyReason 檢查擋住回寫，buffer 才不會被污染。
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'injected during load' } })
     await flushPromises()
-    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // buffer 未變→仍等於 saved(A)→dirty 假
 
-    resolveRead({ content: 'B content', digest: 'sha256:b' })
+    rejectRead(new Error('load failed'))
     await flushEditor()
 
     expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
     expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 載入完成後回到可編輯
+    // busy 已清且 buffer 未被載入結果覆蓋——此時 disabled 純粹反映 dirty：
+    // 若 updateListener 在載入期間漏擋，buffer 會是 'injected during load' ≠ saved(A)，
+    // dirty 為真、按鈕會 enabled，這條就會紅。
+    expect(w.attributes('data-busy')).toBe('')
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // buffer 未被污染→仍等於 saved(A)
 
     // 載入完成後再 dispatch 一次：buffer 應正常更新
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'edited after load' } })
