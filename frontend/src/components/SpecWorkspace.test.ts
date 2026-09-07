@@ -231,6 +231,15 @@ function mustFind(w: VueWrapper<any>, selector: string) {
   return el
 }
 
+// findFileButton：A1a-2 切檔守衛測試共用——從 .files 清單裡用檔名文字找按鈕
+// （同 PlanWorkspace.test.ts「path prop 只 seed 一次」測試已用過的 findAll+text
+// 慣例），不存在時給明確訊息而不是讓 .trigger() 撞上 VTU 的 undefined 錯誤。
+function findFileButton(w: VueWrapper<any>, name: string) {
+  const btn = w.findAll('.files button').find(b => b.text() === name)
+  expect(btn, `找不到檔案清單按鈕 ${name}`).toBeTruthy()
+  return btn!
+}
+
 describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -523,4 +532,161 @@ describe('SpecWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(view.state.doc.toString()).toBe('AI draft') // buffer（編輯器內容）保留接受後內容，即使失敗
     expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // buffer≠saved(原內容'')→ dirty 真
   })
+})
+
+// A1a-2 expected-red 階段：切檔守衛（unsaved-changes navigation guard）尚未實作
+// ——selectFile() 目前沒有任何 dirty 檢查（見 SpecWorkspace.vue 第 197-202 行），
+// 外部（非寫入中）dirty 時點清單切檔會直接切換，不會出現 keep／discard 選擇。
+// 本 describe 斷言「將來會提供」的 [data-test=unsaved-guard]／
+// [data-test=unsaved-discard]／[data-test=unsaved-keep] 介面，現在預期失敗
+// （R），這是 TDD 紅燈階段的正常狀態，不是測試寫錯。G6-S 例外：驗證 A1a-1 的
+// 儲存中互斥（busyReason==='save'）仍然優先於切檔守衛而直接拒絕切檔——這條
+// precedence 已經是現有程式碼的行為，本來就該綠，不是本次要打開的紅燈缺口。
+describe('SpecWorkspace 切檔守衛（A1a-2，expected-red）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([
+      { name: 'a.feature', path: 'spec/a.feature', isDir: false },
+      { name: 'b.feature', path: 'spec/b.feature', isDir: false },
+    ])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('G1-S：dirty 時點擊清單切檔→[data-test=unsaved-guard] 出現，新檔的 read 尚未被呼叫', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: 'a original', digest: 'sha256:a0' },
+      'spec/b.feature': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'a edited') // dirty：fileContent ≠ savedContent
+    await flushPromises()
+
+    await findFileButton(w, 'b.feature').trigger('click')
+    await flushPromises()
+
+    mustFind(w, '[data-test=unsaved-guard]')
+    expect(store.read).not.toHaveBeenCalledWith('spec/b.feature') // 守衛出現前不得先載入新檔
+    expect(view.state.doc.toString()).toBe('a edited') // 編輯器仍停在原檔未儲存內容
+  })
+
+  it('G2-S：G1 情境下點擊 discard→新檔正式載入，read 被呼叫且編輯器內容變成新檔內容', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: 'a original', digest: 'sha256:a0' },
+      'spec/b.feature': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushEditor()
+    typeText(getView(w), 'a edited')
+    await flushPromises()
+    await findFileButton(w, 'b.feature').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushEditor()
+
+    expect(store.read).toHaveBeenCalledWith('spec/b.feature')
+    expect(getView(w).state.doc.toString()).toBe('b original')
+  })
+
+  it('G3-S：G1 情境下點擊 keep→維持原檔，read 未被呼叫，編輯器仍是未儲存內容', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: 'a original', digest: 'sha256:a0' },
+      'spec/b.feature': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    await flushEditor()
+    typeText(getView(w), 'a edited')
+    await flushPromises()
+    await findFileButton(w, 'b.feature').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=unsaved-keep]').trigger('click')
+    await flushPromises()
+
+    expect(store.read).not.toHaveBeenCalledWith('spec/b.feature')
+    expect(getView(w).state.doc.toString()).toBe('a edited') // 停留在原檔的未儲存內容
+  })
+
+  // G6-S-save-selectfile／G6-S-accept-selectfile：owner 裁定（round 2）——G6 要
+  // 涵蓋 SpecWorkspace 每一種寫入等待狀態（busyReason 'save'／'accept'），不只
+  // save，理由是保護 A1a-1 既有的儲存互斥契約不被新的保留／捨棄流程繞過。兩條
+  // 都預期綠：不是「守衛缺元素」的紅燈缺口，而是「busyReason!=='' 時 selectFile()
+  // 直接 return（見 SpecWorkspace.vue 197-202 行）已經先擋下了，dirty-guard 邏輯
+  // 根本沒機會執行——所以現在就是綠，且綠得有意義（precedence 驗證，不是誤判）。
+  it('G6-S-save-selectfile：A1a-1 優先——save 進行中同時 dirty，切檔被 A1a-1 直接拒絕，不進切檔守衛選擇（precedence 已實作，本條預期綠）', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'a edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click') // 觸發 save，尚未 resolve → busyReason='save'
+    expect(w.attributes('data-busy')).toBe('save')
+
+    await findFileButton(w, 'b.feature').trigger('click') // 儲存中嘗試切檔（同時 dirty）
+    await flushPromises()
+
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // A1a-1 儲存互斥直接擋下，不出現守衛選擇
+    expect(w.attributes('data-busy')).toBe('save') // busy 未變
+    expect(mocks.SpecRead).toHaveBeenCalledTimes(1) // 只有初次載入，切檔未觸發任何讀取
+    expect(view.state.doc.toString()).toBe('a edited') // 內容未變
+
+    resolveWrite('sha256:new')
+    await flushPromises()
+  })
+
+  it('G6-S-accept-selectfile：A1a-1 優先——accept 進行中同時 dirty，切檔被 A1a-1 直接拒絕，不進切檔守衛選擇（precedence 已實作，本條預期綠）', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    await mustFind(w, '[data-test=accept-draft]').trigger('click') // 觸發 acceptDraft，尚未 resolve → busyReason='accept'
+    expect(w.attributes('data-busy')).toBe('accept')
+    // dirty：acceptDraft 已把 buffer 換成草稿內容（'AI draft'），savedContent 仍是初始載入的
+    // 空字串，write 尚未 resolve，兩者不同——與 save 案例一樣同時具備 busy 與 dirty。
+    expect(getView(w).state.doc.toString()).toBe('AI draft')
+
+    await findFileButton(w, 'b.feature').trigger('click') // accept 進行中嘗試切檔（同時 dirty）
+    await flushPromises()
+
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // A1a-1 的 accept 互斥直接擋下，不出現守衛選擇
+    expect(w.attributes('data-busy')).toBe('accept') // busy 未變
+    expect(mocks.SpecRead).toHaveBeenCalledTimes(1) // 只有初次載入，切檔未觸發任何讀取
+    expect(getView(w).state.doc.toString()).toBe('AI draft') // 內容未變
+
+    resolveWrite('sha256:new')
+    await flushPromises()
+  })
+  it('G7-S：dirty 發送端——真實輸入→true、改回 saved→false、儲存成功→false（不是只驗接收端）', async () => {
+    const store = makeFileStore({ 'spec/a.feature': { content: 'a original', digest: 'sha256:a0' } })
+    mocks.SpecRead.mockImplementation(store.read)
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write: store.write } })
+    await flushEditor()
+    const seen = () => (w.emitted('dirty') ?? []).map(e => (e as unknown[])[0])
+    expect(seen().at(-1)).toBe(false) // 載入後乾淨
+
+    const view = getView(w)
+    typeText(view, 'a edited') // 真實輸入
+    await flushPromises()
+    expect(seen().at(-1)).toBe(true)
+
+    typeText(view, 'a original') // 改回與 saved 相同
+    await flushPromises()
+    expect(seen().at(-1)).toBe(false)
+
+    typeText(view, 'a edited again')
+    await flushPromises()
+    expect(seen().at(-1)).toBe(true)
+    await mustFind(w, '[data-test=save]').trigger('click') // 儲存成功
+    await flushPromises()
+    expect(seen().at(-1)).toBe(false)
+  })
+
 })

@@ -411,6 +411,10 @@ export default {
     scopeHint: 'Path is outside the managed scope',
     singlePlanBlocked: 'A primary plan file already exists — only one primary plan is allowed at a time',
   },
+  unsaved: {
+    message: 'This file has unsaved changes.',
+    action: { keep: 'Keep editing', discard: 'Discard and leave' },
+  },
   bump: {
     banner: {
       message: 'analysis_base_commit is behind the current HEAD — an update is recommended',

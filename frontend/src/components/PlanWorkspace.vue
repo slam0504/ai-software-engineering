@@ -35,6 +35,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
   (e: 'busy', v: boolean): void
+  (e: 'dirty', v: boolean): void
 }>()
 
 const plan = usePlan()
@@ -71,6 +72,9 @@ const busyReason = ref<'' | 'save' | 'load' | 'bump'>('')
 const saveError = ref('')
 const saveConflict = ref(false)
 watch(busyReason, v => emit('busy', v !== ''))
+// A1a-2：dirty 對外回報（同 SpecWorkspace）；pendingPath 是內部清單切檔的守衛目標。
+watch(bufferDirty, v => emit('dirty', v), { immediate: true })
+const pendingPath = ref<string | null>(null)
 
 const planIdInput = ref('')
 
@@ -305,7 +309,8 @@ function resetDraft() {
 }
 
 function selectFile(p: string) {
-  if (busyReason.value === 'save' || busyReason.value === 'bump') return
+  if (busyReason.value === 'save' || busyReason.value === 'bump') return // A1a-1 優先於 A1a-2 守衛
+  if (bufferDirty.value) { pendingPath.value = p; return } // 未儲存 → 先確認，不得靜默覆蓋
   selectedPath.value = p
   resetDraft()
   resetBump()
@@ -375,6 +380,18 @@ async function runAssist() {
 // applyDraft：只把草稿寫進編輯器 buffer（store.currentContent），不落地——
 // 落地是「儲存」的職責（見下方 saveFile）。同 SpecWorkspace acceptDraft，只取
 // fenced code block 內容，不把整段 prose 一起帶進 buffer。
+function unsavedKeep() { pendingPath.value = null }
+
+function unsavedDiscard() {
+  const p = pendingPath.value
+  pendingPath.value = null
+  if (!p) return
+  selectedPath.value = p
+  resetDraft()
+  resetBump()
+  void loadFile()
+}
+
 function applyDraft() {
   // 忙碌（save／load／bump）期間禁止套用草稿——缺口 4 修正：儲存／bump 等待期間
   // 若替換 plan.currentContent，會讓進行中的寫入送出「按下當下凍結的快照」與
@@ -487,6 +504,12 @@ async function confirmCommit() {
       :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
     />
     <p v-if="loadError" class="err">{{ loadError }}</p>
+
+    <div v-if="pendingPath" class="unsaved-guard" data-test="unsaved-guard">
+      <p>{{ t('unsaved.message') }}</p>
+      <button data-test="unsaved-keep" @click="unsavedKeep">{{ t('unsaved.action.keep') }}</button>
+      <button data-test="unsaved-discard" @click="unsavedDiscard">{{ t('unsaved.action.discard') }}</button>
+    </div>
 
     <div class="assist-area">
       <select v-model="provider" data-test="provider-select" :aria-label="t('planWorkspace.provider.label')">

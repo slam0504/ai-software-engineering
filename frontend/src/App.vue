@@ -92,9 +92,26 @@ const tab = ref<'chat' | 'preview' | 'spec' | 'plan' | 'diagram' | 'dag' | 'tca'
 // 寫入（save）／bump 進行中時不切換分頁，避免 v-if 把工作區元件連同進行中的寫入
 // 一起卸載。只加這個攔截點，不重構分頁 v-if 結構。
 const workspaceBusy = ref(false)
+// A1a-2：跨分頁導覽的未儲存守衛。三個入口（分頁按鈕、FileTree 選檔、重新送核
+// 導向）一律經 guardedNav，**先檢查再改任何狀態**；順序固定為 busy（A1a-1 的
+// 硬性拒絕）→ dirty（A1a-2 的保留／捨棄確認）→ 執行導覽。工作區內部清單切檔
+// 由各元件自己的守衛處理，兩條路徑互斥，同一次導覽不會出現兩次確認。
+const workspaceDirty = ref(false)
+const pendingNav = ref<null | (() => void)>(null)
+function guardedNav(action: () => void) {
+  if (workspaceBusy.value) return // A1a-1 優先：寫入／bump 期間直接拒絕，不跳確認
+  if (workspaceDirty.value) { pendingNav.value = action; return }
+  action()
+}
+function unsavedKeep() { pendingNav.value = null }
+function unsavedDiscard() {
+  const a = pendingNav.value
+  pendingNav.value = null
+  workspaceDirty.value = false // 捨棄後原工作區會被 v-if 卸載，旗標一併歸零
+  a?.()
+}
 function switchTab(next: typeof tab.value) {
-  if (workspaceBusy.value) return
-  tab.value = next
+  guardedNav(() => { tab.value = next })
 }
 // Task 15：DagPane 的 select-task → 找出目前 pending 的 gate2 卡片中，
 // GateDecisionContext 實際含這個 task_id 的那一筆，於 GateConsole 高亮（gate 面板
@@ -127,11 +144,12 @@ const planFocusPath = ref<string | undefined>(undefined)
 const tcaFocusTaskId = ref('')
 const goResubmitError = ref('')
 function onGoResubmit(payload: { gate: string; subject: string }) {
-  // 忙碌攔截（A1a-1 缺口 2 修正）：放在函式最前面，早於 goResubmitError 的清空
-  // 與 resolveResubmitTarget 之後的所有賦值——workspaceBusy 時整個函式不留下
-  // 任何部分狀態變更，避免繞過 SpecWorkspace／PlanWorkspace 的寫入互斥直接改
-  // tab／planFocusPath／tcaFocusTaskId。
-  if (workspaceBusy.value) return
+  // 忙碌攔截（A1a-1 缺口 2 修正）與未儲存守衛（A1a-2）都在 guardedNav 內，早於
+  // goResubmitError 的清空與所有賦值——拒絕或等待確認時整個函式不留下任何部分
+  // 狀態變更，避免繞過寫入互斥或靜默丟棄未儲存內容。
+  guardedNav(() => doGoResubmit(payload))
+}
+function doGoResubmit(payload: { gate: string; subject: string }) {
   goResubmitError.value = ''
   const target = resolveResubmitTarget(payload.gate, payload.subject)
   if (!target) {
@@ -170,9 +188,7 @@ const selectedFile = ref('')
 // 「selectedFile 已換但 tab 沒切」的部分狀態。改為先檢查再改任何狀態，busy 時
 // 整個函式不做事——與 switchTab／onGoResubmit 的攔截順序一致。
 function selectPreviewFile(p: string) {
-  if (workspaceBusy.value) return
-  selectedFile.value = p
-  tab.value = 'preview'
+  guardedNav(() => { selectedFile.value = p; tab.value = 'preview' })
 }
 const cliInfo = ref<Record<string, string>>({})
 watch(timelineOpen, v => save('wb.tl.open', v))
@@ -334,6 +350,11 @@ onMounted(async () => {
         <div class="side-files"><FileTree @select="selectPreviewFile" /></div>
       </aside>
       <main>
+        <div v-if="pendingNav" class="unsaved-guard" data-test="unsaved-guard">
+          <p>{{ t('unsaved.message') }}</p>
+          <button data-test="unsaved-keep" @click="unsavedKeep">{{ t('unsaved.action.keep') }}</button>
+          <button data-test="unsaved-discard" @click="unsavedDiscard">{{ t('unsaved.action.discard') }}</button>
+        </div>
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="switchTab('chat')">{{ t('app.tab.chat') }}</button>
           <button :class="{ active: tab === 'preview' }" @click="switchTab('preview')">{{ t('app.tab.preview') }}</button>
@@ -345,8 +366,8 @@ onMounted(async () => {
         </nav>
         <DualPane v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
-        <SpecWorkspace v-if="tab === 'spec'" @busy="workspaceBusy = $event" />
-        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" @busy="workspaceBusy = $event" />
+        <SpecWorkspace v-if="tab === 'spec'" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
+        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
         <TcaWorkspace
           v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
           :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"

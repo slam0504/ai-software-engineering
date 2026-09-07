@@ -411,6 +411,10 @@ export default {
     scopeHint: '路徑不在管理範圍內',
     singlePlanBlocked: '已存在主要 plan 文件，一次僅允許一份主要 plan（單一 plan 限制）',
   },
+  unsaved: {
+    message: '這個檔案有未儲存的變更。',
+    action: { keep: '保留（留在原處）', discard: '捨棄變更並離開' },
+  },
   bump: {
     banner: {
       message: '分析基準（analysis_base_commit）落後目前 HEAD，建議更新',

@@ -874,3 +874,182 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(w.attributes('data-busy')).toBe('') // 解除封鎖
   })
 })
+
+// A1a-2 expected-red 階段：切檔守衛尚未實作於 PlanWorkspace——selectFile() 目前
+// 沒有任何 dirty 檢查（見 PlanWorkspace.vue 第 307-313 行），外部（非寫入中）
+// dirty 時點清單切檔會直接切換。斷言方式與 SpecWorkspace.test.ts 同一組
+// G1/G2/G3/G6 契約，各自獨立維護一份（同本檔既有 flushEditor／getView／
+// typeText／makeFileStore 皆不跨檔匯入的慣例），不是測試寫錯。G6-P 例外：驗證
+// A1a-1 的儲存中互斥仍優先於切檔守衛——這是現有程式碼已有的行為，本來就該綠。
+describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.PlanList.mockResolvedValue([
+      { name: 'a.yaml', path: 'plan/a.yaml' },
+      { name: 'b.yaml', path: 'plan/b.yaml' },
+    ])
+    mocks.PlanRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  function mustFind(w: VueWrapper<any>, selector: string) {
+    const el = w.find(selector)
+    expect(el.exists(), `找不到 ${selector}——尚未實作（expected-red）`).toBe(true)
+    return el
+  }
+
+  // findFileButton：同 SpecWorkspace.test.ts 的版本，本檔獨立維護一份。
+  function findFileButton(w: VueWrapper<any>, name: string) {
+    const btn = w.findAll('.files button').find(b => b.text() === name)
+    expect(btn, `找不到檔案清單按鈕 ${name}`).toBeTruthy()
+    return btn!
+  }
+
+  it('G1-P：dirty 時點擊清單切檔→[data-test=unsaved-guard] 出現，新檔的 read 尚未被呼叫', async () => {
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'plan a original', digest: 'sha256:a0' },
+      'plan/b.yaml': { content: 'plan b original', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'plan a edited') // dirty：plan.currentContent ≠ plan.savedContent
+    await flushPromises()
+
+    await findFileButton(w, 'b.yaml').trigger('click')
+    await flushPromises()
+
+    mustFind(w, '[data-test=unsaved-guard]')
+    expect(store.read).not.toHaveBeenCalledWith('plan/b.yaml') // 守衛出現前不得先載入新檔
+    expect(view.state.doc.toString()).toBe('plan a edited') // 編輯器仍停在原檔未儲存內容
+  })
+
+  it('G2-P：G1 情境下點擊 discard→新檔正式載入，read 被呼叫且編輯器內容變成新檔內容', async () => {
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'plan a original', digest: 'sha256:a0' },
+      'plan/b.yaml': { content: 'plan b original', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    typeText(getView(w), 'plan a edited')
+    await flushPromises()
+    await findFileButton(w, 'b.yaml').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushEditor()
+
+    expect(store.read).toHaveBeenCalledWith('plan/b.yaml')
+    expect(getView(w).state.doc.toString()).toBe('plan b original')
+  })
+
+  it('G3-P：G1 情境下點擊 keep→維持原檔，read 未被呼叫，編輯器仍是未儲存內容', async () => {
+    const store = makeFileStore({
+      'plan/a.yaml': { content: 'plan a original', digest: 'sha256:a0' },
+      'plan/b.yaml': { content: 'plan b original', digest: 'sha256:b0' },
+    })
+    mocks.PlanRead.mockImplementation(store.read)
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    typeText(getView(w), 'plan a edited')
+    await flushPromises()
+    await findFileButton(w, 'b.yaml').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=unsaved-keep]').trigger('click')
+    await flushPromises()
+
+    expect(store.read).not.toHaveBeenCalledWith('plan/b.yaml')
+    expect(getView(w).state.doc.toString()).toBe('plan a edited') // 停留在原檔的未儲存內容
+  })
+
+  // G6-P-save-selectfile／G6-P-bump-selectfile：owner 裁定（round 2）——G6 要
+  // 涵蓋 PlanWorkspace 每一種寫入等待狀態（busyReason 'save'／'bump'），不只
+  // save。兩條都預期綠：不是「守衛缺元素」的紅燈缺口，而是
+  // 「busyReason!=='' 時 selectFile() 直接 return（見 PlanWorkspace.vue
+  // 307-313 行）」已經先擋下了，dirty-guard 邏輯根本沒機會執行——所以現在就是
+  // 綠，且綠得有意義（precedence 驗證，不是誤判）。
+  it('G6-P-save-selectfile：A1a-1 優先——save 進行中同時 dirty，切檔被 A1a-1 直接拒絕，不進切檔守衛選擇（precedence 已實作，本條預期綠）', async () => {
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'plan a edited')
+    await flushPromises()
+    await w.find('[data-test=save]').trigger('click') // 觸發 save，尚未 resolve → busyReason='save'
+    expect(w.attributes('data-busy')).toBe('save')
+
+    await findFileButton(w, 'b.yaml').trigger('click') // 儲存中嘗試切檔（同時 dirty）
+    await flushPromises()
+
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // A1a-1 儲存互斥直接擋下，不出現守衛選擇
+    expect(w.attributes('data-busy')).toBe('save') // busy 未變
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 只有初次載入，切檔未觸發任何讀取
+    expect(view.state.doc.toString()).toBe('plan a edited') // 內容未變
+
+    resolveWrite('sha256:new')
+    await flushPromises()
+  })
+
+  it('G6-P-bump-selectfile：A1a-1 優先——confirmBump 進行中同時 dirty，切檔被 A1a-1 直接拒絕，不進切檔守衛選擇（precedence 已實作，本條預期綠）', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const view = getView(w)
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    // 觸發 confirmBump 前先編輯，讓凍結快照（confirmBump 內的 frozen.buf）帶著
+    // 未儲存內容，證明「同時 dirty」而不只是「剛好沒改過」。
+    typeText(view, bufferText + 'edited before bump confirm\n')
+    await flushPromises()
+    await w.find('[data-test=bump-confirm]').trigger('click') // 觸發 confirmBump，尚未 resolve → busyReason='bump'
+    expect(w.attributes('data-busy')).toBe('bump')
+
+    await findFileButton(w, 'b.yaml').trigger('click') // bump 進行中嘗試切檔（同時 dirty）
+    await flushPromises()
+
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // A1a-1 的 bump 互斥直接擋下，不出現守衛選擇
+    expect(w.attributes('data-busy')).toBe('bump') // busy 未變
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 只有初次載入，切檔未觸發任何讀取
+    expect(view.state.doc.toString()).toBe(bufferText + 'edited before bump confirm\n') // 內容未變
+
+    resolveConfirm('plan_id: a\nanalysis_base_commit: "head111"\n')
+    await flushPromises()
+  })
+  it('G7-P：dirty 發送端——真實輸入→true、改回 saved→false、儲存成功→false（不是只驗接收端）', async () => {
+    const store = makeFileStore({ 'plan/a.yaml': { content: 'a original', digest: 'sha256:a0' } })
+    mocks.PlanRead.mockImplementation(store.read)
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write: store.write } })
+    await flushEditor()
+    const seen = () => (w.emitted('dirty') ?? []).map(e => (e as unknown[])[0])
+    expect(seen().at(-1)).toBe(false) // 載入後乾淨
+
+    const view = getView(w)
+    typeText(view, 'a edited') // 真實輸入
+    await flushPromises()
+    expect(seen().at(-1)).toBe(true)
+
+    typeText(view, 'a original') // 改回與 saved 相同
+    await flushPromises()
+    expect(seen().at(-1)).toBe(false)
+
+    typeText(view, 'a edited again')
+    await flushPromises()
+    expect(seen().at(-1)).toBe(true)
+    await w.find('[data-test=save]').trigger('click') // 儲存成功
+    await flushPromises()
+    expect(seen().at(-1)).toBe(false)
+  })
+
+})
