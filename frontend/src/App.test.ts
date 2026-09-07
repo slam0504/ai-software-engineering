@@ -531,4 +531,28 @@ describe('App 切檔守衛（A1a-2，expected-red，App 層級）', () => {
     mustFind(w, '[data-test=unsaved-guard]') // dirty 仍在
   })
 
+  it('H5-P：Gate 2 重新送核在同一分頁換檔——捨棄後新檔載入失敗、元件 dirty 未變（不重新 emit），App 仍須保留保護', async () => {
+    // 反例情境（owner 2026-09-07 指出）：gate2 導覽維持 tab='plan'、只改
+    // planFocusPath，PlanWorkspace **不會重新掛載**；若新檔 PlanRead 失敗，
+    // PlanWorkspace 的錯誤路徑保留原 buffer／saved，dirty 沒變化也就不會再
+    // emit。此時若 App 在捨棄當下就把 workspaceDirty 清成 false，之後再離開
+    // 就會略過確認——未儲存內容因此可能被靜默丟棄。
+    const w = await mountOnPlanDirty()
+    w.findComponent(GateConsole).vm.$emit('go-resubmit', { gate: 'gate2', subject: 'plan:P9' })
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]')
+
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(true) // 同一分頁換檔：元件未重新掛載
+    expect(w.findComponent(PlanWorkspace).props('path')).toBe('plan/P9.yaml')
+    // 刻意不發新的 dirty 事件——對應「新檔載入失敗、元件 dirty 未變」
+
+    const specTabBtn = w.findAll('nav button').find(b => b.text() === '規格')
+    await specTabBtn!.trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]') // 再次離開仍須確認
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(false) // 未被靜默切走
+  })
+
 })
