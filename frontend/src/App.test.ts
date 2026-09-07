@@ -482,4 +482,53 @@ describe('App 切檔守衛（A1a-2，expected-red，App 層級）', () => {
     expect(w.findAll('[data-test=unsaved-guard]').length).toBe(0) // 不再出現第二次確認
   })
 
+  it('H2-S：確認框開啟後才開始寫入——此時點捨棄不得離開；寫入結束後才可離開', async () => {
+    const w = await mountOnSpecDirty()
+    const planTabBtn = w.findAll('nav button').find(b => b.text() === '計畫')
+    await planTabBtn!.trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]')
+
+    w.findComponent(SpecWorkspace).vm.$emit('busy', true) // 確認框開著時使用者按了儲存
+    await flushPromises()
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(true) // 寫入中不得離開
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(false)
+    mustFind(w, '[data-test=unsaved-guard]') // 確認框保留，供寫入結束後再選
+
+    w.findComponent(SpecWorkspace).vm.$emit('busy', false) // 寫入完成
+    await flushPromises()
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(true) // 這時才可離開
+  })
+
+  it('H3-S：點目前分頁不設守衛，且不得清掉 dirty——之後真正離開仍受保護', async () => {
+    const w = await mountOnSpecDirty()
+    const specTabBtn = w.findAll('nav button').find(b => b.text() === '規格')
+    await specTabBtn!.trigger('click') // 目標就是目前分頁：不會改變任何東西
+    await flushPromises()
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // 不對無效導覽設守衛
+
+    const planTabBtn = w.findAll('nav button').find(b => b.text() === '計畫')
+    await planTabBtn!.trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]') // dirty 未被錯誤清除，離開仍受保護
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(false)
+  })
+
+  it('H4-S：重新送核導向到目前分頁（無實際導覽）不設守衛，dirty 保留', async () => {
+    const w = await mountOnSpecDirty()
+    w.findComponent(GateConsole).vm.$emit('go-resubmit', { gate: 'gate1', subject: 'spec:demo' })
+    await flushPromises()
+    expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // gate1 目標就是 spec，無實際導覽
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(true)
+
+    const planTabBtn = w.findAll('nav button').find(b => b.text() === '計畫')
+    await planTabBtn!.trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]') // dirty 仍在
+  })
+
 })

@@ -689,4 +689,36 @@ describe('SpecWorkspace 切檔守衛（A1a-2，expected-red）', () => {
     expect(seen().at(-1)).toBe(false)
   })
 
+  it('H1-S：確認框開啟後才開始寫入——此時點捨棄不得切檔；寫入結束後才可切', async () => {
+    const store = makeFileStore({
+      'spec/a.feature': { content: 'a original', digest: 'sha256:a0' },
+      'spec/b.feature': { content: 'b original', digest: 'sha256:b0' },
+    })
+    mocks.SpecRead.mockImplementation(store.read)
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    typeText(getView(w), 'a edited')
+    await flushPromises()
+
+    await findFileButton(w, 'b.feature').trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=unsaved-guard]')
+
+    await mustFind(w, '[data-test=save]').trigger('click') // 確認框開著時按儲存
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('save')
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).not.toHaveBeenCalledWith('spec/b.feature') // 寫入中不得切檔
+    mustFind(w, '[data-test=unsaved-guard]') // 確認框保留
+
+    resolveWrite('sha256:a1')
+    await flushPromises()
+    await mustFind(w, '[data-test=unsaved-discard]').trigger('click')
+    await flushPromises()
+    expect(store.read).toHaveBeenCalledWith('spec/b.feature') // 寫入結束後才切
+  })
+
 })
