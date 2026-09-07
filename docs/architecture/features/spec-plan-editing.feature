@@ -75,7 +75,7 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
     And 該檔在磁碟上已被其他來源改動，我持有的 digest 已過期
     When 我按下儲存
     Then 儲存被拒絕，並依 sentinel 文字契約辨識為 digest 衝突，而不是泛用錯誤
-    And 編輯器內容與受控 buffer 不被覆蓋，未儲存狀態維持
+    And 編輯器內容與受控 buffer 不被覆蓋，未儲存狀態依內容比較決定
     And 持有的 digest 與已儲存快照都不被更新
     And 系統不會自動重新載入該檔
 
@@ -84,7 +84,7 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
     And 後端寫入因非衝突原因失敗
     When 我按下儲存
     Then 錯誤訊息原樣呈現，不被吞掉也不被判為衝突
-    And 未儲存狀態維持，持有的 digest 與已儲存快照都不被更新
+    And 持有的 digest 與已儲存快照都不被更新，未儲存狀態依內容比較決定
 
   Scenario: 切換檔案時選擇捨棄未儲存內容
     Given 我使編輯器文件改變，該檔顯示為未儲存
@@ -166,10 +166,24 @@ Feature: Spec／Plan 手動編輯閉環（A1a）
     Then 已儲存快照與持有的 digest 都不變
     And 受控 buffer 保留接受草稿後的內容，錯誤依其種類呈現
 
-  Scenario: bump 確認回應不得覆蓋等待期間的新編輯或新檔案
+  Scenario: bump 確認等待期間的正常操作限制
     Given 我在 plan 確認 analysis_base bump，該次回應尚未到達
-    And 該次確認送出時已凍結當時的 buffer 版本
-    When 我在等待期間編輯內容或切換到另一個檔案
-    And 該次確認的回應才到達
-    Then 回應因文件或 buffer 版本已改變而不被套用
-    And 系統要求重新預覽，不覆蓋目前編輯器內容
+    And 該次確認送出時已凍結當時的文件與 buffer 版本
+    Then 我仍可以繼續編輯內容
+    And 切換檔案、切換分頁與其他會替換編輯器內容的操作被阻止
+    When 該次確認的回應到達且版本相符
+    Then 編輯器內容與受控 buffer 更新為 bump 結果，上述操作恢復可用
+
+  Scenario: bump 舊回應不套用——防禦性驗證
+    Given 我在 plan 確認 analysis_base bump
+    And 以測試注入使該次確認的送出版本與目前的文件或 buffer 版本不符
+    When 該次確認的回應到達
+    Then 回應不被套用，編輯器內容不被覆蓋
+    And 顯示「內容已變更，請重新預覽」這類明確訊息，而不是後端錯誤原文
+    And 系統要求重新預覽
+
+  Scenario: bump 真正的後端錯誤仍保留原訊息
+    Given 我在 plan 確認 analysis_base bump
+    When 後端回傳錯誤（例如 token 過期）
+    Then 錯誤訊息原樣呈現，不被換成版本已變更的訊息
+    And 系統要求重新預覽
