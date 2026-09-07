@@ -1,6 +1,6 @@
 # Wall-clock 測試有效名單（living）
 
-> 版本：v7（2026-09-07，B2c-7 CI 驗證通過後 #7 → **resolved**：exact implementation base `852c287`（B2c-5 `b2efb1c`／`b9c74e8`、B2c-6 `1b5e54c`／`dad85cf`）、驗證分支 head `a679fcd`、run `34039387868`，`macos-15-intel`×2＋`ubuntu-latest`×2 上 `TestOrphanDoesNotHangNormalExit`／`TestSupervisorCleanupTwoLayerForkOrphan`／`TestCtxCancelKillsWholeGroup`／`TestTerminateEscalatesToGroupKill` 各 400/400、零 invalid／setup／race／timeout、artifact manifest 全 OK；規則 8 的兩種形狀轉為歷史；B2a 解除 blocked（rebase 後仍須重做 Gate A）；前版 v6 2026-09-07，B2c-3 結果回寫 #7——macOS 機制解讀定位為「KILL 送達時正處於建立中的成員被 XNU `killpg1` 靜默略過」的 fork 窗口（本機時間線＋原始碼一致性，送達瞬間未直接觀察）、CI production 順序 36–54% 重現、群組約 30 s 後消失已直接觀察、經身分驗證的第二次群組 KILL 於探針條件下 109／109 清除；#7 維持未解決；**v6 同版本補記（2026-09-07，B2c-4）**：責任邊界已裁定為 production 契約缺口＋測試 oracle 取樣問題，修法為 supervisor 有界清理（B2c-5）與 oracle 有界化（B2c-6），待 B2c-7 CI 驗證後才轉 resolved；EPERM 語意勘誤；前版 v5 2026-09-06，B2c-2 診斷 round 2 結果回寫 #7——macOS 於 production cleanup path＋真實 fixture 時序下確認重現、`claude.Session` 非必要、責任邊界待裁定；ubuntu 為 oracle timing race 支持性證據；#7 維持未解決；前版 v4 2026-09-06 B2c round 1、v3 2026-09-05 B2a 登記 #7、v2 B1b、v1 B1a-4）
+> 版本：v8（2026-09-07，**A1a-1 新增候選：CM6／jsdom 隔離執行**——`-t` 單條隔離模式下 CM6 於 jsdom 掛載時序敏感，具名條目 `T8b-S` 於現行 HEAD `2bd4890` 以 2/4 重現；分類為**候選**，不加入可重跑名單、不併入 F1／F2 的規則 7；全檔／全套批次只記「這些批次未重現」。詳見 B-1 段。前版：版本：v7（2026-09-07，B2c-7 CI 驗證通過後 #7 → **resolved**：exact implementation base `852c287`（B2c-5 `b2efb1c`／`b9c74e8`、B2c-6 `1b5e54c`／`dad85cf`）、驗證分支 head `a679fcd`、run `34039387868`，`macos-15-intel`×2＋`ubuntu-latest`×2 上 `TestOrphanDoesNotHangNormalExit`／`TestSupervisorCleanupTwoLayerForkOrphan`／`TestCtxCancelKillsWholeGroup`／`TestTerminateEscalatesToGroupKill` 各 400/400、零 invalid／setup／race／timeout、artifact manifest 全 OK；規則 8 的兩種形狀轉為歷史；B2a 解除 blocked（rebase 後仍須重做 Gate A）；前版 v6 2026-09-07，B2c-3 結果回寫 #7——macOS 機制解讀定位為「KILL 送達時正處於建立中的成員被 XNU `killpg1` 靜默略過」的 fork 窗口（本機時間線＋原始碼一致性，送達瞬間未直接觀察）、CI production 順序 36–54% 重現、群組約 30 s 後消失已直接觀察、經身分驗證的第二次群組 KILL 於探針條件下 109／109 清除；#7 維持未解決；**v6 同版本補記（2026-09-07，B2c-4）**：責任邊界已裁定為 production 契約缺口＋測試 oracle 取樣問題，修法為 supervisor 有界清理（B2c-5）與 oracle 有界化（B2c-6），待 B2c-7 CI 驗證後才轉 resolved；EPERM 語意勘誤；前版 v5 2026-09-06，B2c-2 診斷 round 2 結果回寫 #7——macOS 於 production cleanup path＋真實 fixture 時序下確認重現、`claude.Session` 非必要、責任邊界待裁定；ubuntu 為 oracle timing race 支持性證據；#7 維持未解決；前版 v4 2026-09-06 B2c round 1、v3 2026-09-05 B2a 登記 #7、v2 B1b、v1 B1a-4）
 > 性質：**living 文件**——「目前有效名單」與規則以本文件為準。`docs/spikes/m3b-results.md` §7 保留為 2026-08-21 的歷史觀察與具名來源，§7.1 為 B1a 收尾時的處置結果快照；兩者原文不再更新。
 > 更新責任：B1b 已於 v2 更新前端兩條候選；B2a 於 v3 登記 #7 候選；**B2c** round 1 已於 v4 回寫 #7（結論：自製 proc 探針路徑未重現、真實路徑機制未定位）；**B2c-2** round 2 已於 v5 回寫 #7；**B2c-3** 已於 v6 回寫 #7 的機制欄（見 A 段與 `orphan-timeout-diagnosis-record.md` §7）；**B2c-4** 已於 v6 同版本補記裁定責任邊界與修法（裁定記錄 `docs/superpowers/plans/2026-09-07-b2c-4-supervisor-cleanup-contract-decision.md`）；#7 的實作由 B2c-5／B2c-6 落地（main `61c2201`／`852c287`），**B2c-7** 已於 v7 依完整條件回寫 #7 → resolved（run `34039387868`）；B2b 於 CI ruleset 啟用後回寫 #2／#3／#6 的 CI 量測（版本＝當時最新＋1）。任何新候選的登記與除名都在本文件的修訂記錄留痕。
 
@@ -32,6 +32,24 @@
 **前端一般規則（owner 凍結，適用於 F1／F2 以外的前端測試）**：完整套件碰到**相同 timeout** 可單獨重跑一次判定，但**仍須揭露**；單獨重跑失敗、或失敗形狀改變（非 timeout），視為真正失敗。新候選須以現行 HEAD 重現並附證據才可補入本文件；不成立者除名並在修訂記錄留痕。
 
 
+## B-1. CM6／jsdom 隔離執行候選（v8 新增，A1a-1；**候選，非名單成員**）
+
+| # | 條目 | 狀態 | 重現指令 | 受測 SHA | 失敗形狀 | 重現計數 |
+|---|---|---|---|---|---|---|
+| C1 | `T8b-S：A→B→A——先前 A 回應延遲，經過 B 後回到 A，該延遲回應仍須丟棄`（`frontend/src/components/SpecWorkspace.test.ts`） | **候選**（待處置） | `npx vitest run src/components/SpecWorkspace.test.ts src/components/PlanWorkspace.test.ts -t "T8b-S"` | `2bd48902829899b4819560a2288c8ad1023a5346` | (i) 測試自身 fail-loud：`Error: CM6 view 未在 jsdom 下成功掛載——這是環境前置條件失敗，不是行為證據，應先修好再重跑`；(ii) `Test timed out in 5000ms` | 現行 HEAD **2/4 重現**（2026-09-07 16:2x）；同命令緊接著 4/4 未重現 → 間歇、疑與機器負載相關 |
+
+**範圍**：A1a-1 於 `SpecWorkspace.test.ts`／`PlanWorkspace.test.ts` 新增的 CM6 相關測試（T1–T14 系列）皆可能落入同一機制；本表目前只具名有現行 HEAD 重現證據的 `T8b-S`，其餘依規則 3 不得直接視為名單成員。
+
+**登記限制（依 owner 2026-09-07 裁定）**：
+
+1. **不加入可重跑名單**——不適用前端一般規則的「相同 timeout 可單獨重跑一次判定」。
+2. **不併入 F1／F2**，規則 7 對本候選不適用（機制相近但條目不同，F1／F2 已 resolved）。
+3. **全檔／全套的通過只能寫「這些批次未重現」**，不得寫成「已證明穩定」：實測 `SpecWorkspace`＋`PlanWorkspace` 全檔連跑 3 次皆 55/55、`PlanWorkspace` 單檔 3 次皆 37/37、全套 3 次皆 429/429——**這些批次未重現**。
+4. **待補**：現行 HEAD 的失敗**原文**尚未擷取（2/4 那次只記錄了訊息計數，未保存輸出）；失敗形狀取自 A1a-1 mutation 的紅燈日誌（較早 SHA）。補齊前本條維持「候選（待處置）」，不得升格。
+
+**與 A1a-1 mutation 證據的關係**：mutation 的紅在正題判定已排除本形狀——分類器對「CM6 未掛載／逾時」一律判 `ENV_FAIL`，不計為紅在正題；38 份紅燈日誌經複核皆為目標測試的斷言失敗。惟**多數紅燈日誌仍含 `getClientRects is not a function` 的 jsdom 量測 stderr 雜訊**（38 份中 35 份），該雜訊不是失敗原因。
+
+
 ## C. 規則
 
 1. **A 段 #1–#6 的 FAIL 先分類，契約回歸不得重跑吸收**。在 `-race`、套件併行或負載下任一條 FAIL，先依 B1a-4 plan D1 分類：**命中該測試的契約／oracle 斷言、或 goroutine dump 可歸因於其契約路徑的卡死（panic／`-timeout`）→ 契約回歸**，不得以「先單獨重跑再判定」吸收，§7 的舊規則對這六條自 2026-09-04 起失效；**命中 setup／前提校驗、可證明的資源失效、或可歸因於其他測試的 panic／`-timeout` → 該次無效**，揭露後可在調整負載後重跑，不算紅也不算綠。
@@ -45,6 +63,8 @@
 8. **unresolved 狀態語意（v5 新增，#7；v6 同版本補記擴充；v7 起 #7 已 resolved，本規則保留給其他 CI-only 候選）**：CI 已重現，且（a）機制或責任邊界未定，**或（b）責任邊界與修法已裁定、但實作或驗證尚未完成**的條目。不是 resolved 也不是 no-change disposition，不得除名或改寫為誤紅。**#7 的兩種已登記形狀（v7 起為歷史；修法後在 B2c-7 run `34039387868` 四 runner ×100 未再出現；若在 B2c-5／B2c-6 之後的 HEAD 再度出現，依規則 3 以現行 HEAD 重現並登記為新候選，不得直接沿用 #7）**——(i) macOS 於 5 秒 guard 命中 `session_test.go:207: drain/Wait hung on orphan-held pipes`（EOF 卡死）、(ii) ubuntu 於 drain／Wait 返回後立即命中 `session_test.go:210: orphan must be reaped by supervisor on parent exit`（oracle 即時失敗）——才視為 #7 的已知未解決項；**其他訊息、panic、data race、`-timeout`、setup／環境問題仍須依規則 1 所定的分類方式另行分類**（命中契約／oracle 斷言或可歸因於契約路徑的卡死 → 契約回歸；setup／資源失效／他測試造成 → 該次無效），不得歸入 #7；此為 #7 的分類契約。已知形狀亦不得以 retry、放寬 guard 或跳過吸收（處置前該 job 維持紅燈語意）；處置路徑與狀態轉換由 backlog 續票決定（v5 當時為 B2c-3／B2c-4；**v6 補記後為 B2c-5／B2c-6／B2c-7**），轉為 resolved／no-change 時須附 commit 或裁定記錄；#7 轉 resolved 的完整條件見 B2c-4 裁定記錄 §5（exact implementation SHA、artifact 完整性、每條核心／escalation 測試各 400/400、零 invalid／setup／race／timeout、v7 落地）。
 
 ## 修訂記錄
+
+- v8（2026-09-07，A1a-1）：新增 **B-1 段「CM6／jsdom 隔離執行候選」**，具名條目 C1（`T8b-S`）於現行 HEAD `2bd4890` 2/4 重現、緊接 4/4 未重現；明列四項登記限制（不入可重跑名單、不併入 F1／F2、全檔通過只寫「未重現」、失敗原文待補）。A 段與 B 段內容不變。
 
 - v7（2026-09-07）：B2c-7 CI 驗證通過，#7 **unresolved → resolved**——commit 欄填 B2c-5 `b2efb1c`／`b9c74e8` 與 B2c-6 `1b5e54c`／`dad85cf`，修正方式欄改「已落地」，負載重驗欄填 run `34039387868`（base `852c287`、head `a679fcd`、四 runner × 四測試各 100/100、零 invalid／setup／race／timeout、manifest 全 OK）並列證據限制；規則 8 的兩種 #7 形狀轉為歷史、規則本身保留；版本摘要、更新責任、A 段標題同步。B2a 解除 blocked 的條件（#7 resolved 且 v7 落地）自本版成立，PR #1 rebase 後仍須重新完成 Gate A。
 - v6 同版本補記（2026-09-07，B2c-4 APPROVED）：#7 維持 unresolved，但原因改為「責任邊界與修法已裁定（production 契約缺口→B2c-5 supervisor 有界清理；oracle 取樣→B2c-6 有界化），實作與 B2c-7 驗證尚未完成」；修正方式欄改列已裁定修法；現行後續改指 B2c-5／B2c-6／B2c-7（B2c-3／B2c-4 作歷史保留）；規則 8 擴充為包含「已裁定修法尚未完成實作或驗證」並附 #7 轉 resolved 的完整條件；版本摘要、更新責任、A 段標題同步。版本號不變，v7 留給 B2c-7。
