@@ -1,6 +1,6 @@
 # Wall-clock 測試有效名單（living）
 
-> 版本：v10（2026-09-08，**B2b-2 五筆樣本回寫**：新增 A-1 段（CI 耗時量測），依 D6 分為舊組 n=3 與 A1a 組 n=2；樣本 4 的 `go` job 因 gofmt 檢查中止、未執行測試，go 相關耗時記「缺」不補零，故 A1a 組的 go／#2／#3／#6 有效資料僅 n=1；五筆皆 npm cache hit、不稱冷啟動；A 段「最後一次負載重驗」以本表回寫。**C1 的既有限制不變**）；前版：v9.1（2026-09-08，**C1 補記精度修正**：區分「2/4 那次未保存失敗原文（從未產生）」與「較早 mutation 日誌保存後遺失」，並補來源 session ID 與約略時點；前版 v9 同日，**C1 補記**：可供補齊失敗原文的原始輸出已隨 `/tmp/a1a-1` 封存整個遺失、清除時點與原因未知；owner 查歷史 session 找到登記內容但無原始輸出；不以摘要代替原文、不授權重新重現，C1 維持候選與原文待補。A 段、B 段與 B-1 段其餘內容不變）；前版：v8（2026-09-07，**A1a-1 新增候選：CM6／jsdom 隔離執行**——`-t` 單條隔離模式下 CM6 於 jsdom 掛載時序敏感，具名條目 `T8b-S` 於現行 HEAD `2bd4890` 以 2/4 重現；分類為**候選**，不加入可重跑名單、不併入 F1／F2 的規則 7；全檔／全套批次只記「這些批次未重現」。詳見 B-1 段。前版：版本：v7（2026-09-07，B2c-7 CI 驗證通過後 #7 → **resolved**：exact implementation base `852c287`（B2c-5 `b2efb1c`／`b9c74e8`、B2c-6 `1b5e54c`／`dad85cf`）、驗證分支 head `a679fcd`、run `34039387868`，`macos-15-intel`×2＋`ubuntu-latest`×2 上 `TestOrphanDoesNotHangNormalExit`／`TestSupervisorCleanupTwoLayerForkOrphan`／`TestCtxCancelKillsWholeGroup`／`TestTerminateEscalatesToGroupKill` 各 400/400、零 invalid／setup／race／timeout、artifact manifest 全 OK；規則 8 的兩種形狀轉為歷史；B2a 解除 blocked（rebase 後仍須重做 Gate A）；前版 v6 2026-09-07，B2c-3 結果回寫 #7——macOS 機制解讀定位為「KILL 送達時正處於建立中的成員被 XNU `killpg1` 靜默略過」的 fork 窗口（本機時間線＋原始碼一致性，送達瞬間未直接觀察）、CI production 順序 36–54% 重現、群組約 30 s 後消失已直接觀察、經身分驗證的第二次群組 KILL 於探針條件下 109／109 清除；#7 維持未解決；**v6 同版本補記（2026-09-07，B2c-4）**：責任邊界已裁定為 production 契約缺口＋測試 oracle 取樣問題，修法為 supervisor 有界清理（B2c-5）與 oracle 有界化（B2c-6），待 B2c-7 CI 驗證後才轉 resolved；EPERM 語意勘誤；前版 v5 2026-09-06，B2c-2 診斷 round 2 結果回寫 #7——macOS 於 production cleanup path＋真實 fixture 時序下確認重現、`claude.Session` 非必要、責任邊界待裁定；ubuntu 為 oracle timing race 支持性證據；#7 維持未解決；前版 v4 2026-09-06 B2c round 1、v3 2026-09-05 B2a 登記 #7、v2 B1b、v1 B1a-4）
+> 版本：v11（2026-09-08，**A-1 補正**：樣本 4 的 `go` **job 耗時 95 s（failure，提前中止）**有紀錄、缺的只是測試耗時，A1a 組 job 統計改為 95／185.5／276 s（n=2，含提前中止）、#2／#3／#6 維持 n=1；規則 5 回填為「B2b-2 已完成 CI 分布量測、指向 A-1、冷啟動仍未驗證」；新增**逐筆來源索引**（六路徑指紋、head／base、四 job 起訖與 runner、artifact ID）並標明樣本證據 manifest 只涵蓋樣本 4／5）；前版：v10（2026-09-08，**B2b-2 五筆樣本回寫**：新增 A-1 段（CI 耗時量測），依 D6 分為舊組 n=3 與 A1a 組 n=2；樣本 4 的 `go` job 因 gofmt 檢查中止、未執行測試，go 相關耗時記「缺」不補零，故 A1a 組的 go／#2／#3／#6 有效資料僅 n=1；五筆皆 npm cache hit、不稱冷啟動；A 段「最後一次負載重驗」以本表回寫。**C1 的既有限制不變**）；前版：v9.1（2026-09-08，**C1 補記精度修正**：區分「2/4 那次未保存失敗原文（從未產生）」與「較早 mutation 日誌保存後遺失」，並補來源 session ID 與約略時點；前版 v9 同日，**C1 補記**：可供補齊失敗原文的原始輸出已隨 `/tmp/a1a-1` 封存整個遺失、清除時點與原因未知；owner 查歷史 session 找到登記內容但無原始輸出；不以摘要代替原文、不授權重新重現，C1 維持候選與原文待補。A 段、B 段與 B-1 段其餘內容不變）；前版：v8（2026-09-07，**A1a-1 新增候選：CM6／jsdom 隔離執行**——`-t` 單條隔離模式下 CM6 於 jsdom 掛載時序敏感，具名條目 `T8b-S` 於現行 HEAD `2bd4890` 以 2/4 重現；分類為**候選**，不加入可重跑名單、不併入 F1／F2 的規則 7；全檔／全套批次只記「這些批次未重現」。詳見 B-1 段。前版：版本：v7（2026-09-07，B2c-7 CI 驗證通過後 #7 → **resolved**：exact implementation base `852c287`（B2c-5 `b2efb1c`／`b9c74e8`、B2c-6 `1b5e54c`／`dad85cf`）、驗證分支 head `a679fcd`、run `34039387868`，`macos-15-intel`×2＋`ubuntu-latest`×2 上 `TestOrphanDoesNotHangNormalExit`／`TestSupervisorCleanupTwoLayerForkOrphan`／`TestCtxCancelKillsWholeGroup`／`TestTerminateEscalatesToGroupKill` 各 400/400、零 invalid／setup／race／timeout、artifact manifest 全 OK；規則 8 的兩種形狀轉為歷史；B2a 解除 blocked（rebase 後仍須重做 Gate A）；前版 v6 2026-09-07，B2c-3 結果回寫 #7——macOS 機制解讀定位為「KILL 送達時正處於建立中的成員被 XNU `killpg1` 靜默略過」的 fork 窗口（本機時間線＋原始碼一致性，送達瞬間未直接觀察）、CI production 順序 36–54% 重現、群組約 30 s 後消失已直接觀察、經身分驗證的第二次群組 KILL 於探針條件下 109／109 清除；#7 維持未解決；**v6 同版本補記（2026-09-07，B2c-4）**：責任邊界已裁定為 production 契約缺口＋測試 oracle 取樣問題，修法為 supervisor 有界清理（B2c-5）與 oracle 有界化（B2c-6），待 B2c-7 CI 驗證後才轉 resolved；EPERM 語意勘誤；前版 v5 2026-09-06，B2c-2 診斷 round 2 結果回寫 #7——macOS 於 production cleanup path＋真實 fixture 時序下確認重現、`claude.Session` 非必要、責任邊界待裁定；ubuntu 為 oracle timing race 支持性證據；#7 維持未解決；前版 v4 2026-09-06 B2c round 1、v3 2026-09-05 B2a 登記 #7、v2 B1b、v1 B1a-4）
 > 性質：**living 文件**——「目前有效名單」與規則以本文件為準。`docs/spikes/m3b-results.md` §7 保留為 2026-08-21 的歷史觀察與具名來源，§7.1 為 B1a 收尾時的處置結果快照；兩者原文不再更新。
 > 更新責任：B1b 已於 v2 更新前端兩條候選；B2a 於 v3 登記 #7 候選；**B2c** round 1 已於 v4 回寫 #7（結論：自製 proc 探針路徑未重現、真實路徑機制未定位）；**B2c-2** round 2 已於 v5 回寫 #7；**B2c-3** 已於 v6 回寫 #7 的機制欄（見 A 段與 `orphan-timeout-diagnosis-record.md` §7）；**B2c-4** 已於 v6 同版本補記裁定責任邊界與修法（裁定記錄 `docs/superpowers/plans/2026-09-07-b2c-4-supervisor-cleanup-contract-decision.md`）；#7 的實作由 B2c-5／B2c-6 落地（main `61c2201`／`852c287`），**B2c-7** 已於 v7 依完整條件回寫 #7 → resolved（run `34039387868`）；B2b 於 CI ruleset 啟用後回寫 #2／#3／#6 的 CI 量測（版本＝當時最新＋1）。任何新候選的登記與除名都在本文件的修訂記錄留痕。
 
@@ -29,7 +29,7 @@
 | 1 | `34075935919`／1／pull_request | `5a83717` | 舊組 | 是 | 378 s | 51 s | 8 s | 152 s | 319 s |
 | 2 | `34077383674`／1／pull_request | `57b2448` | 舊組 | 是 | 390 s | 49 s | 5 s | 268 s | 335 s |
 | 3 | `34080497639`／1／pull_request | `ea5123a` | 舊組 | 是 | 424 s | 59 s | 6 s | 189 s | 357 s |
-| 4 | `34202299786`／1／pull_request | `f2a5ebb` | A1a 組 | 是（D5） | 273 s | 59 s | 4 s | 207 s | **缺**（gofmt 檢查失敗即中止，未執行 build／vet／test） |
+| 4 | `34202299786`／1／pull_request | `f2a5ebb` | A1a 組 | 是（D5） | 273 s | 59 s | 4 s | 207 s | **95 s（failure，提前中止）**——gofmt 檢查失敗即結束，未執行 build／vet／test |
 | 5 | `34209630775`／1／pull_request | `c549d45` | A1a 組 | 是 | 331 s | 47 s | 4 s | 231 s | 276 s |
 
 **逐測試耗時**（#2 `TestClaudeAssistFailsLoudOnOversizedLine`／#3 `TestMultiTurnSendAndTurnBoundaries`／#6 `TestOutputCancellationKillsGrandchildren`；F1／F2 見 B 段）
@@ -50,7 +50,7 @@
 | frontend | 49／51／59 s | 47／53／59 s（n=2） |
 | checksums | 5／6／8 s | 4／4／4 s（n=2） |
 | wails-build | 152／189／268 s | 207／219／231 s（n=2） |
-| **go** | 319／335／357 s | **276 s（n=1）** |
+| **go（job 耗時）** | 319／335／357 s | 95／185.5／276 s（n=2，**含樣本 4 的提前中止 job**，不得解讀為完整測試流程耗時） |
 | #2 | 0.35／0.39／0.50 s | **0.35 s（n=1）** |
 | #3 | 0.03／0.04／0.04 s | **0.04 s（n=1）** |
 | #6 | 0.35／0.35／0.35 s | **0.35 s（n=1）** |
@@ -59,7 +59,20 @@
 
 （格式：min／median／max）
 
-**A 段「最後一次負載重驗」的回寫**：#2／#3／#6 於 CI（`macos-15-intel`）的實測 Elapsed 見上表。**舊組 n=3、A1a 組 go 相關指標 n=1**——樣本 4 的 `go` job 在 gofmt 檢查即中止，未執行測試，**耗時記「缺」不填 0**，測試輸出缺席亦導致 artifact 上傳失敗。此為**格式檢查缺漏，不是 Go 測試失敗**。
+**A 段「最後一次負載重驗」的回寫**：#2／#3／#6 於 CI（`macos-15-intel`）的實測 Elapsed 見上表。**要分清兩件事**：樣本 4 的 `go` **job 耗時有紀錄**（95 s，08:02:46Z→08:04:21Z，failure），缺的是**測試耗時**（#2／#3／#6）——該 job 在 gofmt 檢查即結束，未執行 build／vet／test，測試輸出缺席亦導致 artifact 上傳失敗。因此 **A1a 組的 job 耗時 n=2（含提前中止）、#2／#3／#6 有效 n=1**；測試耗時的缺值**不補零**。此為**格式檢查缺漏，不是 Go 測試失敗**。
+
+**逐筆來源索引**（引用既有資料，不重複抄寫）
+
+| # | head／base | 六路徑指紋（`internal`／`testdata`／`go.mod`／`go.sum`／`frontend`／`ci.yml`） | 四 job 起訖與 runner | artifact | 來源 |
+|---|---|---|---|---|---|
+| 1 | `5a83717`／`1bbb47a` | `e1d3e32`／`8cc2ff0`／`83f5ffb`／`4ae8741`／**`c98b36d`**／`4efaf16`（同 main `1bbb47a`） | 見來源列（含 ubuntu-24.04 image `20260831.293.1`、runner `20260828.587`、macos-15 image `20260824.0482.1`、runner `20260819.586`） | go-test-json `10002143591`／vitest-output `10002042695` | `docs/superpowers/plans/2026-09-08-b2b-ruleset-enforcement.md` 的 D6 樣本表（樣本 1 列） |
+| 2 | `57b2448`／`1bbb47a` | 同上（同 main） | 同來源列 | go-test-json `10002641420`／vitest-output `10002541534` | 同上檔案 Task 4「樣本 2」勾選項 |
+| 3 | `ea5123a`／`1bbb47a` | 同上（同 main） | 同來源列 | go-test-json `10003637798`／vitest-output `10003532624` | 本機工作日誌 `.remember/now.md`，段落標題「**## 2026-09-07 11:52 B2b-2 候選樣本 3 採集（PR #3 head ea5123a）**」 |
+| 4 | `f2a5ebb`／`3ea31ea` | `e1d3e32`／`8cc2ff0`／`83f5ffb`／`4ae8741`／**`278a5bf`**／`4efaf16` | checksums 08:01:43→08:01:47（ubuntu-latest）／frontend 08:01:43→08:02:42（ubuntu-latest）／go 08:02:46→08:04:21（macos-15-intel）／wails-build 08:02:45→08:06:12（macos-15-intel） | wails-app-tar `10046441441`／frontend-dist `10046324117`／vitest-output `10046323042`；**無 go-test-json** | `~/.local/share/sdlc-evidence/b2b-2/samples/34202299786.{run,jobs,artifacts}.json`、`.frontend.log` |
+| 5 | `c549d45`／`3ea31ea` | 同樣本 4 | frontend 09:22:29→09:23:16／checksums 09:22:29→09:22:33（ubuntu-latest）／go 09:23:20→09:27:56／wails-build 09:23:20→09:27:11（macos-15-intel） | go-test-json `10049410730`／wails-app-tar `10049385807`／frontend-dist `10049253502`／vitest-output `10049252638` | 同上目錄 `34209630775.*` |
+
+**證據涵蓋範圍的限制**：`~/.local/share/sdlc-evidence/b2b-2/samples/` 的 manifest（21 檔、21/21 OK、SHA-256 `403ed089b4171b9244aaaa08a6f53d0682bc97bf078e3847e32745f3a6c4ddef`）**只涵蓋樣本 4／5**；樣本 1–3 的欄位由上表「來源」欄所指的既有文件與工作日誌支持，**不得以該 manifest 主張五筆全部欄位齊備**。樣本 1–3 的原始採集檔（原 `/tmp/b2b-t1/samples/`）與 A1a 封存一同遺失，目前無法調閱。ubuntu runner image 由樣本 4／5 的 frontend job log 實測為 `ubuntu-24.04` image `20260831.293.1`、runner `20260828.587`。
+
 
 **邊界**：五筆皆 npm cache hit，**不得稱冷啟動**；本表為 CI 實測，不外推至本機，也不反推本機餘裕（規則 4 不變）。
 
@@ -104,13 +117,15 @@
 2. **綠燈仍不是修正的通過證據**。六條全綠只證明「未重現」，任何修正的通過證據須來自其對應施工票的 mutation／negative control。
 3. **新候選登記條件**：須以現行 HEAD 重現（含失敗輸出、重現指令、HEAD SHA），登記時標「候選」，不得直接視為名單成員；處置完成後改「resolved」或「no-change disposition」並附 commit（no-change 不得虛構 commit）。
 4. **本機餘裕觀察（不外推至 CI）**：B1a-4 矩陣 M3 三份併發下，#2 最長 8.02s／預算 15s（約 1.9 倍）、#6 最長 9.3s／deadline 20s（約 2.2 倍），遠低於單跑時的約 30 倍。此為本機 8 核觀察，CI runner 若較弱，這兩條最先逼近預算。
-5. **CI 冷啟動缺口歸屬 B2**：B1a 全部量測來自本機；CI runner 的冷啟動與 required-check 耗時分布由 B2 於 CI 建立後首批 required check 跑批時量測 **#2／#3／#6** 並回寫本文件 A 段「最後一次負載重驗」欄。
+5. **CI 耗時分布已由 B2b-2 量測（v10／v11 回填，取代原「歸屬 B2、待量測」的表述）**：#2／#3／#6 於 CI（`macos-15-intel`）的實測 Elapsed 與四個 job 的耗時分布見 **A-1 段**；依 D6 分為舊組 n=3 與 A1a 組（job 耗時 n=2、測試耗時 n=1），兩組不混算。**冷啟動仍未驗證**——五筆樣本的 npm cache 皆為 hit（`node-cache-Linux-x64-npm-9dcd67fe…`），依 D6 不得稱冷啟動；B1a 的本機量測與本表不互相外推（規則 4 不變）。
 6. **#6 的自然誤紅從未在本機重現**：現有證據是 B1a-3 的人工延遲證明機制與 B1a-4 負載下 27/27 全綠，結論僅為「本機負載下未重現」。
 7. **F1 `PlanWorkspace > PlanAssist 送出後草稿區顯示 loading，事件送達後輸出累積` 與 F2 `SpecWorkspace draft accept > discards spec-assist result if the file switches during the call` 自 B1b 處置後，「相同 timeout 可單獨重跑一次判定」的前端規則對這兩條失效**，任何 FAIL 先分類：(i) 命中該測試的契約斷言（F1：`assist-busy` 顯示／`draft-text` 累積／busy 解除；F2：`draft-text` 為空／`accept-draft` disabled）、或可歸因於其契約路徑的卡死（含再次 `Test timed out in 5000ms` 且無環境訊號）→ **回歸，required check 阻擋，不得重跑吸收**；(ii) setup 失敗（掛載／mock 建立）、可證明的資源失效（OOM、worker 啟動失敗）、或其他測試造成的中斷 → **該次無效**，揭露後重跑，不算紅也不算綠。另：前端測試不得把模組動態載入或首次建構重型元件的成本留在測試本體。**此規則不受 B1b pre-merge 檔案層級 control 例外影響。**
 
 8. **unresolved 狀態語意（v5 新增，#7；v6 同版本補記擴充；v7 起 #7 已 resolved，本規則保留給其他 CI-only 候選）**：CI 已重現，且（a）機制或責任邊界未定，**或（b）責任邊界與修法已裁定、但實作或驗證尚未完成**的條目。不是 resolved 也不是 no-change disposition，不得除名或改寫為誤紅。**#7 的兩種已登記形狀（v7 起為歷史；修法後在 B2c-7 run `34039387868` 四 runner ×100 未再出現；若在 B2c-5／B2c-6 之後的 HEAD 再度出現，依規則 3 以現行 HEAD 重現並登記為新候選，不得直接沿用 #7）**——(i) macOS 於 5 秒 guard 命中 `session_test.go:207: drain/Wait hung on orphan-held pipes`（EOF 卡死）、(ii) ubuntu 於 drain／Wait 返回後立即命中 `session_test.go:210: orphan must be reaped by supervisor on parent exit`（oracle 即時失敗）——才視為 #7 的已知未解決項；**其他訊息、panic、data race、`-timeout`、setup／環境問題仍須依規則 1 所定的分類方式另行分類**（命中契約／oracle 斷言或可歸因於契約路徑的卡死 → 契約回歸；setup／資源失效／他測試造成 → 該次無效），不得歸入 #7；此為 #7 的分類契約。已知形狀亦不得以 retry、放寬 guard 或跳過吸收（處置前該 job 維持紅燈語意）；處置路徑與狀態轉換由 backlog 續票決定（v5 當時為 B2c-3／B2c-4；**v6 補記後為 B2c-5／B2c-6／B2c-7**），轉為 resolved／no-change 時須附 commit 或裁定記錄；#7 轉 resolved 的完整條件見 B2c-4 裁定記錄 §5（exact implementation SHA、artifact 完整性、每條核心／escalation 測試各 400/400、零 invalid／setup／race／timeout、v7 落地）。
 
 ## 修訂記錄
+
+- v11（2026-09-08）：A-1 補正三處——(1) 樣本 4 的 `go` **job 耗時有紀錄**（95 s、08:02:46Z→08:04:21Z、failure），先前誤填「缺」；缺的是**測試耗時**（#2／#3／#6）。A1a 組 job 耗時統計改為 95／185.5／276 s（n=2，註明含提前中止、不得解讀為完整測試流程），測試耗時維持有效 n=1、不補零。(2) 規則 5 由「歸屬 B2、待量測」回填為「B2b-2 已完成本次 CI 分布量測，指向 A-1；**冷啟動仍未驗證**（五筆 cache 皆 hit）」。(3) 新增**逐筆來源索引**：六路徑指紋、head／base、四 job 起訖與 runner labels、artifact ID 與各自來源；樣本 3 定位到 `.remember/now.md` 的具名段落；並標明樣本證據 manifest（21 檔）**只涵蓋樣本 4／5**，樣本 1–3 由既有文件與工作日誌支持、原始採集檔已遺失。
 
 - v10（2026-09-08）：新增 **A-1 段（CI 耗時量測，B2b-2 五筆樣本）**——D5 入樣、D6 分組：舊組 n=3（指紋同 main `1bbb47a`）、A1a 組 n=2（`frontend`＝`278a5bf…`，其餘五路徑同 main）；兩組不混算。樣本 4（`34202299786`）的 `go` job 於 gofmt 檢查中止，build／vet／test 未執行，**go 耗時與 #2／#3／#6 記「缺」不補零**，A1a 組該類指標有效 n=1。五筆 `ci.yml` SHA-256 一致且與 main 相同、npm cache 皆 hit（不稱冷啟動）。A 段「最後一次負載重驗」以本表回寫。C1 與 B-1 段其餘限制不變。
 
