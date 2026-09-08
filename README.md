@@ -135,12 +135,13 @@ wails build                  # → build/bin/sdlc-workbench.app
 
 ### 測試
 
-從乾淨 checkout 依序執行（順序有意義：root 套件 `go:embed` 需要 `frontend/dist`，所以 frontend 先建）。每條對應 CI（`.github/workflows/ci.yml`）的同名 job，任何人 checkout 同一 SHA 執行下列指令即可重現 CI 的同等證據：
+從乾淨 checkout 依序執行（順序有意義：root 套件 `go:embed` 需要 `frontend/dist`，所以 frontend 先建）。**下列為主要本機檢查**，每條對應 CI 的同名 job；**完整 CI 步驟以 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 為準**：
 
 ```bash
 npm --prefix frontend ci
 npm --prefix frontend run test                          # CI job: frontend — vitest（store／scroll／sanitizer／i18n／元件）
 npm --prefix frontend run build                         # CI job: frontend — vue-tsc typecheck + vite build → frontend/dist
+test -z "$(gofmt -l .)"                                 # CI job: go — 格式檢查；未通過會使該 job 中止，其後步驟不會執行
 go build ./...                                          # CI job: go
 go vet ./...                                            # CI job: go
 go test -race ./... -count=1                            # CI job: go — 所有 package，含 production path 的同步與競態測試
@@ -148,7 +149,9 @@ go test -race ./... -count=1                            # CI job: go — 所有 
 (cd docs/architecture && shasum -a 256 -c SHA256SUMS)   # CI job: checksums — 里程碑 plan 凍結（m0／m1／m1.5）
 ```
 
-上述四個 job 是 `main` 的 required checks：合併規則（ruleset、rebase-only、紅燈處置與維護程序）見 [`docs/architecture/ci-merge-policy.md`](docs/architecture/ci-merge-policy.md)。
+上列不涵蓋第四個 job `wails-build`——該 job 由 Wails CLI 安裝、`wails build -s`、CLI 工具安裝、`scripts/check-cli.sh` 檢查、`scripts/bundle-clis.sh` 封裝與 artifact 上傳等**各自獨立的步驟**組成，逐步內容見 [`ci.yml`](.github/workflows/ci.yml) 的 `wails-build` job。
+
+四個 job（`frontend`／`go`／`wails-build`／`checksums`）是 `main` 的 required checks：合併規則（ruleset、rebase-only、紅燈處置與維護程序）見 [`docs/architecture/ci-merge-policy.md`](docs/architecture/ci-merge-policy.md)；CI 的耗時分布量測見 [`docs/architecture/wall-clock-test-register.md`](docs/architecture/wall-clock-test-register.md) A-1 段。
 
 > **牆鐘相依測試的紅燈怎麼判**：Go 六條與前端兩條具名測試已由 Pre-M4 B1 系列處置完畢，有效名單與規則以
 > [`docs/architecture/wall-clock-test-register.md`](docs/architecture/wall-clock-test-register.md) 為準——
@@ -212,6 +215,11 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 
 - **規格工作區** — 在 app 內編輯 `spec/`（CodeMirror 6，Gherkin 語法標示）；三個 AI 輔助按鈕（草擬 Gherkin、
   歧義偵測、oracle 覆蓋檢查）輸出至草稿區，由使用者確認後才寫入檔案
+- **手動編輯與儲存** — 直接在編輯器打字後按「儲存」寫回檔案。儲存的是按下當下的內容；等待期間仍可繼續打字，
+  之後打的內容不會被誤標成已儲存。若檔案在此期間被其他來源改動，儲存會被明確擋下並指出是版本衝突，
+  **目前編輯中的內容原樣保留、不會被覆蓋，也不會自動重新載入**
+- **未儲存內容的保護** — 有未儲存變更時切換檔案或離開工作區，會先請你選擇**保留**（留在原處繼續編輯）或
+  **捨棄變更並離開**；選擇之前畫面不會被切走。寫入進行中則直接拒絕離開，等寫入結束後才能再選一次
 - **限定變更範圍的兩階段 commit** — 先預覽 diff、確認後才 commit，且保證「確認的內容就是實際 commit 的內容」，
   不影響納管範圍外的變更
 - **Gate 1 主控台** — 送核（綁定 spec manifest digest 與 base commit）、核可／退回並填寫理由；核可後規格一有變更，
@@ -225,8 +233,11 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 把實作拆成任務 DAG，先過確定性驗證，再由人逐項任務決定風險等級後才放行。
 
 - **Plan Workspace** — 結構化 plan YAML 編輯（CodeMirror 6），PlannerAssist 以唯讀的 one-shot 產生草稿至草稿區、
-  由使用者確認後才寫入檔案；沿用 SpecWorkspace 的兩階段（預覽／確認）限定範圍 commit
+  由使用者確認後套用至編輯器，須按儲存才寫檔；沿用 SpecWorkspace 的兩階段（預覽／確認）限定範圍 commit
   （產生 `plan_commit`，工作樹有未提交變更時拒絕核可）
+- **手動編輯與儲存** — 同規格工作區：儲存的是按下當下的內容、版本衝突時保留目前編輯內容、未儲存時切換檔案或
+  離開工作區會先請你選擇保留或捨棄。套用 AI 草稿與確認基準線調整都只更新編輯器內容，仍須自行按儲存才會寫檔；
+  儲存或確認基準線調整的等待期間，暫停重複操作與離開
 - **DagPane** — 將 plan 解析為 mermaid flowchart 的唯讀視覺化結果，plan 檔變更後自動重新渲染
 - **確定性驗證器** — plan schema／DAG 不得包含循環／依賴必須存在／task ID 唯一／最低風險等級
   （`minimum_risk_tier` 依 risk policy 重算，且 `planner_risk_tier ≥ minimum_risk_tier`）／
@@ -382,7 +393,8 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 | **i18n** 繁中介面 | ✅ 已合併 | vue-i18n 語系支援，預設繁體中文並提供完整英文語系 |
 | **M3a** 計畫與測試契約完整流程 | ✅ 已合併 | 任務 DAG、Gate 2、測試契約核可（本機測試證據執行器）、阻擋事項收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；同時檢視多個 session 延後至 **M3b**） |
 | **M3b** 多 session 工作區 | ✅ 已合併 | 每 provider 4 個 session slot、雙 pane 同時檢視與焦點語意（釘選與焦點跨重啟持久化）、WSID 建立交易與 tombstone 移除、single-instance guard、Codex connection-wide wire log 與跨 generation 的 session 級 segment 歸屬、per-WSID replay index 與視窗化載入。四個收尾 gate 與實機驗收 A1–A10 全綠、Task 0 live probe 重跑 GATE GO（[驗收結果](docs/spikes/m3b-results.md)；§10–§11 為最終樹矩陣重跑與實機補跑，三項後續票見 §11 末） |
-| **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外） |
+| **Pre-M4 準備** | 🔄 進行中 | M4 前的整備工作：牆鐘測試處置（B1）、最小 CI＋main ruleset 與 CI 耗時量測（B2 系列）、TaskRun／Gate 3／forge 契約與 application seams（B5／B6a／B6b）、Spec／Plan 編輯閉環與未儲存內容保護（A1a）皆已完成；其餘票見 [`docs/architecture/pre-m4-readiness-backlog.md`](docs/architecture/pre-m4-readiness-backlog.md) |
+| **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外）。**Gate 3 的完整介面與 SC4 端到端流程尚未實作**——B5／B6 完成的是前置契約與基礎建設，不代表 M4 的垂直切片（C1a–C1c）已施工 |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（以 OpenCode 作為第一個目標）、保留 Claude／Codex 原生 adapter、能力協商（capability negotiation）（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 
 里程碑執行計畫（m0／m1／m1.5）經外部審核後凍結於 [`docs/architecture/`](docs/architecture/)（`cd docs/architecture && shasum -a 256 -c SHA256SUMS` 可驗證；app-plan 與治理文件為 living 文件，版本見各自 header 與修訂記錄，不在凍結清單），
