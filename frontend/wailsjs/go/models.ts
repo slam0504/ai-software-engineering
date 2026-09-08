@@ -452,6 +452,7 @@ export namespace main {
 	    reason?: string;
 	    approver?: gate.Approver;
 	    journal_degraded?: boolean;
+	    terminal_cause?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new GateEntryDTO(source);
@@ -471,6 +472,7 @@ export namespace main {
 	        this.reason = source["reason"];
 	        this.approver = this.convertValues(source["approver"], gate.Approver);
 	        this.journal_degraded = source["journal_degraded"];
+	        this.terminal_cause = source["terminal_cause"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
