@@ -1,8 +1,8 @@
 # A1a Spec／Plan 編輯器同步閉環 Implementation Plan
 
 > **For agentic workers:** 本票為前端佈線與測試，無外部寫入。實作前須通過 owner design gate；push、開 PR、CI 另案授權。Steps use checkbox (`- [ ]`) syntax for tracking.
-> 版本：rev9（2026-09-07，**紀錄修正與證據封存**：`getClientRects` 雜訊計數 35 → **36**（附計數方法；不含的兩份是不掛載 CM6 的 App 測試）；§11.5 措辭改為「這些批次未重現」並改記「已登記 register v8 候選 C1」；新增 §11.4b A1a-1 證據封存（manifest 120 檔、120/120 OK）。A1a-2 開工前的最終狀態）；前版：版本：rev8（2026-09-07，**複核修正與證據歸屬補齊**：更正「紅燈日誌零環境失敗訊息」的措辭為「沒有任何目標失敗是環境造成的」並揭露 35/38 份仍含 jsdom 量測雜訊、摘要擷取已離線修正（原始日誌保留、不重跑）；補齊人工 Wails 驗收的實際操作者、原始確認紀錄與受測版本；記錄 register v8 候選登記與 backlog A5 bindings 同步小票的處置）；前版：版本：rev7（2026-09-07，**A1a-1 執行完成回填**：expected-red 結果（R=27／G=3）、mutation **38 項 N/N 全部紅在正題並回綠**（含框架修正與並行汙染的揭露）、人工 Wails 驗收通過（owner 實機確認、隔離工作區）、Gate A1a-1 全部勾選、新增「A1a-1 剩餘揭露」。實作見 `ddbbd2d`／`da20294`／`70dbe04`／`af0cae2`。A1a-2 未授權）；前版：版本：rev6（2026-09-07，**實作啟動回填（設計不變）**：狀態改為 design gate APPROVED（綁定 `7860d75`）、A1a-1 實作進行中；新增第十一節「A1a-1 執行 checklist」（30 個測試識別項目、31 項變異、expected-red 分類規則、人工驗收資料隔離、失敗分類規則）；**測試計數更正 33 → 30**（明列 13 Spec ＋ 16 Plan ＋ 1 Go；不為湊數新增測試）；**前端基準更正 397 → 399 條**（本機實測 40 檔／399 全綠）；**D5 可行性已實測**：jsdom 下 `beforeinput`／`input` 不改變 CM6 文件（doc 未變），採 `view.dispatch` 退路並標明邊界。設計、估點、拆票不變）；前版：版本：rev5（2026-09-07，**窄複核修正（僅一處契約與三處引用；設計、估點、拆票不重開）**：`confirmBump` 改為四條結束路徑——等待期間被阻止的是切檔／切分頁而**不是打字**；**(a) 正常續打造成 buffer 版本過期改以實際編輯器輸入驗證**（不再誤稱只能注入），(b) 文件識別被替換才用測試注入，(c) 未續打且版本相符則套用，(d) 真正的後端錯誤保留原訊息，**四條路徑結束時一律解除封鎖**；feature 與 T14f／T14g／T14h 同步（未新增測試編號、未改架構、未重估）；同批同步引用：A1a-1 分攤表改為 T14a–T14h、Gate A1a-1 的版本檢查改指 T14g 並納入 T14h、backlog 的 plan 引用改為 rev5。場景 33 → 34 個可執行案例。**待 owner 最終窄複核**）；前版：版本：rev4（2026-09-07，**窄幅一致性修正（設計選項不重開）**：(1) `confirmBump` 等待期間的限制與測試情境分為兩層——正常操作允許繼續輸入但阻止切檔／切分頁與衝突操作，「送出版本已過期」改以**測試注入**的防禦性驗證表達，不再描述成 UI 可繞過；本機判定過期時顯示「內容已變更，請重新預覽」，**真正的後端錯誤仍保留原訊息**；(2) 兩張圖改正——載入循序圖以 `alt` 區分過期丟棄與最新才更新，狀態圖補「Plan 套用結果等於 `saved` 留在 clean」「Spec 自 clean 接受草稿進入寫入流程」，並把衝突／失敗改為經 `recompute` 依內容比較決定 dirty，不無條件轉 dirty；(3) D6 撤除「15 項」舊數字改指逐元件展開的實際清單；**核定估點回填**（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt）並同批更新 backlog 小計。**待 owner 窄複核**）；前版：版本：rev3（2026-09-07，**design gate 第二輪 CHANGES_REQUIRED 後修訂**：(1) 草稿語意分流——Plan `applyDraft`／`confirmBump` 只更新 buffer，**Spec `acceptDraft` 保留立即寫入語意**並納入送出快照與寫入互斥，feature／測試／變異同步改寫；(2) 載入回應歸屬改為**請求世代**（補 A→B→A 亂序案例、載入進行中暫停編輯）、`confirmBump` 回應以「文件＋buffer 版本」檢查，不新增通用並行框架；(3) 測試補 M6 的**重載前**斷言、切分頁補捨棄後成功導覽、所有測試與變異標明 Spec／Plan 實際目標且**不預先固定項數**；(4) D9 拆票通過並修正分攤——寫入期間封鎖（含其 `App.vue` 攔截點）留在 A1a-1，A1a-2 只負責非儲存期間的保留／捨棄導覽；重估 25.6 hr（兩票 19.1／6.5）。**待 owner 複核**）；前版：版本：rev2（2026-09-07，**design gate 第一輪 CHANGES_REQUIRED 後修訂**：D1–D8 裁定回寫；新增第三節「非同步儲存與載入契約」（送出快照、等待期間輸入、封鎖重疊、延遲載入回應、草稿／bump 同步、衝突後不自動重載）；場景表改寫並更正條數（12 條 Scenario＋1 條 Scenario Outline／6 例＝18 個可執行案例）；切檔的保留／捨棄拆為兩條獨立情境；新增切分頁保護（Spec／Plan × 三個入口）；T3／T4 改用有狀態讀寫替身並斷言重載後的 `EditorView` 文件；mutation 由 9 項增為 15 項；Gate A 納入 Spec／Plan 各一次實際 Wails 人工驗收；速記展開為正式說明；重估後 **21.6 hr／2.16 pt 超過拆票門檻，提出 A1a-1／A1a-2 拆分（D9）**。**待 owner 複核**）；前版：rev1（2026-09-07，建立）
-> 狀態：**A1a-1 已完成本機驗收（2026-09-07）**——Gate A1a-1 全部成立；全套 vitest 429/429、`npm run build` exit 0、`go test ./...` 全 ok、`wails build` exit 0、mutation 38/38、人工驗收通過。**A1a-2 未開工、未授權**；push、開 PR、遠端 CI 未授權。A1a 為 aggregate，**兩張子票都完成才關票**。
+> 版本：rev10（2026-09-08，**A1a-2 執行紀錄回填**：新增第十二節（expected-red 26 條 R18／G8、owner 複核發現的兩條繞過路徑與修法、mutation 24 項 N/N 與 harness v2 的備份還原、agent 執行的 Wails GUI 驗證與其涵蓋限制、證據封存 143 檔）；Gate A1a-2 逐項回填，**人工驗收一格維持未完成**、Gate 未判定通過）；前版：版本：rev9（2026-09-07，**紀錄修正與證據封存**：`getClientRects` 雜訊計數 35 → **36**（附計數方法；不含的兩份是不掛載 CM6 的 App 測試）；§11.5 措辭改為「這些批次未重現」並改記「已登記 register v8 候選 C1」；新增 §11.4b A1a-1 證據封存（manifest 120 檔、120/120 OK）。A1a-2 開工前的最終狀態）；前版：版本：rev8（2026-09-07，**複核修正與證據歸屬補齊**：更正「紅燈日誌零環境失敗訊息」的措辭為「沒有任何目標失敗是環境造成的」並揭露 35/38 份仍含 jsdom 量測雜訊、摘要擷取已離線修正（原始日誌保留、不重跑）；補齊人工 Wails 驗收的實際操作者、原始確認紀錄與受測版本；記錄 register v8 候選登記與 backlog A5 bindings 同步小票的處置）；前版：版本：rev7（2026-09-07，**A1a-1 執行完成回填**：expected-red 結果（R=27／G=3）、mutation **38 項 N/N 全部紅在正題並回綠**（含框架修正與並行汙染的揭露）、人工 Wails 驗收通過（owner 實機確認、隔離工作區）、Gate A1a-1 全部勾選、新增「A1a-1 剩餘揭露」。實作見 `ddbbd2d`／`da20294`／`70dbe04`／`af0cae2`。A1a-2 未授權）；前版：版本：rev6（2026-09-07，**實作啟動回填（設計不變）**：狀態改為 design gate APPROVED（綁定 `7860d75`）、A1a-1 實作進行中；新增第十一節「A1a-1 執行 checklist」（30 個測試識別項目、31 項變異、expected-red 分類規則、人工驗收資料隔離、失敗分類規則）；**測試計數更正 33 → 30**（明列 13 Spec ＋ 16 Plan ＋ 1 Go；不為湊數新增測試）；**前端基準更正 397 → 399 條**（本機實測 40 檔／399 全綠）；**D5 可行性已實測**：jsdom 下 `beforeinput`／`input` 不改變 CM6 文件（doc 未變），採 `view.dispatch` 退路並標明邊界。設計、估點、拆票不變）；前版：版本：rev5（2026-09-07，**窄複核修正（僅一處契約與三處引用；設計、估點、拆票不重開）**：`confirmBump` 改為四條結束路徑——等待期間被阻止的是切檔／切分頁而**不是打字**；**(a) 正常續打造成 buffer 版本過期改以實際編輯器輸入驗證**（不再誤稱只能注入），(b) 文件識別被替換才用測試注入，(c) 未續打且版本相符則套用，(d) 真正的後端錯誤保留原訊息，**四條路徑結束時一律解除封鎖**；feature 與 T14f／T14g／T14h 同步（未新增測試編號、未改架構、未重估）；同批同步引用：A1a-1 分攤表改為 T14a–T14h、Gate A1a-1 的版本檢查改指 T14g 並納入 T14h、backlog 的 plan 引用改為 rev5。場景 33 → 34 個可執行案例。**待 owner 最終窄複核**）；前版：版本：rev4（2026-09-07，**窄幅一致性修正（設計選項不重開）**：(1) `confirmBump` 等待期間的限制與測試情境分為兩層——正常操作允許繼續輸入但阻止切檔／切分頁與衝突操作，「送出版本已過期」改以**測試注入**的防禦性驗證表達，不再描述成 UI 可繞過；本機判定過期時顯示「內容已變更，請重新預覽」，**真正的後端錯誤仍保留原訊息**；(2) 兩張圖改正——載入循序圖以 `alt` 區分過期丟棄與最新才更新，狀態圖補「Plan 套用結果等於 `saved` 留在 clean」「Spec 自 clean 接受草稿進入寫入流程」，並把衝突／失敗改為經 `recompute` 依內容比較決定 dirty，不無條件轉 dirty；(3) D6 撤除「15 項」舊數字改指逐元件展開的實際清單；**核定估點回填**（A1a-1 19.1 hr／1.91 pt、A1a-2 6.5 hr／0.65 pt）並同批更新 backlog 小計。**待 owner 窄複核**）；前版：版本：rev3（2026-09-07，**design gate 第二輪 CHANGES_REQUIRED 後修訂**：(1) 草稿語意分流——Plan `applyDraft`／`confirmBump` 只更新 buffer，**Spec `acceptDraft` 保留立即寫入語意**並納入送出快照與寫入互斥，feature／測試／變異同步改寫；(2) 載入回應歸屬改為**請求世代**（補 A→B→A 亂序案例、載入進行中暫停編輯）、`confirmBump` 回應以「文件＋buffer 版本」檢查，不新增通用並行框架；(3) 測試補 M6 的**重載前**斷言、切分頁補捨棄後成功導覽、所有測試與變異標明 Spec／Plan 實際目標且**不預先固定項數**；(4) D9 拆票通過並修正分攤——寫入期間封鎖（含其 `App.vue` 攔截點）留在 A1a-1，A1a-2 只負責非儲存期間的保留／捨棄導覽；重估 25.6 hr（兩票 19.1／6.5）。**待 owner 複核**）；前版：版本：rev2（2026-09-07，**design gate 第一輪 CHANGES_REQUIRED 後修訂**：D1–D8 裁定回寫；新增第三節「非同步儲存與載入契約」（送出快照、等待期間輸入、封鎖重疊、延遲載入回應、草稿／bump 同步、衝突後不自動重載）；場景表改寫並更正條數（12 條 Scenario＋1 條 Scenario Outline／6 例＝18 個可執行案例）；切檔的保留／捨棄拆為兩條獨立情境；新增切分頁保護（Spec／Plan × 三個入口）；T3／T4 改用有狀態讀寫替身並斷言重載後的 `EditorView` 文件；mutation 由 9 項增為 15 項；Gate A 納入 Spec／Plan 各一次實際 Wails 人工驗收；速記展開為正式說明；重估後 **21.6 hr／2.16 pt 超過拆票門檻，提出 A1a-1／A1a-2 拆分（D9）**。**待 owner 複核**）；前版：rev1（2026-09-07，建立）
+> 狀態：**A1a-1 已完成驗收；A1a-2 實作與自動化驗證完成、Gate 未判定通過**（2026-09-08）。A1a-2：vitest 466/466、build exit 0、`go test` 全綠、mutation 24/24 四格齊全、agent 執行的 GUI 驗證部分涵蓋（寫入中與重新送核 GUI 未涵蓋）。push、開 PR、遠端 CI、設定變更未授權。A1a 為 aggregate，**兩張子票都完成才關票**。
 > 票源：Pre-M4 Readiness Backlog **A1a**（P1，原始估計 **1.4 pt**，未經 gate 核准）：A1 驗收條件 (1)(2)(3)(4)(6)。**(5) 外部檔案變更 reload／compare／保留本地屬 A1b，不在本票。**
 > 基準：`main`＝`origin/main`＝`3ea31ea`（B2b 關票）。分支 **`a1a/editor-sync`**（本機，自 `3ea31ea`）。
 > 相關產出：`docs/architecture/features/spec-plan-editing.feature`、`docs/architecture/diagrams/a1a-editor-buffer-state.mmd`、`docs/architecture/diagrams/a1a-seq-save.mmd`。
@@ -211,11 +211,12 @@
 
 ### Gate A1a-2（未儲存內容導覽保護）
 
-- [ ] 切檔保留／捨棄兩條獨立情境（T11、T12）在 Spec 與 Plan 各自成立。
-- [ ] 切分頁保護 6 例（T13a）與**捨棄後導覽到正確目標** 6 例（T13b）全綠；三個入口（分頁按鈕、檔案樹選取、重新送核導向）皆不可繞過；選擇前工作區元件未被切走或卸載。
-- [ ] mutation `MU-guard-file`／`MU-guard-tab`／`MU-guard-unmount`／`MU-guard-block` 逐元件展開後 N/N 全跑，四格證據齊全。
-- [ ] 前端全套 `vitest` 與 `npm run build` 綠。
-- [ ] 未接線掃描通過；圖與 feature 與實作一致。
+- [x] 切檔保留／捨棄兩條獨立情境在 Spec 與 Plan 各自成立（G1–G3 各元件；GUI 亦已驗證）。
+- [x] 切分頁保護與**捨棄後導覽到正確目標**（G4／G5 各 6 例）全綠；三個入口皆不可繞過；選擇前元件未被切走或卸載。**GUI 僅驗證分頁按鈕與檔案樹兩個入口，重新送核入口 GUI 未涵蓋**（見 §12.4）。
+- [x] mutation **24 項** N/N 全跑，四格證據齊全（原 8 項因守衛集中於 `App.vue` 合併為 6，另新增 18 項涵蓋 keep／precedence／dirty 發送端／重複確認／兩條繞過路徑的修法；見 §12.3）。
+- [x] 前端全套 `vitest` **466/466** 與 `npm run build` exit 0；`go test ./...` 亦全綠。
+- [x] 圖與 feature 與實作一致。
+- [ ] **人工 Wails 驗收**：本票以 **agent 執行的 GUI 驗證**取得部分涵蓋（§12.4），寫入進行中與重新送核兩項 GUI 未涵蓋、由自動化證據承接。owner 尚未裁定本 Gate 通過。
 
 ### A1a-1 剩餘揭露（不影響 Gate，但須留痕）
 
@@ -335,8 +336,50 @@
 **範圍或估計超出核定（19.1 hr／1.91 pt）時先回報，不自行擴張。**
 
 
+## 十二、A1a-2 執行紀錄（rev10 新增）
+
+**起點**：`6d27bab`（A1a-1 完成後）。**現行 HEAD**：`f719d43`。owner 於 2026-09-07 核准本機實作與驗證，核定 6.5 hr／0.65 pt。
+
+### 12.1 expected-red（26 條）
+
+**R=18、G=8、M=0、ENV=0**。G 的 8 條全是 G6 系列——A1a-1 的 busy 直接拒絕先於 dirty 守衛生效，故在實作前本來就通過；依「不得以元素不存在充當紅燈」的判準如實記 G。owner 另指出 G6 的 App 層四條原本只設 `busy` 未設 `dirty`，無法證明先後順序，已補上 `dirty` 訊號（先送 dirty 再送 busy）。
+
+**測試總數**：429（既有）＋26（G1–G6）＋11（G7-S／G7-P／G8-S 與 H 系列）＝ **466**。
+
+### 12.2 owner 複核發現的兩條繞過路徑（已修，`fe0d4b0`）
+
+1. **確認框開啟後才開始寫入，仍可按捨棄離開**：確認框不阻止使用者按儲存／接受草稿／確認 bump，`unsavedDiscard()`（App 與兩個元件）未重新檢查 busy。修法：執行前重新檢查，且在確定離開前不改路徑、不動 buffer、不清 dirty；`pendingNav`／`pendingPath` 保留，寫入結束後可再選一次。
+2. **點目前分頁再選捨棄會錯誤清除 App 的 dirty**：`switchTab()` 未排除「目標即目前分頁」，而捨棄時假設必然卸載就把 `workspaceDirty` 設 false。修法：`guardedNav` 增加 `isNoop` 判定（同分頁／同預覽檔／重新送核目標即現況），並移除捨棄時的自行清除，改由「切到非 spec／plan 分頁」與工作區的 immediate emit 維持。
+
+回歸測試：H1-S／H1-P（save）、**H1-S-accept**／**H1-P-bump**（另外兩種等待狀態，皆用實際延遲的 binding 回應）、H2-S（App 父層契約，以 emit 模擬 busy，**不宣稱涵蓋後端等待**）、H3-S、H4-S、**H5-P**（gate2 同分頁換檔且新檔載入失敗時 App 仍須保留保護）。
+
+### 12.3 Mutation（24 項，N/N）
+
+24 個唯一 ID 全部 **RED_ON_TARGET**、套用後 hash 改變、備份還原 byte-identical、回綠。**沒有任何目標失敗由環境前置條件造成**；24 份紅燈日誌中 **14 份**仍含 `getClientRects` 的 jsdom 量測 stderr 雜訊（非失敗原因）。
+
+**harness v2 的還原機制**（owner 要求）：植入前保存原始位元組、從備份還原並比對，**不再用 `git checkout`**（那會覆寫未提交內容，`RESTORE_FAIL` 只是事後偵測）；開始前鎖定 HEAD 與乾淨工作樹，異常退出也還原並保留備份。舊版保留為 `run.v1.py`。批次來源見 `mutations/BATCHES.md`，合併索引 `results-merged.json` 中 23 項的 hash 標為**離線重建**（`results.json` 曾被單項重跑覆蓋，副本存 `results.rerun5-only.json`）。
+
+### 12.4 agent 執行的 Wails GUI 驗證（**不是人工操作、不是 owner 確認**）
+
+由 agent 以 `screencapture` 判讀畫面、`osascript`／System Events 送點擊與鍵盤完成，29 張截圖對應操作順序。受測版本：HEAD `f719d43`，`wails build` 產物 SHA-256 `46e2adc5e9ee521928cc15fa54f4892495220ae47efef9378d10fa749e4e63a7`；建置期再生的 `models.ts`（兩行 `terminal_cause`）diff 已保存並於驗收後還原。隔離工作區 `WORKBENCH_WORKSPACE=/tmp/a1a-2/wsfixture`，app 內顯示 `ws: env @ /private/tmp/a1a-2/wsfixture`，正式 repo 驗收後工作樹乾淨、HEAD 不變。
+
+**通過**：Spec 清單切檔的守衛出現／保留／**再次觸發後**捨棄；Spec 未儲存時切分頁的守衛與捨棄後完成導覽；**點目前分頁不設守衛且之後離開仍受保護**；Plan 清單切檔的守衛／保留／再次觸發／捨棄；**檔案樹入口**的守衛；儲存確實寫入 fixture 檔案。
+
+**歸因限定（owner 2026-09-07 更正）**：上述「點目前分頁後仍保留保護」證明的是**同分頁操作不誤清 dirty** 這條路徑，**並未重現 H5-P 的「gate2 同分頁換檔後新檔載入失敗」情境**——H5-P 仍只有自動化證據。
+
+**GUI 未涵蓋（owner 裁定不追加，由自動化證據承接）**：
+- **寫入進行中的行為（案例 8／9）**：本機寫檔在毫秒內完成，無法確認點擊發生於 busy 期間，單張結果圖也無法證明；不為抓時序修改受測程式。由 G6 八條與 H1／H1-accept／H1-bump／H2 系列承接。
+- **重新送核導向入口**：fixture 無核可紀錄，無法在隔離環境觸發；不另造核可流程。由 G4／G5 的 goresubmit 例、H4-S、H5-P 承接。
+- 因此**不宣稱三個導覽入口均經 GUI 驗證**——分頁按鈕與檔案樹已驗，重新送核未驗。
+
+### 12.5 證據封存
+
+`/tmp/a1a-2/EVIDENCE.sha256`：**143 檔、143/143 OK**，SHA-256 `5b868a68b89a5ede19cd5c42e88cc22d54af7e69faf287a9b65dffc721984926`。涵蓋 harness v1／v2、變異表與合併索引、24 組紅綠日誌與 24 份備份、`vitest-final.txt`（466/466 原始輸出）、build 與 `go test` 輸出、29 張 GUI 截圖、執行檔 hash 與 `models.ts` 再生 diff。A1a-1 的封存（120 檔）另存，不混用。
+
+
 ## 修訂記錄
 
+- rev10（2026-09-08）：A1a-2 執行紀錄回填——新增第十二節：12.1 expected-red（26 條，R18／G8，含 G6 補 dirty 訊號的修正）；12.2 owner 複核發現的兩條繞過路徑（捨棄前未重檢 busy、無效導覽誤清 dirty）與修法及回歸測試（含 accept／bump 兩種等待狀態與 H5-P）；12.3 mutation 24 項 N/N 與 harness v2 的位元組備份還原、批次索引與離線重建 hash 的標示；12.4 **agent 執行的 Wails GUI 驗證**（非人工操作、非 owner 確認）逐案結果、歸因限定（案例 6 未重現 H5-P 情境）與兩項 GUI 未涵蓋；12.5 證據封存 143 檔。Gate A1a-2 逐項回填，人工驗收一格維持未完成，**Gate 未判定通過**。
 - rev9（2026-09-07）：owner 複核後的紀錄修正與封存——(1) `getClientRects` 雜訊計數更正為 **36/38**（計數方法：對 `results.json` 的 38 個 id 逐一讀其 red.log；不含的兩份為測 `App.test.ts` 的 `MU-nav-resubmit`／`MU-nav-filetree`。先前的 35 是 `grep -lc` 組合誤計）；(2) §11.5 不再寫「穩定」與「待裁」，改為「這些批次未重現」＋「已登記 register v8 候選 C1」；(3) register C1 的「疑與機器負載相關」改為**原因未確認**（推測不得寫成已確認），並註明 B2b-2 回填採當時最新版本號、不覆蓋或除名 C1；(4) 新增 §11.4b 證據封存（`/tmp/a1a-1/EVIDENCE.sha256`，120 檔全 OK）。Gate 結論與估點不變。
 - rev8（2026-09-07）：owner 複核後的修正與補齊——(1) §11.3 措辭更正：先前寫「38 份紅燈日誌零份殘留環境失敗訊息」不精確，正確陳述是「沒有任何目標失敗是環境造成的」，38 份中 35 份仍含 `getClientRects` 的 jsdom 量測 stderr 雜訊，`results.json` 的 `msg` 欄位曾誤取該雜訊；摘要擷取邏輯已離線修正，原始日誌保留、**mutation 未重跑**（owner 明示不必重跑）。(2) §11.4 補齊人工驗收的證據歸屬：實際操作者為 owner、原始確認紀錄（16:17 訊息＋追問後的明確確認）、受測版本（`af0cae2` ＋ 建置時自動再生的 `models.ts`，再生檔已還原未進 commit）。(3) 剩餘揭露補記 register v8 的候選登記與 backlog A5 bindings 同步小票。設計、估點與 Gate 結論不變。
 - rev7（2026-09-07）：A1a-1 執行完成回填——§11.1 expected-red 結果（R=27／G=3／M=0／ENV=0，含 T3-P 假綠的揭露與修正）；§11.3 mutation 由 31 如實展開為 **38 項並全部 N/N 紅在正題、回綠、還原 byte-identical**，並揭露執行框架的三處修正（回綠與紅燈改全檔模式、新增 `ENV_FAIL` 使環境失敗不計為紅在正題、先前「38 項全數紅在正題」的回報已收回重跑）與並行代理汙染事故；§11.4 人工 Wails 驗收通過（owner 實機確認，隔離工作區證據）；§11.5 補實測的隔離模式 flaky 分類與 register 登記待裁；執行順序全部勾選；Gate A1a-1 全部成立；新增「A1a-1 剩餘揭露」四點。設計與估點不變。
