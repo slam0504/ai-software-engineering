@@ -1,10 +1,11 @@
 stateDiagram-v2
-  %% A1a rev4：單一檔案的儲存狀態機（請求世代、Spec 接受草稿的寫入路徑、失敗後依內容比較）
+  %% A1a rev5：單一檔案的儲存狀態機（請求世代、Spec 接受草稿的寫入路徑、失敗後依內容比較、A1a-2 導覽守衛）
   %% saved＝已儲存快照（最近一次成功寫入所「送出」的內容），載入成功時等於磁碟內容
   %% dirty 判定＝buffer ≠ saved（內容比較，D4）——任何路徑結束後都重新比較，不無條件轉 dirty
   [*] --> empty
   empty --> loading : 發出 loadFile（配發新的請求世代 g，載入期間暫停編輯）
-  loading --> recompute : 回應世代＝最新 g（buffer＝saved＝磁碟內容，持有 digest）
+  loading --> recompute : 回應**成功**且世代＝最新 g（buffer＝saved＝磁碟內容，持有 digest）
+  loading --> recompute : 回應**失敗**（只設 loadError；buffer／saved／digest 皆不變<br/>→ dirty 依內容比較保留，未儲存內容不因載入失敗而消失）
   loading --> loading : 回應世代過期 → 整筆丟棄（含路徑相同的 A→B→A 舊回應）
   clean --> dirty : 編輯器文件改變（updateListener → buffer）
   clean --> clean : Plan 套用草稿／確認 bump 且結果等於 saved（只更新 buffer，不寫檔）
@@ -23,9 +24,11 @@ stateDiagram-v2
   recompute --> clean : buffer 等於 saved
   recompute --> dirty : buffer 不等於 saved
   clean --> empty : 切檔／離開工作區
-  dirty --> guard : 切檔／切分頁／其他替換內容的入口（A1a-2）
+  dirty --> guard : 切檔／切分頁／其他替換內容的入口（A1a-2）<br/>（不會改變目標的無效導覽不進 guard）
   guard --> dirty : 選擇保留（停留原檔，新檔不載入）
-  guard --> empty : 選擇捨棄（導覽到該入口指定的目標）
+  guard --> guard : 捨棄當下仍在寫入（busy）→ 拒絕離開、守衛保留<br/>（確認框不阻止按儲存，A1a-2 修正）
+  guard --> loading : 選擇捨棄且為**同工作區換檔**（元件不卸載）→ 發新載入<br/>**載入失敗時 buffer／saved／dirty 全部保留**（見 loading 的失敗邊）
+  guard --> empty : 選擇捨棄且**離開工作區**（v-if 卸載）
   note right of saving : 期間封鎖：再次儲存、Spec 接受草稿、切檔、切分頁、<br/>套用草稿／bump 等會替換內容的操作<br/>（此封鎖屬 A1a-1；非儲存期間的導覽守衛屬 A1a-2）
   note right of recompute : 過渡節點：只重算 dirty＝(buffer ≠ saved)。<br/>衝突與失敗都不無條件轉 dirty——<br/>使用者可能在等待期間把內容改回 saved，錯誤仍顯示
-  note right of guard : 選擇前工作區元件不得被切走或卸載
+  note right of guard : 選擇前工作區元件不得被切走或卸載。<br/>捨棄不必然導致卸載——同工作區換檔時元件續存，<br/>此時父層不得自行清除 dirty（H5-P）
