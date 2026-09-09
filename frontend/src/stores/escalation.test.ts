@@ -46,4 +46,39 @@ describe('escalation store', () => {
     await s.load(async () => [entry('E1', 'open'), entry('E2', 'acknowledged'), entry('E3', 'resolved')])
     expect(s.unresolvedCount).toBe(2)
   })
+
+  it('連續 load()：先發後到的舊成功回應不得覆蓋新狀態（A2-1）', async () => {
+    const s = useEscalation()
+    let resolveOld!: (v: escalation.Entry[]) => void
+    const p1 = s.load(() => new Promise<escalation.Entry[]>(r => { resolveOld = r }))
+    await s.load(async () => [entry('E-new', 'open')])
+    resolveOld([entry('E-old', 'open'), entry('E-old2', 'open')])
+    await p1
+    expect(s.entries.map(e => e.Item.escalation_id)).toEqual(['E-new'])
+    expect(s.unresolvedCount).toBe(1)
+  })
+
+  it('連續 load()：舊呼叫的失敗不得把新成功狀態改成 unavailable（A2-1）', async () => {
+    const s = useEscalation()
+    let rejectOld!: (e: unknown) => void
+    const p1 = s.load(() => new Promise<escalation.Entry[]>((_, rej) => { rejectOld = rej }))
+    await s.load(async () => [entry('E-new', 'open')])
+    rejectOld(new Error('stale failure'))
+    await p1
+    expect(s.unavailable).toBe('')
+    expect(s.entries).toHaveLength(1)
+  })
+
+  it('連續 load()：較新請求失敗後，較舊成功回應不得清除 unavailable（A2-1）', async () => {
+    const s = useEscalation()
+    let resolveOld!: (v: escalation.Entry[]) => void
+    const p1 = s.load(() => new Promise<escalation.Entry[]>(r => { resolveOld = r }))
+    await s.load(async () => { throw new Error('journal degraded') })
+    expect(s.unavailable).toBe('Error: journal degraded')
+    resolveOld([entry('E-old', 'open')])
+    await p1
+    expect(s.unavailable).toBe('Error: journal degraded')
+    expect(s.entries).toHaveLength(0)
+  })
+
 })

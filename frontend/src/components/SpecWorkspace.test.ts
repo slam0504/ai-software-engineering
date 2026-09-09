@@ -164,6 +164,46 @@ describe('SpecWorkspace 新增檔案', () => {
   })
 })
 
+// A2-1：submit prop 注入——SpecWorkspace 送核改由 App 注入包裝版本（沿 write prop
+// 慣例），未注入時才回退直呼 SubmitForApproval。specAssist 不注入（D7：無 blocker 路徑）。
+describe('SpecWorkspace submit prop 注入（A2-1）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+
+  it('注入 submit prop 時送核走 prop，不走 wailsjs 直呼（A2-1：重載責任在 App）', async () => {
+    const submit = vi.fn(async () => 'approval-9')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', submit } })
+    await flushPromises()
+    await w.find('[data-test=submit-for-approval]').trigger('click')
+    await flushPromises()
+    expect(submit).toHaveBeenCalledTimes(1)
+    expect(mocks.SubmitForApproval).not.toHaveBeenCalled()
+  })
+
+  // D3：Spec 專門回歸——失敗後重試成功，同類錯誤清除、其他操作的錯誤保留。
+  // 「其他操作」用 preview-commit（SpecWorkspace.vue:439，只在 commitBusy 時 disabled，
+  // 不需先弄 dirty）；save 按鈕在非 dirty 時 disabled（:414），不適合當第二操作。
+  it('送核失敗→預覽 commit 失敗→再送核成功：送核錯誤清空、commit 錯誤保留（A2 原則 1／2，Spec 同型）', async () => {
+    const submit = vi.fn()
+      .mockRejectedValueOnce(new Error('spec: dirty tree'))
+      .mockResolvedValueOnce('approval-10')
+    mocks.PreviewSpecCommit.mockRejectedValueOnce(new Error('commit: nothing to commit'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', submit } })
+    await flushPromises()
+    await w.find('[data-test=submit-for-approval]').trigger('click'); await flushPromises()
+    expect(w.text()).toContain('spec: dirty tree')
+    await w.find('[data-test=preview-commit]').trigger('click'); await flushPromises()
+    expect(w.text()).toContain('commit: nothing to commit')
+    await w.find('[data-test=submit-for-approval]').trigger('click'); await flushPromises()
+    expect(w.text()).not.toContain('spec: dirty tree')
+    expect(w.text()).toContain('commit: nothing to commit')
+  })
+})
+
 // A1a-1 expected-red 階段：非同步儲存契約（buffer／saved／digest／dirty／data-busy／
 // 載入世代／樂觀鎖衝突）尚未實作，本 describe 內的測試針對「將來會提供」的可觀察介面
 // 斷言——現在大多預期失敗（R），這是 TDD 紅燈階段的正常狀態，不是測試寫錯。

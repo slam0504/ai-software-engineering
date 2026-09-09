@@ -138,6 +138,21 @@ describe('PlanWorkspace', () => {
     expect(w.find('[data-test=plan-errors]').exists()).toBe(false)
   })
 
+  // A2-1：submit／assist prop 注入——PlanWorkspace 送核與 assist 改由 App 注入
+  // 包裝版本（沿 write prop 慣例），未注入時才回退直呼 SubmitPlanForApproval／PlanAssist。
+  it('注入 submit／assist prop 時走 prop，不走 wailsjs 直呼（A2-1）', async () => {
+    const submit = vi.fn(async (id: string) => 'approval-' + id)
+    const assist = vi.fn(async () => 'corr-1')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/my-plan.yaml', submit, assist } })
+    await flushPromises()
+    await w.find('[data-test=submit-gate2]').trigger('click'); await flushPromises()
+    await w.find('[data-test=generate-draft]').trigger('click'); await flushPromises()
+    expect(submit).toHaveBeenCalledTimes(1)
+    expect(assist).toHaveBeenCalledTimes(1)
+    expect(mocks.SubmitPlanForApproval).not.toHaveBeenCalled()
+    expect(mocks.PlanAssist).not.toHaveBeenCalled()
+  })
+
   // review fix（spec §3.8 回填）：「建立升級項目」帶目前 plan 檔 rel path 當
   // sourceRef，blockScope 留空（不預設阻擋哪個 gate scope）。
   it('點擊「建立升級項目」emit escalate，sourceRef=目前 plan 檔 rel path', async () => {

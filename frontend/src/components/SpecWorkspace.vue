@@ -26,6 +26,9 @@ const props = defineProps<{
   path?: string
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
+  // A2-1：由 App 注入「完成後重載收件匣」的包裝版本；未注入時回退直呼（同 write）。
+  // SpecAssist 不注入：specAssist 沒有建立／解除 blocker 的路徑（D7）。
+  submit?: () => Promise<string>
 }>()
 const emit = defineEmits<{ (e: 'busy', v: boolean): void; (e: 'dirty', v: boolean): void }>()
 
@@ -342,7 +345,7 @@ async function submitForApproval() {
   submitError.value = ''
   submitBusy.value = true
   try {
-    submitResult.value = await SubmitForApproval()
+    submitResult.value = await (props.submit ?? SubmitForApproval)()
   } catch (e) {
     submitError.value = String(e)
   } finally {
