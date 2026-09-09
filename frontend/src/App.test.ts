@@ -31,20 +31,29 @@ const wailsAppMocks = vi.hoisted(() => ({
   SetPaneLayout: vi.fn(async () => undefined),
   RegisterMutation: vi.fn(), RunEvidence: vi.fn(), EvidenceGet: vi.fn(),
   SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
-  EscalationList: vi.fn(async () => []), EscalationCreate: vi.fn(), EscalationAck: vi.fn(), EscalationResolve: vi.fn(),
+  EscalationList: vi.fn(async () => [] as any[]), EscalationCreate: vi.fn(), EscalationAck: vi.fn(), EscalationResolve: vi.fn(),
+  // A2-1：Spec／Plan 送核與 Plan assist——App.vue 用 withEscalationReload 包裝
+  // 這三個綁定，未 mock 時 props('submit')／props('assist') 呼叫會撞 window.go。
+  SubmitForApproval: vi.fn(), SubmitPlanForApproval: vi.fn(), PlanAssist: vi.fn(),
 }))
 vi.mock('../wailsjs/go/main/App', () => wailsAppMocks)
-vi.mock('../wailsjs/runtime/runtime', () => ({ EventsOn: vi.fn() }))
+// A2-1：改成 hoisted 物件（原本直接 inline `{ EventsOn: vi.fn() }`）以便測試
+// 用 mockImplementation 模擬 spec:changed／plan:changed handler 註冊。
+const runtimeMocks = vi.hoisted(() => ({ EventsOn: vi.fn() }))
+vi.mock('../wailsjs/runtime/runtime', () => runtimeMocks)
 
 import App from './App.vue'
 import DualPane from './components/DualPane.vue'
 import SessionList from './components/SessionList.vue'
 import SpecWorkspace from './components/SpecWorkspace.vue'
 import PlanWorkspace from './components/PlanWorkspace.vue'
+import TcaWorkspace from './components/TcaWorkspace.vue'
 import GateConsole from './components/GateConsole.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import FileTree from './components/FileTree.vue'
 import { makeI18n } from './test/i18n'
+import { useEscalation } from './stores/escalation'
+import { escalation } from '../wailsjs/go/models'
 
 describe('App shell 接線（Task 28 review round 1：SessionList／DualPane 真的掛上去了嗎）', () => {
   it('左欄 .side-sessions 內有 SessionList，chat tab（預設）下有 DualPane', async () => {
@@ -555,4 +564,127 @@ describe('App 切檔守衛（A1a-2，expected-red，App 層級）', () => {
     expect(w.findComponent(SpecWorkspace).exists()).toBe(false) // 未被靜默切走
   })
 
+})
+
+// A2-1：重載責任從各元件收回，改由 App.vue 用 withEscalationReload 包裝五個
+// 綁定（Spec 送核、Plan 送核、Plan assist、TCA runEvidence／submitTestContract）
+// ＋ decideGate 後補重載＋監聽既有 spec:changed／plan:changed 事件。這裡只證
+// 明「重載真的被觸發、清單與 badge 反映重載結果」，不重驗各操作本身的行為
+// （那是元件層測試的事）。
+const openEntry = (id: string, state = 'open') => escalation.Entry.createFrom({
+  Item: { _type: 'escalation_item', escalation_id: id, condition_key: 'missing-binding:gate1:workspace',
+    occurrence: 1, source: 'system', source_ref: 'workspace', block_scope: 'workspace', hard: true,
+    summary: 's', created_at: '2026-01-01T00:00:00Z' }, State: state,
+})
+const badgeText = (w: VueWrapper<any>) => w.find('[data-test=escalation-badge]').exists() ? w.find('[data-test=escalation-badge]').text() : ''
+
+describe('A2-1：重載由 App 持有——工作區操作（含等待中切走）與 watcher 事件後，清單與 badge 同步', () => {
+  async function mountAt(tab: '規格' | '計畫' | '測試契約核可') { // 文字依 i18n zh-TW（app.tab.*）
+    const pinia = createPinia(); setActivePinia(pinia)
+    const w = shallowMount(App, { global: { plugins: [pinia, makeI18n()] } })
+    await flushPromises()
+    await w.findAll('nav button').find(b => b.text() === tab)!.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  it('Plan 送核等待中切到對話分頁（PlanWorkspace 卸載）→ 失敗完成 → 清單出現 blocker、badge=1', async () => {
+    const w = await mountAt('計畫')
+    let rejectSubmit!: (e: unknown) => void
+    wailsAppMocks.SubmitPlanForApproval.mockImplementationOnce(() => new Promise((_, rej) => { rejectSubmit = rej }))
+    const submit = w.findComponent(PlanWorkspace).props('submit') as (id: string) => Promise<string>
+    const p = submit('P1').catch(e => e)
+    await w.findAll('nav button').find(b => b.text() === '對話')!.trigger('click')
+    await flushPromises()
+    expect(w.findComponent(PlanWorkspace).exists()).toBe(false)
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('E1')])
+    rejectSubmit(new Error('缺必要 binding'))
+    await p; await flushPromises()
+    expect(useEscalation().entries.map(e => e.Item.escalation_id)).toEqual(['E1'])
+    expect(badgeText(w)).toBe('1')
+  })
+
+  it('Spec 送核等待中切走 → 成功完成 → 既有 blocker 轉 resolved、未解除項目清空、badge 消失', async () => {
+    const w = await mountAt('規格')
+    useEscalation().entries = [openEntry('E1')]
+    await flushPromises()
+    expect(badgeText(w)).toBe('1')
+    let resolveSubmit!: (v: string) => void
+    wailsAppMocks.SubmitForApproval.mockImplementationOnce(() => new Promise(r => { resolveSubmit = r }))
+    const submit = w.findComponent(SpecWorkspace).props('submit') as () => Promise<string>
+    const p = submit()
+    await w.findAll('nav button').find(b => b.text() === '對話')!.trigger('click'); await flushPromises()
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(false)
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('E1', 'resolved')])
+    resolveSubmit('approval-1')
+    await expect(p).resolves.toBe('approval-1'); await flushPromises()
+    expect(useEscalation().entries).toHaveLength(1) // resolved entry 仍在清單
+    expect(useEscalation().entries[0].State).toBe('resolved')
+    expect(useEscalation().unresolvedCount).toBe(0)
+    expect(badgeText(w)).toBe('')
+  })
+
+  it('Plan assist 完成（失敗／成功）後都重載，清單反映 planner 項的建立與解除', async () => {
+    const w = await mountAt('計畫')
+    const assist = w.findComponent(PlanWorkspace).props('assist') as (p: string, q: string) => Promise<string>
+    wailsAppMocks.PlanAssist.mockRejectedValueOnce(new Error('planner-enforcement-preflight'))
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('PF1')])
+    await assist('claude', 'x').catch(() => {}); await flushPromises()
+    expect(useEscalation().entries.map(e => e.Item.escalation_id)).toEqual(['PF1'])
+    expect(badgeText(w)).toBe('1')
+    wailsAppMocks.PlanAssist.mockResolvedValueOnce('corr-1')
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('PF1', 'resolved')])
+    await assist('claude', 'x'); await flushPromises()
+    expect(useEscalation().unresolvedCount).toBe(0)
+    expect(badgeText(w)).toBe('')
+    expect(w.findComponent(SpecWorkspace).exists()).toBe(false) // Spec 未掛載；SpecAssist 不包裝（D7）
+  })
+
+  it('TCA 的 run-evidence 與 submit-test-contract 包裝：成功回傳原值、失敗重拋原錯誤，兩者都重載', async () => {
+    const w = await mountAt('測試契約核可')
+    const base = wailsAppMocks.EscalationList.mock.calls.length
+    const tca = w.findComponent(TcaWorkspace)
+    wailsAppMocks.RunEvidence.mockResolvedValueOnce('EV1')
+    await expect(tca.props('runEvidence')('A1', 'P1', 'T1', 'c0ffee', 'expected_red', '')).resolves.toBe('EV1')
+    wailsAppMocks.SubmitTestContract.mockRejectedValueOnce(new Error('缺必要 binding'))
+    await expect(tca.props('submitTestContract')('P1', 'T1', 'c0ffee', 'EV1', 'EV2', 'M1')).rejects.toThrow('缺必要 binding')
+    expect(wailsAppMocks.EscalationList).toHaveBeenCalledTimes(base + 2)
+  })
+
+  it('decideGate 成功／失敗後都重載；失敗時 gateError 仍顯示', async () => {
+    const w = await mountAt('計畫')
+    const base = wailsAppMocks.EscalationList.mock.calls.length
+    const decide = w.findComponent(GateConsole).props('decide')
+    wailsAppMocks.GateDecide.mockResolvedValueOnce(undefined)
+    await decide('A1', 'approved', '', []); await flushPromises()
+    wailsAppMocks.GateDecide.mockRejectedValueOnce(new Error('blocked by escalation'))
+    await decide('A1', 'approved', '', []); await flushPromises()
+    expect(wailsAppMocks.EscalationList).toHaveBeenCalledTimes(base + 2)
+    expect(w.find('.gate-err').text()).toContain('blocked by escalation') // App.vue:423，sidePanel 預設 gate
+  })
+
+  it('spec:changed／plan:changed（reconcile 已返回後送出）觸發重載，清單反映 stale 項', async () => {
+    const handlers: Record<string, (p?: unknown) => void> = {}
+    runtimeMocks.EventsOn.mockImplementation((name: string, h: (p?: unknown) => void) => { handlers[name] = h; return () => {} })
+    const w = await mountAt('規格')
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('S1')])
+    handlers['spec:changed']?.('spec/a.feature'); await flushPromises()
+    expect(useEscalation().entries.map(e => e.Item.escalation_id)).toEqual(['S1'])
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([])
+    handlers['plan:changed']?.('plan/P1.yaml'); await flushPromises()
+    expect(useEscalation().entries).toHaveLength(0)
+    expect(badgeText(w)).toBe('')
+  })
+
+  it('重載失敗 → badge warn；下一次成功 → 恢復計數（清單與 badge 同源）', async () => {
+    const w = await mountAt('規格')
+    wailsAppMocks.SubmitForApproval.mockResolvedValue('approval-1')
+    wailsAppMocks.EscalationList.mockRejectedValueOnce(new Error('journal degraded'))
+    await (w.findComponent(SpecWorkspace).props('submit') as () => Promise<string>)(); await flushPromises()
+    expect(w.find('[data-test=escalation-badge-warn]').exists()).toBe(true)
+    wailsAppMocks.EscalationList.mockResolvedValueOnce([openEntry('E1')])
+    await (w.findComponent(SpecWorkspace).props('submit') as () => Promise<string>)(); await flushPromises()
+    expect(w.find('[data-test=escalation-badge-warn]').exists()).toBe(false)
+    expect(badgeText(w)).toBe('1')
+  })
 })

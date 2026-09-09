@@ -2,8 +2,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { CLIInfo, GateDecide, GateDecisionContext, GateList, ListSessions, SpecList } from '../wailsjs/go/main/App'
+import { CLIInfo, GateDecide, GateDecisionContext, GateList, ListSessions, PlanAssist, SpecList, SubmitForApproval, SubmitPlanForApproval } from '../wailsjs/go/main/App'
 import { makeBindings } from './lib/bindings'
+import { withEscalationReload } from './lib/escalationReload'
 import { useSession } from './stores/session'
 import { useGate } from './stores/gate'
 import { useAssist } from './stores/assist'
@@ -66,6 +67,7 @@ async function decideGate(id: string, decision: string, reason: string, riskSele
     gateError.value = String(e)
   }
   await refreshGate()
+  await refreshEscalation() // A2-1：GateDecide 內 reconcile 可能補建／解除 blocker；失敗也可能已建立
 }
 // Task 25：escalation 收件匣——沒有專屬事件 lane（brief 明講不加），沿用
 // refreshGate 的重載慣例，operations after ack/resolve/create 由 EscalationInbox
@@ -73,6 +75,14 @@ async function decideGate(id: string, decision: string, reason: string, riskSele
 async function refreshEscalation() {
   await escalation.load(wailsBindings.EscalationList)
 }
+// A2-1：可能建立／解除 blocker 的操作一律由 App 包裝——完成（成功或失敗）後先
+// 重載收件匣再回傳，原值與錯誤原樣透傳；呼叫端元件被 v-if 卸載也不影響重載
+// （withEscalationReload 的 reload 綁在這裡，不靠元件自己通知）。
+const submitSpecAndReload = withEscalationReload(SubmitForApproval, refreshEscalation)
+const submitPlanAndReload = withEscalationReload(SubmitPlanForApproval, refreshEscalation)
+const planAssistAndReload = withEscalationReload(PlanAssist, refreshEscalation)
+const runEvidenceAndReload = withEscalationReload(wailsBindings.RunEvidence, refreshEscalation)
+const submitTestContractAndReload = withEscalationReload(wailsBindings.SubmitTestContract, refreshEscalation)
 const sidePanel = ref<'gate' | 'escalation'>('gate') // 右側欄 Gate／Escalation 並列 tab（§6）
 // escalatePrefill：review fix（spec §3.8 回填）——PlanWorkspace／GateConsole／
 // EvidenceDetail 的「建立升級項目」按鈕 emit 的 payload，轉發給
@@ -338,6 +348,10 @@ onMounted(async () => {
   wailsDisposers.push(EventsOn('session:done', (d: any) => s.applyDone(d)))
   // 先訂閱後查詢（spec §3）：事件不可能落在「查完之後、訂閱之前」的縫裡。
   wailsDisposers.push(EventsOn('workbench:cli-ready', () => { void refreshCliInfo() }))
+  // A2-1：後端在 reconcileGate1NotifyOnly() 已返回後才 emit（app.go:2633／2781）；
+  // reconcile 可能失敗，這裡只是「該重讀一次」的訊號，權威仍是 EscalationList。
+  wailsDisposers.push(EventsOn('spec:changed', () => { void refreshEscalation() }))
+  wailsDisposers.push(EventsOn('plan:changed', () => { void refreshEscalation() }))
   // session 清單以 registry 為權威（ListSessions）；transcript 的視窗化載入是
   // Task 29 的 lazy load，這裡只 hydrate metadata。
   try { s.hydrateSessions(await ListSessions()) } catch { /* dev 無綁定時忽略 */ }
@@ -386,13 +400,13 @@ onMounted(async () => {
         </nav>
         <DualPane v-show="tab === 'chat'" />
         <PreviewPane v-show="tab === 'preview'" :path="selectedFile" />
-        <SpecWorkspace v-if="tab === 'spec'" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
-        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" @escalate="onEscalate" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
+        <SpecWorkspace v-if="tab === 'spec'" :submit="submitSpecAndReload" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
+        <PlanWorkspace v-if="tab === 'plan'" :path="planFocusPath" :submit="submitPlanAndReload" :assist="planAssistAndReload" @escalate="onEscalate" @busy="workspaceBusy = $event" @dirty="workspaceDirty = $event" />
         <TcaWorkspace
           v-if="tab === 'tca'" :entries="gate.list" :load-decision-context="GateDecisionContext"
           :list-candidates="wailsBindings.EvidenceCommitCandidates" :validate-test-commit="wailsBindings.ValidateTestCommit"
-          :register-mutation="wailsBindings.RegisterMutation" :run-evidence="wailsBindings.RunEvidence"
-          :get-evidence="wailsBindings.EvidenceGet" :submit-test-contract="wailsBindings.SubmitTestContract"
+          :register-mutation="wailsBindings.RegisterMutation" :run-evidence="runEvidenceAndReload"
+          :get-evidence="wailsBindings.EvidenceGet" :submit-test-contract="submitTestContractAndReload"
           :focus-task-id="tcaFocusTaskId"
         />
         <div v-show="tab === 'diagram'" class="diagram-tab">

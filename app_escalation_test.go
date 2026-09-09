@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -508,5 +510,256 @@ func TestEscalationUnavailableFailsClosed(t *testing.T) {
 	}
 	if derr := a.GateDecide(id, "approved", "", nil); derr == nil {
 		t.Fatal("approval must be rejected while the escalation inbox is unavailable (fail closed)")
+	}
+}
+
+// ---- A2-2 共用 helper（Task 5/6/7 共用，名稱不可改）----
+
+// entryByID：以 escalation_id 取回同一筆紀錄（含已 resolved），供「同一筆轉 resolved」斷言。
+func entryByID(t *testing.T, a *App, id string) *escalation.Entry {
+	t.Helper()
+	entries, err := a.EscalationList()
+	if err != nil {
+		t.Fatalf("EscalationList: %v", err)
+	}
+	for i := range entries {
+		if entries[i].Item.EscalationID == id {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// gateStateOf：以 approval_id 取回 GateList 投影的 state，供「pending 未被核可」斷言。
+func gateStateOf(t *testing.T, a *App, approvalID string) string {
+	t.Helper()
+	list, err := a.GateList()
+	if err != nil {
+		t.Fatalf("GateList: %v", err)
+	}
+	for _, e := range list {
+		if e.ApprovalID == approvalID {
+			return e.State
+		}
+	}
+	t.Fatalf("GateList 找不到 %s", approvalID)
+	return ""
+}
+
+// assertBlockedBy：拒核錯誤必須來自 blocking escalation 檢查（app.go:5884-5889，
+// 在 PrepareDecision 之後），且訊息含該 condition key——journal 已關閉時任何
+// 後續 append 也會失敗，單憑「回錯」分辨不出拒絕來源。
+func assertBlockedBy(t *testing.T, err error, key string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("核可必須被拒（blocker %s）", key)
+	}
+	if !strings.Contains(err.Error(), "blocked by") || !strings.Contains(err.Error(), key) {
+		t.Fatalf("拒核來源必須是 blocking escalation 且含 %q，got: %v", key, err)
+	}
+}
+
+// failingPolicy：ValidateRequest 依 fail 旗標回錯——注入 a.gateReg，不是 production hook。
+type failingPolicy struct {
+	gate.GatePolicy
+	fail *bool
+}
+
+func (p failingPolicy) ValidateRequest(req gate.GateRequest) error {
+	if *p.fail {
+		return errors.New("test: 缺必要 binding")
+	}
+	return p.GatePolicy.ValidateRequest(req)
+}
+
+// ---- §3.8 (2) missing-binding：建立並回傳錯誤；hard workspace 項擋下有效 pending；Submit 成功後同一筆轉 resolved ----
+
+func TestMissingBindingEscalationLifecycle(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.SpecWrite("spec/glossary.md", "term v1", ""); err != nil { // 前置失敗不得誤歸因為 escalation 行為
+		t.Fatalf("SpecWrite: %v", err)
+	}
+	commitAll(t, a)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	fail := false
+	a.gateReg["gate1"] = failingPolicy{GatePolicy: a.gateReg["gate1"], fail: &fail}
+
+	// 先留一筆有效 pending（policy 正常）
+	pendingID, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 建立：ValidateRequest 失敗 → 建立 hard workspace 項，且仍回傳錯誤（兩者並存，§3.8）
+	fail = true
+	if _, err := a.SubmitForApproval(); err == nil {
+		t.Fatal("ValidateRequest 失敗時送核必須回傳錯誤")
+	}
+	e := openItemByKey(t, a, "missing-binding:gate1:workspace") // gate1 subject 固定 "workspace"（app.go:3941）
+	if e == nil {
+		t.Fatal("ValidateRequest 失敗必須建立 missing-binding 項")
+	}
+	if !e.Item.Hard || e.Item.BlockScope != "workspace" {
+		t.Fatalf("missing-binding 必須 hard 且 scope=workspace，got hard=%v scope=%q", e.Item.Hard, e.Item.BlockScope)
+	}
+	itemID := e.Item.EscalationID
+
+	// 阻擋：既有的有效 pending 被該 blocker 擋下（§3.10 順序 3；檢查位於 gateDecide、PrepareDecision 之後）
+	assertBlockedBy(t, a.GateDecide(pendingID, "approved", "x", nil), "missing-binding:gate1:workspace")
+	if st := gateStateOf(t, a, pendingID); st != "pending" {
+		t.Fatalf("被擋下的 pending 必須仍為 pending，got %q", st)
+	}
+
+	// 解除：修正後 Submit 成功 → 同一筆轉 resolved（不是查不到 open 就算）
+	fail = false
+	pendingID2, err := a.SubmitForApproval()
+	if err != nil {
+		t.Fatalf("修正後送核必須成功: %v", err)
+	}
+	got := entryByID(t, a, itemID)
+	if got == nil || got.State != "resolved" {
+		t.Fatalf("Submit 成功後同一筆 %s 必須為 resolved，got %+v", itemID, got)
+	}
+	if openItemByKey(t, a, "missing-binding:gate1:workspace") != nil {
+		t.Fatal("解除後不得仍有同 key 的未 resolved 項")
+	}
+	if err := a.GateDecide(pendingID2, "approved", "ok", nil); err != nil {
+		t.Fatalf("blocker 解除後核可必須通過: %v", err)
+	}
+}
+
+// ---- §3.8 (7) negative-control-missed：failed 建立（soft、tca scope）；同 key 新 run passed 解除 ----
+
+const negativeControlScript = "#!/bin/sh\nif grep -q correct impl.txt; then echo ok; exit 0; fi\necho 'FAIL: TestX'; exit 1\n"
+
+func mutationPatchOf(t *testing.T, a *App, mutate func()) string {
+	t.Helper()
+	mutate()
+	patch, err := exec.Command("git", "-C", a.workspaceDir, "diff", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("git diff: %v", err)
+	}
+	runGit(t, a, "checkout", "--", ".")
+	return string(patch)
+}
+
+func TestNegativeControlMissedEscalationLifecycle(t *testing.T) {
+	a, _ := newTestAppEvidence(t)
+	writeFile(t, filepath.Join(a.workspaceDir, "run_test.sh"), negativeControlScript)
+	writeFile(t, filepath.Join(a.workspaceDir, "impl.txt"), "correct v1\n")
+	planCommit := setupApprovedEvidencePlan(t, a, "P1") // oracle surface 只含 run_test.sh；impl.txt 在範圍外
+	approvalID := activeApprovalIDFor(t, a, "P1")
+
+	pA := mutationPatchOf(t, a, func() { writeFile(t, filepath.Join(a.workspaceDir, "impl.txt"), "correct v2\n") })
+	mA, err := a.RegisterMutation("P1/T1", pA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evA, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "negative_control", mA)
+	if err != nil {
+		t.Fatalf("RunEvidence A: %v", err)
+	}
+	runA, err := a.EvidenceGet(evA)
+	if err != nil {
+		t.Fatalf("EvidenceGet A: %v", err)
+	}
+	if runA.Result != "failed" {
+		t.Fatalf("前提不成立：patch A 應得 result=failed（tests did not fail），got %q", runA.Result)
+	}
+	e := openItemByKey(t, a, "negative-control-missed:P1/T1")
+	if e == nil {
+		t.Fatal("negative_control result=failed 必須建立 negative-control-missed 項")
+	}
+	if e.Item.Hard || e.Item.BlockScope != "tca:P1/T1" {
+		t.Fatalf("必須 hard=false 且 scope=tca:P1/T1，got hard=%v scope=%q", e.Item.Hard, e.Item.BlockScope)
+	}
+	itemID := e.Item.EscalationID
+
+	pB := mutationPatchOf(t, a, func() { writeFile(t, filepath.Join(a.workspaceDir, "impl.txt"), "broken\n") })
+	mB, err := a.RegisterMutation("P1/T1", pB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evB, err := a.RunEvidence(approvalID, "P1", "T1", planCommit, "negative_control", mB)
+	if err != nil {
+		t.Fatalf("RunEvidence B: %v", err)
+	}
+	runB, err := a.EvidenceGet(evB)
+	if err != nil {
+		t.Fatalf("EvidenceGet B: %v", err)
+	}
+	if runB.Result != "passed" {
+		t.Fatalf("前提不成立：patch B 應得 result=passed，got %q", runB.Result)
+	}
+	if got := entryByID(t, a, itemID); got == nil || got.State != "resolved" {
+		t.Fatalf("同 key 新 run passed 後同一筆 %s 必須為 resolved，got %+v", itemID, got)
+	}
+	assertNoZombieWorktrees(t, a.workspaceDir)
+}
+
+// ---- §3.8 (8) journal-degraded：degraded 時補建 workspace hard 項並拒核；journal 重開後同一筆轉 resolved ----
+
+func TestJournalDegradedEscalationLifecycle(t *testing.T) {
+	a := newTestAppGit(t)
+	if _, err := a.SpecWrite("spec/glossary.md", "term v1", ""); err != nil {
+		t.Fatalf("SpecWrite: %v", err)
+	}
+	commitAll(t, a)
+	if _, err := a.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	pendingID, err := a.SubmitForApproval() // 唯一紀錄：pending，無 Active → Reconcile 不寫入
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 注入：關閉 gate journal 檔案 → 下一次 append 失敗並設 degraded（journal.go:133）
+	if err := a.gateJournal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.SubmitForApproval(); err == nil {
+		t.Fatal("journal 已關閉，Submit 的 append 必須失敗（用以觸發 degraded）")
+	}
+	if !a.gateJournal.Degraded() {
+		t.Fatal("前提不成立：append 失敗後 gate journal 應為 degraded")
+	}
+
+	// 建立：reconcile → svc.List()（無 Active，不 append）→ escJournalDegradedLocked 建立
+	a.reconcileGate1NotifyOnly()
+	e := openItemByKey(t, a, "journal-degraded:gate")
+	if e == nil {
+		t.Fatal("gate journal degraded 時 reconcile 必須建立 journal-degraded:gate 項")
+	}
+	if !e.Item.Hard || e.Item.BlockScope != "workspace" {
+		t.Fatalf("必須 hard 且 scope=workspace，got hard=%v scope=%q", e.Item.Hard, e.Item.BlockScope)
+	}
+	itemID := e.Item.EscalationID
+
+	// 拒核：degraded 期間有效 pending 不得核可——且必須是 blocker 擋的（journal 已關閉，
+	// 後面的 append 本來就會失敗，只斷言回錯分辨不出來源）
+	assertBlockedBy(t, a.GateDecide(pendingID, "approved", "x", nil), "journal-degraded:gate")
+	if st := gateStateOf(t, a, pendingID); st != "pending" {
+		t.Fatalf("被擋下的 pending 必須仍為 pending，got %q", st)
+	}
+
+	// 解除：同 stateDir 重啟 → journal 重開且健康 → 先確認讀回同一筆未解除項，再 reconcile → 同一筆 resolved
+	a2 := newTestAppAt(t, a.stateDir)
+	a2.workspaceDir = a.workspaceDir
+	if _, err := a2.ensureGate(); err != nil {
+		t.Fatal(err)
+	}
+	if a2.gateJournal.Degraded() {
+		t.Fatal("前提不成立：重開後 gate journal 不應 degraded")
+	}
+	before := entryByID(t, a2, itemID)
+	if before == nil || before.State == "resolved" {
+		t.Fatalf("重啟後必須讀回同一筆未解除項 %s，got %+v", itemID, before)
+	}
+	a2.reconcileGate1NotifyOnly()
+	after := entryByID(t, a2, itemID)
+	if after == nil || after.State != "resolved" {
+		t.Fatalf("journal 重開後 reconcile 必須把同一筆 %s 轉 resolved（app.go:6069），got %+v", itemID, after)
 	}
 }

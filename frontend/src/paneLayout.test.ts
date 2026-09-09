@@ -36,6 +36,7 @@ const appMocks = vi.hoisted(() => {
     state,
     CLIInfo: vi.fn(async () => ({}) as Record<string, string>),
     GateDecide: vi.fn(), GateDecisionContext: vi.fn(),
+    SubmitForApproval: vi.fn(), SubmitPlanForApproval: vi.fn(), PlanAssist: vi.fn(),
     GateList: vi.fn(async () => [] as any[]),
     ListSessions: vi.fn(async () => [] as any[]),
     SpecList: vi.fn(async () => [] as any[]),

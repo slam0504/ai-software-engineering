@@ -31,6 +31,9 @@ const props = defineProps<{
   path?: string
   draft?: string
   write?: (path: string, content: string, expectedDigest: string) => Promise<string>
+  // A2-1：由 App 注入的包裝版本（同 write 慣例）；未注入時回退直呼。
+  submit?: (planId: string) => Promise<string>
+  assist?: (provider: string, prompt: string) => Promise<string>
 }>()
 const emit = defineEmits<{
   (e: 'escalate', payload: { sourceRef: string; blockScope: string }): void
@@ -366,7 +369,7 @@ async function runAssist() {
   assistBusy.value = true
   const startedForPath = effectivePath.value
   try {
-    const id = await PlanAssist(provider.value, promptInput.value)
+    const id = await (props.assist ?? PlanAssist)(provider.value, promptInput.value)
     if (id && effectivePath.value === startedForPath) {
       currentCorrelationId.value = id
     }
@@ -444,7 +447,7 @@ async function submitForApproval() {
   submitBusy.value = true
   plan.clearErrors('submit')
   try {
-    submitResult.value = await SubmitPlanForApproval(planIdInput.value)
+    submitResult.value = await (props.submit ?? SubmitPlanForApproval)(planIdInput.value)
     plan.clearErrors('submit')
   } catch (e) {
     plan.pushError(String(e), 'submit')
