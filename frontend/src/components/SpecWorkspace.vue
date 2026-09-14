@@ -10,6 +10,7 @@ import { useAssist } from '../stores/assist'
 import { extractGherkin } from '../lib/gherkin'
 import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
 import { isWriteConflict } from '../lib/writeConflict'
+import { createExternalChangeGuard, shouldApplyBackground, type SyncState } from '../lib/externalChangeGuard'
 
 const { t } = useI18n()
 
@@ -103,6 +104,92 @@ function setEditable(v: boolean) {
   cmView.dispatch({ effects: editableComp.reconfigure(EditorViewRef.editable.of(v)) })
 }
 
+// A1b-1：外部檔案變更防護——所有權／背景世代／B1–B4 核對語意全部由
+// externalChangeGuard 提供（見該檔頂端設計理由），這裡只負責接線與 UI 呈現。
+const guard = createExternalChangeGuard()
+// 同步三值僅供內部判定，不外顯為常駐 UI 狀態或 badge（設計稿條款 14）；不必是
+// reactive ref，模板不依賴它。
+let syncState: SyncState = 'unknown'
+// 背景檢查（視窗取得焦點）產生的使用者可見訊息：已同步時清空；偵測到變更時
+// 依當下是否有未儲存內容分流 notice（已自動重載）／detected（保留本地未覆寫）；
+// 讀取失敗／檔案已刪除則顯示 readFailed／deleted。三個檢查點（回到工作區／視窗
+// 取得焦點／寫入前）一律無條件重讀並比對 digest，不靠任何事件訂閱標記閘控
+// （沒有消費端的旗標不留——修正輪 owner 裁定）。
+const externalChangeNotice = ref('')
+// externalAbortMessage：寫入前檢查（saveFile／acceptDraft）中止本次寫入的
+// 原因——writeAborted（偵測到外部變更）或 readFailed／deleted（預檢讀取失敗）。
+// 與 externalChangeNotice（背景檢查結果）分開呈現，兩者互不覆寫；save-error／
+// accept-error 只保留給 writer 真的被呼叫後才失敗的情況（含後端 digest 衝突）。
+const externalAbortMessage = ref('')
+
+// isDeletedError：以錯誤文字含 "no such file" 判定為「檔案已刪除」——對齊
+// os.ReadFile 對不存在檔案的錯誤文字（"open ...: no such file or directory"），
+// 也對齊本檔測試 makeFileStore 的錯誤字串慣例（`no such file ${path}`）。
+function isDeletedError(e: unknown): boolean {
+  return String(e).toLowerCase().includes('no such file')
+}
+
+// checkExternalChangeInBackground：背景檢查點（視窗聚焦）共用實作——「回到
+// 工作區」已由既有 onMounted → loadFile() 滿足，不再另外處理（裁定 13）。
+async function checkExternalChangeInBackground() {
+  // canStartBackgroundRead() 只認得 guard 前景所有權（saveFile／acceptDraft 的
+  // acquire）；loadFile 的 busy='load' 並未呼叫 guard.acquire()，所以另外檢查
+  // busyReason——避免背景讀取與進行中的載入互踩（讀到載入中途的 fileDigest／
+  // path 當基準）。
+  if (!guard.canStartBackgroundRead() || busyReason.value !== '') return
+  const path = effectivePath.value
+  if (!path) return
+  const baseline = fileDigest.value
+  const stamp = guard.snapshot(path, baseline, true) // 發出背景讀取：遞增背景世代
+  let disk: { content: string; digest: string } | null = null
+  let readErr: unknown = null
+  try {
+    disk = await SpecRead(path) // 無條件重讀，不看 spec:changed 標記
+  } catch (e) {
+    readErr = e
+  }
+  // B1–B4 四項核對：任一不符（含前景取得所有權時已使世代失效、期間切檔、
+  // 期間卸載、期間寫入成功使基準更新）即完全 no-op，不改任何狀態。
+  // 比對用快照必須讀「目前」的 effectivePath——用發出時捕捉的 path 區域變數會讓
+  // B2 變成恆真式，期間切到「內容剛好相同」的另一個檔時 B4 也擋不住（兩檔 digest
+  // 相同），舊回應就會被套到新檔上。
+  //
+  // B3（guard.isActive()）必須另外查：dispose() 不改變 instanceId 與世代，四欄
+  // 比對在卸載後仍可能全等，光靠 shouldApplyBackground 擋不住卸載後才返回的回應
+  // （修正輪修正 1）——成功／失敗兩條路徑共用這一個檢查點，都涵蓋到。
+  if (!guard.isActive() || !shouldApplyBackground(stamp, guard.snapshot(effectivePath.value, fileDigest.value))) return
+
+  if (readErr !== null) {
+    syncState = 'unknown'
+    externalChangeNotice.value = isDeletedError(readErr)
+      ? t('externalChange.deleted')
+      : t('externalChange.readFailed', { error: String(readErr) })
+    return
+  }
+  if (disk!.digest === fileDigest.value) {
+    syncState = 'insync'
+    externalChangeNotice.value = '' // 已同步：靜默清除標記
+    return
+  }
+  syncState = 'diverged'
+  if (!dirty.value) {
+    // 當下無未儲存內容 → 自動重載為磁碟版本＋非阻斷告知
+    fileContent.value = disk!.content
+    savedContent.value = disk!.content
+    fileDigest.value = disk!.digest
+    syncEditorDoc()
+    syncState = 'insync' // 已依磁碟內容重載，基準重新與磁碟相符
+    externalChangeNotice.value = t('externalChange.notice')
+  } else {
+    // 當下有未儲存內容 → 不覆寫，僅提示（三選一屬 A1b-2，本輪不做）
+    externalChangeNotice.value = t('externalChange.detected')
+  }
+}
+
+function onWindowFocus() {
+  void checkExternalChangeInBackground()
+}
+
 async function loadFileList() {
   try {
     files.value = (await SpecList()) ?? []
@@ -112,7 +199,17 @@ async function loadFileList() {
 }
 
 async function loadFile() {
+  // A1b-1 修正輪修正 4：loadFile 的 busy='load' 並未呼叫 guard.acquire()，此前
+  // 已在途的背景讀取無法靠所有權失效——必須在操作開始當下（這裡）就使其失效，
+  // 不能等回應到達時看 busy：loadFile 可能已結束、busy 已清，回應才到，那時光
+  // 看 busy 已經擋不住。
+  guard.invalidateBackground()
   loadError.value = ''
+  // 換檔／重載：上一個檔的外部變更訊息與中止訊息都不得留在畫面上被誤讀成新檔
+  // 的狀態。背景自動重載不走這裡（直接改 fileContent／savedContent／fileDigest），
+  // 所以它設的 notice 不會被這行清掉。
+  externalChangeNotice.value = ''
+  externalAbortMessage.value = ''
   if (!effectivePath.value) return
   const gen = ++loadGen
   busyReason.value = 'load'
@@ -182,8 +279,13 @@ onMounted(async () => {
   await loadFileList()
   await loadFile()
   await initEditor()
+  window.addEventListener('focus', onWindowFocus) // A1b-1：視窗取得焦點＝背景檢查點之一（比照 PlanWorkspace.vue 的 focus listener 形狀）
 })
-onBeforeUnmount(() => cmView?.destroy())
+onBeforeUnmount(() => {
+  cmView?.destroy()
+  window.removeEventListener('focus', onWindowFocus)
+  guard.dispose()
+})
 watch(() => props.path, p => {
   // 寫入互斥（save／accept 進行中）才擋切檔——'load' busy 不擋：新的載入世代
   // 本來就該蓋過舊的（見 loadFile 的 gen 丟棄邏輯），擋掉會讓過期載入卡死畫面。
@@ -297,22 +399,52 @@ function unsavedDiscard() {
 async function acceptDraft() {
   if (busyReason.value !== '') return
   acceptError.value = ''
+  externalAbortMessage.value = '' // 新操作開始，清掉上次中止提示（修正輪修正 2）
   const writer = props.write ?? SpecWrite
   fileContent.value = extractGherkin(draftText.value)
   syncEditorDoc()
   const P = { path: effectivePath.value, content: fileContent.value, digest: fileDigest.value }
+  // A1b-1：取得前景所有權——涵蓋「預檢 → 寫入 → 結果套用」整段；副作用是使此前
+  // 在途的背景讀取立即失效（擋 C3）。等待期間使用者仍可續打，不使本次寫入失效。
+  const token = guard.acquire()
   busyReason.value = 'accept'
   try {
+    let disk: { content: string; digest: string } | null = null
+    let readErr: unknown = null
+    try {
+      disk = await SpecRead(P.path) // 寫入前預檢：無條件重讀，不看 spec:changed 標記
+    } catch (e) {
+      readErr = e
+    }
+    // 已失去所有權（理論防線：busyReason 互斥已擋住同類競爭，僅防禦卸載期間的
+    // 遲到回應）→ 完全 no-op，不改任何狀態。
+    if (!guard.isOwner(token)) return
+
+    if (readErr !== null) {
+      // 讀取失敗／檔案已刪除：中止本次寫入，保留三者，顯示原始訊息——writer
+      // 尚未被呼叫，不算實際寫入失敗，改用獨立的中止呈現點（修正輪修正 2）。
+      externalAbortMessage.value = isDeletedError(readErr) ? t('externalChange.deleted') : t('externalChange.readFailed', { error: String(readErr) })
+      return
+    }
+    if (disk!.digest !== P.digest) {
+      // 磁碟已被外部改動——一律中止，不看當下 dirty，不呼叫 writer，保留三者
+      externalAbortMessage.value = t('externalChange.writeAborted')
+      return
+    }
+
     const newDigest = await writer(P.path, P.content, P.digest)
+    if (!guard.isOwner(token)) return
     savedContent.value = P.content // 送出時內容，不是回應到達當下的 fileContent（等待期間可能已續打）
     fileDigest.value = newDigest
     currentCorrelationId.value = null
   } catch (e) {
+    if (!guard.isOwner(token)) return
     // 失敗：savedContent／fileDigest 不變；fileContent 保留接受後（送出前）內容，
     // 即使使用者等待期間又續打，續打結果也不還原——buffer 是使用者目前看到的
     // 內容，不因失敗而回捲。
     acceptError.value = String(e)
   } finally {
+    guard.release(token)
     busyReason.value = ''
   }
 }
@@ -324,19 +456,45 @@ async function saveFile() {
   if (busyReason.value !== '') return
   saveError.value = '' // A2：新操作開始清同類舊 transient error（與 acceptDraft 一致）
   saveConflict.value = false
+  externalAbortMessage.value = '' // 新操作開始，清掉上次中止提示（修正輪修正 2）
   const writer = props.write ?? SpecWrite
   const P = { path: effectivePath.value, content: fileContent.value, digest: fileDigest.value }
+  // A1b-1：取得前景所有權（同 acceptDraft，理由見該處註解）。
+  const token = guard.acquire()
   busyReason.value = 'save'
   try {
+    let disk: { content: string; digest: string } | null = null
+    let readErr: unknown = null
+    try {
+      disk = await SpecRead(P.path) // 寫入前預檢：無條件重讀，不看 spec:changed 標記
+    } catch (e) {
+      readErr = e
+    }
+    if (!guard.isOwner(token)) return // 已失去所有權：完全 no-op（理由同 acceptDraft）
+
+    if (readErr !== null) {
+      // writer 尚未被呼叫，不算實際寫入失敗，改用獨立的中止呈現點（修正輪修正 2）。
+      externalAbortMessage.value = isDeletedError(readErr) ? t('externalChange.deleted') : t('externalChange.readFailed', { error: String(readErr) })
+      return
+    }
+    if (disk!.digest !== P.digest) {
+      // 磁碟已被外部改動——一律中止，不看當下 dirty，不呼叫 writer，保留三者
+      externalAbortMessage.value = t('externalChange.writeAborted')
+      return
+    }
+
     const newDigest = await writer(P.path, P.content, P.digest)
+    if (!guard.isOwner(token)) return
     savedContent.value = P.content
     fileDigest.value = newDigest
     saveError.value = ''
     saveConflict.value = false
   } catch (e) {
+    if (!guard.isOwner(token)) return
     saveError.value = String(e)
     saveConflict.value = isWriteConflict(e)
   } finally {
+    guard.release(token)
     busyReason.value = ''
   }
 }
@@ -406,6 +564,13 @@ async function confirmCommit() {
       :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
     />
     <p v-if="loadError" class="err">{{ loadError }}</p>
+    <p v-if="externalChangeNotice" class="notice" data-test="external-change">{{ externalChangeNotice }}</p>
+    <!-- A1b-1：外部檔案變更——external-change 是背景檢查（視窗聚焦）結果；
+         external-abort 是寫入前檢查（saveFile／acceptDraft）中止本次寫入的原因
+         （含預檢讀取失敗／檔案已刪除），與 save-error／accept-error（writer 真的
+         被呼叫後才失敗）互不覆寫（修正輪修正 2，比照 PlanWorkspace 的
+         externalAbortMessage）。 -->
+    <p v-if="externalAbortMessage" class="err" data-test="external-abort">{{ externalAbortMessage }}</p>
 
     <div v-if="pendingPath" class="unsaved-guard" data-test="unsaved-guard">
       <p>{{ t('unsaved.message') }}</p>
@@ -430,7 +595,7 @@ async function confirmCommit() {
       <pre class="draft-text" data-test="draft-text">{{ draftText }}</pre>
       <button data-test="accept-draft" :disabled="!draftText || busyReason !== ''" @click="acceptDraft">{{ t('spec.action.acceptDraft') }}</button>
     </div>
-    <p v-if="acceptError" class="err">{{ acceptError }}</p>
+    <p v-if="acceptError" class="err" data-test="accept-error">{{ acceptError }}</p>
 
     <div class="approval">
       <button data-test="submit-for-approval" :disabled="submitBusy" @click="submitForApproval">{{ t('spec.action.submit') }}</button>
@@ -465,4 +630,5 @@ async function confirmCommit() {
 .assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }
+.notice { color: var(--text-muted); font-size: var(--fs-s); }
 </style>

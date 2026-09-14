@@ -13,6 +13,7 @@ import { usePlan } from '../stores/plan'
 import { extractGherkin as extractDraftContent } from '../lib/gherkin'
 import { templateFor, inScope, PLAN_SCOPE_PATTERNS } from '../lib/planTemplates'
 import { isWriteConflict } from '../lib/writeConflict'
+import { createExternalChangeGuard, shouldApplyBackground } from '../lib/externalChangeGuard'
 
 const { t } = useI18n()
 
@@ -74,6 +75,34 @@ const bufferDirty = computed(() => plan.currentContent !== plan.savedContent)
 const busyReason = ref<'' | 'save' | 'load' | 'bump'>('')
 const saveError = ref('')
 const saveConflict = ref(false)
+
+// A1b-1：外部檔案變更偵測（獨立於 analysis_base bump——語意不同，不共用
+// bumpError／bumpStale，見下方 externalChangeMessage／externalAbortMessage）。
+// guard 是本元件掛載實例專屬（每次 <script setup> 執行建立新的一份），涵蓋
+// 前景操作所有權（saveFile 的寫入前檢查）與背景讀取世代／基準版本核對（視窗
+// 聚焦檢查）——完整反例與規則見 externalChangeGuard.ts 檔頭註解。
+const guard = createExternalChangeGuard()
+// externalChangeMessage：背景檢查（視窗聚焦）結果——已同步時清空；已分歧時依
+// 當下是否有未儲存內容顯示 notice（已自動重載）或 detected（未覆寫）；讀取
+// 失敗／已刪除顯示對應原因。
+const externalChangeMessage = ref('')
+// externalAbortMessage：寫入前檢查（saveFile）中止本次寫入的原因——writeAborted
+// （偵測到外部變更）或 readFailed／deleted（預檢讀取失敗）。與
+// externalChangeMessage 分開呈現，兩者互不覆寫。
+const externalAbortMessage = ref('')
+
+// isFileNotFoundError：PlanRead 對已刪除檔案回傳的是 os.ReadFile／
+// filepath.EvalSymlinks 的原生錯誤（app.go:4436、3529），訊息含
+// "no such file or directory"——抓不到就一律視為一般讀取失敗
+// （externalChange.readFailed），不誤判為已刪除。
+function isFileNotFoundError(e: unknown): boolean {
+  return String(e).includes('no such file or directory')
+}
+
+function resetExternalChange() {
+  externalChangeMessage.value = ''
+  externalAbortMessage.value = ''
+}
 watch(busyReason, v => emit('busy', v !== ''))
 // A1a-2：dirty 對外回報（同 SpecWorkspace）；pendingPath 是內部清單切檔的守衛目標。
 watch(bufferDirty, v => emit('dirty', v), { immediate: true })
@@ -142,6 +171,11 @@ function deriveDefaultPlanId(path: string): string {
 async function loadFile() {
   loadError.value = ''
   if (!effectivePath.value) return
+  // A1b-1 修正 2：loadFile 不經過 guard 所有權（不呼叫 acquire），光靠 B4
+  // 基準版本擋不住它——換到內容相同的檔時基準也可能不變。因此在操作開始當下
+  // 呼叫 invalidateBackground()，使此前已在途的背景讀取立即失效，不等回應到達
+  // 時看 busy（那時 loadFile 可能已結束、busy 已清）。
+  guard.invalidateBackground()
   const gen = ++loadGen
   busyReason.value = 'load'
   setEditable(false)
@@ -185,6 +219,47 @@ function resetBump() {
   bumpConfirmError.value = ''
 }
 
+// checkExternalChange：外部檔案變更背景檢查（觸發時機：視窗取得焦點——回到
+// 工作區的檢查點由既有 onMounted → loadFile() 已滿足，見上方 loadFile 註解，
+// 不在此重複）。無條件重讀並比對 digest——沒有任何事件訂閱可依賴（本元件不訂閱
+// plan:changed 或任何其他事件），純粹靠這三個檢查點各自主動重讀。
+// canStartBackgroundRead()／snapshot() 提供 B1 世代／B2 目前檔案／B3 元件生命
+// 週期／B4 基準版本四項核對——任一不符即 shouldApplyBackground 回 false，完全
+// no-op（不改狀態／訊息／buffer／savedContent／寫入基準，含成功與失敗回應皆
+// 然）。guard 只認得自己的前景所有權（saveFile 的 acquire）——loadFile（busy=
+// 'load'）與 confirmBump（busy='bump'）都不經過 guard 所有權，因此這裡額外要求
+// busyReason.value === ''，兩者發出時各自呼叫 guard.invalidateBackground() 使
+// 此前在途的背景讀取失效（見 loadFile／confirmBump 註解）。
+async function checkExternalChange() {
+  if (!guard.canStartBackgroundRead() || busyReason.value !== '') return // 前景操作或 load／bump busy 期間一律略過
+  const path = effectivePath.value
+  if (!path) return
+  const stamp = guard.snapshot(path, plan.currentDigest, true) // 發出時的戳記；遞增背景世代
+  try {
+    const pf = await PlanRead(path)
+    if (!guard.isActive() || !shouldApplyBackground(stamp, guard.snapshot(effectivePath.value, plan.currentDigest))) return
+    if (pf.digest === plan.currentDigest) {
+      externalChangeMessage.value = '' // 已同步：靜默清除提示，不彈窗
+      return
+    }
+    if (!bufferDirty.value) {
+      // 當下無未儲存內容：自動重載磁碟版本＋非阻斷告知
+      plan.setCurrentFile(path, pf.content, pf.digest)
+      syncEditorDoc()
+      externalChangeMessage.value = t('externalChange.notice')
+    } else {
+      // 當下有未儲存內容：不覆寫，只提示
+      externalChangeMessage.value = t('externalChange.detected')
+    }
+  } catch (e) {
+    if (!guard.isActive() || !shouldApplyBackground(stamp, guard.snapshot(effectivePath.value, plan.currentDigest))) return
+    // 保留 buffer／savedContent／寫入基準三者；讀取失敗不得視為「沒有外部變更」
+    externalChangeMessage.value = isFileNotFoundError(e)
+      ? t('externalChange.deleted')
+      : t('externalChange.readFailed', { error: String(e) })
+  }
+}
+
 // confirmBump：ConfirmAnalysisBaseBump 通過後，editor buffer 直接被
 // updatedBuffer 取代（標記未儲存——落地仍要走既有「儲存」／PlanWrite 樂觀
 // 鎖，同 applyDraft 套用草稿的兩步慣例）。失敗（token 過期／buffer 或 HEAD
@@ -193,6 +268,10 @@ function resetBump() {
 async function confirmBump() {
   if (!bumpPreview.value || bumpPreview.value.no_bump_needed) return
   if (busyReason.value !== '') return
+  // A1b-1 修正 2：confirmBump 只改 buffer、不改寫入基準（digest）——B4 基準比對
+  // 擋不住它造成的錯位，只能靠世代失效。同 loadFile，操作開始當下呼叫
+  // invalidateBackground()，讓此前已在途的背景讀取立即失效。
+  guard.invalidateBackground()
   const frozen = { path: effectivePath.value, buf: plan.currentContent }
   const token = bumpPreview.value.token
   busyReason.value = 'bump'
@@ -274,10 +353,14 @@ async function initEditor() {
   }
 }
 
-// onWindowFocus：bump 觸發時機之三（brief 凍結：視窗聚焦）——操作者切回視窗
-// 時可能其他人已推進 HEAD，重查一次讓提示條反映目前狀態。
+// onWindowFocus：視窗聚焦時同時觸發兩個獨立的檢查——bump 引導
+// （checkBump，analysis_base 是否落後 HEAD）與外部檔案變更（checkExternalChange，
+// 磁碟內容是否被編輯器外的操作改動）。兩者語意完全不同，各自獨立的狀態與呈現
+// 點（bumpError／bumpStale vs externalChangeMessage／externalAbortMessage），
+// 只是恰好共用同一個觸發時機。
 function onWindowFocus() {
   void checkBump()
+  void checkExternalChange()
 }
 
 onMounted(async () => {
@@ -290,6 +373,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   cmView?.destroy()
   window.removeEventListener('focus', onWindowFocus)
+  guard.dispose()
 })
 // M3a.1 Task 11（spec §3.5）：STALE 重核引導從 App.vue 一次性帶入 path 導航到
 // 指定 plan 檔（例如 GateConsole／EscalationInbox 的「前往重新送核」）。path
@@ -304,6 +388,7 @@ watch(() => props.path, (p) => {
   if (p) selectedPath.value = p
   resetDraft() // 換檔：清掉舊檔殘留的草稿，避免套用草稿把 A 的草稿寫進 B（同 SpecWorkspace fix round 1）
   resetBump()
+  resetExternalChange()
   void loadFile()
 })
 
@@ -317,6 +402,7 @@ function selectFile(p: string) {
   selectedPath.value = p
   resetDraft()
   resetBump()
+  resetExternalChange()
   void loadFile()
 }
 
@@ -396,6 +482,7 @@ function unsavedDiscard() {
   selectedPath.value = p
   resetDraft()
   resetBump()
+  resetExternalChange()
   void loadFile()
 }
 
@@ -413,27 +500,60 @@ function applyDraft() {
 // digest 於按下當下凍結成送出快照 P，成功後 plan.savedContent／plan.currentDigest
 // 更新為 P 的值（不是回應到達當下可能已被續打改變的內容）；失敗三者皆不變、
 // 不自動重載。
+//
+// A1b-1 寫入前檢查（前景）：guard.acquire() 取得所有權，涵蓋「預檢 → 寫入 →
+// 結果套用」整段，同時使此前在途的背景讀取立即失效（C1／C3，見
+// externalChangeGuard.ts 檔頭反例）。回應有效性只由 guard.isOwner(token) 決定，
+// 不看 busyReason（自身 busy 不得自判失效——見設計稿 §2.3）。預檢讀到的
+// digest 與凍結快照 P.digest 不符時一律中止：不呼叫 writer、保留三者、顯示
+// externalChange.writeAborted，**不看當下 dirty**（即使等待期間 buffer 被改回
+// savedContent 使 bufferDirty 變假，仍中止，不轉為自動重載）。
 async function saveFile() {
   if (busyReason.value !== '') return
   const writer = props.write ?? PlanWrite
   const P = { path: effectivePath.value, content: plan.currentContent, digest: plan.currentDigest }
+  const token = guard.acquire()
   busyReason.value = 'save'
   plan.clearErrors('save') // A2：新操作開始清同類（save）舊 transient error
   saveError.value = '' // 同上，新的呈現點也要清
   saveConflict.value = false
+  externalAbortMessage.value = '' // 新的寫入嘗試開始，清掉上次中止提示
   try {
-    const newDigest = await writer(P.path, P.content, P.digest)
-    plan.savedContent = P.content
-    plan.currentDigest = newDigest
-    plan.clearErrors('save') // A2：操作成功清該操作既有錯誤
-    saveError.value = ''
-    saveConflict.value = false
-    await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
-  } catch (e) {
-    plan.pushError(String(e), 'save')
-    saveError.value = String(e)
-    saveConflict.value = isWriteConflict(e)
+    let pf: { content: string; digest: string }
+    try {
+      pf = await PlanRead(P.path)
+    } catch (e) {
+      if (!guard.isOwner(token)) return // 已失去所有權：完全 no-op
+      externalAbortMessage.value = isFileNotFoundError(e)
+        ? t('externalChange.deleted')
+        : t('externalChange.readFailed', { error: String(e) })
+      return // 中止本次寫入；保留 buffer／savedContent／寫入基準三者
+    }
+    if (!guard.isOwner(token)) return // 已失去所有權：完全 no-op
+
+    if (pf.digest !== P.digest) {
+      // 偵測到外部變更：一律中止，不呼叫 writer，不看當下 dirty
+      externalAbortMessage.value = t('externalChange.writeAborted')
+      return
+    }
+
+    try {
+      const newDigest = await writer(P.path, P.content, P.digest)
+      if (!guard.isOwner(token)) return // 已失去所有權：完全 no-op
+      plan.savedContent = P.content
+      plan.currentDigest = newDigest
+      plan.clearErrors('save') // A2：操作成功清該操作既有錯誤
+      saveError.value = ''
+      saveConflict.value = false
+      await checkBump() // 觸發時機之二（brief 凍結：儲存成功）
+    } catch (e) {
+      if (!guard.isOwner(token)) return // 已失去所有權：完全 no-op
+      plan.pushError(String(e), 'save')
+      saveError.value = String(e)
+      saveConflict.value = isWriteConflict(e)
+    }
   } finally {
+    guard.release(token)
     busyReason.value = ''
   }
 }
@@ -538,6 +658,13 @@ async function confirmCommit() {
       <button data-test="save" :disabled="busyReason !== '' || !bufferDirty" @click="saveFile">{{ t('planWorkspace.action.save') }}</button>
     </div>
     <p v-if="saveError" class="err" data-test="save-error" :data-conflict="saveConflict ? 'true' : undefined">{{ saveError }}</p>
+
+    <!-- A1b-1：外部檔案變更——與 bump 呈現點各自獨立（不共用 bumpError／
+         bumpStale）。external-change 是背景檢查（視窗聚焦）結果，external-abort
+         是寫入前檢查中止本次儲存的原因；同步三值本身不外顯，使用者只看見這兩類
+         必要訊息與讀取失敗／已刪除原因。 -->
+    <p v-if="externalChangeMessage" class="err" data-test="external-change">{{ externalChangeMessage }}</p>
+    <p v-if="externalAbortMessage" class="err" data-test="external-abort">{{ externalAbortMessage }}</p>
 
     <div v-if="bumpPreview || bumpConfirmError || bumpError" class="bump-area">
       <div v-if="bumpPreview && bumpPreview.no_bump_needed" class="bump-no-bump-needed" data-test="bump-no-bump-needed">
