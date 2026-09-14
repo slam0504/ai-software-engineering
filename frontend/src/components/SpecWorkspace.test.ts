@@ -1427,3 +1427,789 @@ describe('SpecWorkspace 外部檔案變更修正輪（owner code review 後）',
     expect(w.find('[data-test=external-abort]').exists()).toBe(false) // a 的中止原因不得殘留在 b 上
   })
 })
+
+// A1b-2 Phase 2（Spec 側接線）：三選一（reload／compare／keep）與並列比較。
+// 共用元件 ExternalChangeChoice／ExternalChangeCompare 已在 Phase 1 完成並附
+// 自己的元件測試，這裡只驗證接線行為——何時顯示、按下後做什麼、狀態如何變化。
+describe('SpecWorkspace A1b-2：三選一與比較（Phase 2 接線）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+  // 測試失敗時 it 內最後的 mockRestore 不會執行，spy 會洩漏到下一條——清理放
+  // afterEach 才能讓負控制只證一個命題（同上方「B2 與換檔殘留」describe 慣例）。
+  afterEach(() => { vi.restoreAllMocks() })
+
+  function focusHandlerOf(addSpy: ReturnType<typeof vi.spyOn>) {
+    const h = addSpy.mock.calls.find((call: unknown[]) => call[0] === 'focus')?.[1] as (() => void) | undefined
+    expect(h, 'focus handler 必須已註冊').toBeTypeOf('function')
+    return h!
+  }
+
+  // ---- J1：三選一出現的時機 ----
+
+  it('三選一：背景偵測到外部變更且有未儲存內容時出現', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' }) // mount
+      .mockResolvedValueOnce({ content: 'disk updated', digest: 'sha256:d1' }) // focus 背景檢查
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'unsaved local edit')
+    await flushPromises()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').text()).toBe(zhTW.externalChange.detected)
+    mustFind(w, '[data-test=external-choice]')
+
+    w.unmount()
+  })
+
+  it('三選一：saveFile 寫入前中止後出現（兩入口之一）', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed', digest: 'sha256:EXTERNAL' }) // save 預檢
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    typeText(getView(w), 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-abort]').text()).toBe(zhTW.externalChange.writeAborted)
+    mustFind(w, '[data-test=external-choice]')
+  })
+
+  it('三選一：acceptDraft 寫入前中止後出現（兩入口之二）', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed', digest: 'sha256:EXTERNAL' }) // accept 預檢
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', draft: 'AI draft', write } })
+    await flushEditor()
+    await mustFind(w, '[data-test=accept-draft]').trigger('click')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-abort]').text()).toBe(zhTW.externalChange.writeAborted)
+    mustFind(w, '[data-test=external-choice]')
+  })
+
+  it('三選一：讀取失敗／已刪除不出現', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' })
+      .mockRejectedValueOnce(new Error('disk unreachable boom'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').text()).toContain('disk unreachable boom')
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false)
+
+    w.unmount()
+  })
+
+  // ---- 保留本地 ----
+
+  it('保留本地：基準不變、writer 未被呼叫、提示關閉；再按儲存仍被預檢中止', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // 第一次 save 預檢：中止
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // 第二次 save 預檢：仍不符
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=external-choice]')
+
+    await mustFind(w, '[data-test=external-choice-keep]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=external-abort]').exists()).toBe(false) // 提示關閉
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false)
+    expect(write).not.toHaveBeenCalled() // writer 未被呼叫
+
+    await mustFind(w, '[data-test=save]').trigger('click') // 再按儲存
+    await flushPromises()
+
+    expect(write).not.toHaveBeenCalled() // fileDigest 未被保留本地更新過，磁碟仍不符→再次被中止
+    expect(mustFind(w, '[data-test=external-abort]').text()).toBe(zhTW.externalChange.writeAborted) // 中止再次出現
+  })
+
+  // ---- 重新載入 ----
+
+  it('重新載入：buffer／saved／基準＝磁碟；提示關閉', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢：中止
+      .mockResolvedValueOnce({ content: 'latest on disk', digest: 'sha256:LATEST' }) // 重新載入：重新讀取磁碟
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click')
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('latest on disk')
+    expect(w.find('[data-test=external-abort]').exists()).toBe(false)
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false)
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeDefined() // saved===buffer→非 dirty
+
+    // 佐證寫入基準確實已更新為磁碟 digest：再次編輯並儲存，預檢須用新 digest 核對才會通過
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'latest on disk', digest: 'sha256:LATEST' })
+    typeText(view, 'after reload edit')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'after reload edit', 'sha256:LATEST')
+  })
+
+  it('重新載入須重讀：提示期間磁碟再變——拿到最新內容而非提示當時的內容', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢：提示當時的磁碟內容
+      .mockResolvedValueOnce({ content: 'EVEN NEWER on disk', digest: 'sha256:NEWER' }) // 重新載入：磁碟又變了一次
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click')
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('EVEN NEWER on disk') // 不是提示當時的 'changed on disk'
+  })
+
+  it('重新載入捨棄範圍：點擊後、回應前又打字——新輸入保留、顯示 reloadKeptNewInput、三選一仍在', async () => {
+    let resolveReload: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveReload = res })) // 重新載入：延遲
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click') // 觸發重新載入，尚未 resolve
+    await flushPromises()
+
+    typeText(view, 'typed again after clicking reload') // 點擊後又打字
+    await flushPromises()
+
+    resolveReload({ content: 'disk content that must not be applied', digest: 'sha256:MUSTNOT' })
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('typed again after clicking reload') // 新輸入保留，不被磁碟內容覆蓋
+    expect(mustFind(w, '[data-test=external-change]').text()).toBe(zhTW.externalChange.reloadKeptNewInput)
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('notice') // F1：資訊類
+    mustFind(w, '[data-test=external-choice]') // 三選一仍在
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // 仍 dirty（未被視為已存檔）
+  })
+
+  it('重新載入讀取失敗：三者不變、顯示錯誤、三選一仍在', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockRejectedValueOnce(new Error('reload read boom')) // 重新載入失敗
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click')
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('edited') // buffer 不變
+    expect(mustFind(w, '[data-test=external-change]').text()).toContain('reload read boom')
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('err') // F1：錯誤類
+    mustFind(w, '[data-test=external-choice]') // 三選一仍在
+
+    // 佐證 fileDigest 未被動到：關閉提示後再按 save，用中止前的舊 digest 仍能通過預檢
+    await mustFind(w, '[data-test=external-choice-keep]').trigger('click')
+    await flushPromises()
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'edited', digest: 'sha256:stub' })
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'edited', 'sha256:stub')
+  })
+
+  it('重新載入×背景：重新載入進行中觸發 focus——不發背景讀取；在途背景回應不得覆寫重新載入結果', async () => {
+    let resolveReload: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveReload = res })) // 重新載入：延遲
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    const focusHandler = focusHandlerOf(addSpy)
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click') // 重新載入進行中，尚未 resolve
+    await flushPromises()
+    const readsBeforeFocus = mocks.SpecRead.mock.calls.length
+
+    focusHandler() // 重新載入進行中觸發 focus
+    await flushPromises()
+
+    expect(mocks.SpecRead).toHaveBeenCalledTimes(readsBeforeFocus) // 未發出任何新的背景讀取
+
+    resolveReload({ content: 'reload result', digest: 'sha256:RELOAD' })
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('reload result') // 重新載入結果正確套用，未被任何背景回應覆寫
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false)
+
+    w.unmount()
+  })
+
+  it('重新載入時可編輯：進行中編輯器仍可輸入（未設 busy=load）', async () => {
+    let resolveReload: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveReload = res })) // 重新載入：延遲
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click') // 重新載入進行中
+    await flushPromises()
+
+    expect(view.contentDOM.getAttribute('contenteditable')).toBe('true') // 未被設為不可編輯
+    expect(w.find('[data-test=editor-host]').attributes('data-editing-suspended')).toBeUndefined()
+    expect(w.attributes('data-busy')).toBe('') // 未設 busyReason='load'
+
+    typeText(view, 'typed while reloading') // 證明真的可編輯，不是裝飾性標記騙過斷言
+    await flushPromises()
+    expect(view.state.doc.toString()).toBe('typed while reloading')
+
+    resolveReload({ content: 'disk', digest: 'sha256:d' })
+    await flushPromises()
+  })
+
+  // ---- 比較 ----
+
+  it('比較開啟：左欄＝開啟當下 buffer、右欄＝開啟時重讀的內容；兩欄有標題', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢（提示當時磁碟內容）
+      .mockResolvedValueOnce({ content: 'even newer on disk', digest: 'sha256:NEWER' }) // 比較開啟時重讀
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-compare-left]').text()).toBe('edited')
+    expect(mustFind(w, '[data-test=external-compare-right]').text()).toBe('even newer on disk') // 不是提示當時的 'changed on disk'
+    mustFind(w, '[data-test=external-compare-left-label]')
+    mustFind(w, '[data-test=external-compare-right-label]')
+  })
+
+  it('比較凍結：開啟後續打——左欄不變', async () => {
+    let resolveCompare: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveCompare = res })) // 比較右欄：延遲
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+    expect(mustFind(w, '[data-test=external-compare-left]').text()).toBe('edited')
+
+    typeText(view, 'typed after opening compare') // 開啟後續打
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-compare-left]').text()).toBe('edited') // 左欄不變（凍結）
+
+    resolveCompare({ content: 'disk content', digest: 'sha256:d' })
+    await flushPromises()
+  })
+
+  it('比較不改基準：開啟再關閉後 fileContent／fileDigest 不變、回到三選一', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockResolvedValueOnce({ content: 'disk during compare', digest: 'sha256:CMP' }) // 比較右欄
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=external-compare]')
+
+    await mustFind(w, '[data-test=external-compare-close]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=external-compare]').exists()).toBe(false) // 比較已關閉
+    mustFind(w, '[data-test=external-choice]') // 回到三選一
+    expect(view.state.doc.toString()).toBe('edited') // fileContent 未變
+
+    // fileDigest 未變的佐證：再按儲存時磁碟 digest 就是比較右欄讀到的 CMP——若 compare 把
+    // 基準改成右欄 digest，預檢會通過並呼叫 writer；基準仍是 stub 才會中止
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'disk during compare', digest: 'sha256:CMP' })
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).not.toHaveBeenCalled()
+    expect(mustFind(w, '[data-test=external-abort]').text()).toBe(zhTW.externalChange.writeAborted)
+  })
+
+  it('比較右欄失敗：顯示失敗、不顯示任何舊內容、本地內容保留', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockRejectedValueOnce(new Error('compare read boom')) // 比較右欄讀取失敗
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-compare-right-error]').text()).toContain('compare read boom')
+    expect(w.find('[data-test=external-compare-right]').exists()).toBe(false) // 不顯示任何舊內容
+    expect(mustFind(w, '[data-test=external-compare-left]').text()).toBe('edited') // 本地內容保留（左欄）
+    expect(view.state.doc.toString()).toBe('edited') // 編輯器內容未變
+  })
+
+  it('比較×切檔：右欄讀取在途時切檔——回應不得套用', async () => {
+    let resolveCompare: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount a
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveCompare = res })) // 比較右欄：延遲
+      .mockResolvedValueOnce({ content: 'file b content', digest: 'sha256:b0' }) // 切檔後載入 b
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+
+    await w.setProps({ path: 'spec/b.feature' }) // 期間切檔
+    await flushEditor()
+
+    resolveCompare({ content: 'stale compare result', digest: 'sha256:stale' }) // 回應現在才到
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe('file b content') // 未被覆蓋
+    expect(w.find('[data-test=external-compare]').exists()).toBe(false) // 已因切檔關閉比較
+  })
+
+  it('比較×卸載：右欄讀取在途時卸載——回應不得拋出例外、不得套用', async () => {
+    let resolveCompare: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveCompare = res })) // 比較右欄：延遲
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click')
+    await flushPromises()
+
+    w.unmount()
+    resolveCompare({ content: 'stale compare result', digest: 'sha256:stale' })
+    await flushPromises() // 不應拋出任何例外／不應有 unhandled rejection
+
+    expect(view.state.doc.toString()).toBe('edited') // buffer 未被觸碰
+  })
+
+  it('比較重開：關閉後重新開啟——舊的讀取回應不得填進新比較', async () => {
+    let resolveFirstCompare: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+      .mockImplementationOnce(() => new Promise(res => { resolveFirstCompare = res })) // 第一次比較右欄：延遲
+      .mockResolvedValueOnce({ content: 'second compare result', digest: 'sha256:SECOND' }) // 第二次比較右欄：立即成功
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click') // 第一次開啟，尚未 resolve
+    await flushPromises()
+    await mustFind(w, '[data-test=external-compare-close]').trigger('click') // 關閉
+    await flushPromises()
+
+    await mustFind(w, '[data-test=external-choice-compare]').trigger('click') // 重新開啟，立即拿到第二次結果
+    await flushPromises()
+    expect(mustFind(w, '[data-test=external-compare-right]').text()).toBe('second compare result')
+
+    resolveFirstCompare({ content: 'STALE first compare', digest: 'sha256:STALE' }) // 第一次的延遲回應現在才到
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-compare-right]').text()).toBe('second compare result') // 未被舊回應覆蓋
+  })
+
+  // ---- 提示中編輯 ----
+
+  it('提示中編輯：使用者編輯後提示仍在、不自動關閉', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // save 預檢
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    mustFind(w, '[data-test=external-choice]')
+
+    typeText(view, 'edited more while prompt is open')
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-abort]').text()).toBe(zhTW.externalChange.writeAborted) // 提示仍在
+    mustFind(w, '[data-test=external-choice]') // 三選一仍在
+  })
+
+  // ---- F1 樣式（class，不只文字） ----
+
+  it('F1 樣式：detected 為 notice class', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' })
+      .mockResolvedValueOnce({ content: 'disk updated', digest: 'sha256:d1' })
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'unsaved local edit')
+    await flushPromises()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('notice')
+    expect(mustFind(w, '[data-test=external-change]').classes()).not.toContain('err')
+
+    w.unmount()
+  })
+
+  it('F1 樣式：notice（自動重載）為 notice class', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' })
+      .mockResolvedValueOnce({ content: 'disk updated', digest: 'sha256:d1' })
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('notice')
+    expect(mustFind(w, '[data-test=external-change]').classes()).not.toContain('err')
+
+    w.unmount()
+  })
+
+  it('F1 樣式：readFailed 為 err class', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' })
+      .mockRejectedValueOnce(new Error('disk unreachable boom'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('err')
+    expect(mustFind(w, '[data-test=external-change]').classes()).not.toContain('notice')
+
+    w.unmount()
+  })
+
+  it('F1 樣式：deleted 為 err class', async () => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' })
+      .mockRejectedValueOnce(new Error('open spec/a.feature: no such file or directory'))
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+
+    focusHandlerOf(addSpy)()
+    await flushPromises()
+
+    expect(mustFind(w, '[data-test=external-change]').classes()).toContain('err')
+    expect(mustFind(w, '[data-test=external-change]').classes()).not.toContain('notice')
+
+    w.unmount()
+  })
+})
+
+// R1／R3 回歸測試（owner 裁定）：
+// R1——三選一已開啟時，後續仍有效的背景檢查若讀取失敗／已刪除，須收起三選一、
+// 在 external-change 顯示原因（err class），編輯內容／已儲存內容／寫入基準三者
+// 保留；已因取得前景所有權而過期的背景失敗則完全 no-op（不改動任何狀態）。
+// R3——三選一已開啟時點擊「重新載入」取得前景所有權，讀取在途（onChoiceReload
+// 刻意不設 busyReason，見該函式註解）期間用「儲存」再次取得所有權並成功落地；
+// 舊的重新載入讀取（不論之後成功或失敗）必須完全不改動已完成的儲存結果。
+describe('SpecWorkspace R1／R3 回歸（A1b-2）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.SpecList.mockResolvedValue([])
+    mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  function focusHandlerOf(addSpy: ReturnType<typeof vi.spyOn>) {
+    const h = addSpy.mock.calls.find((call: unknown[]) => call[0] === 'focus')?.[1] as (() => void) | undefined
+    expect(h, 'focus handler 必須已註冊').toBeTypeOf('function')
+    return h!
+  }
+
+  it.each([
+    {
+      label: '一般讀取失敗',
+      err: new Error('boom R1 spec background read'),
+      assertText: (text: string) => expect(text).toContain('boom R1 spec background read'),
+    },
+    {
+      label: '檔案已刪除',
+      err: new Error('open spec/a.feature: no such file or directory'),
+      assertText: (text: string) => expect(text).toBe(zhTW.externalChange.deleted),
+    },
+  ])('R1：三選一開啟後，下一次仍有效的背景檢查（$label）→ 收起三選一、顯示原因、保留內容與基準', async ({ err, assertText }) => {
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' }) // mount
+      .mockResolvedValueOnce({ content: 'disk updated', digest: 'sha256:d1' }) // 背景檢查一：detected → 三選一開啟
+      .mockRejectedValueOnce(err) // 背景檢查二：仍有效、讀取失敗／已刪除
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'unsaved local edit')
+    await flushPromises()
+    const focusHandler = focusHandlerOf(addSpy)
+
+    focusHandler() // 背景檢查一：detected
+    await flushPromises()
+    mustFind(w, '[data-test=external-choice]')
+
+    focusHandler() // 背景檢查二：讀取失敗／已刪除，仍有效
+    await flushPromises()
+
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false) // R1：收起三選一
+    const changeEl = mustFind(w, '[data-test=external-change]')
+    expect(changeEl.classes()).toContain('err')
+    assertText(changeEl.text())
+    expect(view.state.doc.toString()).toBe('unsaved local edit') // 編輯內容保留
+
+    // 佐證已儲存內容／寫入基準未變：預檢回傳原基準 digest 才會呼叫 writer，
+    // 若基準已被背景失敗誤改，這裡 writer 收到的 expected_digest 會不同。
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'unsaved local edit', digest: 'sha256:d0' })
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'unsaved local edit', 'sha256:d0')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('R1：已因取得前景所有權而過期的背景失敗 → 完全不改動狀態，重新載入仍能正常收尾', async () => {
+    let rejectStaleBg: (e: unknown) => void = () => {}
+    let resolveReload: (v: { content: string; digest: string }) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:d0' }) // mount
+      .mockResolvedValueOnce({ content: 'disk updated', digest: 'sha256:d1' }) // 背景檢查一：detected
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectStaleBg = reject })) // 背景檢查二：發出、在途
+      .mockImplementationOnce(() => new Promise(r => { resolveReload = r })) // 重新載入本身：在途
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature' } })
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'unsaved local edit')
+    await flushPromises()
+    const focusHandler = focusHandlerOf(addSpy)
+
+    focusHandler() // 背景檢查一：detected → 三選一開啟
+    await flushPromises()
+    focusHandler() // 背景檢查二：發出、尚未 resolve
+    await flushPromises()
+    mustFind(w, '[data-test=external-choice]')
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click') // 取得前景所有權：背景檢查二立即過期
+    await flushPromises()
+
+    const choiceBefore = w.find('[data-test=external-choice]').exists()
+    const changeElBefore = w.find('[data-test=external-change]')
+    const changeExistsBefore = changeElBefore.exists()
+    const changeTextBefore = changeExistsBefore ? changeElBefore.text() : null
+    const changeClassesBefore = changeExistsBefore ? [...changeElBefore.classes()] : null
+
+    rejectStaleBg(new Error('stale background read fail after ownership taken')) // 過期背景讀取現在才失敗
+    await flushPromises()
+
+    expect(w.find('[data-test=external-choice]').exists()).toBe(choiceBefore) // 完全不變
+    const changeElAfter = w.find('[data-test=external-change]')
+    expect(changeElAfter.exists()).toBe(changeExistsBefore)
+    if (changeExistsBefore) {
+      expect(changeElAfter.text()).toBe(changeTextBefore)
+      expect([...changeElAfter.classes()]).toEqual(changeClassesBefore)
+    }
+
+    resolveReload({ content: 'disk updated', digest: 'sha256:d1' }) // 讓重新載入正常收尾
+    await flushEditor()
+    expect(w.find('[data-test=external-choice]').exists()).toBe(false)
+    expect(view.state.doc.toString()).toBe('disk updated')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it.each([
+    {
+      label: '舊的重新載入讀取之後成功但內容已不同',
+      settle: (resolve: (v: { content: string; digest: string }) => void, _reject: (e: unknown) => void) =>
+        resolve({ content: 'late stale reload content', digest: 'sha256:latestale' }),
+    },
+    {
+      label: '舊的重新載入讀取之後失敗',
+      settle: (_resolve: (v: { content: string; digest: string }) => void, reject: (e: unknown) => void) =>
+        reject(new Error('late stale reload failure')),
+    },
+  ])('R3：重新載入在途期間用儲存搶到新的所有權並成功落地，$label 也不得覆寫儲存結果', async ({ settle }) => {
+    let resolveReload: (v: { content: string; digest: string }) => void = () => {}
+    let rejectReload: (e: unknown) => void = () => {}
+    mocks.SpecRead
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:EXTERNAL' }) // 第一次儲存預檢：中止 → 三選一開啟
+      .mockImplementationOnce(() => new Promise((res, rej) => { resolveReload = res; rejectReload = rej })) // 重新載入本身：在途
+      .mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // 第二次儲存預檢：符合目前寫入基準
+    const write = vi.fn().mockResolvedValue('sha256:saved')
+    const w = mountWithI18n(SpecWorkspace, { props: { path: 'spec/a.feature', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited')
+    await flushPromises()
+
+    await mustFind(w, '[data-test=save]').trigger('click') // 第一次儲存：預檢不符 → 中止、三選一開啟
+    await flushPromises()
+    mustFind(w, '[data-test=external-choice]')
+
+    await mustFind(w, '[data-test=external-choice-reload]').trigger('click') // 重新載入：取得所有權，讀取在途
+    await flushPromises()
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBeUndefined() // onChoiceReload 不設 busy，儲存應可按
+
+    await mustFind(w, '[data-test=save]').trigger('click') // 重新載入在途時按儲存：再次取得所有權
+    await flushPromises()
+
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'edited', 'sha256:stub')
+    const docAfter = view.state.doc.toString()
+    const saveDisabledAfter = mustFind(w, '[data-test=save]').attributes('disabled')
+    const changeElAfter1 = w.find('[data-test=external-change]')
+    const changeExists = changeElAfter1.exists()
+    const changeText = changeExists ? changeElAfter1.text() : null
+    const abortElAfter1 = w.find('[data-test=external-abort]')
+    const abortExists = abortElAfter1.exists()
+    const abortText = abortExists ? abortElAfter1.text() : null
+
+    settle(resolveReload, rejectReload) // 舊的重新載入讀取現在才到（成功或失敗）
+    await flushPromises()
+
+    expect(view.state.doc.toString()).toBe(docAfter)
+    expect(mustFind(w, '[data-test=save]').attributes('disabled')).toBe(saveDisabledAfter)
+    const changeElAfter2 = w.find('[data-test=external-change]')
+    expect(changeElAfter2.exists()).toBe(changeExists)
+    if (changeExists) expect(changeElAfter2.text()).toBe(changeText)
+    const abortElAfter2 = w.find('[data-test=external-abort]')
+    expect(abortElAfter2.exists()).toBe(abortExists)
+    if (abortExists) expect(abortElAfter2.text()).toBe(abortText)
+
+    // 佐證寫入基準確實停在 sha256:saved（未被過期的重新載入回應覆寫）：
+    // 預檢回傳相符 digest 才會呼叫 writer，第三個參數即是目前基準。
+    mocks.SpecRead.mockResolvedValueOnce({ content: 'edited', digest: 'sha256:saved' })
+    typeText(view, 'edited more')
+    await flushPromises()
+    await mustFind(w, '[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(write).toHaveBeenCalledWith('spec/a.feature', 'edited more', 'sha256:saved')
+
+    w.unmount()
+  })
+})

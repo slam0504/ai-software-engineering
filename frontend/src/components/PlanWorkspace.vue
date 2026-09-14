@@ -14,6 +14,11 @@ import { extractGherkin as extractDraftContent } from '../lib/gherkin'
 import { templateFor, inScope, PLAN_SCOPE_PATTERNS } from '../lib/planTemplates'
 import { isWriteConflict } from '../lib/writeConflict'
 import { createExternalChangeGuard, shouldApplyBackground } from '../lib/externalChangeGuard'
+// A1b-2 Phase 2：外部變更三選一與比較——共用元件（Phase 1 已完成），本檔只負責
+// 接線：何時顯示、按下後做什麼（見下方 choiceOpen／chooseReload／chooseCompare／
+// chooseKeep）。元件本身不含讀寫邏輯。
+import ExternalChangeChoice from './ExternalChangeChoice.vue'
+import ExternalChangeCompare from './ExternalChangeCompare.vue'
 
 const { t } = useI18n()
 
@@ -86,10 +91,42 @@ const guard = createExternalChangeGuard()
 // 當下是否有未儲存內容顯示 notice（已自動重載）或 detected（未覆寫）；讀取
 // 失敗／已刪除顯示對應原因。
 const externalChangeMessage = ref('')
+// externalChangeKind（A1b-2 F1／J4）：externalChangeMessage 目前承載的訊息類別
+// ——資訊（notice／detected／reloadKeptNewInput）依類別套 .notice 樣式、錯誤
+// （readFailed／deleted）套 .err 樣式（見下方 externalChangeClass）。純內部呈現
+// 判定，不外顯為額外文字。
+type ExternalChangeKind = '' | 'notice' | 'detected' | 'readFailed' | 'deleted' | 'reloadKeptNewInput'
+const externalChangeKind = ref<ExternalChangeKind>('')
+const externalChangeClass = computed(() =>
+  externalChangeKind.value === 'readFailed' || externalChangeKind.value === 'deleted' ? 'err' : 'notice')
 // externalAbortMessage：寫入前檢查（saveFile）中止本次寫入的原因——writeAborted
 // （偵測到外部變更）或 readFailed／deleted（預檢讀取失敗）。與
-// externalChangeMessage 分開呈現，兩者互不覆寫。
+// externalChangeMessage 分開呈現，兩者互不覆寫。external-abort 維持固定 class="err"
+// （兩者皆為錯誤／中止，不需依類別區分樣式，同 F1 表）。
 const externalAbortMessage = ref('')
+
+// choiceOpen（A1b-2 J1）：三選一是否顯示——背景 detected（有未儲存內容）與前景
+// writeAborted（digest 不符中止）皆會開啟；讀取失敗／已刪除不開啟（J1）。單一
+// 旗標涵蓋兩處觸發點，因為兩者代表同一個「已分歧、待使用者決定」狀態，動作
+// （reload／compare／keep）語意也相同。
+const choiceOpen = ref(false)
+// reloadBusy（J2 §2.4.4 明確 reload 額外要求）：只用來把三選一按鈕設為
+// disabled，避免重複點擊——刻意不進 busyReason，讓編輯器在重新載入期間仍可
+// 編輯（見下方 chooseReload 註解）。
+const reloadBusy = ref(false)
+
+// compare 狀態（J3、條款 18、§2.9）：左欄是點擊當下的 buffer 凍結快照，右欄是
+// 開啟時重新讀取的磁碟內容凍結快照；compareGen 是比較世代計數器，讓「關閉後
+// 又重新開啟」或「切檔／卸載」時舊的讀取回應不會填進新的比較（不沿用
+// externalChangeGuard 的世代——compare 本身不取得所有權，兩者是獨立機制）。
+const compareOpen = ref(false)
+const compareLeft = ref('')
+const compareLeftCapturedAt = ref(new Date())
+const compareRight = ref<string | null>(null)
+const compareRightCapturedAt = ref<Date | null>(null)
+const compareRightError = ref('')
+const compareRightLoading = ref(false)
+let compareGen = 0
 
 // isFileNotFoundError：PlanRead 對已刪除檔案回傳的是 os.ReadFile／
 // filepath.EvalSymlinks 的原生錯誤（app.go:4436、3529），訊息含
@@ -99,9 +136,26 @@ function isFileNotFoundError(e: unknown): boolean {
   return String(e).includes('no such file or directory')
 }
 
+// closeCompare：隱藏比較並重設其暫存狀態，遞增 compareGen 使任何在途的右欄讀取
+// 回應失效——不論是使用者按「關閉比較」回到三選一，還是切檔／卸載透過
+// resetExternalChange() 呼叫到這裡，都不改動 plan.currentContent／savedContent／
+// currentDigest（compare 只讀，不改任何基準）。
+function closeCompare() {
+  compareOpen.value = false
+  compareGen += 1
+  compareLeft.value = ''
+  compareRight.value = null
+  compareRightCapturedAt.value = null
+  compareRightError.value = ''
+  compareRightLoading.value = false
+}
+
 function resetExternalChange() {
   externalChangeMessage.value = ''
+  externalChangeKind.value = ''
   externalAbortMessage.value = ''
+  choiceOpen.value = false
+  closeCompare()
 }
 watch(busyReason, v => emit('busy', v !== ''))
 // A1a-2：dirty 對外回報（同 SpecWorkspace）；pendingPath 是內部清單切檔的守衛目標。
@@ -240,6 +294,8 @@ async function checkExternalChange() {
     if (!guard.isActive() || !shouldApplyBackground(stamp, guard.snapshot(effectivePath.value, plan.currentDigest))) return
     if (pf.digest === plan.currentDigest) {
       externalChangeMessage.value = '' // 已同步：靜默清除提示，不彈窗
+      externalChangeKind.value = ''
+      choiceOpen.value = false // 已收斂為同步，先前若因分歧開啟的三選一不再有意義
       return
     }
     if (!bufferDirty.value) {
@@ -247,16 +303,20 @@ async function checkExternalChange() {
       plan.setCurrentFile(path, pf.content, pf.digest)
       syncEditorDoc()
       externalChangeMessage.value = t('externalChange.notice')
+      externalChangeKind.value = 'notice'
     } else {
-      // 當下有未儲存內容：不覆寫，只提示
+      // 當下有未儲存內容：不覆寫，只提示（J1：背景分流疊三選一）
       externalChangeMessage.value = t('externalChange.detected')
+      externalChangeKind.value = 'detected'
+      choiceOpen.value = true
     }
   } catch (e) {
     if (!guard.isActive() || !shouldApplyBackground(stamp, guard.snapshot(effectivePath.value, plan.currentDigest))) return
     // 保留 buffer／savedContent／寫入基準三者；讀取失敗不得視為「沒有外部變更」
-    externalChangeMessage.value = isFileNotFoundError(e)
-      ? t('externalChange.deleted')
-      : t('externalChange.readFailed', { error: String(e) })
+    const kind = isFileNotFoundError(e) ? 'deleted' : 'readFailed'
+    externalChangeMessage.value = kind === 'deleted' ? t('externalChange.deleted') : t('externalChange.readFailed', { error: String(e) })
+    externalChangeKind.value = kind
+    choiceOpen.value = false // 讀取失敗／已刪除不顯示三選一（J1）；已開啟者收起（R1）
   }
 }
 
@@ -518,6 +578,7 @@ async function saveFile() {
   saveError.value = '' // 同上，新的呈現點也要清
   saveConflict.value = false
   externalAbortMessage.value = '' // 新的寫入嘗試開始，清掉上次中止提示
+  choiceOpen.value = false // §六：新寫入開始時，對應的三選一也要關閉
   try {
     let pf: { content: string; digest: string }
     try {
@@ -534,6 +595,7 @@ async function saveFile() {
     if (pf.digest !== P.digest) {
       // 偵測到外部變更：一律中止，不呼叫 writer，不看當下 dirty
       externalAbortMessage.value = t('externalChange.writeAborted')
+      choiceOpen.value = true // J1：前景分流疊三選一
       return
     }
 
@@ -555,6 +617,90 @@ async function saveFile() {
   } finally {
     guard.release(token)
     busyReason.value = ''
+  }
+}
+
+// chooseKeep（A1b-2 §2.6「保留本地」）：保留編輯內容，不動 currentDigest、不呼叫
+// writer——只關閉提示（含三選一與比較），操作到此結束。狀態維持已分歧：
+// currentDigest 未變，之後再按儲存仍會被 saveFile 的預檢中止。
+function chooseKeep() {
+  resetExternalChange()
+}
+
+// chooseReload（A1b-2 J2、§2.4 明確 reload 額外要求）：點擊當下凍結「使用者已
+// 同意捨棄的 buffer 快照」與目前路徑，取得前景所有權（guard.acquire()，涵蓋
+// C1／C3 保護，期間背景檢查略過、在途背景讀取立即失效）——重新載入與儲存同樣
+// 會改 buffer／saved／寫入基準，故沿用相同的所有權模型（J2）。
+//
+// ★ 刻意不設 busyReason：load／bump 等既有 busy 狀態會連帶影響編輯器可編輯性
+// （setEditable(false)）與其他導覽守衛，會讓「點擊重新載入後使用者續打」這個
+// §2.4 明確要求的情境變成不可能發生。重新載入進行中改以 reloadBusy 把三選一
+// 按鈕設為 disabled，避免重複點擊；編輯器本身維持可編輯。
+async function chooseReload() {
+  if (reloadBusy.value) return
+  const frozenPath = effectivePath.value
+  const frozenSnapshot = plan.currentContent
+  const token = guard.acquire()
+  reloadBusy.value = true
+  try {
+    let pf: { content: string; digest: string }
+    try {
+      pf = await PlanRead(frozenPath)
+    } catch (e) {
+      // 讀取失敗：三者不變，於 external-change 顯示原因（錯誤類），三選一維持開啟。
+      if (!guard.isOwner(token) || !guard.isActive() || effectivePath.value !== frozenPath) return
+      const kind = isFileNotFoundError(e) ? 'deleted' : 'readFailed'
+      externalChangeMessage.value = kind === 'deleted' ? t('externalChange.deleted') : t('externalChange.readFailed', { error: String(e) })
+      externalChangeKind.value = kind
+      return
+    }
+    // 核對：仍持有所有權、guard 仍有效（未卸載）、目前檔案未變——任一不符即完全
+    // 不改狀態（同 saveFile 慣例）。
+    if (!guard.isOwner(token) || !guard.isActive() || effectivePath.value !== frozenPath) return
+    if (plan.currentContent !== frozenSnapshot) {
+      // 點擊後、回應前又打字：不得捨棄點擊後新增的輸入，不套用磁碟內容，重新提示。
+      externalChangeMessage.value = t('externalChange.reloadKeptNewInput')
+      externalChangeKind.value = 'reloadKeptNewInput'
+      return
+    }
+    // buffer 仍等於點擊當下凍結的快照：套用磁碟內容，buffer／saved／基準皆＝磁碟。
+    plan.setCurrentFile(frozenPath, pf.content, pf.digest)
+    syncEditorDoc()
+    resetExternalChange()
+  } finally {
+    guard.release(token)
+    reloadBusy.value = false
+  }
+}
+
+// chooseCompare（A1b-2 J3、條款 18、§2.9）：只讀，不取得所有權、不改任何基準。
+// 開啟時凍結左欄（當下 buffer）＋重新讀取磁碟填右欄；compareGen 讓「關閉後又
+// 重新開啟」時舊的讀取回應不會填進新的比較。回應到達時核對 guard.isActive()、
+// 目前檔案未變、比較仍開啟且世代相符，任一不符即丟棄——不沿用任何舊內容。
+async function chooseCompare() {
+  const path = effectivePath.value
+  compareOpen.value = true
+  compareLeft.value = plan.currentContent
+  compareLeftCapturedAt.value = new Date()
+  compareRight.value = null
+  compareRightCapturedAt.value = null
+  compareRightError.value = ''
+  compareRightLoading.value = true
+  const gen = ++compareGen
+  try {
+    const pf = await PlanRead(path)
+    if (!guard.isActive() || effectivePath.value !== path || gen !== compareGen) return
+    compareRight.value = pf.content
+    compareRightCapturedAt.value = new Date()
+    compareRightError.value = ''
+    compareRightLoading.value = false
+  } catch (e) {
+    if (!guard.isActive() || effectivePath.value !== path || gen !== compareGen) return
+    // 失敗：保留本地內容並顯示失敗，right 維持 null，不沿用任何舊內容。
+    compareRightError.value = String(e)
+    compareRight.value = null
+    compareRightCapturedAt.value = null
+    compareRightLoading.value = false
   }
 }
 
@@ -663,8 +809,21 @@ async function confirmCommit() {
          bumpStale）。external-change 是背景檢查（視窗聚焦）結果，external-abort
          是寫入前檢查中止本次儲存的原因；同步三值本身不外顯，使用者只看見這兩類
          必要訊息與讀取失敗／已刪除原因。 -->
-    <p v-if="externalChangeMessage" class="err" data-test="external-change">{{ externalChangeMessage }}</p>
+    <p v-if="externalChangeMessage" :class="externalChangeClass" data-test="external-change">{{ externalChangeMessage }}</p>
     <p v-if="externalAbortMessage" class="err" data-test="external-abort">{{ externalAbortMessage }}</p>
+    <!-- A1b-2：三選一疊在上面的訊息旁；compare 開啟時取代三選一的位置，關閉後
+         回到三選一（choiceOpen 本身不變）。 -->
+    <ExternalChangeChoice
+      v-if="choiceOpen && !compareOpen" :disabled="reloadBusy"
+      @reload="chooseReload" @compare="chooseCompare" @keep="chooseKeep"
+    />
+    <ExternalChangeCompare
+      v-if="compareOpen"
+      :left="compareLeft" :left-captured-at="compareLeftCapturedAt"
+      :right="compareRight" :right-captured-at="compareRightCapturedAt"
+      :right-error="compareRightError || undefined" :right-loading="compareRightLoading"
+      @close="closeCompare"
+    />
 
     <div v-if="bumpPreview || bumpConfirmError || bumpError" class="bump-area">
       <div v-if="bumpPreview && bumpPreview.no_bump_needed" class="bump-no-bump-needed" data-test="bump-no-bump-needed">
@@ -743,5 +902,6 @@ async function confirmCommit() {
 .assist-busy { color: var(--text-muted); font-size: var(--fs-s); }
 .err { color: var(--err); font-size: var(--fs-s); }
 .ok { color: var(--text-muted); font-size: var(--fs-s); }
+.notice { color: var(--text-muted); font-size: var(--fs-s); }
 .errors { margin: 0; padding-left: 16px; }
 </style>
