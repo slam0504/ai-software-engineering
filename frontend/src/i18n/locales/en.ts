@@ -415,6 +415,16 @@ export default {
     message: 'This file has unsaved changes.',
     action: { keep: 'Keep editing', discard: 'Discard and leave' },
   },
+  // A1b-1: external file change. Only three user-visible message kinds — change
+  // notice, read failure, and abort reason; the three-valued sync state stays
+  // internal (no persistent status or badge).
+  externalChange: {
+    notice: 'This file was changed outside the editor. The latest version on disk has been loaded.',
+    detected: 'This file was changed outside the editor. Your unsaved changes are still in the editor.',
+    writeAborted: 'This file was changed outside the editor. The save was aborted and nothing was written; your edits and the write baseline are unchanged.',
+    readFailed: 'Could not read this file to check for external changes: {error}',
+    deleted: 'This file no longer exists on disk. The editor content is unchanged.',
+  },
   bump: {
     banner: {
       message: 'analysis_base_commit is behind the current HEAD — an update is recommended',

@@ -1,7 +1,7 @@
 import { flushPromises } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EditorView } from '@codemirror/view'
 import PlanWorkspace from './PlanWorkspace.vue'
 import { usePlan } from '../stores/plan'
@@ -88,6 +88,9 @@ describe('PlanWorkspace', () => {
     expect(usePlan().currentContent).toBe('AI plan draft content') // buffer 已更新
 
     await w.find('[data-test=save]').trigger('click')
+    // A1b-1：saveFile 新增寫入前預檢（PlanRead 比對 digest）——writer 不再是點擊
+    // 當下同一個 microtask 內同步呼叫，需多等一輪 flushPromises 讓預檢完成。
+    await flushPromises()
     expect(write).toHaveBeenCalledWith('plan/a.yaml', 'AI plan draft content', 'sha256:stub')
   })
 
@@ -557,6 +560,8 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     await flushEditor()
     await w.find('[data-test=apply-draft]').trigger('click') // buffer=v1，dirty 真
     await w.find('[data-test=save]').trigger('click') // 送出 v1，尚未 resolve
+    // A1b-1：writer 前先有一輪 PlanRead 預檢（微任務），須多 flush 一次才輪到 writer 被呼叫。
+    await flushPromises()
     expect(write).toHaveBeenCalledWith('plan/a.yaml', 'v1', 'sha256:stub')
 
     const view = getView(w)
@@ -576,6 +581,8 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     await flushEditor()
     await w.find('[data-test=apply-draft]').trigger('click')
     await w.find('[data-test=save]').trigger('click')
+    // A1b-1：writer 前先有一輪 PlanRead 預檢（微任務），須多 flush 一次才輪到 writer 被呼叫。
+    await flushPromises()
     expect(write).toHaveBeenCalledTimes(1)
     expect(w.attributes('data-busy')).toBe('save')
 
@@ -591,7 +598,8 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     await flushPromises()
 
     expect(write).toHaveBeenCalledTimes(1) // 未再被呼叫
-    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 只有 mount 那次，切檔未觸發重載
+    // A1b-1：mount 一次＋save 的寫入前預檢一次＝2；切檔本身未觸發額外重載。
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(2)
 
     resolveWrite('sha256:new')
     await flushPromises()
@@ -686,7 +694,12 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(usePlan().currentContent).toBe('edited after load')
   })
 
-  it('T9-P：衝突——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {
+  // T9-P 情境 A（A1b-1 相容改造，設計稿 §2.11 裁定 18）：寫入前預檢成功（digest
+  // 相符）後才發生的後端衝突——原本斷言「mocks.PlanRead 只被呼叫 1 次」與新增
+  // 的寫入前預檢（也呼叫 PlanRead）不相容，改為斷言「恰好 2 次＝mount 一次＋
+  // 預檢一次，衝突本身不觸發任何額外 reload」，行為契約（三者不變、不自動重載）
+  // 不變。情境 B（預檢已發現外部變更→writer 呼叫次數 0）見下方 A1b-1 describe。
+  it('T9-P：衝突（情境 A：預檢成功後端才拒絕）——[data-test=save-error][data-conflict=true]，三者不變，不自動重載，dirty 依內容比較', async () => {
     const write = vi.fn().mockRejectedValue(new Error('write conflict: expected_digest does not match current file'))
     const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', draft: 'v1', write } })
     await flushEditor()
@@ -698,7 +711,9 @@ describe('PlanWorkspace 非同步儲存契約（A1a-1，expected-red）', () => 
     expect(err.exists()).toBe(true) // 目前錯誤只進 plan-errors，沒有專屬 save-error
     expect(err.text()).toContain('write conflict: expected_digest does not match current file')
     expect(err.attributes('data-conflict')).toBe('true')
-    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 未自動重新載入
+    expect(write).toHaveBeenCalledTimes(1) // 預檢通過後才寫入一次
+    // mount 一次＋寫入前預檢一次＝2；後端衝突本身不觸發任何額外 reload。
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(2)
 
     const view = getView(w)
     typeText(view, '') // 改回 saved 原內容（初始 content 為空字串）
@@ -1002,7 +1017,8 @@ describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
 
     expect(w.find('[data-test=unsaved-guard]').exists()).toBe(false) // A1a-1 儲存互斥直接擋下，不出現守衛選擇
     expect(w.attributes('data-busy')).toBe('save') // busy 未變
-    expect(mocks.PlanRead).toHaveBeenCalledTimes(1) // 只有初次載入，切檔未觸發任何讀取
+    // A1b-1：mount 一次＋save 的寫入前預檢一次＝2；切檔本身未觸發額外讀取。
+    expect(mocks.PlanRead).toHaveBeenCalledTimes(2)
     expect(view.state.doc.toString()).toBe('plan a edited') // 內容未變
 
     resolveWrite('sha256:new')
@@ -1138,4 +1154,614 @@ describe('PlanWorkspace 切檔守衛（A1a-2，expected-red）', () => {
     expect(store.read).toHaveBeenCalledWith('plan/b.yaml') // bump 結束後才切
   })
 
+})
+
+// A1b-1：外部檔案變更偵測——三個檢查點（回到工作區既有 loadFile 已滿足，不
+// 在此重測）、寫入前預檢（前景所有權＋digest 不符一律中止，不看當下 dirty）、
+// 視窗聚焦背景檢查（B1–B4 四項核對，反例 C1／C2／C3）、讀取失敗／已刪除、
+// bump 語意分離、標記非閘控。沿用本檔既有 flushEditor／getView／typeText／
+// makeFileStore（不跨檔匯入）與「直接呼叫元件掛上的 focus handler」慣例（同
+// analysis_base bump 視窗聚焦測試——見上方註解：全域 dispatch 會連帶觸發其他
+// 測試殘留的監聽，呼叫次數不可預期）。
+describe('PlanWorkspace 外部檔案變更（A1b-1）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const fn of Object.values(mocks)) fn.mockReset()
+    mocks.PlanList.mockResolvedValue([])
+    mocks.PlanRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
+  })
+  // 測試失敗時 it 內最後的 mockRestore 不會執行，spy 會殘留到下一條並讓它紅在
+  // 前置條件而非正題（負控制時實測發生過）。清理放 afterEach，確保一次只證一個命題。
+  afterEach(() => { vi.restoreAllMocks() })
+
+  function getFocusHandler(addSpy: { mock: { calls: unknown[][] } }) {
+    const call = addSpy.mock.calls.find(c => c[0] === 'focus')
+    const handler = call?.[1] as (() => void) | undefined
+    expect(handler, '找不到元件註冊的 focus handler').toBeTypeOf('function')
+    return handler!
+  }
+
+  it('C1：寫入已送出→期間觸發 focus→寫入成功回應仍被套用（savedContent／digest 確實更新）', async () => {
+    const store = makeFileStore({ 'plan/a.yaml': { content: 'orig', digest: 'sha256:a0' } })
+    mocks.PlanRead.mockImplementation(store.read)
+    let resolveWrite: (d: string) => void = () => {}
+    const write = vi.fn().mockImplementation(() => new Promise<string>(r => { resolveWrite = r }))
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    typeText(getView(w), 'edited content')
+    await flushPromises()
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises() // 寫入前預檢完成，writer 已被呼叫、尚未 resolve
+
+    const readCallsBeforeFocus = mocks.PlanRead.mock.calls.length
+    focusHandler() // 儲存等待期間視窗取得焦點
+    await flushPromises()
+    // 前景所有權期間：背景檢查一律略過，不發出新讀取（不得淘汰進行中的寫入）
+    expect(mocks.PlanRead.mock.calls.length).toBe(readCallsBeforeFocus)
+
+    resolveWrite('sha256:seq1')
+    await flushPromises()
+
+    expect(usePlan().savedContent).toBe('edited content')
+    expect(usePlan().currentDigest).toBe('sha256:seq1')
+    expect(w.find('[data-test=save-error]').exists()).toBe(false)
+    expect(w.attributes('data-busy')).toBe('')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('C2：新背景檢查成功（已同步）後，舊背景檢查的失敗回應才到——狀態不變、不顯示該錯誤', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: '', digest: 'sha256:stub' }) // mount
+    const resolvers: Array<{ resolve: (v: { content: string; digest: string }) => void; reject: (e: unknown) => void }> = []
+    mocks.PlanRead.mockImplementation(() => new Promise((resolve, reject) => { resolvers.push({ resolve, reject }) }))
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler() // 背景讀取 A（世代較舊，稍後才以失敗回應）
+    await flushPromises()
+    focusHandler() // 背景讀取 B（世代較新，先以成功回應）
+    await flushPromises()
+    expect(resolvers.length).toBe(2)
+
+    resolvers[1].resolve({ content: '', digest: 'sha256:stub' }) // B 先到：已同步
+    await flushPromises()
+    expect(w.find('[data-test=external-change]').exists()).toBe(false)
+
+    resolvers[0].reject(new Error('boom: stale background read failed')) // A 的舊失敗現在才到
+    await flushPromises()
+
+    // 過期回應完全 no-op：不顯示其錯誤，不把已同步狀態改回未知
+    expect(w.find('[data-test=external-change]').exists()).toBe(false)
+    expect(usePlan().currentContent).toBe('')
+    expect(usePlan().savedContent).toBe('')
+    expect(usePlan().currentDigest).toBe('sha256:stub')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('C3-a：背景讀取在途→儲存完成（基準已更新、busy 已清）→舊背景讀取以成功返回→完全不改三者與錯誤', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let resolveBackground: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveBackground = r })) // 背景讀取 A，尚未 resolve
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // save 的寫入前預檢：未變更
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler() // 發出背景讀取 A（尚未 resolve）
+    await flushPromises()
+
+    typeText(getView(w), 'edited by user')
+    await flushPromises()
+    await w.find('[data-test=save]').trigger('click') // 取得所有權：A 立即失效（不等回應）
+    await flushPromises()
+
+    expect(usePlan().savedContent).toBe('edited by user') // 儲存已完成
+    expect(usePlan().currentDigest).toBe('sha256:new') // 基準已更新
+    expect(w.attributes('data-busy')).toBe('') // busy 已清
+
+    resolveBackground({ content: 'STALE disk content', digest: 'sha256:stale' }) // A 現在才回應（成功）
+    await flushPromises()
+
+    // 完全 no-op：若被誤套用，當下 clean 會把剛儲存的內容退回舊版——這正是 C3 要擋的
+    expect(usePlan().currentContent).toBe('edited by user')
+    expect(usePlan().savedContent).toBe('edited by user')
+    expect(usePlan().currentDigest).toBe('sha256:new')
+    expect(w.find('[data-test=external-change]').exists()).toBe(false)
+    expect(w.find('[data-test=save-error]').exists()).toBe(false)
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('C3-b：背景讀取在途→儲存完成→舊背景讀取以失敗返回→完全不改三者與錯誤', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let rejectBackground: (e: unknown) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise((_r, rej) => { rejectBackground = rej })) // 背景讀取 A，尚未 resolve
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // save 的寫入前預檢：未變更
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushPromises()
+
+    typeText(getView(w), 'edited by user')
+    await flushPromises()
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    expect(usePlan().savedContent).toBe('edited by user')
+    expect(usePlan().currentDigest).toBe('sha256:new')
+    expect(w.attributes('data-busy')).toBe('')
+
+    rejectBackground(new Error('boom: stale background read failed')) // A 現在才回應（失敗）
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('edited by user')
+    expect(usePlan().savedContent).toBe('edited by user')
+    expect(usePlan().currentDigest).toBe('sha256:new')
+    expect(w.find('[data-test=external-change]').exists()).toBe(false) // 舊失敗不顯示
+    expect(w.find('[data-test=save-error]').exists()).toBe(false)
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('條款12：預檢等待期間把 buffer 改回 savedContent（dirty→false）→仍中止、writer 呼叫次數 0、不自動重載', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let resolvePrecheck: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolvePrecheck = r })) // 預檢，尚未 resolve
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    const view = getView(w)
+    typeText(view, 'edited by user')
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click') // 凍結快照 {content:'edited by user', digest:'sha256:a0'}
+    await flushPromises()
+
+    typeText(view, 'orig') // 等待期間把 buffer 改回 savedContent（dirty→false）
+    await flushPromises()
+    expect(w.find('[data-test=save]').attributes('disabled')).toBeDefined() // 目前確實 dirty 假
+
+    resolvePrecheck({ content: 'changed on disk', digest: 'sha256:external' }) // 外部變更：digest 不符固定快照
+    await flushPromises()
+
+    expect(write).not.toHaveBeenCalled() // 不看當下 dirty，一律中止，不呼叫 writer
+    expect(usePlan().currentContent).toBe('orig') // 續打內容（改回 saved）保留，不被自動重載覆蓋
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0') // 寫入基準不變
+    const abort = w.find('[data-test=external-abort]')
+    expect(abort.exists()).toBe(true)
+    expect(abort.text()).toContain('本次儲存已中止') // writeAborted 中止原因
+  })
+
+  it('T9-P 情境 B：寫入前預檢已發現外部變更→writer 呼叫次數 0，顯示中止原因', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:b0' }) // 預檢：digest 不符
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    typeText(getView(w), 'edited content')
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    expect(write).not.toHaveBeenCalled()
+    expect(usePlan().currentContent).toBe('edited content') // 續打內容保留
+    expect(usePlan().savedContent).toBe('orig') // 未落地
+    expect(usePlan().currentDigest).toBe('sha256:a0') // 寫入基準不變
+    expect(w.find('[data-test=external-abort]').text())
+      .toBe('這個檔案在編輯器外被改動過，本次儲存已中止，未寫入任何內容；你的編輯內容與寫入基準都保持不變。')
+  })
+
+  it('寫入前預檢讀取失敗：中止寫入、保留三者、顯示原始訊息', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockRejectedValueOnce(new Error('boom: precheck read failed'))
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    typeText(getView(w), 'edited content')
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+
+    expect(write).not.toHaveBeenCalled()
+    expect(usePlan().currentContent).toBe('edited content')
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+    expect(w.find('[data-test=external-abort]').text()).toContain('boom: precheck read failed')
+  })
+
+  it('讀取失敗（背景檢查）：三者保留、顯示原始訊息、不判為已同步', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockRejectedValueOnce(new Error('boom: disk io error'))
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('orig')
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+    expect(w.find('[data-test=external-change]').text()).toContain('boom: disk io error')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('已刪除（背景檢查）：三者保留、顯示「檔案已不存在」，不判為已同步', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockRejectedValueOnce(new Error('open /workspace/plan/a.yaml: no such file or directory'))
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('orig')
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+    expect(w.find('[data-test=external-change]').text()).toBe('這個檔案在磁碟上已不存在；編輯器內容保持不變。')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('背景自動重載：無未儲存內容且核對通過→載入磁碟新內容＋notice', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:b0' }) // 背景檢查
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushEditor() // 讓 syncEditorDoc 的變更確實反映到 CM6 view
+
+    expect(usePlan().currentContent).toBe('changed on disk')
+    expect(usePlan().savedContent).toBe('changed on disk')
+    expect(usePlan().currentDigest).toBe('sha256:b0')
+    expect(getView(w).state.doc.toString()).toBe('changed on disk')
+    expect(w.find('[data-test=external-change]').text()).toBe('這個檔案在編輯器外被改動過，已載入磁碟上的最新版本。')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('無訂閱仍有效：已無任何事件訂閱，focus 檢查點仍無條件重讀並偵測外部變更', async () => {
+    // 修正 1（owner review）：PlanWorkspace 已移除 plan:changed 事件訂閱與輔助旗標
+    // （沒有消費端就不留，也不為它新增診斷介面或 UI）——本檔全部測試自始至終都
+    // 沒有、也不可能訂閱任何事件；下面仍能偵測到外部變更，證明三個檢查點本來就
+    // 是無條件重讀並比對 digest，拿掉訂閱後行為不變。
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'plan_id: a\n', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'plan_id: a\nexternal\n', digest: 'sha256:b0' }) // 背景檢查
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+    typeText(getView(w), 'plan_id: a\nunsaved local edit\n') // 未儲存內容→detected（不自動重載）
+    await flushPromises()
+
+    focusHandler()
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('plan_id: a\nunsaved local edit\n') // 未被覆寫
+    expect(w.find('[data-test=external-change]').text()).toBe('這個檔案在編輯器外被改動過，你的未儲存內容仍保留在編輯器裡。')
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('bump 分離：外部變更提示不出現在 bump 呈現位置', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:b0' }) // 背景檢查
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushPromises()
+
+    expect(w.find('[data-test=external-change]').exists()).toBe(true)
+    expect(w.find('[data-test=bump-error]').exists()).toBe(false)
+    expect(w.find('[data-test=bump-confirm-error]').exists()).toBe(false)
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('bump 分離（反向）：confirmBump 後端錯誤不出現在外部變更呈現位置', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    mocks.ConfirmAnalysisBaseBump.mockRejectedValue(new Error('plan: bump: token expired'))
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test=bump-error]').text()).toContain('plan: bump: token expired')
+    expect(w.find('[data-test=external-change]').exists()).toBe(false)
+    expect(w.find('[data-test=external-abort]').exists()).toBe(false)
+  })
+
+  // A1b-1 修正輪（owner review）：卸載-成功／卸載-失敗——背景讀取在途時元件卸載
+  // （B3：guard.dispose()），回應無論成功或失敗到達，都必須完全 no-op（不拋
+  // 錯、不動任何狀態）。
+  it('卸載-成功：背景讀取在途時 unmount，讀取以成功返回——不得有任何套用', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let resolveBackground: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveBackground = r })) // 背景讀取，尚未 resolve
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler() // 發出背景讀取，尚未 resolve
+    await flushPromises()
+
+    w.unmount() // B3：元件卸載，guard.dispose()
+    resolveBackground({ content: 'after unmount content', digest: 'sha256:after' }) // 卸載後才回應（成功）
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('orig') // 完全未套用
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+
+    addSpy.mockRestore()
+  })
+
+  it('卸載-失敗：背景讀取在途時 unmount，讀取以失敗返回——不得有任何套用', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let rejectBackground: (e: unknown) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise((_r, rej) => { rejectBackground = rej })) // 背景讀取，尚未 resolve
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler()
+    await flushPromises()
+
+    w.unmount()
+    rejectBackground(new Error('boom: after unmount')) // 卸載後才回應（失敗）
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('orig')
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+
+    addSpy.mockRestore()
+  })
+
+  // 修正 2（正確性缺口）：loadFile 重載同一檔案時呼叫 guard.invalidateBackground()，
+  // 讓此前在途的背景讀取立即失效。刻意讓重載後的內容／digest 與重載前完全相同，
+  // 使 B4（基準版本比對）本身不會擋下這次過期回應——若沒有世代失效，B2／B3／B4
+  // 全部符合，回應就會被誤套用；能被擋下必須是靠世代失效（B1），藉此證明
+  // loadFile 真的呼叫了 invalidateBackground()。
+  it('load 交錯：背景讀取在途→觸發重載（loadFile）→背景讀取返回不得套用、不得出現外部變更提示（涵蓋 loadFile 已結束、busy 已清之後回應才到）', async () => {
+    mocks.PlanList.mockResolvedValue([{ name: 'a.yaml', path: 'plan/a.yaml' }])
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    let resolveBackground: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveBackground = r })) // 背景讀取，尚未 resolve
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // 重載：內容／digest 與重載前相同
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler() // 發出背景讀取，尚未 resolve
+    await flushPromises()
+
+    const aButton = w.findAll('button').find(b => b.text() === 'a.yaml')
+    expect(aButton).toBeTruthy()
+    await aButton!.trigger('click') // selectFile → loadFile 重載同一檔（不 dirty，直接重載）
+    await flushEditor() // loadFile 已完整跑完，busy 已清——這時背景讀取仍未 resolve
+    expect(w.attributes('data-busy')).toBe('') // 前提：loadFile 已結束、busy 已清
+
+    resolveBackground({ content: 'externally changed while reloading', digest: 'sha256:ext' }) // 背景讀取現在才回應
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('orig') // 未被套用
+    expect(usePlan().savedContent).toBe('orig')
+    expect(usePlan().currentDigest).toBe('sha256:a0')
+    expect(w.find('[data-test=external-change]').exists()).toBe(false)
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  // 修正 2（正確性缺口）：confirmBump 只改 buffer、不改寫入基準——B4 擋不住它
+  // 造成的錯位，只能靠世代失效擋下。背景讀取回應的 digest 刻意設為與目前寫入
+  // 基準相同（bump 不改 digest），證明「不套用」是世代失效的效果，不是巧合。
+  it('bump 交錯：背景讀取在途→confirmBump 完成使 buffer 改變但寫入基準未變→背景讀取返回不得套用（證明 B4 擋不住、由世代失效擋下）', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValueOnce({ content: bufferText, digest: 'sha256:stub' }) // mount
+    let resolveBackground: (v: { content: string; digest: string }) => void = () => {}
+    mocks.PlanRead.mockImplementationOnce(() => new Promise(r => { resolveBackground = r })) // 背景讀取，尚未 resolve
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    const updated = 'plan_id: a\nanalysis_base_commit: "head111"\n'
+    mocks.ConfirmAnalysisBaseBump.mockResolvedValue(updated)
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    focusHandler() // 發出背景讀取，尚未 resolve
+    await flushPromises()
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // confirmBump：invalidateBackground＋busy='bump'
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe(updated) // buffer 已被 bump 取代
+    expect(usePlan().currentDigest).toBe('sha256:stub') // 寫入基準未變——B4 本身擋不住
+    expect(w.attributes('data-busy')).toBe('') // bump 已完成
+
+    // ★ 鑑別性關鍵（controller 修正）：回應的 digest 必須**不同於**目前基準，套用
+    // 才會產生可觀察的後果（bump 後 buffer≠savedContent＝dirty，套用會顯示
+    // externalChange.detected）。原版用與基準相同的 digest，套用路徑會走「已同步→
+    // 靜默清除」分支、什麼都不改，三條斷言在套用與否之下皆成立——測試空轉，
+    // 移除 confirmBump 的 invalidateBackground() 也不會紅（實測 N5 存活）。
+    // 同時 stamp 的基準（'sha256:stub'）與目前基準相同，**B4 仍然通過**，
+    // 所以擋下來的必然是世代失效。
+    resolveBackground({ content: 'disk content probed before bump', digest: 'sha256:OTHER' })
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe(updated) // 未被套用（buffer 仍是 bump 後內容）
+    expect(usePlan().savedContent).toBe(bufferText) // 未落地——confirmBump 本不落地
+    expect(w.find('[data-test=external-change]').exists()).toBe(false) // 未顯示外部變更提示
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  it('bump 期間不發出：busy=\'bump\' 期間觸發 focus，不得發出新的背景讀取（PlanRead 呼叫次數不增加）', async () => {
+    const bufferText = 'plan_id: a\nanalysis_base_commit: "old000"\n'
+    const bumpPreview = {
+      token: { plan_rel: 'plan/a.yaml', old: 'old000', head: 'head111', buffer_digest: 'digest1' },
+      old: 'old000', head: 'head111', commits: [], touched_files: [], no_bump_needed: false,
+    }
+    mocks.PlanRead.mockResolvedValue({ content: bufferText, digest: 'sha256:stub' })
+    mocks.PreviewAnalysisBaseBump.mockResolvedValue(bumpPreview)
+    let resolveConfirm: (v: string) => void = () => {}
+    mocks.ConfirmAnalysisBaseBump.mockImplementation(() => new Promise<string>(r => { resolveConfirm = r }))
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy)
+
+    await w.find('[data-test=bump-toggle]').trigger('click')
+    await w.find('[data-test=bump-confirm]').trigger('click') // busy='bump'，ConfirmAnalysisBaseBump 尚未 resolve
+    await flushPromises()
+    expect(w.attributes('data-busy')).toBe('bump')
+
+    const readCallsBeforeFocus = mocks.PlanRead.mock.calls.length
+    focusHandler()
+    await flushPromises()
+    expect(mocks.PlanRead.mock.calls.length).toBe(readCallsBeforeFocus) // busy='bump' 期間一律不發出背景讀取
+
+    resolveConfirm('plan_id: a\nanalysis_base_commit: "head111"\n')
+    await flushPromises()
+
+    w.unmount()
+    addSpy.mockRestore()
+  })
+
+  // 中止訊息清除（與 Spec 側統一）：(a) 新寫入開始時先清掉舊 abort 訊息；
+  // (b) 切檔（loadFile 路徑）不殘留。
+  it('中止訊息清除 (a)：abort 產生後再次發起寫入，abort 訊息在新寫入開始時先被清掉', async () => {
+    mocks.PlanRead
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+      .mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:b0' }) // 第一次 save 預檢：外部已變更→中止
+      .mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // 第二次 save 預檢：這次未變更
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    typeText(getView(w), 'edited content')
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=external-abort]').exists()).toBe(true) // 已產生 abort 訊息
+
+    await w.find('[data-test=save]').trigger('click') // 再次發起寫入
+    // saveFile 開頭同步清空 externalAbortMessage，不必等這次結果就已清掉
+    expect(w.find('[data-test=external-abort]').exists()).toBe(false)
+    await flushPromises()
+
+    expect(write).toHaveBeenCalledTimes(1) // 這次預檢通過，成功寫入
+  })
+
+  it('中止訊息清除 (b)：abort 產生後切檔，abort 訊息不殘留', async () => {
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'orig', digest: 'sha256:a0' }) // mount
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'changed on disk', digest: 'sha256:ext' }) // save 預檢：外部已變更→中止
+    const write = vi.fn().mockResolvedValue('sha256:new')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml', write } })
+    await flushEditor()
+    typeText(getView(w), 'edited content')
+    await flushPromises()
+
+    await w.find('[data-test=save]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test=external-abort]').exists()).toBe(true) // 已產生 abort 訊息
+
+    mocks.PlanRead.mockResolvedValueOnce({ content: 'b content', digest: 'sha256:b0' }) // 切檔載入
+    await w.setProps({ path: 'plan/b.yaml' }) // 切檔（watch(props.path) 路徑，內含 resetExternalChange＋loadFile）
+    await flushEditor()
+
+    expect(w.find('[data-test=external-abort]').exists()).toBe(false) // 不殘留
+  })
+  // 與 SpecWorkspace 對稱的切檔整體保護（§4.1 要求 Spec／Plan 各自覆蓋）。
+  //
+  // ★ 鑑別性範圍（勿誇大）：本案**不是** B2 的隔離證明。Plan 的正式切檔路徑
+  // （selectFile／watch(props.path)／unsavedDiscard）**全部經過 loadFile()**，
+  // 而 loadFile() 開頭即呼叫 guard.invalidateBackground() 同步推進 B1——
+  // 因此單獨移除 B2 不會使本測試失敗。B2 比較規則由模組測試
+  // externalChangeGuard.test.ts 獨立驗證；呼叫端傳入即時路徑由程式碼審查確認
+  // （PlanWorkspace.vue:240 用 effectivePath.value／plan.currentDigest，非捕捉變數）。
+  it('切檔後過期背景回應不得套用——A 的回應在切到 B 之後才返回', async () => {
+    let resolveBg: (v: { content: string; digest: string }) => void = () => {}
+    let bgIssued = false
+    mocks.PlanRead
+      .mockResolvedValueOnce({ content: 'same', digest: 'sha256:same' }) // mount 載入 a
+      .mockImplementationOnce(() => new Promise(res => { bgIssued = true; resolveBg = res })) // 背景檢查（延遲）
+      .mockResolvedValueOnce({ content: 'same', digest: 'sha256:same' }) // 切檔後載入 b
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const w = mountWithI18n(PlanWorkspace, { props: { path: 'plan/a.yaml' } })
+    await flushEditor()
+    const focusHandler = getFocusHandler(addSpy) // 內含「handler 必須存在」的斷言
+
+    focusHandler()
+    await flushPromises()
+    expect(bgIssued, '背景讀取必須確實已發出').toBe(true)
+    const readsBeforeSwitch = mocks.PlanRead.mock.calls.length
+
+    await w.setProps({ path: 'plan/b.yaml' }) // 期間切檔
+    await flushPromises()
+    expect(usePlan().currentContent).toBe('same')
+    // 回應確實延遲到切檔完成之後：切檔已觸發自己的讀取，A 的背景讀取仍未 resolve
+    expect(mocks.PlanRead.mock.calls.length).toBeGreaterThan(readsBeforeSwitch)
+
+    resolveBg({ content: 'DISK CONTENT OF FILE A', digest: 'sha256:changed' }) // a 的舊回應現在才到
+    await flushPromises()
+
+    expect(usePlan().currentContent).toBe('same') // 不得被套用到 b
+    expect(usePlan().currentDigest).toBe('sha256:same') // 寫入基準亦不得被改
+    expect(w.find('[data-test=external-change]').exists()).toBe(false) // 不得對 b 發出變更提示
+
+    w.unmount()
+  })
 })
