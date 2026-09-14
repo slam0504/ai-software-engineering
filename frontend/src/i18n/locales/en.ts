@@ -424,6 +424,22 @@ export default {
     writeAborted: 'This file was changed outside the editor. The save was aborted and nothing was written; your edits and the write baseline are unchanged.',
     readFailed: 'Could not read this file to check for external changes: {error}',
     deleted: 'This file no longer exists on disk. The editor content is unchanged.',
+    // A1b-2 Phase 1: text for the three-way choice row and side-by-side compare
+    // (components: ExternalChangeChoice.vue / ExternalChangeCompare.vue).
+    // Wiring is done in Phase 2.
+    choice: {
+      reload: 'Reload from disk',
+      compare: 'Compare',
+      keep: 'Keep local',
+    },
+    compare: {
+      left: 'Current editor content (captured at {time})',
+      right: 'Disk content (read at {time})',
+      rightLoading: 'Reading disk content…',
+      rightFailed: 'Could not read the disk content: {error}. Your edits are unchanged.',
+      close: 'Close comparison',
+    },
+    reloadKeptNewInput: 'You edited the file after choosing Reload, so it was not reloaded to avoid discarding your new input.',
   },
   bump: {
     banner: {

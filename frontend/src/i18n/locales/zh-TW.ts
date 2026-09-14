@@ -423,6 +423,21 @@ export default {
     writeAborted: '這個檔案在編輯器外被改動過，本次儲存已中止，未寫入任何內容；你的編輯內容與寫入基準都保持不變。',
     readFailed: '無法讀取這個檔案以確認是否被外部改動：{error}',
     deleted: '這個檔案在磁碟上已不存在；編輯器內容保持不變。',
+    // A1b-2 Phase 1：三選一按鈕列與並列比較的文字（元件見
+    // ExternalChangeChoice.vue／ExternalChangeCompare.vue）。接線由 Phase 2 完成。
+    choice: {
+      reload: '重新載入',
+      compare: '比較',
+      keep: '保留本地',
+    },
+    compare: {
+      left: '目前編輯器內容（擷取於 {time}）',
+      right: '磁碟內容（讀取於 {time}）',
+      rightLoading: '正在讀取磁碟內容…',
+      rightFailed: '無法讀取磁碟內容：{error}。你的編輯內容保持不變。',
+      close: '關閉比較',
+    },
+    reloadKeptNewInput: '按下重新載入後你又修改了內容，為避免捨棄新的輸入，這次沒有重新載入。',
   },
   bump: {
     banner: {

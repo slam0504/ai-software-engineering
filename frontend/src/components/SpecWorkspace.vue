@@ -11,6 +11,8 @@ import { extractGherkin } from '../lib/gherkin'
 import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
 import { isWriteConflict } from '../lib/writeConflict'
 import { createExternalChangeGuard, shouldApplyBackground, type SyncState } from '../lib/externalChangeGuard'
+import ExternalChangeChoice from './ExternalChangeChoice.vue'
+import ExternalChangeCompare from './ExternalChangeCompare.vue'
 
 const { t } = useI18n()
 
@@ -116,11 +118,37 @@ let syncState: SyncState = 'unknown'
 // 取得焦點／寫入前）一律無條件重讀並比對 digest，不靠任何事件訂閱標記閘控
 // （沒有消費端的旗標不留——修正輪 owner 裁定）。
 const externalChangeNotice = ref('')
+// externalChangeClass：F1 修正（J4）——external-change 過去固定 class="notice"，
+// 導致讀取失敗／已刪除也顯示為淡色。依訊息類別分流：notice／detected／
+// reloadKeptNewInput 是資訊（notice），readFailed／deleted 是錯誤（err）。
+const externalChangeClass = ref<'notice' | 'err'>('notice')
 // externalAbortMessage：寫入前檢查（saveFile／acceptDraft）中止本次寫入的
 // 原因——writeAborted（偵測到外部變更）或 readFailed／deleted（預檢讀取失敗）。
 // 與 externalChangeNotice（背景檢查結果）分開呈現，兩者互不覆寫；save-error／
 // accept-error 只保留給 writer 真的被呼叫後才失敗的情況（含後端 digest 衝突）。
 const externalAbortMessage = ref('')
+
+// A1b-2（J1）：三選一是否顯示——背景 detected 與前景 writeAborted 兩處都會打開；
+// 讀取失敗／已刪除不打開。新操作開始（saveFile／acceptDraft／loadFile）時關閉，
+// 對應訊息一併清除的同一時機。
+const showChoice = ref(false)
+// reloadInProgress：重新載入進行中——只用來讓三選一按鈕 disabled，避免重複點擊
+// （§2.4.4 明確 reload 要求）。★ 刻意不進 busyReason／setEditable(false)：
+// 一旦設 busy='load' 編輯器會變不可編輯，使用者就不可能在點擊重新載入後續打，
+// §2.4「點擊後新增的輸入」的捨棄範圍判斷會變成不可能發生的情境。
+const reloadInProgress = ref(false)
+
+// A1b-2（J3）：比較（compare）唯讀並列兩欄狀態。左欄在開啟當下凍結、右欄在
+// 開啟時重新讀取磁碟後凍結；compareGen 是比較世代——只用來讓「關閉後又重新
+// 開啟」時舊的讀取回應不會填進新的比較（不影響 guard 的背景世代）。
+const showCompare = ref(false)
+const compareLeft = ref('')
+const compareLeftCapturedAt = ref<Date>(new Date())
+const compareRight = ref<string | null>(null)
+const compareRightCapturedAt = ref<Date | null>(null)
+const compareRightError = ref('')
+const compareRightLoading = ref(false)
+let compareGen = 0
 
 // isDeletedError：以錯誤文字含 "no such file" 判定為「檔案已刪除」——對齊
 // os.ReadFile 對不存在檔案的錯誤文字（"open ...: no such file or directory"），
@@ -164,11 +192,14 @@ async function checkExternalChangeInBackground() {
     externalChangeNotice.value = isDeletedError(readErr)
       ? t('externalChange.deleted')
       : t('externalChange.readFailed', { error: String(readErr) })
+    externalChangeClass.value = 'err' // F1（J4）：讀取失敗／已刪除是錯誤類
+    showChoice.value = false // 讀取失敗／已刪除不顯示三選一（J1）
     return
   }
   if (disk!.digest === fileDigest.value) {
     syncState = 'insync'
     externalChangeNotice.value = '' // 已同步：靜默清除標記
+    showChoice.value = false // 已同步，不再有可供選擇的外部變更
     return
   }
   syncState = 'diverged'
@@ -180,9 +211,13 @@ async function checkExternalChangeInBackground() {
     syncEditorDoc()
     syncState = 'insync' // 已依磁碟內容重載，基準重新與磁碟相符
     externalChangeNotice.value = t('externalChange.notice')
+    externalChangeClass.value = 'notice' // F1（J4）：資訊類
+    showChoice.value = false // 已自動重載，沒有需要選擇的東西
   } else {
-    // 當下有未儲存內容 → 不覆寫，僅提示（三選一屬 A1b-2，本輪不做）
+    // 當下有未儲存內容 → 不覆寫，僅提示＋【A1b-2】三選一（J1 背景分流）
     externalChangeNotice.value = t('externalChange.detected')
+    externalChangeClass.value = 'notice' // F1（J4）：資訊類
+    showChoice.value = true
   }
 }
 
@@ -209,7 +244,14 @@ async function loadFile() {
   // 的狀態。背景自動重載不走這裡（直接改 fileContent／savedContent／fileDigest），
   // 所以它設的 notice 不會被這行清掉。
   externalChangeNotice.value = ''
+  externalChangeClass.value = 'notice'
   externalAbortMessage.value = ''
+  // A1b-2（重設時機）：三選一、比較及其暫存狀態隨切檔／重載一併重設——上一個
+  // 檔的選擇畫面不得殘留在新檔上。compareGen 遞增讓任何在途的舊比較右欄讀取
+  // 之後被判定為過期，即使已被 showCompare=false 擋住也不留隱患。
+  showChoice.value = false
+  showCompare.value = false
+  compareGen += 1
   if (!effectivePath.value) return
   const gen = ++loadGen
   busyReason.value = 'load'
@@ -400,6 +442,8 @@ async function acceptDraft() {
   if (busyReason.value !== '') return
   acceptError.value = ''
   externalAbortMessage.value = '' // 新操作開始，清掉上次中止提示（修正輪修正 2）
+  showChoice.value = false // A1b-2（重設時機）：新的寫入操作開始，對應的三選一也關閉
+  showCompare.value = false
   const writer = props.write ?? SpecWrite
   fileContent.value = extractGherkin(draftText.value)
   syncEditorDoc()
@@ -429,6 +473,7 @@ async function acceptDraft() {
     if (disk!.digest !== P.digest) {
       // 磁碟已被外部改動——一律中止，不看當下 dirty，不呼叫 writer，保留三者
       externalAbortMessage.value = t('externalChange.writeAborted')
+      showChoice.value = true // 【A1b-2】前景中止在中止提示上加三選一（J1）
       return
     }
 
@@ -457,6 +502,8 @@ async function saveFile() {
   saveError.value = '' // A2：新操作開始清同類舊 transient error（與 acceptDraft 一致）
   saveConflict.value = false
   externalAbortMessage.value = '' // 新操作開始，清掉上次中止提示（修正輪修正 2）
+  showChoice.value = false // A1b-2（重設時機）：新的寫入操作開始，對應的三選一也關閉
+  showCompare.value = false
   const writer = props.write ?? SpecWrite
   const P = { path: effectivePath.value, content: fileContent.value, digest: fileDigest.value }
   // A1b-1：取得前景所有權（同 acceptDraft，理由見該處註解）。
@@ -480,6 +527,7 @@ async function saveFile() {
     if (disk!.digest !== P.digest) {
       // 磁碟已被外部改動——一律中止，不看當下 dirty，不呼叫 writer，保留三者
       externalAbortMessage.value = t('externalChange.writeAborted')
+      showChoice.value = true // 【A1b-2】前景中止在中止提示上加三選一（J1）
       return
     }
 
@@ -497,6 +545,112 @@ async function saveFile() {
     guard.release(token)
     busyReason.value = ''
   }
+}
+
+// A1b-2（§2.6「保留本地」）：保留編輯內容，fileDigest 不變、不呼叫 writer；只
+// 關閉提示（清掉 detected／writeAborted 訊息、隱藏三選一與比較），操作結束。
+// 狀態維持「已分歧」——不特別改動任何基準，之後再按儲存時，寫入前檢查會用
+// 同一個 fileDigest 重新核對，磁碟仍不符就會再次中止（不暗中續寫）。
+function onChoiceKeep() {
+  externalChangeNotice.value = ''
+  externalAbortMessage.value = ''
+  showChoice.value = false
+  showCompare.value = false
+}
+
+// A1b-2（J2、§2.4 明確 reload 的額外要求）：重新載入。點擊當下凍結「使用者已
+// 同意捨棄的 buffer 快照」與目前路徑，取得前景所有權（涵蓋此前在途背景讀取
+// 失效，享有 C1／C3 同等保護），無條件重新讀取磁碟（不套用任何先前讀到的
+// 快照）。回應到達時若已失去所有權／guard 已卸載／路徑已變，三者完全不改動；
+// 若 buffer 已不等於點擊當下凍結的快照（點擊後又打字），不得捨棄新輸入，改為
+// 顯示 reloadKeptNewInput 並讓三選一維持開啟，供使用者重新選擇。
+// ★ 刻意不設 busyReason='load'：編輯器必須維持可編輯，見 reloadInProgress 宣告
+// 處的說明。
+async function onChoiceReload() {
+  const path = effectivePath.value
+  if (!path) return
+  const frozenSnapshot = fileContent.value // 已同意捨棄的 buffer 快照
+  const token = guard.acquire()
+  reloadInProgress.value = true
+  try {
+    let disk: { content: string; digest: string } | null = null
+    let readErr: unknown = null
+    try {
+      disk = await SpecRead(path) // 重新讀取磁碟——不得套用提示當時讀到的任何快照
+    } catch (e) {
+      readErr = e
+    }
+    if (!guard.isOwner(token) || !guard.isActive() || effectivePath.value !== path) return // 完全不改狀態
+
+    if (readErr !== null) {
+      externalChangeNotice.value = isDeletedError(readErr)
+        ? t('externalChange.deleted')
+        : t('externalChange.readFailed', { error: String(readErr) })
+      externalChangeClass.value = 'err' // F1（J4）：錯誤類
+      return // 三者不變；三選一維持開啟
+    }
+
+    if (fileContent.value !== frozenSnapshot) {
+      // 點擊後、回應前使用者又打字——不得套用磁碟內容，也不得捨棄新增的輸入，
+      // 須重新提示讓使用者再選一次。
+      externalChangeNotice.value = t('externalChange.reloadKeptNewInput')
+      externalChangeClass.value = 'notice' // F1（J4）：資訊類
+      return // 三選一維持開啟
+    }
+
+    fileContent.value = disk!.content
+    savedContent.value = disk!.content
+    fileDigest.value = disk!.digest
+    syncEditorDoc()
+    externalChangeNotice.value = ''
+    externalAbortMessage.value = ''
+    showChoice.value = false
+    showCompare.value = false
+  } finally {
+    guard.release(token)
+    reloadInProgress.value = false
+  }
+}
+
+// A1b-2（J3、§2.9）：比較。開啟當下凍結左欄（目前 buffer），並在開啟時重新
+// 讀取磁碟填右欄——不 acquire()：比較只讀、不改任何基準。compareGen 讓「關閉
+// 後又重新開啟」時舊的讀取回應不會填進新的比較；guard.isActive()／路徑未變／
+// showCompare 仍為開／世代相符四項皆須通過才套用，任一不符即完全丟棄（不沿用
+// 任何舊內容）。
+async function onChoiceCompare() {
+  const path = effectivePath.value
+  const myGen = ++compareGen
+  compareLeft.value = fileContent.value
+  compareLeftCapturedAt.value = new Date()
+  compareRight.value = null
+  compareRightCapturedAt.value = null
+  compareRightError.value = ''
+  compareRightLoading.value = true
+  showCompare.value = true
+  if (!path) {
+    compareRightLoading.value = false
+    return
+  }
+  const stillValid = () => guard.isActive() && effectivePath.value === path && showCompare.value && myGen === compareGen
+  try {
+    const disk = await SpecRead(path)
+    if (!stillValid()) return
+    compareRight.value = disk.content
+    compareRightCapturedAt.value = new Date()
+    compareRightError.value = ''
+  } catch (e) {
+    if (!stillValid()) return
+    compareRightError.value = String(e) // 讀取失敗：保留本地內容並顯示失敗，不沿用任何舊內容
+    compareRight.value = null
+    compareRightCapturedAt.value = null
+  } finally {
+    if (stillValid()) compareRightLoading.value = false
+  }
+}
+
+// 關閉比較：回到三選一；唯讀操作，不改 fileContent／savedContent／fileDigest。
+function closeCompareView() {
+  showCompare.value = false
 }
 
 async function submitForApproval() {
@@ -564,13 +718,26 @@ async function confirmCommit() {
       :data-editing-suspended="busyReason === 'load' ? 'true' : undefined"
     />
     <p v-if="loadError" class="err">{{ loadError }}</p>
-    <p v-if="externalChangeNotice" class="notice" data-test="external-change">{{ externalChangeNotice }}</p>
+    <p v-if="externalChangeNotice" :class="externalChangeClass" data-test="external-change">{{ externalChangeNotice }}</p>
     <!-- A1b-1：外部檔案變更——external-change 是背景檢查（視窗聚焦）結果；
          external-abort 是寫入前檢查（saveFile／acceptDraft）中止本次寫入的原因
          （含預檢讀取失敗／檔案已刪除），與 save-error／accept-error（writer 真的
          被呼叫後才失敗）互不覆寫（修正輪修正 2，比照 PlanWorkspace 的
          externalAbortMessage）。 -->
     <p v-if="externalAbortMessage" class="err" data-test="external-abort">{{ externalAbortMessage }}</p>
+    <!-- A1b-2：三選一疊在上面兩則訊息旁（J1）；比較開啟時暫代三選一，關閉後
+         回到三選一。兩者共用元件不含任何讀寫邏輯，接線全在本檔。 -->
+    <ExternalChangeChoice
+      v-if="showChoice && !showCompare" :disabled="reloadInProgress"
+      @reload="onChoiceReload" @compare="onChoiceCompare" @keep="onChoiceKeep"
+    />
+    <ExternalChangeCompare
+      v-if="showCompare"
+      :left="compareLeft" :left-captured-at="compareLeftCapturedAt"
+      :right="compareRight" :right-captured-at="compareRightCapturedAt"
+      :right-error="compareRightError" :right-loading="compareRightLoading"
+      @close="closeCompareView"
+    />
 
     <div v-if="pendingPath" class="unsaved-guard" data-test="unsaved-guard">
       <p>{{ t('unsaved.message') }}</p>
