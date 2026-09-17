@@ -91,9 +91,10 @@ func runWailsUI(app *App) int { return runInstance(app, wailsUI, os.Stderr) }
 
 func wailsUI(app *App) error {
 	return wails.Run(&options.App{
-		Title:  "sdlc-workbench",
-		Width:  1024,
-		Height: 768,
+		Title:       "sdlc-workbench",
+		Width:       1024,
+		Height:      768,
+		StartHidden: e2eStartHidden(),
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
@@ -104,6 +105,23 @@ func wailsUI(app *App) error {
 			app,
 		},
 	})
+}
+
+// e2eStartHidden：E2E harness 專用旗標，只由測試啟動器設定（見
+// frontend/e2e/support/processTree.ts 的 spawnWailsDev），一般開發／正式
+// 使用不會設這個環境變數，維持現行行為（正常開窗）。
+//
+// 背景：Wails v2.13 的 `options.App` 沒有視窗座標或目標螢幕欄位可用（已在
+// 本機模組快取的 `pkg/options/options.go` 確認過），雙螢幕環境下每次啟動
+// `wails dev` 開的原生視窗都會跳到當下使用中的螢幕、干擾作業。改用
+// `StartHidden` 這個既有欄位處理。
+//
+// 注意：`StartHidden` 只是隱藏視窗，不是不建立視窗；官方文件與程式碼都沒有
+// 保證隱藏時不會搶焦點（macOS 端目前仍會呼叫
+// `activateIgnoringOtherApps:YES`）——是否真的不搶焦點需要實測記錄，不能
+// 假設「有加這個旗標＝問題解決」。
+func e2eStartHidden() bool {
+	return os.Getenv("WORKBENCH_E2E_START_HIDDEN") == "1"
 }
 
 // alreadyRunningMessage：拒絕 UX 的主文。要能讓使用者一眼知道三件事——已經有

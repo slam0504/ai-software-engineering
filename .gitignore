@@ -26,3 +26,7 @@ tools/codex-cli/node_modules/
 
 # 本機 agent tooling state（serena LSP cache）
 .serena/
+
+# --- B3a-1 Browser E2E（§2.9 證據目錄）---
+frontend/e2e/.artifacts/*
+!frontend/e2e/.artifacts/.gitkeep
