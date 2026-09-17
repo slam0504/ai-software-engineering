@@ -1,0 +1,13 @@
+(version 1)
+; B3a-1 E2E offline 驗證模式：只允許 loopback 對外連線的 sandbox profile。
+; 除了網路之外全部沿用預設允許（不限制檔案系統／行程操作，只限制網路對外
+; 連線這一件事），避免影響 wails dev／go build／npm／Vite／Chrome 的其餘
+; 正常運作。
+;
+; 已知限制（reviewer 複核 #34 第六次，2026-09-16 實測確認）：macOS
+; sandbox-exec 的 (remote ip "host:port") 只接受 host 部分是 `*` 或
+; `localhost`（帶字面 IP 如 127.0.0.1 會被 sandbox-exec 本身拒絕）——所以
+; 只能先整體擋，再對 localhost 單獨放行。
+(allow default)
+(deny network-outbound (remote ip "*:*"))
+(allow network-outbound (remote ip "localhost:*"))

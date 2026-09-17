@@ -710,7 +710,7 @@ async function confirmCommit() {
 
     <div class="files">
       <button v-for="f in files" :key="f.path" :class="{ active: f.path === effectivePath }"
-        @click="selectFile(f.path)">{{ f.name }}</button>
+        :data-test="'file-tree-' + f.path" @click="selectFile(f.path)">{{ f.name }}</button>
     </div>
 
     <div

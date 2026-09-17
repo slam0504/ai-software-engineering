@@ -392,7 +392,7 @@ onMounted(async () => {
         <nav>
           <button :class="{ active: tab === 'chat' }" @click="switchTab('chat')">{{ t('app.tab.chat') }}</button>
           <button :class="{ active: tab === 'preview' }" @click="switchTab('preview')">{{ t('app.tab.preview') }}</button>
-          <button :class="{ active: tab === 'spec' }" @click="switchTab('spec')">{{ t('app.tab.spec') }}</button>
+          <button :class="{ active: tab === 'spec' }" data-test="tab-spec" @click="switchTab('spec')">{{ t('app.tab.spec') }}</button>
           <button :class="{ active: tab === 'plan' }" @click="switchTab('plan')">{{ t('app.tab.plan') }}</button>
           <button :class="{ active: tab === 'diagram' }" @click="switchTab('diagram')">{{ t('app.tab.diagram') }}</button>
           <button :class="{ active: tab === 'dag' }" @click="switchTab('dag')">{{ t('app.tab.dag') }}</button>

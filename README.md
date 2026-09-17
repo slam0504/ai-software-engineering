@@ -158,6 +158,171 @@ go test -race ./... -count=1                            # CI job: go — 所有 
 > 這八條紅燈**先分類**（命中契約斷言或契約路徑卡死＝回歸，不得單獨重跑吸收；setup／資源失效＝該次無效並揭露），
 > 其他前端測試依同文件 B 段的一般規則。`docs/spikes/m3b-results.md` §7 為 2026-08-21 的歷史觀察，§7.1 為處置快照。
 
+### Browser E2E（B3a-1）
+
+用真實 `wails dev`＋系統 Chrome 跑一條端到端 smoke（規格分頁 → 開檔 → 編輯 → 存檔 → 核對磁碟），
+涵蓋 Vue UI、Go backend、Wails 開發伺服器的 IPC 與事件；不呼叫真的 claude／codex（用 tripwire 型
+假 CLI）。**只是本機開發用的驗證入口，目前不是 CI 的一部分**（CI 可行性另立票）。
+
+**與 native GUI 驗收的界線**：Browser E2E 不涵蓋 WKWebView 渲染、native window、打包後的
+`.app`（`tools: bundle`）與 macOS 權限（TCC）。**E2E 通過不代表 native GUI 驗收通過**，兩者是
+不同的驗證面。
+
+```bash
+npm --prefix frontend ci                          # 準備階段（可用外部網路）：安裝相依套件
+npm --prefix frontend run test:e2e                # 執行階段（設計上不需外部網路）：跑一次 smoke
+E2E_KEEP_ARTIFACTS=1 npm --prefix frontend run test:e2e   # 成功也保留證據目錄
+E2E_BROWSER=chromium npm --prefix frontend run test:e2e   # 改用 Playwright 內建 Chromium
+                                                            # （需先 `npx playwright install chromium`）
+npm --prefix frontend run test:e2e:controls        # 存檔判定受控對照（對照 A／B，見 §2.5）
+```
+
+- **證據目錄**：`frontend/e2e/.artifacts/<run-id>/`（已加入 `.gitignore`）。成功預設清除，失敗一律
+  保留並在終端機印出路徑。內容包含 `harness.log`（預檢第一步就開始寫，啟動失敗也一定有）、
+  `wails-dev.log`、`invocations.log`／`preflight-invocations.log`（假 CLI 呼叫紀錄）、
+  `network-samples.log`（每秒一次的 `lsof` 取樣，含分類標頭：wails／app／viteNode／chrome／
+  selfTool／other）、`browser-network-violations.log`（browser 層 HTTP／WebSocket 攔截違規）、
+  `chrome-argv.txt`（Chrome 主程序實際完整命令列，取自 `ps`，不是猜測）、`run-state.json`（追蹤到
+  的自家程序樹，含 `observationFailures`）、`artifact-integrity-baseline.json`（執行前的受版控產物
+  內容快照，見下方「受版控產物執行前後檢查」）、fixture 的 `fixture-git-log.txt`／
+  `fixture-git-status.txt`／`glossary-final-content.md`，以及 Playwright 自己的 `playwright/`
+  （trace／screenshot，只在失敗時保留）。
+- **執行期環境變數**：對 `wails dev` 設 `WORKBENCH_WORKSPACE`／`WORKBENCH_TOOLS_DIR`（指向本次
+  執行的隔離 fixture 與假 CLI 目錄）、`GOFLAGS=-mod=readonly`（取代會改寫 go.mod 的
+  `-mod=mod`）、`GOPROXY=off`、`npm_config_offline=true`；已驗證與 `wails dev`（含其內部的
+  `go mod tidy` 步驟）相容，前提是 `go.mod`／`go.sum`／`node_modules` 在準備階段就已經是最新、
+  齊全的狀態（這幾項只是讓已知的下載路徑明確失敗的輔助設定，不等於完整網路隔離）。也會帶
+  `WORKBENCH_E2E_START_HIDDEN=1`（見下方「原生視窗隱藏（StartHidden）」）。
+- **原生視窗隱藏（StartHidden）**：owner 有雙螢幕，每次 E2E 啟動 `wails dev` 都會開出原生視窗並
+  跳到當下使用中的螢幕、干擾作業。`main.go` 的 `e2eStartHidden()` 讀取
+  `WORKBENCH_E2E_START_HIDDEN`（值必須恰好是 `"1"` 才啟用），只由 E2E 測試啟動器
+  （`frontend/e2e/support/processTree.ts` 的 `spawnWailsDev`）帶入這個環境變數給 `wails dev` 子
+  程序；一般開發／正式使用不會設這個變數，維持現行行為（正常開窗）。
+  - **已知限制（照實記錄，不誇大）**：`StartHidden` 只是不顯示視窗，**不是不建立視窗**。macOS 端
+    `AppDelegate.applicationDidFinishLaunching` 仍然無條件呼叫
+    `[NSApp activateIgnoringOtherApps:YES]`（已在本機模組快取
+    `~/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/AppDelegate.m:54`
+    確認，這個呼叫沒有被 `startHidden` 條件包住）——**不能假設隱藏視窗＝不搶焦點**，兩者是不同的事。
+    實測（`frontend/e2e/.artifacts/20260916T040406Z-ce1219/`，hidden 模式）觀察到：`sdlc-workbench`
+    行程存在、`System Events` 讀到的視窗數為 0（視窗確實沒有顯示）；同一次執行前後用
+    `osascript` 讀取 frontmost app 皆為原本的前景 App，沒有觀察到切換。**這只是單一時間點的
+    事後觀察，不是連續監控**，無法排除呼叫本身仍有觸發但极短暫、或本機視窗伺服器行為與一般互動
+    桌面環境不同——因此只能記錄「這次觀察到視窗未顯示、frontmost 表面上沒有變」，**不能寫成
+    「已解決搶焦點」**。若之後仍觀察到搶焦點，這是已知、documented 的限制，不在本次修改範圍內
+    解決。
+  - `E2E_VERIFY_NO_START_HIDDEN=1`（測試專用旗標，非一般用途）：驗證「未設定
+    `WORKBENCH_E2E_START_HIDDEN`＝維持正常開窗」這條路徑，harness 連 `process.env` 繼承的同名
+    變數都會清掉，確保子程序的 env 裡真的沒有這個變數。實測
+    （`frontend/e2e/.artifacts/20260916T041425Z-7623ce/`）：`sdlc-workbench` 視窗數為 1（正常
+    開窗），完整存檔 smoke 通過，收尾正常。
+- **網路判定分兩層**：
+  1. **程序取樣**（`network-samples.log`）：每秒對自家程序樹（wails／app／vite／已辨識的
+     Chrome）跑一次 `lsof`。已辨識為本次 Playwright 啟動的 Chrome 的非 loopback 連線只記錄為
+     診斷（不計入失敗判定，因為系統 Chrome 本身會有少量背景服務連線）；其他來源一律嚴格判定。
+  2. **browser 層攔截**（`browser-network-violations.log`）：在任何 `page.goto` 之前對
+     `BrowserContext` 安裝 `route`／`routeWebSocket`，非 loopback 一律攔下並讓整次執行失敗，
+     loopback（Wails／Vite 用得到）維持真實連線透通轉發。Service Worker 用
+     `use.serviceWorkers: 'block'` 關掉，避免繞過這兩層攔截。
+  - `sandbox-exec` 全程阻斷外網的單次驗證仍未執行（見下方已知限制）。
+- **受版控產物執行前後檢查**：啟動前預檢的第 5 步（`預檢 5/5`）與收尾判定都會核對
+  `frontend/wailsjs/**`（受版控的部分）、`go.mod`、`go.sum`、`frontend/package.json`、
+  `frontend/package-lock.json`、`frontend/package.json.md5` 這幾個檔案：
+  - **mode**：一律跟 HEAD 記錄的 mode 比（git 只存 644／755 兩種）——不管內容有沒有跟 HEAD 不同，
+    mode 意外變動永遠是錯的。`wails dev` 重新產生 bindings／runtime 時偶爾會把
+    `frontend/wailsjs/runtime/` 這三個檔案的 mode 從 644 改成 755（內容不變）；一旦偵測到，預檢
+    直接失敗、不啟動 app；收尾也會再核對一次。**不在 teardown 自動還原**——這是修改受版控檔案的
+    行為，還原與否需要人工核對後决定。
+  - **內容**：只比對「這次執行前」跟「這次執行後」是否相同（不是跟 HEAD 比，因為
+    `frontend/package.json`／`package-lock.json`／`package.json.md5` 本來就可能是這張票自己的正當
+    改動）——執行本身不該去動這些檔案的內容。
+  - 執行前的內容快照落地成 `artifact-integrity-baseline.json`；任何違規都完整記在 `harness.log`。
+- **負控制注入點**：
+
+  | 環境變數 | 對應負控制 | 行為 |
+  |---|---|---|
+  | `E2E_STARTUP_TIMEOUT_MS` | N7 | 覆寫啟動逾時上限（預設 300000） |
+  | `E2E_FAKE_CLI_BAD_VERSION_AFTER_PREFLIGHT=1` | N5 | 通過啟動前預檢之後，假 CLI 才開始回不符版本 |
+  | `E2E_FORCE_FAIL_BEFORE_READY=1`（可搭配 `E2E_FORCE_FAIL_DELAY_MS`） | N10 | spawn 後（預設 2s，可調）強制 SIGKILL `wails dev`，模擬 ready 前失敗 |
+  | `E2E_TREAT_LOOPBACK_AS_EXTERNAL=1` | N9a | 程序取樣把 loopback 連線也算違規，用來驗證判定機制本身有作用 |
+  | `E2E_INJECT_N9B_FETCH=1` | N9b | 頁面對保留測試網域（`example.invalid`）發出 fetch，驗證 browser 層攔截 |
+  | `E2E_INJECT_N9B_WS=1` | N9b | 頁面對保留測試網域（`test.example`）開 WebSocket，驗證 browser 層攔截 |
+  | `E2E_INJECT_BAD_CLI_CALL=1` | N1 | 假 CLI 被以非 `--version` 參數呼叫 |
+  | `E2E_INJECT_DELETE_INVOCATIONS_LOG=1` | N2 | 刪除 `invocations.log` |
+  | `E2E_INJECT_MISSING_TOOLS_DIR_ENV=1` | N3 | 模擬 `WORKBENCH_TOOLS_DIR` 未設定 |
+  | `E2E_INJECT_FIXTURE_READONLY=1` | N4 | fixture 根目錄設成唯讀 |
+  | `E2E_INJECT_PS_FAILURE=1` | N12 | `ps`／`lsof` 指向永遠 exit 2 的替身，驗證觀測失敗不會被誤判成通過 |
+  | `E2E_INJECT_PS_EXIT1_STDERR=1` | N12（擴充） | `ps`／`lsof` 指向 exit 1 但印 stderr 的替身，驗證 exit 1 不會被無條件當成合法空結果 |
+  | `E2E_INJECT_IGNORE_TERM=1` | N13 | 額外啟動一個忽略 `SIGTERM` 的自家 fixture 程序，驗證會升級到 `SIGKILL` |
+  | `E2E_N10_FAKE_STARTER=1`（搭配 `E2E_FORCE_FAIL_BEFORE_READY=1`） | N10 | 用可控假啟動器取代真的 `wails dev`（永遠不 ready），讓「vite-like 後代出現、且尚未 ready」這個觸發條件變成決定性的 |
+  | `E2E_INJECT_N14A_WRITE_FAILURE=1` | N14a | 把 `browser-network-violations.log` 設成唯讀，驗證證據寫入失敗不會被靜默吞掉（worker 行程內的 in-memory 檢查會直接讓測試本體失敗） |
+  | `E2E_INJECT_N14B_DELETE_EVIDENCE=1` | N14b | 測試本體結束前刪除 `browser-network-violations.log`，驗證 globalTeardown 讀不到證據檔時不會誤判成沒有違規 |
+
+  N6（埠已被佔用）、N8（執行中收到 `SIGINT`）、N11a–c（前次殘留辨識／清理／損毀，`N11c` 涵蓋
+  state 遺失、空陣列、欄位缺失三種損毀情境）、控制組反證（`E2E_CONTROLS_REVERSE_CHECK=1`，
+  見 `frontend/e2e/controls/reverse-check.spec.ts`）不是環境變數注入，而是外部手動構造前置狀態
+  （dummy listener／`.active-run.json`＋`run-state.json`），細節見
+  `docs/superpowers/plans/2026-09-14-b3a-1-browser-e2e-design.md` §3。
+
+- **純函式 selftest（不需要真的啟動 `wails dev`，秒級完成）**：`frontend/e2e/support/*.selftest.ts`
+  用 Node 原生 TS 支援直接執行，**不放進 vitest 預設 suite**（`vitest.config.ts` 排除
+  `e2e/**`，避免跟 Playwright 專用的 harness／spec 檔混在一起）。沿用既有工具（Node 內建 TS
+  strip 支援＋內建 `node:assert/strict`），**沒有新增任何測試框架**。
+
+  ```bash
+  npm --prefix frontend run selftest:all                    # 依序跑全部 selftest（共 32 項：Q3 版本整合 4 項＋
+                                                              # F2 lsof 解析 14 項＋停止程序契約 14 項），任一失敗即中止
+  npm --prefix frontend run selftest:artifact-integrity      # Q3：受版控產物 mode／內容檢查
+  npm --prefix frontend run selftest:network-line-parser     # F2：lsof 輸出逐行解析
+  npm --prefix frontend run selftest:stop-procedure          # 停止程序契約（A1–A5＋L1，見下方）
+  ```
+
+  - **Node 版本**：本機用 `v26.8.1` 驗證過（原生 TS 型別剝除支援）。
+  - **`selftest:stop-procedure` 額外需要一個 loader**：`stopProcedure.ts` 本身用專案慣例的
+    `./foo.js` 寫法匯入其他 `.ts` 檔（給 Playwright 的 esbuild-based loader 用），純
+    `node file.ts` 不會自動把 `.js` 解回真正存在的 `.ts`。`package.json` 的 script 已經帶上
+    `--experimental-loader=./e2e/support/selftestJsToTsLoader.mjs`（只供這支 selftest
+    用的最小 resolve hook，不影響 `test:e2e`／`test:e2e:controls` 或任何正式執行路徑）；
+    這個旗標目前仍是 Node 的 experimental API，執行時會印一則警告，不影響測試結果。
+  - `stopProcedure.selftest.ts` 用 `stopProcessGroup` 的第四個參數（只供 selftest 用，正式
+    呼叫端一律不傳）注入假的 `ps` 快照與 `kill`，涵蓋：初次／等待期間身分不符或觀測不完整
+    （A1／A2／A4）、四要素身分比對含開始時間（A3）、診斷寫入失敗不中斷清理（A5）、
+    `ps` 語系造成 `lstart` 解析失敗必須 fail loud、不得誤判成「已清乾淨」（L1，含實際切換
+    `LC_ALL=zh_TW.UTF-8` 重現 reviewer 原始情境的兩項測試）、原始的「dead-root＋存活
+    escaped child」與正常路徑，共 14 項。
+  - **這不取代 `test:e2e:controls`**：`test:e2e:controls` 驗證的是存檔判定受控對照（真的啟動
+    `wails dev`），selftest 驗證的是不需要真實行程樹就能決定性重現的契約邏輯；兩者互補，
+    各自跑各自的失敗情境，不要互相取代。
+  - **負控制（N 系列）不會進預設 smoke**：`npm run test:e2e` 預設路徑不會觸發任何
+    `E2E_INJECT_*`／`E2E_FORCE_FAIL_*` 這類環境變數注入，selftest 新增也沒有改變這一點——
+    負控制／selftest 都需要明確指定對應指令或環境變數才會執行。
+
+- **E2E offline 驗證模式（`E2E_OFFLINE_SANDBOX=1`，opt-in，reviewer 授權實作，
+  2026-09-16）**：明確設這個旗標才會啟用，**預設路徑（不設這個旗標）完全不受
+  影響**。啟用時，`wails dev`／app 後代與正式系統 Chrome 後代都會被包在同一個
+  只允許 loopback 對外連線的 macOS `sandbox-exec` profile
+  （`frontend/e2e/support/sandboxProfiles/loopback-only.sb`）內；harness／
+  observer（Node 主行程本身，含它呼叫的 `ps`／`lsof`）維持在 sandbox 外——
+  這是因為 `ps` 在 sandbox 內會因為 `execvp Operation not permitted` 失效
+  （reviewer 複核 #34 第四次的實測發現），只有把 observer 放在 sandbox 外
+  才能正常追蹤與收尾。Chrome 用專用的 wrapper（`chromeWrapper.sh`，用 `exec`
+  疊上 `sandbox-exec` 再疊上正式系統 Chrome，不用字串拼接、安全處理含空白的
+  路徑），前置條件（profile／wrapper 是否存在可執行、`sandbox-exec` 是否
+  存在）在啟動前同步檢查，**不滿足就直接失敗，不會靜默回退成無 sandbox 的
+  瀏覽器**。目前只支援已驗證的系統 Chrome，`E2E_BROWSER=chromium` 搭配這個
+  模式會在啟動前明確失敗（不嘗試執行，不擴大到跨瀏覽器／跨平台）。`wails
+  dev` 在這個模式下額外帶 `-viteservertimeout 60`（reviewer 併案核准的候選
+  值，只在這個模式生效）；TERM 10s／KILL 5s／啟動逾時／埠與觀測失敗判定／
+  網路 guard／artifact 規則全部維持不變，沒有放寬。完整驗證證據見
+  `frontend/e2e/.artifacts/1b-evidence-20260916/`。
+
+- **已知限制（照實記錄，未折衷；本票尚待完成）**：
+  - `sandbox-exec` 全程阻斷外網的單次驗證（§2.7 完整隔離驗證方式）尚未執行。
+  - 預設 suite 連跑三次尚未執行（目前是多次個別執行皆通過，不是同一批連續三次）。
+  - N1–N13 的負控制皆已個別執行並確認紅在正題（過程見施工紀錄），但尚未在同一批次內完整重放
+    一次全部負控制＋一次連跑三次的最終驗收組合。
+  - Chrome 的 sandbox 設定（`chromiumSandbox`）維持 Playwright 對 `channel:'chrome'` 的預設值
+    （`false`，即帶 `--no-sandbox`），本輪未修改；`chrome-argv.txt` 留有每次執行的實際佐證。
+
 ---
 
 ## 功能
@@ -364,6 +529,7 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 | `WORKBENCH_TOOLS_DIR` | 覆寫 CLI tools 目錄（預設：bundle Resources/tools → repo tools/） |
 | `WORKBENCH_APPROVAL_TIMEOUT` | 核可逾時（Go duration，例如 `5s`；逾時時自動拒絕） |
 | `WORKBENCH_MCP_COMMAND_OVERRIDE` | 測試用：覆寫 MCP approval server 指令 |
+| `WORKBENCH_E2E_START_HIDDEN` | E2E 測試用：值恰好為 `"1"` 時 `StartHidden`，不建立可見原生視窗（只由 E2E 測試啟動器設定，見「Browser E2E」段） |
 
 ### 執行期狀態（workspace 的 `.workbench/`）
 
