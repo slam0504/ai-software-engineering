@@ -559,7 +559,7 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 | **i18n** 繁中介面 | ✅ 已合併 | vue-i18n 語系支援，預設繁體中文並提供完整英文語系 |
 | **M3a** 計畫與測試契約完整流程 | ✅ 已合併 | 任務 DAG、Gate 2、測試契約核可（本機測試證據執行器）、阻擋事項收件匣、STALE 契約（SC3 擴及 Gate 2／TCA；同時檢視多個 session 延後至 **M3b**） |
 | **M3b** 多 session 工作區 | ✅ 已合併 | 每 provider 4 個 session slot、雙 pane 同時檢視與焦點語意（釘選與焦點跨重啟持久化）、WSID 建立交易與 tombstone 移除、single-instance guard、Codex connection-wide wire log 與跨 generation 的 session 級 segment 歸屬、per-WSID replay index 與視窗化載入。四個收尾 gate 與實機驗收 A1–A10 全綠、Task 0 live probe 重跑 GATE GO（[驗收結果](docs/spikes/m3b-results.md)；§10–§11 為最終樹矩陣重跑與實機補跑，三項後續票見 §11 末） |
-| **Pre-M4 準備** | 🔄 進行中 | M4 前的整備工作：牆鐘測試處置（B1）、最小 CI＋main ruleset 與 CI 耗時量測（B2 系列）、TaskRun／Gate 3／forge 契約與 application seams（B5／B6a／B6b）、Spec／Plan 編輯閉環與未儲存內容保護（A1a）皆已完成；其餘票見 [`docs/architecture/pre-m4-readiness-backlog.md`](docs/architecture/pre-m4-readiness-backlog.md) |
+| **Pre-M4 準備** | 🔄 進行中 | M4 前的整備工作：牆鐘測試處置（B1）、最小 CI＋main ruleset 與 CI 耗時量測（B2 系列）、TaskRun／Gate 3／forge 契約與 application seams（B5／B6a／B6b）、Spec／Plan 編輯閉環與未儲存內容保護（A1a）、外部檔案變更 reload／compare／保留流程（A1b）、Browser E2E 基建與行程生命週期契約（B3a-1，技術驗收通過並合併）皆已完成；**B3a-1 的 E2E 尚未進 CI（B3a-CI 另票）**；其餘票見 [`docs/architecture/pre-m4-readiness-backlog.md`](docs/architecture/pre-m4-readiness-backlog.md) |
 | **M4** 完整任務路徑 | 未開始 | 證據鏈、Gate 3 主控台、程式碼代管平台 adapter（SC4：單一任務全程不需切換至 app 外）。**Gate 3 的完整介面與 SC4 端到端流程尚未實作**——B5／B6 完成的是前置契約與基礎建設，不代表 M4 的垂直切片（C1a–C1c）已施工 |
 | 後續候選：ACP／多 Agent Runtime | 主線完成後再規劃 | ACP client adapter（以 OpenCode 作為第一個目標）、保留 Claude／Codex 原生 adapter、能力協商（capability negotiation）（詳見 [`docs/architecture/`](docs/architecture/sdlc-workbench-app-plan.md) §7.1；**不在近期交付範圍**） |
 
