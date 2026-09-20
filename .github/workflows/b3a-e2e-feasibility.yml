@@ -1,0 +1,291 @@
+# ===== DO NOT MERGE — 僅供一次可行性試跑，禁止合併 =====
+# B3a-CI 可行性實驗專用 workflow。只在專用分支 `ci/b3a-e2e-feasibility` 上、
+# 由 `run-e2e-smoke` label 觸發一次 ordinary smoke，用來量測 macOS runner 上
+# 能否跑完整條 E2E 並取得證據。**這張 PR 不得合併**；正式 CI 整合另立票。
+#
+# 本版修正 codex-reviewer #73 複核開出的四項必修（R1–R4），修法對照與證據見
+# 同目錄 evaluation.md「R1–R4 修法」章節；三項小測輸出、靜態檢查、與上一版
+# 的 diff 也在該檔案／同目錄的 diff 檔。
+#
+# 本版另外修正 codex-reviewer #78 用四個反例證明 CHANGES_REQUIRED 的問題
+# （F1–F4，見同目錄 codex-ci78-counterexamples/、regress/regression.sh 的
+# 回歸輸出）：wrapper 改寫成 ci-e2e-wrapper.mjs（Node，取代原本的
+# 早期的 bash 版本），packaging 邏輯抽成
+# package-e2e-evidence.sh（取代原本 inline 在這個 workflow 的 bash 區塊）。
+#
+# 目的：評估「單次 E2E smoke 在 GitHub Actions macOS runner 上能不能跑」的最小
+# workflow 草案。決定性限制（見 evaluation.md §1）：workflow_dispatch 只有在
+# workflow 檔已存在於 default branch（main）時才能被觸發（官方文件原文見
+# evaluation.md）。本草案改用 pull_request 事件（且限定 base=main、同 repo、
+# 專用 head 分支、label），理由與本 repo 自己的實測證據見 evaluation.md §1。
+#
+# 觸發限制（reviewer #73 R0，直接照做，四項缺一不可，皆在 job 層 `if:` 核對）：
+#   - base 必須是 main（`on.pull_request.branches` 已過濾一次，job `if:` 再核對一次）
+#   - 必須同 repo（不接受 fork PR——`head.repo.full_name == github.repository`）
+#   - 專用 head 分支 `ci/b3a-e2e-feasibility`（避免任何其他分支意外觸發）
+#   - 必須貼 label `run-e2e-smoke`（人工煞車）
+#   - 刻意用 `pull_request`、**不用 `pull_request_target`**：後者會在 fork PR
+#     情境下用 base repo 的權杖／secrets 執行 PR head 帶來的程式碼，是已知的
+#     權限逃逸風險；本草案的「同 repo」限制已經降低这個風險，但仍然選用
+#     `pull_request`（不用 base repo 權杖處理 head 的任意程式碼）當一致的
+#     預設立場，不因為目前限定同 repo 就放寬事件類型選擇。
+#
+# 沿用既有 .github/workflows/ci.yml 的慣例：action 以 full SHA 釘版、macOS job
+# 用 macos-15-intel。本草案「不修改」ci.yml，是否要併入 ci.yml 或維持獨立檔案，
+# 留待 CI 可行性票決定。
+#
+# companion 檔案（**本階段不放進 repo**，若下一階段核准採用，需要跟這份
+# workflow 檔一起加進 `.github/scripts/`）：
+#   `ci-e2e-wrapper.mjs`（同目錄）——R2／R4 修法用的薄 wrapper，見該檔頭註解。
+
+name: e2e-smoke-DRAFT-DO-NOT-COMMIT
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]   # base 必須是 main（第一層過濾；job `if:` 再核對一次）
+
+concurrency:
+  group: e2e-smoke-${{ github.workflow }}-${{ github.ref }}
+  # R0（reviewer #73 指定）：改 false——避免同一張 PR 之後又貼其他 label
+  # （跟本 workflow 無關的 label）時，把正在採證中、還沒跑完的 run 取消掉。
+  # 這個 job 本來就有 label 型的 job 層 `if:` 煞車，不需要靠 cancel-in-progress
+  # 來避免重複觸發。
+  cancel-in-progress: false
+
+# 最小 permissions：只讀 checkout；預設 GITHUB_TOKEN 權限不擴大。與 ci.yml
+# 現況（沒有明確宣告 permissions:）不一致，這是刻意更保守的選擇，見
+# evaluation.md §2.7／§6 已知風險，需要 owner 確認是否要處理這個不一致。
+permissions:
+  contents: read
+
+jobs:
+  e2e-smoke:
+    if: >-
+      github.event.label.name == 'run-e2e-smoke' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-e2e-feasibility'
+    name: e2e-smoke
+    runs-on: macos-15-intel   # 沿用 ci.yml 既有選擇，理由見 evaluation.md §2.1
+    timeout-minutes: 45       # job 總上限。內層測試步驟另外設 30 分鐘 step
+                               # timeout，wrapper 自己再設 25 分鐘內層 deadline
+                               # （R2）；安裝／上傳步驟也各自加了 timeout-minutes
+                               # （R2「不得宣稱固定剩餘 15 分鐘」），不是只靠
+                               # job 總額去隱含推算安裝＋上傳一定夠用。
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1，與 ci.yml 同版本
+        timeout-minutes: 3
+
+      # R4：量測落地——SHA／時間戳記錄，checkout 之後立刻做，不等到安裝完成。
+      # 「預設 PR checkout 不能一律稱為 head」：pull_request 事件預設 checkout
+      # 的是 GitHub 自動產生的 merge commit（base 併 head 的結果），不是
+      # `head.sha` 本身——這裡把 `github.sha`（等於這次 run 實際用的 commit，
+      # 對 pull_request 事件就是 merge commit 的 SHA）、PR 的 `head.sha`／
+      # `base.sha`，跟 `git rev-parse HEAD`（checkout 後實際所在的 commit）
+      # 分開各自印出，不能假設三者相同。
+      - name: record SHAs and UTC start time (R4)
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "github.sha (this run's checked-out commit, pull_request 事件下通常是 merge commit): ${{ github.sha }}"
+          echo "github.event.pull_request.head.sha (PR head branch 當下的 commit): ${{ github.event.pull_request.head.sha }}"
+          echo "github.event.pull_request.base.sha (PR base branch 當下的 commit): ${{ github.event.pull_request.base.sha }}"
+          echo "git rev-parse HEAD (checkout 後實際所在的 commit，直接量測，不假設等於上面任何一個): $(git rev-parse HEAD)"
+        timeout-minutes: 1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0，與 ci.yml 同版本
+        timeout-minutes: 3
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0，與 ci.yml 同版本
+        timeout-minutes: 3
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+
+      - run: npm --prefix frontend ci
+        timeout-minutes: 5
+
+      # R3 修法（reviewer #73 指出「沿用 frontend/dist」不成立）：
+      # `frontend/dist/` 已加入 .gitignore（`.gitignore:18`），乾淨 checkout
+      # 後這個目錄不存在；root 套件 `main.go` 用
+      # `//go:embed all:frontend/dist`（`main.go:22-23`），這個 embed 指令在
+      # 編譯期若目錄不存在或沒有匹配檔案會直接編譯失敗（"pattern ...: no
+      # matching files found"）——不管是 `wails dev` 還是任何會編譯 root 套件
+      # 的動作，都需要 `frontend/dist` 先有內容。README（`README.md:138`）
+      # 與 `ci.yml` 本身的 job 順序（`frontend` job 先建 dist、上傳 artifact，
+      # `go`／`wails-build` job 再各自下載）已經明確記錄「frontend 先建」這個
+      # 順序限制；本草案是單一 job（沒有跨 job 的 artifact 下載鏈），所以在
+      # 同一個 job 內直接跑 `npm run build` 產生 dist，順序對齊 `ci.yml` 的
+      # 精神（frontend 先於任何依賴 embed 的動作）。
+      - name: frontend build（產生 go:embed 需要的 frontend/dist，R3）
+        run: npm --prefix frontend run build
+        timeout-minutes: 5
+
+      - run: test -f frontend/dist/index.html   # 對齊 ci.yml 的 go／wails-build job 同一句驗證
+        timeout-minutes: 1
+
+      # R3 修法：README（`README.md:191-193`）明文「GOPROXY=off／
+      # GOFLAGS=-mod=readonly 已驗證與 wails dev 相容，前提是 go.mod／go.sum／
+      # node_modules 在準備階段就已經是最新、齊全的狀態」——這句話描述的是
+      # owner 本機開發環境（go module cache 早就是熱的）。全新 CI runner 的
+      # go module cache 是空的，`wails dev` 的子行程 env 又是 harness 自己
+      # 寫死 `GOPROXY=off`（`frontend/e2e/support/processTree.ts` 的
+      # `spawnWailsDev`，不受這份 workflow 的 step env 影響，兩處是各自獨立
+      # 設定，行為一致但來源不同）——若不在這裡先把 root 套件（`go.mod`）
+      # 的相依下載進本機 module cache，`wails dev` 內部編譯 app 時會因為
+      # cache 沒有它需要的模組、又是 GOPROXY=off 而失敗。這裡在切到 offline
+      # 的測試 step 之前，先用還有網路的環境跑 `go mod download`。
+      # 注意：`go install .../wails/v2/cmd/wails` 只下載「wails CLI 這個工具
+      # 自己」的相依（它有自己的 go.mod／建置圖），**不等於**涵蓋 app 的
+      # `go.mod`（`cel-go`／`go-sdk`／`fsnotify` 等 app 專用相依不在 wails CLI
+      # 的相依圖裡）——這是 README 沒有寫、需要另外處理的一步。
+      - name: go mod download（app 自己的相依，R3；先於 offline 測試 step）
+        run: go mod download
+        timeout-minutes: 5
+
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 && wails version
+        timeout-minutes: 5
+
+      # Google Chrome：macos-15 runner image 內建（evaluation.md §4 官方 README
+      # 引用，版本隨 image 更新滾動，不釘版）。
+      - run: test -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        timeout-minutes: 1
+
+      # R4：安裝完成後再記一次版本清單（node／go／wails／chrome）——跟上面
+      # 「record SHAs」那個 step 分開，因為 wails／chrome 要等對應安裝 step
+      # 跑完才拿得到版本字串；這裡也再印一次 UTC，方便跟 checkout 後那個
+      # 時間戳算出「安裝耗時」的粗略上界（精確數字仍以 `gh run view --json
+      # jobs` 的 step 層 startedAt／completedAt 為準，這裡只是人工可讀的
+      # 輔助記錄）。
+      - name: record tool versions（R4）
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sw_vers
+          uname -a
+          node --version
+          npm --version
+          go version
+          wails version
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+        timeout-minutes: 1
+
+      # R2／R4 修法：換掉原本「set +e ... | tee ... PIPESTATUS ... set -e」的
+      # 模式——那個模式在 step 被平台 timeout／人工取消打斷時，可能連
+      # `e2e.rc` 都沒寫到（shell 整段被中斷，來不及跑到 `echo "$rc" >
+      # e2e.rc` 那一行）。改用 `ci-e2e-wrapper.mjs`（同目錄，
+      # 若採用本草案需要一併加進 `.github/scripts/`）：
+      #   - 內層 deadline 25 分鐘（`E2E_WRAPPER_DEADLINE_SECONDS=1500`），早於
+      #     這個 step 的 30 分鐘 timeout，由 wrapper 自己先送 SIGTERM，而不是
+      #     被平台強殺才第一次有反應。
+      #   - 一定會寫出 `e2e-wrapper-status.json`（status 欄位是
+      #     completed／timeout／timeout-no-clean-exit／interrupted 其中之一）
+      #     與 `e2e.rc`，即使子行程沒能在 grace 時間內收尾。
+      #   - 只對自己 spawn 的那個直接子行程送信號；改用 Node 版
+      #     （`ci-e2e-wrapper.mjs`，codex-reviewer #78 F1–F3 修法）之後不再靠
+      #     `ps` 核對 pid＋lstart，改成直接對 Node 自己持有的 ChildProcess
+      #     handle 送訊號（見該檔案檔頭的理由說明）；**不使用 pkill／
+      #     killall**；逾時仍未結束時如實記成 `timeout-no-clean-exit`，不
+      #     升級成 SIGKILL——完整邊界說明見 `ci-e2e-wrapper.mjs` 檔頭。
+      #   - 直接子行程改成 `node e2e/scripts/run-e2e.mjs`（cwd=frontend），
+      #     不再透過 `npm --prefix frontend run test:e2e`：reviewer #78 指出
+      #     舊版只對 `npm` 送 TERM，`npm → run-e2e.mjs → Playwright` 這條轉發
+      #     鏈是否真的把訊號轉給 harness 從未被證明過；四個小測都不是這條鏈
+      #     ，改成直接呼叫 `run-e2e.mjs` 可以省掉 npm 這層轉發不確定性，跟
+      #     `frontend/package.json` 的 `test:e2e` script 語意一致（見
+      #     `frontend/package.json`：`"test:e2e": "node e2e/scripts/run-e2e.mjs
+      #     e2e/playwright.config.ts"`）。
+      #   - 逐行加時間戳寫成 `e2e.timestamped.out`（原始 `e2e.out` 不動
+      #     格式），供跟 `DEBUG=pw:browser,pw:api` 的輸出粗略對時（R4）。
+      - name: e2e smoke（wrapper：內層 25min deadline／timeout-no-clean-exit 誠實回報／逐行 UTC 時間戳）
+        timeout-minutes: 30   # 平台層 step timeout，早於 job 45 分鐘；wrapper 內層 deadline 25 分鐘早於這個 30 分鐘
+        env:
+          # 成功也保留證據目錄——見 evaluation.md §2.5，harness 預設 PASSED
+          # 會自己刪掉證據目錄，CI 情境下必須關掉這個預設行為。
+          E2E_KEEP_ARTIFACTS: '1'
+          GOFLAGS: '-mod=readonly'
+          GOPROXY: 'off'
+          npm_config_offline: 'true'
+          # R4：Playwright debug 輸出，供事後比對瀏覽器啟動時序；沒有時間戳
+          # （Playwright 自己不加），靠 wrapper 的逐行 UTC 時間戳副本粗略對時
+          # ——精確度只到秒，見 ci-e2e-wrapper.mjs 檔頭「已知限制」。
+          DEBUG: 'pw:browser,pw:api'
+          E2E_WRAPPER_DEADLINE_SECONDS: '1500'
+          E2E_WRAPPER_GRACE_SECONDS: '120'
+        run: |
+          set +e
+          node .github/scripts/ci-e2e-wrapper.mjs \
+            e2e-wrapper-status.json e2e.out e2e.timestamped.out e2e.rc \
+            -- node frontend/e2e/scripts/run-e2e.mjs e2e/playwright.config.ts
+          rc=$?
+          set -e
+          echo "wrapper 回報 rc=$rc（同一個值已寫進 e2e.rc／e2e-wrapper-status.json 的 wrapperRc 欄位；子行程自己的 rc 另外存在 childRc 欄位，見 ci-e2e-wrapper.mjs 檔頭）"
+          exit "$rc"
+
+      - name: locate artifacts dir
+        if: always()
+        timeout-minutes: 1
+        run: |
+          ls -la frontend/e2e/.artifacts/ 2>&1 || echo "no artifacts dir（可能是啟動前就失敗，見 run-e2e.mjs 的早期 harness.log 邏輯，或 wrapper 從未成功 spawn 子行程）"
+          cat e2e-wrapper-status.json 2>&1 || echo "no e2e-wrapper-status.json（wrapper 本身可能沒跑到——這本身就是異常，下一步會 fail）"
+
+      # R1 修法（reviewer #73 指出 `upload-artifact` v7.0.1 的
+      # `include-hidden-files` 預設 false，`frontend/e2e/.artifacts/**` 是
+      # 隱藏路徑會被漏傳；官方原碼已逐字核對，見 evaluation.md「R1 修法」）：
+      # 不直接把 `frontend/e2e/.artifacts/**` 交給 upload-artifact 的
+      # `path:`，改成這裡先組一個**非隱藏**的證據目錄
+      # `e2e-evidence-package/`（`cp -r` 會把來源目錄底下的隱藏檔案／目錄一併
+      # 複製過去，不受 shell glob 的隱藏檔排除影響）、算好每個檔案的
+      # sha256、封裝成單一 `e2e-evidence.tar.gz`（tar 天生不排除隱藏檔，
+      # 從根本上不落入 upload-artifact 的 include-hidden-files 這個坑）。
+      # **成功但缺必要證據要 fail，不得用 warn 掩蓋**：`e2e.out`／`e2e.rc`／
+      # `e2e-wrapper-status.json` 這三個一定要存在（wrapper 保證，見上）；
+      # 若 `frontend/e2e/.artifacts/` 下有任一次執行的目錄，裡面的
+      # `harness.log` 也一定要存在（harness 自己的保證，見 README「證據
+      # 目錄」段——啟動失敗也一定有）。這幾項缺任何一項，這個 step 都要以
+      # 非零結束，不能只印警告。**唯一的例外**：`frontend/e2e/.artifacts/`
+      # 整個目錄都不存在（代表在 harness 建立 HarnessLogger 之前就失敗，
+      # 例如 `run-e2e.mjs` 自己的早期 precheck 路徑）——這個情境本身允許沒有
+      # trace／harness.log，只要求 `e2e.out`／`e2e.rc`／
+      # `e2e-wrapper-status.json` 仍然存在。
+      # F4 修法（codex-reviewer #78 反例 package_without_harness）：舊版只在
+      # 「frontend/e2e/.artifacts/ 整個目錄不存在」時套用「啟動前失敗」的
+      # 例外，沒有檢查 wrapper 自己是不是宣稱 completed/rc=0——反例就是拿一個
+      # 宣稱成功、卻完全沒有 harness trace 的 fixture，直接鑽進這個例外。
+      # 邏輯抽到 package-e2e-evidence.sh（同目錄 .github/scripts/），差異與
+      # 理由見該檔案檔頭；這裡只傳 workdir。
+      - name: package evidence（tar＋sha256 manifest，R1／F4）
+        if: always()
+        timeout-minutes: 3
+        run: |
+          bash .github/scripts/package-e2e-evidence.sh "$(pwd)"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1，與 ci.yml 同版本
+        if: always()
+        timeout-minutes: 10
+        with:
+          name: e2e-smoke-output
+          if-no-files-found: error   # 改 error（原本 warn）：package evidence 這個 step
+                                      # 一定會產生 tar／manifest，找不到檔案代表更早的
+                                      # 環節壞了，不該用 warn 靜默放過。
+          path: |
+            e2e-evidence.tar.gz
+            e2e-evidence-manifest.txt
+            e2e-evidence-manifest.sha256
+
+    # 取消／強制終止時的已知限制（不是本草案能解決的，寫出來避免誤判）：
+    # wrapper 的 25 分鐘內層 deadline／120 秒 grace（R2）大幅降低「平台
+    # timeout 打斷、e2e.rc 沒寫到」這個原始風險，但仍有殘餘風險：
+    #   - 若人工在 GitHub UI 直接取消整個 run（不是透過 step timeout），
+    #     GitHub Actions 會直接對整個 job 的 process group 送訊號，wrapper
+    #     自己的 trap 是否來得及跑完再送一次 SIGTERM 給子行程、還是被平台
+    #     同時／更早殺掉，未經實際遠端測試驗證，只在本機隔離環境測過（見
+    #     evaluation.md 附的三項小測輸出）。
+    #   - `timeout-no-clean-exit` 這個狀態代表 wrapper 確認自己送過訊號、但
+    #     grace 時間到子行程仍在——這個殘留行程樹的清理，本草案刻意不做
+    #     （不使用 pkill／killall），GitHub-hosted runner 本身在 job 結束後
+    #     會整個回收虛擬機，所以殘留行程不會跨 run 汙染，但「這次 run 的
+    #     evidence 是否完整」仍然要看 `e2e-wrapper-status.json` 裡的
+    #     `childConfirmedGone` 欄位，不能假設一定乾淨。
