@@ -375,7 +375,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | B3a-2a | Gate 1、Gate 2、STALE 三條流程，不經 provider（M3b §12 已用純 UI 走過） | **0.65**（6–7 hr，中位 6.5 hr） | **未授權施工**（rev48）；依 B3a-1 harness |
 | B3a-2s | spike（timebox）：評估既有 fake 或 replay 能否支援 session recovery 與 approval（claude resume 參數、MCP approval tool_use 流程、codex app-server 協定涵蓋範圍） | **0.45**（spike timebox 4–5 hr，中位 4.5 hr） | **未授權施工**（rev48） |
 | B3a-2b | session recovery、approval 兩條流程，以 replay provider 驅動 | **spike 後再估，不計入小計** | 依賴 B3a-2s 結論；**未授權施工** |
-| B3a-CI | **單次可行性驗收完成（rev64）；正式 CI 整合另票。** 實測：job 5m08s、e2e step 2m44s、`globalSetup 完成`→`Running` 1.640s、artifact 41,118 bytes、runner image `macos-15` `20260824.0482.1`、Chrome 151.0.7922.174。**未測**：遠端失敗／逾時／取消路徑；成本僅單一樣本、計費未知。以下為原始範圍：macOS runner 可行性——確認 `wails dev` 能啟動、完成一條 smoke、完整收尾、上傳證據目錄 | **0.4**（3–5 hr，中位 4 hr；CI 等候時間另列，不算工時） | **未授權施工**（rev48） |
+| B3a-CI | **單次可行性驗收完成（rev64）；正式 CI 整合另票。** 實測：job 5m08s、e2e step 2m44s、`globalSetup 完成`→`Running` 1.640s、artifact 41,118 bytes、runner image `macos-15` `20260824.0482.1`、Chrome 151.0.7922.174。**未測**：遠端失敗／逾時／取消路徑；成本僅單一樣本、計費未知。以下為原始範圍：macOS runner 可行性——確認 `wails dev` 能啟動、完成一條 smoke、完整收尾、上傳證據目錄 | **0.4**（3–5 hr，中位 4 hr；CI 等候時間另列，不算工時） | **單次可行性驗收完成**（rev64）；正式整合未授權施工 |
 | B3b | 最小 native smoke 自動化 | 0.5 | 依 B2 macOS build job |
 | B4 | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | — |
 | B5 | TaskRun／Gate 3／forge 契約 spec（authoring＋gate 修訂輪工作量） | 1.2 | design gate 往返等候不計工時；(6c)(6d)(6e) owner 決議於 gate 中取得 |
