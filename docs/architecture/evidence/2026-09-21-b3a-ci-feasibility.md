@@ -10,7 +10,7 @@
 |---|---|
 | 實驗 PR | [#12](https://github.com/slam0504/ai-software-engineering/pull/12)（draft、標示 DO NOT MERGE、**已關閉未合併**） |
 | 分支 | `ci/b3a-e2e-feasibility`（保留） |
-| head | `79819d8562847b3ff8ec1cdae4fdf3...`（PR head branch 當下 commit） |
+| head | `79819d8562847b3ff8ec1cdae4fdf37047a70329`（PR head branch 當下 commit） |
 | base | `b42025fa598f7ad58cec97554984c5233a67cea4`（main） |
 | 實際 checkout | `564a7cf07235827266b645c945e1356f0ffd0faf`（`git rev-parse HEAD` 實測；`pull_request` 事件下為 merge commit，**不等於 head**） |
 | run | [35526092898](https://github.com/slam0504/ai-software-engineering/actions/runs/35526092898)（`event=pull_request`，label `run-e2e-smoke` 僅貼一次、零重試） |
@@ -49,6 +49,16 @@
   （本機 `du` 顯示的 48 KB 是檔案系統配置空間，**非下載產物大小**，兩者來源不同）
 - 由 reviewer（codex-reviewer）**獨立下載、獨立解包、獨立核對**，結論一致
 
+證據識別如下；GitHub artifact API 的 digest 對應平台封裝，與包內 tar 的 SHA256 分列。
+
+| 證據 | 識別／SHA256 |
+|---|---|
+| [GitHub artifact 10610081093](https://github.com/slam0504/ai-software-engineering/actions/runs/35526092898/artifacts/10610081093) | `362c9d23df8ebbf940e911cc5577c2911b33332bdef31ad478c27bedcdb94ecf` |
+| `e2e-evidence.tar.gz` | `87d822b08f4431e6532151cd80c3afa4db6d90cc63aea2b2f0eeb2d5d8a5e45b` |
+| `e2e-evidence-manifest.sha256` | `76c6e331f46a9223e24957f33ff6f0b6e477d88c589eb74db1b6d61c946c603e` |
+
+API 記錄的 artifact 到期時間為 `2026-12-19T17:30:42Z`，並非永久保存。本機另保留下載副本；本機路徑不是唯一來源，後續核對須使用上述 run、artifact 識別與雜湊。
+
 ## 5. 三項分開判定
 
 | 面向 | 結論 |
@@ -62,7 +72,7 @@
 1. **遠端失敗／逾時／取消路徑完全未測**：本次未觸發任何 timeout 或 cancel，平台實際如何送訊號仍未知。wrapper 的 timeout／observation-error／producer-error 路徑僅有本機隔離 fixture 驗證。
 2. 成功路徑本就不保留 trace，trace 缺失依既有成功／失敗契約判斷。
 3. **本機「globalSetup 完成 → 測試開始」曾有 11–12 分鐘成因未知的耗時，本次在 CI 未重現**（實測 1.640 s）。**僅為觀察，成因仍未知**，不得據此推論本機問題的原因。
-4. Chrome 在 runner 上輸出多筆 `CVDisplayLinkCreateWithCGDisplay failed (CVReturn: -6670)`，測試仍通過。方向上與「runner 為模擬顯示」的假設一致，但**該假設未經驗證**（來源為社群討論，非官方文件）。
+4. Chrome 在 runner 上輸出多筆 `CVDisplayLinkCreateWithCGDisplay failed (CVReturn: -6670)`，測試仍通過。本次未定位訊息成因，也未驗證 runner 的顯示環境。
 5. 單一樣本、單一 Chrome 版本、單一時段。
 6. **實驗稿已知措辭欠缺**（正式整合前必須清除，本輪為保全已採證的 head 而**未修改、未重跑**）：workflow 第 183 行「一定會寫出」、第 244 行「wrapper 保證」、第 213 行仍寫秒精度；evaluator 第 337 行的 NO-RUN 仍宣稱「確定未開始」——實際上 **NO-RUN 只代表未取得 run 證據，不能證明從未啟動**。
 7. 主機或檔案系統整體 I/O 卡死時，最後界線仍是平台的 step 30 分／job 45 分限制，資料可能不完整。
