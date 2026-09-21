@@ -75,14 +75,22 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <div v-if="current" class="overlay">
+  <!-- B3a-2b-2 Task C 驗收缺口修正（缺口 1）：WSID／approval id／method 是
+       既有欄位（Req interface，對齊 app.go 的 approval:request payload），
+       這裡只在既有節點上加純測試用 data-test-* 屬性（不新增可見文字、不改
+       任何行為），讓 e2e spec 能做三段式串接核對（UI ↔ App 端證據 ↔ 原始
+       wire）。 -->
+  <div
+    v-if="current" class="overlay" data-test="approval-dialog"
+    :data-test-wsid="current.wsid" :data-test-approval-id="current.id" :data-test-approval-method="current.toolName"
+  >
     <div class="dialog">
       <h3>[{{ current.provider }}] {{ t('approval.toolRequest', { tool: current.toolName }) }}</h3>
-      <pre>{{ current.inputJson }}</pre>
+      <pre data-test="approval-raw-params">{{ current.inputJson }}</pre>
       <input v-model="reason" :placeholder="t('approval.reason.placeholder')" />
       <div class="actions">
-        <button class="allow" @click="decide(true)">{{ t('approval.action.allow') }}</button>
-        <button class="deny" @click="decide(false)">{{ t('approval.action.deny') }}</button>
+        <button class="allow" data-test="approval-allow" @click="decide(true)">{{ t('approval.action.allow') }}</button>
+        <button class="deny" data-test="approval-deny" @click="decide(false)">{{ t('approval.action.deny') }}</button>
         <span v-if="queue.length > 1" class="pending">{{ t('approval.pendingCount', { n: queue.length - 1 }) }}</span>
       </div>
       <p v-if="error" class="error">{{ error }}</p>

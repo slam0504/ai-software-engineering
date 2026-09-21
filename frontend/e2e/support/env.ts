@@ -21,6 +21,20 @@ export interface RunEnv {
   codexVersion: string;
   baseUrl: string;
   vitePort?: number;
+  // B3a-2b-2 Task C：scenario identity（僅 playwright.scenario.config.ts 這條
+  // 入口會填）。這裡刻意跟 base 欄位分開放，讓 default／controls 兩條入口的
+  // run-env.json 維持原樣不受影響；scenario 入口下這幾欄缺一即視為壞掉
+  // ——見下方 readScenarioRunEnv，不得回退成「當作沒有 scenario」。
+  scenario?: string;
+  scenarioThreadId?: string;
+  scenarioTurnId?: string;
+  scenarioItemId?: string;
+  scenarioApprovalMethod?: string;
+  scenarioApprovalRequestId?: string;
+  scenarioDecision?: string;
+  scenarioConfigPath?: string;
+  scenarioLogPath?: string;
+  scenarioManifestPath?: string;
 }
 
 function runEnvFile(artifactsDir: string): string {
@@ -46,6 +60,16 @@ function envToProcessEnv(env: RunEnv): Record<string, string | undefined> {
     E2E_CODEX_VERSION: env.codexVersion,
     E2E_BASE_URL: env.baseUrl,
     E2E_VITE_PORT: env.vitePort ? String(env.vitePort) : undefined,
+    E2E_SCENARIO_NAME: env.scenario,
+    E2E_SCENARIO_THREAD_ID: env.scenarioThreadId,
+    E2E_SCENARIO_TURN_ID: env.scenarioTurnId,
+    E2E_SCENARIO_ITEM_ID: env.scenarioItemId,
+    E2E_SCENARIO_APPROVAL_METHOD: env.scenarioApprovalMethod,
+    E2E_SCENARIO_APPROVAL_REQUEST_ID: env.scenarioApprovalRequestId,
+    E2E_SCENARIO_DECISION: env.scenarioDecision,
+    E2E_SCENARIO_CONFIG_PATH: env.scenarioConfigPath,
+    E2E_SCENARIO_LOG_PATH: env.scenarioLogPath,
+    E2E_SCENARIO_MANIFEST_PATH: env.scenarioManifestPath,
   };
 }
 
@@ -64,6 +88,16 @@ export function readRunEnv(): RunEnv {
       codexVersion: p.E2E_CODEX_VERSION,
       baseUrl: p.E2E_BASE_URL,
       vitePort: p.E2E_VITE_PORT ? Number(p.E2E_VITE_PORT) : undefined,
+      scenario: p.E2E_SCENARIO_NAME,
+      scenarioThreadId: p.E2E_SCENARIO_THREAD_ID,
+      scenarioTurnId: p.E2E_SCENARIO_TURN_ID,
+      scenarioItemId: p.E2E_SCENARIO_ITEM_ID,
+      scenarioApprovalMethod: p.E2E_SCENARIO_APPROVAL_METHOD,
+      scenarioApprovalRequestId: p.E2E_SCENARIO_APPROVAL_REQUEST_ID,
+      scenarioDecision: p.E2E_SCENARIO_DECISION,
+      scenarioConfigPath: p.E2E_SCENARIO_CONFIG_PATH,
+      scenarioLogPath: p.E2E_SCENARIO_LOG_PATH,
+      scenarioManifestPath: p.E2E_SCENARIO_MANIFEST_PATH,
     };
   }
   const artifactsDir = p.E2E_ARTIFACTS_DIR;
@@ -71,6 +105,45 @@ export function readRunEnv(): RunEnv {
     throw new Error('readRunEnv: E2E_ARTIFACTS_DIR 未設定，無法退回讀取 run-env.json（globalSetup 是否有跑過？）');
   }
   return JSON.parse(fs.readFileSync(runEnvFile(artifactsDir), 'utf8')) as RunEnv;
+}
+
+// readScenarioRunEnv：scenario spec 專用——scenario identity 的九個欄位缺一
+// 就整個 fail loud（不得回退成「當作沒有 scenario」或用預設值頂替，見票面
+// 既有裁定）。同時涵蓋 process.env 與 run-env.json 兩條路徑：readRunEnv()
+// 已經把兩邊都讀過一次，這裡只再做「scenario 欄位必須完整」這一層守門。
+export interface ScenarioRunEnv extends RunEnv {
+  scenario: string;
+  scenarioThreadId: string;
+  scenarioTurnId: string;
+  scenarioItemId: string;
+  scenarioApprovalMethod: string;
+  scenarioApprovalRequestId: string;
+  scenarioDecision: string;
+  scenarioConfigPath: string;
+  scenarioLogPath: string;
+  scenarioManifestPath: string;
+}
+
+export function readScenarioRunEnv(): ScenarioRunEnv {
+  const env = readRunEnv();
+  const required = [
+    'scenario', 'scenarioThreadId', 'scenarioTurnId', 'scenarioItemId',
+    'scenarioApprovalMethod', 'scenarioApprovalRequestId', 'scenarioDecision',
+    'scenarioConfigPath', 'scenarioLogPath', 'scenarioManifestPath',
+  ] as const;
+  // B3a-2b-2 Task C 第三輪限縮補正（缺陷 1 的姊妹修正）：不能用
+  // `!env[k]`（truthy）代替 runtime 型別驗證——process.env 路徑的值必為
+  // string，但 run-env.json 純檔案 fallback 路徑是未經驗證的 `JSON.parse`
+  // 結果，欄位可能是數字（例如 `scenarioTurnId: 42`）之類非字串值；truthy
+  // 檢查對非零數字會判定「有值」而放行，型別其實不對。這裡逐欄要求
+  // `typeof === 'string' && length > 0`，缺失與型別錯誤都算 missing。
+  const missing = required.filter(k => typeof env[k] !== 'string' || (env[k] as string).length === 0);
+  if (missing.length > 0) {
+    throw new Error(
+      `readScenarioRunEnv: scenario identity 欄位缺失或型別錯誤（不得回退 default）：${missing.join('、')}`,
+    );
+  }
+  return env as ScenarioRunEnv;
 }
 
 // 使用者可見的旗標／注入點（§2.1、負控制注入點，命名見 README「Browser E2E」段）。
