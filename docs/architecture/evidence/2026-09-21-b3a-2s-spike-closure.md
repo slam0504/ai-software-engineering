@@ -1,18 +1,23 @@
 # B3a-2s 結案紀錄
 
 > 日期：2026-09-21（台灣時間）。以下時刻一律為原始 UTC 值。
-> 結論：**spike 技術結論通過；browser 整合未驗收。**（codex-reviewer #198 裁定）
+> 結論：**spike 技術結論通過；browser 整合未驗收。**（codex-reviewer #198 裁定，
+> #202 維持此裁定不變）
 > 本文件只是**結案紀錄**，不是 browser E2E 驗收，也不是 B3a-2b 施工授權；
 > 授權範圍見「6. 授權範圍與下一步」。
+> **本版更正**：codex-reviewer（#202）指出原始版本（PR #14 head `5b77c690`）第
+> 3.2／3.3 節與末段有過度宣稱，**暫不合併 PR #14、不授權 2b 實作**；本版已修正
+> Probe 3 子行程宣稱、3.3 節跨層合併宣稱、`fakeCli.ts` 擴充用語，並新增第 5 節
+> rev4 reviewer 證據 addendum，詳見 backlog rev66 修訂記錄。
 
 ## 1. 受測對象與來源
 
 | 項目 | 值 |
 |---|---|
 | Worktree pin | `db1e8b0a40aee7bc0766ac6c22658b684860d373`（detached，`/tmp/b3a2s-wt`；與本次結案文件分支基準的 `origin/main` 同一 commit） |
-| 證據根目錄 | `/tmp/b3a2s-20260921T022524Z/`（rev1 原始 spike＋`rev2/` 補件＋`rev3/` 封存 addendum，三者皆保留、不互相覆寫） |
-| manifest 版本 | rev1：`manifest/MANIFEST.txt`（生成於 2026-09-21T02:35:29Z）／rev2：`rev2/manifest/MANIFEST-rev2.txt`（生成於 2026-09-21T02:59:58Z）／rev3：`rev3/README.md`＋`rev3/SHA256SUMS`（本次結案文件撰寫前完成，見第 5 節） |
-| reviewer 裁定 | #198（本次結案授權，「spike 技術結論通過，可進入結案文件與最小實作設計」）；#190（rev1 原 binary 雜湊與實跑核對，見第 5 節限制） |
+| 證據根目錄 | `/tmp/b3a2s-20260921T022524Z/`（rev1 原始 spike＋`rev2/` 補件＋`rev3/` 封存 addendum＋`rev4-review-evidence/` reviewer 原始測試輸出 addendum，四者皆保留、不互相覆寫） |
+| manifest 版本 | rev1：`manifest/MANIFEST.txt`（生成於 2026-09-21T02:35:29Z）／rev2：`rev2/manifest/MANIFEST-rev2.txt`（生成於 2026-09-21T02:59:58Z）／rev3：`rev3/README.md`＋`rev3/SHA256SUMS`（本次結案文件撰寫前完成，見第 5 節）／rev4：`rev4-review-evidence/README.md`＋`rev4-review-evidence/SHA256SUMS`（本次結案文件撰寫前完成，見第 5 節） |
+| reviewer 裁定 | #198（本次結案授權，「spike 技術結論通過，可進入結案文件與最小實作設計」）；#190（rev1 原 binary 雜湊與實跑核對，原始輸出見 `rev4-review-evidence/review190/`，第 5 節限制仍適用）；#197（rev2 R4 修法版六測試獨立重跑，原始輸出見 `rev4-review-evidence/review197/`） |
 
 本票僅涵蓋 fake／replay provider 對 session recovery 與 approval 流程的**技術可行性評估**，
 不涉及真實 provider、Wails、browser 的任何實跑。
@@ -55,29 +60,35 @@ provider 契約對稱或不對稱，**不**定性為 production defect，維持*
 ### 3.2 Claude
 
 - **已實測**：`app.go:7372-7383`（送出前，對 App 自己的 `internal/claude/registry.go`
-  做本地一致性檢查）在 Claude 送出前會**拒絕**接回錯的 WSID（Probe 3，正確性閘存在且
-  本次新驗證了真實子行程邊界）。
+  做本地一致性檢查）在 Claude 送出前會**拒絕**接回錯的 WSID（Probe 3，正確性閘存在）。
+  **更正**：Probe 3 呼叫 `startClaude`，但在啟動前即被上述 registry guard 擋下，**未**
+  觸及真實子行程邊界；真正的 MCP 子行程證據見本節下方「Approval 往返證據」一條的
+  Probe 1（R4 修法版）。
 - **未實測、僅為讀碼結果**：`app.go:7499-7510`（`Bind(info.SessionID, ...)`，init 事件
-  處理層）**未顯式比對** claude CLI 回報的 `info.SessionID` 與原本請求的 resume 參數，
-  無條件接受——這是**讀碼**得出的結論（含 `internal/claude/registry.go:57-59` `Bind()`
-  的文件註解佐證），**下游行為未經任何測試實際跑過**，不同於 3.1 節 Codex 那一層有
-  Probe 2 直接執行驗證。
+  處理層）**未顯式比對** claude CLI 回報的 `info.SessionID` 與原本請求的 resume 參數
+  ——這是**讀碼**得出的觀察（含 `internal/claude/registry.go:57-59` `Bind()` 的文件
+  註解佐證），**下游行為未經任何測試實際跑過**，不同於 3.1 節 Codex 那一層有 Probe 2
+  直接執行驗證。
 - **Approval 往返證據**：**分段覆蓋**——MCP handshake、broker↔App↔UI 各自有雙向協定
   fake 級別的既有測試，Probe 1（R4 修法版）補強了「真實 OS 子行程邊界」這一段；但
   claude CLI 是否真的照 `--mcp-config` 內容 spawn 宣告的子行程，中間銜接處**沒有任何
   一段測試涵蓋**，不得把三段綠燈相加宣稱等於完整鏈路。
 
-### 3.3 兩者共通、不得跨層混淆的邊界
+### 3.3 不得跨層混淆的邊界
 
 Probe 2（Codex）與 Probe 3（Claude）驗證的是**不同層**：Probe 3 是「送出前」對 App 自己
-registry 的一致性檢查（Claude 有、且本次證實會攔下錯接），Probe 2 是「送出後」對 provider
-回應 id 的比對（Codex 沒有）。「送出後比對回應 id」這一層，3.1／3.2 已分別確認 **Codex 與
-Claude 都沒有**（Claude 的對應層是 3.2 節「未實測、僅為讀碼結果」那一條）——這是兩個
-provider **共有**的待判契約，不是單一 provider 的不對稱，也不得由此定性為 production
-defect。是否該補、補在哪一層，超出本次授權，留給 owner／reviewer 另行決定。
+registry 的一致性檢查（Claude 有、且本次證實會攔下錯接，但**不**觸及真實子行程邊界，見
+3.2 節更正），Probe 2 是「送出後」對 provider 回應 id 的比對，**實測**確認 Codex 沒有
+這層比對。Claude 是否也有「送出後比對回應 id」這一層，本次**沒有**對等的實測證據——3.2
+節「未實測、僅為讀碼結果」那一條只是**讀碼觀察**（init handler 未顯式比較，下游行為未經
+任何測試實際跑過），證據層級明顯弱於 Probe 2 對 Codex 的直接執行驗證。**不得**把這兩個
+不同證據層級（一個實測、一個讀碼觀察）合併宣稱「兩個 provider 契約對稱」或「不對稱」，
+也**不得**由此定性為 production defect。是否該補、補在哪一層，超出本次授權，留給
+owner／reviewer 另行決定。
 
-browser E2E 整合（fakeCli.ts 擴充、MCP config 讀取／spawn、真實 codex app-server 行為）
-**全部未驗收**——本票結論僅止於 App／adapter 層與已補強的 wire 層證據。
+browser E2E 整合（新增 scenario 模組（既有 `fakeCli.ts` 已裁定凍結，不擴充）、MCP config
+讀取／spawn、真實 codex app-server 行為）**全部未驗收**——本票結論僅止於 App／adapter 層
+與已補強的 wire 層證據。
 
 ## 4. rev1 原 binary 遭覆寫的限制
 
@@ -100,15 +111,34 @@ session 並未實際比對 build metadata 或用 `-trimpath` 等手法排除其�
 唯一站得住的事實是：目前的 binary 雜湊與 rev1 記錄值不同，**成因未知、未查證**。詳見
 `rev3/README.md`。
 
-## 5. rev3 封存 addendum
+## 5. rev3 封存 addendum、rev4 reviewer 證據 addendum
 
-- 位置：`/tmp/b3a2s-20260921T022524Z/rev3/`（additive，不覆寫 rev1／rev2）。
-- 內容：`README.md`（第 1.1／1.2 節對應上方第 4 節兩項變更的完整敘述、舊 manifest 的
+- rev3 位置：`/tmp/b3a2s-20260921T022524Z/rev3/`（additive，不覆寫 rev1／rev2）。
+- rev3 內容：`README.md`（第 1.1／1.2 節對應上方第 4 節兩項變更的完整敘述、舊 manifest 的
   路徑基準表）、`sources/`（四個現用 probe 來源＋`frontend/dist/index.html` placeholder
   的複製）、`bin/workbench`（rev2 重建 binary 的複製，非重建、非新建置）、
   `logs/rev3-session.log`（本次 session 時間軸）、`SHA256SUMS`（純雜湊清單）。
-- 驗證：`cd /tmp/b3a2s-20260921T022524Z/rev3 && shasum -a 256 -c SHA256SUMS` 全數
+- rev3 驗證：`cd /tmp/b3a2s-20260921T022524Z/rev3 && shasum -a 256 -c SHA256SUMS` 全數
   `OK`（本次結案文件撰寫前實際執行過，見交付回報的證據區塊）。
+- **rev3 的已知缺口**：只有封存時間軸與來源複製，**沒有測試原始輸出**——reviewer
+  #190／#197 的獨立重跑紀錄（含 `go test` 呼叫、`-v` 輸出、exit code）此前僅存在於
+  `/tmp/b3a2s-review190-v9ownhw2/` 與 `/tmp/b3a2s-review197-ocpavh5j/`，**未被收進任何
+  封存包**。
+- **rev4 reviewer 證據 addendum**（本次新增，補上述缺口）：位置
+  `/tmp/b3a2s-20260921T022524Z/rev4-review-evidence/`（additive，**不修改 rev1／rev2／
+  rev3**）。內容為 review #190（四測試重跑：subprocess／resume-mismatch／
+  resume-refused）與 review #197（六測試重跑，含 Probe 4）**既有** `go test` 呼叫、
+  `-v` 輸出、exit code 的 byte-identical 複製，逐檔附來源路徑、sha256（複製前後比對
+  相符）、檔案系統 mtime（UTC，作為原始執行時間的代理值）；**明確標示為既有 reviewer
+  記錄、非本輪（rev3／本次任務）重新執行**，本 session 未重跑任何 `go test`、未做任何
+  建置鑑識。完整清單與逐項雜湊見 `rev4-review-evidence/README.md` 與同目錄
+  `SHA256SUMS`。rev1 原 probe binary 位元組不可復原的限制（見第 4 節）**不受此次補件
+  影響，仍然成立**。
+- rev4 驗證：`cd /tmp/b3a2s-20260921T022524Z/rev4-review-evidence && shasum -a 256 -c
+  SHA256SUMS` 全數 `OK`（本次結案文件撰寫前實際執行過，見交付回報的證據區塊）。
+- 至此，rev1（原始 spike）＋rev2（R1–R4 補件）＋rev3（時間軸與位元組更正）＋rev4
+  （reviewer 原始測試輸出）四者合併，才是可一起覆核的完整封存包；四者互相 additive，
+  沒有任何一份覆寫或取代另一份。
 
 ## 6. 授權範圍與下一步
 
