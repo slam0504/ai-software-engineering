@@ -24,7 +24,11 @@ if (isOfflineSandboxEnabled()) {
 export default defineConfig({
   testDir: __dirname,
   testMatch: ['*.spec.ts'],
-  testIgnore: ['controls/**'],
+  // B3a-2b-2 Task C：scenario 套件有自己的入口
+  // （playwright.scenario.config.ts／test:e2e:scenario），default 這裡明確
+  // 排除，避免 default（禁止 E2E_SCENARIO 的入口，見 global-setup.ts 開頭
+  // 守門）意外把 scenario spec 一起收集進來。
+  testIgnore: ['controls/**', 'scenarios/**'],
   fullyParallel: false,
   workers: 1,
   retries: 0,

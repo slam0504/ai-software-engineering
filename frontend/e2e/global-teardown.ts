@@ -21,6 +21,8 @@ import type { ActiveRunPointer, RunState } from './support/runState.js';
 import { runtime } from './support/runtime.js';
 import { loadValidatedPreviousRunState } from './support/staleRun.js';
 import { stopProcessGroup } from './support/stopProcedure.js';
+import { judgeScenarioCliCalls } from './support/scenario/scenarioTripwire.js';
+import { determineExecutionMode } from './support/executionMode.js';
 
 const TRIPWIRE_LINE_RE = /^\[(?<ts>[^\]]+)\] name=(?<name>\S+) argv=\((?<argv>.*)\) cwd=(?<cwd>\S+) ppid=(?<ppid>\d+)$/;
 
@@ -73,6 +75,14 @@ function assertPointerBelongsToCurrentRun(
     + '不送任何信號，pointer 保留不變',
   );
 }
+
+// B3a-2b-2 Task C 第三輪限縮補正（缺陷 1）：執行模式判定移到獨立模組
+// `support/executionMode.ts`（型別／實作／判定依據見該檔開頭註解——改用
+// execution-entry.json 入口標記，不再只靠 `env.scenario` truthy 推斷，也不再
+// 只核對單一 `scenario` 欄位；十個 identity 欄位逐一驗型別＋跨來源一致性）。
+// 獨立成模組的原因：`determineExecutionMode` 需要能被 `node xxx.selftest.ts`
+// 直接 import 驗證負控制，Node 原生 TS stripping 解析不了本檔慣用的 `.js`
+// 副檔名 import 指向 `.ts` 檔。
 
 export default async function globalTeardown(): Promise<void> {
   // globalSetup 有好幾條失敗路徑會讓 writeRunEnv 從未執行、process.env 與
@@ -229,13 +239,42 @@ export default async function globalTeardown(): Promise<void> {
     log.log('清理未完全成功，保留 .active-run.json 供下次執行的前次殘留檢查接手');
   }
 
+  // 執行模式：明確判定（見 determineExecutionMode 上方註解），不是靠
+  // `env.scenario` truthy 推斷。
+  //
+  // 位置更正（B3a-2b-2 Task C 阻擋缺陷修正）：這裡原本寫在第 1 節「停止
+  // 取樣、停止 wails dev 程序樹」之前，註解卻宣稱「無論判定結果為何，第 1
+  // 節一律先做完」——那句話跟實際程式順序不符：`determineExecutionMode`
+  // 若拋出未捕捉例外（例如 execution-entry.json 落地內容是 JSON `null`），
+  // 會讓整個 globalTeardown 在還沒呼叫 `runtime.processTree.stop()`／純檔案
+  // 退回路徑之前就中止，已擁有的程序反而不會被停。`executionMode` 唯一的
+  // 使用點在下面的 tripwire 判定（§2.6），跟第 1 節的停止程序、跟上面的
+  // pointer 清理都無關，所以直接把判定移到這兩者都做完之後——即使
+  // `determineExecutionMode` 本身出狀況，也不會擋到已經做完的 bounded stop
+  // 與 pointer 清理。
+  const executionMode = determineExecutionMode(env, env.artifactsDir, log);
+  log.log(`執行模式判定：${executionMode.kind}${executionMode.kind === 'scenario-broken' ? `（${executionMode.reason}）` : ''}`);
+
   // ---- 2. tripwire 判定（§2.6） ----
   const toolsDir = env.toolsDir;
   const finalInvocationsLog = path.join(env.artifactsDir, 'invocations.log');
   let tripwireViolations: string[] = [];
   try {
     fs.copyFileSync(path.join(toolsDir, 'invocations.log'), finalInvocationsLog);
-    tripwireViolations = judgeTripwire(finalInvocationsLog, env.claudeVersion, env.codexVersion, log);
+    // B3a-2b-2 Task C 驗收缺口修正（缺口 4）：改用上面明確判定的
+    // `executionMode`（不是 `env.scenario` truthy）決定要走哪一套 tripwire
+    // 判定。`scenario-broken`（identity 遺失／型別錯誤／來源不一致）一律判
+    // 失敗，不得回退成 default 的 `judgeTripwire`（那套假設 codex 永遠只會
+    // 收到 `--version`，對 scenario 執行一定會誤判；反過來也不能誤用
+    // scenario 判定去查一個其實是 default 的 run）。
+    if (executionMode.kind === 'scenario') {
+      tripwireViolations = judgeScenarioCliCalls(finalInvocationsLog, log);
+    } else if (executionMode.kind === 'default') {
+      tripwireViolations = judgeTripwire(finalInvocationsLog, env.claudeVersion, env.codexVersion, log);
+    } else {
+      tripwireViolations = [`scenario identity 判定失敗，無法安全選擇 tripwire 判定方式：${executionMode.reason}`];
+      log.log(`tripwire 判定略過（identity 壞掉，fail closed）：${executionMode.reason}`);
+    }
   } catch (e) {
     tripwireViolations = [`invocations.log 缺失或無法讀取：${String(e)}`];
     log.log(`tripwire 判定失敗：${String(e)}`);

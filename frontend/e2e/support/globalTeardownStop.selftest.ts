@@ -422,6 +422,69 @@ async function main(): Promise<void> {
     fs.rmSync(artifactsRoot, { recursive: true, force: true });
   });
 
+  // 阻擋缺陷修正（B3a-2b-2 Task C）：舊版 `determineExecutionMode` 在
+  // execution-entry.json 落地內容為 JSON `null` 時，對 `marker.entry` 的
+  // property access 會直接拋出未捕捉的 TypeError；而舊版 global-teardown.ts
+  // 在呼叫這個判定「之前」都還沒呼叫 `runtime.processTree.stop()`——兩個
+  // 缺陷疊加，會讓已擁有的程序完全不會被停（stopCalls=0）就整個中止。
+  // 這裡用真正的 `globalTeardown()` 公開入口（不是只測
+  // `determineExecutionMode` 回傳什麼字串）＋可控的 stop stub，驗證修正後：
+  //   (1) identity 壞掉時 stop() 仍然被呼叫且等它跑完；
+  //   (2) 最終結果仍然是失敗（不是被吞掉變成 PASSED）。
+  await check('（阻擋缺陷修正）execution-entry.json 為 JSON null（壞掉的 identity）→ stop() 仍被呼叫並等待完成，且最終結果為失敗', async () => {
+    const { artifactsRoot, artifactsDir } = freshArtifactsDir();
+    const toolsDir = path.join(artifactsRoot, 'tools');
+    fs.mkdirSync(toolsDir, { recursive: true });
+    fs.writeFileSync(path.join(toolsDir, 'invocations.log'), '');
+    // workspaceDir 刻意跟 artifactsDir 分開：global-teardown.ts 第 4 節會對
+    // workspaceDir 做 `fs.rmSync(..., { recursive: true })`，如果沿用
+    // artifactsDir 會把整個證據目錄（含 harness.log）一起刪掉，後續
+    // log.log() 就會因為目錄消失而 ENOENT——這是測試 fixture 設置的問題，
+    // 不是待驗證的缺陷，需要分開避免污染斷言。
+    const workspaceDir = path.join(artifactsRoot, 'workspace');
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    writeRunState(artifactsDir, { status: 'ready', failureStage: undefined });
+    // 壞掉的 identity：execution-entry.json 落地內容是合法 JSON，但值是
+    // `null`，不是預期的物件——這是 controller 實測重現的具體反例。
+    fs.writeFileSync(path.join(artifactsDir, 'execution-entry.json'), 'null');
+    resetRuntime(artifactsDir);
+    process.env.E2E_RUN_ID = 'fake-run';
+    process.env.E2E_ARTIFACTS_DIR = artifactsDir;
+    process.env.E2E_WORKSPACE_DIR = workspaceDir;
+    process.env.E2E_TOOLS_DIR = toolsDir;
+    process.env.E2E_GLOSSARY_PATH = path.join(workspaceDir, 'glossary.md');
+    process.env.E2E_CLAUDE_VERSION = 'x';
+    process.env.E2E_CODEX_VERSION = 'x';
+    process.env.E2E_BASE_URL = 'http://127.0.0.1:1';
+    const fake = delayedStop(30, {
+      clean: true, residualPids: [], abandonedPids: [], unconfirmedPids: [],
+      observationFailed: false, diagnosticWriteFailed: false, portsReleased: true, residualPorts: [],
+    });
+    runtime.processTree = fake as unknown as typeof runtime.processTree;
+    try {
+      const { error, signalCalls } = await withKillGuard(() => globalTeardown());
+      assert.ok(error, '壞掉的 identity 不得讓 globalTeardown 判成 PASSED，必須 reject');
+      assert.match(
+        String(error),
+        /tripwire violations.*scenario identity 判定失敗/,
+        `最終失敗原因應包含 tripwire／scenario identity 判定失敗，實際：${String(error)}`,
+      );
+      assert.equal(signalCalls, 0, '這個測項不涉及純檔案 kill 路徑，不應呼叫 process.kill');
+      assert.equal(fake.calls, 1, 'stop() 應該恰好被呼叫一次（壞掉的 identity 不得阻止已擁有程序的 bounded stop）');
+      assert.ok(fake.resolved, 'globalTeardown 返回前 stop() 應該已經 resolve（真的等完，不是提前中止）');
+    } finally {
+      delete process.env.E2E_RUN_ID;
+      delete process.env.E2E_ARTIFACTS_DIR;
+      delete process.env.E2E_WORKSPACE_DIR;
+      delete process.env.E2E_TOOLS_DIR;
+      delete process.env.E2E_GLOSSARY_PATH;
+      delete process.env.E2E_CLAUDE_VERSION;
+      delete process.env.E2E_CODEX_VERSION;
+      delete process.env.E2E_BASE_URL;
+    }
+    fs.rmSync(artifactsRoot, { recursive: true, force: true });
+  });
+
   console.log(`\n共 ${passed} 項通過`);
 }
 

@@ -74,7 +74,10 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
 </script>
 
 <template>
-  <div class="pane" :class="{ focused }" :data-test="'pane-' + idx" @click="s.setFocus(idx)">
+  <!-- B3a-2b-2 Task C 驗收缺口修正（缺口 1）：`data-test-wsid` 是純測試用
+       屬性（既有的 `wsid` computed 值，不新增任何行為），讓 e2e spec 能把
+       「新內容泡泡」的搜尋範圍限定在同一個 WSID 的 pane 內，不是全頁搜尋。 -->
+  <div class="pane" :class="{ focused }" :data-test="'pane-' + idx" :data-test-wsid="wsid" @click="s.setFocus(idx)">
     <div v-if="!wsid" class="empty">{{ t('dualPane.empty') }}</div>
     <template v-else>
       <div class="head">
@@ -91,10 +94,10 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
         </div>
       </div>
       <div v-if="focused" class="composer" data-test="composer">
-        <textarea v-model="draft" rows="2" :disabled="meta?.busy"
+        <textarea v-model="draft" rows="2" :disabled="meta?.busy" data-test="composer-textarea"
           :placeholder="t('chat.input.placeholder')"
           @keydown.enter.exact.prevent="send" @click.stop />
-        <button :disabled="meta?.busy || !draft.trim()" @click.stop="send">{{ t('chat.action.send') }}</button>
+        <button :disabled="meta?.busy || !draft.trim()" data-test="composer-send" @click.stop="send">{{ t('chat.action.send') }}</button>
       </div>
     </template>
   </div>

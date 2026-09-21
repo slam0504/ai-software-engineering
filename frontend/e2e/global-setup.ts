@@ -44,6 +44,20 @@ function sleep(ms: number): Promise<void> {
 }
 
 export default async function globalSetup(): Promise<void> {
+  // B3a-2b-2 Task C 裁定：default（test:e2e）／controls（test:e2e:controls）
+  // 這兩條入口共用本檔，一律禁止 E2E_SCENARIO——scenario 專屬情境只走
+  // playwright.scenario.config.ts（global-setup.scenario.ts），不得靜默
+  // 忽略、也不得在這兩條入口下被意外啟用。
+  // B3a-2b-2 Task C 驗收缺口修正（缺口 4）：先前用 `if (process.env.E2E_SCENARIO)`
+  // truthy 判斷——`E2E_SCENARIO=''`（空字串）會被 truthy 檢查放過，靜默流入
+  // default／controls 入口。改成用「這個變數是否存在」判斷，空字串也算「設定
+  // 了但無效」，一律拒絕，不回退成「當作沒設定」。
+  if ('E2E_SCENARIO' in process.env) {
+    throw new Error(
+      `globalSetup: E2E_SCENARIO=${JSON.stringify(process.env.E2E_SCENARIO)} 對 default／controls 入口無效且被禁止——`
+      + 'scenario 執行請改用 npm run test:e2e:scenario（playwright.scenario.config.ts）',
+    );
+  }
   const runId = process.env.E2E_RUN_ID;
   const artifactsDir = process.env.E2E_ARTIFACTS_DIR;
   if (!runId || !artifactsDir) {
@@ -60,6 +74,12 @@ export default async function globalSetup(): Promise<void> {
   runtime.artifactsRoot = artifactsRoot;
   runtime.setupPid = process.pid;
   log.log(`globalSetup 開始：runId=${runId} pid=${process.pid} repoRoot=${repoRoot}`);
+
+  // B3a-2b-2 Task C 第三輪限縮補正（缺陷 1）：入口標記——globalTeardown 的
+  // `determineExecutionMode` 用這個檔案正面判定「這次執行是從哪個入口啟動
+  // 的」，不再從（可能被竄改／型別錯誤／缺漏的）scenario identity 欄位反推。
+  // 寫在最開頭（任何預檢／spawn 之前），即使後面失敗也留得下這份標記。
+  fs.writeFileSync(path.join(artifactsDir, 'execution-entry.json'), JSON.stringify({ entry: 'default' }, null, 2));
 
   if (userFlags.injectPsFailure()) { // N12 注入點：讓 ps／lsof 指向會失敗的替身
     const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a1-fake-ps-'));

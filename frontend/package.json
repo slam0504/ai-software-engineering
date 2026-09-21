@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:e2e": "node e2e/scripts/run-e2e.mjs e2e/playwright.config.ts",
     "test:e2e:controls": "node e2e/scripts/run-e2e.mjs e2e/playwright.controls.config.ts",
+    "test:e2e:scenario": "node e2e/scripts/run-e2e.mjs e2e/playwright.scenario.config.ts",
     "typecheck:e2e": "tsc --noEmit -p tsconfig.e2e.json",
     "selftest:artifact-integrity": "node e2e/support/artifactIntegrity.selftest.ts",
     "selftest:network-line-parser": "node e2e/support/networkLineParser.selftest.ts",
@@ -17,7 +18,11 @@
     "selftest:offline-sandbox": "node e2e/support/offlineSandbox.selftest.ts",
     "selftest:global-teardown-stop": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/globalTeardownStop.selftest.ts",
     "selftest:late-write-after-stop": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/lateWriteAfterStop.selftest.ts",
-    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop"
+    "selftest:scenario-verify": "node e2e/support/scenario/verify.selftest.ts",
+    "selftest:scenario-fake-app-server": "node e2e/support/scenario/fakeAppServer.selftest.ts",
+    "selftest:scenario-protocol-judge": "node e2e/support/scenario/scenarioProtocolJudge.selftest.ts",
+    "selftest:execution-mode": "node e2e/support/executionMode.selftest.ts",
+    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop && npm run selftest:scenario-verify && npm run selftest:scenario-fake-app-server && npm run selftest:scenario-protocol-judge && npm run selftest:execution-mode"
   },
   "dependencies": {
     "@codemirror/state": "^6.7.1",
