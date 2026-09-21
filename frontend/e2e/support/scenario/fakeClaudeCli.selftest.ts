@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { buildClaudeApprovalExpectation } from './claudeApprovalProtocol.ts';
+import { buildClaudeApprovalExpectation, buildClaudeRecoveryExpectation } from './claudeApprovalProtocol.ts';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -653,6 +653,14 @@ async function runCli(o: {
   name: string; mode: string;
   /** true＝用 F2 的 appStateDir policy（config/socket 落在模擬的 App stateDir）。 */
   appStateDir?: boolean;
+  /** B3a-2b-2 E1：兩輪 fixture（存在時取代頂層 approval/prompt）。 */
+  rounds?: unknown[];
+  /** 本次送進 stdin 的 prompt（預設單輪案的 PROMPT）。 */
+  prompt?: string;
+  /** 本次 argv 要帶的 resume（null＝fresh start）。 */
+  resume?: string | null;
+  /** 覆寫輪次登記目錄——兩輪測試讓兩次啟動共用同一個（真實情形就是共用）。 */
+  roundDirOverride?: string;
   preCreate?: (evidenceDir: string) => void;
   afterStart?: (cli: ChildProcessWithoutNullStreams, pidOf: () => number | null,
     stageOf: () => string | null) => Promise<void>;
@@ -693,8 +701,11 @@ async function runCli(o: {
   }
   fs.writeFileSync(mcpConfigPath, renderMcpConfig(binReal, sockPath));
   const expectationPath = path.join(runDir, 'expectation.json');
+  const roundsPart = o.rounds === undefined
+    ? { approval: EXP, prompt: PROMPT }
+    : { rounds: o.rounds };
   fs.writeFileSync(expectationPath, JSON.stringify({
-    approval: EXP, prompt: PROMPT,
+    ...roundsPart,
     mcpConfigPolicy: configPolicy,
     mcp: { commandPath: binReal, commandSha256: binSha, socket: socketPolicy },
     timeoutMs: 4000, stdinTimeoutMs: 4000, settleMs: 120, drainMs: 2000,
@@ -702,18 +713,25 @@ async function runCli(o: {
     grace: { pipeWaitMs: 400, termWaitMs: 2500, killWaitMs: 1000 },
   }, null, 2));
 
+  // 輪次登記目錄：正式流程由 wrapper（claudeScenarioCli）建立並烤入 env，這裡
+  // 由測試自己建一個 run 專屬的空目錄，等價地提供排他 claim 的所在。
+  const roundDir = o.roundDirOverride ?? path.join(runDir, 'rounds');
+  fs.mkdirSync(roundDir, { recursive: true });
+
   o.preCreate?.(evidenceDir);
 
-  const cli = spawn(process.execPath, [CLI_PATH, ...expectedConversationArgv({ mcpConfigPath })], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { PATH: process.env.PATH ?? '', FAKE_CLAUDE_EVIDENCE_DIR: evidenceDir,
-      FAKE_CLAUDE_EXPECTATION: expectationPath, FAKE_CLAUDE_MCP_CONFIG: mcpConfigPath },
-  }) as ChildProcessWithoutNullStreams;
+  const cli = spawn(process.execPath,
+    [CLI_PATH, ...expectedConversationArgv({ mcpConfigPath, resume: o.resume ?? null })], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH ?? '', FAKE_CLAUDE_EVIDENCE_DIR: evidenceDir,
+        FAKE_CLAUDE_EXPECTATION: expectationPath, FAKE_CLAUDE_MCP_CONFIG: mcpConfigPath,
+        FAKE_CLAUDE_ROUND_DIR: roundDir },
+    }) as ChildProcessWithoutNullStreams;
   let stdout = ''; let stderr = '';
   cli.stdout.setEncoding('utf8'); cli.stdout.on('data', (c: string) => { stdout += c; });
   cli.stderr.setEncoding('utf8'); cli.stderr.on('data', (c: string) => { stderr += c; });
   // **stdin 寫入首行後刻意保持開啟**（真 App MultiTurn=true 就是這樣）。
-  cli.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: PROMPT }] } })}\n`);
+  cli.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: o.prompt ?? PROMPT }] } })}\n`);
 
   const pidOf = (): number | null => {
     try { return Number(fs.readFileSync(pidFile, 'utf8').trim()); } catch { return null; }
@@ -901,6 +919,262 @@ await acheck('CLI main：必要證據寫入失敗（judgement.json 為目錄 →
   } finally {
     await reapIfAlive('eisdir', run?.mockPid ?? null);
   }
+});
+
+// ---------------------------------------------------------------------------
+// B3a-2b-2 E1：兩輪 start → resume 的 CLI main runtime 控制
+//
+// ⚠️ 同上，MCP 子程序是本檔控制的 synthetic mock，**不是**真 workbench binary；
+// 這一層證明的是「輪次 claim／證據隔離／resume argv」這些 CLI 端行為，不構成
+// 真 App／真 broker 的驗收。
+// ---------------------------------------------------------------------------
+const REC = buildClaudeRecoveryExpectation('20260921T000000Z-e1test');
+const REC_ROUNDS = REC.rounds as unknown as unknown[];
+/** 依輪次組出 runCli 需要的參數（prompt／resume 都來自固定 builder）。 */
+function roundArgs(k: number): { rounds: unknown[]; prompt: string; resume: string | null } {
+  return { rounds: REC_ROUNDS, prompt: REC.rounds[k].prompt, resume: REC.rounds[k].resume };
+}
+
+await acheck('CLI main 兩輪正控制：第一輪 fresh、第二輪 --resume S，兩輪證據各自獨立且不互相覆寫', async () => {
+  const name = 'rounds-ok';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  let r1: CliRun | null = null; let r2: CliRun | null = null;
+  try {
+    r1 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(0) });
+    assert.equal(r1.code, 0, `第一輪應成功｜stderr=${r1.stderr}`);
+    assert.ok(r1.stdout.includes(REC.rounds[0].approval.completionText), r1.stdout);
+    assert.ok(!r1.stdout.includes(REC.rounds[1].approval.completionText), '第一輪不得送出第二輪內容');
+    // 第一輪的完成標記必須存在——第二輪的有序 claim 以它為準
+    assert.ok(fs.existsSync(path.join(roundDir, 'round-1', 'done.json')), '第一輪應留下完成標記');
+    assert.ok(!fs.existsSync(path.join(roundDir, 'round-2', 'done.json')), '第二輪此時尚未開始');
+  } finally {
+    await reapIfAlive(`${name}-r1`, r1?.mockPid ?? null);
+  }
+  try {
+    r2 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(1) });
+    assert.equal(r2.code, 0, `第二輪應成功｜stderr=${r2.stderr}`);
+    assert.ok(r2.stdout.includes(REC.rounds[1].approval.completionText), r2.stdout);
+  } finally {
+    await reapIfAlive(`${name}-r2`, r2?.mockPid ?? null);
+  }
+  // 兩輪證據目錄各自完整，且**內容不同**
+  const ev = r1.evidenceDir;
+  for (const n of ['round-1', 'round-2']) {
+    for (const f of ['round.json', 'init.json', 'argv.json', 'judgement.json',
+      'mcp-transcript.json', 'mcp-child.json', 'mcp-config.path.txt']) {
+      assert.ok(fs.existsSync(path.join(ev, n, f)), `${n}/${f} 應存在`);
+    }
+    const j = JSON.parse(fs.readFileSync(path.join(ev, n, 'judgement.json'), 'utf8')) as { problems: string[] };
+    assert.deepEqual(j.problems, [], `${n} 判定應無問題`);
+  }
+  const a1 = JSON.parse(fs.readFileSync(path.join(ev, 'round-1', 'argv.json'), 'utf8')) as string[];
+  const a2 = JSON.parse(fs.readFileSync(path.join(ev, 'round-2', 'argv.json'), 'utf8')) as string[];
+  assert.ok(!a1.includes('--resume'), '第一輪 argv 不得有 --resume');
+  assert.deepEqual(a2.slice(a2.length - 2), ['--resume', REC.sessionId], '第二輪 argv 尾端應為 --resume S');
+  const i1 = JSON.parse(fs.readFileSync(path.join(ev, 'round-1', 'init.json'), 'utf8')) as { sessionId: string };
+  assert.equal(i1.sessionId, REC.sessionId, '第一輪 init 宣告的 session id 必須等於核定 S');
+  const c1 = JSON.parse(fs.readFileSync(path.join(ev, 'round-1', 'mcp-child.json'), 'utf8')) as Record<string, number>;
+  const c2 = JSON.parse(fs.readFileSync(path.join(ev, 'round-2', 'mcp-child.json'), 'utf8')) as Record<string, number>;
+  assert.notEqual(c1.selfPid, c2.selfPid, '兩輪應是不同的 CLI 程序');
+  assert.notEqual(c1.observedPid, c2.observedPid, '兩輪應是不同的 MCP 子程序');
+  // **第三次**對話啟動必須被拒，且不得覆寫前兩輪證據
+  const before = ['round-1', 'round-2'].map(n =>
+    fs.readFileSync(path.join(ev, n, 'judgement.json'), 'utf8'));
+  let r3: CliRun | null = null;
+  try {
+    r3 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(1) });
+    assert.notEqual(r3.code, 0, '第三次對話啟動必須非零退出');
+    assert.ok(r3.stderr.includes('核定 2 輪'), r3.stderr);
+    assert.ok(!r3.stdout.includes(REC.rounds[1].approval.completionText), '第三次不得送完成內容');
+  } finally {
+    await reapIfAlive(`${name}-r3`, r3?.mockPid ?? null);
+  }
+  const after = ['round-1', 'round-2'].map(n =>
+    fs.readFileSync(path.join(ev, n, 'judgement.json'), 'utf8'));
+  assert.deepEqual(after, before, '第三次呼叫不得改動前兩輪的證據');
+});
+
+await acheck('CLI main 兩輪：第二輪**沒帶 --resume** 必須被拒（不得當成重跑第一輪）', async () => {
+  const name = 'rounds-noresume';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  let r1: CliRun | null = null; let r2: CliRun | null = null;
+  try {
+    r1 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(0) });
+    assert.equal(r1.code, 0, r1.stderr);
+  } finally { await reapIfAlive(`${name}-r1`, r1?.mockPid ?? null); }
+  try {
+    r2 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir,
+      rounds: REC_ROUNDS, prompt: REC.rounds[1].prompt, resume: null });
+    assert.equal(r2.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r2.stderr}`);
+    assert.ok(r2.stderr.includes('argv 卻沒有 --resume'), r2.stderr);
+  } finally { await reapIfAlive(`${name}-r2`, r2?.mockPid ?? null); }
+});
+
+await acheck('CLI main 兩輪：**第一輪就帶 --resume** 必須被拒', async () => {
+  const name = 'rounds-earlyresume';
+  let r: CliRun | null = null;
+  try {
+    r = await runCli({ name, mode: 'allow', appStateDir: true,
+      rounds: REC_ROUNDS, prompt: REC.rounds[0].prompt, resume: REC.sessionId });
+    assert.equal(r.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r.stderr}`);
+    assert.ok(r.stderr.includes('不得含 --resume'), r.stderr);
+  } finally { await reapIfAlive(name, r?.mockPid ?? null); }
+});
+
+await acheck('CLI main 兩輪：第一輪**尚未完成**就啟動第二輪必須被拒（有序性）', async () => {
+  const name = 'rounds-unordered';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  fs.mkdirSync(path.join(roundDir, 'round-1'), { recursive: true }); // claim 已被占，但沒有 done.json
+  let r: CliRun | null = null;
+  try {
+    r = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(1) });
+    assert.equal(r.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r.stderr}`);
+    assert.ok(r.stderr.includes('尚未留下完成標記'), r.stderr);
+  } finally { await reapIfAlive(name, r?.mockPid ?? null); }
+});
+
+await acheck('CLI main 兩輪：第二輪的證據目錄**已存在**（植入第一輪證據冒充）必須被拒', async () => {
+  const name = 'rounds-planted';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  let r1: CliRun | null = null; let r2: CliRun | null = null;
+  try {
+    r1 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(0) });
+    assert.equal(r1.code, 0, r1.stderr);
+  } finally { await reapIfAlive(`${name}-r1`, r1?.mockPid ?? null); }
+  // 把第一輪的證據原封不動複製成 round-2
+  const ev = r1.evidenceDir;
+  fs.cpSync(path.join(ev, 'round-1'), path.join(ev, 'round-2'), { recursive: true });
+  const planted = fs.readFileSync(path.join(ev, 'round-2', 'argv.json'), 'utf8');
+  const beforeTree = hashTree(ev);
+  try {
+    r2 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir, ...roundArgs(1) });
+    assert.equal(r2.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r2.stderr}`);
+    assert.ok(r2.stderr.includes('不得覆寫'), r2.stderr);
+  } finally { await reapIfAlive(`${name}-r2`, r2?.mockPid ?? null); }
+  assert.equal(fs.readFileSync(path.join(ev, 'round-2', 'argv.json'), 'utf8'), planted,
+    '被拒之後不得覆寫植入的內容（失敗必須留原樣供追查）');
+  assert.deepEqual(hashTree(ev), beforeTree,
+    '被植入目錄拒絕時，第一輪證據與被植入的內容都必須逐 byte 不變（reviewer #393 P1-2）');
+});
+
+await acheck('CLI main 單輪（既有契約）：**第二次**對話啟動必須被拒，恰一次', async () => {
+  const name = 'single-twice';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  let r1: CliRun | null = null; let r2: CliRun | null = null;
+  try {
+    r1 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir });
+    assert.equal(r1.code, 0, r1.stderr);
+    // 單輪案的證據仍寫在 evidenceDir 本身（既有版面不變）
+    assert.ok(fs.existsSync(path.join(r1.evidenceDir, 'judgement.json')), '單輪證據版面不得改變');
+    assert.ok(!fs.existsSync(path.join(r1.evidenceDir, 'round-1')), '單輪案不得產生 round-1 子目錄');
+  } finally { await reapIfAlive(`${name}-r1`, r1?.mockPid ?? null); }
+  const rootBefore = hashTree(r1.evidenceDir);
+  try {
+    r2 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir });
+    assert.equal(r2.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r2.stderr}`);
+    assert.ok(r2.stderr.includes('核定 1 輪'), r2.stderr);
+  } finally { await reapIfAlive(`${name}-r2`, r2?.mockPid ?? null); }
+  // 第二次啟動被拒之後，第一輪留在根目錄的既有證據必須逐 byte 不變
+  const after = hashTree(r1.evidenceDir);
+  for (const k of Object.keys(rootBefore)) {
+    assert.equal(after[k], rootBefore[k], `第二次啟動不得改動既有證據：${k}`);
+  }
+});
+
+await acheck('CLI main：缺 FAKE_CLAUDE_ROUND_DIR 必須 fail closed（不自行補建、不失去排他性）', async () => {
+  const runDir = path.join(cliRoot, 'no-rounddir');
+  const evidenceDir = path.join(runDir, 'evidence');
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  const expectationPath = path.join(runDir, 'expectation.json');
+  fs.writeFileSync(expectationPath, JSON.stringify({ approval: EXP, prompt: PROMPT,
+    mcpConfigPolicy: { kind: 'fixed', path: '/nope.json' },
+    mcp: { commandPath: '/nope', commandSha256: 'x', socket: { kind: 'fixed', path: '/nope.sock' } } }));
+  const cli = spawn(process.execPath,
+    [CLI_PATH, ...expectedConversationArgv({ mcpConfigPath: '/nope.json' })], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH ?? '', FAKE_CLAUDE_EVIDENCE_DIR: evidenceDir,
+        FAKE_CLAUDE_EXPECTATION: expectationPath },
+    }) as ChildProcessWithoutNullStreams;
+  let stderr = '';
+  cli.stderr.setEncoding('utf8'); cli.stderr.on('data', (c: string) => { stderr += c; });
+  cli.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: PROMPT }] } })}\n`);
+  const code = await withDeadline(new Promise<number | null>(res => { cli.once('exit', c => res(c)); }), 10000);
+  try { cli.stdin.end(); } catch { /* 已關 */ }
+  assert.equal(code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${stderr}`);
+  assert.ok(stderr.includes('FAKE_CLAUDE_ROUND_DIR'), stderr);
+});
+
+
+/**
+ * 目錄快照（遞迴，路徑 → sha256），**略過 `unowned-` 開頭的診斷目錄**——
+ * 那是失敗路徑排他新建的落點，本來就會新增；要驗的是「既有證據沒被改動」。
+ */
+function hashTree(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (d: string, rel: string): void => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory() && e.name.startsWith('unowned-')) continue;
+      const p = path.join(d, e.name);
+      const r = rel === '' ? e.name : `${rel}/${e.name}`;
+      if (e.isDirectory()) walk(p, r);
+      else out[r] = crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    }
+  };
+  walk(dir, '');
+  return out;
+}
+
+await acheck('P1-2：單輪既有證據 ＋ 第二次啟動目錄 EEXIST，既有證據必須逐 byte 不變', async () => {
+  const name = 'legacy-eexist';
+  const roundDir = path.join(cliRoot, name, 'shared-rounds');
+  let r1: CliRun | null = null; let r2: CliRun | null = null;
+  try {
+    r1 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir });
+    assert.equal(r1.code, 0, r1.stderr);
+  } finally { await reapIfAlive(`${name}-r1`, r1?.mockPid ?? null); }
+  // 先把第二輪的目錄佔掉，讓第二次啟動在「取得專屬位置」之前就失敗
+  fs.mkdirSync(path.join(r1.evidenceDir, 'round-2'));
+  fs.writeFileSync(path.join(r1.evidenceDir, 'round-2', 'planted.txt'), 'PLANTED\n');
+  const before = hashTree(r1.evidenceDir);
+  try {
+    r2 = await runCli({ name, mode: 'allow', appStateDir: true, roundDirOverride: roundDir });
+    assert.equal(r2.code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${r2.stderr}`);
+    assert.ok(r2.stderr.includes('不得覆寫'), r2.stderr);
+  } finally { await reapIfAlive(`${name}-r2`, r2?.mockPid ?? null); }
+  assert.deepEqual(hashTree(r1.evidenceDir), before,
+    '失敗路徑不得改動任何既有證據（含根目錄的 judgement.json／argv.json 與被植入的 round-2）');
+  // 診斷必須另外落在排他新建的位置，不是消失
+  const unowned = fs.readdirSync(r1.evidenceDir).filter(x => x.startsWith('unowned-'));
+  assert.equal(unowned.length, 1, `應恰有一個排他新建的診斷目錄：${JSON.stringify(unowned)}`);
+  assert.ok(fs.existsSync(path.join(r1.evidenceDir, unowned[0], 'failure.json')), '診斷必須留下');
+});
+
+await acheck('P1-2：缺 ROUND_DIR ＋ 已存在證據時，既有證據必須逐 byte 不變', async () => {
+  const runDir = path.join(cliRoot, 'no-rounddir-preexisting');
+  const evidenceDir = path.join(runDir, 'evidence');
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, 'judgement.json'), '{\n  "problems": [\n    "PREEXISTING"\n  ]\n}\n');
+  fs.writeFileSync(path.join(evidenceDir, 'argv.json'), '["PREEXISTING"]\n');
+  const before = hashTree(evidenceDir);
+  const expectationPath = path.join(runDir, 'expectation.json');
+  fs.writeFileSync(expectationPath, JSON.stringify({ approval: EXP, prompt: PROMPT,
+    mcpConfigPolicy: { kind: 'fixed', path: '/nope.json' },
+    mcp: { commandPath: '/nope', commandSha256: 'x', socket: { kind: 'fixed', path: '/nope.sock' } } }));
+  const cli = spawn(process.execPath,
+    [CLI_PATH, ...expectedConversationArgv({ mcpConfigPath: '/nope.json' })], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH ?? '', FAKE_CLAUDE_EVIDENCE_DIR: evidenceDir,
+        FAKE_CLAUDE_EXPECTATION: expectationPath },
+    }) as ChildProcessWithoutNullStreams;
+  let stderr = '';
+  cli.stderr.setEncoding('utf8'); cli.stderr.on('data', (c: string) => { stderr += c; });
+  cli.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: PROMPT }] } })}\n`);
+  const code = await withDeadline(new Promise<number | null>(res => { cli.once('exit', c => res(c)); }), 10000);
+  try { cli.stdin.end(); } catch { /* 已關 */ }
+  assert.equal(code, 19, `應為 EXIT_CONTRACT_VIOLATION=19｜stderr=${stderr}`);
+  assert.deepEqual(hashTree(evidenceDir), before, 'claim 失敗不得改動既有證據');
+  const unowned = fs.readdirSync(evidenceDir).filter(x => x.startsWith('unowned-'));
+  assert.equal(unowned.length, 1, `應恰有一個排他新建的診斷目錄：${JSON.stringify(unowned)}`);
 });
 
 // ledger 寫在**本次 mkdtemp 目錄內**——寫死共用路徑會讓不同人的驗證互相覆寫

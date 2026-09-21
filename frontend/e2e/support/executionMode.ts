@@ -53,6 +53,9 @@ const REQUIRED_SCENARIO_FIELDS = [
 const REQUIRED_CLAUDE_FIELDS = [
   'claudeExpectationPath', 'claudeEvidenceDir',
   'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir',
+  // B3a-2b-2 E1：輪次登記目錄。單輪與兩輪案都必填——少了它，假 CLI 就沒有
+  // 排他的輪次來源，「恰一次」與「恰兩輪」兩種契約都會失去依據。
+  'claudeRoundDir',
 ] as const satisfies ReadonlyArray<keyof RunEnv>;
 
 // 十個 identity 欄位：scenario 本身＋上面九個（Codex 案）。
@@ -65,7 +68,10 @@ export type ExecutionMode =
   | { kind: 'default' }
   // provider：B3a-2b-2 F2——**由已驗證的 identity 決定**，teardown 不得另外
   // 用「解析失敗就當 codex」這種 fallback 取得（reviewer #367）。
-  | { kind: 'scenario'; provider: 'codex' | 'claude'; scenario: ScenarioRunEnvLike }
+  // scenarioKind：B3a-2b-2 E1——tripwire 的**預期對話輪數**必須由已驗證的
+  // scenario identity 決定，不能從觀測到的呼叫數反推。與 provider 同一來源
+  // （登記表），同樣在未知／不一致時 fail closed。
+  | { kind: 'scenario'; provider: 'codex' | 'claude'; scenarioKind: 'approval' | 'recovery'; scenario: ScenarioRunEnvLike }
   | { kind: 'scenario-broken'; reason: string };
 
 function isNonEmptyString(v: unknown): v is string {
@@ -156,8 +162,11 @@ export function determineExecutionMode(env: RunEnv, artifactsDir: string, log: H
     return { kind: 'scenario-broken', reason };
   }
   let provider: 'codex' | 'claude';
+  let scenarioKind: 'approval' | 'recovery';
   try {
-    provider = resolveScenario(scenarioName).provider;
+    const def = resolveScenario(scenarioName);
+    provider = def.provider;
+    scenarioKind = def.kind;
   } catch (e) {
     const reason = `無法由 scenario 名稱決定 provider（未知或未登記）：${String(e instanceof Error ? e.message : e)}`;
     log.log(`determineExecutionMode：${reason}`);
@@ -187,5 +196,5 @@ export function determineExecutionMode(env: RunEnv, artifactsDir: string, log: H
     return { kind: 'scenario-broken', reason };
   }
 
-  return { kind: 'scenario', provider, scenario: env as ScenarioRunEnvLike };
+  return { kind: 'scenario', provider, scenarioKind, scenario: env as ScenarioRunEnvLike };
 }

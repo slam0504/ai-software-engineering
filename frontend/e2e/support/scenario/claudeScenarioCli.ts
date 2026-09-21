@@ -21,6 +21,8 @@ export interface ClaudeScenarioCliPaths {
 }
 
 export interface ClaudeScenarioCli extends ClaudeScenarioCliPaths {
+  /** 本次 run 專屬的輪次登記目錄（排他 claim 的所在，見 fakeClaudeCli claimConversationRound）。 */
+  roundDir: string;
   /** wrapper 的實際路徑，與 app.go claudeCLIPathIn(toolsDir) 的版面相同。 */
   claudeBin: string;
   claudeVersion: string;
@@ -59,6 +61,11 @@ export function createScenarioClaudeCli(
   // **不對 wrapper 的 printf %q 輸出拆字**——那種拆法對含空白的 --settings
   // 值不可靠，也看不出重複旗標／多餘 positional。
   const argvLog = path.join(toolsDir, 'claude-argv.jsonl');
+  // 輪次登記目錄：**run 專屬**（跟著 toolsDir 一起新建），所以不會沿用上一次
+  // 執行的計數。由這裡先建好空目錄，假 CLI 只做非 recursive 的 mkdir——少了
+  // 這段接線就會 ENOENT 失敗，而不是自己補建、悄悄失去排他性。
+  const roundDir = path.join(toolsDir, 'claude-rounds');
+  fs.mkdirSync(roundDir, { recursive: true });
 
   const script = `#!/usr/bin/env bash
 # FAKE claude CLI（B3a-2b-2 F1b）— 絕不呼叫真 claude。
@@ -75,6 +82,7 @@ export FAKE_CLAUDE_EXPECTATION=${shellSingleQuote(paths.expectationPath)}
 export FAKE_CLAUDE_EVIDENCE_DIR=${shellSingleQuote(paths.evidenceDir)}
 export FAKE_CLAUDE_RUN_ID=${shellSingleQuote(runId)}
 export FAKE_CLAUDE_ARGV_LOG=${shellSingleQuote(argvLog)}
+export FAKE_CLAUDE_ROUND_DIR=${shellSingleQuote(roundDir)}
 exec node ${shellSingleQuote(fakeClaudeCliPath)} "$@"
 `;
   fs.writeFileSync(claudeBin, script);
@@ -83,7 +91,7 @@ exec node ${shellSingleQuote(fakeClaudeCliPath)} "$@"
   // 預檢的 snapshot/truncate 才能與 invocations.log 同階段處理（fakeCli.ts）。
   fs.writeFileSync(argvLog, '');
 
-  return { ...paths, claudeBin, claudeVersion, invocationsLog, argvLog };
+  return { ...paths, claudeBin, claudeVersion, invocationsLog, argvLog, roundDir };
 }
 
 /** 驅動端寫 mcp config 時使用的同一段字串組法（對齊 app.go startClaude 的格式）。 */

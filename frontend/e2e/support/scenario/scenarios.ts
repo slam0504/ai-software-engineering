@@ -133,6 +133,24 @@ const SCENARIOS: Record<string, ScenarioDef> = {
       );
     },
   },
+  // B3a-2b-2 E1：Claude 最小 recovery 檢查點——同一個 App、同一個 WSID／
+  // canonical cwd，第一輪 fresh start、第二輪由真 App 帶 `--resume S` 續聊，
+  // 兩輪都 allow。與上面那一案同樣**不使用 Codex wire 協定欄位**，`build()`
+  // 一樣會 throw；期望值來自 `buildClaudeRecoveryExpectation(runId)`
+  // （見 claudeApprovalProtocol.ts）。
+  'claude-approval-recovery': {
+    name: 'claude-approval-recovery',
+    provider: 'claude',
+    decision: 'accept',
+    kind: 'recovery',
+    build: () => {
+      throw new Error(
+        'scenarios: claude-approval-recovery 沒有 Codex wire 協定 config——'
+        + 'Claude recovery 案的期望值來自 buildClaudeRecoveryExpectation(runId)，'
+        + '呼叫到這裡代表誤用了 Codex 路徑處理 Claude 案',
+      );
+    },
+  },
 };
 
 export function resolveScenario(name: string | undefined): ScenarioDef {

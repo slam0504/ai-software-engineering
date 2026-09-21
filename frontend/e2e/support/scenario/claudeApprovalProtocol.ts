@@ -73,3 +73,63 @@ export function buildClaudeApprovalExpectation(runId: string): ClaudeApprovalExp
     completionText: `b3a2b2-claude-content-${runId}`,
   };
 }
+
+// ---------------------------------------------------------------------------
+// B3a-2b-2 E1（Claude recovery 最小檢查點）：兩輪 start → resume 的期望。
+//
+// **與上面的單輪 builder 完全分開，不改它**：F1a／F2 既有的單輪契約（恰一次
+// 對話呼叫、argv 不得含 --resume）原樣保留，本段只新增兩輪案專用的期望。
+//
+// Claude 的 resume 身分與 Codex 不同：resume id 不是 App 自己造的 threadId，
+// 而是**CLI 在 init 事件自己宣告**、再由 App 綁進 registry（app.go:7504
+// registry.Bind ／ commitClaudeResume → wsReg.SetResume）。因此兩輪共用同一個
+// sessionId S：第一輪由假 CLI 宣告 S，第二輪必須由真 App 以 `--resume S` 帶回。
+// **S 只能來自這個固定 builder**，不得從第二輪的待驗 argv 反填。
+// ---------------------------------------------------------------------------
+
+/** 一輪對話的完整期望。 */
+export interface ClaudeRoundExpectation {
+  /** 1-based 輪次；與排他 claim 取得的輪次必須一致。 */
+  round: number;
+  /** 本輪 stdin 首行的 user text（逐字比對）。 */
+  prompt: string;
+  /** null＝fresh start（argv 不得出現 --resume）；字串＝argv 必須恰好帶 `--resume <值>`。 */
+  resume: string | null;
+  /** 本輪的 approval／完成內容期望。 */
+  approval: ClaudeApprovalExpectation;
+}
+
+export interface ClaudeRecoveryExpectation {
+  /** 兩輪共用的 provider session id（第一輪宣告、第二輪 resume）。 */
+  sessionId: string;
+  rounds: ClaudeRoundExpectation[];
+}
+
+/**
+ * 受版控 builder：同一個 runId 永遠得到同一份兩輪期望。
+ *
+ * 兩輪刻意**每一項可辨識內容都不同**（prompt／inputMarker／input／完成文字），
+ * 只有 sessionId 相同——這樣「沿用第一輪證據冒充第二輪」在任何一個欄位上都會
+ * 當場露餡。
+ */
+export function buildClaudeRecoveryExpectation(runId: string): ClaudeRecoveryExpectation {
+  const sessionId = `b3a2b2-claude-session-${runId}`;
+  const round = (n: number, resume: string | null): ClaudeRoundExpectation => {
+    const marker = `b3a2b2-claude-approval-r${n}-${runId}`;
+    return {
+      round: n,
+      prompt: `b3a2b2-claude-prompt-r${n}-${runId}`,
+      resume,
+      approval: {
+        sessionId,
+        initializeRequestId: 1,
+        toolCallRequestId: 2,
+        toolName: 'Bash',
+        inputMarker: marker,
+        input: { command: `printf '%s' ${marker}` },
+        completionText: `b3a2b2-claude-content-r${n}-${runId}`,
+      },
+    };
+  };
+  return { sessionId, rounds: [round(1, null), round(2, sessionId)] };
+}

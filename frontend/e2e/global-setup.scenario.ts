@@ -37,7 +37,7 @@ import { handleStaleRun, StaleRunConflictError } from './support/staleRun.js';
 import { createScenarioCodexCli } from './support/scenario/scenarioCli.js';
 import { createFakeCliSet } from './support/fakeCli.js';
 import { createScenarioClaudeCli } from './support/scenario/claudeScenarioCli.js';
-import { buildClaudeApprovalExpectation } from './support/scenario/claudeApprovalProtocol.js';
+import { buildClaudeApprovalExpectation, buildClaudeRecoveryExpectation } from './support/scenario/claudeApprovalProtocol.js';
 import { handleClaudeSetupFailure } from './support/scenario/claudeSetupFailure.js';
 import { resolveAppBinaryIdentity } from './support/scenario/appBinaryIdentity.js';
 import { resolveScenario } from './support/scenario/scenarios.js';
@@ -149,6 +149,9 @@ export default async function globalSetupScenario(): Promise<void> {
   const claudeExpectationPath = path.join(artifactsDir, 'claude-expectation.json');
   const claudeEvidenceDir = path.join(artifactsDir, 'claude-evidence');
   const claudePrompt = `b3a2b2-claude-prompt-${runId}`;
+  // 輪次登記目錄：由 createScenarioClaudeCli 建立並烤進 wrapper，這裡接住它的
+  // 實際值再寫進 run-env——spec 與 teardown 都要能拿到**與 argv 無關**的輪次事實。
+  let claudeRoundDir = '';
   let cli: ReturnType<typeof createScenarioCodexCli> | (ReturnType<typeof createFakeCliSet> & { scenarioManifestPath?: string });
   let scenarioName: string;
   let scenarioConfig: ReturnType<typeof scenarioDef.build> | null = null;
@@ -170,6 +173,7 @@ export default async function globalSetupScenario(): Promise<void> {
       expectationPath: claudeExpectationPath,
       evidenceDir: claudeEvidenceDir,
     });
+    claudeRoundDir = claudeSet.roundDir;
     cli = { ...base, claudeVersion: claudeSet.claudeVersion };
     log.log(`scenario claude CLI 建立完成：${toolsDir}（scenario=${scenarioName}）`);
   } else {
@@ -285,7 +289,7 @@ export default async function globalSetupScenario(): Promise<void> {
     // 都必須走既有的失敗收尾路徑——標記 failed、保存 harness.log、停止本次
     // 程序，不能只 throw 讓 globalTeardown 去猜（reviewer #367）。
     try {
-      await setupClaudeRunEnv(runId, artifactsDir);
+      await setupClaudeRunEnv(runId, artifactsDir, claudeRoundDir, scenarioDef.kind);
     } catch (e) {
       // 記 log／標記 failed 各自獨立包起來——**其中任一自己 throw 都不得讓
       // 清理被跳過**（reviewer #369）。原始錯誤照原樣 rethrow，不被掩蓋。
@@ -304,7 +308,10 @@ export default async function globalSetupScenario(): Promise<void> {
 
   // runId 以參數傳入：這是 hoisted function declaration，TS 不會把外層守門的
   // 收窄帶進來（它可能在守門之前被呼叫），顯式傳參比在函式內重新斷言誠實。
-  async function setupClaudeRunEnv(runIdArg: string, artifactsDirArg: string): Promise<void> {
+  async function setupClaudeRunEnv(
+    runIdArg: string, artifactsDirArg: string, roundDirArg: string,
+    kindArg: 'approval' | 'recovery',
+  ): Promise<void> {
     // **核定 MCP binary identity 來自受控啟動產物**：依 wails.json 的
     // outputfilename ＋ macOS bundle 佈局算出預期路徑，再用**當次受控程序樹
     // ＋ 新鮮 ps 觀測**確認那確實是本次存活的 App（見 appBinaryIdentity.ts）。
@@ -339,19 +346,29 @@ export default async function globalSetupScenario(): Promise<void> {
     // App stateDir = <normalized workspace>/.workbench（app.go resolveWorkspace:3265）；
     // 動態 socket 必須落在此目錄之下（approvalSockPath，session_host.go:113）。
     const claudeStateDir = path.join(fs.realpathSync(fixture.root), '.workbench');
-    const approval = buildClaudeApprovalExpectation(runIdArg);
-    fs.writeFileSync(claudeExpectationPath, JSON.stringify({
-      approval,
-      prompt: claudePrompt,
-      // 兩個動態路徑都走 appStateDir policy：canonical 父目錄必須等於
-      // realpath(stateDir)，檔名必須符合 App 的實際命名契約。
+    if (roundDirArg === '') {
+      const m = 'globalSetupScenario: Claude 案缺少輪次登記目錄（createScenarioClaudeCli 未回傳 roundDir？）';
+      log.log(m);
+      throw new Error(m);
+    }
+    // 兩個動態路徑都走 appStateDir policy：canonical 父目錄必須等於
+    // realpath(stateDir)，檔名必須符合 App 的實際命名契約。兩案共用。
+    const sharedFixture = {
       mcpConfigPolicy: { kind: 'appStateDir', stateDir: claudeStateDir },
       mcp: {
         commandPath: approvedCommandPath,
         commandSha256: approvedCommandSha256,
         socket: { kind: 'appStateDir', stateDir: claudeStateDir },
       },
-    }, null, 2));
+    };
+    // **期望值一律來自受版控 builder**：單輪案沿用 F1a 的
+    // buildClaudeApprovalExpectation（欄位與版面完全不變），兩輪案用 E1 的
+    // buildClaudeRecoveryExpectation。兩者互斥——fixture 不會同時有
+    // `approval`＋`prompt` 與 `rounds`。
+    const fixtureBody = kindArg === 'recovery'
+      ? { ...sharedFixture, rounds: buildClaudeRecoveryExpectation(runIdArg).rounds }
+      : { ...sharedFixture, approval: buildClaudeApprovalExpectation(runIdArg), prompt: claudePrompt };
+    fs.writeFileSync(claudeExpectationPath, JSON.stringify(fixtureBody, null, 2));
     writeRunEnv({
       ...baseRunEnv,
       scenario: scenarioName,
@@ -360,6 +377,7 @@ export default async function globalSetupScenario(): Promise<void> {
       claudeApprovedCommandPath: approvedCommandPath,
       claudeApprovedCommandSha256: approvedCommandSha256,
       claudeStateDir,
+      claudeRoundDir: roundDirArg,
     });
   }
 
