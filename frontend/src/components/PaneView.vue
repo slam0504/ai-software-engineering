@@ -76,8 +76,15 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
 <template>
   <!-- B3a-2b-2 Task C 驗收缺口修正（缺口 1）：`data-test-wsid` 是純測試用
        屬性（既有的 `wsid` computed 值，不新增任何行為），讓 e2e spec 能把
-       「新內容泡泡」的搜尋範圍限定在同一個 WSID 的 pane 內，不是全頁搜尋。 -->
-  <div class="pane" :class="{ focused }" :data-test="'pane-' + idx" :data-test-wsid="wsid" @click="s.setFocus(idx)">
+       「新內容泡泡」的搜尋範圍限定在同一個 WSID 的 pane 內，不是全頁搜尋。
+       B3a-2b-2 Task E2：`data-test-active` 同樣是純測試用屬性，反映既有的
+       `meta.active` 狀態（session.ts applyDone() 在真的 session:done 事件
+       時設為 false，submit() 在真的 StartSession 時設回 true）——不新增
+       binding、不改 production 行為，只是把既有的 in-memory 狀態揭露成
+       DOM 屬性，讓 e2e spec 能等到「同一個 WSID 的可觀察結束狀態」而不必
+       改讀 App 事件接收器內部狀態。 -->
+  <div class="pane" :class="{ focused }" :data-test="'pane-' + idx" :data-test-wsid="wsid"
+    :data-test-active="meta ? String(meta.active) : ''" @click="s.setFocus(idx)">
     <div v-if="!wsid" class="empty">{{ t('dualPane.empty') }}</div>
     <template v-else>
       <div class="head">

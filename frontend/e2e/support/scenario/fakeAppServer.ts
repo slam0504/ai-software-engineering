@@ -72,6 +72,7 @@ const manifest: Manifest = {
   decisionReceived: null,
   unknownMethodsSeen: [],
   fatalError: null,
+  secondTurn: null,
 };
 
 const logFd = fs.openSync(logPath, 'a');
@@ -138,6 +139,49 @@ function validateScenarioConfig(raw: unknown): string | null {
   if (c.turnStatus !== 'completed' && c.turnStatus !== 'failed') {
     return `turnStatus must be "completed" or "failed", got ${JSON.stringify(c.turnStatus)}`;
   }
+  // Task E1：secondTurn 是選填欄位——「缺 key」與「key 存在」是唯二合法情況；
+  // `undefined` 之外的任何值（含顯式 `null`／array／缺欄位／與第一輪重複的
+  // ID）一律 fail closed（協定契約 #10），不進協定就先擋下。
+  if ('secondTurn' in c && c.secondTurn !== undefined) {
+    const st = c.secondTurn;
+    if (typeof st !== 'object' || st === null || Array.isArray(st)) {
+      return `secondTurn must be an object when present, got ${JSON.stringify(st)}`;
+    }
+    // B3a-2b-2 Task E1 R2 修正：#293 明確限定「第一輪 start、第二輪
+    // resume」——secondTurn 存在時，第一輪必須是 threadMode='start'。先前版
+    // 本沒有這條檢查，reviewer 把 threadMode 設成 'resume' 且保留
+    // secondTurn，送 resume→turn1→resume→turn2 仍 exit 0。單輪場景
+    // （secondTurn 缺省）不受影響，threadMode='resume' 仍合法。
+    if (c.threadMode !== 'start') {
+      return `secondTurn requires threadMode="start" for the first round (got ${JSON.stringify(c.threadMode)}); `
+        + 'the second round is always thread/resume regardless of threadMode';
+    }
+    const s = st as Record<string, unknown>;
+    if (typeof s.turnId !== 'string' || s.turnId.length === 0) return 'secondTurn.turnId must be a non-empty string';
+    if (typeof s.itemId !== 'string' || s.itemId.length === 0) return 'secondTurn.itemId must be a non-empty string';
+    if (typeof s.approvalRequestId !== 'string' || s.approvalRequestId.length === 0) {
+      return 'secondTurn.approvalRequestId must be a non-empty string';
+    }
+    // 協定契約 #4：第二輪必須有獨立的 turnId／itemId／approvalRequestId，不得
+    // 沿用第一輪的值（否則舊事件會滿足第二輪斷言）。
+    if (s.turnId === c.turnId) return 'secondTurn.turnId must differ from the first-turn turnId';
+    if (s.itemId === c.itemId) return 'secondTurn.itemId must differ from the first-turn itemId';
+    if (s.approvalRequestId === c.approvalRequestId) {
+      return 'secondTurn.approvalRequestId must differ from the first-turn approvalRequestId';
+    }
+    if (!Array.isArray(s.afterApproval)) return 'secondTurn.afterApproval must be an array';
+    for (const ev of s.afterApproval) {
+      if (typeof ev !== 'object' || ev === null) return 'secondTurn.afterApproval entries must be objects';
+      const e = ev as Record<string, unknown>;
+      if (e.type !== 'itemStarted' && e.type !== 'itemCompleted') {
+        return `secondTurn.afterApproval[].type must be "itemStarted" or "itemCompleted", got ${JSON.stringify(e.type)}`;
+      }
+      if (typeof e.text !== 'string') return 'secondTurn.afterApproval[].text must be a string';
+    }
+    if (s.turnStatus !== 'completed' && s.turnStatus !== 'failed') {
+      return `secondTurn.turnStatus must be "completed" or "failed", got ${JSON.stringify(s.turnStatus)}`;
+    }
+  }
   return null;
 }
 
@@ -197,10 +241,34 @@ type Stage =
   | 'awaitThreadStart'
   | 'awaitTurnStart'
   | 'awaitApprovalResponse'
+  // Task E1 新增：第一輪 turn/completed 送出後、cfg.secondTurn 存在時，process
+  // 不 finish(0)，改進這個 stage 等待第二次 thread/resume（協定契約 #6）。
+  | 'awaitSecondThreadResume'
   | 'done';
 
 let stage: Stage = 'awaitInitialize';
 let pendingApprovalId: RawId | null = null;
+
+// Task E1：round 追蹤目前在跑哪一輪的 turn/approval——'awaitTurnStart' 與
+// 'awaitApprovalResponse' 兩個既有 stage 對兩輪共用同一套邏輯，差別只在
+// activeRound 指向哪一組 turnId/itemId/approvalRequestId/afterApproval/
+// turnStatus（round 1 固定是 cfg 本身；round 2 是 cfg.secondTurn，在
+// 'awaitSecondThreadResume' 驗證通過後才切換，見下方 handleLine）。
+type RoundCfg = {
+  turnId: string;
+  itemId: string;
+  approvalRequestId: string;
+  afterApproval: Array<{ type: 'itemStarted' | 'itemCompleted'; text: string }>;
+  turnStatus: 'completed' | 'failed';
+};
+let round: 1 | 2 = 1;
+let activeRound: RoundCfg = {
+  turnId: cfg.turnId,
+  itemId: cfg.itemId,
+  approvalRequestId: cfg.approvalRequestId,
+  afterApproval: cfg.afterApproval,
+  turnStatus: cfg.turnStatus,
+};
 
 function idsEqual(a: RawId, b: RawId): boolean {
   // 型別保留檢查的正面用法：只有「原始值完全相等」才算符合，number 1 跟字串
@@ -303,19 +371,29 @@ function handleLine(line: string): void {
           return;
         }
       }
-      send({ id: f.id, result: { turn: { id: cfg.turnId, status: 'inProgress' } } });
+      send({ id: f.id, result: { turn: { id: activeRound.turnId, status: 'inProgress' } } });
       // turn/start response 立即回（同 internal/codex/turns.go 註記）；approval
       // request 在 response 之後才送，避免 client 端 pending map 還沒登記好。
-      pendingApprovalId = cfg.approvalRequestId;
-      manifest.approvalMethod = cfg.approvalMethod;
-      manifest.approvalRequestId = pendingApprovalId;
+      // Task E1：approvalMethod 兩輪固定沿用 cfg.approvalMethod（協定契約
+      // #5——不擴成兩個獨立 method 選擇）；turnId/itemId/approvalRequestId 依
+      // activeRound（round 1 是 cfg 本身，round 2 是 cfg.secondTurn）。
+      pendingApprovalId = activeRound.approvalRequestId;
+      if (round === 1) {
+        manifest.approvalMethod = cfg.approvalMethod;
+        manifest.approvalRequestId = pendingApprovalId;
+      } else {
+        // round === 2：絕不覆寫頂層（第一輪）欄位，寫進獨立的 secondTurn 子
+        // 物件，讓兩輪的 approval 結果能各自獨立核對（協定契約 #8）。
+        manifest.secondTurn!.approvalMethod = cfg.approvalMethod;
+        manifest.secondTurn!.approvalRequestId = pendingApprovalId;
+      }
       send({
         id: pendingApprovalId,
         method: cfg.approvalMethod,
         params: {
           threadId: cfg.threadId,
-          turnId: cfg.turnId,
-          itemId: cfg.itemId,
+          turnId: activeRound.turnId,
+          itemId: activeRound.itemId,
           startedAtMs: Date.now(),
         },
       });
@@ -353,24 +431,75 @@ function handleLine(line: string): void {
         fail(`approval response missing/invalid decision: ${JSON.stringify(f.result)}`);
         return;
       }
-      manifest.decisionReceived = decision;
-      for (const ev of cfg.afterApproval) {
+      if (round === 1) {
+        manifest.decisionReceived = decision;
+      } else {
+        // 同上：round 2 的 decision 寫進 secondTurn，不覆寫第一輪的
+        // manifest.decisionReceived（協定契約 #8）。
+        manifest.secondTurn!.decisionReceived = decision;
+      }
+      for (const ev of activeRound.afterApproval) {
         send({
           method: ev.type === 'itemStarted' ? Method.ItemStarted : Method.ItemCompleted,
           params: {
             threadId: cfg.threadId,
-            turnId: cfg.turnId,
-            item: { type: 'agentMessage', id: cfg.itemId, text: ev.text },
+            turnId: activeRound.turnId,
+            item: { type: 'agentMessage', id: activeRound.itemId, text: ev.text },
           },
         });
       }
       send({
         method: Method.TurnCompleted,
-        params: { threadId: cfg.threadId, turn: { id: cfg.turnId, status: cfg.turnStatus } },
+        params: { threadId: cfg.threadId, turn: { id: activeRound.turnId, status: activeRound.turnStatus } },
       });
+      // Task E1：round 1 完成且 cfg.secondTurn 存在時，**不** finish(0)——
+      // process 保持存活等待第二次 thread/resume（協定契約 #1／#6：缺省時
+      // 這個分支永遠不會進來，單輪路徑完全不變）。fake 不會自己替 client 發
+      // resume，純粹被動等待下一筆 client frame。
+      if (round === 1 && cfg.secondTurn) {
+        activeRound = { ...cfg.secondTurn };
+        round = 2;
+        manifest.secondTurn = { approvalMethod: null, approvalRequestId: null, decisionReceived: null, resumeAccepted: false };
+        stage = 'awaitSecondThreadResume';
+        writeLog('meta', { note: 'first turn/completed sent; awaiting second thread/resume' });
+        return;
+      }
       stage = 'done';
       writeLog('meta', { note: 'turn/completed sent; scenario finished' });
       finish(0);
+      return;
+    }
+    case 'awaitSecondThreadResume': {
+      // 協定契約 #3／#7：第二輪必須精確是 thread/resume，且 params.threadId
+      // 必須精確等於同一個配置 threadId（cfg.threadId，不另開欄位）——同一個
+      // process／PID、同一條 wire 流，不是另開一輪 thread/start。送成
+      // thread/start、缺合法 id、或 threadId 錯誤都要 fail，不得提前成功收尾。
+      if (f.method !== Method.ThreadResume || !isValidRequestId(f.id)) {
+        manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
+        fail(`expected ${Method.ThreadResume} for secondTurn, got ${JSON.stringify(f)}`);
+        return;
+      }
+      // R2 補強：這個分支先前只查 method／id／threadId，沒核對 request 本身
+      // 不該帶 result／error（混雜 request／response／error 形狀的 frame，例
+      // 如 `{id, method:'thread/resume', result:{...}}`，先前會被當成合法
+      // request 放行）。對齊 scenarioProtocolJudge.ts#assertRequestShape 的
+      // 最小核對，只補這一個新分支，不擴成通用 protocol 框架。
+      if (f.result !== undefined || f.error !== undefined) {
+        fail(`malformed second ${Method.ThreadResume} frame (must not carry result/error): ${JSON.stringify(f)}`);
+        return;
+      }
+      const params = f.params as { threadId?: unknown } | undefined;
+      if (typeof params?.threadId !== 'string' || params.threadId !== cfg.threadId) {
+        fail(
+          `second ${Method.ThreadResume} threadId mismatch: got ${JSON.stringify(params?.threadId)} want ${JSON.stringify(cfg.threadId)}`,
+        );
+        return;
+      }
+      if (manifest.secondTurn) manifest.secondTurn.resumeAccepted = true;
+      send({ id: f.id, result: { thread: { id: cfg.threadId } } });
+      // 沿用既有 awaitTurnStart／awaitApprovalResponse（activeRound 已切到第二
+      // 輪身分），不另造第二套 turn 狀態機。
+      stage = 'awaitTurnStart';
       return;
     }
     case 'done':

@@ -1,0 +1,36 @@
+{
+  "scenario": "commandExecution-recovery",
+  "threadId": "b3a2b2-thread-20260921T113808Z-c12056",
+  "turnId": "b3a2b2-turn-20260921T113808Z-c12056",
+  "itemId": "b3a2b2-item-20260921T113808Z-c12056",
+  "threadMode": "start",
+  "approvalMethod": "item/commandExecution/requestApproval",
+  "approvalRequestId": "b3a2b2-approval-20260921T113808Z-c12056",
+  "afterApproval": [
+    {
+      "type": "itemStarted",
+      "text": "b3a2b2-scenario-content-20260921T113808Z-c12056"
+    },
+    {
+      "type": "itemCompleted",
+      "text": "b3a2b2-scenario-content-20260921T113808Z-c12056"
+    }
+  ],
+  "turnStatus": "completed",
+  "secondTurn": {
+    "turnId": "b3a2b2-turn2-20260921T113808Z-c12056",
+    "itemId": "b3a2b2-item2-20260921T113808Z-c12056",
+    "approvalRequestId": "b3a2b2-approval2-20260921T113808Z-c12056",
+    "afterApproval": [
+      {
+        "type": "itemStarted",
+        "text": "b3a2b2-scenario-content2-20260921T113808Z-c12056"
+      },
+      {
+        "type": "itemCompleted",
+        "text": "b3a2b2-scenario-content2-20260921T113808Z-c12056"
+      }
+    ],
+    "turnStatus": "completed"
+  }
+}

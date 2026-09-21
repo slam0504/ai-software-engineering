@@ -1,0 +1,12 @@
+{
+  "sourceRunId": "20260921T113808Z-c12056",
+  "sourceDir": "frontend/e2e/.artifacts/20260921T113808Z-c12056（gitignored，僅本機保留）",
+  "transformed": false,
+  "note": "逐位元組複製，未做任何轉換；供 selftest 在乾淨 checkout 下離線使用。",
+  "expectedDomWsid": "01M31W7HXW0007GJP3YWG6PJD6",
+  "files": {
+    "app-wire-log.jsonl": "17e0297e7db3a597dc820c5283cd09725a4ad3c449acf0da6e92db15ab4dc7b2",
+    "scenario-config.json": "e1f5cec06987ca9a8380320d206b89b7f18ce72a8007c7871f299310578154a2",
+    "scenario-wire.log.manifest.json": "9612b6b5eeaef54f28a8de1875eceb77e09a939d49c52db09143b82285e1c458"
+  }
+}

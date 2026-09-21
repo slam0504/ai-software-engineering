@@ -166,5 +166,29 @@ check('案例錯配（run identity 交叉核對）：fileChange-deny 的落地 c
   assert.ok(violations.some(v => v.includes('manifest.decisionReceived')), `expected manifest.decisionReceived violation, got: ${JSON.stringify(violations)}`);
 });
 
+// --- B3a-2b-2 Task E2：commandExecution-recovery 登記表核對 -----------------
+check('commandExecution-recovery：kind=recovery，四個既有案 kind=approval，兩輪 identity 齊全且互不相同', () => {
+  const recoveryDef = resolveScenario('commandExecution-recovery');
+  assert.equal(recoveryDef.kind, 'recovery', 'commandExecution-recovery 的 kind 應為 recovery');
+  assert.equal(recoveryDef.decision, 'accept', 'commandExecution-recovery 兩輪都 accept');
+  for (const name of ALL_NAMES) {
+    assert.equal(resolveScenario(name).kind, 'approval', `${name} 的 kind 應為 approval`);
+  }
+  const cfg = recoveryDef.build(runId);
+  assert.equal(cfg.approvalMethod, Method.CmdExecRequestApproval, 'commandExecution-recovery 應為 commandExecution method');
+  assert.ok(cfg.secondTurn, 'commandExecution-recovery 的 build() 必須帶 secondTurn');
+  assert.notEqual(cfg.secondTurn!.turnId, cfg.turnId, 'round2 turnId 應與 round1 不同');
+  assert.notEqual(cfg.secondTurn!.itemId, cfg.itemId, 'round2 itemId 應與 round1 不同');
+  assert.notEqual(cfg.secondTurn!.approvalRequestId, cfg.approvalRequestId, 'round2 approvalRequestId 應與 round1 不同');
+  assert.equal(cfg.threadMode, 'start', 'secondTurn 存在時第一輪 threadMode 必須是 start（fakeAppServer.ts validateScenarioConfig 的既有契約）');
+});
+
+check('四個既有 approval 案 build() 一律不帶 secondTurn（單輪路徑不受影響）', () => {
+  for (const name of ALL_NAMES) {
+    const cfg = resolveScenario(name).build(runId);
+    assert.equal(cfg.secondTurn, undefined, `${name} 不應帶 secondTurn`);
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;
