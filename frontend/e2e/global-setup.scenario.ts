@@ -247,7 +247,10 @@ export default async function globalSetupScenario(): Promise<void> {
     scenarioItemId: scenarioConfig.itemId,
     scenarioApprovalMethod: scenarioConfig.approvalMethod,
     scenarioApprovalRequestId: scenarioConfig.approvalRequestId,
-    scenarioDecision: 'accept',
+    // Task D：scenario decision 由受版控的 scenarioDef 決定（見
+    // scenarios.ts ScenarioDef.decision），不再固定寫死 'accept'——四案
+    // matrix 有兩案是 decline。
+    scenarioDecision: scenarioDef.decision,
     scenarioConfigPath,
     scenarioLogPath,
     scenarioManifestPath: cli.scenarioManifestPath,
