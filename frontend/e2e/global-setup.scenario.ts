@@ -18,6 +18,7 @@
 // ——那些是那兩條入口自己的負控制測試設施，本檢查點的成功條件不需要它們，
 // 硬搬只會放大維護面、不會提高本票的證據品質。
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +35,11 @@ import { RunStateStore } from './support/runState.js';
 import { runtime } from './support/runtime.js';
 import { handleStaleRun, StaleRunConflictError } from './support/staleRun.js';
 import { createScenarioCodexCli } from './support/scenario/scenarioCli.js';
+import { createFakeCliSet } from './support/fakeCli.js';
+import { createScenarioClaudeCli } from './support/scenario/claudeScenarioCli.js';
+import { buildClaudeApprovalExpectation } from './support/scenario/claudeApprovalProtocol.js';
+import { handleClaudeSetupFailure } from './support/scenario/claudeSetupFailure.js';
+import { resolveAppBinaryIdentity } from './support/scenario/appBinaryIdentity.js';
 import { resolveScenario } from './support/scenario/scenarios.js';
 import { isOfflineSandboxEnabled } from './support/offlineSandbox.js';
 
@@ -137,11 +143,42 @@ export default async function globalSetupScenario(): Promise<void> {
     throw new Error(`globalSetupScenario: 找不到 fakeAppServer.ts（${fakeAppServerPath}）——B3a-2b-1 交付是否還在？`);
   }
 
-  const scenarioConfig = scenarioDef.build(runId);
-  fs.writeFileSync(scenarioConfigPath, JSON.stringify(scenarioConfig, null, 2));
+  // B3a-2b-2 F2：provider 分流——**兩種 provider 的 CLI 與 config 完全不共用**。
+  // Codex 案的建立流程與既有完全相同；Claude 案走另一條，不碰 scenarioConfigPath。
+  const isClaude = scenarioDef.provider === 'claude';
+  const claudeExpectationPath = path.join(artifactsDir, 'claude-expectation.json');
+  const claudeEvidenceDir = path.join(artifactsDir, 'claude-evidence');
+  const claudePrompt = `b3a2b2-claude-prompt-${runId}`;
+  let cli: ReturnType<typeof createScenarioCodexCli> | (ReturnType<typeof createFakeCliSet> & { scenarioManifestPath?: string });
+  let scenarioName: string;
+  let scenarioConfig: ReturnType<typeof scenarioDef.build> | null = null;
 
-  const cli = createScenarioCodexCli(toolsDir, runId, fakeAppServerPath, scenarioConfigPath, scenarioLogPath);
-  log.log(`scenario codex CLI 建立完成：${toolsDir}（scenario=${scenarioConfig.scenario}）`);
+  if (isClaude) {
+    scenarioName = scenarioDef.name;
+    // 先建完整鷹架（codex/claude 兩支 version-only tripwire），再把 claude 這支
+    // 換成 scenario 專屬 wrapper；codex 留在 version-only，本案不該用到它。
+    const base = createFakeCliSet(toolsDir, runId);
+    const fakeClaudeCliPath = path.join(frontendRoot, 'e2e', 'support', 'scenario', 'fakeClaudeCli.ts');
+    if (!fs.existsSync(fakeClaudeCliPath)) {
+      throw new Error(`globalSetupScenario: 找不到 fakeClaudeCli.ts（${fakeClaudeCliPath}）——F1b 交付是否還在？`);
+    }
+    fs.mkdirSync(claudeEvidenceDir, { recursive: true });
+    const claudeSet = createScenarioClaudeCli(toolsDir, runId, fakeClaudeCliPath, {
+      // **mcpConfigPath 留空**：F2 起假 CLI 只從 argv 的 --mcp-config 取真 App
+      // 傳進來的路徑（見 fakeClaudeCli.readMcpConfigPathFromArgv）。
+      mcpConfigPath: '',
+      expectationPath: claudeExpectationPath,
+      evidenceDir: claudeEvidenceDir,
+    });
+    cli = { ...base, claudeVersion: claudeSet.claudeVersion };
+    log.log(`scenario claude CLI 建立完成：${toolsDir}（scenario=${scenarioName}）`);
+  } else {
+    scenarioConfig = scenarioDef.build(runId);
+    scenarioName = scenarioConfig.scenario;
+    fs.writeFileSync(scenarioConfigPath, JSON.stringify(scenarioConfig, null, 2));
+    cli = createScenarioCodexCli(toolsDir, runId, fakeAppServerPath, scenarioConfigPath, scenarioLogPath);
+    log.log(`scenario codex CLI 建立完成：${toolsDir}（scenario=${scenarioName}）`);
+  }
 
   try {
     checkFixture(fixture, repoRoot, log);
@@ -231,7 +268,7 @@ export default async function globalSetupScenario(): Promise<void> {
   runState.setStatus('ready');
   log.log(`wails dev 就緒：HTTP 可達，vite port=${vitePort ?? '(未解析到)'}`);
 
-  writeRunEnv({
+  const baseRunEnv = {
     runId,
     artifactsDir,
     workspaceDir: fixture.root,
@@ -241,6 +278,94 @@ export default async function globalSetupScenario(): Promise<void> {
     codexVersion: cli.codexVersion,
     baseUrl: `http://127.0.0.1:${WAILS_PORT}`,
     vitePort,
+  };
+
+  if (isClaude) {
+    // **app 已經啟動**：這一段的任何失敗（產物不存在／realpath／hash／寫檔）
+    // 都必須走既有的失敗收尾路徑——標記 failed、保存 harness.log、停止本次
+    // 程序，不能只 throw 讓 globalTeardown 去猜（reviewer #367）。
+    try {
+      await setupClaudeRunEnv(runId, artifactsDir);
+    } catch (e) {
+      // 記 log／標記 failed 各自獨立包起來——**其中任一自己 throw 都不得讓
+      // 清理被跳過**（reviewer #369）。原始錯誤照原樣 rethrow，不被掩蓋。
+      const outcome = await handleClaudeSetupFailure(e, {
+        log, runState,
+        teardown: () => teardownOnFailure(log, processTree, networkSampler, runState, 'claude setup failed'),
+      });
+      log.log(`Claude setup 失敗收尾：teardownAttempted=${outcome.teardownAttempted}`
+        + ` logError=${outcome.logError ?? 'null'} statusError=${outcome.statusError ?? 'null'}`
+        + ` teardownError=${outcome.teardownError ?? 'null'}`);
+      throw e;
+    }
+    log.log('globalSetupScenario 完成（claude）');
+    return;
+  }
+
+  // runId 以參數傳入：這是 hoisted function declaration，TS 不會把外層守門的
+  // 收窄帶進來（它可能在守門之前被呼叫），顯式傳參比在函式內重新斷言誠實。
+  async function setupClaudeRunEnv(runIdArg: string, artifactsDirArg: string): Promise<void> {
+    // **核定 MCP binary identity 來自受控啟動產物**：依 wails.json 的
+    // outputfilename ＋ macOS bundle 佈局算出預期路徑，再用**當次受控程序樹
+    // ＋ 新鮮 ps 觀測**確認那確實是本次存活的 App（見 appBinaryIdentity.ts）。
+    // 在 app ready 之後、spec 開始之前計算——#372 實測證明 wails dev 收尾時
+    // 會把 bundle 內的執行檔清掉，跑完就取不到了。**不從待驗 config 反推。**
+    const wailsJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'wails.json'), 'utf8')) as { outputfilename?: unknown };
+    const outputFileName = wailsJson.outputfilename;
+    if (typeof outputFileName !== 'string' || outputFileName === '') {
+      const m = `globalSetupScenario: wails.json 的 outputfilename 無效：${JSON.stringify(outputFileName)}`;
+      log.log(m);
+      throw new Error(m);
+    }
+    const rootPid = child.pid;
+    if (rootPid === undefined) {
+      const m = 'globalSetupScenario: 取不到 wails dev 的 pid，無法以受控程序樹核定 App binary 身分';
+      log.log(m);
+      throw new Error(m);
+    }
+    const resolved = resolveAppBinaryIdentity({ repoRoot, outputFileName, rootPid });
+    if (resolved.identity === null) {
+      const m = `globalSetupScenario: 無法核定 App binary 身分：${resolved.violations.join('; ')}`;
+      log.log(m);
+      throw new Error(m);
+    }
+    const approvedCommandPath = resolved.identity.canonicalPath;
+    const approvedCommandSha256 = resolved.identity.sha256;
+    // path/SHA/pid/startedAt 的獨立證據（不依賴後續任何待驗產物）
+    fs.writeFileSync(path.join(artifactsDirArg, 'app-binary-identity.json'),
+      `${JSON.stringify(resolved.identity, null, 2)}\n`);
+    log.log(`App binary 身分核定：pid=${resolved.identity.pid} startedAt=${resolved.identity.startedAt}`
+      + ` path=${approvedCommandPath} sha256=${approvedCommandSha256}`);
+    // App stateDir = <normalized workspace>/.workbench（app.go resolveWorkspace:3265）；
+    // 動態 socket 必須落在此目錄之下（approvalSockPath，session_host.go:113）。
+    const claudeStateDir = path.join(fs.realpathSync(fixture.root), '.workbench');
+    const approval = buildClaudeApprovalExpectation(runIdArg);
+    fs.writeFileSync(claudeExpectationPath, JSON.stringify({
+      approval,
+      prompt: claudePrompt,
+      // 兩個動態路徑都走 appStateDir policy：canonical 父目錄必須等於
+      // realpath(stateDir)，檔名必須符合 App 的實際命名契約。
+      mcpConfigPolicy: { kind: 'appStateDir', stateDir: claudeStateDir },
+      mcp: {
+        commandPath: approvedCommandPath,
+        commandSha256: approvedCommandSha256,
+        socket: { kind: 'appStateDir', stateDir: claudeStateDir },
+      },
+    }, null, 2));
+    writeRunEnv({
+      ...baseRunEnv,
+      scenario: scenarioName,
+      claudeExpectationPath,
+      claudeEvidenceDir,
+      claudeApprovedCommandPath: approvedCommandPath,
+      claudeApprovedCommandSha256: approvedCommandSha256,
+      claudeStateDir,
+    });
+  }
+
+  if (scenarioConfig === null) throw new Error('globalSetupScenario: Codex 案缺少 scenarioConfig（不應發生）');
+  writeRunEnv({
+    ...baseRunEnv,
     scenario: scenarioConfig.scenario,
     scenarioThreadId: scenarioConfig.threadId,
     scenarioTurnId: scenarioConfig.turnId,
@@ -253,7 +378,7 @@ export default async function globalSetupScenario(): Promise<void> {
     scenarioDecision: scenarioDef.decision,
     scenarioConfigPath,
     scenarioLogPath,
-    scenarioManifestPath: cli.scenarioManifestPath,
+    scenarioManifestPath: (cli as ReturnType<typeof createScenarioCodexCli>).scenarioManifestPath,
   });
 
   log.log('globalSetupScenario 完成');

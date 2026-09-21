@@ -268,7 +268,12 @@ export default async function globalTeardown(): Promise<void> {
     // 收到 `--version`，對 scenario 執行一定會誤判；反過來也不能誤用
     // scenario 判定去查一個其實是 default 的 run）。
     if (executionMode.kind === 'scenario') {
-      tripwireViolations = judgeScenarioCliCalls(finalInvocationsLog, log);
+      // F2：provider 來自**已驗證的 executionMode identity**（determineExecutionMode
+      // 已確認 scenario 名稱在 env 與檔案兩側一致且可由登記表解析）。
+      // 不使用「解析失敗就當 codex」的 fallback——那會在 identity 壞掉時
+      // 悄悄套用另一個 provider 的判定（reviewer #367）。
+      tripwireViolations = judgeScenarioCliCalls(finalInvocationsLog, log,
+        { provider: executionMode.provider, toolsDir: env.toolsDir });
     } else if (executionMode.kind === 'default') {
       tripwireViolations = judgeTripwire(finalInvocationsLog, env.claudeVersion, env.codexVersion, log);
     } else {
@@ -445,7 +450,10 @@ function checkResidualPorts(ports: number[], log: HarnessLogger, context: string
 // signal handler／teardownOnFailure 共用 single-flight in-flight promise，
 // 真的等它 resolve，不用「猜測」代替）；跨行程時用既有的 `stopProcessGroup`
 // （跟 handleStaleRun 同一套四要素身分核對，不是重新發明一套無界的停止
-// 程序——需求 4／6）。env 從未寫出＝app 從未 ready＝這次執行不可能是正常
+// 程序——需求 4／6）。env 從未寫出**只代表 setup 未走完**——B3a-2b-2 F2 的
+// 實測（#372）證明 app 可以已經 ready、HTTP 可達，卻在 ready 之後的 setup
+// 步驟失敗而沒寫出 env；因此不能一律說「app 從未 ready」。這條分支的判定與
+// 收尾行為不變（仍然 fail closed），只是措辭不再冒稱知道 app 有沒有就緒。
 // PASSED，一律非零結束（不管停止程序本身乾不乾淨），不讓 Playwright 誤判
 // 成功；只有真的完成且乾淨才清 `.active-run.json` 指標，不完整時保留（需求
 // 3）。
@@ -473,7 +481,7 @@ async function teardownWithoutEnv(readEnvError: unknown): Promise<void> {
   // 推定（見下方）。
   if (runtime.processTree) {
     const stopResult = await runtime.processTree.stop();
-    logStopResult(log, '(env 不可用，同行程 runtime.processTree)', stopResult);
+    logStopResult(log, '(env 不可用＝setup 未走完，同行程 runtime.processTree)', stopResult);
     const cleanupClean = stopResult.clean && stopResult.portsReleased;
     if (cleanupClean) {
       if (runtime.runState) runtime.runState.clearActiveRunPointer();
@@ -496,15 +504,15 @@ async function teardownWithoutEnv(readEnvError: unknown): Promise<void> {
     const wasInterrupted = !!st && (st.status === 'interrupted' || (st.failureStage ?? '').startsWith('interrupted'));
     if (wasInterrupted) {
       console.error(`[e2e] 執行被中斷（${st!.failureStage}），證據目錄：${fallbackDir}`);
-      log.log(`最終結果：INTERRUPTED（${st!.failureStage}），env 從未寫出（app 未就緒），保留證據目錄 ${fallbackDir}`);
+      log.log(`最終結果：INTERRUPTED（${st!.failureStage}），env 從未寫出（setup 未走完；app 是否曾就緒需看 harness.log），保留證據目錄 ${fallbackDir}`);
     } else {
       console.error(`[e2e] 執行失敗，證據目錄：${fallbackDir}`);
       log.log(
-        `最終結果：FAILED（env 從未寫出，app 未就緒${st ? `；run-state 記錄 status=${st.status} failureStage=${st.failureStage ?? '(未設定)'}` : '；run-state.json 缺失或無法解析'}），`
+        `最終結果：FAILED（env 從未寫出＝setup 未走完；app 是否曾就緒需看 harness.log${st ? `；run-state 記錄 status=${st.status} failureStage=${st.failureStage ?? '(未設定)'}` : '；run-state.json 缺失或無法解析'}），`
         + `保留證據目錄 ${fallbackDir}`,
       );
     }
-    // 缺乏執行證據（env 從未寫出）本身就代表 app 未曾就緒，不管停止程序
+    // 缺乏執行證據（env 從未寫出）代表 **setup 未走完**（不等於 app 未曾就緒），不管停止程序
     // 乾不乾淨、run-state.json 讀不讀得到，這次執行都不能算 PASSED。
     const reasons = [
       wasInterrupted
@@ -512,7 +520,7 @@ async function teardownWithoutEnv(readEnvError: unknown): Promise<void> {
         : `run failed before ready (${st ? `status=${st.status}, failureStage=${st.failureStage ?? '(未設定)'}` : 'run-state.json missing or unreadable'})`,
       !cleanupClean && 'cleanup incomplete',
     ].filter(Boolean);
-    throw new Error(`B3a-1 e2e globalTeardown（env 不可用，app 從未就緒）：${reasons.join(' | ')}`);
+    throw new Error(`B3a-1 e2e globalTeardown（env 不可用＝setup 未走完）：${reasons.join(' | ')}`);
   }
 
   // 沒有同行程 runtime.processTree 可用。以下分支只處理「未取得本次程序

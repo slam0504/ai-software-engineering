@@ -9,6 +9,13 @@
 // import、自己內部用 `.ts` import protocol.ts）。`global-teardown.ts` 照舊用
 // `.js` 匯入這支模組（Playwright loader 能解析，不受影響）。
 //
+// **B3a-2b-2 F2 更正（reviewer #381）**：上面那句「能被 `node xxx.selftest.ts`
+// 直接 import」已經過期。本模組現在為了由**已驗證 identity** 取得 provider 而
+// import `./scenario/scenarios.ts`，而 `scenarios.ts` 自己是用 `./protocol.js`
+// 匯入的——因此 `selftest:execution-mode` 這個 npm 入口必須帶上既有的
+// `selftestJsToTsLoader.mjs`（與其他 scenario selftest 同一套慣例）。
+// 這只是執行入口的載入方式，函式、import graph 與判定邏輯都沒有改。
+//
 // 第二輪遺留的缺陷（reviewer 第三次複核找到）：舊版 `determineExecutionMode`
 // 只從落地檔讀 `raw.scenario` 一個欄位，其餘欄位只對傳入的 `env` 做 truthy
 // 檢查（`!env[k]`），完全沒有交叉核對「run-env.json 檔案」與「env（process.env
@@ -30,6 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { RunEnv } from './env.ts';
 import type { HarnessLogger } from './logger.ts';
+import { resolveScenario } from './scenario/scenarios.ts';
 
 // 必須跟 env.ts 的 `readScenarioRunEnv` required 清單保持一致（那份是
 // spec 用、這份是 teardown 用，兩邊各自獨立判定，欄位集合要同步）。
@@ -39,14 +47,25 @@ const REQUIRED_SCENARIO_FIELDS = [
   'scenarioConfigPath', 'scenarioLogPath', 'scenarioManifestPath',
 ] as const satisfies ReadonlyArray<keyof RunEnv>;
 
-// 十個 identity 欄位：scenario 本身＋上面九個。
+// B3a-2b-2 F2：Claude 案的必要欄位——**與 Codex 九欄互斥**。Claude 案沒有
+// thread/turn/item/approvalMethod 這些 Codex wire 協定概念，硬套那九欄會把
+// 一個完全正常的 Claude 執行誤判成 scenario-broken（reviewer #367 實測）。
+const REQUIRED_CLAUDE_FIELDS = [
+  'claudeExpectationPath', 'claudeEvidenceDir',
+  'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir',
+] as const satisfies ReadonlyArray<keyof RunEnv>;
+
+// 十個 identity 欄位：scenario 本身＋上面九個（Codex 案）。
 const ALL_IDENTITY_FIELDS = ['scenario', ...REQUIRED_SCENARIO_FIELDS] as const;
+const ALL_CLAUDE_IDENTITY_FIELDS = ['scenario', ...REQUIRED_CLAUDE_FIELDS] as const;
 
 export type ScenarioRunEnvLike = RunEnv & { scenario: string } & { [K in typeof REQUIRED_SCENARIO_FIELDS[number]]: string };
 
 export type ExecutionMode =
   | { kind: 'default' }
-  | { kind: 'scenario'; scenario: ScenarioRunEnvLike }
+  // provider：B3a-2b-2 F2——**由已驗證的 identity 決定**，teardown 不得另外
+  // 用「解析失敗就當 codex」這種 fallback 取得（reviewer #367）。
+  | { kind: 'scenario'; provider: 'codex' | 'claude'; scenario: ScenarioRunEnvLike }
   | { kind: 'scenario-broken'; reason: string };
 
 function isNonEmptyString(v: unknown): v is string {
@@ -123,8 +142,32 @@ export function determineExecutionMode(env: RunEnv, artifactsDir: string, log: H
   }
   const raw: Record<string, unknown> = rawParsed;
 
+  // provider 必須由**登記表**依 scenario 名稱決定；名稱缺失／未知一律
+  // scenario-broken（fail closed），**不得回退成 codex**。
+  const scenarioName = env.scenario;
+  if (!isNonEmptyString(scenarioName)) {
+    const reason = `入口標記為 scenario，但 env.scenario 缺失或型別錯誤：${JSON.stringify(scenarioName)}`;
+    log.log(`determineExecutionMode：${reason}`);
+    return { kind: 'scenario-broken', reason };
+  }
+  if (raw.scenario !== scenarioName) {
+    const reason = `scenario 名稱在 env（${JSON.stringify(scenarioName)}）與 run-env.json（${JSON.stringify(raw.scenario)}）不一致`;
+    log.log(`determineExecutionMode：${reason}`);
+    return { kind: 'scenario-broken', reason };
+  }
+  let provider: 'codex' | 'claude';
+  try {
+    provider = resolveScenario(scenarioName).provider;
+  } catch (e) {
+    const reason = `無法由 scenario 名稱決定 provider（未知或未登記）：${String(e instanceof Error ? e.message : e)}`;
+    log.log(`determineExecutionMode：${reason}`);
+    return { kind: 'scenario-broken', reason };
+  }
+  const identityFields: ReadonlyArray<string> =
+    provider === 'claude' ? ALL_CLAUDE_IDENTITY_FIELDS : ALL_IDENTITY_FIELDS;
+
   const mismatches: string[] = [];
-  for (const field of ALL_IDENTITY_FIELDS) {
+  for (const field of identityFields) {
     const envVal = (env as unknown as Record<string, unknown>)[field];
     const fileVal = raw[field];
     const envOk = isNonEmptyString(envVal);
@@ -139,10 +182,10 @@ export function determineExecutionMode(env: RunEnv, artifactsDir: string, log: H
     }
   }
   if (mismatches.length > 0) {
-    const reason = `scenario identity 欄位驗證失敗（${mismatches.length} 項不符或缺漏）：${mismatches.join('；')}`;
+    const reason = `scenario identity 欄位驗證失敗（provider=${provider}，${mismatches.length} 項不符或缺漏）：${mismatches.join('；')}`;
     log.log(`determineExecutionMode：${reason}`);
     return { kind: 'scenario-broken', reason };
   }
 
-  return { kind: 'scenario', scenario: env as ScenarioRunEnvLike };
+  return { kind: 'scenario', provider, scenario: env as ScenarioRunEnvLike };
 }

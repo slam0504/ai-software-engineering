@@ -10,11 +10,154 @@
 // 違規；且必須「至少一次 --version」＋「至少一次 app-server」——後者證明
 // Start 真的觸發了 StartAppServer，不是單純沒跑到那一步就被略過判定。
 import fs from 'node:fs';
+import path from 'node:path';
 import type { HarnessLogger } from '../logger.js';
+import { expectedConversationArgv } from './fakeClaudeCli.js';
 
 const TRIPWIRE_LINE_RE = /^\[(?<ts>[^\]]+)\] name=(?<name>\S+) argv=\((?<argv>.*)\) cwd=(?<cwd>\S+) ppid=(?<ppid>\d+)$/;
 
-export function judgeScenarioCliCalls(logFile: string, log: HarnessLogger): string[] {
+/**
+ * B3a-2b-2 F2：Claude 對話呼叫的**嚴格判定**。
+ *
+ * 判定來源是 `fakeClaudeCli.ts` 寫出的**結構化 argv 紀錄**（JSON Lines，argv 是
+ * 原生字串陣列），**不是** wrapper 那行 `printf %q` 引號化過的文字——對含空白的
+ * `--settings` 值拆字不可靠，而且看不出重複旗標與多餘 positional（reviewer #367）。
+ *
+ * 判定方式：與 `expectedConversationArgv()` **逐位置全等**。config 路徑本身是
+ * 動態值（真 App 的 `<stateDir>/mcp-<WSID>.json`），因此拿該次 argv 自己的
+ * `--mcp-config` 值代入期望再做全等——**其餘 token 的值、順序、重複、多餘
+ * positional 一項都沒有放過**。該動態值本身是否合法（父目錄 canonical 與檔名
+ * 契約）由假 CLI 在執行當下判定並留證，不在這裡重複推測。
+ */
+export function judgeClaudeConversationArgvStrict(argv: string[]): string[] {
+  const v: string[] = [];
+  const i = argv.indexOf('--mcp-config');
+  if (i < 0) return ['claude conversation argv 缺少 --mcp-config'];
+  if (argv.indexOf('--mcp-config', i + 1) >= 0) return ['claude conversation argv 出現多個 --mcp-config'];
+  const cfg = argv[i + 1];
+  if (typeof cfg !== 'string' || cfg === '' || cfg.startsWith('--')) {
+    return [`claude conversation argv 的 --mcp-config 值不合法：${JSON.stringify(cfg)}`];
+  }
+  const expected = expectedConversationArgv({ mcpConfigPath: cfg });
+  if (argv.length !== expected.length) {
+    v.push(`claude conversation argv 長度應為 ${expected.length}，實際 ${argv.length}`);
+  }
+  const n = Math.min(argv.length, expected.length);
+  for (let k = 0; k < n; k += 1) {
+    if (argv[k] !== expected[k]) {
+      v.push(`claude conversation argv[${k}] 應為 ${JSON.stringify(expected[k])}，實際 ${JSON.stringify(argv[k])}`);
+    }
+  }
+  return v;
+}
+
+export interface ScenarioTripwireOptions {
+  /** 本次 scenario 的 provider——**兩種 provider 不共用同一個寬鬆判定**。 */
+  provider: 'codex' | 'claude';
+  /** Claude 案必填：結構化 argv 紀錄所在的 tools 目錄。 */
+  toolsDir?: string;
+}
+
+export function judgeScenarioCliCalls(
+  logFile: string, log: HarnessLogger,
+  opts: ScenarioTripwireOptions = { provider: 'codex' },
+): string[] {
+  return opts.provider === 'claude'
+    ? judgeClaudeScenarioCalls(logFile, log, opts.toolsDir)
+    : judgeCodexScenarioCalls(logFile, log);
+}
+
+interface StructuredArgvRecord { ts?: unknown; pid?: unknown; argv?: unknown }
+
+/**
+ * Claude 案：以結構化 argv 紀錄為準；同時要求共用的 invocations.log 裡確實
+ * 出現 `name=claude-scenario`（證明 wrapper 真的接上了正式紀錄，而不是只有
+ * 手刻的結構化檔）。codex 在本案退回 version-only。
+ */
+function judgeClaudeScenarioCalls(logFile: string, log: HarnessLogger, toolsDir?: string): string[] {
+  const violations: string[] = [];
+  const text = fs.readFileSync(logFile, 'utf8');
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) violations.push('invocations.log 為空（缺失呼叫紀錄不算通過）');
+
+  let claudeWrapperLines = 0;
+  let codexVersionCalls = 0;
+  for (const line of lines) {
+    const m = TRIPWIRE_LINE_RE.exec(line);
+    if (!m || !m.groups) {
+      violations.push(`invocations.log 出現無法解析的行：${line}`);
+      continue;
+    }
+    const name = m.groups.name;
+    const argv = m.groups.argv.trim();
+    if (name === 'claude-scenario') { claudeWrapperLines += 1; continue; }
+    if (name === 'codex') {
+      if (argv !== '--version') violations.push(`codex 收到非 --version 的呼叫：argv=(${argv})`);
+      codexVersionCalls += 1;
+      continue;
+    }
+    violations.push(`未知的假 CLI 名稱：${name}`);
+  }
+  if (claudeWrapperLines < 1) {
+    violations.push('共用 invocations.log 內沒有任何 name=claude-scenario 行——wrapper 未接上正式紀錄');
+  }
+
+  if (toolsDir === undefined || toolsDir === '') {
+    violations.push('Claude 案的 tripwire 需要 toolsDir 才能讀結構化 argv 紀錄');
+    log.log(`scenario 呼叫紀律判定（claude）：缺 toolsDir，違規 ${violations.length} 筆`);
+    return violations;
+  }
+  const argvLogPath = path.join(toolsDir, 'claude-argv.jsonl');
+  let argvText: string;
+  try { argvText = fs.readFileSync(argvLogPath, 'utf8'); }
+  catch (e) {
+    violations.push(`無法讀取結構化 argv 紀錄 ${argvLogPath}：${String(e)}`);
+    log.log(`scenario 呼叫紀律判定（claude）：argv 紀錄讀取失敗，違規 ${violations.length} 筆`);
+    return violations;
+  }
+
+  let versionCalls = 0;
+  let conversationCalls = 0;
+  const argvLines = argvText.split('\n').map(l => l.trim()).filter(Boolean);
+  argvLines.forEach((line, idx) => {
+    let rec: StructuredArgvRecord;
+    try { rec = JSON.parse(line) as StructuredArgvRecord; }
+    catch (e) { violations.push(`argv 紀錄第 ${idx} 行無法解析：${String(e)}`); return; }
+    const argv = rec.argv;
+    if (!Array.isArray(argv) || argv.some(x => typeof x !== 'string')) {
+      violations.push(`argv 紀錄第 ${idx} 行的 argv 不是字串陣列：${JSON.stringify(argv)}`);
+      return;
+    }
+    const a = argv as string[];
+    if (a.length === 1 && a[0] === '--version') { versionCalls += 1; return; }
+    const cv = judgeClaudeConversationArgvStrict(a);
+    if (cv.length > 0) {
+      violations.push(`claude-scenario 收到非核定的呼叫：${JSON.stringify(a)}｜${cv.join('; ')}`);
+      return;
+    }
+    conversationCalls += 1;
+  });
+
+  if (codexVersionCalls < 1) {
+    violations.push('codex 從未以 --version 被呼叫——Claude 整合仍必須留下兩個工具的隔離證據');
+  }
+  if (versionCalls < 1) violations.push('claude-scenario 從未以 --version 被呼叫（CLIInfo／preflight 應呼叫）');
+  if (conversationCalls < 1) violations.push('claude-scenario 從未以核定 conversation argv 被呼叫（Start 應觸發真正的 claude.Start）');
+  if (conversationCalls > 1) violations.push(`claude-scenario 的 conversation 呼叫出現 ${conversationCalls} 次（本案只允許一次）`);
+  if (claudeWrapperLines !== argvLines.length) {
+    violations.push(
+      `wrapper 行數（${claudeWrapperLines}）與結構化 argv 紀錄筆數（${argvLines.length}）不一致`
+      + '——兩份紀錄必須同源',
+    );
+  }
+  log.log(
+    `scenario 呼叫紀律判定（claude）：--version ${versionCalls} 次、conversation ${conversationCalls} 次、`
+    + `codex --version ${codexVersionCalls} 次、wrapper 行 ${claudeWrapperLines} 筆、違規 ${violations.length} 筆`,
+  );
+  return violations;
+}
+
+function judgeCodexScenarioCalls(logFile: string, log: HarnessLogger): string[] {
   const violations: string[] = [];
   const text = fs.readFileSync(logFile, 'utf8');
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);

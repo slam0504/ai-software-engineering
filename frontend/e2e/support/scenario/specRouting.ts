@@ -15,6 +15,8 @@ import { resolveScenario } from './scenarios.js';
 
 export const APPROVAL_SPEC_FILE = 'codexApproval.spec.ts';
 export const RECOVERY_SPEC_FILE = 'codexSessionRecovery.spec.ts';
+/** B3a-2b-2 F2：Claude 單一 approval allow 的專屬 spec。 */
+export const CLAUDE_APPROVAL_SPEC_FILE = 'claudeApproval.spec.ts';
 
 export function resolveScenarioSpecFile(scenarioName: string | undefined): string {
   let def: ReturnType<typeof resolveScenario>;
@@ -25,5 +27,21 @@ export function resolveScenarioSpecFile(scenarioName: string | undefined): strin
     // 這裡的挑選結果不影響那個既有契約，回傳中性預設值即可。
     return APPROVAL_SPEC_FILE;
   }
+  // provider 先分流，再看 kind——兩種 provider 的 spec 不共用，也不互相回退。
+  if (def.provider === 'claude') return CLAUDE_APPROVAL_SPEC_FILE;
   return def.kind === 'recovery' ? RECOVERY_SPEC_FILE : APPROVAL_SPEC_FILE;
+}
+
+/**
+ * B3a-2b-2 F2：給 global-teardown 的 tripwire 用的 provider 解析。
+ * 缺失／未知名稱的拒絕由 global-setup.scenario.ts 的 `resolveScenario()` 負責
+ * （啟動前 throw ＋ harness.log），這裡與既有 spec 路由採同一個中性預設，
+ * 不改變那條既有契約。
+ */
+export function resolveScenarioProviderForTripwire(scenarioName: string | undefined): 'codex' | 'claude' {
+  try {
+    return resolveScenario(scenarioName).provider;
+  } catch {
+    return 'codex';
+  }
 }

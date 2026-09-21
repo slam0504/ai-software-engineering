@@ -79,11 +79,28 @@ export function injectBadVersionAfterPreflight(toolsDir: string): void {
   fs.writeFileSync(path.join(toolsDir, 'codex.version'), 'fake-codex 9.9.9-WRONG\n');
 }
 
+/**
+ * B3a-2b-2 F2：Claude 案的結構化 argv 紀錄檔名。
+ *
+ * 它與 `invocations.log` **必須在同一階段保存與重設**——預檢只處理其中一份的話，
+ * 正式 tripwire 的「兩份筆數一致」在正常路徑也必然差一筆（reviewer #369 實測
+ * wrapperLines=0、structuredLines=1）。
+ *
+ * 檔案存在與否是 **provider 的判別**、不是 silent-optional：
+ * `createScenarioClaudeCli` 會在建立 wrapper 時一併建出空檔，Codex 案則從不建立。
+ */
+export const CLAUDE_ARGV_LOG_NAME = 'claude-argv.jsonl';
+
 export function snapshotInvocationsLog(toolsDir: string, destFile: string): void {
-  const src = path.join(toolsDir, 'invocations.log');
-  fs.copyFileSync(src, destFile);
+  fs.copyFileSync(path.join(toolsDir, 'invocations.log'), destFile);
+  const argvSrc = path.join(toolsDir, CLAUDE_ARGV_LOG_NAME);
+  if (fs.existsSync(argvSrc)) {
+    fs.copyFileSync(argvSrc, path.join(path.dirname(destFile), `preflight-${CLAUDE_ARGV_LOG_NAME}`));
+  }
 }
 
 export function truncateInvocationsLog(toolsDir: string): void {
   fs.writeFileSync(path.join(toolsDir, 'invocations.log'), '');
+  const argv = path.join(toolsDir, CLAUDE_ARGV_LOG_NAME);
+  if (fs.existsSync(argv)) fs.writeFileSync(argv, '');
 }
