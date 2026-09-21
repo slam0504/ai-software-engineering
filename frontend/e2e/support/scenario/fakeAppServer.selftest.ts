@@ -252,6 +252,24 @@ await check('未知 method（handshake 前送錯誤方法）：fake 記錄後 fa
   }
 });
 
+await check('未知 method（approval response 階段送陌生 method 而非純 response）：fake 記錄後 fail', async () => {
+  const cfg = baseConfig({ scenario: 'unknown-method-at-approval-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    await driveThreadAndTurn(h, cfg);
+    await h.readFrame(); // 消掉 approval request，不回它——改送一個帶 method 的陌生 frame
+    h.send({ id: 999, method: 'thread/fork', params: {} });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.unknownMethodsSeen.includes('thread/fork'));
+    assert.ok(manifest.fatalError && manifest.fatalError.length > 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 await check('未知 argv：拒絕並以 exit 17 結束（不進場）', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a2b1-scenario-fake-argv-'));
   const child = spawn(FAKE_BIN, ['not-app-server'], { cwd: dir, stdio: ['ignore', 'ignore', 'pipe'] });
