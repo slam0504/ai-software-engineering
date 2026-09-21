@@ -4,6 +4,7 @@
 //
 // 執行：node frontend/e2e/support/scenario/verify.selftest.ts
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -140,10 +141,100 @@ check('parseRunLog：正常檔案時成功解析且保留筆數', () => {
   const p = path.join(tmpDir, 'ok.jsonl');
   fs.writeFileSync(
     p,
-    '{"seq":1,"ts":"t1","dir":"meta"}\n{"seq":2,"ts":"t2","dir":"c2s"}\n',
+    '{"seq":1,"ts":"t1","dir":"meta"}\n{"seq":2,"ts":"t2","dir":"c2s","frame":{"id":1,"method":"initialize","params":{}}}\n',
   );
   const entries = parseRunLog(p);
   assert.equal(entries.length, 2);
+});
+
+// --- R1 缺陷修正回歸：直接重現 codex-reviewer 205 輪的反例輸入 ---
+// （/tmp/b3a2b1-repro205-gc_r3e4d/parser-repro.mjs 與 invalid-log.jsonl）
+const baseManifestFields = {
+  scenario: 'x',
+  argv: ['app-server'],
+  pid: 1,
+  startedAt: 't',
+  approvalRequestId: 'id',
+  approvalMethod: 'item/commandExecution/requestApproval',
+  decisionReceived: 'accept',
+};
+
+check('parseManifest：完全省略 exitCode／endedAt 欄位時 throw（先前會靜默通過）', () => {
+  const p = path.join(tmpDir, 'missing-exit.manifest.json');
+  fs.writeFileSync(p, JSON.stringify(baseManifestFields));
+  assert.throws(() => parseManifest(p));
+});
+
+check('judgeApproval：identity 相符但 exitCode/fatalError/unknownMethodsSeen 顯示失敗時必須回報違規（不是 []）', () => {
+  const failed = goodManifest({
+    exitCode: 17,
+    fatalError: 'failed',
+    unknownMethodsSeen: ['bad'],
+  });
+  const violations = judgeApproval(failed, expected);
+  assert.ok(violations.length > 0, 'expected violations for a failed manifest with matching identity');
+  assert.ok(violations.some(v => v.includes('exitCode')));
+  assert.ok(violations.some(v => v.includes('fatalError')));
+  assert.ok(violations.some(v => v.includes('unknownMethodsSeen')));
+});
+
+check('parseRunLog：seq=1.5／dir="bogus"／無 frame 的紀錄時 throw（先前會靜默通過）', () => {
+  const p = path.join(tmpDir, 'invalid.jsonl');
+  fs.writeFileSync(p, JSON.stringify({ seq: 1.5, ts: 'bad-time', dir: 'bogus' }) + '\n');
+  assert.throws(() => parseRunLog(p));
+});
+
+check('parseRunLog：dir=c2s 但缺 frame 時 throw', () => {
+  const p = path.join(tmpDir, 'c2s-no-frame.jsonl');
+  fs.writeFileSync(p, '{"seq":1,"ts":"t","dir":"c2s"}\n');
+  assert.throws(() => parseRunLog(p));
+});
+
+// --- 測試與交付補正 #1：最小的實際子程序呼叫（不只證明 assert 會 throw，
+// 而是證明 caller 真的用非零 exit code 反映判定結果，不會 catch 後吞掉）。
+// 只證明本包 caller；不宣稱 browser runner 已涵蓋。
+const verifyModuleUrl = new URL('./verify.ts', import.meta.url).href;
+
+function runCallerSubprocess(manifestObj: unknown, expectedObj: unknown): { code: number | null; stdout: string } {
+  const script = `
+    import { parseManifest, judgeApproval } from '${verifyModuleUrl}';
+    import fs from 'node:fs';
+    const path = process.argv[2];
+    try {
+      const m = parseManifest(path);
+      const violations = judgeApproval(m, ${JSON.stringify(expectedObj)});
+      if (violations.length > 0) {
+        console.error('VIOLATIONS: ' + JSON.stringify(violations));
+        process.exit(1);
+      }
+      console.log('ACCEPTED');
+      process.exit(0);
+    } catch (e) {
+      console.error('REJECTED: ' + e.message);
+      process.exit(1);
+    }
+  `;
+  const scriptPath = path.join(tmpDir, `caller-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(scriptPath, script);
+  const manifestPath = path.join(tmpDir, `caller-manifest-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifestObj));
+  const res = spawnSync(process.execPath, [scriptPath, manifestPath], { encoding: 'utf8' });
+  return { code: res.status, stdout: res.stdout + res.stderr };
+}
+
+check('實際子程序 caller：正確證據 rc0', () => {
+  const { code, stdout } = runCallerSubprocess(goodManifest(), expected);
+  assert.equal(code, 0, `expected rc0, got ${code}, output=${stdout}`);
+});
+
+check('實際子程序 caller：wrong expected id 時非零 exit（不是 catch 後回成功）', () => {
+  const { code } = runCallerSubprocess(goodManifest(), { ...expected, requestId: 'appr-WRONG' });
+  assert.notEqual(code, 0, 'expected nonzero exit for wrong expected id');
+});
+
+check('實際子程序 caller：failed manifest（exitCode!=0）時非零 exit', () => {
+  const { code } = runCallerSubprocess(goodManifest({ exitCode: 17, fatalError: 'boom' }), expected);
+  assert.notEqual(code, 0, 'expected nonzero exit for failed manifest');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

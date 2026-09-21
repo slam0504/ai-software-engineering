@@ -42,26 +42,22 @@ if (argv[0] === '--version') {
 const configPath = process.env.SCENARIO_FAKE_CONFIG;
 const logPath = process.env.SCENARIO_FAKE_LOG;
 if (!configPath || !logPath) {
+  // R4 邊界：根本沒有 log 路徑可用（連 SCENARIO_FAKE_LOG 都沒給），無法留下
+  // 可解析的 evidence，只能 stderr＋非零收尾——這是唯一允許「沒有 manifest」
+  // 的邊界，明列於此，不擴大到其他失敗路徑。
   fatalArgv(
     `missing required env (SCENARIO_FAKE_CONFIG=${configPath ?? ''} SCENARIO_FAKE_LOG=${logPath ?? ''})`,
   );
 }
 
-let cfg: ScenarioConfig;
-try {
-  const raw = fs.readFileSync(configPath, 'utf8');
-  cfg = JSON.parse(raw) as ScenarioConfig;
-  if (!cfg.scenario || !cfg.threadId || !cfg.turnId || !cfg.approvalMethod) {
-    throw new Error('missing required scenario fields');
-  }
-} catch (e) {
-  fatalArgv(`malformed SCENARIO_FAKE_CONFIG (${configPath}): ${(e as Error).message}`);
-}
-
+// R4 修正：log 路徑已知（可寫），所以從這裡開始的任何失敗（包含 config 壞掉／
+// 不合法）都要留下可解析的 manifest，而不是像先前那樣整段走 fatalArgv、
+// 完全不建立 manifest。manifest.scenario 先以空字串佔位，config 解析成功後
+// 才覆寫成真正的 scenario 名稱。
 let seq = 0;
 const startedAt = nowIso();
 const manifest: Manifest = {
-  scenario: cfg.scenario,
+  scenario: '',
   argv,
   pid: process.pid,
   startedAt,
@@ -103,6 +99,63 @@ function finish(code: number, fatalError?: string): void {
   process.exit(code);
 }
 
+// validateScenarioConfig：R4 修正——先前只檢查四個欄位 truthy，完全沒驗證
+// approvalMethod 是否落在白名單內（`not-approved/method` 這種偽方法會被真的
+// 送出去，違反「只允許兩個 method」的契約），也沒驗證其餘實際會用到的欄位
+// 型別。這裡逐一檢查，缺少或型別不對一律在協定開始前回傳錯誤訊息（呼叫端
+// finish(17, msg) 收尾，manifest 留下可診斷的 fatalError）。
+function validateScenarioConfig(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return 'config is not a JSON object';
+  }
+  const c = raw as Record<string, unknown>;
+  if (typeof c.scenario !== 'string' || c.scenario.length === 0) return 'scenario must be a non-empty string';
+  if (typeof c.threadId !== 'string' || c.threadId.length === 0) return 'threadId must be a non-empty string';
+  if (typeof c.turnId !== 'string' || c.turnId.length === 0) return 'turnId must be a non-empty string';
+  if (typeof c.itemId !== 'string' || c.itemId.length === 0) return 'itemId must be a non-empty string';
+  if (c.threadMode !== 'start' && c.threadMode !== 'resume') {
+    return `threadMode must be "start" or "resume", got ${JSON.stringify(c.threadMode)}`;
+  }
+  if (c.approvalMethod !== Method.CmdExecRequestApproval && c.approvalMethod !== Method.FileChangeRequestApproval) {
+    return `approvalMethod must be one of [${Method.CmdExecRequestApproval}, ${Method.FileChangeRequestApproval}], got ${JSON.stringify(c.approvalMethod)}`;
+  }
+  if (typeof c.approvalRequestId !== 'string' || c.approvalRequestId.length === 0) {
+    return 'approvalRequestId must be a non-empty string';
+  }
+  if (!Array.isArray(c.afterApproval)) return 'afterApproval must be an array';
+  for (const ev of c.afterApproval) {
+    if (typeof ev !== 'object' || ev === null) return 'afterApproval entries must be objects';
+    const e = ev as Record<string, unknown>;
+    if (e.type !== 'itemStarted' && e.type !== 'itemCompleted') {
+      return `afterApproval[].type must be "itemStarted" or "itemCompleted", got ${JSON.stringify(e.type)}`;
+    }
+    if (typeof e.text !== 'string') return 'afterApproval[].text must be a string';
+  }
+  if (c.turnStatus !== 'completed' && c.turnStatus !== 'failed') {
+    return `turnStatus must be "completed" or "failed", got ${JSON.stringify(c.turnStatus)}`;
+  }
+  return null;
+}
+
+let cfg: ScenarioConfig;
+{
+  let raw: unknown;
+  try {
+    const text = fs.readFileSync(configPath, 'utf8');
+    raw = JSON.parse(text);
+  } catch (e) {
+    finish(17, `malformed SCENARIO_FAKE_CONFIG (${configPath}): ${(e as Error).message}`);
+    throw new Error('unreachable: finish() exits the process');
+  }
+  const violation = validateScenarioConfig(raw);
+  if (violation !== null) {
+    finish(17, `invalid SCENARIO_FAKE_CONFIG (${configPath}): ${violation}`);
+    throw new Error('unreachable: finish() exits the process');
+  }
+  cfg = raw as ScenarioConfig;
+  manifest.scenario = cfg.scenario;
+}
+
 function send(f: Frame, dir: 's2c' = 's2c'): void {
   process.stdout.write(JSON.stringify(f) + '\n');
   writeLog(dir, { frame: f });
@@ -113,9 +166,19 @@ function fail(msg: string): void {
   finish(17, msg);
 }
 
+// R5 修正：先前無條件 finish(0)——即使場景根本沒跑完（例如 initialize
+// response 剛送出就被 SIGTERM），也會被記成「成功」manifest（exitCode 0、
+// fatalError null）。現在只有 stage 已經是 'done'（turn/completed 已送出、
+// 正常收尾）才視為成功；其餘一律記為 interrupted、非零收尾，manifest 留下
+// 可診斷的 fatalError。finish() 內部的 `exited` guard 保證真正已經 finish(0)
+// 過的 run 不會被這裡的呼叫覆寫。
 process.on('SIGTERM', () => {
   writeLog('meta', { note: 'SIGTERM received' });
-  finish(0);
+  if (stage === 'done') {
+    finish(0);
+    return;
+  }
+  finish(17, `terminated by SIGTERM before scenario finished (stage=${stage})`);
 });
 
 type Stage =
@@ -136,14 +199,23 @@ function idsEqual(a: RawId, b: RawId): boolean {
 }
 
 function handleLine(line: string): void {
-  let f: Frame;
+  let parsed: unknown;
   try {
-    f = JSON.parse(line) as Frame;
+    parsed = JSON.parse(line);
   } catch (e) {
     writeLog('c2s', { note: `malformed json: ${(e as Error).message}` });
     fail(`malformed client frame: ${line.slice(0, 200)}`);
     return;
   }
+  // R3 修正：先前直接 `as Frame` 就存取 `.id`／`.method`，遇到 `null`／array／
+  // 其他非物件 JSON 值會丟未捕捉的 TypeError（process 直接崩潰，沒有
+  // manifest）。這裡先守門，非物件一律走 fail()，留下可診斷的證據。
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    writeLog('c2s', { note: `non-object frame: ${line.slice(0, 200)}` });
+    fail(`expected a JSON object frame, got: ${line.slice(0, 200)}`);
+    return;
+  }
+  const f = parsed as Frame;
   writeLog('c2s', { frame: f });
 
   switch (stage) {
@@ -167,10 +239,25 @@ function handleLine(line: string): void {
       return;
     }
     case 'awaitThreadStart': {
-      if ((f.method !== Method.ThreadStart && f.method !== Method.ThreadResume) || f.id === undefined) {
+      // R2 修正：先前 thread/start 與 thread/resume 兩個方法無條件都接受，也
+      // 完全不核對 params——送 `thread/resume(threadId="WRONG")` 一樣 rc0 並
+      // 拿到正確 thread，會讓未來錯接的 resume 測試假通過。現在 config 明確
+      // 指定 threadMode，本次協定只允許對應的那個方法；resume 額外核對
+      // params.threadId 是否等於 cfg.threadId。
+      const expectedMethod = cfg.threadMode === 'resume' ? Method.ThreadResume : Method.ThreadStart;
+      if (f.method !== expectedMethod || f.id === undefined) {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
-        fail(`expected ${Method.ThreadStart}|${Method.ThreadResume} with id, got ${JSON.stringify(f)}`);
+        fail(`expected ${expectedMethod} (threadMode=${cfg.threadMode}) with id, got ${JSON.stringify(f)}`);
         return;
+      }
+      if (cfg.threadMode === 'resume') {
+        const params = f.params as { threadId?: unknown } | undefined;
+        if (typeof params?.threadId !== 'string' || params.threadId !== cfg.threadId) {
+          fail(
+            `${Method.ThreadResume} threadId mismatch: got ${JSON.stringify(params?.threadId)} want ${JSON.stringify(cfg.threadId)}`,
+          );
+          return;
+        }
       }
       send({ id: f.id, result: { thread: { id: cfg.threadId } } });
       stage = 'awaitTurnStart';
@@ -181,6 +268,18 @@ function handleLine(line: string): void {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
         fail(`expected ${Method.TurnStart} with id, got ${JSON.stringify(f)}`);
         return;
+      }
+      // R2 修正：turn/start 先前完全不核對 params，錯接到別的 thread 一樣會
+      // rc0 通過。這裡要求 params.threadId 嚴格等於本次協定已確立的
+      // cfg.threadId。
+      {
+        const params = f.params as { threadId?: unknown } | undefined;
+        if (typeof params?.threadId !== 'string' || params.threadId !== cfg.threadId) {
+          fail(
+            `${Method.TurnStart} threadId mismatch: got ${JSON.stringify(params?.threadId)} want ${JSON.stringify(cfg.threadId)}`,
+          );
+          return;
+        }
       }
       send({ id: f.id, result: { turn: { id: cfg.turnId, status: 'inProgress' } } });
       // turn/start response 立即回（同 internal/codex/turns.go 註記）；approval
@@ -209,6 +308,21 @@ function handleLine(line: string): void {
       }
       if (pendingApprovalId === null || !idsEqual(f.id, pendingApprovalId)) {
         fail(`approval response id mismatch: got ${JSON.stringify(f.id)} want ${JSON.stringify(pendingApprovalId)}`);
+        return;
+      }
+      // R3 修正：先前完全不看 `f.error`——即使 frame 同時帶
+      // `result.decision="accept"` 與 `error={code:-1,...}`（JSON-RPC 規範互斥
+      // 的兩個欄位同時出現）一樣被當成合法 accept 收下並 rc0。現在明確核對
+      // result／error 互斥，且「error response」本身必須讓這個成功場景判定為
+      // 未完成（fail，非 0 收尾），不能被當成 decision 處理。
+      const hasResult = f.result !== undefined;
+      const hasError = f.error !== undefined;
+      if (hasResult && hasError) {
+        fail(`approval response has both result and error (violates JSON-RPC mutual exclusivity): ${JSON.stringify(f)}`);
+        return;
+      }
+      if (hasError) {
+        fail(`approval response is an error, not a decision: ${JSON.stringify(f.error)}`);
         return;
       }
       const result = f.result as { decision?: string } | undefined;

@@ -35,6 +35,12 @@ export type ApprovalMethod =
   | typeof Method.CmdExecRequestApproval
   | typeof Method.FileChangeRequestApproval;
 
+// approval request params 的四個必要欄位（threadId／turnId／itemId／
+// startedAtMs）對齊 repo 內 pinned schema，兩個方法的 required 集合相同：
+//   schemas/codex/CommandExecutionRequestApprovalParams.json
+//   schemas/codex/FileChangeRequestApprovalParams.json
+// （reviewer 205 輪確認：兩個 schema 都在 repo，不需類推另一方法。）
+
 export type Decision = 'accept' | 'decline';
 
 // ScenarioConfig：單一明確場景／每次子行程一份（B3a-2b-1 範圍表 §介面）。
@@ -43,6 +49,11 @@ export interface ScenarioConfig {
   threadId: string;
   turnId: string;
   itemId: string;
+  // threadMode：明確指定本次協定允許 client 送 thread/start 還是
+  // thread/resume——兩者不得任意通過（B3a2b1-2b-1 缺陷修正 R2）。resume 時 fake
+  // 會核對 client 送來的 params.threadId 是否等於 threadId（不知道要 resume
+  // 誰卻能 resume 成功，本身就是錯接的訊號）。
+  threadMode: 'start' | 'resume';
   approvalMethod: ApprovalMethod;
   // approvalRequestId：刻意用字串（非數字字面量）——正面證明 server→client
   // request 的 id 型別經過真正的 Go Conn 往返後不被轉型（見 B3a2b1 probe）。

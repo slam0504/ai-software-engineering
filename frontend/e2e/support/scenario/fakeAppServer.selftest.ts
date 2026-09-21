@@ -41,6 +41,7 @@ function baseConfig(overrides: Partial<ScenarioConfig> = {}): ScenarioConfig {
     threadId: 'thread-selftest-1',
     turnId: 'turn-selftest-1',
     itemId: 'item-selftest-1',
+    threadMode: 'start',
     approvalMethod: 'item/commandExecution/requestApproval',
     approvalRequestId: 'appr-selftest-1',
     afterApproval: [{ type: 'itemCompleted', text: 'done' }],
@@ -306,7 +307,7 @@ await check('缺失設定：沒帶 SCENARIO_FAKE_CONFIG/LOG env 時 exit 17（�
   }
 });
 
-await check('malformed 設定：SCENARIO_FAKE_CONFIG 指向壞掉的 JSON 時 exit 17', async () => {
+await check('malformed 設定：SCENARIO_FAKE_CONFIG 指向壞掉的 JSON 時 exit 17，且留下可解析的 manifest（R4）', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a2b1-scenario-fake-badcfg-'));
   const configPath = path.join(dir, 'bad.json');
   fs.writeFileSync(configPath, '{not valid json');
@@ -320,6 +321,204 @@ await check('malformed 設定：SCENARIO_FAKE_CONFIG 指向壞掉的 JSON 時 ex
     child.once('exit', c => resolve(c));
   });
   assert.equal(code, 17);
+  // R4 修正：先前 malformed config 整段走 fatalArgv，根本不建立 manifest；
+  // 現在 log 路徑已提供時要留下可解析的 failure evidence。
+  const manifest = parseManifest(`${logPath}.manifest.json`);
+  assert.equal(manifest.exitCode, 17);
+  assert.ok(manifest.fatalError && manifest.fatalError.includes('malformed'), `fatalError=${manifest.fatalError}`);
+});
+
+await check('bad-config-method：approvalMethod 不在白名單時 exit 17，協定從未開始也留下 manifest（R4）', async () => {
+  const cfg = { ...baseConfig(), approvalMethod: 'not-approved/method' } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('approvalMethod'), `fatalError=${manifest.fatalError}`);
+    // 白名單擋在協定開始前：approvalMethod 這個 manifest 欄位本身應仍是
+    // null（表示從沒進到「送出 approval request」那一步）。
+    assert.equal(manifest.approvalMethod, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('bad-config-method：threadMode 缺漏或型別錯誤時 exit 17（R4）', async () => {
+  const cfg = { ...baseConfig(), threadMode: 'bogus' } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('threadMode'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// --- R2 負向子程序案例：thread/resume 錯 ID／錯型別／錯順序都不得通過 ---
+
+await check('R2 正向：threadMode=resume 且 client 送對的 threadId 時成功', async () => {
+  const cfg = baseConfig({ scenario: 'resume-ok-selftest', threadMode: 'resume' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    h.send({ id: 2, method: 'thread/resume', params: { threadId: cfg.threadId } });
+    const threadRes = await h.readFrame();
+    assert.deepEqual(threadRes.result, { thread: { id: cfg.threadId } });
+    h.send({ id: 3, method: 'turn/start', params: { threadId: cfg.threadId, input: [] } });
+    const turnRes = await h.readFrame();
+    assert.deepEqual(turnRes.result, { turn: { id: cfg.turnId, status: 'inProgress' } });
+    const appr = await h.readFrame();
+    h.send({ id: appr.id as RawId, result: { decision: 'accept' } });
+    await h.readFrame();
+    await h.readFrame();
+    const code = await h.waitExit();
+    assert.equal(code, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R2 負向：threadMode=resume 但 client 送錯 threadId（"WRONG"）時 fail，非 0 結束', async () => {
+  const cfg = baseConfig({ scenario: 'resume-wrong-id-selftest', threadMode: 'resume' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    h.send({ id: 2, method: 'thread/resume', params: { threadId: 'WRONG' } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('threadId mismatch'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R2 負向：threadMode=start 但 client 送 thread/resume（方法型別不符）時 fail', async () => {
+  const cfg = baseConfig({ scenario: 'wrong-method-selftest', threadMode: 'start' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    h.send({ id: 2, method: 'thread/resume', params: { threadId: cfg.threadId } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.unknownMethodsSeen.includes('thread/resume'));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R2 負向：turn/start 送錯 threadId（順序錯接）時 fail', async () => {
+  const cfg = baseConfig({ scenario: 'wrong-turn-threadid-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    h.send({ id: 2, method: 'thread/start', params: {} });
+    await h.readFrame();
+    h.send({ id: 3, method: 'turn/start', params: { threadId: 'WRONG', input: [] } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('threadId mismatch'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// --- R3 負向子程序案例：result／error 互斥、error response、壞型別 frame ---
+
+await check('R3 負向：approval response 同時帶 result 與 error 時 fail（互斥違規），非 0 結束', async () => {
+  const cfg = baseConfig({ scenario: 'result-and-error-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    await driveThreadAndTurn(h, cfg);
+    const appr = await h.readFrame();
+    h.send({ id: appr.id as RawId, result: { decision: 'accept' }, error: { code: -1, message: 'real error' } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('mutual exclusivity'), `fatalError=${manifest.fatalError}`);
+    assert.notEqual(manifest.decisionReceived, 'accept');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R3 負向：approval response 只帶 error 時視為未完成、非 0 結束（不得成功）', async () => {
+  const cfg = baseConfig({ scenario: 'error-only-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    await driveThreadAndTurn(h, cfg);
+    const appr = await h.readFrame();
+    h.send({ id: appr.id as RawId, error: { code: -32000, message: 'declined via error' } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.equal(manifest.decisionReceived, null);
+    assert.ok(manifest.fatalError && manifest.fatalError.length > 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R3 負向：approval response 送 null frame 時受控失敗，不是未捕捉例外（有 manifest 可診斷）', async () => {
+  const cfg = baseConfig({ scenario: 'null-frame-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    await driveThreadAndTurn(h, cfg);
+    await h.readFrame(); // approval request
+    h.child.stdin.write('null\n');
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.length > 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R3 負向：approval response 送 array frame 時受控失敗，不是未捕捉例外', async () => {
+  const cfg = baseConfig({ scenario: 'array-frame-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    await driveThreadAndTurn(h, cfg);
+    await h.readFrame(); // approval request
+    h.child.stdin.write('[1,2,3]\n');
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.length > 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// --- R5 負向子程序案例：SIGTERM 在場景完成前送達，不得記成功 manifest ---
+
+await check('R5 負向：initialize 完成後、stdin 保持開啟時送 SIGTERM，manifest 必須記為未完成（非 0、非 null fatalError）', async () => {
+  const cfg = baseConfig({ scenario: 'sigterm-early-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveHandshake(h);
+    // 刻意不關閉 stdin、不繼續協定，模擬 reviewer term205 反例：只送
+    // SIGTERM，不觸發 stdin 'end' 事件。
+    h.child.kill('SIGTERM');
+    const code = await h.waitExit();
+    assert.notEqual(code, 0, 'SIGTERM before scenario finished must not be exitCode 0');
+    const manifest = parseManifest(h.manifestPath);
+    assert.notEqual(manifest.exitCode, 0);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('SIGTERM'), `fatalError=${manifest.fatalError}`);
+    assert.equal(manifest.decisionReceived, null);
+  } finally {
+    await h.cleanup();
+  }
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
