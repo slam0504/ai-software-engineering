@@ -1,16 +1,32 @@
-// B3a-2b-2 Task C：Codex 單一 approval 的 browser 整合檢查點——第一案
-// `commandExecution-allow`。
+// B3a-2b-2 Task C／Task D：Codex 單一 approval 的 browser 整合檢查點——四案
+// matrix（2 methods × 2 decisions：commandExecution-allow／
+// commandExecution-deny／fileChange-allow／fileChange-deny）共用本檔一個
+// runner，一次 invocation 只跑 `E2E_SCENARIO` 明確選定的那一案（見
+// support/scenario/scenarios.ts resolveScenario，未指定或未知一律 throw、
+// 不回退 default）。
 //
 // 真 Wails／App 正式啟動（globalSetup.scenario.ts spawn 真的 `wails dev`）→
 // 真瀏覽器操作 Start（建立 codex session → 送出第一則訊息）→ UI 顯示
 // approval（ApprovalDialog，真的 `approval:request` 事件、真的
-// `window.go.main.App.ResolveApproval` binding）→ 點 allow → 新內容顯示
-// （assistant 訊息泡泡）。
+// `window.go.main.App.ResolveApproval` binding）→ 依本案 `decision` 點
+// allow 或 deny → 新內容顯示（assistant 訊息泡泡）。method／按鈕／預期
+// decision 全部由 `resolveScenario(env.scenario)` 這個受版控的 ScenarioDef
+// 決定（見 scenarios.ts），不是本檔寫死。
+//
+// 重要限制（Task D 裁定，回報與文件都要保留）：fake app-server
+// （fakeAppServer.ts，凍結不改）在收到 decline 之後**仍然**依 config 送出
+// afterApproval 的 itemStarted／itemCompleted 與 turn/completed——它不看
+// decision 決定要不要繼續送內容，只是照單全收 client 實際送來的值。deny 案
+// 因此一樣會看到「新內容顯示」，這只是本測試套件受控的合成情境，**不得**
+// 宣稱真正的 codex provider 被拒絕後也會照樣送出後續內容。UI／decision 的
+// 證據（approval-deny 按鈕真的被點、wire／audit 記錄的 decision 真的是
+// decline）與「後續是否有新內容」這兩件事在回報時分開陳述。
 //
 // 絕對禁止（reviewer 明訂，逐項對齊）：
 //   - 不在 browser 注入 fake bindings——全程只用真的 `window.go.main.App.*`。
 //   - 不直接呼叫 ResolveApproval 取代按鈕點擊——本檔只用
-//     `page.locator('[data-test="approval-allow"]').click()`。
+//     `page.locator('[data-test="approval-allow"]'／'[data-test="approval-deny"]').click()`，
+//     選哪個按鈕由本案 `decision` 決定。
 //   - 不沿用 codexHostOverride——App 走 `a.ensureAppServer()` 真正 spawn
 //     `a.codexCLIPath()`（見 support/scenario/scenarioCli.ts 的裁定說明）。
 //   - App 事件接收器不算 UI 證據——approval 是否出現一律以 DOM
@@ -38,6 +54,8 @@ import { parseManifest, parseRunLog, judgeApproval } from '../support/scenario/v
 import { judgeFullProtocol, judgeRunIdentity } from '../support/scenario/scenarioProtocolJudge.js';
 import { resolveScenario } from '../support/scenario/scenarios.js';
 import type { ScenarioConfig } from '../support/scenario/protocol.js';
+import { HarnessLogger } from '../support/logger.js';
+import { assertWireEvidencePersisted, persistWireEvidence, selectGenerationsByIdentity, validateWireMeta, waitForWireMeta, WireMetaWaitError } from '../support/scenario/wireEvidence.js';
 
 test.afterEach(async ({}, testInfo) => {
   if (testInfo.status !== testInfo.expectedStatus) {
@@ -46,8 +64,12 @@ test.afterEach(async ({}, testInfo) => {
   }
 });
 
-test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示 → allow → 新內容顯示', async ({ page }) => {
+test('codex approval scenario matrix: 真 App 啟動 → Start → approval 顯示 → decision → 新內容顯示', async ({ page }) => {
   const env = readScenarioRunEnv();
+  // 本案的獨立期望（受版控，不從落地檔案回填）——method／decision／按鈕
+  // 選擇全部從這裡取得，不在本檔寫死任何一案的字面值。
+  const expectedScenario = resolveScenario(env.scenario);
+  test.info().annotations.push({ type: 'scenario', description: `${env.scenario} (decision=${expectedScenario.decision})` });
 
   await installNetworkGuard(page.context(), env.artifactsDir);
   await page.goto(env.baseUrl);
@@ -115,9 +137,11 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   expect(rawParams.turnId, 'approval DOM 顯示的 raw params.turnId 應等於本次 scenario turnId').toBe(env.scenarioTurnId);
   expect(rawParams.itemId, 'approval DOM 顯示的 raw params.itemId 應等於本次 scenario itemId').toBe(env.scenarioItemId);
 
-  // 點 allow：真的按鈕點擊，走 ApprovalDialog.vue 的
-  // `ResolveApproval(r.id, true, reason)` wails binding，不是測試直接呼叫。
-  await page.locator('[data-test="approval-allow"]').click();
+  // 點 allow 或 deny：由本案獨立期望的 decision 決定按哪個鈕，真的按鈕
+  // 點擊，走 ApprovalDialog.vue 的 `ResolveApproval(r.id, allow, reason)`
+  // wails binding，不是測試直接呼叫。
+  const approvalButtonTestId = expectedScenario.decision === 'accept' ? 'approval-allow' : 'approval-deny';
+  await page.locator(`[data-test="${approvalButtonTestId}"]`).click();
 
   await expect(dialog, 'approval 解決後 dialog 應關閉').toHaveCount(0, { timeout: 15_000 });
 
@@ -134,7 +158,7 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
     ownerPane.locator('.bubble.assistant', { hasText: expectedText }),
     'approval 核可後，同一個 WSID 的 pane 內應顯示新的 assistant 內容',
   ).toBeVisible({ timeout: 30_000 });
-  await page.screenshot({ path: `${env.artifactsDir}/ui-new-content-after-allow.png` });
+  await page.screenshot({ path: `${env.artifactsDir}/ui-new-content-after-${expectedScenario.decision}.png` });
 
   const guardState = getInMemoryGuardState(env.artifactsDir);
   expect(guardState.violations, 'network guard 不應攔到任何違規').toEqual([]);
@@ -171,7 +195,10 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
     e => e.kind === 'codex_approval_decision' && e.data.id === domApprovalId,
   );
   expect(approvalDecisionEntry, `audit.jsonl 應有 id=${domApprovalId} 的 codex_approval_decision 紀錄`).toBeTruthy();
-  expect(approvalDecisionEntry?.data.decision, 'audit.jsonl 的 codex_approval_decision.decision 應為 accept').toBe('accept');
+  expect(
+    approvalDecisionEntry?.data.decision,
+    `audit.jsonl 的 codex_approval_decision.decision 應等於本案獨立期望（${expectedScenario.decision}）`,
+  ).toBe(expectedScenario.decision);
 
   const wsRegistryRaw = JSON.parse(fs.readFileSync(wsRegistryPath, 'utf8')) as {
     entries?: Record<string, { wsid?: string; provider?: string }>;
@@ -196,37 +223,122 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   // fixture 目錄會在 teardown 被清掉，必須在這裡（run 進行中、清理前）就
   // 複製，比照上面 audit.jsonl 的複製點；找不到就直接讓測試失敗並回報實際
   // 路徑與原因，不得把 audit 改稱 wire。
+  //
+  // F1（B3a-2b-2 Task D 限縮補正，codex-reviewer 裁定）：`<id>.meta.json`
+  // 從這裡原本的 `if (fs.existsSync(...))`（optional，缺了不失敗）升格為
+  // 必要證據，理由與逐條要求見 wireEvidence.ts 檔頭與本輪 F1 逐條：
+  //   1. generation 的選擇以「內容含本案 approval request」為準（見
+  //      selectGenerationsByIdentity），不是只挑 mtime 最新；找到之後對
+  //      同一個 generation 的 meta 做有上限（15 秒級）的輪詢等待，不固定
+  //      sleep、不用重跑整案來等綠燈。
+  //   2. meta 必須核對 provider=codex、exit_code=0（缺少不當成 0）、argv
+  //      對應本次的 codex wrapper／app-server、無 recorder_error／
+  //      cleanup_incomplete；finalize_cause 保留但若含逾時等異常訊號仍判
+  //      違規（見 validateWireMeta）。
+  //   3. 【F1 限縮補正第二輪】不論等待成功或失敗，都先呼叫共用的
+  //      `persistWireEvidence`（wireEvidence.ts）把「當下已經讀到的原始
+  //      bytes」存進證據目錄，**在任何可能 throw 的 expect 之前**——避免
+  //      `exit_code!=0`／錯 argv／`recorder_error` 等內容違規、或逾時失敗，
+  //      在複製前就先讓例外把 wire／meta 兩者都沒存到的情況再次發生。成功
+  //      時傳入 `waitForWireMeta` 回傳的 `raw`（與 `validateWireMeta` 核對
+  //      的是同一份 `meta`，保證「保留副本」＝「被驗證的 bytes」）；失敗時
+  //      傳入 `WireMetaWaitError.diagnostics.lastRawBytes`（當下可讀到的最
+  //      後一次原始內容，即使是損毀 JSON 或缺失也原樣保留，缺失時
+  //      `persistWireEvidence` 只記錄「不存在」、不補造）。下面的 wire 內容
+  //      斷言一律讀「保留下來的副本」，不是再讀一次來源路徑。
+  //   4. 失敗時把 run-id／generation／等待期限／最後一次讀取狀態寫進
+  //      harness.log，並保留能取得的原始檔；不阻擋既有的 bounded teardown、
+  //      不合成假 meta 補齊。
+  const harness = new HarnessLogger(env.artifactsDir);
   const wireLogsDir = path.join(workbenchDir, 'wire-logs');
-  const wireLogFiles = fs.existsSync(wireLogsDir)
-    ? fs.readdirSync(wireLogsDir).filter(f => f.endsWith('.jsonl'))
-    : [];
-  expect(
-    wireLogFiles.length,
-    `App 端原始 wire 錄流應存在（${wireLogsDir}），找不到任何 .jsonl generation 檔——不得改用 audit.jsonl 頂替`,
-  ).toBeGreaterThan(0);
-  const wireLogWithMtime = wireLogFiles
-    .map(f => ({ f, mtime: fs.statSync(path.join(wireLogsDir, f)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  const chosenWireLogFile = wireLogWithMtime[0].f;
-  const chosenWireLogPath = path.join(wireLogsDir, chosenWireLogFile);
-  fs.copyFileSync(chosenWireLogPath, path.join(env.artifactsDir, 'app-wire-log.jsonl'));
-  const chosenMetaPath = chosenWireLogPath.replace(/\.jsonl$/, '.meta.json');
-  if (fs.existsSync(chosenMetaPath)) {
-    fs.copyFileSync(chosenMetaPath, path.join(env.artifactsDir, 'app-wire-log.meta.json'));
+  const identityCandidates = selectGenerationsByIdentity(wireLogsDir, {
+    approvalMethod: env.scenarioApprovalMethod,
+    approvalRequestId: env.scenarioApprovalRequestId,
+  });
+  if (identityCandidates.length === 0) {
+    harness.log(
+      `F1：wire-logs（${wireLogsDir}）內找不到任何內容含 approvalRequestId=${env.scenarioApprovalRequestId}／`
+      + `method=${env.scenarioApprovalMethod} 的 generation（run-id=${env.runId}）——不得改用 audit.jsonl 頂替，也不合成假證據。`,
+    );
   }
-  if (wireLogWithMtime.length > 1) {
-    fs.writeFileSync(
-      path.join(env.artifactsDir, 'app-wire-log-note.txt'),
-      `wire-logs 目錄內有 ${wireLogWithMtime.length} 個 generation，已複製最新（mtime）一個：${chosenWireLogFile}；`
-      + `其餘未複製：${wireLogWithMtime.slice(1).map(w => w.f).join('、')}`,
+  expect(
+    identityCandidates.length,
+    `App 端原始 wire 錄流應存在且內容須與本案 wire identity 一致（${wireLogsDir}），找不到任何相符的 .jsonl generation 檔——不得只挑 mtime 最新`,
+  ).toBeGreaterThan(0);
+  if (identityCandidates.length > 1) {
+    harness.log(
+      `F1：wire-logs 內有 ${identityCandidates.length} 個 generation 內容都符合本案 wire identity（run-id=${env.runId}），`
+      + `依 mtime 選最新：${identityCandidates[0].file}；其餘：${identityCandidates.slice(1).map(c => c.file).join('、')}`,
+    );
+  }
+  const chosenGeneration = identityCandidates[0];
+
+  const expectedCodexBinPath = path.join(envToolsReal, 'codex-cli', 'node_modules', '.bin', 'codex');
+  const expectedCodexBinRealPath = fs.realpathSync(expectedCodexBinPath);
+
+  let waitResult: Awaited<ReturnType<typeof waitForWireMeta>> | undefined;
+  let waitError: unknown;
+  try {
+    waitResult = await waitForWireMeta(chosenGeneration.metaPath, { deadlineMs: 15_000 });
+  } catch (e) {
+    waitError = e;
+  }
+
+  // 不論等待成功或失敗，先保存「當下已經讀到的原始 bytes」——這一步必須排
+  // 在下面任何可能 throw 的 expect 之前執行，否則就重演 reviewer 抓到的缺
+  // 口 1（內容違規／逾時會在複製前就先 throw，wire／meta 都沒存到）。
+  const waitErrorDiagnostics = waitError instanceof WireMetaWaitError ? waitError.diagnostics : undefined;
+  const persistResult = persistWireEvidence(
+    {
+      jsonlSourcePath: chosenGeneration.jsonlPath,
+      metaRaw: waitResult ? waitResult.raw : (waitErrorDiagnostics?.lastRawBytes as string | undefined),
+    },
+    env.artifactsDir,
+  );
+  if (persistResult.copyErrors.length > 0) {
+    harness.log(
+      `F1：證據保存過程有診斷訊息（不代表一定失敗，複製失敗不得掩蓋原始錯誤）：${persistResult.copyErrors.join('；')}`,
     );
   }
 
+  if (!waitResult) {
+    harness.log(
+      `F1：等待 finalize meta 失敗（run-id=${env.runId}，generation=${chosenGeneration.file}，`
+      + `metaPath=${chosenGeneration.metaPath}）：${waitErrorDiagnostics ? JSON.stringify(waitErrorDiagnostics) : String(waitError)}；`
+      + `已嘗試保存當下可讀到的原始 bytes（wireLogCopied=${persistResult.wireLogCopied}／metaCopied=${persistResult.metaCopied}）`,
+    );
+    throw waitError;
+  }
+  harness.log(
+    `F1：finalize meta 已就緒（run-id=${env.runId}，generation=${chosenGeneration.file}，`
+    + `等待 ${waitResult.elapsedMs}ms／共 ${waitResult.attempts} 次嘗試，已保存副本 wireLogCopied=${persistResult.wireLogCopied}／metaCopied=${persistResult.metaCopied}）`,
+  );
+
+  const metaViolations = validateWireMeta(waitResult.meta, {
+    provider: 'codex',
+    expectedArgvTail: ['app-server'],
+    expectedArgv0RealPath: expectedCodexBinRealPath,
+  });
+  if (metaViolations.length > 0) {
+    harness.log(`F1：finalize meta 核對失敗（run-id=${env.runId}，generation=${chosenGeneration.file}）：${JSON.stringify(metaViolations)}`);
+  }
+  expect(metaViolations, `finalize meta 應無違規：${JSON.stringify(metaViolations)}（meta=${JSON.stringify(waitResult.meta)}）`).toEqual([]);
+
+  // 保存已在上面完成（且保存的是與這裡驗證同一份 `waitResult.raw`
+  // bytes）；後續讀取一律用保留下來的副本路徑，不再讀一次來源。
+  // reviewer #285：先前這裡只擋 `wireLogCopied`，`metaCopied` 只寫 log——來源
+  // meta 合法、wire 複製成功、但 meta 寫入失敗（例如目的位置已存在同名目錄）
+  // 時會 false PASS。改成呼叫 spec 與 selftest 共用的判定，wire 與 meta 任一
+  // 未保存都失敗，不得只 warning。
+  assertWireEvidencePersisted(persistResult, { requireMeta: true });
+  const copiedWireLogPath = persistResult.wireLogDestPath;
+
   // 核對 approval 的原始 provider ID 與 decision，與 fake log
   // （scenario-wire.log）相符——App 端 wire log 是獨立於 fake app-server 另一
-  // 份原始證據，兩邊看到的應是同一組 JSON-RPC frame。
+  // 份原始證據，兩邊看到的應是同一組 JSON-RPC frame。以下一律讀「保留下來
+  // 的副本」（copiedWireLogPath），不是再讀一次來源路徑。
   interface AppWireRow { frame: number; dir: 'c2s' | 's2c'; wsid: string; raw: { id?: unknown; method?: string; result?: { decision?: string } } }
-  const appWireEntries: AppWireRow[] = fs.readFileSync(chosenWireLogPath, 'utf8')
+  const appWireEntries: AppWireRow[] = fs.readFileSync(copiedWireLogPath, 'utf8')
     .split('\n').map(l => l.trim()).filter(l => l.length > 0)
     .map(l => JSON.parse(l) as AppWireRow);
   const appApprovalRequest = appWireEntries.find(
@@ -242,8 +354,8 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   expect(appApprovalDecision, `App 端原始 wire 錄流應有 id=${env.scenarioApprovalRequestId} 的 decision response`).toBeTruthy();
   expect(
     appApprovalDecision?.raw.result?.decision,
-    'App 端原始 wire 錄流記錄的 decision 應為 accept，與 fake log（scenario-wire.log）相符',
-  ).toBe('accept');
+    `App 端原始 wire 錄流記錄的 decision 應等於本案獨立期望（${expectedScenario.decision}），與 fake log（scenario-wire.log）相符`,
+  ).toBe(expectedScenario.decision);
 
   // 缺口 3（第一段）：manifest 輪詢只容忍「檔案尚未出現」（fake 收尾前，
   // manifest 檔案根本不存在），其餘任何錯誤（malformed json、欄位缺漏／型別
@@ -276,16 +388,21 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   // item/started／item/completed，仍然 0 violations）。改成從受版控的
   // `resolveScenario(env.scenario).build(env.runId)` 取得獨立期望——純函式，
   // 只依賴 scenarios.ts 原始碼與本次 runId，不讀任何本次執行落地的檔案。
-  const expectedCfg = resolveScenario(env.scenario).build(env.runId);
+  // （Task D：`expectedScenario` 已在測試開頭算好，這裡只再算一次 cfg，
+  // decision 的獨立期望沿用同一個 `expectedScenario.decision`，不重複
+  // resolve。）
+  const expectedCfg = expectedScenario.build(env.runId);
 
   // 用獨立期望核對 run-env 的所有 identity 欄位（env.scenarioXxx 系列）——
-  // 這些欄位一樣可能被竄改／corrupt，不能只驗 disk config。
+  // 這些欄位一樣可能被竄改／corrupt，不能只驗 disk config。decision 也要對上
+  // 獨立期望，不能只驗「非空字串」（Task D 補項）。
   expect(env.scenario, 'env.scenario 應等於獨立期望的 scenario').toBe(expectedCfg.scenario);
   expect(env.scenarioThreadId, 'env.scenarioThreadId 應等於獨立期望的 threadId').toBe(expectedCfg.threadId);
   expect(env.scenarioTurnId, 'env.scenarioTurnId 應等於獨立期望的 turnId').toBe(expectedCfg.turnId);
   expect(env.scenarioItemId, 'env.scenarioItemId 應等於獨立期望的 itemId').toBe(expectedCfg.itemId);
   expect(env.scenarioApprovalMethod, 'env.scenarioApprovalMethod 應等於獨立期望的 approvalMethod').toBe(expectedCfg.approvalMethod);
   expect(env.scenarioApprovalRequestId, 'env.scenarioApprovalRequestId 應等於獨立期望的 approvalRequestId').toBe(expectedCfg.approvalRequestId);
+  expect(env.scenarioDecision, 'env.scenarioDecision 應等於獨立期望的 decision').toBe(expectedScenario.decision);
 
   // 缺口 3（第二段）：完整 protocol 判定——不是只 `find` approval
   // request／response 兩筆訊息，而是核對本案完整必要步驟序列＋方向
@@ -296,7 +413,7 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   // exp.cfg 用獨立期望（expectedCfg），不是待驗的 scenarioConfigOnDisk。
   const scenarioConfigOnDisk = JSON.parse(fs.readFileSync(env.scenarioConfigPath, 'utf8')) as ScenarioConfig;
   const runLog = parseRunLog(env.scenarioLogPath);
-  const protocolViolations = judgeFullProtocol(runLog, { cfg: expectedCfg, decision: 'accept' });
+  const protocolViolations = judgeFullProtocol(runLog, { cfg: expectedCfg, decision: expectedScenario.decision });
   expect(protocolViolations, `完整 protocol 序列應無違規：${JSON.stringify(protocolViolations)}`).toEqual([]);
 
   // manifest／落地的 scenario-config.json（含 afterApproval）／run identity
@@ -305,7 +422,7 @@ test('codex commandExecution-allow: 真 App 啟動 → Start → approval 顯示
   const identityViolations = judgeRunIdentity(manifest, scenarioConfigOnDisk, {
     runId: env.runId,
     cfg: expectedCfg,
-    decision: 'accept',
+    decision: expectedScenario.decision,
   });
   expect(identityViolations, `manifest／scenario-config／run identity 交叉核對應無違規：${JSON.stringify(identityViolations)}`).toEqual([]);
 });
