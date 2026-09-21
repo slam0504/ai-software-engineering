@@ -41,13 +41,17 @@ if (argv[0] === '--version') {
 
 const configPath = process.env.SCENARIO_FAKE_CONFIG;
 const logPath = process.env.SCENARIO_FAKE_LOG;
-if (!configPath || !logPath) {
+// C4 修正：先前 `if (!configPath || !logPath)` 把兩種情況合在一起處理——log
+// 路徑存在、只缺 config 時，也被當成「沒有 log 路徑可用」直接 fatalArgv，
+// 完全略過 manifest，跟下面這段註解（R4 邊界只涵蓋「連 SCENARIO_FAKE_LOG 都
+// 沒給」）不符。這裡只在 log 路徑本身缺失時才走 fatalArgv（唯一允許「沒有
+// manifest」的邊界）；log 路徑存在時即使 config 缺失，也要繼續往下開
+// log／manifest，讓 config 驗證失敗走 finish(17, msg) 留下可診斷的 manifest。
+if (!logPath) {
   // R4 邊界：根本沒有 log 路徑可用（連 SCENARIO_FAKE_LOG 都沒給），無法留下
   // 可解析的 evidence，只能 stderr＋非零收尾——這是唯一允許「沒有 manifest」
   // 的邊界，明列於此，不擴大到其他失敗路徑。
-  fatalArgv(
-    `missing required env (SCENARIO_FAKE_CONFIG=${configPath ?? ''} SCENARIO_FAKE_LOG=${logPath ?? ''})`,
-  );
+  fatalArgv(`missing required env (SCENARIO_FAKE_LOG=${logPath ?? ''})`);
 }
 
 // R4 修正：log 路徑已知（可寫），所以從這裡開始的任何失敗（包含 config 壞掉／
@@ -140,6 +144,12 @@ function validateScenarioConfig(raw: unknown): string | null {
 let cfg: ScenarioConfig;
 {
   let raw: unknown;
+  if (!configPath) {
+    // C4 修正：log 路徑可寫時，缺 config 也要走 finish(17, msg)（有 manifest
+    // 可診斷），不是像 fatalArgv 那樣完全跳過 manifest。
+    finish(17, `missing required env (SCENARIO_FAKE_CONFIG=${configPath ?? ''})`);
+    throw new Error('unreachable: finish() exits the process');
+  }
   try {
     const text = fs.readFileSync(configPath, 'utf8');
     raw = JSON.parse(text);
@@ -198,6 +208,18 @@ function idsEqual(a: RawId, b: RawId): boolean {
   return typeof a === typeof b && a === b;
 }
 
+// isValidRequestId：C4 缺陷修正——先前各 stage 只用 `f.id === undefined` 判斷
+// 「有沒有 id」，`null` 滿足 `!== undefined` 卻不是合法 RequestId，會被當成
+// 「有 id」放行，讓 initialize／thread/start／turn/start 全用 id:null 也能
+// 走完整個 approval 流程並 rc0。這裡對齊 schemas/codex/RequestId.json（string |
+// integer union）：只接受字串或整數，null／object／boolean 一律視為「沒有合法
+// id」。
+function isValidRequestId(id: unknown): id is RawId {
+  if (typeof id === 'string') return true;
+  if (typeof id === 'number') return Number.isInteger(id);
+  return false;
+}
+
 function handleLine(line: string): void {
   let parsed: unknown;
   try {
@@ -220,7 +242,7 @@ function handleLine(line: string): void {
 
   switch (stage) {
     case 'awaitInitialize': {
-      if (f.method !== Method.Initialize || f.id === undefined) {
+      if (f.method !== Method.Initialize || !isValidRequestId(f.id)) {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
         fail(`expected ${Method.Initialize} with id, got ${JSON.stringify(f)}`);
         return;
@@ -245,7 +267,7 @@ function handleLine(line: string): void {
       // 指定 threadMode，本次協定只允許對應的那個方法；resume 額外核對
       // params.threadId 是否等於 cfg.threadId。
       const expectedMethod = cfg.threadMode === 'resume' ? Method.ThreadResume : Method.ThreadStart;
-      if (f.method !== expectedMethod || f.id === undefined) {
+      if (f.method !== expectedMethod || !isValidRequestId(f.id)) {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
         fail(`expected ${expectedMethod} (threadMode=${cfg.threadMode}) with id, got ${JSON.stringify(f)}`);
         return;
@@ -264,7 +286,7 @@ function handleLine(line: string): void {
       return;
     }
     case 'awaitTurnStart': {
-      if (f.method !== Method.TurnStart || f.id === undefined) {
+      if (f.method !== Method.TurnStart || !isValidRequestId(f.id)) {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method)');
         fail(`expected ${Method.TurnStart} with id, got ${JSON.stringify(f)}`);
         return;
@@ -301,7 +323,7 @@ function handleLine(line: string): void {
       return;
     }
     case 'awaitApprovalResponse': {
-      if (f.id === undefined || f.method !== undefined) {
+      if (!isValidRequestId(f.id) || f.method !== undefined) {
         manifest.unknownMethodsSeen.push(f.method ?? '(no method, missing id)');
         fail(`expected approval response frame, got ${JSON.stringify(f)}`);
         return;

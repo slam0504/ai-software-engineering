@@ -9,7 +9,8 @@
 // 用真正的 stdio pipe 送 wire frame 進去、讀它送出來的 frame，驗證行為；不是
 // fake 自己跟自己在同一個 process 內對話（票面禁止的形狀）。
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,32 @@ import { fileURLToPath } from 'node:url';
 import type { Frame, RawId, ScenarioConfig } from './protocol.ts';
 import { splitFrames } from './protocol.ts';
 import { parseManifest, parseRunLog } from './verify.ts';
+
+// waitForChildExit：C3 修正——共用的「等到 exit 或明確逾時失敗」邏輯。先前
+// cleanup() 裡的 `setTimeout(resolve, 1000)` 會在逾時後照樣 resolve，把「子
+// 程序其實還沒死」當成清理成功；本函式改成逾時就 reject（呼叫端必須處理，
+// 不能被靜默吞掉），且會處理 spawn 過程本身的 error 事件。
+function waitForChildExit(
+  child: Pick<ChildProcess, 'exitCode' | 'signalCode' | 'once'>,
+  timeoutMs: number,
+): Promise<number | null> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(child.exitCode);
+  }
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`waitForChildExit: timed out after ${timeoutMs}ms waiting for exit`));
+    }, timeoutMs);
+    child.once('exit', code => {
+      clearTimeout(t);
+      resolve(code);
+    });
+    child.once('error', err => {
+      clearTimeout(t);
+      reject(err);
+    });
+  });
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_BIN = path.join(__dirname, 'fakeAppServer.ts');
@@ -117,26 +144,27 @@ function startHarness(cfg: ScenarioConfig | null, extraEnv: Record<string, strin
       });
     },
     waitExit(timeoutMs = 3000): Promise<number | null> {
-      if (child.exitCode !== null) return Promise.resolve(child.exitCode);
-      return new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error(`waitExit timeout after ${timeoutMs}ms`)), timeoutMs);
-        child.once('exit', code => {
-          clearTimeout(t);
-          resolve(code);
-        });
-      });
+      return waitForChildExit(child, timeoutMs);
     },
     async cleanup() {
       // 清理自己起的 fake 子程序（票面要求 #4）：正常結束時已自行 exit，這裡
       // 對還活著的殘留一律 SIGKILL，不留孤兒；log／manifest 是暫存目錄檔案，
       // 保留給測試自己讀，不在這裡刪（selftest 進程結束後由 OS temp 回收，
       // 跟既有 artifactIntegrity.selftest.ts 的 tmpRepo 處理方式一致）。
+      //
+      // C3 修正：先前 `setTimeout(resolve, 1000)` 在逾時後照樣 resolve，把
+      // 「SIGKILL 送出但子程序其實還沒死」當成清理成功，check() 也不會看到
+      // 任何錯誤。現在改用 waitForChildExit：逾時會 reject，讓這個
+      // check() 明確回報 FAIL，而不是靜默過關；成功 exit 後再核對
+      // exitCode／signalCode，確認真的是被我們的 SIGKILL 終止的。
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
-        await new Promise<void>(resolve => {
-          child.once('exit', () => resolve());
-          setTimeout(resolve, 1000);
-        });
+        const code = await waitForChildExit(child, 3000);
+        if (child.signalCode === null && code === null) {
+          throw new Error(
+            `cleanup: fake child (pid=${child.pid}) reported exit but neither exitCode nor signalCode is set`,
+          );
+        }
       }
     },
   };
@@ -274,9 +302,7 @@ await check('未知 method（approval response 階段送陌生 method 而非純 
 await check('未知 argv：拒絕並以 exit 17 結束（不進場）', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a2b1-scenario-fake-argv-'));
   const child = spawn(FAKE_BIN, ['not-app-server'], { cwd: dir, stdio: ['ignore', 'ignore', 'pipe'] });
-  const code: number | null = await new Promise(resolve => {
-    child.once('exit', c => resolve(c));
-  });
+  const code = await waitForChildExit(child, 3000);
   assert.equal(code, 17);
 });
 
@@ -290,9 +316,7 @@ await check('--version：固定格式、不進 server loop', async () => {
   let out = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (c: string) => (out += c));
-  const code: number | null = await new Promise(resolve => {
-    child.once('exit', c => resolve(c));
-  });
+  const code = await waitForChildExit(child, 3000);
   assert.equal(code, 0);
   assert.equal(out.trim(), 'fake-codex-scenario 0.0.0-e2e+selftest-run');
 });
@@ -302,6 +326,56 @@ await check('缺失設定：沒帶 SCENARIO_FAKE_CONFIG/LOG env 時 exit 17（�
   try {
     const code = await h.waitExit();
     assert.equal(code, 17);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C4 負控制：SCENARIO_FAKE_LOG 可寫、只缺 SCENARIO_FAKE_CONFIG 時仍留下 failure manifest（不是 stderr-only）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a2b1-scenario-fake-noconfig-'));
+  const logPath = path.join(dir, 'run.jsonl');
+  const child = spawn(FAKE_BIN, ['app-server'], {
+    cwd: dir,
+    env: { ...process.env, SCENARIO_FAKE_LOG: logPath } as NodeJS.ProcessEnv,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  const code = await waitForChildExit(child, 3000);
+  assert.equal(code, 17);
+  const manifest = parseManifest(`${logPath}.manifest.json`);
+  assert.equal(manifest.exitCode, 17);
+  assert.ok(
+    manifest.fatalError && manifest.fatalError.includes('SCENARIO_FAKE_CONFIG'),
+    `fatalError=${manifest.fatalError}`,
+  );
+});
+
+await check('C4 負控制：確實沒有可寫 log（SCENARIO_FAKE_LOG 也沒給）時 stderr＋非零、沒有 manifest 可讀', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b3a2b1-scenario-fake-nolog-'));
+  const child = spawn(FAKE_BIN, ['app-server'], {
+    cwd: dir,
+    env: { ...process.env, SCENARIO_FAKE_CONFIG: path.join(dir, 'scenario.json') } as NodeJS.ProcessEnv,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderrBuf = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (c: string) => (stderrBuf += c));
+  const code = await waitForChildExit(child, 3000);
+  assert.equal(code, 17);
+  assert.ok(stderrBuf.includes('SCENARIO_FAKE_LOG'), `stderr=${stderrBuf}`);
+  assert.throws(() => parseManifest(path.join(dir, 'run.jsonl.manifest.json')));
+});
+
+await check('C4 負控制：initialize／thread/start／turn/start 全用 id:null 時受控失敗，不得 rc0 通過 approval', async () => {
+  const cfg = baseConfig({ scenario: 'null-request-id-selftest' });
+  const h = startHarness(cfg);
+  try {
+    h.send({ id: null as unknown as RawId, method: 'initialize', params: { clientInfo: { name: 'selftest' } } });
+    const code = await h.waitExit();
+    assert.notEqual(code, 0, 'id:null on initialize must not be accepted (rc must not be 0)');
+    const manifest = parseManifest(h.manifestPath);
+    assert.notEqual(manifest.exitCode, 0);
+    assert.ok(manifest.fatalError && manifest.fatalError.length > 0, `fatalError=${manifest.fatalError}`);
+    assert.equal(manifest.decisionReceived, null);
   } finally {
     await h.cleanup();
   }
@@ -317,9 +391,7 @@ await check('malformed 設定：SCENARIO_FAKE_CONFIG 指向壞掉的 JSON 時 ex
     env: { ...process.env, SCENARIO_FAKE_CONFIG: configPath, SCENARIO_FAKE_LOG: logPath } as NodeJS.ProcessEnv,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  const code: number | null = await new Promise(resolve => {
-    child.once('exit', c => resolve(c));
-  });
+  const code = await waitForChildExit(child, 3000);
   assert.equal(code, 17);
   // R4 修正：先前 malformed config 整段走 fatalArgv，根本不建立 manifest；
   // 現在 log 路徑已提供時要留下可解析的 failure evidence。
@@ -519,6 +591,19 @@ await check('R5 負向：initialize 完成後、stdin 保持開啟時送 SIGTERM
   } finally {
     await h.cleanup();
   }
+});
+
+// --- C3 控制：直接證明「逾時不會假成功」，不依賴真的殺不死的子程序 ---
+// SIGKILL 本身不可攔截，真實子程序幾乎必然會死，沒辦法拿真 spawn 決定性地
+// 逼出逾時分支。這裡用一個永不送出 'exit' 事件的假 EventEmitter 頂替
+// ChildProcess，直接驗證 waitForChildExit／cleanup() 用到的逾時路徑真的會
+// reject，而不是像修正前的 `setTimeout(resolve, 1000)` 那樣逾時後照樣成功。
+await check('C3 控制：waitForChildExit 對永不 exit 的 child 必須逾時 reject，不能靜默 resolve', async () => {
+  const neverExits = new EventEmitter() as unknown as Pick<ChildProcess, 'exitCode' | 'signalCode' | 'once'>;
+  Object.assign(neverExits, { exitCode: null, signalCode: null });
+  const start = Date.now();
+  await assert.rejects(() => waitForChildExit(neverExits, 50), /timed out/);
+  assert.ok(Date.now() - start >= 50, 'must actually wait out the timeout, not resolve early');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
