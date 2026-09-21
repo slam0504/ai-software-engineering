@@ -218,7 +218,9 @@ function runCallerSubprocess(manifestObj: unknown, expectedObj: unknown): { code
   fs.writeFileSync(scriptPath, script);
   const manifestPath = path.join(tmpDir, `caller-manifest-${Math.random().toString(36).slice(2)}.json`);
   fs.writeFileSync(manifestPath, JSON.stringify(manifestObj));
-  const res = spawnSync(process.execPath, [scriptPath, manifestPath], { encoding: 'utf8' });
+  // timeout：C5 修正——caller 子程序理論上應該很快收尾（純函式判定＋寫檔），
+  // 加上逾時避免萬一卡住時 spawnSync 無限期阻塞整個 selftest。
+  const res = spawnSync(process.execPath, [scriptPath, manifestPath], { encoding: 'utf8', timeout: 10_000 });
   return { code: res.status, stdout: res.stdout + res.stderr };
 }
 
@@ -227,14 +229,28 @@ check('實際子程序 caller：正確證據 rc0', () => {
   assert.equal(code, 0, `expected rc0, got ${code}, output=${stdout}`);
 });
 
-check('實際子程序 caller：wrong expected id 時非零 exit（不是 catch 後回成功）', () => {
-  const { code } = runCallerSubprocess(goodManifest(), { ...expected, requestId: 'appr-WRONG' });
-  assert.notEqual(code, 0, 'expected nonzero exit for wrong expected id');
+// C5 修正：先前用 `assert.notEqual(code, 0)`——spawnSync 若根本沒啟動成功
+// （res.status 為 null，例如 ENOENT）或被 signal 終止，也會讓 `notEqual(null,
+// 0)` 成立、被誤判為「負控制通過」。這裡改成明確核對 `status === 1`（腳本
+// 自己 `process.exit(1)` 的值），並核對 stdout 真的包含目標 violation 訊息，
+// 不能只看 exit code 是不是 0。
+
+check('實際子程序 caller：wrong expected id 時 rc=1 且輸出包含 approvalRequestId violation（不是 catch 後回成功，也不是被 signal 終止誤判）', () => {
+  const { code, stdout } = runCallerSubprocess(goodManifest(), { ...expected, requestId: 'appr-WRONG' });
+  assert.equal(code, 1, `expected status===1 for wrong expected id, got ${code}, output=${stdout}`);
+  assert.ok(stdout.includes('approvalRequestId'), `expected output to mention approvalRequestId, got: ${stdout}`);
 });
 
-check('實際子程序 caller：failed manifest（exitCode!=0）時非零 exit', () => {
-  const { code } = runCallerSubprocess(goodManifest({ exitCode: 17, fatalError: 'boom' }), expected);
-  assert.notEqual(code, 0, 'expected nonzero exit for failed manifest');
+check('實際子程序 caller：failed manifest（exitCode!=0）時 rc=1 且輸出包含 exitCode violation', () => {
+  const { code, stdout } = runCallerSubprocess(goodManifest({ exitCode: 17, fatalError: 'boom' }), expected);
+  assert.equal(code, 1, `expected status===1 for failed manifest, got ${code}, output=${stdout}`);
+  assert.ok(stdout.includes('exitCode'), `expected output to mention exitCode, got: ${stdout}`);
+});
+
+check('實際子程序 caller：wrong expected decision 時 rc=1 且輸出包含 decisionReceived violation（前輪缺項，本輪補上）', () => {
+  const { code, stdout } = runCallerSubprocess(goodManifest(), { ...expected, decision: 'decline' });
+  assert.equal(code, 1, `expected status===1 for wrong expected decision, got ${code}, output=${stdout}`);
+  assert.ok(stdout.includes('decisionReceived'), `expected output to mention decisionReceived, got: ${stdout}`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
