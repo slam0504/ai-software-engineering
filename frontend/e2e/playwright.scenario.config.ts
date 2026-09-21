@@ -10,14 +10,24 @@
 import { defineConfig } from '@playwright/test';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveScenarioSpecFile } from './support/scenario/specRouting.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const artifactsDir = process.env.E2E_ARTIFACTS_DIR ?? path.join(__dirname, '.artifacts', 'no-run-id');
 const useChromium = process.env.E2E_BROWSER === 'chromium';
 
+// B3a-2b-2 Task E2：`testMatch` 原本固定 `*.spec.ts`——`scenarios/` 目錄新增
+// `codexSessionRecovery.spec.ts` 後，若繼續收集全部 spec，一次 invocation
+// 會把 approval 四案與 recovery 案的 spec 一起跑，跟「一個 run-id 只跑指定
+// 案」的既有契約衝突。改成依 `E2E_SCENARIO` 對應的 kind（見 scenarios.ts／
+// specRouting.ts）只收集恰好一支 spec 檔；缺失／未知名稱的拒絕仍由
+// global-setup.scenario.ts 的 resolveScenario() 負責，這裡的預設值選擇不
+// 影響那個既有行為。
+const scenarioSpecFile = resolveScenarioSpecFile(process.env.E2E_SCENARIO);
+
 export default defineConfig({
   testDir: path.join(__dirname, 'scenarios'),
-  testMatch: ['*.spec.ts'],
+  testMatch: [scenarioSpecFile],
   fullyParallel: false,
   workers: 1,
   retries: 0,

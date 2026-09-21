@@ -1,0 +1,21 @@
+{
+  "scenario": "commandExecution-recovery",
+  "argv": [
+    "app-server"
+  ],
+  "pid": 18782,
+  "startedAt": "2026-09-21T11:39:44.317Z",
+  "endedAt": "2026-09-21T11:39:45.245Z",
+  "exitCode": 0,
+  "approvalMethod": "item/commandExecution/requestApproval",
+  "approvalRequestId": "b3a2b2-approval-20260921T113808Z-c12056",
+  "decisionReceived": "accept",
+  "unknownMethodsSeen": [],
+  "fatalError": null,
+  "secondTurn": {
+    "approvalMethod": "item/commandExecution/requestApproval",
+    "approvalRequestId": "b3a2b2-approval2-20260921T113808Z-c12056",
+    "decisionReceived": "accept",
+    "resumeAccepted": true
+  }
+}

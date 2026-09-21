@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import type { Frame, RawId, ScenarioConfig } from './protocol.ts';
 import { splitFrames } from './protocol.ts';
 import { parseManifest, parseRunLog } from './verify.ts';
+import { judgeRecoveryManifest, judgeRecoverySequence } from './recoveryJudge.ts';
 
 // waitForChildExit：C3 修正——共用的「等到 exit 或明確逾時失敗」邏輯。先前
 // cleanup() 裡的 `setTimeout(resolve, 1000)` 會在逾時後照樣 resolve，把「子
@@ -483,6 +484,74 @@ await check('R2 負向：threadMode=start 但 client 送 thread/resume（方法�
   }
 });
 
+await check('R2 負向：secondTurn 存在但 threadMode=resume（#293 限定第一輪必須是 start）時 exit 17，handshake 之前就擋下，留下 failure manifest', async () => {
+  const cfg = {
+    ...baseConfig({ scenario: 'recovery-threadmode-resume-with-secondturn-selftest' }),
+    threadMode: 'resume',
+    secondTurn: {
+      turnId: 'turn-r2-2',
+      itemId: 'item-r2-2',
+      approvalRequestId: 'appr-r2-2',
+      afterApproval: [{ type: 'itemCompleted', text: 'second' }],
+      turnStatus: 'completed',
+    },
+  } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    // 驗證「handshake 之前」就擋下：完全不送任何 c2s frame，直接等 exit。
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(
+      manifest.fatalError && manifest.fatalError.includes('secondTurn') && manifest.fatalError.includes('threadMode'),
+      `fatalError=${manifest.fatalError}`,
+    );
+    assert.equal(manifest.decisionReceived, null, 'protocol must never have started');
+    assert.equal(manifest.secondTurn, null, 'secondTurn must never have been populated');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R2 正向：secondTurn 存在且 threadMode=start（合法組合）不受新檢查影響', async () => {
+  const cfg = baseConfigWithSecondTurn({ scenario: 'recovery-threadmode-start-with-secondturn-selftest' });
+  assert.equal(cfg.threadMode, 'start');
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    // 合法組合下 config 驗證必須放行，第一輪走完後 process 仍存活等第二輪
+    // resume（不是被新檢查誤擋而提前 exit 17）——不呼叫 waitExit：它本來就
+    // 不會 exit，呼叫只會製造逾時噪音，直接查 exitCode/signalCode 即可。
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(h.child.exitCode, null, 'process must still be alive after round 1 (not rejected by the new threadMode check)');
+    assert.equal(h.child.signalCode, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('R2 補強負控制：第二輪 thread/resume 帶不合法 frame 形狀（method+result 混雜）時 fail，非 0 結束（先前分支只查 method／id／threadId，不查形狀）', async () => {
+  const cfg = baseConfigWithSecondTurn({ scenario: 'recovery-malformed-resume-shape-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    h.send({ id: 10, method: 'thread/resume', params: { threadId: cfg.threadId }, result: { thread: { id: cfg.threadId } } } as unknown as Frame);
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(
+      manifest.fatalError && manifest.fatalError.includes('malformed') && manifest.fatalError.includes('thread/resume'),
+      `fatalError=${manifest.fatalError}`,
+    );
+    // 第一輪結果不得被這個非法 frame 影響。
+    assert.equal(manifest.decisionReceived, 'accept');
+    assert.ok(manifest.secondTurn, 'secondTurn stub must exist once round 1 completed');
+    assert.equal(manifest.secondTurn!.resumeAccepted, false, 'resume must not be marked accepted on a malformed frame');
+  } finally {
+    await h.cleanup();
+  }
+});
+
 await check('R2 負向：turn/start 送錯 threadId（順序錯接）時 fail', async () => {
   const cfg = baseConfig({ scenario: 'wrong-turn-threadid-selftest' });
   const h = startHarness(cfg);
@@ -605,6 +674,284 @@ await check('C3 控制：waitForChildExit 對永不 exit 的 child 必須逾時 
   await assert.rejects(() => waitForChildExit(neverExits, 50), /timed out/);
   assert.ok(Date.now() - start >= 50, 'must actually wait out the timeout, not resolve early');
 });
+
+// =====================================================================
+// Task E1：同一 fake 程序的兩輪 start→resume（secondTurn）
+// =====================================================================
+//
+// judgeRecoverySequence／judgeRecoveryManifest：recovery 專屬的共用嚴格
+// judge，定義在獨立的 recoveryJudge.ts（不是本檔內部函式）——刻意獨立於凍結
+// 的 verify.ts#judgeApproval／scenarioProtocolJudge.ts#judgeFullProtocol，
+// 兩者都是「單輪」判定，拿來對同一份雙輪 log 各套一次會漏掉中間的
+// thread/resume 銜接與第二輪身分（task 說明 #9：不得「切成兩段各套一次舊
+// judge」）。fake 的正控制與未來 E2 的 browser spec 都應該 import 這裡。
+
+function baseConfigWithSecondTurn(overrides: Partial<ScenarioConfig> = {}): ScenarioConfig {
+  return baseConfig({
+    scenario: 'recovery-selftest',
+    secondTurn: {
+      turnId: 'turn-selftest-2',
+      itemId: 'item-selftest-2',
+      approvalRequestId: 'appr-selftest-2',
+      afterApproval: [{ type: 'itemCompleted', text: 'second-round-done' }],
+      turnStatus: 'completed',
+    },
+    ...overrides,
+  });
+}
+
+async function driveFirstRoundOnly(h: Harness, cfg: ScenarioConfig): Promise<void> {
+  await driveHandshake(h);
+  await driveThreadAndTurn(h, cfg);
+  const appr = await h.readFrame();
+  assert.equal(appr.id, cfg.approvalRequestId);
+  h.send({ id: appr.id as RawId, result: { decision: 'accept' } });
+  await h.readFrame(); // item/completed（round 1 的 afterApproval）
+  const done = await h.readFrame();
+  assert.equal(done.method, 'turn/completed');
+  assert.deepEqual(done.params, { threadId: cfg.threadId, turn: { id: cfg.turnId, status: 'completed' } });
+}
+
+await check(
+  '真 child process 正控制：第一輪完成後仍 alive、manifest 尚未落地；第二輪 resume 完成才收尾（exit 0）',
+  async () => {
+    const cfg = baseConfigWithSecondTurn();
+    const h = startHarness(cfg);
+    try {
+      await driveFirstRoundOnly(h, cfg);
+
+      // 正控制核心斷言：第一輪完成後、第二輪 resume 送出前，process 仍 alive
+      // 且 manifest 尚未落地（writeManifest 只在 finish() 內呼叫，中途完全沒
+      // 有 manifest 檔——不是「有 manifest 但標未完成」，是根本不存在）。
+      await new Promise(resolve => setTimeout(resolve, 150));
+      assert.equal(h.child.exitCode, null, 'child must still be alive after round 1 turn/completed');
+      assert.equal(h.child.signalCode, null, 'child must still be alive after round 1 turn/completed');
+      assert.equal(fs.existsSync(h.manifestPath), false, 'manifest must not exist before second-round resume completes');
+
+      h.send({ id: 10, method: 'thread/resume', params: { threadId: cfg.threadId } });
+      const resumeRes = await h.readFrame();
+      assert.deepEqual(resumeRes.result, { thread: { id: cfg.threadId } });
+
+      h.send({ id: 11, method: 'turn/start', params: { threadId: cfg.threadId, input: [] } });
+      const turnRes2 = await h.readFrame();
+      assert.deepEqual(turnRes2.result, { turn: { id: cfg.secondTurn!.turnId, status: 'inProgress' } });
+
+      const appr2 = await h.readFrame();
+      assert.equal(appr2.id, cfg.secondTurn!.approvalRequestId);
+      assert.notEqual(appr2.id, cfg.approvalRequestId, 'second-round approvalRequestId must differ from first round');
+      const params2 = appr2.params as Record<string, unknown>;
+      assert.equal(params2.turnId, cfg.secondTurn!.turnId);
+      assert.equal(params2.itemId, cfg.secondTurn!.itemId);
+      assert.notEqual(params2.turnId, cfg.turnId, 'second-round turnId must differ from first round');
+      assert.notEqual(params2.itemId, cfg.itemId, 'second-round itemId must differ from first round');
+
+      h.send({ id: appr2.id as RawId, result: { decision: 'accept' } });
+      const content2 = await h.readFrame();
+      assert.equal(content2.method, 'item/completed');
+      const done2 = await h.readFrame();
+      assert.equal(done2.method, 'turn/completed');
+      assert.deepEqual(done2.params, { threadId: cfg.threadId, turn: { id: cfg.secondTurn!.turnId, status: 'completed' } });
+
+      const code = await h.waitExit();
+      assert.equal(code, 0);
+
+      const manifest = parseManifest(h.manifestPath);
+      // manifest 層核對不再手寫 assert，改走共用的 judgeRecoveryManifest——
+      // 第一輪必須留在頂層欄位（協定契約 #8），第二輪落在獨立的 secondTurn
+      // 子物件、resumeAccepted 必須是 true、兩輪 approvalRequestId 不得相同。
+      const manifestViolations = judgeRecoveryManifest(manifest, {
+        approvalMethod: cfg.approvalMethod,
+        round1: { approvalRequestId: cfg.approvalRequestId, decision: 'accept' },
+        round2: { approvalRequestId: cfg.secondTurn!.approvalRequestId, decision: 'accept' },
+      });
+      assert.deepEqual(manifestViolations, [], `judgeRecoveryManifest must accept a genuine two-round run, got: ${JSON.stringify(manifestViolations)}`);
+
+      const log = parseRunLog(h.logPath);
+      const violations = judgeRecoverySequence(log, {
+        threadId: cfg.threadId,
+        approvalMethod: cfg.approvalMethod,
+        round1: {
+          turnId: cfg.turnId,
+          itemId: cfg.itemId,
+          approvalRequestId: cfg.approvalRequestId,
+          decision: 'accept',
+          afterApproval: cfg.afterApproval,
+          turnStatus: cfg.turnStatus,
+        },
+        round2: {
+          turnId: cfg.secondTurn!.turnId,
+          itemId: cfg.secondTurn!.itemId,
+          approvalRequestId: cfg.secondTurn!.approvalRequestId,
+          decision: 'accept',
+          afterApproval: cfg.secondTurn!.afterApproval,
+          turnStatus: cfg.secondTurn!.turnStatus,
+        },
+      });
+      assert.deepEqual(violations, [], `judgeRecoverySequence must accept a genuine two-round run, got: ${JSON.stringify(violations)}`);
+    } finally {
+      await h.cleanup();
+    }
+  },
+);
+
+await check('負控制：第二輪 thread/resume 送錯 threadId 時 fail，非 0 結束（driver 寫錯參數，fake 自己的協定守門擋下）', async () => {
+  const cfg = baseConfigWithSecondTurn({ scenario: 'recovery-wrong-resume-id-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    h.send({ id: 10, method: 'thread/resume', params: { threadId: 'WRONG-THREAD-ID' } });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(
+      manifest.fatalError && manifest.fatalError.includes('second') && manifest.fatalError.includes('threadId mismatch'),
+      `fatalError=${manifest.fatalError}`,
+    );
+    // 第一輪結果保持不變（沒被第二輪的失敗抹掉）。secondTurn 子物件在轉入
+    // 'awaitSecondThreadResume' 時就會被建立（stub），但 resumeAccepted 與
+    // decisionReceived 必須仍是初始值——證明第二輪從未真正被接受，不是被
+    // 「resume 失敗」偷偷標記成功。
+    assert.equal(manifest.decisionReceived, 'accept');
+    assert.ok(manifest.secondTurn, 'secondTurn stub must exist once round 1 completed');
+    assert.equal(manifest.secondTurn!.resumeAccepted, false, 'resume must not be marked accepted on a rejected id');
+    assert.equal(manifest.secondTurn!.decisionReceived, null, 'round 2 approval must never have been reached');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('負控制：第二輪送成 thread/start（而非 thread/resume）時 fail，非 0 結束', async () => {
+  const cfg = baseConfigWithSecondTurn({ scenario: 'recovery-wrong-method-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    h.send({ id: 10, method: 'thread/start', params: {} });
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.unknownMethodsSeen.includes('thread/start'));
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('thread/resume'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('負控制：第二輪被截斷（round1 完成後 stdin 直接關閉，不送 resume）時 fail，非 0 結束（不得把未完成寫成 success）', async () => {
+  const cfg = baseConfigWithSecondTurn({ scenario: 'recovery-truncated-second-turn-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    h.child.stdin.end();
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.notEqual(manifest.exitCode, 0);
+    assert.ok(
+      manifest.fatalError && manifest.fatalError.includes('stdin closed before scenario finished'),
+      `fatalError=${manifest.fatalError}`,
+    );
+    assert.ok(manifest.fatalError!.includes('awaitSecondThreadResume'), `fatalError=${manifest.fatalError}`);
+    // 第一輪已經是 accept，不得被第二輪的失敗覆寫。
+    assert.equal(manifest.decisionReceived, 'accept');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C4 型別負控制：secondTurn 為 null（顯式）時 exit 17，config 驗證階段就擋下（單輪路徑不受影響，因為缺 key 才是合法單輪）', async () => {
+  const cfg = { ...baseConfig({ scenario: 'recovery-null-secondturn-selftest' }), secondTurn: null } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('secondTurn'), `fatalError=${manifest.fatalError}`);
+    assert.equal(manifest.decisionReceived, null, 'protocol must never have started');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C4 型別負控制：secondTurn 為 array 時 exit 17', async () => {
+  const cfg = { ...baseConfig({ scenario: 'recovery-array-secondturn-selftest' }), secondTurn: [] } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('secondTurn'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C4 型別負控制：secondTurn 缺 turnId 欄位時 exit 17', async () => {
+  const cfg = {
+    ...baseConfig({ scenario: 'recovery-missing-field-secondturn-selftest' }),
+    secondTurn: { itemId: 'item-2', approvalRequestId: 'appr-2', afterApproval: [], turnStatus: 'completed' },
+  } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(manifest.fatalError && manifest.fatalError.includes('secondTurn.turnId'), `fatalError=${manifest.fatalError}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C4 型別負控制：secondTurn 與第一輪重複 ID（turnId 相同）時 exit 17（協定契約 #4：不得沿用第一輪 ID）', async () => {
+  const base = baseConfig({ scenario: 'recovery-duplicate-turnid-selftest' });
+  const cfg = {
+    ...base,
+    secondTurn: {
+      turnId: base.turnId, // 刻意跟第一輪相同
+      itemId: 'item-selftest-2',
+      approvalRequestId: 'appr-selftest-2',
+      afterApproval: [{ type: 'itemCompleted', text: 'second' }],
+      turnStatus: 'completed',
+    },
+  } as unknown as ScenarioConfig;
+  const h = startHarness(cfg);
+  try {
+    const code = await h.waitExit();
+    assert.equal(code, 17);
+    const manifest = parseManifest(h.manifestPath);
+    assert.ok(
+      manifest.fatalError && manifest.fatalError.includes('must differ from the first-turn turnId'),
+      `fatalError=${manifest.fatalError}`,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+await check('C1 正控制：缺省 secondTurn 時單輪路徑完全不變（manifest.secondTurn 明確為 null，不是省略）', async () => {
+  const cfg = baseConfig({ scenario: 'recovery-default-singleturn-selftest' });
+  const h = startHarness(cfg);
+  try {
+    await driveFirstRoundOnly(h, cfg);
+    const code = await h.waitExit();
+    assert.equal(code, 0, 'single-turn scenario (no secondTurn) must finish exactly as before');
+    const manifest = parseManifest(h.manifestPath);
+    assert.equal(manifest.secondTurn, null);
+    // 單輪路徑也走同一套共用 judge（round2: null），不是只有雙輪案例才驗。
+    const manifestViolations = judgeRecoveryManifest(manifest, {
+      approvalMethod: cfg.approvalMethod,
+      round1: { approvalRequestId: cfg.approvalRequestId, decision: 'accept' },
+      round2: null,
+    });
+    assert.deepEqual(manifestViolations, [], `judgeRecoveryManifest must accept a genuine single-turn run, got: ${JSON.stringify(manifestViolations)}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// judgeRecoverySequence／judgeRecoveryManifest 自身的正／負控制（含 R1 反例
+// (a)(b)(c)(d)、錯 ID 型別、截斷／錯序）已搬到獨立的
+// recoveryJudge.selftest.ts（授權範圍要求「新增 recovery judge 模組與其
+// selftest」）；本檔只保留「真的啟動 fakeAppServer.ts 子程序」的黑箱測試。
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;

@@ -62,6 +62,23 @@ export interface ScenarioConfig {
   // 對應 item/started＋item/completed），最後一律以 turn/completed 收尾。
   afterApproval: Array<{ type: 'itemStarted' | 'itemCompleted'; text: string }>;
   turnStatus: 'completed' | 'failed';
+  // secondTurn：B3a-2b-2 Task E1 新增（選填）。缺省時第一輪 turn/completed
+  // 送出後照舊 finish(0)，單輪路徑完全不變（協定契約 #1）。
+  //
+  // 存在時，第一輪 turn/completed 之後 process 保持存活，等待**同一個
+  // threadId**（沿用 cfg.threadId，不另開欄位）的 `thread/resume`——第二輪
+  // 固定是 resume，不受 cfg.threadMode 影響（協定契約 #3）；approvalMethod
+  // 也固定沿用 cfg.approvalMethod（協定契約 #5，不擴成兩個獨立 method 選擇）。
+  //
+  // turnId／itemId／approvalRequestId 必須與第一輪（cfg 本身）不同——由
+  // validateScenarioConfig 在協定開始前擋下重複值（協定契約 #4／#10）。
+  secondTurn?: {
+    turnId: string;
+    itemId: string;
+    approvalRequestId: string;
+    afterApproval: Array<{ type: 'itemStarted' | 'itemCompleted'; text: string }>;
+    turnStatus: 'completed' | 'failed';
+  };
 }
 
 export interface RunLogEntry {
@@ -84,6 +101,20 @@ export interface Manifest {
   decisionReceived: string | null;
   unknownMethodsSeen: string[];
   fatalError: string | null;
+  // secondTurn：Task E1 新增（選填附加欄位——刻意用 `?`，不是必填，讓凍結的
+  // verify.selftest.ts／scenarios.selftest.ts／scenarioProtocolJudge.selftest.ts
+  // 既有手寫的 Manifest 字面量（完全不含這個欄位）繼續通過型別檢查，型別層面
+  // 也印證「單輪路徑完全不受影響」。凍結的 verify.ts#isManifestShape 只逐一
+  // 核對既有欄位存在，不拒絕額外欄位，因此舊 judge 契約不受影響——協定契約
+  // #8／#9 的「兩輪各自可獨立核對」透過本欄位與既有頂層欄位（代表第一輪）
+  // 並存達成，第二輪絕不覆寫頂層欄位）。fakeAppServer.ts 實際寫出的 manifest
+  // 一律明確帶這個欄位（cfg.secondTurn 缺省時寫 `null`，不是省略 key）。
+  secondTurn?: {
+    approvalMethod: string | null;
+    approvalRequestId: RawId | null;
+    decisionReceived: string | null;
+    resumeAccepted: boolean;
+  } | null;
 }
 
 export function nowIso(): string {

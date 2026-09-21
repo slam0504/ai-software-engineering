@@ -21,10 +21,13 @@
     "selftest:scenario-verify": "node e2e/support/scenario/verify.selftest.ts",
     "selftest:scenario-fake-app-server": "node e2e/support/scenario/fakeAppServer.selftest.ts",
     "selftest:scenario-protocol-judge": "node e2e/support/scenario/scenarioProtocolJudge.selftest.ts",
+    "selftest:scenario-recovery-judge": "node e2e/support/scenario/recoveryJudge.selftest.ts",
     "selftest:scenarios-matrix": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/scenarios.selftest.ts",
+    "selftest:spec-routing": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/specRouting.selftest.ts",
     "selftest:scenario-wire-evidence": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/wireEvidence.selftest.ts",
     "selftest:execution-mode": "node e2e/support/executionMode.selftest.ts",
-    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop && npm run selftest:scenario-verify && npm run selftest:scenario-fake-app-server && npm run selftest:scenario-protocol-judge && npm run selftest:scenarios-matrix && npm run selftest:scenario-wire-evidence && npm run selftest:execution-mode"
+    "selftest:recovery-app-evidence": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/recoveryAppEvidence.selftest.ts",
+    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop && npm run selftest:scenario-verify && npm run selftest:scenario-fake-app-server && npm run selftest:scenario-protocol-judge && npm run selftest:scenario-recovery-judge && npm run selftest:scenarios-matrix && npm run selftest:spec-routing && npm run selftest:scenario-wire-evidence && npm run selftest:execution-mode && npm run selftest:recovery-app-evidence"
   },
   "dependencies": {
     "@codemirror/state": "^6.7.1",

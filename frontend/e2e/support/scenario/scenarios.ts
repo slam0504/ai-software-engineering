@@ -21,8 +21,17 @@ import type { ApprovalMethod, ScenarioConfig } from './protocol.js';
 export interface ScenarioDef {
   name: string;
   // decision：本案例「允許」或「拒絕」——瀏覽器該點 approval-allow 還是
-  // approval-deny，以及 wire／audit 判定端該核對哪個 decision 值。
+  // approval-deny，以及 wire／audit 判定端該核對哪個 decision 值。單輪案例
+  // 只有一個 decision；recovery 案兩輪都 accept，同一個欄位對兩輪皆適用
+  // （Task E2 未擴充成每輪各自 decision——票面要求「一個 commandExecution／
+  // 兩輪都 accept」，不需要兩個獨立欄位）。
   decision: 'accept' | 'decline';
+  // kind：B3a-2b-2 Task E2 新增——playwright.scenario.config.ts 的
+  // specRouting.ts 靠這個欄位決定一個 E2E_SCENARIO 該挑哪一支 spec 檔
+  // （'approval' → codexApproval.spec.ts；'recovery' →
+  // codexSessionRecovery.spec.ts），單一登記表同時是 resolveScenario 與
+  // spec 路由的共同事實來源，不另外維護第二份名稱清單。
+  kind: 'approval' | 'recovery';
   build(runId: string): ScenarioConfig;
 }
 
@@ -47,22 +56,52 @@ const SCENARIOS: Record<string, ScenarioDef> = {
   'commandExecution-allow': {
     name: 'commandExecution-allow',
     decision: 'accept',
+    kind: 'approval',
     build: (runId: string) => buildConfig('commandExecution-allow', Method.CmdExecRequestApproval, runId),
   },
   'commandExecution-deny': {
     name: 'commandExecution-deny',
     decision: 'decline',
+    kind: 'approval',
     build: (runId: string) => buildConfig('commandExecution-deny', Method.CmdExecRequestApproval, runId),
   },
   'fileChange-allow': {
     name: 'fileChange-allow',
     decision: 'accept',
+    kind: 'approval',
     build: (runId: string) => buildConfig('fileChange-allow', Method.FileChangeRequestApproval, runId),
   },
   'fileChange-deny': {
     name: 'fileChange-deny',
     decision: 'decline',
+    kind: 'approval',
     build: (runId: string) => buildConfig('fileChange-deny', Method.FileChangeRequestApproval, runId),
+  },
+  // B3a-2b-2 Task E2：一個 commandExecution／兩輪都 accept 的 browser
+  // recovery 案——第一輪 threadMode 固定 'start'（secondTurn 存在時的協定
+  // 契約），第二輪由真 App 對同一個 WSID 再次送出觸發 thread/resume（見
+  // app.go startSession：resume 空時回退 registryResume(w)，而真實 UI 流程
+  // 在第一輪就已經透過 session_id 事件把 store 的 m.resume 填成本輪
+  // threadId，因此「同一個 pane 再次送出」自然帶著 resume，不需要測試碼
+  // 另外注入）。turnId／itemId／approvalRequestId／afterApproval 內容全部
+  // 與第一輪不同，供兩輪 identity 交叉核對。
+  'commandExecution-recovery': {
+    name: 'commandExecution-recovery',
+    decision: 'accept',
+    kind: 'recovery',
+    build: (runId: string) => ({
+      ...buildConfig('commandExecution-recovery', Method.CmdExecRequestApproval, runId),
+      secondTurn: {
+        turnId: `b3a2b2-turn2-${runId}`,
+        itemId: `b3a2b2-item2-${runId}`,
+        approvalRequestId: `b3a2b2-approval2-${runId}`,
+        afterApproval: [
+          { type: 'itemStarted', text: `b3a2b2-scenario-content2-${runId}` },
+          { type: 'itemCompleted', text: `b3a2b2-scenario-content2-${runId}` },
+        ],
+        turnStatus: 'completed',
+      },
+    }),
   },
 };
 
