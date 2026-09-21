@@ -41,6 +41,7 @@ import {
   APPROVAL_TOOL_NAME,
   MCP_PROTOCOL_VERSION,
   type ClaudeApprovalExpectation,
+  type ClaudeRoundExpectation,
   type McpEvent,
 } from './claudeApprovalProtocol.ts';
 import { judgeMcpTranscript } from './claudeApprovalJudge.ts';
@@ -62,17 +63,27 @@ export const EXIT_SIGNALLED = 23;           // 收到 SIGTERM／SIGINT
 // 1. argv
 // ---------------------------------------------------------------------------
 /**
- * 本案（fresh start、有 permission prompt tool、有 settings、**無 resume**）下，
- * internal/claude/session.go Config.args() 會產生的**完整**參數序列。
+ * internal/claude/session.go Config.args() 會產生的**完整**參數序列
+ * （有 permission prompt tool、有 settings）。
+ *
+ * `resume`：**預設 null＝fresh start，序列與 F1a／F2 既有單輪案逐 token 相同**，
+ * 既有契約不受影響。傳入非空字串時才在**序列最尾端**補上 `--resume <值>`——
+ * 位置不是猜的，session.go args() 的 `if c.Resume != ""` 分支就在 return 之前
+ * （一手讀碼，2026-09-21 於 internal/claude/session.go:45-47 覆核）。
  */
-export function expectedConversationArgv(opts: { mcpConfigPath: string }): string[] {
-  return [
+export function expectedConversationArgv(
+  opts: { mcpConfigPath: string; resume?: string | null },
+): string[] {
+  const a = [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--verbose', '--include-partial-messages',
     '--settings', SETTINGS_JSON,
     '--permission-prompt-tool', PERMISSION_PROMPT_TOOL,
     '--mcp-config', opts.mcpConfigPath, '--strict-mcp-config',
   ];
+  const r = opts.resume ?? null;
+  if (r !== null && r !== '') a.push('--resume', r);
+  return a;
 }
 
 /** `--version` 探測必須**恰好一個參數**（app.go:3365 exec.Command(bin,"--version")）。 */
@@ -83,16 +94,27 @@ export function validateVersionArgv(argv: string[]): string[] {
 
 /**
  * 對話 argv 必須與期望**逐位置完全相同**：多餘、缺少、重複、順序不同、未知參數
- * 都失敗。本案明確不接受 --resume。
+ * 都失敗。
+ *
+ * `expectedResume`：**這一輪核定的 resume 值**，由呼叫端依**排他 claim 取得的
+ * 輪次**決定，絕不由待驗 argv 自己推導。
+ *   null（預設）→ 沿用既有契約：argv 一旦出現 --resume 即違規（fresh start）
+ *   非空字串     → argv 必須恰好帶一組 `--resume <該值>`；缺少、值不符、
+ *                  重複都會被下面的逐位置全等與重複檢查攔下
  */
-export function validateConversationArgv(argv: unknown, expected: string[]): string[] {
+export function validateConversationArgv(
+  argv: unknown, expected: string[], expectedResume: string | null = null,
+): string[] {
   if (!Array.isArray(argv) || argv.some(a => typeof a !== 'string')) {
     return [`argv 必須是字串陣列，實際 ${JSON.stringify(argv)}`];
   }
   const a = argv as string[];
   const v: string[] = [];
-  if (a.includes('--resume')) {
-    v.push('本案是 fresh start，argv 不得含 --resume');
+  if (expectedResume === null && a.includes('--resume')) {
+    v.push('本輪核定為 fresh start，argv 不得含 --resume');
+  }
+  if (expectedResume !== null && !a.includes('--resume')) {
+    v.push(`本輪核定為 resume ${JSON.stringify(expectedResume)}，argv 卻沒有 --resume`);
   }
   const known = new Set(expected.filter(x => x.startsWith('--') || x === '-p'));
   for (const tok of a) {
@@ -896,20 +918,15 @@ export async function runMcpRoundTrip(
 }
 
 /**
- * 把「往返是否真的成功」收斂成一份違規清單——**送 success 之前必須是空的**。
- * 這裡刻意呼叫已審的 `judgeMcpTranscript`（F1a 基準），不另造一套較弱的判定。
+ * **子程序所有權／收尾的完整判定**（B3a-2b-2 E1 抽出）。
+ *
+ * 抽成獨立函式的唯一理由：跨輪判定（claudeRecoveryJudge.ts）必須用**同一份**
+ * 判定去驗每一輪落地的 `mcp-child.json`，而不是另寫一份較寬鬆的第二版
+ * （reviewer #393 P1-1 實測：另寫的那份會放過 psDuring 缺失、exitCode 非 0、
+ * unreaped、串流未 drain 等六種以上的壞觀測）。內容逐字未改。
  */
-export function judgeRoundTripSuccess(
-  round: McpRoundTrip,
-  exp: ClaudeApprovalExpectation,
-): string[] {
+export function judgeChildObservation(o: ChildObservation): string[] {
   const v: string[] = [];
-  if (round.error !== null) v.push(`[roundtrip] ${round.error}`);
-  if (round.observation.spawnError !== null) v.push(`[spawn] ${round.observation.spawnError}`);
-  v.push(...round.transportViolations.map(m => `[transport] ${m}`));
-  v.push(...judgeMcpTranscript(round.events, exp).map(m => `[mcp] ${m}`));
-
-  const o = round.observation;
   if (o.observedPid === null) {
     v.push('[os] spawn 未取得 pid');
   } else if (o.psDuring === null) {
@@ -946,6 +963,103 @@ export function judgeRoundTripSuccess(
   }
   return v;
 }
+/**
+ * 把「往返是否真的成功」收斂成一份違規清單——**送 success 之前必須是空的**。
+ * 這裡刻意呼叫已審的 `judgeMcpTranscript`（F1a 基準），不另造一套較弱的判定。
+ */
+export function judgeRoundTripSuccess(
+  round: McpRoundTrip,
+  exp: ClaudeApprovalExpectation,
+): string[] {
+  const v: string[] = [];
+  if (round.error !== null) v.push(`[roundtrip] ${round.error}`);
+  if (round.observation.spawnError !== null) v.push(`[spawn] ${round.observation.spawnError}`);
+  v.push(...round.transportViolations.map(m => `[transport] ${m}`));
+  v.push(...judgeMcpTranscript(round.events, exp).map(m => `[mcp] ${m}`));
+
+  v.push(...judgeChildObservation(round.observation));
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// 6b. 輪次的排他 claim（B3a-2b-2 E1）
+// ---------------------------------------------------------------------------
+/**
+ * **輪次絕不由待驗 argv 推導。**
+ *
+ * 這裡用一個 run 專屬目錄（wrapper 烤入的 `FAKE_CLAUDE_ROUND_DIR`）內的
+ * `round-<n>` 子目錄當作**有序的排他 claim**：`mkdir`（非 recursive）在 POSIX 上
+ * 是原子的，已存在就回 EEXIST。第 k 次對話啟動必然拿到第 k 個仍空著的號碼，
+ * 與它自己帶什麼參數無關，也與另一個並行程序看到的號碼互斥。
+ *
+ * 設計上刻意成立的幾件事：
+ *   - `--version` 探測**不經過這裡**（呼叫點在對話分支內），所以不佔輪次。
+ *   - roundDir 是 run 專屬的（每次 run 由 wrapper 新建），**不跨 run 沿用計數**。
+ *   - 超出核定輪數仍會拿到一個號碼（才留得下第三次呼叫的證據），但回傳違規。
+ *   - roundDir 不存在時 `mkdir` 以 ENOENT 失敗 → 違規，**不自行補建**：
+ *     少了 wrapper 的接線就等於失去排他性，寧可 fail closed。
+ */
+export interface RoundClaim {
+  /** 實際取得的輪次（1-based）；取不到時為 null。 */
+  round: number | null;
+  /** 本輪的 claim 目錄（已建立）；取不到時為 null。 */
+  claimDir: string | null;
+  violations: string[];
+}
+
+/** 前一輪完成標記的檔名——存在即代表前一輪走完判定並送出完成內容。 */
+export const ROUND_DONE_FILE = 'done.json';
+
+export function claimConversationRound(
+  roundDir: string, maxRounds: number, maxProbe = 16,
+): RoundClaim {
+  if (roundDir === '') {
+    return { round: null, claimDir: null,
+      violations: ['缺少 FAKE_CLAUDE_ROUND_DIR：沒有 run 專屬的輪次登記處就無法排他判定輪次'] };
+  }
+  let round: number | null = null;
+  let claimDir: string | null = null;
+  for (let n = 1; n <= maxProbe; n += 1) {
+    const dir = path.join(roundDir, `round-${n}`);
+    try {
+      fs.mkdirSync(dir); // 非 recursive：已存在必定 EEXIST，這正是排他性的來源
+      round = n; claimDir = dir; break;
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === 'EEXIST') continue;
+      return { round: null, claimDir: null,
+        violations: [`無法在 ${JSON.stringify(roundDir)} 取得輪次 claim：${String(e)}`] };
+    }
+  }
+  if (round === null || claimDir === null) {
+    return { round: null, claimDir: null,
+      violations: [`輪次 claim 連續 ${maxProbe} 個號碼都已被佔用，拒絕繼續`] };
+  }
+  const violations: string[] = [];
+  if (round > maxRounds) {
+    violations.push(`本次 run 核定 ${maxRounds} 輪對話，這是第 ${round} 次對話啟動——多餘的呼叫一律拒絕`);
+  } else if (round >= 2) {
+    // 有序：第 n 輪必須在第 n-1 輪**完成**之後才啟動。並行或搶跑都會在這裡失敗。
+    const prev = path.join(roundDir, `round-${round - 1}`, ROUND_DONE_FILE);
+    if (!fs.existsSync(prev)) {
+      violations.push(
+        `第 ${round} 輪啟動時，第 ${round - 1} 輪尚未留下完成標記（${prev}）`
+        + '——前一輪未完成或兩輪並行，拒絕繼續',
+      );
+    }
+  }
+  return { round, claimDir, violations };
+}
+
+/** 寫下本輪完成標記；失敗一律回報（不得吞掉——下一輪的有序判定靠它）。 */
+export function writeRoundDone(claimDir: string, payload: Record<string, unknown>): string[] {
+  try {
+    fs.writeFileSync(path.join(claimDir, ROUND_DONE_FILE), `${JSON.stringify(payload, null, 2)}\n`);
+    return [];
+  } catch (e) {
+    return [`無法寫入輪次完成標記：${String(e)}`];
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 7. main（只有被直接執行時才跑；被 selftest import 時不執行）
@@ -962,12 +1076,32 @@ function isDirectRun(): boolean {
  * 更不得讓一次失敗的判定反轉成成功（reviewer #355 第 2 點）。
  */
 function safeWrite(dir: string, name: string, content: string, problems: string[]): void {
+  if (dir === '') {
+    problems.push(`[evidence] 沒有可用的專屬輸出位置，略過 ${name}（**不得回退寫入既有目錄**）`);
+    return;
+  }
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, name), content);
   } catch (e) {
     problems.push(`[evidence] 無法寫入 ${name}：${String(e)}`);
   }
+}
+
+/**
+ * **尚未取得本輪專屬輸出位置時**的診斷落點：在 evidenceDir 底下以
+ * `mkdtemp` 排他新建一個目錄。
+ *
+ * reviewer #393 P1-2 實測到的缺陷：失敗路徑（claim 失敗、round-N 目錄
+ * EEXIST、缺 ROUND_DIR）當時 outDir 還指著 evidenceDir 根目錄，complete →
+ * finalizeOnce 會把根目錄既有的 `judgement.json` 覆寫成 `{"problems":[]}`
+ * ——**一條失敗路徑把別人的證據改成「全過」**。修法是：沒有排他取得的位置
+ * 就另外排他新建一個，寧可多一個目錄也不碰既有固定檔名。
+ */
+export function exclusiveDiagDir(evidenceDir: string): string {
+  if (evidenceDir === '') return '';
+  try { return fs.mkdtempSync(path.join(evidenceDir, 'unowned-')); }
+  catch { return ''; }
 }
 
 /** 收尾的總期限：closeAndReapChild 自身已有界，這裡再加一層防止任何等待卡死。 */
@@ -987,7 +1121,9 @@ if (isDirectRun()) {
     if (activeComplete !== null) { await activeComplete(EXIT_UNEXPECTED, reason); return; }
     // 例外發生在共用流程建立之前（尚未 spawn 任何子程序）——照實記錄，不假裝有收尾。
     process.stderr.write(`fake-claude-cli: ${reason}\n`);
-    const dir = process.env.FAKE_CLAUDE_EVIDENCE_DIR ?? '';
+    // **排他新建**的診斷位置：例外發生在共用流程建立之前，這裡同樣不得覆寫
+    // evidenceDir 根目錄的既有固定檔（reviewer #393 P1-2）。
+    const dir = exclusiveDiagDir(process.env.FAKE_CLAUDE_EVIDENCE_DIR ?? '');
     if (dir) {
       const ignored: string[] = [];
       safeWrite(dir, 'failure.json', `${JSON.stringify({
@@ -1015,6 +1151,19 @@ async function cliMain(): Promise<void> {
     }
   }
   const evidenceDir = env.FAKE_CLAUDE_EVIDENCE_DIR ?? '';
+  // **本輪實際落檔的位置——只有在排他取得之後才會有值**（reviewer #393 P1-2）。
+  // 單輪案的第一輪在 claim 成功後指向 evidenceDir 本身（既有版面完全不變）；
+  // 兩輪案指向排他新建的 <evidenceDir>/round-<n>。在此之前（argv 紀錄、
+  // --version、缺 env、fixture 壞掉、claim 失敗、round 目錄 EEXIST）一律沒有
+  // 專屬位置，診斷改寫進 `exclusiveDiagDir` 排他新建的目錄，**不碰既有固定檔**。
+  let outDir: string | null = null;
+  let fallbackDir: string | null = null;
+  /** 目前可安全寫入的診斷位置：有專屬位置就用它，否則排他新建一個。 */
+  const diagDir = (): string => {
+    if (outDir !== null) return outDir;
+    if (fallbackDir === null) fallbackDir = exclusiveDiagDir(evidenceDir);
+    return fallbackDir;
+  };
   const handle = createRoundTripHandle();
   const writeProblems: string[] = [];
   let finishing = false;
@@ -1026,10 +1175,10 @@ async function cliMain(): Promise<void> {
 
   /** 把**中斷當下已取得的**往返資料全部落檔——中斷不是略過證據的理由。 */
   const persistRound = (round: McpRoundTrip): void => {
-    safeWrite(evidenceDir, 'mcp-transcript.json', `${JSON.stringify(round.events, null, 2)}\n`, writeProblems);
-    safeWrite(evidenceDir, 'mcp-stdout-raw.txt', `${round.rawStdoutLines.join('\n')}\n`, writeProblems);
-    safeWrite(evidenceDir, 'mcp-child.json', `${JSON.stringify(round.observation, null, 2)}\n`, writeProblems);
-    safeWrite(evidenceDir, 'mcp-child.stderr.txt', round.childStderr, writeProblems);
+    safeWrite(diagDir(), 'mcp-transcript.json', `${JSON.stringify(round.events, null, 2)}\n`, writeProblems);
+    safeWrite(diagDir(), 'mcp-stdout-raw.txt', `${round.rawStdoutLines.join('\n')}\n`, writeProblems);
+    safeWrite(diagDir(), 'mcp-child.json', `${JSON.stringify(round.observation, null, 2)}\n`, writeProblems);
+    safeWrite(diagDir(), 'mcp-child.stderr.txt', round.childStderr, writeProblems);
   };
 
   /**
@@ -1053,7 +1202,7 @@ async function cliMain(): Promise<void> {
     }
     if (round !== null) persistRound(round);
     const judged = round === null || approval === null ? [] : judgeRoundTripSuccess(round, approval);
-    safeWrite(evidenceDir, 'judgement.json', `${JSON.stringify({ problems: judged }, null, 2)}\n`, writeProblems);
+    safeWrite(diagDir(), 'judgement.json', `${JSON.stringify({ problems: judged }, null, 2)}\n`, writeProblems);
     return { round, problems: [...judged, ...writeProblems] };
   };
 
@@ -1075,9 +1224,9 @@ async function cliMain(): Promise<void> {
       const o = f.round.observation;
       process.stderr.write(`fake-claude-cli: cleanup exit=${String(o.exitCode)} signal=${String(o.exitSignal)} unreaped=${String(o.unreaped)} psAfter=${o.psAfter === null ? 'null' : o.psAfter.state} stdoutDrained=${String(o.stdoutDrained)} stderrDrained=${String(o.stderrDrained)}\n`);
     }
-    if (evidenceDir) {
+    {
       const w: string[] = [];
-      safeWrite(evidenceDir, 'failure.json', `${JSON.stringify({
+      safeWrite(diagDir(), 'failure.json', `${JSON.stringify({
         reason, code: exitCode, argv, problems: f.problems,
         cleanupSteps: f.round === null ? null : f.round.observation.cleanupSteps,
         ...extra,
@@ -1106,9 +1255,12 @@ async function cliMain(): Promise<void> {
 
   // 獨立 fixture：期望值來自這裡，**不從 config 推導**。
   const fixture = JSON.parse(fs.readFileSync(expectationPath, 'utf8')) as {
-    approval: ClaudeApprovalExpectation;
+    /** 單輪案（F1a／F2 既有契約）：頂層 approval ＋ prompt，一輪、禁止 resume。 */
+    approval?: ClaudeApprovalExpectation;
+    prompt?: string;
+    /** 兩輪案（E1）：逐輪期望。存在時取代上面兩欄，核定輪數 = rounds.length。 */
+    rounds?: ClaudeRoundExpectation[];
     mcp: McpConfigExpectation;
-    prompt: string;
     /** config 路徑的判定 policy（JSON 載入，**runtime 驗形狀**）。 */
     mcpConfigPolicy: unknown;
     timeoutMs?: number;
@@ -1117,9 +1269,63 @@ async function cliMain(): Promise<void> {
     drainMs?: number;
     grace?: CleanupGrace;
   };
-  approval = fixture.approval;
 
-  safeWrite(evidenceDir, 'argv.json', `${JSON.stringify(argv, null, 2)}\n`, writeProblems);
+  // --- 輪次：run 專屬、**獨立於 argv** 的有序排他 claim ----------------------
+  // 先 claim 再看 argv：輪次是「第幾次對話啟動」這件事實，不能由待驗的 argv
+  // 自己宣告（否則第二輪只要不帶 --resume 就會被當成第一輪重跑而矇混過關）。
+  const rounds = Array.isArray(fixture.rounds) ? fixture.rounds : null;
+  const maxRounds = rounds === null ? 1 : rounds.length;
+  const claim = claimConversationRound(env.FAKE_CLAUDE_ROUND_DIR ?? '', maxRounds);
+  if (claim.round === null || claim.claimDir === null) {
+    await complete(EXIT_CONTRACT_VIOLATION, `無法取得輪次 claim：${claim.violations.join('; ')}`,
+      { claimViolations: claim.violations });
+    return;
+  }
+  const roundNo = claim.round;
+  if (rounds !== null || roundNo > 1) {
+    // **每輪自己的證據目錄，且拒絕覆寫**：mkdir 非 recursive，已存在即代表有人
+    // 把別輪（多半是第一輪）的證據擺在這裡冒充，一律當場失敗。
+    // 單輪案的第一輪維持寫在 evidenceDir 本身，既有檔案版面不變。
+    const dir = path.join(evidenceDir, `round-${roundNo}`);
+    try { fs.mkdirSync(dir); }
+    catch (e) {
+      await complete(EXIT_CONTRACT_VIOLATION,
+        `第 ${roundNo} 輪的證據目錄無法以「不得覆寫」的方式建立（${dir}）：${String(e)}`);
+      return;
+    }
+    outDir = dir;
+  } else {
+    // 單輪案的第一輪：claim 已保證只有一個程序走到這裡，evidenceDir 就是它的
+    // 專屬位置（既有 F1a／F2 檔案版面不變）。
+    outDir = evidenceDir;
+  }
+  safeWrite(outDir ?? '', 'round.json', `${JSON.stringify({
+    round: roundNo, maxRounds, claimDir: claim.claimDir, pid: process.pid,
+    startedAt: new Date().toISOString(), argv,
+  }, null, 2)}\n`, writeProblems);
+  if (claim.violations.length > 0) {
+    await complete(EXIT_CONTRACT_VIOLATION, `輪次不符核定：${claim.violations.join('; ')}`,
+      { round: roundNo, claimViolations: claim.violations });
+    return;
+  }
+  const roundSpec: ClaudeRoundExpectation | undefined = rounds === null
+    ? { round: 1, prompt: fixture.prompt ?? '', resume: null,
+        approval: fixture.approval as ClaudeApprovalExpectation }
+    : rounds[roundNo - 1];
+  if (roundSpec === undefined || typeof roundSpec.prompt !== 'string' || roundSpec.prompt === ''
+    || typeof roundSpec.approval !== 'object' || roundSpec.approval === null) {
+    await complete(EXIT_CONTRACT_VIOLATION,
+      `第 ${roundNo} 輪的 fixture 期望不完整：${JSON.stringify(roundSpec)}`);
+    return;
+  }
+  if (roundSpec.round !== roundNo) {
+    await complete(EXIT_CONTRACT_VIOLATION,
+      `fixture 的第 ${roundNo} 筆 round 欄位是 ${JSON.stringify(roundSpec.round)}，與 claim 取得的輪次不一致`);
+    return;
+  }
+  approval = roundSpec.approval;
+
+  safeWrite(outDir ?? '', 'argv.json', `${JSON.stringify(argv, null, 2)}\n`, writeProblems);
 
   // **順序刻意如此**（reviewer #367）：
   //   1. 先從 argv 取出 config 路徑（真 App 傳進來的 host.mcpPath）
@@ -1141,7 +1347,8 @@ async function cliMain(): Promise<void> {
     return;
   }
   const argvViolations = validateConversationArgv(argv,
-    expectedConversationArgv({ mcpConfigPath: cfgPath }));
+    expectedConversationArgv({ mcpConfigPath: cfgPath, resume: roundSpec.resume }),
+    roundSpec.resume);
   if (argvViolations.length > 0) {
     await complete(EXIT_CONTRACT_VIOLATION, `argv 不符預定：${argvViolations.join('; ')}`, { argvViolations });
     return;
@@ -1158,16 +1365,24 @@ async function cliMain(): Promise<void> {
   // 首行已取得就停止讀 stdin：驅動端（真 App）會一直開著 stdin，若讓它保持
   // flowing 會留著 handle 讓本行程無法自然退出。
   try { process.stdin.pause(); process.stdin.unref(); } catch { /* 非 TTY／已關閉都無所謂 */ }
-  safeWrite(evidenceDir, 'stdin.first-line.txt', `${first.line}\n`, writeProblems);
-  if (first.rest !== '') safeWrite(evidenceDir, 'stdin.rest.txt', first.rest, writeProblems);
-  const stdinViolations = validateUserStreamJson(first.line, fixture.prompt);
+  safeWrite(outDir ?? '', 'stdin.first-line.txt', `${first.line}\n`, writeProblems);
+  if (first.rest !== '') safeWrite(outDir ?? '', 'stdin.rest.txt', first.rest, writeProblems);
+  const stdinViolations = validateUserStreamJson(first.line, roundSpec.prompt);
   if (stdinViolations.length > 0) {
     await complete(EXIT_CONTRACT_VIOLATION, `stdin 不符預定：${stdinViolations.join('; ')}`, { stdinViolations });
     return;
   }
 
   // 先送合法 init（此時 stdin 仍可能開著，這是正常的）
-  process.stdout.write(`${buildInitEvent(fixture.approval.sessionId)}\n`);
+  const initLine = buildInitEvent(roundSpec.approval.sessionId);
+  process.stdout.write(`${initLine}\n`);
+  // **第一手保存本輪實際宣告的 session id**：Claude 的 resume 身分是 CLI 在 init
+  // 事件自己宣告、再由 App 綁定的（app.go:7504 registry.Bind ／ commitClaudeResume）。
+  // 把宣告當下的原始事件留成證據，之後才能把「CLI 宣告」「App 綁定」「下一輪 argv」
+  // 三者拿同一個固定期望值交叉核對，而不是互相反推。
+  safeWrite(outDir ?? '', 'init.json', `${JSON.stringify({
+    sessionId: roundSpec.approval.sessionId, round: roundNo, line: initLine,
+  }, null, 2)}\n`, writeProblems);
 
   // 讀 config → 驗 → **用驗過的同一份 resolved 去 spawn**
   // config 路徑已在前段自 argv 取得並通過 policy 校驗。
@@ -1178,9 +1393,9 @@ async function cliMain(): Promise<void> {
       `FAKE_CLAUDE_MCP_CONFIG（${envCfg}）與 argv 的 --mcp-config（${cfgPath}）不一致`);
     return;
   }
-  safeWrite(evidenceDir, 'mcp-config.path.txt', `${cfgPath}\n`, writeProblems);
+  safeWrite(outDir ?? '', 'mcp-config.path.txt', `${cfgPath}\n`, writeProblems);
   const raw = fs.readFileSync(cfgPath, 'utf8');
-  safeWrite(evidenceDir, 'mcp-config.read.json', raw, writeProblems);
+  safeWrite(outDir ?? '', 'mcp-config.read.json', raw, writeProblems);
   const { violations: cfgViolations, resolved } = validateMcpConfig(raw, fixture.mcp);
   const shaViolations = resolved === null ? [] : verifyCommandBinary(resolved.command, fixture.mcp.commandSha256);
   const allCfg = [...cfgViolations, ...shaViolations];
@@ -1191,7 +1406,7 @@ async function cliMain(): Promise<void> {
     return;
   }
 
-  roundPromise = runMcpRoundTrip(resolved, fixture.approval, {
+  roundPromise = runMcpRoundTrip(resolved, roundSpec.approval, {
     timeoutMs: fixture.timeoutMs ?? 30_000,
     settleMs: fixture.settleMs,
     drainMs: fixture.drainMs,
@@ -1210,9 +1425,22 @@ async function cliMain(): Promise<void> {
   // 訊號可能在上面任一個 await 期間觸發；已進入完成流程就不得再送成功內容。
   if (finishing) return;
 
+  // **完成標記先寫**：下一輪的有序 claim 以它為準；寫不出去就不是一個可以
+  // 讓下一輪接續的完成，直接走失敗路徑（不得只記 warning 就繼續）。
+  const doneProblems = writeRoundDone(claim.claimDir, {
+    round: roundNo, pid: process.pid, sessionId: roundSpec.approval.sessionId,
+    resume: roundSpec.resume, completionText: roundSpec.approval.completionText,
+    finishedAt: new Date().toISOString(),
+  });
+  if (doneProblems.length > 0) {
+    await complete(EXIT_JUDGE_FAILED, `無法寫出輪次完成標記：${doneProblems.join('; ')}`,
+      { doneProblems });
+    return;
+  }
+
   // 只有到這裡——往返、判定、OS 核對、收尾、證據保存全部成功——才送完成內容
-  process.stdout.write(`${buildAssistantEvent(fixture.approval.sessionId, fixture.approval.completionText)}\n`);
-  process.stdout.write(`${buildResultEvent(fixture.approval.sessionId, fixture.approval.completionText)}\n`);
+  process.stdout.write(`${buildAssistantEvent(roundSpec.approval.sessionId, roundSpec.approval.completionText)}\n`);
+  process.stdout.write(`${buildResultEvent(roundSpec.approval.sessionId, roundSpec.approval.completionText)}\n`);
   // 收尾已完成，解除訊號監聽讓行程自然退出（不用 process.exit，避免截斷 stdout）。
   process.removeAllListeners('SIGTERM');
   process.removeAllListeners('SIGINT');

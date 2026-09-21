@@ -22,6 +22,7 @@ import { runtime } from './support/runtime.js';
 import { loadValidatedPreviousRunState } from './support/staleRun.js';
 import { stopProcessGroup } from './support/stopProcedure.js';
 import { judgeScenarioCliCalls } from './support/scenario/scenarioTripwire.js';
+import { buildClaudeRecoveryExpectation } from './support/scenario/claudeApprovalProtocol.js';
 import { determineExecutionMode } from './support/executionMode.js';
 
 const TRIPWIRE_LINE_RE = /^\[(?<ts>[^\]]+)\] name=(?<name>\S+) argv=\((?<argv>.*)\) cwd=(?<cwd>\S+) ppid=(?<ppid>\d+)$/;
@@ -272,8 +273,16 @@ export default async function globalTeardown(): Promise<void> {
       // 已確認 scenario 名稱在 env 與檔案兩側一致且可由登記表解析）。
       // 不使用「解析失敗就當 codex」的 fallback——那會在 identity 壞掉時
       // 悄悄套用另一個 provider 的判定（reviewer #367）。
-      tripwireViolations = judgeScenarioCliCalls(finalInvocationsLog, log,
-        { provider: executionMode.provider, toolsDir: env.toolsDir });
+      // E1：**核定輪數與核定 resume 都由已驗證的 scenario identity 決定**
+      // （determineExecutionMode 已核對 env 與 run-env.json 兩份來源一致，
+      // 並由登記表解析出 provider／kind），不從觀測到的呼叫數或待驗 argv 反推。
+      const isRecovery = executionMode.scenarioKind === 'recovery';
+      tripwireViolations = judgeScenarioCliCalls(finalInvocationsLog, log, {
+        provider: executionMode.provider,
+        toolsDir: env.toolsDir,
+        expectedConversationCalls: isRecovery ? 2 : 1,
+        expectedResume: isRecovery ? buildClaudeRecoveryExpectation(env.runId).sessionId : null,
+      });
     } else if (executionMode.kind === 'default') {
       tripwireViolations = judgeTripwire(finalInvocationsLog, env.claudeVersion, env.codexVersion, log);
     } else {

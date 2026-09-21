@@ -45,6 +45,11 @@ export interface RunEnv {
   claudeApprovedCommandSha256?: string;
   /** App stateDir（<workspace>/.workbench）：動態 socket 必須落在此目錄之下。 */
   claudeStateDir?: string;
+  /**
+   * B3a-2b-2 E1：本次 run 的輪次登記目錄（假 CLI 排他 claim 的所在）。
+   * 單輪與兩輪案都會設；spec 由它讀取**與 argv 無關**的輪次事實。
+   */
+  claudeRoundDir?: string;
 }
 
 function runEnvFile(artifactsDir: string): string {
@@ -87,6 +92,7 @@ function envToProcessEnv(env: RunEnv): Record<string, string | undefined> {
     E2E_CLAUDE_APPROVED_COMMAND_PATH: env.claudeApprovedCommandPath,
     E2E_CLAUDE_APPROVED_COMMAND_SHA256: env.claudeApprovedCommandSha256,
     E2E_CLAUDE_STATE_DIR: env.claudeStateDir,
+    E2E_CLAUDE_ROUND_DIR: env.claudeRoundDir,
   };
 }
 
@@ -120,6 +126,7 @@ export function readRunEnv(): RunEnv {
       claudeApprovedCommandPath: p.E2E_CLAUDE_APPROVED_COMMAND_PATH,
       claudeApprovedCommandSha256: p.E2E_CLAUDE_APPROVED_COMMAND_SHA256,
       claudeStateDir: p.E2E_CLAUDE_STATE_DIR,
+      claudeRoundDir: p.E2E_CLAUDE_ROUND_DIR,
     };
   }
   const artifactsDir = p.E2E_ARTIFACTS_DIR;
@@ -212,6 +219,7 @@ export interface ClaudeScenarioRunEnv extends RunEnv {
   claudeApprovedCommandPath: string;
   claudeApprovedCommandSha256: string;
   claudeStateDir: string;
+  claudeRoundDir: string;
 }
 
 export function readClaudeScenarioRunEnv(): ClaudeScenarioRunEnv {
@@ -219,6 +227,7 @@ export function readClaudeScenarioRunEnv(): ClaudeScenarioRunEnv {
   const required = [
     'scenario', 'claudeExpectationPath', 'claudeEvidenceDir',
     'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir',
+    'claudeRoundDir',
   ] as const;
   const missing = required.filter(k => {
     const v = env[k];

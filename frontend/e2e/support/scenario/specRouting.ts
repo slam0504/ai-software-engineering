@@ -17,6 +17,8 @@ export const APPROVAL_SPEC_FILE = 'codexApproval.spec.ts';
 export const RECOVERY_SPEC_FILE = 'codexSessionRecovery.spec.ts';
 /** B3a-2b-2 F2：Claude 單一 approval allow 的專屬 spec。 */
 export const CLAUDE_APPROVAL_SPEC_FILE = 'claudeApproval.spec.ts';
+/** B3a-2b-2 E1：Claude 兩輪 start→resume 的專屬 spec。 */
+export const CLAUDE_RECOVERY_SPEC_FILE = 'claudeSessionRecovery.spec.ts';
 
 export function resolveScenarioSpecFile(scenarioName: string | undefined): string {
   let def: ReturnType<typeof resolveScenario>;
@@ -27,8 +29,11 @@ export function resolveScenarioSpecFile(scenarioName: string | undefined): strin
     // 這裡的挑選結果不影響那個既有契約，回傳中性預設值即可。
     return APPROVAL_SPEC_FILE;
   }
-  // provider 先分流，再看 kind——兩種 provider 的 spec 不共用，也不互相回退。
-  if (def.provider === 'claude') return CLAUDE_APPROVAL_SPEC_FILE;
+  // provider 先分流，再看 kind——兩種 provider 的 spec 不共用，也不互相回退；
+  // **kind 在兩種 provider 底下各自分流**，claude 的 recovery 不會掉回 approval。
+  if (def.provider === 'claude') {
+    return def.kind === 'recovery' ? CLAUDE_RECOVERY_SPEC_FILE : CLAUDE_APPROVAL_SPEC_FILE;
+  }
   return def.kind === 'recovery' ? RECOVERY_SPEC_FILE : APPROVAL_SPEC_FILE;
 }
 

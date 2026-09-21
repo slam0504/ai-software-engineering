@@ -36,6 +36,8 @@ function claudeEnv(dir: string): RunEnv {
     claudeExpectationPath: `${dir}/exp.json`, claudeEvidenceDir: `${dir}/ev`,
     claudeApprovedCommandPath: '/bin/app', claudeApprovedCommandSha256: 'abc',
     claudeStateDir: '/w/.workbench',
+    // E1 新增的必要欄位：輪次登記目錄（假 CLI 排他 claim 的所在）。
+    claudeRoundDir: '/t/claude-rounds',
   };
 }
 function codexEnv(dir: string): RunEnv {
@@ -61,7 +63,8 @@ function mkRun(name: string, env: RunEnv, entry = 'scenario'): { dir: string; in
 
 // --- writeRunEnv → readRunEnv：env 路徑 ------------------------------------
 const CLAUDE_FIELDS = ['claudeExpectationPath', 'claudeEvidenceDir',
-  'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir'] as const;
+  'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir',
+  'claudeRoundDir'] as const;
 
 check('run-env：Claude 欄位經 process.env 路徑完整往返（逐欄對照實際輸入）', () => {
   resetEnv();
@@ -106,6 +109,17 @@ check('executionMode：Claude 完整 env＋一致落地檔 → scenario/claude�
   const m = determineExecutionMode(readRunEnv(), dir, log);
   assert.equal(m.kind, 'scenario', JSON.stringify(m));
   assert.equal(m.kind === 'scenario' ? m.provider : null, 'claude');
+  // E1：核定輪數的來源——identity 必須一路帶出 kind，teardown 才不必自己反推。
+  assert.equal(m.kind === 'scenario' ? m.scenarioKind : null, 'approval');
+});
+check('executionMode：Claude recovery 案的 scenarioKind 必須是 recovery（核定輪數的來源）', () => {
+  resetEnv();
+  const e = { ...claudeEnv(tmp), scenario: 'claude-approval-recovery' };
+  const dir = mkRun('em-claude-recovery', e).dir;
+  const m = determineExecutionMode(readRunEnv(), dir, log);
+  assert.equal(m.kind, 'scenario', JSON.stringify(m));
+  assert.equal(m.kind === 'scenario' ? m.provider : null, 'claude');
+  assert.equal(m.kind === 'scenario' ? m.scenarioKind : null, 'recovery');
 });
 check('executionMode：Codex 案仍判 scenario/codex（既有契約不變）', () => {
   resetEnv();
@@ -113,6 +127,7 @@ check('executionMode：Codex 案仍判 scenario/codex（既有契約不變）', 
   const m = determineExecutionMode(readRunEnv(), dir, log);
   assert.equal(m.kind, 'scenario', JSON.stringify(m));
   assert.equal(m.kind === 'scenario' ? m.provider : null, 'codex');
+  assert.equal(m.kind === 'scenario' ? m.scenarioKind : null, 'approval');
 });
 check('executionMode：Codex 案缺九欄之一仍 fail closed（未放寬）', () => {
   resetEnv();

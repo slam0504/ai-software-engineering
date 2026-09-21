@@ -10,12 +10,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveScenario } from './scenarios.ts';
 import {
-  APPROVAL_SPEC_FILE, CLAUDE_APPROVAL_SPEC_FILE, RECOVERY_SPEC_FILE,
+  APPROVAL_SPEC_FILE, CLAUDE_APPROVAL_SPEC_FILE, CLAUDE_RECOVERY_SPEC_FILE, RECOVERY_SPEC_FILE,
   resolveScenarioProviderForTripwire, resolveScenarioSpecFile,
 } from './specRouting.ts';
 import { judgeClaudeConversationArgvStrict, judgeScenarioCliCalls } from './scenarioTripwire.ts';
 import { createScenarioClaudeCli } from './claudeScenarioCli.ts';
 import { expectedConversationArgv } from './fakeClaudeCli.ts';
+import { buildClaudeRecoveryExpectation } from './claudeApprovalProtocol.ts';
 
 let passed = 0;
 const failures: string[] = [];
@@ -48,8 +49,15 @@ check('identity：新增 claude-approval-allow，provider=claude、kind=approval
   assert.equal(d.provider, 'claude');
   assert.equal(d.kind, 'approval');
 });
+check('identity：新增 claude-approval-recovery，provider=claude、kind=recovery', () => {
+  const d = resolveScenario('claude-approval-recovery');
+  assert.equal(d.provider, 'claude');
+  assert.equal(d.kind, 'recovery');
+  assert.equal(d.decision, 'accept');
+});
 check('identity：Claude 案的 build() 必須 throw（不得被 Codex 路徑誤用）', () => {
   assert.throws(() => resolveScenario('claude-approval-allow').build('run'), /誤用了 Codex 路徑/);
+  assert.throws(() => resolveScenario('claude-approval-recovery').build('run'), /誤用了 Codex 路徑/);
 });
 check('identity：既有五案的 build() 仍可正常產生 Codex config', () => {
   const cfg = resolveScenario('commandExecution-allow').build('run1');
@@ -66,6 +74,11 @@ check('identity：未知／缺失 scenario 仍一律 throw，不回退', () => {
 check('routing：claude 案路由到 claudeApproval.spec.ts', () => {
   assert.equal(resolveScenarioSpecFile('claude-approval-allow'), CLAUDE_APPROVAL_SPEC_FILE);
 });
+check('routing：claude recovery 案路由到 claudeSessionRecovery.spec.ts（不掉回 approval）', () => {
+  assert.equal(resolveScenarioSpecFile('claude-approval-recovery'), CLAUDE_RECOVERY_SPEC_FILE);
+  assert.notEqual(CLAUDE_RECOVERY_SPEC_FILE, CLAUDE_APPROVAL_SPEC_FILE);
+  assert.notEqual(CLAUDE_RECOVERY_SPEC_FILE, RECOVERY_SPEC_FILE);
+});
 check('routing：Codex approval／recovery 的既有對應完全不變', () => {
   for (const n of ['commandExecution-allow', 'commandExecution-deny', 'fileChange-allow', 'fileChange-deny']) {
     assert.equal(resolveScenarioSpecFile(n), APPROVAL_SPEC_FILE, n);
@@ -77,12 +90,14 @@ check('routing：未知名稱仍回中性預設（拒絕由 globalSetup 負責�
   assert.equal(resolveScenarioSpecFile(undefined), APPROVAL_SPEC_FILE);
 });
 check('routing：每個登記案都恰好對應一支 spec 檔', () => {
-  const all = [...CODEX_CASES, 'claude-approval-allow'];
+  const all = [...CODEX_CASES, 'claude-approval-allow', 'claude-approval-recovery'];
   const files = new Set(all.map(n => resolveScenarioSpecFile(n)));
-  assert.deepEqual([...files].sort(), [CLAUDE_APPROVAL_SPEC_FILE, APPROVAL_SPEC_FILE, RECOVERY_SPEC_FILE].sort());
+  assert.deepEqual([...files].sort(),
+    [CLAUDE_APPROVAL_SPEC_FILE, CLAUDE_RECOVERY_SPEC_FILE, APPROVAL_SPEC_FILE, RECOVERY_SPEC_FILE].sort());
 });
 check('routing：tripwire provider 解析正確，未知回中性 codex', () => {
   assert.equal(resolveScenarioProviderForTripwire('claude-approval-allow'), 'claude');
+  assert.equal(resolveScenarioProviderForTripwire('claude-approval-recovery'), 'claude');
   assert.equal(resolveScenarioProviderForTripwire('commandExecution-allow'), 'codex');
   assert.equal(resolveScenarioProviderForTripwire('nope'), 'codex');
   assert.equal(resolveScenarioProviderForTripwire(undefined), 'codex');
@@ -161,19 +176,19 @@ check('tripwire(claude)：缺 toolsDir 必須判失敗，不得因為讀不到�
 check('tripwire(claude)：從未以 conversation argv 被呼叫必須被擋', () => {
   const f = makeClaudeTools(goodWrapperLines.slice(0, 2), [goodArgvRecords[0]]);
   assert.ok(judgeScenarioCliCalls(f.logFile, log, { provider: 'claude', toolsDir: f.toolsDir })
-    .some(x => x.includes('從未以核定 conversation argv')));
+    .some(x => x.includes('出現 0 次，核定為 1 次')));
 });
 check('tripwire(claude)：conversation 被呼叫兩次必須被擋', () => {
   const f = makeClaudeTools([...goodWrapperLines, L('claude-scenario', 'redacted')],
     [...goodArgvRecords, { ts: 't', pid: 3, argv: [...APPROVED_ARGV] }]);
   assert.ok(judgeScenarioCliCalls(f.logFile, log, { provider: 'claude', toolsDir: f.toolsDir })
-    .some(x => x.includes('只允許一次')));
+    .some(x => x.includes('超出核定 1 次')));
 });
 check('tripwire(claude)：非核定 argv（值被改）必須被擋', () => {
   const bad = [...APPROVED_ARGV]; bad[bad.indexOf('--settings') + 1] = '{"permissions":{}}';
   const f = makeClaudeTools(goodWrapperLines, [goodArgvRecords[0], { ts: 't', pid: 2, argv: bad }]);
   assert.ok(judgeScenarioCliCalls(f.logFile, log, { provider: 'claude', toolsDir: f.toolsDir })
-    .some(x => x.includes('非核定的呼叫')));
+    .some(x => x.includes('conversation 呼叫非核定')));
 });
 check('tripwire(claude)：wrapper 行數與結構化紀錄筆數不一致必須被擋（兩份必須同源）', () => {
   const f = makeClaudeTools([L('claude-scenario', '--version')], goodArgvRecords);
@@ -236,6 +251,79 @@ await acheck('整合：實際 wrapper 執行 → invocations.log ＋ claude-argv
   fs.appendFileSync(cli.invocationsLog, `${L('codex', '--version')}\n`);
   const v = judgeScenarioCliCalls(cli.invocationsLog, log, { provider: 'claude', toolsDir });
   assert.deepEqual(v, [], `實際 wrapper 產物應通過 tripwire：${JSON.stringify(v)}`);
+});
+
+// --- tripwire：兩輪案（E1）----------------------------------------------
+// 核定輪數與核定 resume 都由呼叫端（teardown 依已驗證 identity）給定，
+// **不由觀測到的呼叫數或待驗 argv 推定**。
+const S2 = buildClaudeRecoveryExpectation('trip').sessionId;
+const RECOVERY_OPTS = { provider: 'claude' as const, expectedConversationCalls: 2, expectedResume: S2 };
+const freshArgv = (): string[] => [...APPROVED_ARGV];
+const resumeArgv = (id = S2): string[] =>
+  expectedConversationArgv({ mcpConfigPath: '/tmp/app/.workbench/mcp-ws1.json', resume: id });
+const twoRoundWrapper = [L('claude-scenario', '--version'), L('codex', '--version'),
+  L('claude-scenario', 'redacted'), L('claude-scenario', 'redacted')];
+const twoRoundArgv = (second: string[]): unknown[] => [
+  { ts: 't', pid: 1, argv: ['--version'] },
+  { ts: 't', pid: 2, argv: freshArgv() },
+  { ts: 't', pid: 3, argv: second },
+];
+
+check('tripwire(claude,2 輪)：正控制——第一輪 fresh、第二輪 --resume S，無違規', () => {
+  const f = makeClaudeTools(twoRoundWrapper, twoRoundArgv(resumeArgv()));
+  const v = judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir });
+  assert.deepEqual(v, [], JSON.stringify(v));
+});
+check('tripwire(claude,2 輪)：第二輪沒帶 --resume 必須被擋', () => {
+  const f = makeClaudeTools(twoRoundWrapper, twoRoundArgv(freshArgv()));
+  assert.ok(judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir })
+    .some(x => x.includes('argv 卻沒有 --resume')));
+});
+check('tripwire(claude,2 輪)：第二輪 resume 值不是 S 必須被擋', () => {
+  const f = makeClaudeTools(twoRoundWrapper, twoRoundArgv(resumeArgv('someone-else')));
+  assert.ok(judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir })
+    .some(x => x.includes('第 2 筆 conversation 呼叫非核定')));
+});
+check('tripwire(claude,2 輪)：**第一輪就帶 resume** 必須被擋（順序不得對調）', () => {
+  const f = makeClaudeTools(twoRoundWrapper, [
+    { ts: 't', pid: 1, argv: ['--version'] },
+    { ts: 't', pid: 2, argv: resumeArgv() },
+    { ts: 't', pid: 3, argv: freshArgv() },
+  ]);
+  const v = judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir });
+  assert.ok(v.some(x => x.includes('第 1 筆')), JSON.stringify(v));
+  assert.ok(v.some(x => x.includes('第 2 筆')), JSON.stringify(v));
+});
+check('tripwire(claude,2 輪)：只有一輪必須被擋（缺輪不得當成通過）', () => {
+  const f = makeClaudeTools(goodWrapperLines, goodArgvRecords);
+  assert.ok(judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir })
+    .some(x => x.includes('出現 1 次，核定為 2 次')));
+});
+check('tripwire(claude,2 輪)：**第三次對話呼叫**必須被擋', () => {
+  const f = makeClaudeTools([...twoRoundWrapper, L('claude-scenario', 'redacted')],
+    [...twoRoundArgv(resumeArgv()), { ts: 't', pid: 4, argv: resumeArgv() }]);
+  assert.ok(judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir })
+    .some(x => x.includes('超出核定 2 次')));
+});
+check('tripwire(claude,2 輪)：核定兩輪卻沒給 expectedResume 必須 fail closed', () => {
+  const f = makeClaudeTools(twoRoundWrapper, twoRoundArgv(resumeArgv()));
+  assert.ok(judgeScenarioCliCalls(f.logFile, log,
+    { provider: 'claude', toolsDir: f.toolsDir, expectedConversationCalls: 2 })
+    .some(x => x.includes('沒有給 expectedResume')));
+});
+check('tripwire(claude,1 輪)：核定一輪時，第二輪的 resume 呼叫仍被擋（既有契約不放寬）', () => {
+  const f = makeClaudeTools(twoRoundWrapper, twoRoundArgv(resumeArgv()));
+  const v = judgeScenarioCliCalls(f.logFile, log, { provider: 'claude', toolsDir: f.toolsDir });
+  assert.ok(v.some(x => x.includes('超出核定 1 次')), JSON.stringify(v));
+});
+check('tripwire(claude)：--version 呼叫不計輪次（多次探測不影響核定輪數）', () => {
+  const f = makeClaudeTools(
+    [L('claude-scenario', '--version'), L('claude-scenario', '--version'),
+      L('codex', '--version'), L('claude-scenario', 'redacted'), L('claude-scenario', 'redacted')],
+    [{ ts: 't', pid: 1, argv: ['--version'] }, { ts: 't', pid: 2, argv: ['--version'] },
+      { ts: 't', pid: 3, argv: freshArgv() }, { ts: 't', pid: 4, argv: resumeArgv() }]);
+  const v = judgeScenarioCliCalls(f.logFile, log, { ...RECOVERY_OPTS, toolsDir: f.toolsDir });
+  assert.deepEqual(v, [], JSON.stringify(v));
 });
 
 function writeLog(lines: string[]): string {
