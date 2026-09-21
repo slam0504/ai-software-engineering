@@ -20,6 +20,10 @@ import type { ApprovalMethod, ScenarioConfig } from './protocol.js';
 
 export interface ScenarioDef {
   name: string;
+  // provider：B3a-2b-2 F2 新增——**provider 必須明確區分**，不得把兩種協定塞進
+  // 同一個寬鬆判定（reviewer #365）。既有五案一律 'codex'，語意與契約完全不變；
+  // 'claude' 是本次新增的單一 fresh-start approval allow 案。
+  provider: 'codex' | 'claude';
   // decision：本案例「允許」或「拒絕」——瀏覽器該點 approval-allow 還是
   // approval-deny，以及 wire／audit 判定端該核對哪個 decision 值。單輪案例
   // 只有一個 decision；recovery 案兩輪都 accept，同一個欄位對兩輪皆適用
@@ -55,24 +59,28 @@ function buildConfig(name: string, approvalMethod: ApprovalMethod, runId: string
 const SCENARIOS: Record<string, ScenarioDef> = {
   'commandExecution-allow': {
     name: 'commandExecution-allow',
+    provider: 'codex',
     decision: 'accept',
     kind: 'approval',
     build: (runId: string) => buildConfig('commandExecution-allow', Method.CmdExecRequestApproval, runId),
   },
   'commandExecution-deny': {
     name: 'commandExecution-deny',
+    provider: 'codex',
     decision: 'decline',
     kind: 'approval',
     build: (runId: string) => buildConfig('commandExecution-deny', Method.CmdExecRequestApproval, runId),
   },
   'fileChange-allow': {
     name: 'fileChange-allow',
+    provider: 'codex',
     decision: 'accept',
     kind: 'approval',
     build: (runId: string) => buildConfig('fileChange-allow', Method.FileChangeRequestApproval, runId),
   },
   'fileChange-deny': {
     name: 'fileChange-deny',
+    provider: 'codex',
     decision: 'decline',
     kind: 'approval',
     build: (runId: string) => buildConfig('fileChange-deny', Method.FileChangeRequestApproval, runId),
@@ -87,6 +95,7 @@ const SCENARIOS: Record<string, ScenarioDef> = {
   // 與第一輪不同，供兩輪 identity 交叉核對。
   'commandExecution-recovery': {
     name: 'commandExecution-recovery',
+    provider: 'codex',
     decision: 'accept',
     kind: 'recovery',
     build: (runId: string) => ({
@@ -102,6 +111,27 @@ const SCENARIOS: Record<string, ScenarioDef> = {
         turnStatus: 'completed',
       },
     }),
+  },
+  // B3a-2b-2 F2：單一 Claude fresh-start approval allow。
+  //
+  // **這一案不使用 Codex 的 wire 協定欄位**（threadId／turnId／approvalMethod 等是
+  // fake codex app-server 的協定，與 Claude 的 MCP approval 無關）。`build()` 仍然
+  // 存在只是為了讓登記表維持單一型別；**Claude 案的 build() 一定會 throw**，
+  // 任何誤用 Codex 路徑處理 Claude 案的地方都會當場炸開，不會悄悄拿到一份
+  // 語意不對的 config。Claude 案真正的期望值由 F1a 的
+  // `buildClaudeApprovalExpectation(runId)` 提供（見 claudeApprovalProtocol.ts）。
+  'claude-approval-allow': {
+    name: 'claude-approval-allow',
+    provider: 'claude',
+    decision: 'accept',
+    kind: 'approval',
+    build: () => {
+      throw new Error(
+        'scenarios: claude-approval-allow 沒有 Codex wire 協定 config——'
+        + 'Claude 案的期望值來自 buildClaudeApprovalExpectation(runId)，'
+        + '呼叫到這裡代表誤用了 Codex 路徑處理 Claude 案',
+      );
+    },
   },
 };
 

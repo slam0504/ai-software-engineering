@@ -35,6 +35,16 @@ export interface RunEnv {
   scenarioConfigPath?: string;
   scenarioLogPath?: string;
   scenarioManifestPath?: string;
+  // B3a-2b-2 F2：Claude 案專屬欄位。**與 Codex 的 scenario* 欄位互斥**——
+  // Claude 案沒有 thread/turn/item/approvalMethod 這些 Codex wire 協定概念，
+  // 硬塞會讓 readScenarioRunEnv 的「缺一即壞掉」契約失去意義。
+  claudeExpectationPath?: string;
+  claudeEvidenceDir?: string;
+  /** 核定 MCP binary 的 canonical path——來自受控啟動產物，不從待驗 config 反推。 */
+  claudeApprovedCommandPath?: string;
+  claudeApprovedCommandSha256?: string;
+  /** App stateDir（<workspace>/.workbench）：動態 socket 必須落在此目錄之下。 */
+  claudeStateDir?: string;
 }
 
 function runEnvFile(artifactsDir: string): string {
@@ -70,6 +80,13 @@ function envToProcessEnv(env: RunEnv): Record<string, string | undefined> {
     E2E_SCENARIO_CONFIG_PATH: env.scenarioConfigPath,
     E2E_SCENARIO_LOG_PATH: env.scenarioLogPath,
     E2E_SCENARIO_MANIFEST_PATH: env.scenarioManifestPath,
+    // B3a-2b-2 F2：Claude 案欄位——**必須與 readRunEnv 的 process.env 分支成對**，
+    // 否則 spec/teardown 在 env 路徑上會拿不到這些值而誤判。
+    E2E_CLAUDE_EXPECTATION_PATH: env.claudeExpectationPath,
+    E2E_CLAUDE_EVIDENCE_DIR: env.claudeEvidenceDir,
+    E2E_CLAUDE_APPROVED_COMMAND_PATH: env.claudeApprovedCommandPath,
+    E2E_CLAUDE_APPROVED_COMMAND_SHA256: env.claudeApprovedCommandSha256,
+    E2E_CLAUDE_STATE_DIR: env.claudeStateDir,
   };
 }
 
@@ -98,6 +115,11 @@ export function readRunEnv(): RunEnv {
       scenarioConfigPath: p.E2E_SCENARIO_CONFIG_PATH,
       scenarioLogPath: p.E2E_SCENARIO_LOG_PATH,
       scenarioManifestPath: p.E2E_SCENARIO_MANIFEST_PATH,
+      claudeExpectationPath: p.E2E_CLAUDE_EXPECTATION_PATH,
+      claudeEvidenceDir: p.E2E_CLAUDE_EVIDENCE_DIR,
+      claudeApprovedCommandPath: p.E2E_CLAUDE_APPROVED_COMMAND_PATH,
+      claudeApprovedCommandSha256: p.E2E_CLAUDE_APPROVED_COMMAND_SHA256,
+      claudeStateDir: p.E2E_CLAUDE_STATE_DIR,
     };
   }
   const artifactsDir = p.E2E_ARTIFACTS_DIR;
@@ -181,3 +203,32 @@ export const userFlags = {
   injectDeleteNetworkLog: () => process.env.E2E_INJECT_DELETE_NETWORK_LOG === '1', // R3 定點反證：network-samples.log 在判定前被刪除，globalTeardown 不能當成 0 違規
   injectDeleteRunStateForTeardown: () => process.env.E2E_INJECT_DELETE_RUN_STATE_FOR_TEARDOWN === '1', // R3 定點反證：run-state.json 在判定前被刪除，observationFailures 讀取失敗不能當成空陣列
 };
+
+/** B3a-2b-2 F2：Claude 案的 run-env 讀取——缺一即視為壞掉，不回退。 */
+export interface ClaudeScenarioRunEnv extends RunEnv {
+  scenario: string;
+  claudeExpectationPath: string;
+  claudeEvidenceDir: string;
+  claudeApprovedCommandPath: string;
+  claudeApprovedCommandSha256: string;
+  claudeStateDir: string;
+}
+
+export function readClaudeScenarioRunEnv(): ClaudeScenarioRunEnv {
+  const env = readRunEnv();
+  const required = [
+    'scenario', 'claudeExpectationPath', 'claudeEvidenceDir',
+    'claudeApprovedCommandPath', 'claudeApprovedCommandSha256', 'claudeStateDir',
+  ] as const;
+  const missing = required.filter(k => {
+    const v = env[k];
+    return typeof v !== 'string' || v.length === 0;
+  });
+  if (missing.length > 0) {
+    throw new Error(
+      `readClaudeScenarioRunEnv: run-env 缺少 Claude scenario 欄位：${missing.join('、')}`
+      + '——Claude 案不得在欄位不全的情況下繼續',
+    );
+  }
+  return env as ClaudeScenarioRunEnv;
+}
