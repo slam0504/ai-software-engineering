@@ -1,6 +1,6 @@
 // B3a-2b-2 F2：App 端證據挑選與三方一致性的離線正負控制。
 import assert from 'node:assert/strict';
-import { buildClaudeApprovalExpectation } from './claudeApprovalProtocol.ts';
+import { buildClaudeApprovalExpectation, buildClaudeDenyExpectation } from './claudeApprovalProtocol.ts';
 import {
   judgeClaudeUiConsistency, parseAuditLines, selectBrokerAuditForApproval, wsidFromMcpConfigPath,
 } from './claudeAppEvidence.ts';
@@ -112,6 +112,48 @@ check('反例：broker audit 為空必須被擋，不得因為沒有觀察值就
   const r = judgeClaudeUiConsistency({ ...base(), brokerAudit: [] });
   assert.ok(r.violations.some(x => x.includes('無法建立三方一致')), JSON.stringify(r.violations));
   assert.equal(r.agreedApprovalId, null);
+});
+
+// --- deny 案的三方一致（reviewer #403） -------------------------------------
+const DENY_EXP = buildClaudeDenyExpectation('f2test');
+const denyTranscript = (): any[] => [
+  { seq: 0, dir: 'c2s', frame: { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } } },
+  { seq: 1, dir: 's2c', frame: { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-06-18',
+    capabilities: { logging: {}, tools: { listChanged: true } }, serverInfo: { name: 'workbench', version: '0.0.1' } } } },
+  { seq: 2, dir: 'c2s', frame: { jsonrpc: '2.0', method: 'notifications/initialized' } },
+  { seq: 3, dir: 'c2s', frame: { jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'approval_prompt', arguments: { tool_name: DENY_EXP.toolName, input: DENY_EXP.input } } } },
+  { seq: 4, dir: 's2c', frame: { jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text',
+    text: JSON.stringify({ behavior: 'deny', message: DENY_EXP.denyReason }) }] } } },
+];
+const denyAudit = (): any[] => [
+  { ts: 't1', kind: 'request', data: { id: ID, tool_name: DENY_EXP.toolName, input: DENY_EXP.input,
+    raw_params: { name: 'approval_prompt', arguments: { tool_name: DENY_EXP.toolName, input: DENY_EXP.input } } } },
+  { ts: 't2', kind: 'decision', data: { id: ID, behavior: 'deny', message: DENY_EXP.denyReason } },
+];
+const denyBase = () => ({ transcript: denyTranscript(), brokerAudit: denyAudit(),
+  domWsid: WSID, domApprovalId: ID, mcpConfigPath: CFG, exp: DENY_EXP });
+
+check('deny 正控制：三方一致且協定無違規', () => {
+  const r = judgeClaudeUiConsistency(denyBase());
+  assert.deepEqual(r.violations, [], JSON.stringify(r.violations));
+  assert.equal(r.agreedApprovalId, ID);
+});
+check('deny 反例：DOM approval id 與 broker audit 不符必須被擋', () => {
+  const r = judgeClaudeUiConsistency({ ...denyBase(), domApprovalId: 'different-id' });
+  assert.ok(r.violations.some(x => x.includes('與 DOM 觀察到的')), JSON.stringify(r.violations));
+  assert.equal(r.agreedApprovalId, null);
+});
+check('deny 反例：**完全沒有 UI 點擊**（audit 只有 request、沒有 decision）必須被擋', () => {
+  const r = judgeClaudeUiConsistency({ ...denyBase(), brokerAudit: [denyAudit()[0]] });
+  assert.ok(r.violations.some(x => x.includes('[broker]')), JSON.stringify(r.violations));
+});
+check('deny 反例：整份 allow 證據配 deny 期望必須被擋', () => {
+  const r = judgeClaudeUiConsistency({ ...denyBase(), transcript: goodTranscript(), brokerAudit: goodAudit() });
+  assert.ok(r.violations.some(x => x.includes('behavior 應為 "deny"')), JSON.stringify(r.violations));
+});
+check('allow 案不受影響：allow 正控制仍無違規', () => {
+  assert.deepEqual(judgeClaudeUiConsistency(base()).violations, []);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

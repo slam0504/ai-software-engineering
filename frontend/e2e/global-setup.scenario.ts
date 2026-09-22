@@ -37,7 +37,7 @@ import { handleStaleRun, StaleRunConflictError } from './support/staleRun.js';
 import { createScenarioCodexCli } from './support/scenario/scenarioCli.js';
 import { createFakeCliSet } from './support/fakeCli.js';
 import { createScenarioClaudeCli } from './support/scenario/claudeScenarioCli.js';
-import { buildClaudeApprovalExpectation, buildClaudeRecoveryExpectation } from './support/scenario/claudeApprovalProtocol.js';
+import { buildClaudeApprovalExpectation, buildClaudeDenyExpectation, buildClaudeRecoveryExpectation, protocolDecisionFor } from './support/scenario/claudeApprovalProtocol.js';
 import { handleClaudeSetupFailure } from './support/scenario/claudeSetupFailure.js';
 import { resolveAppBinaryIdentity } from './support/scenario/appBinaryIdentity.js';
 import { resolveScenario } from './support/scenario/scenarios.js';
@@ -289,7 +289,7 @@ export default async function globalSetupScenario(): Promise<void> {
     // 都必須走既有的失敗收尾路徑——標記 failed、保存 harness.log、停止本次
     // 程序，不能只 throw 讓 globalTeardown 去猜（reviewer #367）。
     try {
-      await setupClaudeRunEnv(runId, artifactsDir, claudeRoundDir, scenarioDef.kind);
+      await setupClaudeRunEnv(runId, artifactsDir, claudeRoundDir, scenarioDef.kind, scenarioDef.decision);
     } catch (e) {
       // 記 log／標記 failed 各自獨立包起來——**其中任一自己 throw 都不得讓
       // 清理被跳過**（reviewer #369）。原始錯誤照原樣 rethrow，不被掩蓋。
@@ -310,7 +310,7 @@ export default async function globalSetupScenario(): Promise<void> {
   // 收窄帶進來（它可能在守門之前被呼叫），顯式傳參比在函式內重新斷言誠實。
   async function setupClaudeRunEnv(
     runIdArg: string, artifactsDirArg: string, roundDirArg: string,
-    kindArg: 'approval' | 'recovery',
+    kindArg: 'approval' | 'recovery', decisionArg: 'accept' | 'decline',
   ): Promise<void> {
     // **核定 MCP binary identity 來自受控啟動產物**：依 wails.json 的
     // outputfilename ＋ macOS bundle 佈局算出預期路徑，再用**當次受控程序樹
@@ -365,9 +365,24 @@ export default async function globalSetupScenario(): Promise<void> {
     // buildClaudeApprovalExpectation（欄位與版面完全不變），兩輪案用 E1 的
     // buildClaudeRecoveryExpectation。兩者互斥——fixture 不會同時有
     // `approval`＋`prompt` 與 `rounds`。
+    // decision 由**登記表**決定，並經 `protocolDecisionFor()` 明確映射到協定層
+    // 的 allow／deny（未知值 throw，不回退）。recovery 案目前固定兩輪 allow，
+    // 若哪天出現 decline 的 recovery，這裡會在組 fixture 前就 fail loud。
+    const protoDecision = protocolDecisionFor(decisionArg);
+    if (kindArg === 'recovery' && protoDecision !== 'allow') {
+      const m = `globalSetupScenario: recovery 案目前只支援 allow，scenario decision=${decisionArg}`;
+      log.log(m);
+      throw new Error(m);
+    }
     const fixtureBody = kindArg === 'recovery'
       ? { ...sharedFixture, rounds: buildClaudeRecoveryExpectation(runIdArg).rounds }
-      : { ...sharedFixture, approval: buildClaudeApprovalExpectation(runIdArg), prompt: claudePrompt };
+      : {
+        ...sharedFixture,
+        approval: protoDecision === 'deny'
+          ? buildClaudeDenyExpectation(runIdArg)
+          : buildClaudeApprovalExpectation(runIdArg),
+        prompt: claudePrompt,
+      };
     fs.writeFileSync(claudeExpectationPath, JSON.stringify(fixtureBody, null, 2));
     writeRunEnv({
       ...baseRunEnv,

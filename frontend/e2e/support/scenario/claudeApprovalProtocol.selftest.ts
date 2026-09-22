@@ -17,10 +17,13 @@
 import assert from 'node:assert/strict';
 import {
   buildClaudeApprovalExpectation,
+  buildClaudeDenyExpectation,
+  protocolDecisionFor,
   type ClaudeApprovalExpectation,
 } from './claudeApprovalProtocol.ts';
 import {
   judgeBrokerAudit,
+  validateExpectationDecision,
   judgeClaudeApprovalEvidence,
   judgeMcpBrokerCorrelation,
   judgeMcpToolCallResult,
@@ -48,6 +51,7 @@ check('builder 自身：與手寫固定期望逐欄相符（不經 builder 推�
     toolName: 'Bash',
     inputMarker: MARKER,
     input: { command: "printf '%s' " + MARKER },
+    decision: 'allow',
     completionText: 'b3a2b2-claude-content-20260921T000000Z-f1atest',
   };
   assert.deepStrictEqual(buildClaudeApprovalExpectation('20260921T000000Z-f1atest'), FIXED);
@@ -389,6 +393,189 @@ check('完整入口：transcript 被預先裁切成四筆時必須失敗（calle
   const t = clone(goodTranscript()).slice(0, 4);
   const v = judgeClaudeApprovalEvidence(t, goodAudit(), exp).violations;
   assert.ok(v.some(x => x.includes('恰好 5 筆')), JSON.stringify(v));
+});
+
+// ---------------------------------------------------------------------------
+// B3a-2b-2 deny 案（reviewer #403 核定）：**使用者明確拒絕**
+//
+// production 事實（一手讀碼，2026-09-22 覆核）：
+//   ApprovalDialog.vue:16,55-62,90-93  reason 預設 **空字串**，由既有 input
+//                                      v-model 綁定；decide(false) 把它原樣送進
+//                                      ResolveApproval(id, false, reason)
+//   app.go:6908-6916                   allow=false → behavior/decision = "deny"，
+//                                      reason 原樣成為 Decision.Message
+//   broker.go:20-25,118-120            Message 與 UpdatedInput 皆 omitempty；
+//                                      **只有 allow 才補 UpdatedInput**
+//   mcpserver.go:70-76                 回覆 {behavior,message?,updatedInput?}
+//
+// 因此「deny 一定有 message」**不是** production 契約——空理由的 deny 完全合法。
+// 本 scenario 自己固定一個 run 專屬理由，判定才有辦法逐字認出「使用者這次按的
+// 那個 deny」，並與 fail-closed 的自動 deny 分開。下面的空／錯 reason 反例
+// **只對這個非空理由的案例成立**，不代表一般空理由 deny 非法。
+const denyExp: ClaudeApprovalExpectation = buildClaudeDenyExpectation(RUN_ID);
+
+check('deny builder：與手寫固定期望逐欄相符（不經 builder 推導）', () => {
+  const M = 'b3a2b2-claude-deny-20260921T000000Z-f1atest';
+  const FIXED: ClaudeApprovalExpectation = {
+    sessionId: 'b3a2b2-claude-session-20260921T000000Z-f1atest',
+    initializeRequestId: 1,
+    toolCallRequestId: 2,
+    toolName: 'Bash',
+    inputMarker: M,
+    input: { command: "printf '%s' " + M },
+    decision: 'deny',
+    denyReason: 'b3a2b2-claude-deny-reason-20260921T000000Z-f1atest',
+    completionText: 'b3a2b2-claude-denied-content-20260921T000000Z-f1atest',
+  };
+  assert.deepStrictEqual(buildClaudeDenyExpectation(RUN_ID), FIXED);
+});
+check('deny builder：與 allow builder 的 marker／input／完成內容全部不同（不得互相冒充）', () => {
+  assert.notEqual(denyExp.inputMarker, exp.inputMarker);
+  assert.notDeepStrictEqual(denyExp.input, exp.input);
+  assert.notEqual(denyExp.completionText, exp.completionText);
+  assert.equal(exp.decision, 'allow');
+  assert.equal(exp.denyReason, undefined);
+});
+check('deny builder：不同 runId 必須產生不同 reason 與 marker', () => {
+  assert.notEqual(buildClaudeDenyExpectation('runA').denyReason, buildClaudeDenyExpectation('runB').denyReason);
+  assert.notEqual(buildClaudeDenyExpectation('runA').inputMarker, buildClaudeDenyExpectation('runB').inputMarker);
+});
+check('decline→deny 映射明確，未知值一律 throw（不回退 allow）', () => {
+  assert.equal(protocolDecisionFor('accept'), 'allow');
+  assert.equal(protocolDecisionFor('decline'), 'deny');
+  assert.throws(() => protocolDecisionFor('deny'), /未知的 scenario decision/);
+  assert.throws(() => protocolDecisionFor(''), /未知的 scenario decision/);
+  assert.throws(() => protocolDecisionFor('ACCEPT'), /未知的 scenario decision/);
+});
+
+// --- 核定決策本身的形狀（fail closed，無預設） ------------------------------
+check('期望形狀：decision 缺失必須被拒（不得靜默當成 allow）', () => {
+  const bad = { ...exp } as Record<string, unknown>; delete bad.decision;
+  const v = validateExpectationDecision(bad as unknown as ClaudeApprovalExpectation);
+  assert.ok(v.some(x => x.includes('不提供預設')), JSON.stringify(v));
+});
+check('期望形狀：decision 為未知值必須被拒', () => {
+  const bad = { ...exp, decision: 'maybe' } as unknown as ClaudeApprovalExpectation;
+  assert.ok(validateExpectationDecision(bad).length > 0);
+});
+check('期望形狀：deny 案缺 denyReason 必須被拒', () => {
+  const bad = { ...denyExp, denyReason: undefined } as unknown as ClaudeApprovalExpectation;
+  assert.ok(validateExpectationDecision(bad).some(x => x.includes('denyReason')));
+});
+check('期望形狀：deny 案的核定理由不得含 "fail closed"', () => {
+  const bad = { ...denyExp, denyReason: 'nope (fail closed)' };
+  assert.ok(validateExpectationDecision(bad).some(x => x.includes('fail closed')));
+});
+check('期望形狀：allow 案帶 denyReason 必須被拒（兩案互斥）', () => {
+  const bad = { ...exp, denyReason: 'x' };
+  assert.ok(validateExpectationDecision(bad).some(x => x.includes('互斥')));
+});
+check('期望形狀：兩個 builder 的輸出都必須通過形狀驗證', () => {
+  assert.deepEqual(validateExpectationDecision(exp), []);
+  assert.deepEqual(validateExpectationDecision(denyExp), []);
+});
+
+// --- deny 的 MCP 回覆與 broker audit -----------------------------------------
+const denyPayload = (over: Record<string, unknown> = {}): unknown =>
+  ({ behavior: 'deny', message: denyExp.denyReason, ...over });
+const denyFrame = (payload: unknown): unknown => ({
+  jsonrpc: '2.0', id: 2,
+  result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+});
+const denyTranscript = (payload: unknown = denyPayload()): unknown[] => [
+  { seq: 0, dir: 'c2s', frame: { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } } },
+  { seq: 1, dir: 's2c', frame: { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-06-18',
+    capabilities: { logging: {}, tools: { listChanged: true } }, serverInfo: { name: 'workbench', version: '0.0.1' } } } },
+  { seq: 2, dir: 'c2s', frame: { jsonrpc: '2.0', method: 'notifications/initialized' } },
+  { seq: 3, dir: 'c2s', frame: { jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'approval_prompt', arguments: { tool_name: denyExp.toolName, input: denyExp.input } } } },
+  { seq: 4, dir: 's2c', frame: denyFrame(payload) },
+];
+const DENY_ID = 'ffffffffffffffffffffffffffffffff';
+const denyAudit = (decOver: Record<string, unknown> = {}): unknown[] => [
+  { ts: 't1', kind: 'request', data: { id: DENY_ID, tool_name: denyExp.toolName, input: denyExp.input,
+    raw_params: { name: 'approval_prompt', arguments: { tool_name: denyExp.toolName, input: denyExp.input } } } },
+  { ts: 't2', kind: 'decision', data: { id: DENY_ID, behavior: 'deny', message: denyExp.denyReason, ...decOver } },
+];
+
+check('deny 正控制：完整入口無違規，且觀察到 broker id', () => {
+  const r = judgeClaudeApprovalEvidence(denyTranscript(), denyAudit(), denyExp);
+  assert.deepEqual(r.violations, [], JSON.stringify(r.violations, null, 2));
+  assert.equal(r.observedBrokerId, DENY_ID);
+});
+check('deny 反例：MCP 回覆帶 updatedInput 必須被擋（broker 只對 allow 補值）', () => {
+  const v = judgeMcpToolCallResult(denyFrame(denyPayload({ updatedInput: denyExp.input })), denyExp);
+  assert.ok(v.some(x => x.includes('deny 不得帶 updatedInput')), JSON.stringify(v));
+});
+check('deny 反例：MCP 回覆的 updatedInput 為 null 也必須被擋（連欄位都不得存在）', () => {
+  const v = judgeMcpToolCallResult(denyFrame(denyPayload({ updatedInput: null })), denyExp);
+  assert.ok(v.some(x => x.includes('deny 不得帶 updatedInput')), JSON.stringify(v));
+});
+check('deny 反例：合法的 allow 回覆不算通過', () => {
+  const v = judgeMcpToolCallResult(denyFrame({ behavior: 'allow', updatedInput: denyExp.input }), denyExp);
+  assert.ok(v.some(x => x.includes('behavior 應為 "deny"')), JSON.stringify(v));
+});
+check('deny 反例：**理由不同的另一個合法 deny** 不算通過', () => {
+  const v = judgeMcpToolCallResult(denyFrame(denyPayload({ message: '使用者其實是別的理由' })), denyExp);
+  assert.ok(v.some(x => x.includes('應逐字等於核定理由')), JSON.stringify(v));
+});
+check('deny 反例：空理由的 deny 在本案不算通過（但不代表 production 禁止空理由）', () => {
+  const v = judgeMcpToolCallResult(denyFrame({ behavior: 'deny' }), denyExp);
+  assert.ok(v.some(x => x.includes('應逐字等於核定理由')), JSON.stringify(v));
+});
+check('deny 反例：**broker 逾時的 fail-closed 自動 deny** 不得冒充使用者拒絕', () => {
+  const v = judgeMcpToolCallResult(denyFrame({ behavior: 'deny', message: 'approval timeout (fail closed)' }), denyExp);
+  assert.ok(v.some(x => x.includes('fail-closed 自動拒絕')), JSON.stringify(v));
+});
+check('deny 反例：**socket 不可達的 fail-closed 自動 deny** 不得冒充使用者拒絕', () => {
+  const v = judgeMcpToolCallResult(denyFrame({ behavior: 'deny', message: 'approval broker unavailable (fail closed)' }), denyExp);
+  assert.ok(v.some(x => x.includes('fail-closed 自動拒絕')), JSON.stringify(v));
+});
+check('deny 反例：MCP 回覆仍不得洩漏 internal broker id', () => {
+  const v = judgeMcpToolCallResult(denyFrame(denyPayload({ id: DENY_ID })), denyExp);
+  assert.ok(v.some(x => x.includes('不得含 id')), JSON.stringify(v));
+});
+check('deny 反例：isError 規則對 deny 案同樣成立', () => {
+  const f = denyFrame(denyPayload()) as { result: Record<string, unknown> };
+  f.result.isError = true;
+  assert.ok(judgeMcpToolCallResult(f, denyExp).some(x => x.includes('isError')));
+});
+check('deny 反例：audit decision 帶 updatedInput 必須被擋', () => {
+  const v = judgeBrokerAudit(denyAudit({ updatedInput: denyExp.input }), denyExp).violations;
+  assert.ok(v.some(x => x.includes('deny 不得帶 updatedInput')), JSON.stringify(v));
+});
+check('deny 反例：audit decision 是 allow 必須被擋', () => {
+  const v = judgeBrokerAudit(denyAudit({ behavior: 'allow' }), denyExp).violations;
+  assert.ok(v.some(x => x.includes('應為 "deny"')), JSON.stringify(v));
+});
+check('deny 反例：audit decision 的理由與核定不符必須被擋', () => {
+  const v = judgeBrokerAudit(denyAudit({ message: '別的理由' }), denyExp).violations;
+  assert.ok(v.some(x => x.includes('應逐字等於核定理由')), JSON.stringify(v));
+});
+check('deny 反例：audit decision 是 fail-closed 必須被擋', () => {
+  const v = judgeBrokerAudit(denyAudit({ message: 'approval timeout (fail closed)' }), denyExp).violations;
+  assert.ok(v.some(x => x.includes('fail-closed')), JSON.stringify(v));
+});
+check('deny 反例：**MCP 與 audit 的理由不一致**必須被擋（兩層必須同一筆決策）', () => {
+  const v = judgeClaudeApprovalEvidence(
+    denyTranscript(denyPayload({ message: '這一層寫別的' })), denyAudit(), denyExp).violations;
+  assert.ok(v.some(x => x.startsWith('[mcp]') && x.includes('應逐字等於核定理由')), JSON.stringify(v));
+});
+check('deny 反例：audit 出現 timeout 列（fail-closed 路徑）必須被擋', () => {
+  const a = [denyAudit()[0], { ts: 't9', kind: 'timeout', data: DENY_ID }, denyAudit()[1]];
+  const v = judgeBrokerAudit(a, denyExp).violations;
+  assert.ok(v.some(x => x.includes('[request, decision]')), JSON.stringify(v));
+});
+check('deny 反例：**完全沒有 audit**（socket 不可達時 broker 根本沒收到）必須被擋', () => {
+  const v = judgeBrokerAudit([], denyExp).violations;
+  assert.ok(v.length > 0, JSON.stringify(v));
+});
+check('allow 案的既有判定未被 deny 分流影響：allow 正控制仍無違規', () => {
+  assert.deepEqual(judgeClaudeApprovalEvidence(goodTranscript(), goodAudit(), exp).violations, []);
+});
+check('allow 案收到 deny 仍必須被擋（既有規則未放寬）', () => {
+  const v = judgeMcpToolCallResult(denyFrame(denyPayload()), exp);
+  assert.ok(v.some(x => x.includes('behavior 應為 "allow"')), JSON.stringify(v));
 });
 
 console.log(`\n${passed} passed (any FAIL above sets process.exitCode=1)`);

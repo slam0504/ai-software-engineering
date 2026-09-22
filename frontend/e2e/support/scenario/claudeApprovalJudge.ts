@@ -120,6 +120,31 @@ function checkInitializeResult(result: unknown, label: string): string[] {
 // 1. MCP transcript 判定（**涵蓋整段往返，含 tools/call 回覆**）
 // ---------------------------------------------------------------------------
 
+/**
+ * **核定決策的形狀驗證**（reviewer #403 第 3 點）：期望值只能來自已驗證的
+ * scenario 與固定 builder，缺值、未知值、或 allow 卻帶 `denyReason` 這種
+ * 跨欄位矛盾一律拒絕。**沒有預設值**——靜默當成 allow 會讓一個壞掉的 deny 案
+ * 走完整條 allow 判定而通過。
+ */
+export function validateExpectationDecision(exp: ClaudeApprovalExpectation): string[] {
+  const d = (exp as { decision?: unknown }).decision;
+  if (d !== 'allow' && d !== 'deny') {
+    return [`核定決策不合法：decision 應為 "allow" 或 "deny"，實際 ${JSON.stringify(d)}（不提供預設）`];
+  }
+  const v: string[] = [];
+  const reason = (exp as { denyReason?: unknown }).denyReason;
+  if (d === 'deny') {
+    if (typeof reason !== 'string' || reason === '') {
+      v.push(`deny 案必須由 fixture 指定非空的 denyReason（本 scenario 固定一個 run 專屬理由），實際 ${JSON.stringify(reason)}`);
+    } else if (reason.includes('fail closed')) {
+      v.push(`deny 案的核定 denyReason 不得含 "fail closed"：${JSON.stringify(reason)}——那是自動 deny 的字樣，會讓兩者分不開`);
+    }
+  } else if (reason !== undefined) {
+    v.push(`allow 案不得帶 denyReason，實際 ${JSON.stringify(reason)}（兩案互斥）`);
+  }
+  return v;
+}
+
 /** tools/call request 在完整序列中的索引；其 response 緊接其後。 */
 const TOOL_CALL_REQUEST_INDEX = 3;
 /** 完整往返恰好五筆：initialize req／resp、notifications/initialized、tools/call req／resp。 */
@@ -242,14 +267,38 @@ export function judgeMcpToolCallResult(
   try { payload = JSON.parse(c0.text as string); }
   catch (e) { return v.concat([`tools/call response: content[0].text 不是合法 JSON：${String(e)}`]); }
   if (!isPlainObject(payload)) return v.concat([`tools/call response: text payload 應為物件，實際 ${JSON.stringify(payload)}`]);
-  // **本案是 allow**：不得因為看到任意合法的 deny 就通過。
-  if (payload.behavior !== 'allow') {
-    v.push(`tools/call response: behavior 應為 "allow"（本案為 allow 案，合法的 deny 也不算通過），實際 ${JSON.stringify(payload.behavior)}`);
+  // **依核定決策分流**：兩條分支都要求「恰好是核定的那一種」，合法但不是本案
+  // 核定的那一種決策一律不算通過（reviewer #403 第 2、4 點）。
+  const decisionViolations = validateExpectationDecision(exp);
+  if (decisionViolations.length > 0) {
+    return v.concat(decisionViolations.map(m => `tools/call response: ${m}`));
   }
-  if (payload.updatedInput === undefined) {
-    v.push('tools/call response: allow 必須帶 updatedInput（broker.go:119-120 會補上 req.Input）');
-  } else if (!deepEqual(payload.updatedInput, exp.input)) {
-    v.push(`tools/call response: updatedInput 應等於原 input，實際 ${JSON.stringify(payload.updatedInput)}`);
+  if (exp.decision === 'allow') {
+    // ——以下 allow 分支的判定逐字保留 F1a 既有行為，未放寬——
+    if (payload.behavior !== 'allow') {
+      v.push(`tools/call response: behavior 應為 "allow"（本案為 allow 案，合法的 deny 也不算通過），實際 ${JSON.stringify(payload.behavior)}`);
+    }
+    if (payload.updatedInput === undefined) {
+      v.push('tools/call response: allow 必須帶 updatedInput（broker.go:119-120 會補上 req.Input）');
+    } else if (!deepEqual(payload.updatedInput, exp.input)) {
+      v.push(`tools/call response: updatedInput 應等於原 input，實際 ${JSON.stringify(payload.updatedInput)}`);
+    }
+  } else {
+    if (payload.behavior !== 'deny') {
+      v.push(`tools/call response: behavior 應為 "deny"（本案為 deny 案，合法的 allow 也不算通過），實際 ${JSON.stringify(payload.behavior)}`);
+    }
+    // broker.go:119-120 **只對 allow** 補 updatedInput；Decision.UpdatedInput 是
+    // omitempty，因此 deny 的 payload 必須**連欄位都不存在**（`null` 也不接受）。
+    if ('updatedInput' in payload) {
+      v.push(`tools/call response: deny 不得帶 updatedInput 欄位（broker 只對 allow 補值），實際 ${JSON.stringify(payload.updatedInput)}`);
+    }
+    // message 必須**逐字等於**本次核定的理由：這才分得出「使用者這次按下的
+    // deny」與「任何一個合法 deny」，也分得出 fail-closed 的自動 deny。
+    if (typeof payload.message === 'string' && payload.message.includes('fail closed')) {
+      v.push(`tools/call response: deny 的 message 是 fail-closed 自動拒絕（${JSON.stringify(payload.message)}），不得冒充使用者拒絕`);
+    } else if (payload.message !== exp.denyReason) {
+      v.push(`tools/call response: deny 的 message 應逐字等於核定理由 ${JSON.stringify(exp.denyReason)}，實際 ${JSON.stringify(payload.message)}`);
+    }
   }
   // 回覆不得洩漏 internal broker id（mcpserver_test.go 明確檢查這點）
   if ('id' in payload) {
@@ -339,14 +388,32 @@ export function judgeBrokerAudit(
     v.push(`audit 的 request.id 與 decision.id 不同（${JSON.stringify(reqId)} vs ${JSON.stringify(decId)}）——無法建立 request↔decision 關聯`);
   }
 
-  // decision：本案是 allow，且 allow 必須帶等於原 input 的 updatedInput
-  if (dec.behavior !== 'allow') {
-    v.push(`audit decision.behavior 應為 "allow"（本案為 allow 案），實際 ${JSON.stringify(dec.behavior)}`);
+  // decision：**依核定決策分流**（allow 分支逐字保留既有行為）
+  const decisionViolations = validateExpectationDecision(exp);
+  if (decisionViolations.length > 0) {
+    v.push(...decisionViolations.map(m => `audit decision: ${m}`));
+  } else if (exp.decision === 'allow') {
+    if (dec.behavior !== 'allow') {
+      v.push(`audit decision.behavior 應為 "allow"（本案為 allow 案），實際 ${JSON.stringify(dec.behavior)}`);
+    }
+    if (dec.updatedInput === undefined) v.push('audit decision: allow 必須帶 updatedInput');
+    else if (!deepEqual(dec.updatedInput, exp.input)) v.push(`audit decision.updatedInput 應等於原 input，實際 ${JSON.stringify(dec.updatedInput)}`);
+  } else {
+    if (dec.behavior !== 'deny') {
+      v.push(`audit decision.behavior 應為 "deny"（本案為 deny 案，合法的 allow 也不算通過），實際 ${JSON.stringify(dec.behavior)}`);
+    }
+    if ('updatedInput' in dec) {
+      v.push(`audit decision: deny 不得帶 updatedInput 欄位，實際 ${JSON.stringify(dec.updatedInput)}`);
+    }
+    if (typeof dec.message !== 'string' || !dec.message.includes('fail closed')) {
+      if (dec.message !== exp.denyReason) {
+        v.push(`audit decision.message 應逐字等於核定理由 ${JSON.stringify(exp.denyReason)}，實際 ${JSON.stringify(dec.message)}`);
+      }
+    }
   }
-  if (dec.updatedInput === undefined) v.push('audit decision: allow 必須帶 updatedInput');
-  else if (!deepEqual(dec.updatedInput, exp.input)) v.push(`audit decision.updatedInput 應等於原 input，實際 ${JSON.stringify(dec.updatedInput)}`);
+  // fail-closed 一律拒絕（兩種決策皆然，訊息獨立於上面的分流）
   if (typeof dec.message === 'string' && dec.message.includes('fail closed')) {
-    v.push(`audit decision.message 顯示 fail-closed：${JSON.stringify(dec.message)}——本案不得以 fail-closed 收尾`);
+    v.push(`audit decision.message 顯示 fail-closed：${JSON.stringify(dec.message)}——本案不得以 fail-closed 收尾（自動 deny 不得冒充使用者拒絕）`);
   }
 
   const ok = v.length === 0 && typeof reqId === 'string' ? reqId : null;
