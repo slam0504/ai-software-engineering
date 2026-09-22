@@ -49,6 +49,17 @@ check('identity：新增 claude-approval-allow，provider=claude、kind=approval
   assert.equal(d.provider, 'claude');
   assert.equal(d.kind, 'approval');
 });
+check('identity：新增 claude-approval-deny，provider=claude、kind=approval、decision=decline', () => {
+  const d = resolveScenario('claude-approval-deny');
+  assert.equal(d.provider, 'claude');
+  assert.equal(d.kind, 'approval');
+  assert.equal(d.decision, 'decline');
+  assert.throws(() => d.build('run'), /誤用了 Codex 路徑/);
+});
+check('identity：allow 與 deny 兩案的 decision 必須相反（不是同一個值的複製）', () => {
+  assert.equal(resolveScenario('claude-approval-allow').decision, 'accept');
+  assert.equal(resolveScenario('claude-approval-deny').decision, 'decline');
+});
 check('identity：新增 claude-approval-recovery，provider=claude、kind=recovery', () => {
   const d = resolveScenario('claude-approval-recovery');
   assert.equal(d.provider, 'claude');
@@ -74,6 +85,13 @@ check('identity：未知／缺失 scenario 仍一律 throw，不回退', () => {
 check('routing：claude 案路由到 claudeApproval.spec.ts', () => {
   assert.equal(resolveScenarioSpecFile('claude-approval-allow'), CLAUDE_APPROVAL_SPEC_FILE);
 });
+check('routing：claude deny 案與 allow 案共用同一支 spec（decision 不影響選哪支）', () => {
+  assert.equal(resolveScenarioSpecFile('claude-approval-deny'), CLAUDE_APPROVAL_SPEC_FILE);
+  assert.equal(resolveScenarioSpecFile('claude-approval-allow'), CLAUDE_APPROVAL_SPEC_FILE);
+});
+check('routing：claude deny 案的 tripwire provider 仍是 claude', () => {
+  assert.equal(resolveScenarioProviderForTripwire('claude-approval-deny'), 'claude');
+});
 check('routing：claude recovery 案路由到 claudeSessionRecovery.spec.ts（不掉回 approval）', () => {
   assert.equal(resolveScenarioSpecFile('claude-approval-recovery'), CLAUDE_RECOVERY_SPEC_FILE);
   assert.notEqual(CLAUDE_RECOVERY_SPEC_FILE, CLAUDE_APPROVAL_SPEC_FILE);
@@ -90,7 +108,7 @@ check('routing：未知名稱仍回中性預設（拒絕由 globalSetup 負責�
   assert.equal(resolveScenarioSpecFile(undefined), APPROVAL_SPEC_FILE);
 });
 check('routing：每個登記案都恰好對應一支 spec 檔', () => {
-  const all = [...CODEX_CASES, 'claude-approval-allow', 'claude-approval-recovery'];
+  const all = [...CODEX_CASES, 'claude-approval-allow', 'claude-approval-deny', 'claude-approval-recovery'];
   const files = new Set(all.map(n => resolveScenarioSpecFile(n)));
   assert.deepEqual([...files].sort(),
     [CLAUDE_APPROVAL_SPEC_FILE, CLAUDE_RECOVERY_SPEC_FILE, APPROVAL_SPEC_FILE, RECOVERY_SPEC_FILE].sort());

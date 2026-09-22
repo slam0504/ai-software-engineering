@@ -40,6 +40,27 @@ export interface BrokerAuditRecord {
 }
 
 /**
+ * 核定的 approval 決策。**這是協定層的值**（MCP payload 與 broker audit 用的
+ * `behavior`），與 `ScenarioDef.decision` 的 `accept`／`decline` 是兩套詞彙，
+ * 由 `protocolDecisionFor()` 明確轉換，不靠字串巧合。
+ */
+export type ApprovalDecision = 'allow' | 'deny';
+
+/**
+ * `ScenarioDef.decision`（accept／decline）→ 協定層 behavior（allow／deny）。
+ * **未知值一律 throw**，不提供寬鬆預設——靜默回 allow 會讓一個壞掉的 deny 案
+ * 走完整條 allow 判定而通過。
+ */
+export function protocolDecisionFor(scenarioDecision: string): ApprovalDecision {
+  if (scenarioDecision === 'accept') return 'allow';
+  if (scenarioDecision === 'decline') return 'deny';
+  throw new Error(
+    `protocolDecisionFor: 未知的 scenario decision ${JSON.stringify(scenarioDecision)}`
+    + '——只接受 "accept"／"decline"，不回退',
+  );
+}
+
+/**
  * 本案的**獨立期望**——全部由 runId 決定，與待驗輸出分開。
  * 不含 broker id：那是隨機的，只能在執行期觀察。
  */
@@ -56,7 +77,23 @@ export interface ClaudeApprovalExpectation {
   inputMarker: string;
   /** 完整 input 物件（MCP arguments.input，也是 allow 時的 updatedInput） */
   input: Record<string, unknown>;
-  /** 假 claude 收到 allow 之後送出的可辨識完成文字 */
+  /**
+   * **本案核定的決策**（必填、無預設）。判定端一律以它分流；缺值或未知值
+   * 都必須被拒絕，**不得靜默當成 allow**（reviewer #403 第 3、4 點）。
+   */
+  decision: ApprovalDecision;
+  /**
+   * deny 案核定的拒絕理由——由**既有** approval dialog 的 reason 輸入框填入
+   * （ApprovalDialog.vue 的 `v-model="reason"`，預設空字串，App 原樣傳成
+   * `Decision.Message`，MCP 回覆的 `message` 是 omitempty）。
+   *
+   * **注意**：production 並不要求 deny 一定有 message——空理由的 deny 是合法的。
+   * 這個欄位只是**本 scenario 自己固定一個 run 專屬理由**，好讓判定能逐字核對
+   * 「使用者這次按下的 deny」而不是任何一個合法 deny，也才分得出 fail-closed
+   * 自動 deny。allow 案必須不帶這個欄位。
+   */
+  denyReason?: string;
+  /** 假 claude 收到決策之後送出的可辨識完成文字（allow 與 deny 各自不同） */
   completionText: string;
 }
 
@@ -70,7 +107,31 @@ export function buildClaudeApprovalExpectation(runId: string): ClaudeApprovalExp
     toolName: 'Bash',
     inputMarker: marker,
     input: { command: `printf '%s' ${marker}` },
+    decision: 'allow',
     completionText: `b3a2b2-claude-content-${runId}`,
+  };
+}
+
+/**
+ * 受版控 builder：**單一 Claude deny 案**（B3a-2b-2，reviewer #403 核定）。
+ *
+ * 與 allow builder 刻意完全分開，不是「allow 加個旗標」：兩案的 marker、input
+ * 與完成內容都不同，任何一邊被拿去冒充另一邊都會在 marker 上當場露餡。
+ * `denyReason` 是 run 專屬字串，且刻意**不含** `fail closed`——fail-closed 的
+ * 自動 deny（broker 逾時／socket 不可達）訊息固定帶那段文字，判定據此分辨。
+ */
+export function buildClaudeDenyExpectation(runId: string): ClaudeApprovalExpectation {
+  const marker = `b3a2b2-claude-deny-${runId}`;
+  return {
+    sessionId: `b3a2b2-claude-session-${runId}`,
+    initializeRequestId: 1,
+    toolCallRequestId: 2,
+    toolName: 'Bash',
+    inputMarker: marker,
+    input: { command: `printf '%s' ${marker}` },
+    decision: 'deny',
+    denyReason: `b3a2b2-claude-deny-reason-${runId}`,
+    completionText: `b3a2b2-claude-denied-content-${runId}`,
   };
 }
 
@@ -127,6 +188,7 @@ export function buildClaudeRecoveryExpectation(runId: string): ClaudeRecoveryExp
         toolName: 'Bash',
         inputMarker: marker,
         input: { command: `printf '%s' ${marker}` },
+        decision: 'allow',
         completionText: `b3a2b2-claude-content-r${n}-${runId}`,
       },
     };

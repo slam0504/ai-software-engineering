@@ -133,6 +133,23 @@ const SCENARIOS: Record<string, ScenarioDef> = {
       );
     },
   },
+  // B3a-2b-2（reviewer #403）：**使用者明確拒絕**的單一 Claude 檢查點。
+  // 與上面的 allow 案走同一支 spec（specRouting 依 provider＋kind 分流，
+  // decision 不影響選哪支 spec），差別在 spec 依 `decision` 決定點哪顆按鈕、
+  // 判定端依核定 decision 分流。期望值來自 `buildClaudeDenyExpectation(runId)`。
+  'claude-approval-deny': {
+    name: 'claude-approval-deny',
+    provider: 'claude',
+    decision: 'decline',
+    kind: 'approval',
+    build: () => {
+      throw new Error(
+        'scenarios: claude-approval-deny 沒有 Codex wire 協定 config——'
+        + 'Claude deny 案的期望值來自 buildClaudeDenyExpectation(runId)，'
+        + '呼叫到這裡代表誤用了 Codex 路徑處理 Claude 案',
+      );
+    },
+  },
   // B3a-2b-2 E1：Claude 最小 recovery 檢查點——同一個 App、同一個 WSID／
   // canonical cwd，第一輪 fresh start、第二輪由真 App 帶 `--resume S` 續聊，
   // 兩輪都 allow。與上面那一案同樣**不使用 Codex wire 協定欄位**，`build()`
