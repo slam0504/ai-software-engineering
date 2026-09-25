@@ -11,6 +11,7 @@
     "test:e2e": "node e2e/scripts/run-e2e.mjs e2e/playwright.config.ts",
     "test:e2e:controls": "node e2e/scripts/run-e2e.mjs e2e/playwright.controls.config.ts",
     "test:e2e:scenario": "node e2e/scripts/run-e2e.mjs e2e/playwright.scenario.config.ts",
+    "test:e2e:gates": "node e2e/scripts/run-e2e.mjs e2e/playwright.gates.config.ts",
     "typecheck:e2e": "tsc --noEmit -p tsconfig.e2e.json",
     "selftest:artifact-integrity": "node e2e/support/artifactIntegrity.selftest.ts",
     "selftest:network-line-parser": "node e2e/support/networkLineParser.selftest.ts",
@@ -34,7 +35,17 @@
     "selftest:claude-app-evidence": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/claudeAppEvidence.selftest.ts",
     "selftest:claude-recovery-judge": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/claudeRecoveryJudge.selftest.ts",
     "selftest:app-binary-identity": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/scenario/appBinaryIdentity.selftest.ts",
-    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop && npm run selftest:scenario-verify && npm run selftest:scenario-fake-app-server && npm run selftest:scenario-protocol-judge && npm run selftest:scenario-recovery-judge && npm run selftest:scenarios-matrix && npm run selftest:spec-routing && npm run selftest:scenario-wire-evidence && npm run selftest:execution-mode && npm run selftest:recovery-app-evidence && npm run selftest:claude-approval-protocol && npm run selftest:fake-claude-cli && npm run selftest:claude-provider-routing && npm run selftest:claude-run-env && npm run selftest:claude-app-evidence && npm run selftest:app-binary-identity && npm run selftest:claude-recovery-judge"
+    "selftest:gate-routing": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateRouting.selftest.ts",
+    "selftest:gate-digest": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/canonicalDigest.selftest.ts",
+    "selftest:gate-journal": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/journalReader.selftest.ts",
+    "selftest:gate-fixture": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gate2Fixture.selftest.ts",
+    "selftest:gate-probe": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateProbe.selftest.ts",
+    "selftest:gate-flow-descriptor": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateFlowDescriptor.selftest.ts",
+    "selftest:gate-stale-judge": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateStaleJudge.selftest.ts",
+    "selftest:gate-evidence": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateEvidence.selftest.ts",
+    "selftest:gate-hook": "node e2e/support/gates/gateAfterEachHook.selftest.ts",
+    "selftest:gate-submit-wait": "node --experimental-loader=./e2e/support/selftestJsToTsLoader.mjs e2e/support/gates/gateSubmitWait.selftest.ts",
+    "selftest:all": "npm run selftest:artifact-integrity && npm run selftest:network-line-parser && npm run selftest:stop-procedure && npm run selftest:offline-sandbox && npm run selftest:global-teardown-stop && npm run selftest:late-write-after-stop && npm run selftest:scenario-verify && npm run selftest:scenario-fake-app-server && npm run selftest:scenario-protocol-judge && npm run selftest:scenario-recovery-judge && npm run selftest:scenarios-matrix && npm run selftest:spec-routing && npm run selftest:scenario-wire-evidence && npm run selftest:execution-mode && npm run selftest:recovery-app-evidence && npm run selftest:claude-approval-protocol && npm run selftest:fake-claude-cli && npm run selftest:claude-provider-routing && npm run selftest:claude-run-env && npm run selftest:claude-app-evidence && npm run selftest:app-binary-identity && npm run selftest:claude-recovery-judge && npm run selftest:gate-routing && npm run selftest:gate-digest && npm run selftest:gate-journal && npm run selftest:gate-fixture && npm run selftest:gate-probe && npm run selftest:gate-flow-descriptor && npm run selftest:gate-stale-judge && npm run selftest:gate-evidence && npm run selftest:gate-hook && npm run selftest:gate-submit-wait"
   },
   "dependencies": {
     "@codemirror/state": "^6.7.1",

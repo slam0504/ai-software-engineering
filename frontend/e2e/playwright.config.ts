@@ -28,7 +28,15 @@ export default defineConfig({
   // （playwright.scenario.config.ts／test:e2e:scenario），default 這裡明確
   // 排除，避免 default（禁止 E2E_SCENARIO 的入口，見 global-setup.ts 開頭
   // 守門）意外把 scenario spec 一起收集進來。
-  testIgnore: ['controls/**', 'scenarios/**'],
+  // B3a-2a：gates 套件（playwright.gates.config.ts／test:e2e:gates）同理
+  // 需要排除——**這是必要修正，非保險做法**：已讀 Playwright 1.63.0 原始碼
+  // 確認 `testMatch: ['*.spec.ts']` 經 createFileMatcher
+  // （node_modules/playwright/lib/util.js:104-108）會補成
+  // `['**/*.spec.ts']`，**會**匹配 `gates/gate1.spec.ts` 這類子目錄路徑
+  // （collectFilesForProject 對 testMatch／testIgnore 都套用同一個
+  // matcher，lib/runner/index.js:2237-2244）。不排除的話 default 入口會
+  // 誤收 gates spec。
+  testIgnore: ['controls/**', 'scenarios/**', 'gates/**'],
   fullyParallel: false,
   workers: 1,
   retries: 0,
