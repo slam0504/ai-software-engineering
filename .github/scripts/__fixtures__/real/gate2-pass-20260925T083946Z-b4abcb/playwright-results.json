@@ -1,0 +1,155 @@
+{
+  "config": {
+    "argv": [
+      "/Users/eason_tseng/.nvm/versions/node/v26.8.1/bin/node",
+      "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/playwright",
+      "test",
+      "--config",
+      "e2e/playwright.gates.config.ts"
+    ],
+    "configFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/playwright.gates.config.ts",
+    "rootDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates",
+    "failOnFlakyTests": false,
+    "forbidOnly": false,
+    "fullyParallel": false,
+    "globalSetup": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-setup.gates.ts",
+    "globalTeardown": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-teardown.ts",
+    "globalTimeout": 0,
+    "grep": {},
+    "grepInvert": null,
+    "maxFailures": 0,
+    "metadata": {
+      "actualWorkers": 1
+    },
+    "preserveOutput": "always",
+    "projects": [
+      {
+        "outputDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T083946Z-b4abcb/playwright",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {
+          "actualWorkers": 1
+        },
+        "id": "",
+        "name": "",
+        "testDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates",
+        "testIgnore": [],
+        "testMatch": [
+          "gate2.spec.ts"
+        ],
+        "timeout": 90000
+      }
+    ],
+    "quiet": false,
+    "reporter": [
+      [
+        "list",
+        null
+      ],
+      [
+        "json",
+        {
+          "outputFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T083946Z-b4abcb/playwright-results.json"
+        }
+      ]
+    ],
+    "reportSlowTests": {
+      "max": 5,
+      "threshold": 300000
+    },
+    "shard": null,
+    "tags": [],
+    "updateSnapshots": "missing",
+    "updateSourceMethod": "patch",
+    "version": "1.63.0",
+    "workers": 1,
+    "webServer": null
+  },
+  "suites": [
+    {
+      "title": "gate2.spec.ts",
+      "file": "gate2.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [
+        {
+          "title": "Gate 2：G2-N1 → Gate1 核可 → G2-N2..N5 → G2-P1（三個合法風險組合）",
+          "ok": true,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 240000,
+              "annotations": [],
+              "expectedStatus": "passed",
+              "projectId": "",
+              "projectName": "",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "passed",
+                  "duration": 88778,
+                  "errors": [],
+                  "stdout": [],
+                  "stderr": [
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    },
+                    {
+                      "buffer": ""
+                    }
+                  ],
+                  "retry": 0,
+                  "startTime": "2026-09-25T08:41:22.831Z",
+                  "annotations": [],
+                  "attachments": []
+                }
+              ],
+              "status": "expected"
+            }
+          ],
+          "id": "7eda4a8fae6d47c600ae-88729f2d3bfe5ad1ebae",
+          "file": "gate2.spec.ts",
+          "line": 62,
+          "column": 1
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "stats": {
+    "startTime": "2026-09-25T08:39:47.358Z",
+    "duration": 209023.86599999998,
+    "expected": 1,
+    "skipped": 0,
+    "unexpected": 0,
+    "flaky": 0
+  }
+}

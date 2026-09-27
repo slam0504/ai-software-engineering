@@ -1,0 +1,388 @@
+{
+  "runId": "20260925T083946Z-b4abcb",
+  "rootPgid": 79901,
+  "status": "stopped",
+  "processes": [
+    {
+      "pid": 79901,
+      "ppid": 0,
+      "pgid": 79901,
+      "command": "wails dev -noreload -skipbindings",
+      "startedAt": "Fri Sep 25 16:39:57 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 79996,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "go list -e -json=Name,ImportPath,Error,Dir,GoFiles,IgnoredGoFiles,IgnoredOtherFiles,CFiles,CgoFiles,CXXFiles,MFiles,HFiles,FFiles,SFiles,SwigFiles,SwigCXXFiles,SysoFiles,CompiledGoFiles,Export,DepOnly,Imports,ImportMap,Module -compiled=true -test=false -export=true -deps=true -find=false -buildvcs=false -pgo=off -- ./...",
+      "startedAt": "Fri Sep 25 16:39:59 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 80131,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "npm run build",
+      "startedAt": "Fri Sep 25 16:40:02 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 80182,
+      "ppid": 80131,
+      "pgid": 79901,
+      "command": "sh -c vue-tsc --noEmit && vite build",
+      "startedAt": "Fri Sep 25 16:40:03 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 80204,
+      "ppid": 80182,
+      "pgid": 79901,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vue-tsc --noEmit",
+      "startedAt": "Fri Sep 25 16:40:04 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 80472,
+      "ppid": 80182,
+      "pgid": 79901,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vite build",
+      "startedAt": "Fri Sep 25 16:40:10 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 80501,
+      "ppid": 80472,
+      "pgid": 79901,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Fri Sep 25 16:40:10 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 81060,
+      "ppid": 79901,
+      "pgid": 81060,
+      "command": "npm run dev",
+      "startedAt": "Fri Sep 25 16:40:33 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 81233,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 81234,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 81116,
+      "ppid": 81060,
+      "pgid": 81060,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vite",
+      "startedAt": "Fri Sep 25 16:40:34 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 81209,
+      "ppid": 81116,
+      "pgid": 81060,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Fri Sep 25 16:40:38 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 81516,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 81518,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "go build -buildvcs=false -gcflags all=-N -l -tags dev,devtools -o /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/build/bin/sdlc-workbench-dev-darwin-amd64",
+      "startedAt": "Fri Sep 25 16:40:49 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 81631,
+      "ppid": 81518,
+      "pgid": 79901,
+      "command": "/Users/eason_tseng/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.darwin-amd64/pkg/tool/darwin_amd64/link -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build1800869742/b001/exe/a.out -importcfg /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build1800869742/b001/importcfg.link -buildmode=pie -buildid=5Gr1TcIwSz4QzTaz-SHv/PgJ5p0N_vmWisGdTBNHx/HRz5wrstsIbBmAaPuSDV/5Gr1TcIwSz4QzTaz-SHv -extld=clang /Users/eason_tseng/Library/Caches/go-build/a2/a2307ffe77849a9091f498d05b29a8e6b235eac66d8fa498c9e244630a600a83-d",
+      "startedAt": "Fri Sep 25 16:40:53 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 81820,
+      "ppid": 81631,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 81968,
+      "ppid": 81631,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 82057,
+      "ppid": 79901,
+      "pgid": 79901,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench",
+      "startedAt": "Fri Sep 25 16:41:07 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 82212,
+      "ppid": 82057,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 82234,
+      "ppid": 82057,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 82904,
+      "ppid": 82057,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 82926,
+      "ppid": 82057,
+      "pgid": 79901,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 83185,
+      "ppid": 82057,
+      "pgid": 83185,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 83383,
+      "ppid": 82057,
+      "pgid": 83383,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 83522,
+      "ppid": 82057,
+      "pgid": 83522,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 83670,
+      "ppid": 82057,
+      "pgid": 83670,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 83785,
+      "ppid": 82057,
+      "pgid": 83785,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84115,
+      "ppid": 82057,
+      "pgid": 84115,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84228,
+      "ppid": 82057,
+      "pgid": 84228,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84340,
+      "ppid": 82057,
+      "pgid": 84340,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84690,
+      "ppid": 82057,
+      "pgid": 84690,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84801,
+      "ppid": 82057,
+      "pgid": 84801,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 84913,
+      "ppid": 82057,
+      "pgid": 84913,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 85260,
+      "ppid": 82057,
+      "pgid": 85260,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 85373,
+      "ppid": 82057,
+      "pgid": 85373,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 85485,
+      "ppid": 82057,
+      "pgid": 85485,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 85851,
+      "ppid": 82057,
+      "pgid": 85851,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 85963,
+      "ppid": 82057,
+      "pgid": 85963,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86080,
+      "ppid": 82057,
+      "pgid": 86080,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86210,
+      "ppid": 82057,
+      "pgid": 86210,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86324,
+      "ppid": 82057,
+      "pgid": 86324,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86454,
+      "ppid": 82057,
+      "pgid": 86454,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86568,
+      "ppid": 82057,
+      "pgid": 86568,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86591,
+      "ppid": 82057,
+      "pgid": 86591,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86753,
+      "ppid": 82057,
+      "pgid": 86753,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 86889,
+      "ppid": 82057,
+      "pgid": 86889,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 87057,
+      "ppid": 82057,
+      "pgid": 87057,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    }
+  ],
+  "ports": {
+    "wails": 34115,
+    "vite": 5173
+  },
+  "observationFailures": []
+}

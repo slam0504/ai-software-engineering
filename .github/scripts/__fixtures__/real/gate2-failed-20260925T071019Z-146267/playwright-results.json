@@ -1,0 +1,172 @@
+{
+  "config": {
+    "argv": [
+      "/Users/eason_tseng/.nvm/versions/node/v26.8.1/bin/node",
+      "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/playwright",
+      "test",
+      "--config",
+      "e2e/playwright.gates.config.ts"
+    ],
+    "configFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/playwright.gates.config.ts",
+    "rootDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates",
+    "failOnFlakyTests": false,
+    "forbidOnly": false,
+    "fullyParallel": false,
+    "globalSetup": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-setup.gates.ts",
+    "globalTeardown": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-teardown.ts",
+    "globalTimeout": 0,
+    "grep": {},
+    "grepInvert": null,
+    "maxFailures": 0,
+    "metadata": {
+      "actualWorkers": 1
+    },
+    "preserveOutput": "always",
+    "projects": [
+      {
+        "outputDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T071019Z-146267/playwright",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {
+          "actualWorkers": 1
+        },
+        "id": "",
+        "name": "",
+        "testDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates",
+        "testIgnore": [],
+        "testMatch": [
+          "gate2.spec.ts"
+        ],
+        "timeout": 90000
+      }
+    ],
+    "quiet": false,
+    "reporter": [
+      [
+        "list",
+        null
+      ],
+      [
+        "json",
+        {
+          "outputFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T071019Z-146267/playwright-results.json"
+        }
+      ]
+    ],
+    "reportSlowTests": {
+      "max": 5,
+      "threshold": 300000
+    },
+    "shard": null,
+    "tags": [],
+    "updateSnapshots": "missing",
+    "updateSourceMethod": "patch",
+    "version": "1.63.0",
+    "workers": 1,
+    "webServer": null
+  },
+  "suites": [
+    {
+      "title": "gate2.spec.ts",
+      "file": "gate2.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [
+        {
+          "title": "Gate 2：G2-N1 → Gate1 核可 → G2-N2..N5 → G2-P1（三個合法風險組合）",
+          "ok": false,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 90000,
+              "annotations": [],
+              "expectedStatus": "passed",
+              "projectId": "",
+              "projectName": "",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "failed",
+                  "duration": 84681,
+                  "error": {
+                    "message": "Error: 應出現 gate2 的 gate_request\n\n應出現 gate2 的 gate_request\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate",
+                    "stack": "Error: 應出現 gate2 的 gate_request\n\n應出現 gate2 的 gate_request\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n    at /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates/gate2.spec.ts:226:12",
+                    "location": {
+                      "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates/gate2.spec.ts",
+                      "column": 12,
+                      "line": 226
+                    },
+                    "snippet": "  224 |     await expect\n  225 |       .poll(() => latestGateRequestApprovalId(gatePath, 'gate2'), { message: '應出現 gate2 的 gate_request', timeout: 15_000 })\n> 226 |       .not.toBeNull();\n      |            ^\n  227 |     const gate2ApprovalId = latestGateRequestApprovalId(gatePath, 'gate2');\n  228 |     expect(gate2ApprovalId).not.toBeNull();\n  229 |     if (gate2ApprovalId === null) throw new Error('unreachable');"
+                  },
+                  "errors": [
+                    {
+                      "location": {
+                        "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates/gate2.spec.ts",
+                        "column": 12,
+                        "line": 226
+                      },
+                      "message": "Error: 應出現 gate2 的 gate_request\n\n應出現 gate2 的 gate_request\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n\n  224 |     await expect\n  225 |       .poll(() => latestGateRequestApprovalId(gatePath, 'gate2'), { message: '應出現 gate2 的 gate_request', timeout: 15_000 })\n> 226 |       .not.toBeNull();\n      |            ^\n  227 |     const gate2ApprovalId = latestGateRequestApprovalId(gatePath, 'gate2');\n  228 |     expect(gate2ApprovalId).not.toBeNull();\n  229 |     if (gate2ApprovalId === null) throw new Error('unreachable');\n    at /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates/gate2.spec.ts:226:12"
+                    }
+                  ],
+                  "stdout": [],
+                  "stderr": [],
+                  "retry": 0,
+                  "startTime": "2026-09-25T07:12:00.695Z",
+                  "annotations": [],
+                  "attachments": [
+                    {
+                      "name": "screenshot",
+                      "contentType": "image/png",
+                      "path": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T071019Z-146267/playwright/gate2-Gate-2：G2-N1-→-Gate1-核可-→-G2-N2-N5-→-G2-P1（三個合法風險組合）/test-failed-1.png"
+                    },
+                    {
+                      "name": "error-context",
+                      "contentType": "text/markdown",
+                      "path": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T071019Z-146267/playwright/gate2-Gate-2：G2-N1-→-Gate1-核可-→-G2-N2-N5-→-G2-P1（三個合法風險組合）/error-context.md"
+                    },
+                    {
+                      "name": "trace",
+                      "contentType": "application/zip",
+                      "path": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T071019Z-146267/playwright/gate2-Gate-2：G2-N1-→-Gate1-核可-→-G2-N2-N5-→-G2-P1（三個合法風險組合）/trace.zip"
+                    }
+                  ],
+                  "errorLocation": {
+                    "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/gates/gate2.spec.ts",
+                    "column": 12,
+                    "line": 226
+                  }
+                }
+              ],
+              "status": "unexpected"
+            }
+          ],
+          "id": "7eda4a8fae6d47c600ae-88729f2d3bfe5ad1ebae",
+          "file": "gate2.spec.ts",
+          "line": 61,
+          "column": 1
+        }
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "message": "Error: B3a-1 e2e globalTeardown：test failed | cleanup incomplete",
+      "stack": "Error: B3a-1 e2e globalTeardown：test failed | cleanup incomplete\n    at globalTeardown (/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-teardown.ts:424:11)",
+      "location": {
+        "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/global-teardown.ts",
+        "column": 11,
+        "line": 424
+      },
+      "snippet": "   at ../global-teardown.ts:424\n\n  422 |       runStateReadFailed && 'run-state.json missing or unreadable (cannot prove no observation failures occurred)',\n  423 |     ].filter(Boolean);\n> 424 |     throw new Error(`B3a-1 e2e globalTeardown：${reasons.join(' | ')}`);\n      |           ^\n  425 |   }\n  426 | }\n  427 |"
+    }
+  ],
+  "stats": {
+    "startTime": "2026-09-25T07:10:20.976Z",
+    "duration": 241270.326,
+    "expected": 0,
+    "skipped": 0,
+    "unexpected": 1,
+    "flaky": 0
+  }
+}

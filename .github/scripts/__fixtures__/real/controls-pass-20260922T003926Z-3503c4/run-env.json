@@ -1,0 +1,11 @@
+{
+  "runId": "20260922T003926Z-3503c4",
+  "artifactsDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/.artifacts/20260922T003926Z-3503c4",
+  "workspaceDir": "/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-iofSmE",
+  "toolsDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/.artifacts/20260922T003926Z-3503c4/fake-tools",
+  "glossaryPath": "/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-iofSmE/spec/glossary.md",
+  "claudeVersion": "fake-claude 0.0.0-e2e+20260922T003926Z-3503c4",
+  "codexVersion": "fake-codex 0.0.0-e2e+20260922T003926Z-3503c4",
+  "baseUrl": "http://127.0.0.1:34115",
+  "vitePort": 5173
+}

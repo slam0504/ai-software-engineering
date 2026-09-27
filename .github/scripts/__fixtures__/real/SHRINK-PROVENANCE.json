@@ -1,0 +1,52 @@
+[
+  {
+    "dir": "controls-pass-20260922T003926Z-3503c4",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "e93eccf25e6307115cc1a906f10b3553027596130b79dcc8e55288a037628574",
+    "original_size_bytes": 73161,
+    "new_size_bytes": 5223,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10
+  },
+  {
+    "dir": "gate1-pass-20260925T065454Z-924661",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "e7a730f92d7fda7cd558d904625511ae8f279fe61413019b8c36902a29a2fa6c",
+    "original_size_bytes": 163168,
+    "new_size_bytes": 10184,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10
+  },
+  {
+    "dir": "gate2-failed-20260925T071019Z-146267",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "4af5ff4068c68dc3a2e05ab1a4de0a087ea8368a78d68dc1a6bdeec87b3fce57",
+    "original_size_bytes": 170881,
+    "new_size_bytes": 5435,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10
+  },
+  {
+    "dir": "gate2-pass-20260925T083946Z-b4abcb",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "e3d60fc4232696b0c196dad7b4bd236bf4977917bb931b5a0258aa4db486fe42",
+    "original_size_bytes": 213152,
+    "new_size_bytes": 5529,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10
+  },
+  {
+    "dir": "stale-pass-20260925T084336Z-1d7c3f",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "b5cf3ba75f18ce474d2f1db89629e0e72727d63c33ac316f5bd2730152af5d1c",
+    "original_size_bytes": 153134,
+    "new_size_bytes": 5437,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10
+  }
+]

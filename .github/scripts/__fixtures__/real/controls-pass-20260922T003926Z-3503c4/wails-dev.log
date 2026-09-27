@@ -1,0 +1,45 @@
+[0;92mWails CLI[0m [0;31mv2.13.0[0m
+
+[0;92mExecuting: go mod tidy[0m
+  [90m[90m•[0m[0m [39m[39mInstalling frontend dependencies: [0m[0mDone.
+  [90m[90m•[0m[0m [39m[39mCompiling frontend: [0m[0mDone.
+
+> frontend@0.0.0 dev
+> vite
+
+
+  VITE v7.3.6  ready in 720 ms
+
+[0;92mVite Server URL: http://localhost:5173/[0m
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+[0;92mRunning frontend DevWatcher command: 'npm run dev'[0m
+Building application for development...
+  [90m[90m•[0m[0m [39m[39mCompiling application: [0m[0m# github.com/slam0504/sdlc-workbench
+ld: warning: object file (/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-link-3317903205/go.o) was built for newer 'macOS' version (13.0) than being linked (10.13)
+Done.
+  [90m[90m•[0m[0m [39m[39mPackaging application: [0m[0mDone.
+  [90m[90m•[0m[0m [39m[39mSelf-signing application: [0m[0mDone.
+[30;43m[30;43m WARNING [0m[0m [33m[33mThis darwin build contains the use of private APIs. This will not pass Apple's AppStore approval process. Please use it only as a test build for testing and debug purposes.[0m[0m
+
+[0;92mUsing DevServer URL: http://localhost:34115[0m
+[0;92mUsing Frontend DevServer URL: http://localhost:5173/[0m
+[0;92mUsing reload debounce setting of 100 milliseconds[0m
+INF | Serving assets from frontend DevServer URL: http://localhost:5173/
+[0;92mWatching (sub)/directory: /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress[0m
+[0;92m
+
+To develop in the browser and call your bound Go methods from Javascript, navigate to: http://localhost:34115[0m
+8:41:02 AM [vite] (client) page reload e2e/.artifacts/20260922T003926Z-3503c4/playwright/.playwright-artifacts-0/traces/resources/6ac3509805af652268e3f22c1e7cbfd25cc49932.html
+ERR | process message error: runtime:ready -> Unknown message from front end: runtime:ready
+ERR | Unknown message from front end: runtime:ready
+ERR | process message error: runtime:ready -> Unknown message from front end: runtime:ready
+ERR | Unknown message from front end: runtime:ready
+8:41:49 AM [vite] (client) page reload e2e/.artifacts/20260922T003926Z-3503c4/playwright/.playwright-artifacts-0/traces/resources/6ac3509805af652268e3f22c1e7cbfd25cc49932.html
+
+Ctrl+C detected. Shutting down...
+[0;92m
+Caught quit[0m
+[0;92mDevelopment mode exited[0m
+[31;107m[31;107m ♥  [0m[0m [92m[92mIf Wails is useful to you or your company, please consider sponsoring the project:[0m[0m
+https://github.com/sponsors/leaanthony

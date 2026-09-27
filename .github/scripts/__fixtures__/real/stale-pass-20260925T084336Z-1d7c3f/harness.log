@@ -1,0 +1,34 @@
+[2026-09-25T08:43:37.358Z] globalSetup 開始：runId=20260925T084336Z-1d7c3f pid=89262 repoRoot=/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates
+[2026-09-25T08:43:37.359Z] 前次殘留檢查結果：none
+[2026-09-25T08:43:38.696Z] fixture 建立完成：/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-UTJaE5
+[2026-09-25T08:43:38.698Z] 假 CLI 建立完成：/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T084336Z-1d7c3f/fake-tools
+[2026-09-25T08:43:38.698Z] 預檢 1/5：fixture /private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-UTJaE5
+[2026-09-25T08:43:38.970Z] 預檢 1/5：fixture 通過
+[2026-09-25T08:43:38.970Z] 預檢 2/5：假 CLI 可執行且回報正確版本
+[2026-09-25T08:43:39.605Z] 預檢 2/5：通過，呼叫紀錄存為 /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T084336Z-1d7c3f/preflight-invocations.log，正式 invocations.log 已清空
+[2026-09-25T08:43:39.606Z] 預檢 3/5：WORKBENCH_WORKSPACE／WORKBENCH_TOOLS_DIR 值檢查
+[2026-09-25T08:43:39.606Z] 預檢 3/5：通過
+[2026-09-25T08:43:39.606Z] 預檢 4/5：埠 34115 是否已被佔用
+[2026-09-25T08:43:40.113Z] 預檢 4/5：通過，埠 34115 空閒
+[2026-09-25T08:43:40.114Z] 預檢 5/5：受版控產物 mode 是否符合 HEAD（frontend/wailsjs／go.mod／go.sum／frontend/package*）
+[2026-09-25T08:43:43.299Z] 預檢 5/5：通過，受版控產物 mode 皆符合 HEAD
+[2026-09-25T08:43:46.387Z] spawn: wails dev -noreload -skipbindings（cwd=/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates）
+[2026-09-25T08:43:46.392Z] wails dev spawned：pid=89734 pgid=89734（先以 spawn 資訊占位登記，state／tracker／.active-run.json 已就緒）
+[2026-09-25T08:43:47.397Z] wails dev 身分補強完成：pid=89734 pgid=89734 startedAt=Fri Sep 25 16:43:46 2026
+[2026-09-25T08:43:48.547Z] 等待 wails dev 就緒（HTTP 可達 127.0.0.1:34115），上限 300000ms
+[2026-09-25T08:44:35.327Z] wails dev 就緒：HTTP 可達，vite port=5173
+[2026-09-25T08:44:35.328Z] globalSetup 完成
+[2026-09-25T08:45:59.936Z] globalTeardown 開始：pid=89262（globalSetup pid=89262）
+[2026-09-25T08:46:00.432Z] 送 SIGTERM 給 pgid=89734
+[2026-09-25T08:46:00.433Z] 送 SIGTERM 給非同 pgid 的 pid=90774
+[2026-09-25T08:46:00.434Z] 送 SIGTERM 給非同 pgid 的 pid=90831
+[2026-09-25T08:46:00.436Z] 送 SIGTERM 給非同 pgid 的 pid=90919
+[2026-09-25T08:46:00.952Z] wails dev 行程結束：exit code=0 signal=null
+[2026-09-25T08:46:01.732Z] TERM 階段耗時 1292ms，殘存 pid=[]
+[2026-09-25T08:46:01.733Z] 停止程序耗時：TERM 1292ms、KILL 0ms（escalatedToKill=false）
+[2026-09-25T08:46:02.747Z] 埠核對耗時 1014ms（獨立於 TERM／KILL grace time）
+[2026-09-25T08:46:02.748Z] 停止程序結果：clean=true residualPids= abandonedPids= unconfirmedPids= observationFailed=false diagnosticWriteFailed=false portsReleased=true residualPorts=
+[2026-09-25T08:46:02.749Z] 執行模式判定：default
+[2026-09-25T08:46:02.751Z] tripwire 判定：claude 呼叫 6 次、codex 呼叫 6 次、違規 0 筆
+[2026-09-25T08:46:09.206Z] globalTeardown 判定：interrupted=false testFailed=false cleanupClean=true tripwireViolations=0 networkViolations=0 networkLogMissingOrUnreadable=false runStateReadFailed=false browserNetworkViolations=false observationFailures=0 artifactViolations=0 → overallFailed=false
+[2026-09-25T08:46:09.206Z] 最終結果：PASSED，依 E2E_KEEP_ARTIFACTS 保留證據目錄 /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T084336Z-1d7c3f

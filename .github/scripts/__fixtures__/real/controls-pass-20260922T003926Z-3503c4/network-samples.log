@@ -1,0 +1,38 @@
+=== 2026-09-22T00:39:43.407Z wails=[8902,8941] app=[] viteNode=[] chrome=[] selfTool(excluded)=[8960] other=[] ===
+=== 2026-09-22T00:39:47.118Z wails=[8902,8971,9022,9092] app=[] viteNode=[] chrome=[] selfTool(excluded)=[9137] other=[] ===
+=== 2026-09-22T00:39:51.192Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186] chrome=[] selfTool(excluded)=[9328] other=[] ===
+=== 2026-09-22T00:39:53.934Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186] chrome=[] selfTool(excluded)=[9461] other=[] ===
+=== 2026-09-22T00:39:56.530Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9599] other=[] ===
+=== 2026-09-22T00:39:59.276Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9715] other=[] ===
+=== 2026-09-22T00:40:00.955Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9788] other=[] ===
+=== 2026-09-22T00:40:02.603Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9861] other=[] ===
+=== 2026-09-22T00:40:04.258Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9922] other=[] ===
+=== 2026-09-22T00:40:05.913Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547] chrome=[] selfTool(excluded)=[9999] other=[] ===
+=== 2026-09-22T00:40:09.380Z wails=[8902,8971,9022,9092,9227] app=[] viteNode=[9186,9523,9547,10106,10154] chrome=[] selfTool(excluded)=[10212] other=[] ===
+=== 2026-09-22T00:40:15.026Z wails=[8902,8971,9022,9092,9227,10260,10261,10456] app=[] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[10478] other=[] ===
+node    10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+=== 2026-09-22T00:40:18.730Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693] app=[] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[10692] other=[] ===
+node    10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+=== 2026-09-22T00:40:21.382Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10771,10812] app=[] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[10811] other=[] ===
+node    10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+=== 2026-09-22T00:40:25.042Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10849,10869,11032] app=[] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[11039] other=[] ===
+node    10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+=== 2026-09-22T00:40:27.697Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10849,10869,11099] app=[11173] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[11172] other=[] ===
+node    10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+=== 2026-09-22T00:40:31.072Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10849,10869,11099,11254] app=[11194] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[11303] other=[] ===
+node      10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+node      10154 eason_tseng   31u  IPv6 0xd0782ffe80573212      0t0  TCP [::1]:5173->[::1]:50677 (ESTABLISHED)
+node      10154 eason_tseng   32u  IPv6 0x898a1c481fa59328      0t0  TCP [::1]:5173->[::1]:50672 (ESTABLISHED)
+
+... [B3a-CI-1 review round 3（R6）為縮小 repo fixture 體積，在此截斷 519 行；原始完整檔案 sha256=e93eccf25e6307115cc1a906f10b3553027596130b79dcc8e55288a037628574 size=73161 bytes，見同目錄 PROVENANCE.md 與 /Users/eason_tseng/b3a-evidence/ci-1/attempt-002/fixtures-full-backup/real-fixtures-full-r2.tar.gz（完整未截斷原件的持久備份） ...
+
+node      10154 eason_tseng   32u  IPv6 0x898a1c481fa59328      0t0  TCP [::1]:5173->[::1]:50672 (ESTABLISHED)
+sdlc-work 11194 eason_tseng    9u  IPv4 0x59c5f81218594b31      0t0  TCP 127.0.0.1:34115 (LISTEN)
+=== 2026-09-22T00:41:51.112Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10849,10869,11099,11420,11445,12875,12895,13351,13352] app=[11194] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[15701] other=[] ===
+node      10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+node      10154 eason_tseng   32u  IPv6 0x898a1c481fa59328      0t0  TCP [::1]:5173->[::1]:50672 (ESTABLISHED)
+sdlc-work 11194 eason_tseng    9u  IPv4 0x59c5f81218594b31      0t0  TCP 127.0.0.1:34115 (LISTEN)
+=== 2026-09-22T00:41:52.532Z wails=[8902,8971,9022,9092,9227,10260,10261,10502,10539,10693,10849,10869,11099,11420,11445,12875,12895,13351,13352] app=[11194] viteNode=[9186,9523,9547,10106,10154,10239] chrome=[] selfTool(excluded)=[15895] other=[] ===
+node      10154 eason_tseng   18u  IPv6 0x3d3a377a79248ed1      0t0  TCP [::1]:5173 (LISTEN)
+node      10154 eason_tseng   32u  IPv6 0x898a1c481fa59328      0t0  TCP [::1]:5173->[::1]:50672 (ESTABLISHED)
+sdlc-work 11194 eason_tseng    9u  IPv4 0x59c5f81218594b31      0t0  TCP 127.0.0.1:34115 (LISTEN)

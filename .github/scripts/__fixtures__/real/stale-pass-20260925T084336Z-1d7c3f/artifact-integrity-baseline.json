@@ -1,0 +1,72 @@
+{
+  "files": [
+    "frontend/package-lock.json",
+    "frontend/package.json",
+    "frontend/package.json.md5",
+    "frontend/wailsjs/go/main/App.d.ts",
+    "frontend/wailsjs/go/main/App.js",
+    "frontend/wailsjs/go/models.ts",
+    "frontend/wailsjs/runtime/package.json",
+    "frontend/wailsjs/runtime/runtime.d.ts",
+    "frontend/wailsjs/runtime/runtime.js",
+    "go.mod",
+    "go.sum"
+  ],
+  "snapshot": [
+    {
+      "path": "frontend/package-lock.json",
+      "mode": "644",
+      "contentHash": "b869e4e31e41c5f0e03fe463b0a8124f12a339cc"
+    },
+    {
+      "path": "frontend/package.json",
+      "mode": "644",
+      "contentHash": "955ea50c5c2f8d4e4378045c8f21eff3af7775da"
+    },
+    {
+      "path": "frontend/package.json.md5",
+      "mode": "755",
+      "contentHash": "601a9a113f42481a625a996d0012bf09f151e15e"
+    },
+    {
+      "path": "frontend/wailsjs/go/main/App.d.ts",
+      "mode": "755",
+      "contentHash": "6b1952233eef6da28ef717695e6ec03d284ca156"
+    },
+    {
+      "path": "frontend/wailsjs/go/main/App.js",
+      "mode": "755",
+      "contentHash": "a820fd5b3ff75b6daad5284be36152ed3fda6db0"
+    },
+    {
+      "path": "frontend/wailsjs/go/models.ts",
+      "mode": "755",
+      "contentHash": "3b791fb38f80171275393c7e75b7edb661989869"
+    },
+    {
+      "path": "frontend/wailsjs/runtime/package.json",
+      "mode": "644",
+      "contentHash": "1e7c8a5d705eb8edfc5bbf8468f68f62396cbb1b"
+    },
+    {
+      "path": "frontend/wailsjs/runtime/runtime.d.ts",
+      "mode": "644",
+      "contentHash": "3bbea8489dfc4c0e931740f5da24f0d0d02c33e9"
+    },
+    {
+      "path": "frontend/wailsjs/runtime/runtime.js",
+      "mode": "644",
+      "contentHash": "556621eeb0246756bb479b67781402debad6fd3b"
+    },
+    {
+      "path": "go.mod",
+      "mode": "644",
+      "contentHash": "83f5ffb9ffd23354cae6625c01ae506235d9c2c1"
+    },
+    {
+      "path": "go.sum",
+      "mode": "644",
+      "contentHash": "4ae874109feda96f181d689401b24331a2d7d205"
+    }
+  ]
+}
