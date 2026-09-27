@@ -150,3 +150,21 @@ B3a-2a 完成的是「Gate 1、Gate 2、STALE 三條流程，不經 provider」�
 - `/tmp` 與 worktree 路徑非跨機器可取得的證據；不宣稱原始 artifacts 已上傳到 GitHub。
 - 原始診斷 binary 目前已不在保存的原路徑，僅有當時記錄的 SHA256 與 build-info，未另重建。
 - 本文件與 backlog 以獨立 docs 分支／PR 交付，source PR #23 不含這兩份文件。未量測工時、未核定點數與先前歷史修訂均保留原意。
+
+
+## 11. 2026-09-27 證據保存勘誤與復原
+
+2026-09-27 回查時，前述 `/tmp` 與 `/var/folders/.../T` 的指定證據目錄已不存在。Claude 在 mailroom #472 回報機器重開機後發現遺失；本輪確認檔案缺失，不另外推論每個檔案的刪除時間或原因。本文件先前「仍有保存」等措辭描述的是驗收當時狀態，不能再用來表示暫存路徑目前可讀。
+
+reviewer 已完成下列復原與獨立驗證（不重跑 App/browser）：
+
+- Gate1 `20260925T065454Z-924661`（22檔）、Gate2 首跑失敗 `20260925T071019Z-146267`（26檔）、Gate2 正式 `20260925T083946Z-b4abcb`（22檔）、STALE `20260925T084336Z-1d7c3f`（22檔）仍存於原 worktree。依相對路徑排序及原 shasum 格式重建 manifest，四份 manifest 自身 SHA256 均與 §3 的歷史值完全相同。此項涵蓋這92個 artifacts 的路徑與內容，不涵蓋遺失的外部啟動 driver／preflight／postcheck。
+- r5 的31個 committed blobs 從 source commit `e66045d34f59373e023821079156b981277aa7ce` 重建 manifest，自身 SHA256 仍為 `d90afedb5022805b0d9d4cac9bb37e41075e8e5de8602666ea1a3474ec0c19a6`。這不等於恢復 source-only 執行副本或702項檢查的原始完整log。
+- 診斷 run `20260925T075938Z-b6d61a` 的22個 artifacts仍在；本輪以相對run目錄、`./`前綴及排序格式產生的manifest SHA256為 `1de0eb8dbb01e59f50555c010440b966157045ae9f3224ed85d8936f7e2cb045`，未能重現 §3 的歷史manifest hash。原manifest序列化內容尚未取得，不能僅憑hash不同判定artifact改動，也不能憑檔案數相同宣稱歷史一致；這組仍僅供診斷，不升格為驗收。
+- 五組現存run共114個runtime artifacts，加上復原契約與manifest，已封存為 `b3a-preserved-evidence-20260927.tar.gz`，SHA256 `38c105a3a82e6af04dd3a94dc1f90547e6a833dc8e64cbef0ce173e96e83d485`。實際解包後123個檔案的集合與逐檔內容hash均相符；這證明本次封存可還原，不會使診斷run自動取得歷史一致性證明。
+
+本次持久保存根目錄為 `/Users/eason_tseng/b3a-evidence/2026-09-27-recovery/`。`archive-verification.json` 記錄archive校驗及還原結果；`manifests/verification.json` 記錄逐run結果；`source-recovery.json` 記錄r5復原。這是同一台主機上的獨立副本，**尚無跨機器備份或GitHub原始artifact上傳**。r5重建manifest另存於根目錄的manifests，未包含在上述已封存123檔的archive內。
+
+同次復原的 CI-1 設計v2（`58ae25df69364da4ff1aecf34347ccea4c44a8542dd520bd840cf71c5689db68`）與reviewer核定補充（`9f7339e47985176502ab18232cd970c192c735a455f14f176d19615d1e2b1335`）來自原始Codex工具紀錄，恢復後與原核定hash一致，不是根據信件摘要重寫。這些文件的復原不能代表所有歷史暫存證據均已找回。
+
+截至本次盤點，外部啟動driver／preflight／postcheck、診斷out計時檔與build-info、完整source-only測試log等暫存產物尚未逐項恢復；它們的歷史摘要與當時review裁定保留，但目前可供獨立重算的範圍已縮小。§3正式run的92個artifacts和r5 source已有上述hash證據，原限定技術驗收結論保留，不擴大既有證據界線，也不以重跑補造歷史結果。
