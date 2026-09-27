@@ -23,6 +23,29 @@
 聚合 sha256 算法：`find <dir> -type f -exec shasum -a 256 {} \; | sed 's|<dir>/||' | sort | shasum -a 256`
 （逐檔 hash 再排序聚合，複製前後分別算一次核對是否相同）。
 
+## decision497（`/Users/eason_tseng/b3a-evidence/2026-09-28-review497/decision.md` §B）新增第六個真實樣本
+
+reviewer 裁定：這次 PR26 attempt1 遠端 run（controls job，run 36347781855，artifact 10941635782）
+`e2e-wrapper-status.json` 為 `wrapperRc=1`／`childRc=1`／`status="completed"`，
+但 `verdict.json` 卻寫 `overall:"passed"`——package-e2e-evidence.sh 先前只用
+封裝/readback 是否成功決定 `overall`，完全不看執行結果。修法需要一份「執行
+真的失敗、但打包/readback 完整成功」的真實樣本做回歸，不能只用合成 fixture。
+
+| 本目錄名稱 | 來源 | 原始 run-id | 用途 | 聚合 sha256（縮小前，逐位元組複製） | 聚合 sha256（縮小後，本目錄現狀） |
+|---|---|---|---|---|---|
+| `controls-execution-failed-packaged-20260927T202728Z-151ce1` | GitHub Actions run `36347781855`（artifact `10941635782`，下載副本見 `/Users/eason_tseng/b3a-evidence/ci-2/ci-fix-001/regression/attempt-001-artifact-x-copy/20260927T202458Z-0f94a4/controls/e2e-evidence-package/artifacts/`，逐位元組複製自 `/Users/eason_tseng/b3a-evidence/ci-2/attempt-001/artifact/x/`，原件不動） | `20260927T202728Z-151ce1` | controls 執行失敗但打包成功（本次 decision497 修法的核心反例） | `56b54c19eca3713aaa65b8724a655fd901deb779cf93cffa5f3b17acc4e714c0` | `19968940a4483a8dce290065f44e191f44d4671131e01107915e7f8743aee70b` |
+
+這個目錄只供 `evaluate-e2e-evidence.mjs`「非成功宣稱但仍有新 run 目錄」分支
+（約第 314-321 行）與 `package-e2e-evidence.review497.selftest.mjs` 的
+`executionOutcome`／`overall` 語意回歸使用；該分支不讀 `runDir` 底下任何檔
+案內容，只計數新 run 目錄數量，因此縮小規則沿用既有五個 fixture（整個刪除
+`fake-tools/`／`playwright/`／`fixture-git-log.txt`／`fixture-git-status.txt`／
+`glossary-final-content.md`；`network-samples.log` 截斷保留前 25＋後 10
+行），細節見同目錄 `SHRINK-PROVENANCE.json`。真正搭配的 `e2e-wrapper-status.json`／
+`e2e.rc`（`wrapperRc=1`／`childRc=1`／`status="completed"`／
+`childConfirmedGone="true"`／`producerErrors=[]`）是 selftest 內用這次真實
+下載的 `e2e-wrapper-status.json` 原文照抄的常數，不是憑空編造。
+
 ## review round 3（#480 R6）：縮小到最小必要切片
 
 上表五個聚合 hash 是**縮小前**（逐位元組複製）的值，作為 provenance 保留；

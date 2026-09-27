@@ -314,6 +314,29 @@ if (claimedSuccess) {
 } else {
   // 宣稱非成功，但仍有新 run 目錄：保留既有行為（PR #12 既有裁定），不在
   // 本輪修法範圍內做內容深度核對，只記錄候選目錄數量供人工檢視。
+  //
+  // review round 8（decision497 §B-3）：reviewer 已證實這條路徑本身不出
+  // ::error::、evaluator exit 0，但 package-e2e-evidence.sh 先前只憑「exit
+  // 0」就把 verdict.json 寫成 overall:"passed"——即使 wrapper/child 實際失
+  // 敗（見同 decision §B-2 的 controls 真實反例：wrapperRc=1 卻
+  // overall:"passed"）。這裡不改變 evaluator 自己的 exit code（判定「是否
+  // 執行成功」不是這支腳本、這個分支的職責），只額外落地一份
+  // validation-scope.json，讓呼叫端（package-e2e-evidence.sh）能在
+  // verdict.json 裡明列「這次只做了封裝層檢查，沒有做完整 success-content
+  // 驗證」，不能被誤讀成內容已驗收過。
+  const scopeNote = {
+    scope: 'packaging-only',
+    validated: false,
+    reason:
+      `非成功宣稱（status=${wrapperStatus.status} wrapperRc=${wrapperRc}），偵測到 ${newRunDirs.length} 個新 run 目錄，`
+        + '證據已保留，但未執行 playwright-results.json／run-state.json／domain 證據／envelope 交叉核對等完整內容驗證',
+    newRunDirsCount: newRunDirs.length,
+  };
+  try {
+    writeFileSync(path.join(packageDir, 'validation-scope.json'), `${JSON.stringify(scopeNote, null, 2)}\n`);
+  } catch (e) {
+    fail(`寫 validation-scope.json 失敗：${e.message}`);
+  }
   process.stdout.write(
     `[${entryId}] 非成功宣稱（status=${wrapperStatus.status} wrapperRc=${wrapperRc}），`
       + `但偵測到 ${newRunDirs.length} 個新 run 目錄，證據已保留，不在本輪內容驗證範圍。\n`,

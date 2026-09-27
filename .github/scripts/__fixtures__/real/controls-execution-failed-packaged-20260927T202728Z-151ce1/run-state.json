@@ -1,0 +1,151 @@
+{
+  "runId": "20260927T202728Z-151ce1",
+  "rootPgid": 43807,
+  "status": "failed",
+  "processes": [
+    {
+      "pid": 43807,
+      "ppid": 0,
+      "pgid": 43807,
+      "command": "wails dev -noreload -skipbindings",
+      "startedAt": "Sun Sep 27 20:27:29 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 43972,
+      "ppid": 43807,
+      "pgid": 43807,
+      "command": "npm run build",
+      "startedAt": "Sun Sep 27 20:27:31 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44021,
+      "ppid": 43972,
+      "pgid": 43807,
+      "command": "sh -c vue-tsc --noEmit && vite build",
+      "startedAt": "Sun Sep 27 20:27:31 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44022,
+      "ppid": 44021,
+      "pgid": 43807,
+      "command": "node /Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/node_modules/.bin/vue-tsc --noEmit",
+      "startedAt": "Sun Sep 27 20:27:31 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44637,
+      "ppid": 44021,
+      "pgid": 43807,
+      "command": "node /Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/node_modules/.bin/vite build",
+      "startedAt": "Sun Sep 27 20:27:39 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44687,
+      "ppid": 44637,
+      "pgid": 43807,
+      "command": "/Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Sun Sep 27 20:27:40 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 46603,
+      "ppid": 43807,
+      "pgid": 46603,
+      "command": "npm run dev",
+      "startedAt": "Sun Sep 27 20:28:00 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 46629,
+      "ppid": 46603,
+      "pgid": 46603,
+      "command": "node /Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/node_modules/.bin/vite",
+      "startedAt": "Sun Sep 27 20:28:00 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 46720,
+      "ppid": 46629,
+      "pgid": 46603,
+      "command": "/Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Sun Sep 27 20:28:01 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 46874,
+      "ppid": 43807,
+      "pgid": 43807,
+      "command": "go build -buildvcs=false -gcflags all=-N -l -tags dev,devtools -o /Users/runner/work/ai-software-engineering/ai-software-engineering/build/bin/sdlc-workbench-dev-darwin-amd64",
+      "startedAt": "Sun Sep 27 20:28:02 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 46892,
+      "ppid": 46874,
+      "pgid": 43807,
+      "command": "/Users/runner/hostedtoolcache/go/1.26.5/x64/pkg/tool/darwin_amd64/link -o /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-build474060908/b001/exe/a.out -importcfg /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-build474060908/b001/importcfg.link -X=runtime.godebugDefault=cryptocustomrand=1,tlssecpmlkem=0,urlstrictcolons=0 -buildmode=pie -buildid=MBCjK_hJ44wqIT5NPnto/9hJrjxhaaDVxuWoX2hUc/9AryJic_k67h5Cx2lLTB/MBCjK_hJ44wqIT5NPnto -extld=clang /Users/runner/Library/Caches/go-build/84/84d74b331ee42786172c01be26f828e927ab8ca6b3be6e36d0483d6c4d8c0ca3-d",
+      "startedAt": "Sun Sep 27 20:28:03 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 47022,
+      "ppid": 46892,
+      "pgid": 43807,
+      "command": "/Applications/Xcode_16.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -arch x86_64 -m64 -mmacosx-version-min=10.13 -mmacosx-version-min=10.13 -mmacosx-version-min=10.13 -o /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-link-2138323170/a.out -Wl,--compress-debug-sections=zlib /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-link-2138323170/trivial.c",
+      "startedAt": "Sun Sep 27 20:28:04 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 47119,
+      "ppid": 46892,
+      "pgid": 43807,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 47175,
+      "ppid": 46892,
+      "pgid": 43807,
+      "command": "/Applications/Xcode_16.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/dsymutil -f /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-build474060908/b001/exe/a.out -o /var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/go-link-2138323170/go.dwarf",
+      "startedAt": "Sun Sep 27 20:28:05 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 47370,
+      "ppid": 46892,
+      "pgid": 43807,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 47768,
+      "ppid": 43807,
+      "pgid": 43807,
+      "command": "/Users/runner/work/ai-software-engineering/ai-software-engineering/build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench",
+      "startedAt": "Sun Sep 27 20:28:09 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 49195,
+      "ppid": 47768,
+      "pgid": 43807,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    }
+  ],
+  "ports": {
+    "wails": 34115,
+    "vite": 5173
+  },
+  "observationFailures": [
+    "[2026-09-27T20:28:33.704Z] stopProcedure: 有 3 個目標身分無法確認（詳見上方 harness.log 對應行）：46603,46629,47768"
+  ],
+  "failureStage": "teardown: cleanup incomplete"
+}

@@ -48,5 +48,16 @@
     "new_size_bytes": 5437,
     "head_lines_kept": 25,
     "tail_lines_kept": 10
+  },
+  {
+    "dir": "controls-execution-failed-packaged-20260927T202728Z-151ce1",
+    "file": "network-samples.log",
+    "action": "truncated",
+    "original_sha256": "c3b9df78588c70b706a16d4505a8400eae0ed0e0c47ea7f4bb9ac59666a6ca77",
+    "original_size_bytes": 92244,
+    "new_size_bytes": 5164,
+    "head_lines_kept": 25,
+    "tail_lines_kept": 10,
+    "note": "decision497 §B-4 新增：fake-tools/、playwright/、fixture-git-log.txt、fixture-git-status.txt、glossary-final-content.md 整個刪除（沿用既有五個 fixture 的縮小規則）；playwright-results.json/run-state.json/harness.log 等完全不動——本 fixture 只供 evaluate-e2e-evidence.mjs 的『非成功宣稱但仍有新 run 目錄』分支測試，該分支不讀 runDir 內任何檔案內容，內容保留純粹為 provenance 誠實。"
   }
 ]

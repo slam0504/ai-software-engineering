@@ -1,0 +1,17 @@
+{
+  "diskContentAtOldSignal": "# Glossary\n\n- term: definition\n",
+  "diskSha256": "2c0cf7f9014cbb01c2023d17043532359bfc37f0842b072afb34e9bc5792d8fb",
+  "baselineSha256": "2c0cf7f9014cbb01c2023d17043532359bfc37f0842b072afb34e9bc5792d8fb",
+  "expectedNewContent": "# Glossary (control-a-20260927T202728Z-151ce1)\n\n- term: definition\n",
+  "wrapperEvidence": [
+    {
+      "callTime": "2026-09-27T20:28:19.581Z",
+      "argsSummary": [
+        "spec/glossary.md",
+        "# Glossary (control-a-20260927T202728Z-151ce1)\n\n- term: definition\n",
+        "sha256:2c0cf7f9014cbb01c2023d17043532359bfc37f0842b072afb34e9bc5792d8fb"
+      ],
+      "actualDelayMs": 2105
+    }
+  ]
+}

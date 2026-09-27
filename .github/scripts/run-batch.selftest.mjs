@@ -158,6 +158,20 @@ check('gates 批次：真實 gate2 首跑失敗樣本（fake-runner real-gate2-f
   assert.equal(byId.stale, 'not-run');
   const gate2Result = summary.entries.find((e) => e.id === 'gate2');
   assert.equal(gate2Result.wrapperRc, 1, '批次判定失敗的依據是 wrapper 子行程本身的 exit code（真實 rc=1），不是 evaluator 額外挑出的問題');
+  // review round 8（decision497 §B-2）：這個案例正是「wrapper/child 執行
+  // 失敗，但打包/readback 完整成功」的合成對照組（跟 §B-2 真實反例
+  // controls wrapperRc=1/childRc=1 同一種形狀）。先前 package-e2e-evidence.sh
+  // 寫出的 verdict.json 只憑封裝結果決定 overall，這裡巢狀在
+  // batch-summary.json 裡的 entries[].verdict 也會是 overall:"passed"——
+  // 跟同一筆 entries[].status="failed" 自相矛盾，任何直接讀 verdict.json
+  // 或 entries[].verdict 的人都會被誤導（reviewer 正是在讀真實 verdict.json
+  // 副本時發現這個矛盾，不是先看 batch-summary.json 的 status 欄位）。
+  assert.equal(
+    gate2Result.verdict?.overall,
+    'failed',
+    `entries[].verdict.overall 不應該跟 entries[].status 自相矛盾：verdict=${JSON.stringify(gate2Result.verdict, null, 2)}`,
+  );
+  assert.equal(gate2Result.verdict?.executionOutcome, 'failed', JSON.stringify(gate2Result.verdict, null, 2));
 });
 
 // --- review round 3（R1）：對照 reviewer #480 probe-batch.py 反例——

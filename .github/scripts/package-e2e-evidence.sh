@@ -150,6 +150,87 @@ else
   readback_ok=0
 fi
 
+# review round 8（decision497 §B-2／§B-3）：reviewer 已證實真實 controls
+# run（wrapperRc=1／childRc=1／status="completed"）打包/readback 完整成功
+# 時，verdict.json 先前只憑本腳本自己的封裝結果（missing／packaging_errors／
+# content_eval_ok／readback_ok）就寫 overall:"passed"，完全沒看 wrapper／
+# child 是否真的執行成功——讓人誤讀成「這個 entry 成功」。這裡把「執行結
+# 果」（executionOutcome，依 e2e-wrapper-status.json／e2e.rc／
+# new-run-dirs.json 獨立判定，不依賴 evaluator 的 exit code）與「打包／
+# readback 結果」（packageStatus／packagingExitCode，即先前的 exit_code）
+# 分開計算，overall 現在要求兩者都成立才是 passed。
+#
+# 注意：packagingExitCode／本腳本自己最終的 process exit code 刻意不因
+# executionOutcome!=success 而變號——decision497 §B-3 明確要求「package腳本
+# 可以成功封存失敗run」（保留 failed run 的封存能力），本腳本的 exit
+# status 仍然只代表「封裝／readback 這件事本身有沒有做好」。
+NODE_EXECUTION_OUTCOME_JS='
+const fs = require("fs");
+const path = require("path");
+const workdir = process.argv[1];
+const packageDir = process.argv[2];
+function readJsonIfExists(p) {
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return undefined; }
+}
+const status = readJsonIfExists(path.join(workdir, "e2e-wrapper-status.json"));
+const rcPath = path.join(workdir, "e2e.rc");
+let rcVal = null;
+if (fs.existsSync(rcPath)) {
+  const t = fs.readFileSync(rcPath, "utf8").trim();
+  rcVal = /^-?\d+$/.test(t) ? Number(t) : NaN;
+}
+const newRunDirs = readJsonIfExists(path.join(workdir, "new-run-dirs.json"));
+const newRunCount = Array.isArray(newRunDirs) ? newRunDirs.length : null;
+
+const statusUsable = !!status && typeof status === "object"
+  && typeof status.status === "string"
+  && Number.isInteger(status.wrapperRc)
+  && !(rcVal !== null && (Number.isNaN(rcVal) || rcVal !== status.wrapperRc));
+
+let executionOutcome = "unknown";
+if (statusUsable) {
+  // 跟 evaluate-e2e-evidence.mjs 的 claimedSuccess 用同一組寬鬆條件決定
+  // 「evaluator 有沒有走深度驗證分支」；executionOutcome 本身另外疊上
+  // childRc／childConfirmedGone／producerErrors／新 run 目錄數剛好 1
+  // 這些較嚴格的條件（decision497 §B-2：「依 wrapper／child rc」），兩者
+  // 故意不是同一個布林值。
+  const looseClaimedSuccess = status.status === "completed" && status.wrapperRc === 0;
+  const strictSuccess = looseClaimedSuccess
+    && status.childRc === 0
+    && status.childConfirmedGone === "true"
+    && Array.isArray(status.producerErrors) && status.producerErrors.length === 0
+    && newRunCount === 1;
+  if (strictSuccess) {
+    executionOutcome = "success";
+  } else if (!looseClaimedSuccess && newRunCount === 0) {
+    executionOutcome = "no-run";
+  } else {
+    executionOutcome = "failed";
+  }
+}
+
+let contentValidationScope = "unavailable";
+if (executionOutcome === "success") {
+  contentValidationScope = "full";
+} else if (fs.existsSync(path.join(packageDir, "NO-RUN.txt"))) {
+  contentValidationScope = "no-run";
+} else if (fs.existsSync(path.join(packageDir, "validation-scope.json"))) {
+  contentValidationScope = "packaging-only";
+}
+
+process.stdout.write(executionOutcome + "\n" + contentValidationScope + "\n");
+'
+execution_outcome="unknown"
+content_validation_scope="unavailable"
+if exec_info="$("$NODE" -e "$NODE_EXECUTION_OUTCOME_JS" "$WORKDIR" "e2e-evidence-package" 2>"$WORKDIR/.execinfo.err")"; then
+  execution_outcome="$(printf '%s\n' "$exec_info" | sed -n '1p')"
+  content_validation_scope="$(printf '%s\n' "$exec_info" | sed -n '2p')"
+else
+  packaging_errors+=("計算 executionOutcome／contentValidationScope 失敗：$(cat "$WORKDIR/.execinfo.err" 2>/dev/null)")
+fi
+rm -f "$WORKDIR/.execinfo.err"
+
 echo "--- manifest ($ENTRY_ID) ---"
 cat e2e-evidence-manifest.txt
 echo "--- sha256 ---"
@@ -180,6 +261,20 @@ fi
 # 的檔案狀態已經不同）。改成本腳本是唯一的判定權威，把最終結論寫成
 # machine-readable 的 verdict.json，run-batch.mjs 只讀這份檔案，不重新呼叫
 # evaluator。
+#
+# review round 8（decision497 §B-2）：package_status／packaging_exit_code＝
+# 「封裝／readback／內容驗證這件事本身有沒有做好」（即先前的 exit_code，
+# 語意不變，本腳本自己的 process exit code 仍然只看這個——「package腳本可
+# 以成功封存失敗run」）；execution_outcome＝「wrapper／child 這次實際執行
+# 結果如何」（見上方 NODE_EXECUTION_OUTCOME_JS，獨立於 evaluator exit
+# code）。overall 現在要求兩者同時成立才是 passed，不再只憑封裝面就宣稱
+# passed（真實反例：controls wrapperRc=1／childRc=1，封裝/readback 全部成
+# 功，先前 verdict.json 仍寫 overall:"passed"）。
+package_status="$([ "$exit_code" -eq 0 ] && echo ok || echo failed)"
+overall_status="failed"
+if [ "$execution_outcome" = "success" ] && [ "$package_status" = "ok" ]; then
+  overall_status="passed"
+fi
 ENTRY_ID_JSON="$("$NODE" -e "process.stdout.write(JSON.stringify(process.argv[1]))" "$ENTRY_ID")"
 cat > verdict.json <<VERDICT_EOF
 {
@@ -188,8 +283,11 @@ cat > verdict.json <<VERDICT_EOF
   "packagingErrors": ${#packaging_errors[@]},
   "contentEvalOk": $([ "$content_eval_ok" -eq 1 ] && echo true || echo false),
   "readbackOk": $([ "$readback_ok" -eq 1 ] && echo true || echo false),
-  "exitCode": $exit_code,
-  "overall": "$([ "$exit_code" -eq 0 ] && echo passed || echo failed)",
+  "packagingExitCode": $exit_code,
+  "packageStatus": "$package_status",
+  "executionOutcome": "$execution_outcome",
+  "contentValidationScope": "$content_validation_scope",
+  "overall": "$overall_status",
   "generatedAtIso": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 VERDICT_EOF
