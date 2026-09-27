@@ -193,6 +193,55 @@ function classifyRow(
     return { classification: 'dead', detail: `zombie（stat=${cur.stat} command=${cur.command}），依 ps(1) 定義等同已死` };
   }
 
+  // cleanup-observation-002（reviewer 複核 #499 §C，2026-09-28，P1 修正）：
+  // 在括號 command（argv 取不到）提前歸類 unconfirmed 之前，先比對不依賴
+  // command 顯示格式的身分欄位——pgid／startedAt。這兩個欄位跟 command 顯不
+  // 顯示成括號無關，是從同一行 `ps` 輸出各自獨立的欄位解析出來的（見
+  // psUtil.ts 的 PS_ROW_RE：pgid、lstart 各自有自己的擷取群組，不受最後一欄
+  // command 內容影響），只要 `cur` 存在（這一輪批次觀測找到這個 pid），這兩
+  // 個欄位就一定是已知、非空的具體值，不存在「觀測不到 pgid／startedAt 但
+  // 觀測得到 command」這種情況——不會因為新增這個比對而把原本真的觀測不到
+  // 的狀況誤判成「已確認」。
+  //
+  // reviewer 複核 #499 反例：pid 送信號前身分四要素相符（command 可見）；
+  // TERM 等待期間 command 變成括號（argv 取不到，仍存活）→ 舊寫法在這裡直接
+  // return 'unconfirmed'，不看 pgid／startedAt；下一輪 pgid 或 startedAt 其
+  // 實已經變了（身分不符，pid 已被另一個程序重用/不是原本目標），但因為
+  // command 依然是括號，舊寫法還是只看到 argvUnavailable=true，重複回報
+  // 'unconfirmed'——已經觀測到的身分不符被「argv 取不到」整個遮蔽掉，直到
+  // 再下一輪這個 pid 消失，才被本次新增的 pending 解除路徑（見下方
+  // `waitForDeathVerified` 的說明）依既有死亡準則解除，誤報 clean=true（見
+  // decision.md 2026-09-28 §C／cleanup/reviewer-probes.json 的
+  // `pending-startedAt-mismatch-then-gone`／`pending-pgid-mismatch-then-gone`
+  // 兩個反例）。
+  //
+  // 修法：只要「仍存活」（已經通過上面的 zombie／dead 判定）且 pgid 或
+  // startedAt 這兩個可信欄位明確對不上，就直接判 mismatch，不等到括號
+  // 判斷——即使 command 因為 argv 取不到而完全無法核對，pgid／startedAt 已
+  // 經足夠確認「這不是原本追蹤的那個目標」。刻意不在這裡比較 command：
+  // argv 取不到時 command 欄位本身就是「觀測不完整」，沒有可信字串可比較，
+  // 這條不變條件（不能用取不到的 argv 冒充身分證據）維持不變，只是往前提到
+  // 跟 pgid／startedAt 分開處理，不再讓「command 顯示成括號」阻擋掉已經算好
+  // 的 pgid／startedAt 比對結果。
+  //
+  // 不影響既有 argv 可見時的分類：下面這個提前比對只是既有完整比對
+  // （pgid／command／startedAt 三者，見下方 `commandMatches` 那組判斷）的
+  // 子集提前 return——pgid／startedAt 有任一項不符時，原本的完整比對本來就
+  // 會判 mismatch，這裡只是提早得到同一個結論（差別只在 log 訊息不會再提到
+  // command 是否相符，分類結果不變）；pgid／startedAt 都相符時，原本的完整
+  // 比對照常往下跑，包含 argv 可見時的 command 字串比對與 `<exiting>` 特例，
+  // 完全不受影響。用既有 selftest（A1／A3／案例 1–10）逐項核對過沒有回歸，
+  // 見 design.md「對 baseline 既有路徑的影響」。
+  if (cur.pgid !== t.pgid || cur.startedAt !== t.startedAt) {
+    return {
+      classification: 'mismatch',
+      detail:
+        `身分核對不符（pgid／startedAt；command=${cur.command} 因 argv 不可用或其他原因暫不列入這裡的比對）：`
+        + `記錄 pgid=${t.pgid} startedAt=${t.startedAt}；`
+        + `目前 pgid=${cur.pgid} startedAt=${cur.startedAt}（stat=${cur.stat}）`,
+    };
+  }
+
   const argvUnavailable = /^\([^()]+\)$/.test(cur.command);
   if (argvUnavailable) {
     return {
@@ -286,13 +335,52 @@ function verifyInitialTargets(
 //   - 查不到／確認 zombie＝已死，合法結束，直接移出清單。
 //   - 查得到但身分確認不符＝視為已非我方目標，放棄追蹤，記進 `abandoned`。
 //   - 查得到但身分觀測不完整（argv 取不到）＝不知道是不是我方目標，記進
-//     `unconfirmed`，不再對它送信號。
+//     `pending`（先前叫 `unconfirmed`，見下方 cleanup-observation-001 候選說明），
+//     不再對它送信號，但**在同一次呼叫剩餘的 budget 內繼續唯讀觀測**。
 //   - 查得到且身分仍相符＝留在 `remaining`，下一輪繼續等，也是唯一可以在
-//     KILL 階段被拿來重新升級信號的來源。
+//     KILL 階段被拿去重新升級信號的來源。
 // A2 修正核心：這一輪的批次觀測本身失敗時，**不能**把「上一輪還活著」的舊
 // 資訊當成「這一輪已經重新驗證」——`remaining` 裡除了仍有可靠持有依據
-// （`heldChild`）的那個特定 pid，其餘全部移進 `unconfirmed`，不會被外層
-// 拿去送 KILL。
+// （`heldChild`）的那個特定 pid，其餘全部移進 `pending`，不會被外層拿去送
+// KILL；且這一次觀測失敗**仍然立刻結束這次呼叫**（不在失敗後重試，維持
+// A2／A2 OR 分支既有的時序與 heldChild 快速通道不變）。
+//
+// cleanup-observation-001（reviewer 複核 #497 §A／§C，2026-09-28）：
+// `stop-observation-probe.mjs` 重現了一個獨立於「觀測工具本身失敗」的洞——
+// 送信號前身分四要素相符、TERM 等待期間批次觀測**成功**但這一列 command
+// 變成括號（argv 取不到）時，原本的寫法會把它直接歸進最終 `unconfirmed`、
+// 從 `remaining` 移除；`remaining` 一空就（第 429 行附近）提早 `break`，
+// 之後任何一輪原本可能顯示「查無此 pid（已死）」的快照，根本沒有機會被
+// 讀到——因此即使遠端下一筆觀測其實會顯示該 pid 已經消失，目前的程式碼也
+// 永遠不會知道。reviewer 裁定（decision.md §A／§C）：不能放寬 E／括號／
+// command 穩定＝死亡的既有死亡準則，但應該在**既有的 TERM／KILL 整體
+// budget 內**，讓这類「身分觀測不完整」的目標繼續被唯讀觀測，直到後續某輪
+// 成功快照依既有死亡準則確認它已經不存在／死亡，才解除未確認狀態；到
+// deadline 仍無法確認就維持未解決（最終 `clean=false`）。
+//
+// 修法：新增 `pendingUnconfirmed` 參數，把呼叫端已經歸類「身分觀測不完整」
+// 的目標（可能來自送信號前的 `verifyInitialTargets`，或前一個階段
+// `waitForDeathVerified` 呼叫結束時仍未解決的目標）一併餵進這一次呼叫，
+// 跟 `remaining`（仍可送信號的已驗證集合）分開管理：
+//   - 迴圈條件從「`remaining` 還有東西」改成「`remaining` 或 `pending` 還有
+//     東西」——`remaining` 已經清空、但 `pending` 還有未解決的目標時，**不**
+//     提前 `break`，在同一個階段的 budget 內繼續打下一輪批次快照。
+//   - 每一輪批次觀測**成功**時，用同一份剛拿到的 `byPid`（不多打查詢）同時
+//     核對 `pending` 裡的每個目標：`dead`＝依既有死亡準則解除未確認狀態，
+//     從 `pending` 移除（不進最終 `unconfirmed`，也不進 `abandoned`）；
+//     `mismatch`＝確認不是我方目標，移進 `abandoned`（不再繼續觀測它，也
+//     絕對不送信號）；`match` 或仍然 `unconfirmed`＝**留在 `pending`**，不
+//     因為看起來身分又「穩定」了就重新授予送信號的權限——只有 `dead` 能
+//     解除未確認狀態，這是 reviewer 裁定明文要求的收斂方向。
+//   - 批次觀測本身失敗（`catch` 分支）的既有行為完全不變：仍然立刻
+//     `break`，`remaining` 裡非 heldChild 的目標仍然移進 `pending`（原本移
+//     進 `unconfirmed`）；已經在 `pending` 裡的目標這一輪沒有新資訊，原封
+//     不動留著，不會被這次失敗「升級」成別的狀態。這保留了 A2／A2（OR
+//     分支）／L1-3c 三個既有回歸測項完全相同的時序與判定（heldChild 快速
+//     通道、觀測失敗立刻結束本次呼叫，都沒有被本次修法影響）。
+//   - 絕對不送信號給 `pending` 裡的目標——這個函式送信號的邏輯（見下方
+//     `stopProcessGroup`）只讀 `residual`／已驗證存活的集合，從未讀過
+//     `pending`，本次修法沒有新增任何會讀 `pending` 去送信號的路徑。
 //
 // 診斷 1 修正（reviewer 複核 #34，2026-09-16，N13 重跑實測 `050030Z-70c019`
 // 實際數字確認）：deadline 迴圈原本只在 `budgetMs <= 0` 時才不再多打一次
@@ -313,6 +401,7 @@ const POLL_INTERVAL_MS = 300;
 
 async function waitForDeathVerified(
   targets: LiveTarget[],
+  pendingUnconfirmed: LiveTarget[],
   timeoutMs: number,
   log: HarnessLogger,
   phase: string,
@@ -322,13 +411,17 @@ async function waitForDeathVerified(
 ): Promise<{ residual: LiveTarget[]; abandoned: LiveTarget[]; unconfirmed: LiveTarget[]; elapsedMs: number; observationFailed: boolean }> {
   const start = nowNs();
   let remaining = [...targets];
+  // `pending`：身分觀測不完整、送信號前或前一階段已經歸類「未確認」的目標
+  // （見上方函式說明）。跟 `remaining` 分開管理，永遠不會被拿去送信號；
+  // 只有這一輪批次觀測成功且依既有死亡準則確認它已死／不存在，才會被移出
+  // 這個清單。
+  let pending = [...pendingUnconfirmed];
   const abandoned: LiveTarget[] = [];
-  const unconfirmed: LiveTarget[] = [];
   let observationFailed = false;
 
-  while (remaining.length > 0) {
+  while (remaining.length > 0 || pending.length > 0) {
     const budgetMs = timeoutMs - msSince(start);
-    if (budgetMs <= 0) break; // 已到 deadline，不再多打一次查詢；remaining 在這裡是「最後一次成功觀測仍存活、身分仍相符」的殘存，不是身分不明。
+    if (budgetMs <= 0) break; // 已到 deadline，不再多打一次查詢；remaining 在這裡是「最後一次成功觀測仍存活、身分仍相符」的殘存，pending 是仍未解決的未確認目標，都不是身分不明的新結論。
     if (budgetMs < POLL_INTERVAL_MS) {
       // 診斷 1 修正：剩餘時間比一次輪詢間隔還短，不足以合理期待一次
       // `ps -Ao ...` 全系統掃描能在期限內完成——不硬打這一注定極可能失敗
@@ -339,7 +432,8 @@ async function waitForDeathVerified(
         log,
         `stopProcedure（${phase}）剩餘 budget=${budgetMs}ms 小於輪詢間隔 ${POLL_INTERVAL_MS}ms，`
         + '不再嘗試這一輪查詢（避免用注定極可能失敗的極短逾時偽造成「觀測失敗」），'
-        + `視同到期，殘存 pid=[${remaining.map(t => t.pid).join(',')}]`,
+        + `視同到期，殘存 pid=[${remaining.map(t => t.pid).join(',')}]`
+        + (pending.length > 0 ? `，仍未確認 pid=[${pending.map(t => t.pid).join(',')}]` : ''),
         diagFailures,
       );
       break;
@@ -358,6 +452,9 @@ async function waitForDeathVerified(
         diagFailures,
       );
       observationFailed = true;
+      // 保留既有時序：觀測失敗一律立刻結束這次呼叫（不在失敗後於同一次呼叫
+      // 內重試），跟 A2／A2（OR 分支）／L1-3c 既有回歸測項的判定完全一致。
+      // 已經在 `pending` 裡的目標這一輪沒有新資訊，原封不動留著。
       const stillReliable: LiveTarget[] = [];
       for (const t of remaining) {
         if (heldChild && heldChild.pid === t.pid) {
@@ -366,13 +463,35 @@ async function waitForDeathVerified(
           }
           // else：Node 回報已經結束，合法死亡，不用管。
         } else {
-          unconfirmed.push(t);
+          pending.push(t);
         }
       }
       remaining = stillReliable;
       break;
     }
     const byPid = new Map(table.map(r => [r.pid, r]));
+    // 先核對 `pending`（先前已經歸類「身分觀測不完整」的目標）：只有這一輪
+    // 依既有死亡準則確認「死」的才解除未確認狀態；確認「身分不符」的移進
+    // `abandoned`（不再繼續觀測，也絕對不送信號）；其餘（仍然觀測不完整，
+    // 或這一輪身分四要素其實又對得上）**留在 `pending`**——不因為看起來
+    // 穩定就重新授予送信號的權限，這是 reviewer 裁定明文要求的收斂方向。
+    const stillPending: LiveTarget[] = [];
+    for (const t of pending) {
+      const cur = byPid.get(t.pid);
+      const { classification, detail } = classifyRow(t, cur);
+      if (classification === 'dead') {
+        safeLog(log, `stopProcedure（${phase}）先前未確認的 pid=${t.pid} 後續完整觀測依既有死亡準則確認已不存在／已死，解除未確認狀態（不等於先前的觀測缺口不存在，僅供最終未解清單參考）`, diagFailures);
+        continue;
+      }
+      if (classification === 'mismatch') {
+        safeLog(log, `stopProcedure（${phase}）先前未確認的 pid=${t.pid} 後續觀測顯示身分已不符，視為已非我方目標，不再繼續觀測、不送信號：${detail}`, diagFailures);
+        abandoned.push(t);
+        continue;
+      }
+      // 'match' 或仍然 'unconfirmed'：都留在 pending，不送信號、不解除未確認狀態。
+      stillPending.push(t);
+    }
+    pending = stillPending;
     const stillAlive: LiveTarget[] = [];
     for (const t of remaining) {
       // late-write-after-stop 修正（B3a-1 offline attempt-1 crash-after-pass，
@@ -414,8 +533,12 @@ async function waitForDeathVerified(
       const { classification, detail } = classifyRow(t, cur);
       if (classification === 'dead') continue;
       if (classification === 'unconfirmed') {
-        safeLog(log, `stopProcedure（${phase}）等待期間 pid=${t.pid} 身分觀測不完整，不再視為可安全動作的目標：${detail}`, diagFailures);
-        unconfirmed.push(t);
+        safeLog(log, `stopProcedure（${phase}）等待期間 pid=${t.pid} 身分觀測不完整，不再視為可安全動作的目標，移入未確認清單，在既有 budget 內繼續唯讀觀測：${detail}`, diagFailures);
+        // cleanup-observation-001：不再直接進最終 `unconfirmed` 並讓
+        // `remaining` 提早清空——移進 `pending`，下一輪（只要還在這次呼叫
+        // 的 budget 內）用新的批次快照繼續核對，唯一能解除的路徑是依既有
+        // 死亡準則確認「死」（見上方 `pending` 的核對區塊）。
+        pending.push(t);
         continue;
       }
       if (classification === 'mismatch') {
@@ -426,13 +549,16 @@ async function waitForDeathVerified(
       stillAlive.push(t);
     }
     remaining = stillAlive;
-    if (remaining.length === 0) break;
+    // cleanup-observation-001：`remaining` 清空不再直接 `break`——`pending`
+    // 裡可能還有未解決的未確認目標，只要這次呼叫的 budget 還沒用完，就繼續
+    // 唯讀觀測它們；只有兩者都清空才代表這一輪已經沒有任何東西需要再等。
+    if (remaining.length === 0 && pending.length === 0) break;
     const timeLeftMs = timeoutMs - msSince(start);
     if (timeLeftMs <= 0) break;
     await sleep(Math.min(300, timeLeftMs));
   }
 
-  return { residual: remaining, abandoned, unconfirmed, elapsedMs: msSince(start), observationFailed };
+  return { residual: remaining, abandoned, unconfirmed: pending, elapsedMs: msSince(start), observationFailed };
 }
 
 // stopProcessGroup：`tracked` 是呼叫端的歷史追蹤清單（例如
@@ -463,10 +589,13 @@ export async function stopProcessGroup(
   // `abandonedAll`，不能只寫 log 就放過——這是 reviewer 複核 #34 反例
   // （tracked command=worker，目前同 pid command=other）直接對應的修正點。
   const abandonedAll: LiveTarget[] = [...initial.abandoned];
-  const unconfirmedAll: LiveTarget[] = [...initial.unconfirmed];
+  // cleanup-observation-001：`initial.unconfirmed` 不再在這裡就直接定案——
+  // 交給下面的 TERM 階段當 `pendingUnconfirmed` 繼續唯讀觀測（在既有 TERM
+  // budget 內），最終未解的目標才會出現在 `unconfirmedAll`／`unconfirmedPids`。
+  const unconfirmedAll: LiveTarget[] = [];
 
   if (initial.unconfirmed.length > 0) {
-    safeLog(log, `送信號前有 ${initial.unconfirmed.length} 個目標身分觀測不完整，不送信號：${initial.unconfirmed.map(t => t.pid).join(',')}`, diagFailures);
+    safeLog(log, `送信號前有 ${initial.unconfirmed.length} 個目標身分觀測不完整，不送信號，併入 TERM 階段的未確認觀測窗：${initial.unconfirmed.map(t => t.pid).join(',')}`, diagFailures);
   }
 
   const initialGroupPgids = [...new Set(initial.verified.filter(t => t.samePgid).map(t => t.pgid))];
@@ -478,7 +607,7 @@ export async function stopProcessGroup(
   for (const pgid of initialGroupPgids) killGroup(pgid, 'SIGTERM', log, deps.kill, diagFailures);
   for (const t of initialOther) killPid(t.pid, 'SIGTERM', log, deps.kill, diagFailures);
 
-  const termResult = await waitForDeathVerified(initial.verified, 10_000, log, 'TERM', heldChild, deps, diagFailures);
+  const termResult = await waitForDeathVerified(initial.verified, initial.unconfirmed, 10_000, log, 'TERM', heldChild, deps, diagFailures);
   safeLog(
     log,
     `TERM 階段耗時 ${termResult.elapsedMs}ms，殘存 pid=[${termResult.residual.map(t => t.pid).join(',')}]`
@@ -488,7 +617,10 @@ export async function stopProcessGroup(
 
   let residual = termResult.residual;
   abandonedAll.push(...termResult.abandoned);
-  unconfirmedAll.push(...termResult.unconfirmed);
+  // cleanup-observation-001：TERM 結束時仍未解決的未確認目標先不直接定案，
+  // 依下面的分支決定要不要再併入 KILL 階段（有殘存要送信號）或獨立的
+  // 唯讀觀測窗（沒有殘存可送信號，但還有未確認目標）繼續觀測。
+  let pendingUnconfirmed = termResult.unconfirmed;
   let killPhaseMs = 0;
   let escalatedToKill = false;
   let observationFailed = initial.observationFailed || termResult.observationFailed;
@@ -511,7 +643,7 @@ export async function stopProcessGroup(
     for (const pgid of residualGroupPgids) killGroup(pgid, 'SIGKILL', log, deps.kill, diagFailures);
     for (const t of residualOther) killPid(t.pid, 'SIGKILL', log, deps.kill, diagFailures);
 
-    const killResult = await waitForDeathVerified(residual, 5_000, log, 'KILL', heldChild, deps, diagFailures);
+    const killResult = await waitForDeathVerified(residual, pendingUnconfirmed, 5_000, log, 'KILL', heldChild, deps, diagFailures);
     safeLog(
       log,
       `KILL 階段耗時 ${killResult.elapsedMs}ms，殘存 pid=[${killResult.residual.map(t => t.pid).join(',')}]`
@@ -520,18 +652,36 @@ export async function stopProcessGroup(
     );
     residual = killResult.residual;
     abandonedAll.push(...killResult.abandoned);
-    unconfirmedAll.push(...killResult.unconfirmed);
+    pendingUnconfirmed = killResult.unconfirmed;
     killPhaseMs = killResult.elapsedMs;
     observationFailed = observationFailed || killResult.observationFailed;
-  } else if (termResult.unconfirmed.length > 0) {
+  } else if (pendingUnconfirmed.length > 0) {
+    // cleanup-observation-001：沒有已驗證存活的殘存目標可以送 KILL，但還有
+    // 身分未確認的目標——不因此送任何信號（絕對不對 unknown 目標送信號），
+    // 但比照 residual 有殘存時同樣能用到的 KILL 5s 觀測窗，純粹唯讀繼續
+    // 觀測這些未確認目標；`targets` 傳空陣列，這次呼叫不會有任何 stillAlive
+    // 可以被拿去送信號，`escalatedToKill`／`killPhaseMs` 因此維持原本語意
+    // （只代表「真的送過 KILL 信號」），不在這裡被改動。
     safeLog(
       log,
-      `TERM 階段結束沒有已驗證存活的殘存目標，但有 ${termResult.unconfirmed.length} 個目標身分未確認`
-      + `（觀測失敗或身分觀測不完整），依規則不對未知目標送信號，不升級 KILL：`
-      + `${termResult.unconfirmed.map(t => t.pid).join(',')}`,
+      `TERM 階段結束沒有已驗證存活的殘存目標，但有 ${pendingUnconfirmed.length} 個目標身分未確認`
+      + `（觀測失敗或身分觀測不完整），依規則不對未知目標送信號，不升級 KILL，`
+      + `在既有 KILL 觀測窗（5s）內繼續唯讀觀測：${pendingUnconfirmed.map(t => t.pid).join(',')}`,
       diagFailures,
     );
+    const observeResult = await waitForDeathVerified([], pendingUnconfirmed, 5_000, log, 'KILL-observe-only（無信號，僅延續既有預算唯讀觀測未確認目標）', heldChild, deps, diagFailures);
+    safeLog(
+      log,
+      `KILL 觀測窗（無信號）耗時 ${observeResult.elapsedMs}ms`
+      + (observeResult.unconfirmed.length > 0 ? `，仍未確認 pid=[${observeResult.unconfirmed.map(t => t.pid).join(',')}]` : '，未確認目標全部依既有死亡準則解除'),
+      diagFailures,
+    );
+    abandonedAll.push(...observeResult.abandoned);
+    pendingUnconfirmed = observeResult.unconfirmed;
+    observationFailed = observationFailed || observeResult.observationFailed;
   }
+
+  unconfirmedAll.push(...pendingUnconfirmed);
 
   if (abandonedAll.length > 0) {
     safeLog(
