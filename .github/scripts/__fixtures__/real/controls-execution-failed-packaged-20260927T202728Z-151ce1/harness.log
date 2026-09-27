@@ -1,0 +1,43 @@
+[2026-09-27T20:27:29.217Z] globalSetup 開始：runId=20260927T202728Z-151ce1 pid=43283 repoRoot=/Users/runner/work/ai-software-engineering/ai-software-engineering
+[2026-09-27T20:27:29.218Z] 前次殘留檢查結果：none
+[2026-09-27T20:27:29.315Z] fixture 建立完成：/private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/b3a1-e2e-wdaAu9
+[2026-09-27T20:27:29.317Z] 假 CLI 建立完成：/Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/e2e/.artifacts/20260927T202728Z-151ce1/fake-tools
+[2026-09-27T20:27:29.318Z] 預檢 1/5：fixture /private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/b3a1-e2e-wdaAu9
+[2026-09-27T20:27:29.332Z] 預檢 1/5：fixture 通過
+[2026-09-27T20:27:29.332Z] 預檢 2/5：假 CLI 可執行且回報正確版本
+[2026-09-27T20:27:29.387Z] 預檢 2/5：通過，呼叫紀錄存為 /Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/e2e/.artifacts/20260927T202728Z-151ce1/preflight-invocations.log，正式 invocations.log 已清空
+[2026-09-27T20:27:29.387Z] 預檢 3/5：WORKBENCH_WORKSPACE／WORKBENCH_TOOLS_DIR 值檢查
+[2026-09-27T20:27:29.387Z] 預檢 3/5：通過
+[2026-09-27T20:27:29.388Z] 預檢 4/5：埠 34115 是否已被佔用
+[2026-09-27T20:27:29.446Z] 預檢 4/5：通過，埠 34115 空閒
+[2026-09-27T20:27:29.446Z] 預檢 5/5：受版控產物 mode 是否符合 HEAD（frontend/wailsjs／go.mod／go.sum／frontend/package*）
+[2026-09-27T20:27:29.665Z] 預檢 5/5：通過，受版控產物 mode 皆符合 HEAD
+[2026-09-27T20:27:29.919Z] spawn: wails dev -noreload -skipbindings（cwd=/Users/runner/work/ai-software-engineering/ai-software-engineering）
+[2026-09-27T20:27:29.924Z] wails dev spawned：pid=43807 pgid=43807（先以 spawn 資訊占位登記，state／tracker／.active-run.json 已就緒）
+[2026-09-27T20:27:29.977Z] wails dev 身分補強完成：pid=43807 pgid=43807 startedAt=Sun Sep 27 20:27:29 2026
+[2026-09-27T20:27:30.288Z] 等待 wails dev 就緒（HTTP 可達 127.0.0.1:34115），上限 300000ms
+[2026-09-27T20:28:10.532Z] wails dev 就緒：HTTP 可達，vite port=5173
+[2026-09-27T20:28:10.534Z] globalSetup 完成
+[2026-09-27T20:28:32.455Z] globalTeardown 開始：pid=43283（globalSetup pid=43283）
+[2026-09-27T20:28:32.578Z] 送 SIGTERM 給 pgid=43807
+[2026-09-27T20:28:32.578Z] 送 SIGTERM 給非同 pgid 的 pid=46603
+[2026-09-27T20:28:32.578Z] 送 SIGTERM 給非同 pgid 的 pid=46629
+[2026-09-27T20:28:32.579Z] 送 SIGTERM 給非同 pgid 的 pid=46720
+[2026-09-27T20:28:33.294Z] stopProcedure（TERM）等待期間 pid=46603 身分觀測不完整，不再視為可安全動作的目標：command=(node)（stat=?<）：依 /usr/share/man/man1/ps.1:401-421，command 顯示成括號代表 argv 取不到或跟 ucomm 不一致，不是死亡證據，身分觀測不完整
+[2026-09-27T20:28:33.294Z] stopProcedure（TERM）等待期間 pid=46629 身分觀測不完整，不再視為可安全動作的目標：command=(node)（stat=?<E）：依 /usr/share/man/man1/ps.1:401-421，command 顯示成括號代表 argv 取不到或跟 ucomm 不一致，不是死亡證據，身分觀測不完整
+[2026-09-27T20:28:33.295Z] stopProcedure（TERM）等待期間 pid=47768 身分觀測不完整，不再視為可安全動作的目標：command=(sdlc-workbench)（stat=?<E）：依 /usr/share/man/man1/ps.1:401-421，command 顯示成括號代表 argv 取不到或跟 ucomm 不一致，不是死亡證據，身分觀測不完整
+[2026-09-27T20:28:33.295Z] wails dev 行程結束：exit code=0 signal=null
+[2026-09-27T20:28:33.701Z] TERM 階段耗時 1100ms，殘存 pid=[]，未確認 pid=[46603,46629,47768]
+[2026-09-27T20:28:33.702Z] TERM 階段結束沒有已驗證存活的殘存目標，但有 3 個目標身分未確認（觀測失敗或身分觀測不完整），依規則不對未知目標送信號，不升級 KILL：46603,46629,47768
+[2026-09-27T20:28:33.702Z] 停止程序期間有 3 個目標身分始終無法確認（不是已驗證存活、也不是已確認死亡），不算乾淨收尾：46603,46629,47768
+[2026-09-27T20:28:33.703Z] 停止程序耗時：TERM 1100ms、KILL 0ms（escalatedToKill=false）
+[2026-09-27T20:28:33.703Z] 停止程序期間有 3 個目標身分始終無法確認，clean 判定為 false 的原因之一：46603,46629,47768
+[2026-09-27T20:28:33.828Z] 埠核對耗時 123ms（獨立於 TERM／KILL grace time）
+[2026-09-27T20:28:33.828Z] 停止程序結果：clean=false residualPids= abandonedPids= unconfirmedPids=46603,46629,47768 observationFailed=false diagnosticWriteFailed=false portsReleased=true residualPorts=
+[2026-09-27T20:28:33.828Z] 偵測到 1 筆觀測失敗（ps／lsof 本身執行失敗），不得判成乾淨：
+[2026-09-27T20:28:33.704Z] stopProcedure: 有 3 個目標身分無法確認（詳見上方 harness.log 對應行）：46603,46629,47768
+[2026-09-27T20:28:33.829Z] 清理未完全成功，保留 .active-run.json 供下次執行的前次殘留檢查接手
+[2026-09-27T20:28:33.830Z] 執行模式判定：default
+[2026-09-27T20:28:33.831Z] tripwire 判定：claude 呼叫 5 次、codex 呼叫 5 次、違規 0 筆
+[2026-09-27T20:28:34.680Z] globalTeardown 判定：interrupted=false testFailed=false cleanupClean=false tripwireViolations=0 networkViolations=0 networkLogMissingOrUnreadable=false runStateReadFailed=false browserNetworkViolations=false observationFailures=1 artifactViolations=0 → overallFailed=true
+[2026-09-27T20:28:34.681Z] 最終結果：FAILED，保留證據目錄 /Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/e2e/.artifacts/20260927T202728Z-151ce1

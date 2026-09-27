@@ -1,0 +1,38 @@
+=== 2026-09-27T20:27:29.977Z wails=[43807,43841] app=[] viteNode=[] chrome=[] selfTool(excluded)=[43872] other=[] ===
+=== 2026-09-27T20:27:31.290Z wails=[43807,43972] app=[] viteNode=[] chrome=[] selfTool(excluded)=[43995] other=[] ===
+=== 2026-09-27T20:27:32.298Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44199] other=[] ===
+=== 2026-09-27T20:27:33.299Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44260] other=[] ===
+=== 2026-09-27T20:27:34.300Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44321] other=[] ===
+=== 2026-09-27T20:27:35.301Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44382] other=[] ===
+=== 2026-09-27T20:27:36.301Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44443] other=[] ===
+=== 2026-09-27T20:27:37.301Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44509] other=[] ===
+=== 2026-09-27T20:27:38.302Z wails=[43807,43972,44022] app=[] viteNode=[44021] chrome=[] selfTool(excluded)=[44576] other=[] ===
+=== 2026-09-27T20:27:39.303Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637] chrome=[] selfTool(excluded)=[44642] other=[] ===
+=== 2026-09-27T20:27:40.305Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[44741] other=[] ===
+=== 2026-09-27T20:27:41.307Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[44871] other=[] ===
+=== 2026-09-27T20:27:42.309Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45013] other=[] ===
+=== 2026-09-27T20:27:43.312Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45170] other=[] ===
+=== 2026-09-27T20:27:44.314Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45301] other=[] ===
+=== 2026-09-27T20:27:45.315Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45400] other=[] ===
+=== 2026-09-27T20:27:46.328Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45462] other=[] ===
+=== 2026-09-27T20:27:47.331Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45524] other=[] ===
+=== 2026-09-27T20:27:48.332Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45587] other=[] ===
+=== 2026-09-27T20:27:49.333Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45650] other=[] ===
+=== 2026-09-27T20:27:50.334Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45713] other=[] ===
+=== 2026-09-27T20:27:51.335Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45775] other=[] ===
+=== 2026-09-27T20:27:52.336Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45837] other=[] ===
+=== 2026-09-27T20:27:53.337Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45903] other=[] ===
+=== 2026-09-27T20:27:54.337Z wails=[43807,43972,44022] app=[] viteNode=[44021,44637,44687] chrome=[] selfTool(excluded)=[45983] other=[] ===
+
+... [B3a-CI-1 decision497 §B-4 為縮小 repo fixture 體積，在此截斷 708 行；原始完整檔案 sha256=c3b9df78588c70b706a16d4505a8400eae0ed0e0c47ea7f4bb9ac59666a6ca77 size=92244 bytes，見同目錄 PROVENANCE.md 與 /Users/eason_tseng/b3a-evidence/ci-2/ci-fix-001/regression/attempt-001-artifact-x-copy/20260927T202458Z-0f94a4/controls/e2e-evidence-package/artifacts/network-samples.log（完整未截斷原件的持久備份） ...
+
+CHROME-BACKGROUND (not counted): Google    48018 runner   31u  IPv4 0xaf13301213aeb764      0t0  TCP 192.168.64.3:49702->142.251.157.119:443 (ESTABLISHED)
+CHROME-BACKGROUND (not counted): Google    48018 runner   39u  IPv4 0x32946ce26707086a      0t0  TCP 192.168.64.3:49699->142.251.218.142:443 (ESTABLISHED)
+CHROME-BACKGROUND (not counted): Google    48018 runner   41u  IPv4 0xa334e2f151c14a90      0t0  UDP 192.168.64.3:63448->142.251.218.142:443
+CHROME-BACKGROUND (not counted): Google    48018 runner   42u  IPv4 0x9f5f04354c15ee42      0t0  TCP 192.168.64.3:49700->142.250.141.188:5228 (ESTABLISHED)
+=== 2026-09-27T20:28:31.700Z wails=[43807,43972,44022,46874,46892,47022,47119,47175,47370,49195] app=[47768] viteNode=[44021,44637,44687,46603,46629,46720] chrome=[47955,49529] selfTool(excluded)=[49544] other=[47869] ===
+node      46629 runner   18u  IPv6 0xf979aaf40a22f057      0t0  TCP [::1]:5173 (LISTEN)
+node      46629 runner   31u  IPv6 0xd41f64bf1967aa11      0t0  TCP [::1]:5173->[::1]:49651 (ESTABLISHED)
+node      46629 runner   34u  IPv6 0x995b0dcd622c20f4      0t0  TCP [::1]:5173->[::1]:49721 (ESTABLISHED)
+sdlc-work 47768 runner    9u  IPv4 0xbb5884fdf3c2126e      0t0  TCP 127.0.0.1:34115 (LISTEN)
+sdlc-work 47768 runner   46u  IPv6 0xae3096ebd2b929ff      0t0  TCP [::1]:49721->[::1]:5173 (ESTABLISHED)

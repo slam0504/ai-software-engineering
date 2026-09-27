@@ -442,6 +442,15 @@ for (const entry of entries) {
   // 布林條件，因此誤判成功。現在 wrapperAbnormal／packageAbnormal
   // （error／signal／timedOut／hardKilled 任一為真）一律計入失敗，不論
   // status 最後是不是 0。
+  //
+  // review round 8（decision497 §B-2）：verdict.json 現在多了
+  // executionOutcome／packageStatus 兩個欄位（package-e2e-evidence.sh 分開
+  // 算「執行結果」與「打包/readback結果」）——verdictOk 沿用 verdict.overall
+  // 即可（overall 本身現在已經是兩者的合取，語意已修正，不需要在這裡重複
+  // 拆開判斷），這裡只是把 verdict.executionOutcome 也印進診斷訊息，讓
+  // wrapperSpawnRc（run-batch 自己觀察到的 wrapper 行程 rc）跟
+  // verdict.executionOutcome（package script 從 e2e-wrapper-status.json 獨
+  // 立算出來的執行結果）方便並排核對，不是新增判定依據。
   const passed = !wrapperAbnormal && !packageAbnormal && wrapperSpawnRc === 0 && packageRc === 0 && verdictOk;
   const result = {
     id: entry.id,
@@ -465,7 +474,8 @@ for (const entry of entries) {
   process.stdout.write(
     `=== [${batchName}] entry=${entry.id} result=${result.status} wrapperRc=${wrapperSpawnRc} `
       + `wrapperAbnormal=${wrapperAbnormal} packageRc=${packageRc} packageAbnormal=${packageAbnormal} `
-      + `verdict.overall=${verdict?.overall ?? '(none)'} ===\n`,
+      + `verdict.overall=${verdict?.overall ?? '(none)'} `
+      + `verdict.executionOutcome=${verdict?.executionOutcome ?? '(none)'} ===\n`,
   );
 
   if (!passed) {

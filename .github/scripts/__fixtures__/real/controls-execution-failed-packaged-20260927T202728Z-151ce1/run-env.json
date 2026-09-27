@@ -1,0 +1,11 @@
+{
+  "runId": "20260927T202728Z-151ce1",
+  "artifactsDir": "/Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/e2e/.artifacts/20260927T202728Z-151ce1",
+  "workspaceDir": "/private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/b3a1-e2e-wdaAu9",
+  "toolsDir": "/Users/runner/work/ai-software-engineering/ai-software-engineering/frontend/e2e/.artifacts/20260927T202728Z-151ce1/fake-tools",
+  "glossaryPath": "/private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/b3a1-e2e-wdaAu9/spec/glossary.md",
+  "claudeVersion": "fake-claude 0.0.0-e2e+20260927T202728Z-151ce1",
+  "codexVersion": "fake-codex 0.0.0-e2e+20260927T202728Z-151ce1",
+  "baseUrl": "http://127.0.0.1:34115",
+  "vitePort": 5173
+}

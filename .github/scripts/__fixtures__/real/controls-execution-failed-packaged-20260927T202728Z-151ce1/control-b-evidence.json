@@ -1,0 +1,15 @@
+{
+  "finalDiskContent": "# Glossary (control-b-20260927T202728Z-151ce1)\n\n- term: definition\n",
+  "expectedNewContent": "# Glossary (control-b-20260927T202728Z-151ce1)\n\n- term: definition\n",
+  "wrapperEvidence": [
+    {
+      "callTime": "2026-09-27T20:28:28.535Z",
+      "argsSummary": [
+        "spec/glossary.md",
+        "# Glossary (control-b-20260927T202728Z-151ce1)\n\n- term: definition\n",
+        "sha256:2c0cf7f9014cbb01c2023d17043532359bfc37f0842b072afb34e9bc5792d8fb"
+      ],
+      "actualDelayMs": 2118
+    }
+  ]
+}

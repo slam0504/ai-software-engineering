@@ -158,6 +158,13 @@ jobs:
         with:
           name: b3a-e2e-smoke-evidence
           if-no-files-found: error
+          # decision497 §B-1：真實 run 36347781855（artifact 10941635782）證實 nested
+          # `.bin`／`.last-run.json` 這類隱藏路徑被 actions/upload-artifact
+          # 預設行為漏傳（實測 include-hidden-files=false，見
+          # remote-log-verification.json）。這裡只加這個旗標，path 仍精確
+          # 限定在各自批次的 `.github/.ci-e2e-work/<batch>/**`，不擴大到
+          # repo root 或其他隱藏目錄。
+          include-hidden-files: true
           # review round 3（#480 R4）：先前的 glob 沒算進
           # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
           # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/
@@ -247,6 +254,13 @@ jobs:
         with:
           name: b3a-e2e-gates-evidence
           if-no-files-found: error
+          # decision497 §B-1：真實 run 36347781855（artifact 10941635782）證實 nested
+          # `.bin`／`.last-run.json` 這類隱藏路徑被 actions/upload-artifact
+          # 預設行為漏傳（實測 include-hidden-files=false，見
+          # remote-log-verification.json）。這裡只加這個旗標，path 仍精確
+          # 限定在各自批次的 `.github/.ci-e2e-work/<batch>/**`，不擴大到
+          # repo root 或其他隱藏目錄。
+          include-hidden-files: true
           # review round 3（#480 R4）：先前的 glob 沒算進
           # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
           # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/
@@ -336,6 +350,13 @@ jobs:
         with:
           name: b3a-e2e-scenarios-evidence
           if-no-files-found: error
+          # decision497 §B-1：真實 run 36347781855（artifact 10941635782）證實 nested
+          # `.bin`／`.last-run.json` 這類隱藏路徑被 actions/upload-artifact
+          # 預設行為漏傳（實測 include-hidden-files=false，見
+          # remote-log-verification.json）。這裡只加這個旗標，path 仍精確
+          # 限定在各自批次的 `.github/.ci-e2e-work/<batch>/**`，不擴大到
+          # repo root 或其他隱藏目錄。
+          include-hidden-files: true
           # review round 3（#480 R4）：先前的 glob 沒算進
           # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
           # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/

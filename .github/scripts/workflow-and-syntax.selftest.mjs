@@ -189,6 +189,22 @@ check('upload-artifact 都有 if: always() 且 if-no-files-found: error（不得
   }
 });
 
+check('decision497 §B-1：三個 upload-artifact 都加了 include-hidden-files:true，path 仍精確限定在各自批次目錄（沒有擴大到 repo root 或其他隱藏目錄）', () => {
+  for (const [jobName, batch] of [['smoke', 'smoke'], ['gates', 'gates'], ['scenarios', 'scenarios']]) {
+    const uploadSteps = JSON.parse(
+      rubyEval(`y["jobs"]["${jobName}"]["steps"].select { |s| (s["uses"] || "").include?("upload-artifact") }`),
+    );
+    assert.equal(uploadSteps.length, 1, `job=${jobName} 應該剛好一個 upload-artifact step`);
+    const withBlock = uploadSteps[0]['with'];
+    assert.equal(withBlock['include-hidden-files'], true, `job=${jobName} 應該有 include-hidden-files: true`);
+    assert.equal(
+      (withBlock['path'] || '').trim(),
+      `.github/.ci-e2e-work/${batch}/**`,
+      `job=${jobName} 的 upload path 不應該因為這次修法被擴大`,
+    );
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 console.log('\n--- 不能做到的檢查（明列，不假裝通過）---');
 console.log('- 未驗證 GitHub Actions 自己的 expression／schema 語意（例如 ${{ }} 運算式文法、action input 是否合法、on.pull_request.types 是否為 GitHub 認可的列舉值）——Ruby Psych 只做 YAML 語法／結構層級的解析。');
