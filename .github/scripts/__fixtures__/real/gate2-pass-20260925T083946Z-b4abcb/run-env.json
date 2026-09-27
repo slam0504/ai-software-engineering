@@ -1,0 +1,11 @@
+{
+  "runId": "20260925T083946Z-b4abcb",
+  "artifactsDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T083946Z-b4abcb",
+  "workspaceDir": "/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-hynzgJ",
+  "toolsDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T083946Z-b4abcb/fake-tools",
+  "glossaryPath": "/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-hynzgJ/spec/glossary.md",
+  "claudeVersion": "fake-claude 0.0.0-e2e+20260925T083946Z-b4abcb",
+  "codexVersion": "fake-codex 0.0.0-e2e+20260925T083946Z-b4abcb",
+  "baseUrl": "http://127.0.0.1:34115",
+  "vitePort": 5173
+}

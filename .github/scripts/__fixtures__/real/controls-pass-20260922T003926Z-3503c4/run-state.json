@@ -1,0 +1,220 @@
+{
+  "runId": "20260922T003926Z-3503c4",
+  "rootPgid": 8902,
+  "status": "stopped",
+  "processes": [
+    {
+      "pid": 8902,
+      "ppid": 0,
+      "pgid": 8902,
+      "command": "wails dev -noreload -skipbindings",
+      "startedAt": "Tue Sep 22 08:39:42 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 8971,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "go list -e -json=Name,ImportPath,Error,Dir,GoFiles,IgnoredGoFiles,IgnoredOtherFiles,CFiles,CgoFiles,CXXFiles,MFiles,HFiles,FFiles,SFiles,SwigFiles,SwigCXXFiles,SysoFiles,CompiledGoFiles,Export,DepOnly,Imports,ImportMap,Module -compiled=true -test=false -export=true -deps=true -find=false -buildvcs=false -pgo=off -- ./...",
+      "startedAt": "Tue Sep 22 08:39:44 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 9022,
+      "ppid": 8971,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 9092,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "npm run build",
+      "startedAt": "Tue Sep 22 08:39:46 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 9186,
+      "ppid": 9092,
+      "pgid": 8902,
+      "command": "sh -c vue-tsc --noEmit && vite build",
+      "startedAt": "Tue Sep 22 08:39:47 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 9227,
+      "ppid": 9186,
+      "pgid": 8902,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/.bin/vue-tsc --noEmit",
+      "startedAt": "Tue Sep 22 08:39:49 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 9523,
+      "ppid": 9186,
+      "pgid": 8902,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/.bin/vite build",
+      "startedAt": "Tue Sep 22 08:39:55 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 9547,
+      "ppid": 9523,
+      "pgid": 8902,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Tue Sep 22 08:39:55 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 10106,
+      "ppid": 8902,
+      "pgid": 10106,
+      "command": "npm run dev",
+      "startedAt": "Tue Sep 22 08:40:07 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 10260,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 10261,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 10154,
+      "ppid": 10106,
+      "pgid": 10106,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/.bin/vite",
+      "startedAt": "Tue Sep 22 08:40:08 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 10239,
+      "ppid": 10154,
+      "pgid": 10106,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Tue Sep 22 08:40:10 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 10502,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "go build -buildvcs=false -gcflags all=-N -l -tags dev,devtools -o /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/build/bin/sdlc-workbench-dev-darwin-amd64",
+      "startedAt": "Tue Sep 22 08:40:16 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 10539,
+      "ppid": 10502,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 10693,
+      "ppid": 10502,
+      "pgid": 8902,
+      "command": "/usr/local/Cellar/go/1.27.1/libexec/pkg/tool/darwin_amd64/link -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build1798239260/b001/exe/a.out -importcfg /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build1798239260/b001/importcfg.link -X=runtime.godebugDefault=cryptocustomrand=1,tlssecpmlkem=0,tracebacklabels=0,urlstrictcolons=0,x509sslcertoverrideplatform=0 -buildmode=pie -buildid=MnbaxN_zqOoLFSy05Bs9/Bu97ivZlt1f0u6ANNMua/Wj2ihM1u6D5xg0TlcBO-/MnbaxN_zqOoLFSy05Bs9 -extld=cc /Users/eason_tseng/Library/Caches/go-build/cc/cc26285a1347233c01b46418c079d9defece2fc109b51c4d3304be36a9f46e65-d",
+      "startedAt": "Tue Sep 22 08:40:18 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 10849,
+      "ppid": 10693,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 10869,
+      "ppid": 10849,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 11099,
+      "ppid": 10693,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 11194,
+      "ppid": 8902,
+      "pgid": 8902,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench",
+      "startedAt": "Tue Sep 22 08:40:28 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 11420,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 11445,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 12875,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 12895,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 13351,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 13352,
+      "ppid": 11194,
+      "pgid": 8902,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    }
+  ],
+  "ports": {
+    "wails": 34115,
+    "vite": 5173
+  },
+  "observationFailures": []
+}

@@ -1,0 +1,354 @@
+# B3a-CI-1：browser E2E 整合進 CI 的第一階段（受控採證，非 required）。
+#
+# 契約：/Users/eason_tseng/b3a-evidence/2026-09-27-recovery/contracts/decision470.md
+#（核定補充，優先於衝突文字）＋ b3a-ci-design-draft-v2.md。本輪只做本機隔離
+# 實作與離線驗證，**未經任何遠端 run 驗證**——不要因為這個檔案存在就假設它
+# 已經在 GitHub-hosted runner 上跑過。三個批次互斥、串行、任一非預期失敗即
+# 停止同批次後續 invocation，已完成案例的證據保留。
+#
+# 參考 PR #12（`ci/b3a-e2e-feasibility`，79819d8，已關閉未合併）的單案可行性
+# 實驗機制（沿用、不整包照抄），擴充為 13 案三批次。
+#
+# 觸發限制（四項同時成立才跑，job `if:` 逐一核對；trigger 層另加
+# `branches:[main]` 做早期噪音過濾——這個 workflow 目前非 required，不落入
+# v2 design §3.2 warned 的「required + paths/branches 過濾 → 永遠 Pending」
+# 陷阱）：
+#   - pull_request（非 pull_request_target）、types:[labeled]
+#   - base 必須是 main
+#   - head 必須是同一個 repo（不接受 fork PR）
+#   - head 必須是本輪專用分支 ci/b3a-e2e-integration
+#   - 觸發本次 run 的 label 名稱必須精確相符對應批次的 label（b3a-ci-smoke／
+#     b3a-ci-gates／b3a-ci-scenarios，見 .github/scripts/ci-e2e-entries.mjs
+#     的 BATCH_LABELS）——不依「這張 PR 目前掛著哪些 label」推測，只看這次
+#     `labeled` 事件本身帶的 `github.event.label.name`。
+name: b3a-e2e-ci
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]
+
+concurrency:
+  group: b3a-e2e-ci-${{ github.workflow }}-${{ github.ref }}
+  # 操作面約定「一次只排一個受控 run」（非 GitHub 保證，見 v2 design §3.1）：
+  # cancel-in-progress:false，不靠取消來避免重複觸發——重複觸發本來就被
+  # job 層的精確 label 比對擋掉。
+  cancel-in-progress: false
+
+# 最小 permissions：只讀 checkout；預設 GITHUB_TOKEN 權限不擴大（decision470
+# 收斂實作選擇 #8）。
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: b3a-e2e-smoke
+    if: >-
+      github.event.label.name == 'b3a-ci-smoke' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-e2e-integration'
+    runs-on: macos-15-intel
+    # timing 公式（review round 4／#480 R2 剩餘缺口：新增「generate CI
+    # invocation envelope」step 把 setup 從 33min 推到 34min，見該 step 的
+    # timeout-minutes: 1；round 3／#480 R4 原本的算法不變，只是 setup 的常
+    # 數多算這 1 分鐘）：「30 分鐘／entry」改成 wrapper 內部 watchdog
+    # （25+2+0.5=27.5min）＋package script 有界 spawnSync（2min）＝29.5min
+    # 的正常路徑上限，由 run-batch.mjs／package-e2e-evidence.sh 的
+    # spawnSync timeout 直接強制，不是只靠這裡的 job/step timeout-minutes
+    # 宣稱：
+    # smoke 2 案 × 30min(entry 上限) = 60min，加 setup 34min、上傳 15min
+    # → job 上限 109min。這是可核算的 hard cap，不是耗時預測，也不是 runner
+    # 使用授權——本輪不觸發任何遠端 run。詳細算式見
+    # /Users/eason_tseng/b3a-evidence/ci-1/attempt-002/timing-check-r4.txt。
+    timeout-minutes: 109
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1，與 ci.yml 同版本
+        timeout-minutes: 3
+
+      - name: record SHAs and UTC start time
+        env:
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "github.sha: $GITHUB_SHA_VALUE"
+          echo "head.sha: $PR_HEAD_SHA"
+          echo "base.sha: $PR_BASE_SHA"
+          echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+        timeout-minutes: 1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0，與 ci.yml 同版本
+        timeout-minutes: 3
+        with:
+          node-version: '26.10.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0，與 ci.yml 同版本
+        timeout-minutes: 3
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+
+      - run: npm --prefix frontend ci
+        timeout-minutes: 5
+
+      # go:embed all:frontend/dist 需要 dist 先存在（main.go:22-23；README.md:138）。
+      - name: frontend build（產生 go:embed 需要的 frontend/dist）
+        run: npm --prefix frontend run build
+        timeout-minutes: 5
+
+      - run: test -f frontend/dist/index.html
+        timeout-minutes: 1
+
+      - name: go mod download（app 自己的相依，先於 offline 測試 step）
+        run: go mod download
+        timeout-minutes: 5
+
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 && wails version
+        timeout-minutes: 5
+
+      - run: test -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        timeout-minutes: 1
+
+      - name: record tool versions
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sw_vers
+          node --version
+          go version
+          wails version
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+        timeout-minutes: 1
+
+      # review round 4（#480 R2 剩餘缺口）：可信 CI invocation envelope——
+      # reviewer 裁定「不能只echo metadata到job log」，上面「record SHAs」／
+      # 「record tool versions」兩個 step 只 echo 到 job log，沒有落地成檔
+      # 案、也沒有交叉核對過。這裡用獨立 script 把 PR head/base/test-merge
+      # SHA、checkout HEAD、runner os/image、實際解析到的 Node/Go/Chrome
+      # 版本落地成 envelope.json（透過 `env:` 傳入 GitHub context 的值，不
+      # 插進 shell 程式碼本身），供 run-batch.mjs 逐 entry 蓋章、
+      # evaluate-e2e-evidence.mjs 逐 entry 交叉核對（見該檔
+      # validateEnvelope()）。輸出路徑要跟 run-batch.mjs 的
+      # CI_E2E_ENVELOPE_PATH 預設值（<repo>/.github/.ci-e2e-work/<batch>/
+      # envelope.json）一致。
+      - name: generate CI invocation envelope
+        env:
+          CI_ENVELOPE_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_ENVELOPE_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node .github/scripts/generate-ci-envelope.mjs .github/.ci-e2e-work/smoke/envelope.json
+        timeout-minutes: 1
+
+      # 批次執行：串行跑 default／controls，任一非預期失敗即停止（見
+      # run-batch.mjs 頭註）。step timeout 早於 job timeout，wrapper 內層
+      # deadline（25min／entry）早於 step timeout。
+      - name: run smoke batch (default + controls)
+        timeout-minutes: 60
+        env:
+          GOFLAGS: '-mod=readonly'
+          GOPROXY: 'off'
+          npm_config_offline: 'true'
+        run: node .github/scripts/run-batch.mjs smoke
+
+      - name: upload smoke evidence
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1，與 ci.yml 同版本
+        with:
+          name: b3a-e2e-smoke-evidence
+          if-no-files-found: error
+          # review round 3（#480 R4）：先前的 glob 沒算進
+          # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
+          # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/
+          # summary，中斷時 wrapper 原始輸出與 raw run 目錄不在清單
+          # 內、診斷資料可能不完整。改成整個 batch 目錄遞迴上傳（含
+          # verdict.json／e2e.out／e2e-wrapper-status.json／
+          # candidates/ 等），不再限縮成幾個特定檔名。
+          path: |
+            .github/.ci-e2e-work/smoke/**
+
+  gates:
+    name: b3a-e2e-gates
+    if: >-
+      github.event.label.name == 'b3a-ci-gates' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-e2e-integration'
+    runs-on: macos-15-intel
+    # review round 4：setup 34min（新增 generate-ci-envelope step +1min，見
+    # smoke job 的完整算式註解）。3 案 × 30min(entry 上限) = 90min，加 setup
+    # 34min、上傳 15min → 139min。
+    timeout-minutes: 139
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 3
+      - name: record SHAs and UTC start time
+        env:
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "github.sha: $GITHUB_SHA_VALUE"
+          echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+        timeout-minutes: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 3
+        with:
+          node-version: '26.10.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        timeout-minutes: 3
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+      - run: npm --prefix frontend ci
+        timeout-minutes: 5
+      - name: frontend build
+        run: npm --prefix frontend run build
+        timeout-minutes: 5
+      - run: test -f frontend/dist/index.html
+        timeout-minutes: 1
+      - name: go mod download
+        run: go mod download
+        timeout-minutes: 5
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 && wails version
+        timeout-minutes: 5
+      - run: test -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        timeout-minutes: 1
+      - name: record tool versions
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sw_vers
+          node --version
+          go version
+          wails version
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+        timeout-minutes: 1
+      # review round 4（#480 R2 剩餘缺口）：可信 CI invocation envelope——
+      # 見 smoke job 同名 step 的完整說明。
+      - name: generate CI invocation envelope
+        env:
+          CI_ENVELOPE_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_ENVELOPE_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node .github/scripts/generate-ci-envelope.mjs .github/.ci-e2e-work/gates/envelope.json
+        timeout-minutes: 1
+      - name: run gates batch (gate1 + gate2 + stale)
+        timeout-minutes: 90
+        env:
+          GOFLAGS: '-mod=readonly'
+          GOPROXY: 'off'
+          npm_config_offline: 'true'
+        run: node .github/scripts/run-batch.mjs gates
+      - name: upload gates evidence
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-e2e-gates-evidence
+          if-no-files-found: error
+          # review round 3（#480 R4）：先前的 glob 沒算進
+          # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
+          # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/
+          # summary，中斷時 wrapper 原始輸出與 raw run 目錄不在清單
+          # 內、診斷資料可能不完整。改成整個 batch 目錄遞迴上傳（含
+          # verdict.json／e2e.out／e2e-wrapper-status.json／
+          # candidates/ 等），不再限縮成幾個特定檔名。
+          path: |
+            .github/.ci-e2e-work/gates/**
+
+  scenarios:
+    name: b3a-e2e-scenarios
+    if: >-
+      github.event.label.name == 'b3a-ci-scenarios' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-e2e-integration'
+    runs-on: macos-15-intel
+    # review round 4：setup 34min（新增 generate-ci-envelope step +1min，見
+    # smoke job 的完整算式註解）。8 案 × 30min(entry 上限) = 240min，加
+    # setup 34min、上傳 15min → 289min。
+    timeout-minutes: 289
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 3
+      - name: record SHAs and UTC start time
+        env:
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "github.sha: $GITHUB_SHA_VALUE"
+          echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+        timeout-minutes: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 3
+        with:
+          node-version: '26.10.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        timeout-minutes: 3
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+      - run: npm --prefix frontend ci
+        timeout-minutes: 5
+      - name: frontend build
+        run: npm --prefix frontend run build
+        timeout-minutes: 5
+      - run: test -f frontend/dist/index.html
+        timeout-minutes: 1
+      - name: go mod download
+        run: go mod download
+        timeout-minutes: 5
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 && wails version
+        timeout-minutes: 5
+      - run: test -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        timeout-minutes: 1
+      - name: record tool versions
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sw_vers
+          node --version
+          go version
+          wails version
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+        timeout-minutes: 1
+      # review round 4（#480 R2 剩餘缺口）：可信 CI invocation envelope——
+      # 見 smoke job 同名 step 的完整說明。
+      - name: generate CI invocation envelope
+        env:
+          CI_ENVELOPE_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_ENVELOPE_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node .github/scripts/generate-ci-envelope.mjs .github/.ci-e2e-work/scenarios/envelope.json
+        timeout-minutes: 1
+      - name: run scenarios batch (8 cases)
+        timeout-minutes: 240
+        env:
+          GOFLAGS: '-mod=readonly'
+          GOPROXY: 'off'
+          npm_config_offline: 'true'
+        run: node .github/scripts/run-batch.mjs scenarios
+      - name: upload scenarios evidence
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-e2e-scenarios-evidence
+          if-no-files-found: error
+          # review round 3（#480 R4）：先前的 glob 沒算進
+          # CI_E2E_ATTEMPT_ID 這一層目錄（會直接漏傳，見
+          # run-batch.mjs 的 WORK_ROOT 結構），而且只挑 tar/manifest/
+          # summary，中斷時 wrapper 原始輸出與 raw run 目錄不在清單
+          # 內、診斷資料可能不完整。改成整個 batch 目錄遞迴上傳（含
+          # verdict.json／e2e.out／e2e-wrapper-status.json／
+          # candidates/ 等），不再限縮成幾個特定檔名。
+          path: |
+            .github/.ci-e2e-work/scenarios/**
+
+# 明確不承諾（沿用 PR #12 已寫明的邊界，未經真實遠端測試驗證）：
+#   - always() 收尾步驟在 job 被 timeout 或人工硬終止時不保證一定執行。
+#   - 三個 job 名稱各自代表「受控批次」，不是全 13 案彙總；全範圍彙總 check
+#     尚未實作（v2 design §3.1：「初期不把單批 PASS 叫全案 PASS」）。
+#   - 這份 workflow 本輪未貼過 label、未觸發過任何遠端 run，job timeout 數
+#     字是可核算的 hard cap，不是實測耗時，也不是 runner 使用授權。

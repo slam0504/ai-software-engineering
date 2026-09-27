@@ -1,0 +1,65 @@
+{
+  "flow": "gate1",
+  "runId": "20260925T065454Z-924661",
+  "bodyStatus": "passed",
+  "finalStatus": "passed",
+  "steps": [
+    {
+      "at": "2026-09-25T07:01:02.304Z",
+      "label": "G1-N1",
+      "data": {
+        "errorText": "Error: spec: scoped tree dirty — commit before 送核",
+        "newGateRequests": []
+      }
+    },
+    {
+      "at": "2026-09-25T07:01:14.879Z",
+      "label": "C1",
+      "data": {
+        "sha": "e60d9787c48dfd670ca49614ab38c6f78496ec19"
+      }
+    },
+    {
+      "at": "2026-09-25T07:01:30.452Z",
+      "label": "G1-P1-bindings",
+      "data": {
+        "approvalId": "01M3BNWPEZ000D8971M5KQP6A9",
+        "expected": {
+          "spec_manifest": "sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23",
+          "base_commit": "git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19"
+        },
+        "actualGateRequest": {
+          "spec_manifest": "sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23",
+          "base_commit": "git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19"
+        },
+        "actualApprovalRecord": {
+          "spec_manifest": "sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23",
+          "base_commit": "git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19"
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T07:01:30.456Z",
+      "label": "journals-snapshot",
+      "data": {
+        "gate_jsonl": {
+          "status": "ok",
+          "content": "{\"op_id\":\"01M3BNWPF00007SZPD0YDX5792\",\"at\":\"2026-09-25T07:01:19.968058Z\",\"records\":[{\"_type\":\"gate_request\",\"schema_version\":2,\"approval_id\":\"01M3BNWPEZ000D8971M5KQP6A9\",\"gate\":\"gate1\",\"subject\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19\"}],\"created_at\":\"2026-09-25T07:01:19.967711Z\"}]}\n{\"op_id\":\"01M3BNWV9P0005D43C0KHKJT0H\",\"at\":\"2026-09-25T07:01:24.918088Z\",\"records\":[{\"_type\":\"approval_record\",\"schema_version\":2,\"approval_id\":\"01M3BNWPEZ000D8971M5KQP6A9\",\"gate\":\"gate1\",\"subject\":\"workspace\",\"decision\":\"approved\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"reason\":\"\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19\"}],\"created_at\":\"2026-09-25T07:01:24.917171Z\"}]}\n"
+        },
+        "audit_jsonl": {
+          "status": "ok",
+          "content": "{\"data\":{\"node\":\"v26.8.1\",\"node_path\":\"/Users/eason_tseng/.nvm/versions/node/v26.8.1/bin/node\",\"startup_error\":\"\",\"tools_dir\":\"/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T065454Z-924661/fake-tools\",\"tools_source\":\"env\",\"workspace\":\"/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-lVTBKH\",\"workspace_source\":\"env\"},\"kind\":\"startup\",\"ts\":\"2026-09-25T07:00:09.891489Z\"}\n"
+        },
+        "events_jsonl": {
+          "status": "ok",
+          "content": "{\"event_id\":\"01M3BNWPKP000DMBX5F8AZ0BQA\",\"ts\":\"2026-09-25T07:01:20.118056Z\",\"provider\":\"\",\"kind\":\"gate_request\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19\"}],\"payload\":{\"approval_id\":\"01M3BNWPEZ000D8971M5KQP6A9\",\"gate\":\"gate1\"}}\n{\"event_id\":\"01M3BNWVB500068EJ4S6PVRS85\",\"ts\":\"2026-09-25T07:01:24.965983Z\",\"provider\":\"\",\"kind\":\"approval_decision\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:e60d9787c48dfd670ca49614ab38c6f78496ec19\"}],\"payload\":{\"approval_id\":\"01M3BNWPEZ000D8971M5KQP6A9\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"decision\":\"approved\",\"gate\":\"gate1\",\"reason\":\"\"}}\n"
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T07:01:30.456Z",
+      "label": "final-status",
+      "data": "passed"
+    }
+  ]
+}

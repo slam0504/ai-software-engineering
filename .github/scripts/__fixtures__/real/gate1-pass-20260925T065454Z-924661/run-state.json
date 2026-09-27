@@ -1,0 +1,1284 @@
+{
+  "runId": "20260925T065454Z-924661",
+  "rootPgid": 44473,
+  "status": "stopped",
+  "processes": [
+    {
+      "pid": 44473,
+      "ppid": 0,
+      "pgid": 44473,
+      "command": "wails dev -noreload -skipbindings",
+      "startedAt": "Fri Sep 25 14:55:06 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44517,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "go mod tidy",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44686,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "go list -e -json=Name,ImportPath,Error,Dir,GoFiles,IgnoredGoFiles,IgnoredOtherFiles,CFiles,CgoFiles,CXXFiles,MFiles,HFiles,FFiles,SFiles,SwigFiles,SwigCXXFiles,SysoFiles,CompiledGoFiles,Export,DepOnly,Imports,ImportMap,Module -compiled=true -test=false -export=true -deps=true -find=false -buildvcs=false -pgo=off -- ./...",
+      "startedAt": "Fri Sep 25 14:55:11 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 44777,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44778,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44779,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44780,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44781,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44782,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44783,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 44784,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45467,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45468,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45469,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45470,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45471,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45907,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45908,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45909,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45910,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45911,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45912,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45913,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 45914,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 46518,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 46653,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 46696,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 46700,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 46701,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 47205,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 47436,
+      "ppid": 44686,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 47677,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "npm run build",
+      "startedAt": "Fri Sep 25 14:56:02 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 47736,
+      "ppid": 47677,
+      "pgid": 44473,
+      "command": "sh -c vue-tsc --noEmit && vite build",
+      "startedAt": "Fri Sep 25 14:56:03 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 47764,
+      "ppid": 47736,
+      "pgid": 44473,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vue-tsc --noEmit",
+      "startedAt": "Fri Sep 25 14:56:04 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 48220,
+      "ppid": 47736,
+      "pgid": 44473,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vite build",
+      "startedAt": "Fri Sep 25 14:56:11 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 48355,
+      "ppid": 48220,
+      "pgid": 44473,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Fri Sep 25 14:56:13 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 49255,
+      "ppid": 44473,
+      "pgid": 49255,
+      "command": "npm run dev",
+      "startedAt": "Fri Sep 25 14:56:28 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 49362,
+      "ppid": 49255,
+      "pgid": 49255,
+      "command": "node /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/.bin/vite",
+      "startedAt": "Fri Sep 25 14:56:29 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 49491,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "go list -e -json=Name,ImportPath,Error,Dir,GoFiles,IgnoredGoFiles,IgnoredOtherFiles,CFiles,CgoFiles,CXXFiles,MFiles,HFiles,FFiles,SFiles,SwigFiles,SwigCXXFiles,SysoFiles,CompiledGoFiles,Export,DepOnly,Imports,ImportMap,Module -compiled=true -test=false -export=true -deps=true -find=false -buildvcs=false -pgo=off -- ./...",
+      "startedAt": "Fri Sep 25 14:56:33 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 49579,
+      "ppid": 49491,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 49459,
+      "ppid": 49362,
+      "pgid": 49255,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/node_modules/@esbuild/darwin-x64/bin/esbuild --service=0.28.1 --ping",
+      "startedAt": "Fri Sep 25 14:56:32 2026",
+      "samePgid": false
+    },
+    {
+      "pid": 49904,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 49927,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "go build -buildvcs=false -gcflags all=-N -l -tags dev,devtools -o /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/build/bin/sdlc-workbench-dev-darwin-amd64",
+      "startedAt": "Fri Sep 25 14:56:40 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 50253,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50258,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50263,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50268,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50281,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50282,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50283,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50879,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50892,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50893,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50894,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50897,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50898,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50899,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 50900,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51476,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51490,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51494,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51507,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51519,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51520,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51521,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51522,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 51518,
+      "ppid": 51476,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52318,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52324,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52344,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52345,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52346,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52347,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52348,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52349,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 52511,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Users/eason_tseng/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.darwin-amd64/pkg/tool/darwin_amd64/cgo -objdir /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -importpath github.com/wailsapp/wails/v2/pkg/assetserver/webview -ldflags=\"-framework\" \"UniformTypeIdentifiers\" \"-mmacosx-version-min=10.13\" \"-framework\" \"Foundation\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"WebKit\" -- -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -mmacosx-version-min=10.13 -x objective-c -x objective-c /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/pkg/assetserver/webview/request_darwin.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/pkg/assetserver/webview/responsewriter_darwin.go",
+      "startedAt": "Fri Sep 25 14:57:16 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 53079,
+      "ppid": 52511,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-3925123691.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 53433,
+      "ppid": 52511,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 53473,
+      "ppid": 53433,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 53746,
+      "ppid": 52511,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1557403196.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 53756,
+      "ppid": 53746,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54046,
+      "ppid": 52511,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1395595390.c",
+      "startedAt": "Fri Sep 25 14:57:34 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 54150,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/pkg/assetserver/webview -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -frandom-seed=J_LWRnfxokmNe8pkAN0S -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b300/_x002.o -c request_darwin.cgo2.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54178,
+      "ppid": 54150,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54340,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54476,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54477,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Users/eason_tseng/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.darwin-amd64/pkg/tool/darwin_amd64/cgo -objdir /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -importpath github.com/wailsapp/wails/v2/internal/frontend/desktop/darwin -ldflags=\"-framework\" \"UniformTypeIdentifiers\" \"-mmacosx-version-min=10.13\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"UserNotifications\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-framework\" \"AppKit\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"Foundation\" \"-framework\" \"Cocoa\" \"-framework\" \"WebKit\" \"-lobjc\" -- -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/callbacks.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/calloc.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/dialog.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/frontend.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/inspector_dev.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/menu.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/menuitem.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/notifications.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/screen.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/single_instance.go /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin/window.go",
+      "startedAt": "Fri Sep 25 14:57:42 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 54569,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54615,
+      "ppid": 54569,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54866,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54973,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-3725593085.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 54974,
+      "ppid": 54973,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55154,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-2856686796.c",
+      "startedAt": "Fri Sep 25 14:57:57 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 55240,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55242,
+      "ppid": 55240,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55439,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-211405301.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55440,
+      "ppid": 55439,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55635,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-675835812.c",
+      "startedAt": "Fri Sep 25 14:58:07 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 55705,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55706,
+      "ppid": 55705,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55934,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1682891295.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 55935,
+      "ppid": 55934,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56131,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-2919846818.c",
+      "startedAt": "Fri Sep 25 14:58:20 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 56226,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1728538649.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56228,
+      "ppid": 56226,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56300,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56344,
+      "ppid": 56300,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56559,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1554029464.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56561,
+      "ppid": 56559,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56758,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-2740633429.c",
+      "startedAt": "Fri Sep 25 14:58:34 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 56827,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 56829,
+      "ppid": 56827,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57021,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-1208061150.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57022,
+      "ppid": 57021,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57241,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-760508735.c",
+      "startedAt": "Fri Sep 25 14:58:43 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 57340,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -w -Wno-error -o/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269//_cgo_.o -gdwarf-2 -c -ferror-limit=0 -Wno-unknown-warning-option -Wno-unneeded-internal-declaration -Wno-unused-function -Qunused-arguments -fno-builtin -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -arch x86_64 -m64 -fno-lto -O0 -fdiagnostics-color=never -I . /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/cgo-gcc-input-2096443769.c",
+      "startedAt": "Fri Sep 25 14:58:45 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 57341,
+      "ppid": 57340,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57462,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57514,
+      "ppid": 57462,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57600,
+      "ppid": 54477,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57649,
+      "ppid": 57600,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57915,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x001.o -c _cgo_export.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 57918,
+      "ppid": 57915,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58130,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58156,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58201,
+      "ppid": 58156,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58656,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x006.o -c inspector_dev.cgo2.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58658,
+      "ppid": 58656,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58900,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x008.o -c menuitem.cgo2.c",
+      "startedAt": "Fri Sep 25 14:59:14 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 58966,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 58967,
+      "ppid": 58966,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59142,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x011.o -c single_instance.cgo2.c",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59143,
+      "ppid": 59142,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59346,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x013.o -c AppDelegate.m",
+      "startedAt": "Fri Sep 25 14:59:25 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 59413,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59414,
+      "ppid": 59413,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59589,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x016.o -c WailsAlert.m",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59590,
+      "ppid": 59589,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59781,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Library/Developer/CommandLineTools/usr/bin/clang -I /Users/eason_tseng/go/pkg/mod/github.com/wailsapp/wails/v2@v2.13.0/internal/frontend/desktop/darwin -fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269=/tmp/go-build -gno-record-gcc-switches -fno-common -I /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/ -mmacosx-version-min=10.13 -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -x objective-c -frandom-seed=kroBhfCXDlXnVw1zkriT -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b269/_x018.o -c WailsMenu.m",
+      "startedAt": "Fri Sep 25 14:59:34 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 59847,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 59849,
+      "ppid": 59847,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60032,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60084,
+      "ppid": 60032,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60438,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60618,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60634,
+      "ppid": 49927,
+      "pgid": 44473,
+      "command": "/Users/eason_tseng/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.darwin-amd64/pkg/tool/darwin_amd64/link -o /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b001/exe/a.out -importcfg /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b001/importcfg.link -buildmode=pie -buildid=5Gr1TcIwSz4QzTaz-SHv/PgJ5p0N_vmWisGdTBNHx/HRz5wrstsIbBmAaPuSDV/5Gr1TcIwSz4QzTaz-SHv -extld=clang /var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/go-build301544814/b001/_pkg_.a",
+      "startedAt": "Fri Sep 25 14:59:50 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 60747,
+      "ppid": 60634,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 60924,
+      "ppid": 60634,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 61275,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 61300,
+      "ppid": 44473,
+      "pgid": 44473,
+      "command": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/build/bin/sdlc-workbench.app/Contents/MacOS/sdlc-workbench",
+      "startedAt": "Fri Sep 25 15:00:04 2026",
+      "samePgid": true
+    },
+    {
+      "pid": 61386,
+      "ppid": 61300,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 63164,
+      "ppid": 61300,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 63364,
+      "ppid": 61300,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 63366,
+      "ppid": 61300,
+      "pgid": 63366,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 63530,
+      "ppid": 61300,
+      "pgid": 63530,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 63706,
+      "ppid": 61300,
+      "pgid": 63706,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 63926,
+      "ppid": 61300,
+      "pgid": 63926,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    },
+    {
+      "pid": 64099,
+      "ppid": 61300,
+      "pgid": 44473,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": true
+    },
+    {
+      "pid": 64294,
+      "ppid": 61300,
+      "pgid": 64294,
+      "command": "(unavailable)",
+      "startedAt": "(unavailable)",
+      "samePgid": false
+    }
+  ],
+  "ports": {
+    "wails": 34115,
+    "vite": 5173
+  },
+  "observationFailures": []
+}

@@ -1,0 +1,265 @@
+{
+  "config": {
+    "argv": [
+      "/Users/eason_tseng/.nvm/versions/node/v26.8.1/bin/node",
+      "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/node_modules/.bin/playwright",
+      "test",
+      "--config",
+      "e2e/playwright.controls.config.ts"
+    ],
+    "configFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/playwright.controls.config.ts",
+    "rootDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls",
+    "failOnFlakyTests": false,
+    "forbidOnly": false,
+    "fullyParallel": false,
+    "globalSetup": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/global-setup.ts",
+    "globalTeardown": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/global-teardown.ts",
+    "globalTimeout": 0,
+    "grep": {},
+    "grepInvert": null,
+    "maxFailures": 0,
+    "metadata": {
+      "actualWorkers": 1
+    },
+    "preserveOutput": "always",
+    "projects": [
+      {
+        "outputDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/.artifacts/20260922T003926Z-3503c4/playwright",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {
+          "actualWorkers": 1
+        },
+        "id": "",
+        "name": "",
+        "testDir": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls",
+        "testIgnore": [],
+        "testMatch": [
+          "*.spec.ts"
+        ],
+        "timeout": 60000
+      }
+    ],
+    "quiet": false,
+    "reporter": [
+      [
+        "list",
+        null
+      ],
+      [
+        "json",
+        {
+          "outputFile": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/.artifacts/20260922T003926Z-3503c4/playwright-results.json"
+        }
+      ]
+    ],
+    "reportSlowTests": {
+      "max": 5,
+      "threshold": 300000
+    },
+    "shard": null,
+    "tags": [],
+    "updateSnapshots": "missing",
+    "updateSourceMethod": "patch",
+    "version": "1.63.0",
+    "workers": 1,
+    "webServer": null
+  },
+  "suites": [
+    {
+      "title": "reverse-check.spec.ts",
+      "file": "reverse-check.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [
+        {
+          "title": "reverse-check: broken locator before test.fail() must NOT be absorbed",
+          "ok": true,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 60000,
+              "annotations": [
+                {
+                  "type": "skip",
+                  "description": "只在 E2E_CONTROLS_REVERSE_CHECK=1 時執行（反證，預期紅燈）",
+                  "location": {
+                    "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/reverse-check.spec.ts",
+                    "line": 21,
+                    "column": 8
+                  }
+                }
+              ],
+              "expectedStatus": "skipped",
+              "projectId": "",
+              "projectName": "",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "skipped",
+                  "duration": 1172,
+                  "errors": [],
+                  "stdout": [],
+                  "stderr": [],
+                  "retry": 0,
+                  "startTime": "2026-09-22T00:40:56.494Z",
+                  "annotations": [
+                    {
+                      "type": "skip",
+                      "description": "只在 E2E_CONTROLS_REVERSE_CHECK=1 時執行（反證，預期紅燈）",
+                      "location": {
+                        "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/reverse-check.spec.ts",
+                        "line": 21,
+                        "column": 8
+                      }
+                    }
+                  ],
+                  "attachments": []
+                }
+              ],
+              "status": "skipped"
+            }
+          ],
+          "id": "69dabd8c794fae1850b7-aad29a3c92411297d03f",
+          "file": "reverse-check.spec.ts",
+          "line": 20,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "title": "save-detection.spec.ts",
+      "file": "save-detection.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [
+        {
+          "title": "control A: old judgment (save button disabled) must fail on the target assertion",
+          "ok": true,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 60000,
+              "annotations": [
+                {
+                  "type": "fail",
+                  "location": {
+                    "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts",
+                    "line": 127,
+                    "column": 8
+                  }
+                }
+              ],
+              "expectedStatus": "failed",
+              "projectId": "",
+              "projectName": "",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "failed",
+                  "duration": 16408,
+                  "error": {
+                    "message": "Error: 對照 A（舊判定）預期失敗：讀到的應是舊內容而非新內容\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\n\u001b[32m- Expected  - 1\u001b[39m\n\u001b[31m+ Received  + 1\u001b[39m\n\n\u001b[32m- # Glossary\u001b[7m (control-a-20260922T003926Z-3503c4)\u001b[27m\u001b[39m\n\u001b[31m+ # Glossary\u001b[39m\n\n\u001b[2m  - term: definition\u001b[22m\n\u001b[2m  ↵\u001b[22m",
+                    "stack": "Error: 對照 A（舊判定）預期失敗：讀到的應是舊內容而非新內容\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\n\u001b[32m- Expected  - 1\u001b[39m\n\u001b[31m+ Received  + 1\u001b[39m\n\n\u001b[32m- # Glossary\u001b[7m (control-a-20260922T003926Z-3503c4)\u001b[27m\u001b[39m\n\u001b[31m+ # Glossary\u001b[39m\n\n\u001b[2m  - term: definition\u001b[22m\n\u001b[2m  ↵\u001b[22m\n    at /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts:128:65",
+                    "location": {
+                      "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts",
+                      "column": 65,
+                      "line": 128
+                    },
+                    "snippet": "  126 |   // ---- test.fail() 必須緊接目標存檔斷言之前才呼叫 ----\n  127 |   test.fail();\n> 128 |   expect(diskContentAtOldSignal, '對照 A（舊判定）預期失敗：讀到的應是舊內容而非新內容').toBe(newContent);\n      |                                                                 ^\n  129 | });\n  130 |\n  131 | test('control B: new judgment (expect.poll full content) succeeds', async ({ page }) => {"
+                  },
+                  "errors": [
+                    {
+                      "location": {
+                        "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts",
+                        "column": 65,
+                        "line": 128
+                      },
+                      "message": "Error: 對照 A（舊判定）預期失敗：讀到的應是舊內容而非新內容\n\n\u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\n\u001b[32m- Expected  - 1\u001b[39m\n\u001b[31m+ Received  + 1\u001b[39m\n\n\u001b[32m- # Glossary\u001b[7m (control-a-20260922T003926Z-3503c4)\u001b[27m\u001b[39m\n\u001b[31m+ # Glossary\u001b[39m\n\n\u001b[2m  - term: definition\u001b[22m\n\u001b[2m  ↵\u001b[22m\n\n  126 |   // ---- test.fail() 必須緊接目標存檔斷言之前才呼叫 ----\n  127 |   test.fail();\n> 128 |   expect(diskContentAtOldSignal, '對照 A（舊判定）預期失敗：讀到的應是舊內容而非新內容').toBe(newContent);\n      |                                                                 ^\n  129 | });\n  130 |\n  131 | test('control B: new judgment (expect.poll full content) succeeds', async ({ page }) => {\n    at /Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts:128:65"
+                    }
+                  ],
+                  "stdout": [],
+                  "stderr": [],
+                  "retry": 0,
+                  "startTime": "2026-09-22T00:41:01.034Z",
+                  "annotations": [
+                    {
+                      "type": "fail",
+                      "location": {
+                        "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts",
+                        "line": 127,
+                        "column": 8
+                      }
+                    }
+                  ],
+                  "attachments": [
+                    {
+                      "name": "error-context",
+                      "contentType": "text/markdown",
+                      "path": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/.artifacts/20260922T003926Z-3503c4/playwright/save-detection-control-A-o-061ca-ail-on-the-target-assertion/error-context.md"
+                    }
+                  ],
+                  "errorLocation": {
+                    "file": "/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-regress/frontend/e2e/controls/save-detection.spec.ts",
+                    "column": 65,
+                    "line": 128
+                  }
+                }
+              ],
+              "status": "expected"
+            }
+          ],
+          "id": "ea19076c465029e0fd26-e4dca9f1c4a9077a8e54",
+          "file": "save-detection.spec.ts",
+          "line": 55,
+          "column": 1
+        },
+        {
+          "title": "control B: new judgment (expect.poll full content) succeeds",
+          "ok": true,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 60000,
+              "annotations": [],
+              "expectedStatus": "passed",
+              "projectId": "",
+              "projectName": "",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "passed",
+                  "duration": 12284,
+                  "errors": [],
+                  "stdout": [],
+                  "stderr": [],
+                  "retry": 0,
+                  "startTime": "2026-09-22T00:41:17.470Z",
+                  "annotations": [],
+                  "attachments": []
+                }
+              ],
+              "status": "expected"
+            }
+          ],
+          "id": "ea19076c465029e0fd26-550f7ee292a5a4c65b33",
+          "file": "save-detection.spec.ts",
+          "line": 131,
+          "column": 1
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "stats": {
+    "startTime": "2026-09-22T00:39:27.575Z",
+    "duration": 160349.355,
+    "expected": 2,
+    "skipped": 1,
+    "unexpected": 0,
+    "flaky": 0
+  }
+}

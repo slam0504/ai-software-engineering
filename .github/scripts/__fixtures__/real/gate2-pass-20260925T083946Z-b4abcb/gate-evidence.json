@@ -1,0 +1,168 @@
+{
+  "flow": "gate2",
+  "runId": "20260925T083946Z-b4abcb",
+  "bodyStatus": "passed",
+  "finalStatus": "passed",
+  "steps": [
+    {
+      "at": "2026-09-25T08:41:28.199Z",
+      "label": "G2-N1",
+      "data": {
+        "expectedSubstring": "no active Gate 1 approval",
+        "actualText": "Error: plan: no active Gate 1 approval — approve the spec before submitting a plan for Gate 2"
+      }
+    },
+    {
+      "at": "2026-09-25T08:41:30.790Z",
+      "label": "C1",
+      "data": {
+        "sha": "5249fc5ab16ad0e3c978b0347098d7dc0ce074c6"
+      }
+    },
+    {
+      "at": "2026-09-25T08:41:44.922Z",
+      "label": "G2-N2",
+      "data": {
+        "expectedSubstring": "does not match filename-derived plan ID",
+        "actualText": "Error: plan: committed plan.yaml plan_id \"gate2-n2-mismatch\" does not match filename-derived plan ID \"gate2-n2\""
+      }
+    },
+    {
+      "at": "2026-09-25T08:41:55.503Z",
+      "label": "G2-N3",
+      "data": {
+        "expectedSubstring": "not found in spec scenarios",
+        "actualText": "Error: plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: task \"T1\": scenario \"scenario-not-exist\" not found in spec scenarios"
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:06.445Z",
+      "label": "G2-N4",
+      "data": {
+        "expectedSubstring": "does not match recomputed",
+        "actualText": "Error: plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: task \"T1\": minimum_risk_tier \"low\" does not match recomputed \"high\": plan: risk tier unclassifiable"
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:17.339Z",
+      "label": "G2-N5",
+      "data": {
+        "expectedSubstring": "below minimum_risk_tier",
+        "actualText": "Error: plan: validation failed（scenario not found 時，檢查該 scenario 是否以上一行 @tag 命名——parseScenarioTags 只認上一行的 @tag）: task \"T1\": planner_risk_tier \"low\" below minimum_risk_tier \"medium\": plan: risk tier unclassifiable"
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:22.023Z",
+      "label": "C2",
+      "data": {
+        "sha": "79d3484faf1337a1e06498c4d0c412e7438ef538",
+        "tasks": [
+          {
+            "id": "T1",
+            "title": "Task T1",
+            "scenarios": [
+              "scenario-ok"
+            ],
+            "minimumRiskTier": "medium",
+            "plannerRiskTier": "medium",
+            "permissionsRef": "permissions/T1.yaml"
+          },
+          {
+            "id": "T2",
+            "title": "Task T2",
+            "scenarios": [
+              "scenario-ok"
+            ],
+            "minimumRiskTier": "medium",
+            "plannerRiskTier": "high",
+            "permissionsRef": "permissions/T2.yaml"
+          },
+          {
+            "id": "T3",
+            "title": "Task T3",
+            "scenarios": [
+              "scenario-ok"
+            ],
+            "minimumRiskTier": "medium",
+            "plannerRiskTier": "medium",
+            "permissionsRef": "permissions/T3.yaml"
+          }
+        ]
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:35.401Z",
+      "label": "G2-P1-submit-wait",
+      "data": {
+        "observedDurationMs": 13317.537372000006,
+        "observedAt15sMark": true,
+        "found": true
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:52.723Z",
+      "label": "G2-P1-bindings",
+      "data": {
+        "gate2ApprovalId": "01M3BVP3FT000BNEXJ3CHDA2KJ",
+        "expected": {
+          "spec_manifest": "sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23",
+          "plan": "sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc",
+          "risk_policy": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb",
+          "permission_manifest": "sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434",
+          "base_commit": "git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538"
+        },
+        "actual": {
+          "spec_manifest": "sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23",
+          "plan": "sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc",
+          "base_commit": "git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538",
+          "risk_policy": "sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb",
+          "permission_manifest": "sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434"
+        },
+        "riskDecisions": {
+          "T1": {
+            "task_id": "T1",
+            "minimum_risk_tier": "medium",
+            "planner_risk_tier": "medium",
+            "selected_risk_tier": "medium"
+          },
+          "T2": {
+            "task_id": "T2",
+            "minimum_risk_tier": "medium",
+            "planner_risk_tier": "high",
+            "selected_risk_tier": "medium",
+            "override_reason": "b3a-2a gate2 e2e override reason (20260925T083946Z-b4abcb)"
+          },
+          "T3": {
+            "task_id": "T3",
+            "minimum_risk_tier": "medium",
+            "planner_risk_tier": "medium",
+            "selected_risk_tier": "high"
+          }
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:52.726Z",
+      "label": "journals-snapshot",
+      "data": {
+        "gate_jsonl": {
+          "status": "ok",
+          "content": "{\"op_id\":\"01M3BVM7AC000KF3WBVJNGA9WA\",\"at\":\"2026-09-25T08:41:33.772371Z\",\"records\":[{\"_type\":\"gate_request\",\"schema_version\":2,\"approval_id\":\"01M3BVM7AC000E3MPYD6QK890A\",\"gate\":\"gate1\",\"subject\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:5249fc5ab16ad0e3c978b0347098d7dc0ce074c6\"}],\"created_at\":\"2026-09-25T08:41:33.772206Z\"}]}\n{\"op_id\":\"01M3BVMAAV0004871Y64TXFZYQ\",\"at\":\"2026-09-25T08:41:36.859675Z\",\"records\":[{\"_type\":\"approval_record\",\"schema_version\":2,\"approval_id\":\"01M3BVM7AC000E3MPYD6QK890A\",\"gate\":\"gate1\",\"subject\":\"workspace\",\"decision\":\"approved\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"reason\":\"\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:5249fc5ab16ad0e3c978b0347098d7dc0ce074c6\"}],\"created_at\":\"2026-09-25T08:41:36.859443Z\"}]}\n{\"op_id\":\"01M3BVP3FT000QCQAT1MTGK58D\",\"at\":\"2026-09-25T08:42:35.386758Z\",\"records\":[{\"_type\":\"gate_request\",\"schema_version\":2,\"approval_id\":\"01M3BVP3FT000BNEXJ3CHDA2KJ\",\"gate\":\"gate2\",\"subject\":\"plan:gate2-p1\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"plan\",\"ref\":\"plan/\",\"digest\":\"sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538\"},{\"kind\":\"risk_policy\",\"ref\":\"plan/risk-policy.yaml\",\"digest\":\"sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb\"},{\"kind\":\"permission_manifest\",\"ref\":\"plan/permissions/\",\"digest\":\"sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434\"}],\"created_at\":\"2026-09-25T08:42:35.386707Z\"}]}\n{\"op_id\":\"01M3BVPAC500028GMRAEBFA2VC\",\"at\":\"2026-09-25T08:42:42.437341Z\",\"records\":[{\"_type\":\"approval_record\",\"schema_version\":2,\"approval_id\":\"01M3BVP3FT000BNEXJ3CHDA2KJ\",\"gate\":\"gate2\",\"subject\":\"plan:gate2-p1\",\"decision\":\"approved\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"reason\":\"\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"plan\",\"ref\":\"plan/\",\"digest\":\"sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538\"},{\"kind\":\"risk_policy\",\"ref\":\"plan/risk-policy.yaml\",\"digest\":\"sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb\"},{\"kind\":\"permission_manifest\",\"ref\":\"plan/permissions/\",\"digest\":\"sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434\"}],\"metadata\":{\"risk_decisions\":[{\"task_id\":\"T1\",\"minimum_risk_tier\":\"medium\",\"planner_risk_tier\":\"medium\",\"selected_risk_tier\":\"medium\"},{\"task_id\":\"T2\",\"minimum_risk_tier\":\"medium\",\"planner_risk_tier\":\"high\",\"selected_risk_tier\":\"medium\",\"override_reason\":\"b3a-2a gate2 e2e override reason (20260925T083946Z-b4abcb)\"},{\"task_id\":\"T3\",\"minimum_risk_tier\":\"medium\",\"planner_risk_tier\":\"medium\",\"selected_risk_tier\":\"high\"}]},\"created_at\":\"2026-09-25T08:42:42.437019Z\"}]}\n"
+        },
+        "audit_jsonl": {
+          "status": "ok",
+          "content": "{\"data\":{\"node\":\"v26.8.1\",\"node_path\":\"/Users/eason_tseng/.nvm/versions/node/v26.8.1/bin/node\",\"startup_error\":\"\",\"tools_dir\":\"/Users/eason_tseng/playground/project/ai-se-worktrees/b3a-2a-gates/frontend/e2e/.artifacts/20260925T083946Z-b4abcb/fake-tools\",\"tools_source\":\"env\",\"workspace\":\"/private/var/folders/qc/sl4x_xc16c919shkwhz_tg08xl6cln/T/b3a1-e2e-hynzgJ\",\"workspace_source\":\"env\"},\"kind\":\"startup\",\"ts\":\"2026-09-25T08:41:10.435411Z\"}\n"
+        },
+        "events_jsonl": {
+          "status": "ok",
+          "content": "{\"event_id\":\"01M3BVM7B6000FJGWNVYHBXPEK\",\"ts\":\"2026-09-25T08:41:33.798857Z\",\"provider\":\"\",\"kind\":\"gate_request\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:5249fc5ab16ad0e3c978b0347098d7dc0ce074c6\"}],\"payload\":{\"approval_id\":\"01M3BVM7AC000E3MPYD6QK890A\",\"gate\":\"gate1\"}}\n{\"event_id\":\"01M3BVMABJ0000K4K73KMN7GCY\",\"ts\":\"2026-09-25T08:41:36.882767Z\",\"provider\":\"\",\"kind\":\"approval_decision\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:5249fc5ab16ad0e3c978b0347098d7dc0ce074c6\"}],\"payload\":{\"approval_id\":\"01M3BVM7AC000E3MPYD6QK890A\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"decision\":\"approved\",\"gate\":\"gate1\",\"reason\":\"\"}}\n{\"event_id\":\"01M3BVP3HC0005R0FWC1WN7DDT\",\"ts\":\"2026-09-25T08:42:35.436622Z\",\"provider\":\"\",\"kind\":\"gate_request\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"plan\",\"ref\":\"plan/\",\"digest\":\"sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538\"},{\"kind\":\"risk_policy\",\"ref\":\"plan/risk-policy.yaml\",\"digest\":\"sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb\"},{\"kind\":\"permission_manifest\",\"ref\":\"plan/permissions/\",\"digest\":\"sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434\"}],\"payload\":{\"approval_id\":\"01M3BVP3FT000BNEXJ3CHDA2KJ\",\"gate\":\"gate2\"}}\n{\"event_id\":\"01M3BVPADP0007PBRCY4YQE7ME\",\"ts\":\"2026-09-25T08:42:42.486705Z\",\"provider\":\"\",\"kind\":\"approval_decision\",\"scope\":\"workspace\",\"bindings\":[{\"kind\":\"spec_manifest\",\"ref\":\"spec/\",\"digest\":\"sha256:289d32e5ffc7f3fbea55c7ac9404ef4b253e8d667bf8e44043b955954c608d23\"},{\"kind\":\"plan\",\"ref\":\"plan/\",\"digest\":\"sha256:93465c5795bd88f21d5c1a60cd9c93aca28c9fbcf53c519c6f6c7930a58aa9bc\"},{\"kind\":\"base_commit\",\"ref\":\"HEAD\",\"digest\":\"git:sha1:79d3484faf1337a1e06498c4d0c412e7438ef538\"},{\"kind\":\"risk_policy\",\"ref\":\"plan/risk-policy.yaml\",\"digest\":\"sha256:696e50f199e780567007611967c04cf08d39002e57432243b2ba11b15e61cbfb\"},{\"kind\":\"permission_manifest\",\"ref\":\"plan/permissions/\",\"digest\":\"sha256:49c59ad18d3b22133c9811c9e363c8a168d42b502ab74176dbcc4da201a94434\"}],\"payload\":{\"approval_id\":\"01M3BVP3FT000BNEXJ3CHDA2KJ\",\"approver\":{\"id\":\"B3a-1 E2E Harness\",\"method\":\"app-local\"},\"decision\":\"approved\",\"gate\":\"gate2\",\"reason\":\"\"}}\n"
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T08:42:52.726Z",
+      "label": "final-status",
+      "data": "passed"
+    }
+  ]
+}
