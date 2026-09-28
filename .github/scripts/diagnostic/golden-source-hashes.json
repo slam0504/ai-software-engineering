@@ -1,0 +1,20 @@
+{
+  "_comment": "b3a-ci2-platform-negative 診斷 driver 的 golden source hash 表。每一筆是 repo 相對路徑（相對於這個候選 workflow 執行時的 checkout 根目錄）對應到 91226366d70b8e2f7e949d010b597b269db43183 這個 commit 上，該檔案 blob 的 sha256。表中指紋在審查時與 goldenCommit 的 git blob 比對；driver 執行前讀取本次 checkout 的實體檔案算 sha256，跟表中核定值比對（不需要 fetch 歷史 object）；任一筆不符就在任何 spawn 之前非零結束，不嘗試繼續往下跑。這份表本身不複製任何原始模組內容進 repo，只記錄指紋。",
+  "goldenCommit": "91226366d70b8e2f7e949d010b597b269db43183",
+  "files": [
+    { "path": "frontend/e2e/support/stopProcedure.ts", "sha256": "e86a249e37ba12db6c1e99786aae4bf6bf6951402d5bc6b6af1801a21c4c4cca", "usedBy": ["C-persistent-to-deadline probe", "C-unconfirmed-then-gone probe"] },
+    { "path": "frontend/e2e/support/logger.ts", "sha256": "1d09a02ddd9bfb5414e92805d31faf193bad50b076cb5b32b2ee2b0fdaf6c0bd", "usedBy": ["C probes (HarnessLogger)"] },
+    { "path": "frontend/e2e/support/psUtil.ts", "sha256": "3389e7b43c5234bf561183cef46dbd6e916a574c7a4e5ba69018c1a572410a14", "usedBy": ["stopProcedure.ts 型別/工具相依"] },
+    { "path": "frontend/e2e/support/runState.ts", "sha256": "4186015098087650c56cee83c8f65985c450d3a2004b8643c471aabb05a62527", "usedBy": ["stopProcedure.ts 型別相依"] },
+    { "path": "frontend/e2e/support/selftestJsToTsLoader.mjs", "sha256": "05e3308377b41edbf90ebd5d1b9ae667483f363832549fe4c2a4be4973d3706f", "usedBy": ["C probes 執行時的 --experimental-loader"] },
+    { "path": ".github/scripts/ci-e2e-wrapper.mjs", "sha256": "2b7e962b4e65d1a0074daef6c7085781c4977a0b3a8efb2d410d44296be5189a", "usedBy": ["wrapper obedient/stubborn/watchdog 三情境", "NO-RUN 情境（真實良性 fixture 呼叫）"] },
+    { "path": ".github/scripts/bounded-spawn.mjs", "sha256": "387b15689e14dd37cd4aa0d7cd1ff6a87454453444db2dd2bb6a4aaf73e400aa", "usedBy": ["run-batch.mjs 內部依賴（未被本 driver 直接呼叫，但仍核對指紋供 reviewer 對照）"] },
+    { "path": ".github/scripts/gha-runtime-guard.mjs", "sha256": "9136338cfdc19361047b278eca309e82e5244796ac69948578880d3d2afee328", "usedBy": ["evaluate-e2e-evidence.mjs 匯入時即載入的相依"] },
+    { "path": ".github/scripts/ci-e2e-entries.mjs", "sha256": "10072c66e7d40ffb1f705cb394820d445b3e6e5bcb3fc58f64f1b80c39b6aea3", "usedBy": ["evaluate-e2e-evidence.mjs 用 entryById() 查 NO-RUN 情境用的既有 entry id"] },
+    { "path": ".github/scripts/run-batch.mjs", "sha256": "0e531c6fb6a0715f05b10fdb191d62189809061ac41fa33f790b0205777afadd", "usedBy": ["未被本 driver 直接呼叫，僅核對指紋供 reviewer 對照（本輪 NO-RUN 直接呼叫 package/evaluate，不經過 run-batch.mjs）"] },
+    { "path": ".github/scripts/generate-ci-envelope.mjs", "sha256": "023f3f7105d69e85a28858cf913abc37e835c37738a7cadf4c63839ecab36735", "usedBy": ["未被本 driver 直接呼叫，僅核對指紋供 reviewer 對照"] },
+    { "path": ".github/scripts/evaluate-e2e-evidence.mjs", "sha256": "1f67b619ad647160f34a12d9b8a5b7f836e043832e3b22725cee30f178634edf", "usedBy": ["NO-RUN 情境（由 package-e2e-evidence.sh 內部呼叫）"] },
+    { "path": ".github/scripts/package-e2e-evidence.sh", "sha256": "e5badafc0eb18bd07996a40effcc9d68db0110f99e035ae04a284ef4ae6f92db", "usedBy": ["NO-RUN 情境"] },
+    { "path": ".github/scripts/envelope-checks.mjs", "sha256": "6f57a230d11404c5ebc685d4bad29fbf3003b25009598f2912ca2d3f85db0ac2", "usedBy": ["evaluate-e2e-evidence.mjs 匯入時即載入的相依（checkEnvelopeBaseAll，即使 NO-RUN 分支不會呼叫它，模組載入時仍會 import）"] }
+  ]
+}

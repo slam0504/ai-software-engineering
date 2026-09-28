@@ -1,0 +1,390 @@
+# b3a-ci2-platform-negative：CI-2 平台反例候選 workflow（platform-negative-
+# plan-002，依 /Users/eason_tseng/b3a-evidence/2026-09-28-review525/decision.md
+# 定案）。
+#
+# **狀態：僅為候選檔案，未 commit、未 push、未貼到任何 repo 或 worktree、未
+# 觸發任何遠端 run。發布時的設計（decision.md 原文）：在同一 repo 建立獨立
+# 診斷分支 `ci/b3a-ci2-platform-negative`，基於
+# 91226366d70b8e2f7e949d010b597b269db43183，另開一個對 main 的 draft 診斷
+# PR。這份 workflow 檔本身只新增診斷內容，不修改 ci.yml／b3a-e2e-ci.yml／
+# harness／wails.json／identity／GHA guard。**
+#
+# 只新增診斷檔：這份 workflow 與 .github/scripts/diagnostic/ 底下的 driver／
+# fixtures 都是本輪新增，14 份既有原始模組（ci-e2e-wrapper.mjs／
+# stopProcedure.ts／package-e2e-evidence.sh 等）不複製進來，driver 從原路徑
+# 呼叫、執行前先核對 golden-source-hashes.json 的 sha256。
+#
+# 兩個 Run 各自用精確的 event label 觸發（同一個 workflow 檔、同一個
+# pull_request labeled 事件，比照正式 b3a-e2e-ci.yml 用 job 層 if 檢查
+# github.event.label.name 的既有慣例）：
+#   - Run A（GitHub 平台 step timeout ＋ 人工 cancel／always()）：
+#     label b3a-ci2-negative-platform → job step-timeout-and-always ／
+#     cancel-target
+#   - Run B（C／wrapper／NO-RUN 元件證據 ＋ artifact 空路徑前置缺檔 oracle）：
+#     label b3a-ci2-negative-artifact → job diagnostic-artifact-and-components
+#
+# 不使用 workflow_dispatch／pull_request_target／schedule（decision.md 明文
+# 禁止）。
+name: b3a-ci2-platform-negative
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]
+
+concurrency:
+  group: b3a-ci2-platform-negative-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # =========================================================================
+  # Run A，job 1／2：GitHub 平台 step timeout（先跑，cancel-target 的前提）。
+  # =========================================================================
+  step-timeout-and-always:
+    name: b3a-ci2-negative-platform / step-timeout-and-always
+    if: >-
+      github.event.label.name == 'b3a-ci2-negative-platform' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-ci2-platform-negative'
+    runs-on: macos-15-intel
+    # decision.md：「兩個 job 的上限合計不超過 15 分鐘，例如 6＋8」。這裡是
+    # 前段（6 分鐘）；只驗證 step timeout，job timeout-minutes 本身是保底上
+    # 限，未經任何遠端執行驗證（見 plan.md「未驗證項目」）。
+    timeout-minutes: 6
+    outputs:
+      eligible: ${{ steps.eligible.outputs.eligible }}
+      run-id: ${{ github.run_id }}
+      run-attempt: ${{ github.run_attempt }}
+      head-sha: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1，與 b3a-e2e-ci.yml 同版本
+        timeout-minutes: 2
+
+      - name: record identity marker（唯一 run/job/phase/attempt/head/checkout/time/刺激參數）
+        id: identity
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+          {
+            echo "PHASE=step-timeout-and-always"
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_ATTEMPT=$RUN_ATTEMPT"
+            echo "JOB=step-timeout-and-always"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "CHECKOUT_HEAD=$(git rev-parse HEAD)"
+            echo "STIMULUS=sleep-90s-under-1min-step-timeout"
+            echo "TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee phase-marker.txt
+        timeout-minutes: 1
+
+      # 刻意用 timeout-minutes 遠小於刺激的睡眠時間，讓 GitHub 平台自己的
+      # 「step 逾時」機制介入（不是 ci-e2e-wrapper.mjs 的內部 deadline——這裡
+      # 完全沒有呼叫 wrapper，也不啟 App/browser/Wails/Vite）。這一步「預期」
+      # 以非成功結束；continue-on-error 讓後續 eligible／always 收尾步驟仍能
+      # 執行並核對這一步的 outcome，不是對這一步的失敗做任何產品判定。
+      - name: intentionally-exceed-step-timeout（觀察 GitHub 平台行為，非 wrapper 行為）
+        id: stimulus
+        timeout-minutes: 1
+        continue-on-error: true
+        run: |
+          echo "sleeping 90s under a 1-minute step timeout-minutes — observing platform behavior only"
+          date -u +%Y-%m-%dT%H:%M:%SZ > stimulus-started.txt
+          /bin/sleep 90
+
+      - name: always-observe-preservation（記錄 phase/run/attempt/job/head/checkout/time/刺激參數）
+        id: preserve
+        if: always()
+        timeout-minutes: 1
+        env:
+          JOB_STATUS: ${{ job.status }}
+          STIMULUS_OUTCOME: ${{ steps.stimulus.outcome }}
+          STIMULUS_CONCLUSION: ${{ steps.stimulus.conclusion }}
+        run: |
+          test -s phase-marker.txt
+          test -s stimulus-started.txt
+          {
+            echo "job.status=$JOB_STATUS"
+            echo "steps.stimulus.outcome=$STIMULUS_OUTCOME"
+            echo "steps.stimulus.conclusion=$STIMULUS_CONCLUSION"
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            cat phase-marker.txt
+            echo "STIMULUS_STARTED_UTC=$(cat stimulus-started.txt)"
+          } > always-observation.txt
+          cat always-observation.txt
+
+      - name: upload diagnostic evidence（if-no-files-found:error，不用 warn 掩蓋缺漏）
+        id: upload
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1，與 b3a-e2e-ci.yml 同版本
+        with:
+          name: b3a-ci2-negative-platform-step-timeout-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            phase-marker.txt
+            stimulus-started.txt
+            always-observation.txt
+
+      # 只有這一個 step 計算並輸出 eligible——必須排在 preserve／upload 之後
+      # 才知道它們的 outcome，因此不能用「stimulus 一結束就先算」這種寫法
+      # （那樣會少算 preserve/upload 失敗的情況）。job 層 `outputs.eligible`
+      # 直接引用這個 step id，不經過任何中介 step。
+      - name: compute eligible-for-cancel job output（只有目標 step 確實進入且如預期失敗、保存與上傳都 success、artifact-id 非空，才輸出 true）
+        id: eligible
+        if: always()
+        timeout-minutes: 1
+        env:
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          STIMULUS_OUTCOME: ${{ steps.stimulus.outcome }}
+          PRESERVE_OUTCOME: ${{ steps.preserve.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          echo "stimulus.outcome=$STIMULUS_OUTCOME preserve.outcome=$PRESERVE_OUTCOME upload.outcome=$UPLOAD_OUTCOME artifact-id=$ARTIFACT_ID"
+          if [ "$IDENTITY_OUTCOME" = "success" ] && [ "$STIMULUS_OUTCOME" = "failure" ] && [ "$PRESERVE_OUTCOME" = "success" ] && [ "$UPLOAD_OUTCOME" = "success" ] && [ -n "$ARTIFACT_ID" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::error::timeout diagnostic preconditions or evidence incomplete"
+            exit 1
+          fi
+
+  cancel-target:
+    name: b3a-ci2-negative-platform / cancel-target
+    needs: [step-timeout-and-always]
+    # 依裁定：不能用 job 級 always()；用明確 !cancelled() 加 needs output 的
+    # eligible 判定。
+    if: >-
+      !cancelled() &&
+      needs.step-timeout-and-always.outputs.eligible == 'true' &&
+      github.event.label.name == 'b3a-ci2-negative-platform' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-ci2-platform-negative'
+    runs-on: macos-15-intel
+    # 後段（8 分鐘）；6＋8＝14 分鐘，在 decision.md 目標的 15 分鐘合計上限內
+    # （runner 排隊／平台 cancel 延遲另計，未經驗證，見 plan.md）。
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
+
+      - name: write unique ready marker（run/head/attempt 一致性核對用）
+        id: ready-marker
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UPSTREAM_RUN_ID: ${{ needs.step-timeout-and-always.outputs.run-id }}
+          UPSTREAM_RUN_ATTEMPT: ${{ needs.step-timeout-and-always.outputs.run-attempt }}
+          UPSTREAM_HEAD_SHA: ${{ needs.step-timeout-and-always.outputs.head-sha }}
+        run: |
+          test "$UPSTREAM_RUN_ID" = "$RUN_ID"
+          test "$UPSTREAM_RUN_ATTEMPT" = "$RUN_ATTEMPT"
+          test "$UPSTREAM_HEAD_SHA" = "$HEAD_SHA"
+          {
+            echo "PHASE=cancel-target-ready"
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_ATTEMPT=$RUN_ATTEMPT"
+            echo "JOB=cancel-target"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "CHECKOUT_HEAD=$(git rev-parse HEAD)"
+            echo "UPSTREAM_RUN_ID=$UPSTREAM_RUN_ID"
+            echo "UPSTREAM_RUN_ATTEMPT=$UPSTREAM_RUN_ATTEMPT"
+            echo "UPSTREAM_HEAD_SHA=$UPSTREAM_HEAD_SHA"
+            echo "TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee ready-marker.txt
+
+      - name: upload ready artifact（先寫 ready marker 並上傳，才進入有界等待）
+        id: upload-ready
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-ci2-negative-platform-cancel-ready-marker
+          if-no-files-found: error
+          path: ready-marker.txt
+
+      # 有界等待——controller 在核對過 API／artifact／log／ready marker（見
+      # plan.md「取消前的讀取程序」）之後，才可以對這個 run 提出一次普通
+      # `gh run cancel`。這裡本身不執行任何 cancel（本輪禁止一切 gh 寫入操
+      # 作）；若沒有人介入，fixture 在 180 秒後以非零自然結束，
+      # 記為「cancel 未驗證」，不把自然到期當成 cancel 成功。
+      - name: bounded-wait-for-controller-cancel
+        id: bounded-wait
+        timeout-minutes: 4
+        run: |
+          echo "waiting up to 180 seconds for controller cancel; 4-minute step timeout is a separate hard fallback"
+          /bin/sleep 180
+          echo "::error::controller cancellation not observed before natural expiry"
+          exit 1
+
+      - name: step-level always tail（只用來觀察，不保證必跑）
+        id: observe-tail
+        if: always()
+        timeout-minutes: 1
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "job.status=$JOB_STATUS" > tail-observation.txt
+          date -u +%Y-%m-%dT%H:%M:%SZ >> tail-observation.txt
+          cat ready-marker.txt >> tail-observation.txt 2>/dev/null || echo "ready-marker.txt missing" >> tail-observation.txt
+
+      - name: upload final diagnostic evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-ci2-negative-platform-cancel-final-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            ready-marker.txt
+            tail-observation.txt
+
+  # =========================================================================
+  # Run B：C／wrapper／NO-RUN 元件證據 ＋ artifact 空路徑前置缺檔 oracle，
+  # 單一小 job，依序執行 decision.md 五個子步驟。
+  # =========================================================================
+  diagnostic-artifact-and-components:
+    name: b3a-ci2-negative-artifact / diagnostic-artifact-and-components
+    if: >-
+      github.event.label.name == 'b3a-ci2-negative-artifact' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'ci/b3a-ci2-platform-negative'
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1，與 b3a-e2e-ci.yml 同版本
+        timeout-minutes: 2
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0，與 b3a-e2e-ci.yml 同版本
+        timeout-minutes: 2
+        with:
+          node-version: '26.10.0'
+
+      - name: record identity marker
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+          {
+            echo "PHASE=diagnostic-artifact-and-components"
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_ATTEMPT=$RUN_ATTEMPT"
+            echo "JOB=diagnostic-artifact-and-components"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "CHECKOUT_HEAD=$(git rev-parse HEAD)"
+            echo "TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee phase-marker.txt
+        timeout-minutes: 1
+
+      # 步驟 1–4（decision.md）：核 source hash → C 受控分支證據 → wrapper
+      # 三情境 → NO-RUN。全部在 run-b-driver.mjs 內完成，寫出唯一的
+      # receipt.json（含每個子案的期待值／實際值／單獨結果／整體判定）。
+      - name: run diagnostic driver（hash 核對／C／wrapper／NO-RUN）
+        id: driver
+        timeout-minutes: 6
+        run: |
+          mkdir -p "$RUNNER_TEMP/b3a-ci2-negative-artifact-driver"
+          node .github/scripts/diagnostic/run-b-driver.mjs "$GITHUB_WORKSPACE" "$RUNNER_TEMP/b3a-ci2-negative-artifact-driver"
+
+      # 步驟 5（decision.md）：唯一新目錄裡上傳非空 control（必須 success），
+      # 再上傳刻意為空的 empty（只有它 continue-on-error），接著斷言
+      # steps.<empty>.outcome=='failure'。
+      - name: prepare control/empty upload directories
+        id: prepare
+        timeout-minutes: 1
+        run: |
+          mkdir -p diag-artifact-oracle/control diag-artifact-oracle/empty
+          echo "control file, non-empty path, should upload fine" > diag-artifact-oracle/control/control.txt
+          # diag-artifact-oracle/empty 刻意保持空——這是 oracle 唯一要觀察的
+          # 目標情境；空路徑只證明 upload-artifact 的缺檔前置拒絕，不是
+          # NO-RUN，也不是網路／權限／儲存服務失敗。
+
+      - name: upload non-empty control artifact（必須 success）
+        id: upload-control
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-ci2-negative-artifact-control
+          if-no-files-found: error
+          path: diag-artifact-oracle/control/**
+
+      - name: upload deliberately-empty artifact（只有這一步 continue-on-error）
+        id: upload-empty
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-ci2-negative-artifact-empty
+          if-no-files-found: error
+          path: diag-artifact-oracle/empty/**
+
+      - name: assert empty-upload outcome oracle（意外 success/skipped/cancelled 都要讓 job 失敗）
+        id: assert-empty-outcome
+        if: always()
+        timeout-minutes: 1
+        env:
+          DRIVER_OUTCOME: ${{ steps.driver.outcome }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          CONTROL_OUTCOME: ${{ steps.upload-control.outcome }}
+          CONTROL_CONCLUSION: ${{ steps.upload-control.conclusion }}
+          EMPTY_OUTCOME: ${{ steps.upload-empty.outcome }}
+          EMPTY_CONCLUSION: ${{ steps.upload-empty.conclusion }}
+        run: |
+          {
+            echo "driver.outcome=$DRIVER_OUTCOME"
+            echo "prepare.outcome=$PREPARE_OUTCOME"
+            echo "upload-control.outcome=$CONTROL_OUTCOME"
+            echo "upload-control.conclusion=$CONTROL_CONCLUSION"
+            echo "upload-empty.outcome=$EMPTY_OUTCOME"
+            echo "upload-empty.conclusion=$EMPTY_CONCLUSION"
+          } | tee artifact-oracle-observation.txt
+          if [ "$DRIVER_OUTCOME" != "success" ] || [ "$PREPARE_OUTCOME" != "success" ]; then
+            echo "::error::component driver or preparation failed; no further stimulus permitted"
+            exit 1
+          fi
+          if [ "$CONTROL_OUTCOME" != "success" ]; then
+            echo "::error::control upload 必須 success，實際 outcome=$CONTROL_OUTCOME"
+            exit 1
+          fi
+          if [ "$EMPTY_OUTCOME" != "failure" ]; then
+            echo "::error::empty upload 預期 outcome=failure（前置缺檔拒絕），實際=$EMPTY_OUTCOME——success/skipped/cancelled 任一都視為 oracle 失敗"
+            exit 1
+          fi
+
+      # 步驟 6：最後 always 上傳 receipt 與元件原始證據；缺 log/manifest/
+      # receipt 也要讓 job 失敗（if-no-files-found:error，不用 warn）。
+      - name: upload final receipt and component evidence
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b3a-ci2-negative-artifact-receipt-and-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            phase-marker.txt
+            artifact-oracle-observation.txt
+            ${{ runner.temp }}/b3a-ci2-negative-artifact-driver/**
+
+# 明確不承諾（未經真實遠端執行驗證，見 plan.md「未驗證項目」）：
+#   - always() 在 timeout／人工 cancel 情境下不保證一定執行到 upload-artifact
+#     這一步；平台可能在收到 timeout/cancel 訊號後對整個 job process group
+#     送出的訊號使 always() 收尾也來不及跑完——這正是 Run A 要觀察的問題，
+#     不是已知答案。
+#   - job timeout-minutes 只是保底上限，不是實測耗時，也不是 runner 使用授
+#     權；本輪只驗證 step timeout，job timeout 未驗。
+#   - 這份 workflow 本身尚未觸發過任何遠端 run。
