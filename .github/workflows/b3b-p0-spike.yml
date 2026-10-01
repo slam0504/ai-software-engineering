@@ -87,9 +87,6 @@ jobs:
       github.event.pull_request.head.ref == 'b3b-p0-diagnostic' &&
       github.event.label.name == 'b3b-p0-spike-approved'
     timeout-minutes: 30
-    env:
-      RUNDIR: ${{ runner.temp }}/p0-rundir
-      SETUP_DIR: ${{ runner.temp }}/p0-rundir/setup
     steps:
       # ---- setup／下載階段（與 driver 的 5 分鐘觀測預算分開計時） ----
       # 004：setup 的所有輸出（run_json/artifact_json/開始時間/node 版本）
@@ -97,9 +94,14 @@ jobs:
       # $RUNDIR/workspace 同屬一個 RUNDIR 根目錄——整個 run 只有一個證據
       # 根目錄，upload 步驟直接打包整個 RUNDIR。
       - name: record setup start
+        env:
+          RUNDIR: ${{ runner.temp }}/p0-rundir
+          SETUP_DIR: ${{ runner.temp }}/p0-rundir/setup
         run: |
           mkdir -p "$SETUP_DIR"
           date -u +%s > "$SETUP_DIR/setup_start_epoch.txt"
+          echo "RUNDIR=$RUNDIR" >> "$GITHUB_ENV"
+          echo "SETUP_DIR=$SETUP_DIR" >> "$GITHUB_ENV"
 
       - name: checkout (full SHA action, explicit PR head SHA ref)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（沿用 ci.yml 既有、已審過的 pin,不另外引入新的 supply-chain surface)
