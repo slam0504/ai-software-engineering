@@ -1,0 +1,218 @@
+# candidate/workflow-candidate.yml — B3b P0 spike workflow 候選（004）
+#
+# 本檔是候選,不是要安裝的檔案。本輪不 commit/push/PR、不接進
+# .github/workflows/ci.yml、不新增 required check、不觸發任何 CI 執行。
+# 若之後獲授權執行 P0,把 candidate/ 整份（driver.sh／lib/*.sh）複製到本檔
+# 下方 `driver path` 註解標明的實際路徑即可直接使用,不需要再改這份 YAML
+# 裡的路徑。
+#
+# 002 的九項修正（見 compliance-table.md「必修 C」區塊）本輪全部沿用不變：
+# 觸發精確事件、job-level if 四條件、cancel-in-progress:false、full-SHA
+# checkout+PR head SHA、Node 精確版號、寫死常數 artifact 身分、metadata
+# 核對、Python 標準庫安全解析、upload 用完整 SHA 且不放寬 retention。
+#
+# 004 對 review564「保存與 extractor」段新增兩項修正：
+#   10. metadata 核對步驟（run id/head sha/artifact name）過去只把
+#       run_json/artifact_json 放在 shell 變數裡，從沒寫到磁碟，upload
+#       evidence 自然也拿不到——decision.md：「upload仍主要是evidence與兩個
+#       /tmp檔；需把身份查核輸入/結果、setup/log及原始錯誤落到唯一證據根
+#       目錄並納入upload」。整個 setup 階段的輸出（run_json／artifact_json／
+#       setup 開始時間／node 版本）都寫進 `${{ runner.temp }}/p0-rundir/
+#       setup/`——與 driver.sh 自己管理的 `evidence/`／`workspace/` 同一個
+#       RUNDIR 根目錄下的兄弟目錄（driver.sh 的 no-reuse 檢查已同步收斂成
+#       只檢查 evidence/／workspace/），upload 的 path 也改成整個 RUNDIR，
+#       不再另外散落 /tmp 下的檔案。
+#   11. setup-end 時間點：舊版「record setup end」在 setup-node 之前執行，
+#       算出來的 setup_duration_seconds 不包含 Node 安裝時間，不是完整的
+#       setup 耗時。004 把這個步驟移到 `node --version` 之後（整個 setup
+#       階段——checkout/metadata/download/safe-extract/setup-node——全部
+#       跑完才算 setup 結束），與「driver 的 5 分鐘觀測預算」分開計時這件事
+#       本身沒變，只是分界點移到真正的 setup 尾端。
+#
+# 假 backend 注入防護（decision.md：「假backend注入只供離線測試,正式GHA
+# 入口需拒絕未知/污染的工具替換與FAKE_* override」）：這份 workflow 本身
+# 從不設定 OSASCRIPT_BIN／SCREENCAPTURE_BIN／CG_WINDOW_CHECK_CMD 或任何
+# `FAKE_*` 變數；額外的防線在 candidate/driver.sh 的
+# check_no_test_injection_in_ci()——只要偵測到 GITHUB_ACTIONS=true 且這些
+# 變數任一存在（例如被 repo/org variables 或某個上游 step 意外注入），
+# driver 會立即拒絕執行並以非 0 退出,不依賴這份 YAML 本身「沒寫」就够。
+
+name: b3b-p0-spike (candidate, non-required)
+
+on:
+  pull_request:
+    types: [labeled]
+
+# 只信任精確符合下列條件的觸發：
+#   - 同一個 repo（不是 fork PR，避免 secrets/artifact 讀取權限外流）
+#   - base branch 是 main
+#   - head branch 是這份候選指定的專用診斷分支（分支確切名稱屬於「執行授權
+#     時才決定」的事，這裡用一個具體字面值佔位，結構上要求「精確比對單一
+#     分支名」而不是「符合某個 prefix/pattern 就放行」）
+#   - 這次事件觸發的 label 精確等於下方指定的單一 label 名稱（不是「有任何
+#     label」）
+env:
+  ALLOWED_HEAD_BRANCH: "b3b-p0-diagnostic"
+  ALLOWED_LABEL: "b3b-p0-spike-approved"
+  # 固定 artifact 身分——寫死常數,不是 workflow_dispatch input,不允許任意
+  # 覆寫。
+  PINNED_RUN_ID: "36385577457"
+  PINNED_RUN_ATTEMPT: "1"
+  PINNED_HEAD_SHA: "ef041d4a02fa96cb72f7dc3aefdc59676c5b9412"
+  PINNED_ARTIFACT_ID: "10954731826"
+  PINNED_ARTIFACT_NAME: "wails-app-tar"
+  PINNED_ZIP_SHA256: "4c48b2f8fd49da5a8b86dd5ed73dd45c15a015a05b806196de2810ab371843d0"
+  PINNED_NODE_VERSION: "26.10.0"
+
+permissions:
+  contents: read
+  actions: read   # 只需要讀既有 artifact,不需要寫權限
+
+concurrency:
+  group: b3b-p0-spike
+  # cancel-in-progress=false,不自動取消正在跑的取證——診斷資料一旦開始
+  # 蒐集就讓它跑完,不要因為新事件把進行中的 evidence run 攔腰砍斷。
+  cancel-in-progress: false
+
+jobs:
+  p0-spike:
+    name: p0-spike (diagnostic, not required)
+    runs-on: macos-15-intel
+    # job 級 if：同 repo／base main／專用分支／精確 label 四個條件同時成立
+    # 才跑,任何一個不符就整個 job skip（不是進去了才在 step 裡面判斷再
+    # exit，那樣還是消耗了 runner）。
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'b3b-p0-diagnostic' &&
+      github.event.label.name == 'b3b-p0-spike-approved'
+    timeout-minutes: 30
+    steps:
+      # ---- setup／下載階段（與 driver 的 5 分鐘觀測預算分開計時） ----
+      # 004：setup 的所有輸出（run_json/artifact_json/開始時間/node 版本）
+      # 都落在 $SETUP_DIR，與 driver.sh 自己管理的 $RUNDIR/evidence、
+      # $RUNDIR/workspace 同屬一個 RUNDIR 根目錄——整個 run 只有一個證據
+      # 根目錄，upload 步驟直接打包整個 RUNDIR。
+      - name: record setup start
+        env:
+          RUNDIR: ${{ runner.temp }}/p0-rundir
+          SETUP_DIR: ${{ runner.temp }}/p0-rundir/setup
+        run: |
+          mkdir -p "$SETUP_DIR"
+          date -u +%s > "$SETUP_DIR/setup_start_epoch.txt"
+          echo "RUNDIR=$RUNDIR" >> "$GITHUB_ENV"
+          echo "SETUP_DIR=$SETUP_DIR" >> "$GITHUB_ENV"
+
+      - name: checkout (full SHA action, explicit PR head SHA ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（沿用 ci.yml 既有、已審過的 pin,不另外引入新的 supply-chain surface)
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: verify metadata (run id / head sha / artifact name), not just ZIP hash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_json=$(gh api "repos/${{ github.repository }}/actions/runs/${PINNED_RUN_ID}/attempts/${PINNED_RUN_ATTEMPT}")
+          echo "$run_json" > "$SETUP_DIR/run.json"
+          actual_head_sha=$(echo "$run_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['head_sha'])")
+          if [ "$actual_head_sha" != "$PINNED_HEAD_SHA" ]; then
+            echo "::error::run head_sha mismatch: expected $PINNED_HEAD_SHA got $actual_head_sha" | tee "$SETUP_DIR/metadata-verify.err"
+            exit 1
+          fi
+          artifact_json=$(gh api "repos/${{ github.repository }}/actions/artifacts/${PINNED_ARTIFACT_ID}")
+          echo "$artifact_json" > "$SETUP_DIR/artifact.json"
+          actual_name=$(echo "$artifact_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
+          if [ "$actual_name" != "$PINNED_ARTIFACT_NAME" ]; then
+            echo "::error::artifact name mismatch: expected $PINNED_ARTIFACT_NAME got $actual_name" | tee "$SETUP_DIR/metadata-verify.err"
+            exit 1
+          fi
+          actual_workflow_run=$(echo "$artifact_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['workflow_run']['id'])")
+          if [ "$actual_workflow_run" != "$PINNED_RUN_ID" ]; then
+            echo "::error::artifact workflow_run id mismatch: expected $PINNED_RUN_ID got $actual_workflow_run" | tee "$SETUP_DIR/metadata-verify.err"
+            exit 1
+          fi
+
+      - name: download pinned wails-app-tar artifact (no override input; constants only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/artifacts/${PINNED_ARTIFACT_ID}/zip" \
+            > wails-app-tar.zip
+          actual=$(shasum -a 256 wails-app-tar.zip | awk '{print $1}')
+          echo "$actual" > "$SETUP_DIR/zip.sha256.actual"
+          if [ "$actual" != "$PINNED_ZIP_SHA256" ]; then
+            echo "::error::ZIP SHA256 mismatch: expected $PINNED_ZIP_SHA256 got $actual" | tee "$SETUP_DIR/download.err"
+            exit 1
+          fi
+
+      - name: safe-parse ZIP + inner tar BEFORE extracting (no ditto-then-check)
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/p0-spike/safe_extract.py" \
+            --zip wails-app-tar.zip \
+            --zip-out unzipped \
+            --tar-out extracted 2> "$SETUP_DIR/safe-extract.err" | tee "$SETUP_DIR/safe-extract.out"
+          echo "APP_BIN=$PWD/extracted/sdlc-workbench.app/Contents/MacOS/sdlc-workbench" >> "$GITHUB_ENV"
+
+      - name: setup-node (exact patch pin, not major-only)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0（沿用 ci.yml 既有 pin）
+        with:
+          node-version: ${{ env.PINNED_NODE_VERSION }}
+
+      - run: node --version | tee "$SETUP_DIR/actual-node-version.txt"
+
+      - name: record setup end / compute setup duration (excluded from driver's 5-minute budget)
+        # 004：移到 setup-node/node --version 之後——完整 setup（checkout /
+        # metadata / download / safe-extract / setup-node）都跑完才算 setup
+        # 結束，舊版在 setup-node 之前就記了 setup-end，
+        # setup_duration_seconds 漏算 Node 安裝耗時，不是完整 setup 耗時。
+        run: |
+          start=$(cat "$SETUP_DIR/setup_start_epoch.txt")
+          end=$(date -u +%s)
+          echo "$end" > "$SETUP_DIR/setup_end_epoch.txt"
+          echo "setup_duration_seconds=$((end - start))" | tee -a "$GITHUB_STEP_SUMMARY" | tee "$SETUP_DIR/setup_duration_seconds.txt"
+
+      # ---- driver 階段（5 分鐘觀測+收尾預算，driver.sh 內部強制） ----
+      # driver path：若獲授權執行,candidate/driver.sh 與 candidate/lib/*.sh
+      # 複製到 repo 內 .github/p0-spike/（與 .github/p0-spike/safe_extract.py
+      # 同一個新目錄，不放進 .github/workflows/），這裡引用的就是那個實際
+      # 存在的路徑,不是佔位符。本輪**不**把這些檔案實際安裝進
+      # ai-se-worktrees/b3a-ci-1 或任何 repo——這份 YAML 只是描述「若採用,
+      # 檔案要放哪裡、指令要長什麼樣子」。driver.sh 內建
+      # check_no_test_injection_in_ci()：這個 step 的環境繼承自
+      # `runs-on: macos-15-intel` 的乾淨 GITHUB_ACTIONS=true runner
+      # 環境，本身不注入任何 FAKE_*／OSASCRIPT_BIN／SCREENCAPTURE_BIN／
+      # CG_WINDOW_CHECK_CMD，driver 的防護是「即使將來有人不小心加了」也
+      # 會被擋下，不是本步驟本身需要額外做什麼。
+      # 010（review595 必修 3）：candidate 現在預設拒絕任何真工具呼叫
+      # （App spawn／osascript／screencapture／Quartz），只有這個 step 的
+      # env 裡設定 P0_ALLOW_NATIVE=1 才放行——這是「若本候選未來獲授權
+      # 執行時，這一步應該長什麼樣子」的設定候選，寫在這裡**不等於現在
+      # 已經授權執行**；本輪（010）與這份 YAML 所屬的任何候選版本一樣，
+      # 完全不 commit/push/接進 CI，也不會有任何一次真的以
+      # P0_ALLOW_NATIVE=1 執行——見 010/PROGRESS.md／compliance-table.md
+      # 的邊界聲明。全 repo／全 workflow 只有這一個 step 允許設定這個
+      # 旗標；離線測試（run_tests.sh）固定 unset 它。
+      - name: run P0 driver (bounded, real path)
+        env:
+          TOTAL_BUDGET_SECS: "300"
+          P0_ALLOW_NATIVE: "1"  # 只在這裡；不等於已授權執行，見上方註解
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.github/p0-spike/driver.sh"
+
+      - name: upload evidence (always, even on failure; no missing-file silence)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1（沿用 ci.yml 既有 pin）
+        with:
+          name: b3b-p0-spike-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          # 004：整個 RUNDIR（setup/ + evidence/ + workspace/）就是唯一證據
+          # 根目錄——setup 階段的 run.json/artifact.json/setup log 與
+          # driver.sh 自己的 evidence/ 現在在同一棵樹下，不再散落 /tmp。
+          path: |
+            ${{ runner.temp }}/p0-rundir/**
+          # 不自行設定 retention-days：沿用 repo/org 預設值。
