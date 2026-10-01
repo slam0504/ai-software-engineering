@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev78·估點版）
+# Pre-M4 Readiness Backlog（rev79·估點版）
 
-> 版本：rev78（2026-10-01）：**B3b 重新定位**（owner 2026-10-01 決定；codex-reviewer 對 reframe-proposal-003 ACCEPT #668）。原 B3b 驗收條件改由三層承接：L1 **B3b-CI** packaged-app startup／bundle smoke（no UI assertions；於 `push` 至 `main` 時執行；發布只在 current main SHA 的 L1 已完成且 success 時允許）、L2 **B3b-ready** 前端與 binding 就緒訊號（產品票）、L3 **B3b-RC** release candidate 真實 Mac 視覺檢查；拆為 B3b-CI-1／B3b-CI-2／B3b-ready／B3b-RC-1／B3b-RC-2 五張票，剩餘工程暫估 17–29 hr（1.7–2.9 pt），原 0.5 pt 改列歷史估計。唯一一次 P0（run `36801518474`）為 **FAILURE／不驗收**（review659），只接受 startup、audit、bundle tools source、System Events 存取、fail-fast、證據上傳與有界收尾等有界事實。本次只改寫 B3b 段落、估點表 B3b 列與本檔頭；其他票與其點數不變（本檔沒有任何小計或合計列計入 B3b 的 0.5 pt）；rev77 以前內容保留為歷史。
+> 版本：rev79（2026-10-01）：**新增 D6 票、D7 票（各拆為兩張子票）；修訂 D5 一句**（owner 2026-10-01 決定；codex-reviewer review686 依工作性質拆票）。D6 票「AI 探索式測試與規格回饋流程」拆為 D6a 流程與證據契約設計、D6b 受控 browser 試跑，落實參考型 SDLC v2.1 附錄 A.5；D7 票「Gherkin runner 導入」拆為 D7a runner 選型與相容性 spike、D7b bounded integration，排在 D6b 之後。D5 在 D7b 證明等價 traceability 之前維持有效。D 軌維持「待立項後估」，本次不新增點數；其他票與點數不變；參考型 SDLC 文件本次不修改；rev78 以前內容保留為歷史。
+
+> 前版：rev78（2026-10-01）：**B3b 重新定位**（owner 2026-10-01 決定；codex-reviewer 對 reframe-proposal-003 ACCEPT #668）。原 B3b 驗收條件改由三層承接：L1 **B3b-CI** packaged-app startup／bundle smoke（no UI assertions；於 `push` 至 `main` 時執行；發布只在 current main SHA 的 L1 已完成且 success 時允許）、L2 **B3b-ready** 前端與 binding 就緒訊號（產品票）、L3 **B3b-RC** release candidate 真實 Mac 視覺檢查；拆為 B3b-CI-1／B3b-CI-2／B3b-ready／B3b-RC-1／B3b-RC-2 五張票，剩餘工程暫估 17–29 hr（1.7–2.9 pt），原 0.5 pt 改列歷史估計。唯一一次 P0（run `36801518474`）為 **FAILURE／不驗收**（review659），只接受 startup、audit、bundle tools source、System Events 存取、fail-fast、證據上傳與有界收尾等有界事實。本次只改寫 B3b 段落、估點表 B3b 列與本檔頭；其他票與其點數不變（本檔沒有任何小計或合計列計入 B3b 的 0.5 pt）；rev77 以前內容保留為歷史。
 
 > 前版：rev77（2026-09-28）：codex-reviewer review545 依 B3a 原驗收 (1)(2)(3) 與已核定子票範圍，裁定 **B3a aggregate 在既定範圍內技術驗收完成**。核心流程已有 repo 資產與同一 source 的 13 個受控 CI entry 證據，provider 維持 deterministic fake／replay，CI-1／CI-2 已整合進 main；原條件允許 non-required 起步，不新增日常觸發或 required 化作關票門檻。Source PR #26 與限定結案文件 PR [#28](https://github.com/slam0504/ai-software-engineering/pull/28) 已合併；PR #28 mergeCommit `7184daa139ea710f2058613d063f5ee5d3cd067b`，main CI `36383922565` attempt=1 四項 success。CI-3(a)/(b) 仍未授權、未啟用；cold-start、live provider、多輪穩定性與負例未涵蓋範圍仍保留，詳見[限定驗收紀錄](evidence/2026-09-28-b3a-ci-1-ci-2-closure.md)。本次只回填狀態，不改驗收原文、既有點數／合計或未量測工時；rev76 以前內容保留為歷史。
 
@@ -365,9 +367,54 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 
 ### D5 BDD scenario 與測試的 metadata 自動追蹤
 
-- **背景**：目前條款→測試對應靠人工矩陣，測試名稱漂移無機制偵測；不必導入 Cucumber runner。
+- **背景**：目前條款→測試對應靠人工矩陣，測試名稱漂移無機制偵測。（rev78 以前原寫「不必導入 Cucumber runner」；rev79 起，owner 2026-10-01 決定 runner 由 **D7 票**在 D6b 之後導入。**本票在 D7b 證明等價 traceability 之前維持有效**；只有 D7b 對本票 (1)–(4) 逐項證明等價或更強，並提供 migration／rollback 與既有 ID 對照之後，才能把本票標為 superseded，否則只能整合、不能取代。）
 - **驗收條件**：(1) active scenario 具穩定 ID；(2) 測試以 metadata 宣告 scenario ID；(3) CI 驗證每個 active scenario 至少一個對應測試（掛 B2）；(4) 驗收報告可從 metadata 自動產生。
 - **依賴／裁決**：CI 部分依賴 B2；無需裁決。
+
+### D6 票 AI 探索式測試與規格回饋流程（rev79 新增；aggregate，D6a＋D6b 完成才關）
+
+- **背景**：參考型 SDLC v2.1 附錄 A.5 已定義探索式測試與規格回饋的規則（既有 Rule 的回歸例照一般 review 推進；新增或改變規則、範圍、驗收門檻、商業選擇需 owner 核准；探索需有目標、界線與執行授權；瀏覽器探索不能證明 native 路徑），但目前沒有實際的流程或工具。B3a 的 browser E2E harness 可作為基底。（本文中的「D6」指 D 軌票號；B2 相關敘述中的「決策 D6」是另一回事。）
+- **D6a 流程與證據契約設計**
+  - **驗收條件**：
+    1. 目標選擇與範圍：以既有 Rule／Example 與風險為依據。
+    2. 界線：資料、登入、副作用與時間的界線（例如只使用 fake 或 replay provider 與拋棄式 workspace，不碰真實帳號與外部服務）。
+    3. 證據 schema：重現步驟、截圖、console、網路紀錄，以及對應的 source、build、SHA。
+    4. 結果分流（依附錄 A.5），並附上授權矩陣：
+       - 探索結果先保存為 **observation**，不直接成為需求或缺陷的結論；
+       - 違反已確認 Rule 的重現例，取得既有 bugfix scope 的實作授權後，才進入 TDD；
+       - 新增或改變 Rule、範圍、門檻或商業選擇，先寫成 candidate Rule／Example 交 owner 核准；
+       - 完成分流並取得對應授權後，才寫「預期會在目標 assertion 失敗」的紅燈測試；setup 或環境失敗不算紅燈。
+  - **依賴／裁決**：依賴 B3a（已完成）與附錄 A.5；探索範圍與界線需 owner 裁決。
+- **D6b 受控 browser 試跑**
+  - **驗收條件**：
+    1. 固定 source、build 與 SHA，並另外取得執行授權。
+    2. 依 D6a 的流程執行一次，保存並封存證據。
+    3. 驗證流程是否可用。
+  - 結果的解讀：
+    - 「沒有發現候選」只證明這次流程有執行，不證明產品沒有缺陷；
+    - infrastructure failure 記為「無法判定」；
+    - browser 的結果不得外推到 native。
+  - **依賴／裁決**：依賴 D6a；執行授權需 owner 裁決。
+
+### D7 票 Gherkin runner 導入（rev79 新增；aggregate，D7a＋D7b 完成才關）
+
+- **背景**：參考型 SDLC v2.1 附錄 A.4 目前以「Rule／Example ID ↔ 測試」的人工對照表取代 runner，§10 記載 runner 的收益尚未驗證。owner 2026-10-01 決定在 D6 之後導入 Gherkin runner。在 runner 實際落地之前，A.4 與 §10 的現況措辭維持不變。
+- **D7a runner 選型與相容性 spike**
+  - **驗收條件**：比較候選 runner（例如 Go 端的 godog、前端的 cucumber-js），涵蓋以下面向：
+    - Go、前端、native 各層的定位，以及不涵蓋的範圍；
+    - 相依套件與維護成本；
+    - 與現有 feature 檔、測試架構的適配程度。
+    - **沒有合格候選時，回報 owner 決定，不得為了完成「導入」而硬選。**
+  - **依賴／裁決**：依賴 D6b。
+- **D7b bounded integration**
+  - **驗收條件**：
+    1. 先做一個具名的 vertical slice。
+    2. 在 CI 中檢查 undefined 或 ambiguous step。
+    3. 訂定 glue code 的撰寫與審查規則；AI 產生的 glue code 必須經過審查。
+    4. 漸進式 migration，不一次轉換全部 feature 檔。
+    5. 依 D5 的條件處理與 D5 的關係：逐項證明等價或更強，才能將 D5 標為 superseded；否則只整合。
+    6. **收尾時**，檢查並更新參考型 SDLC 的 A.4、§10 與 v2.1 修訂記錄的現況措辭。更新時保留「runner 不是通用 BDD 的必備條件」，並保留未遷移範圍以 D5 作為 fallback。
+  - **依賴／裁決**：依賴 D7a，以及 owner 對 runner 選型與相依套件的核准。
 
 ---
 
