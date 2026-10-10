@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev81·估點版）
+# Pre-M4 Readiness Backlog（rev82·估點版）
 
-> 版本：rev81（2026-10-10）：**A3 關票＋修訂記錄補齊**（owner 2026-10-10 授權先做小票）。A3 的驗收三項都有證據：header 同步與 frozen／living 原則已由 `26de25d`（2026-08-27）完成，凍結清單已由 `66a7110`（2026-09-06）收斂；本版補上同類掃描紀錄（[收尾紀錄](evidence/2026-10-10-a3-doc-version-closure.md)）。掃描找到一處 living 文件不一致：本檔的「修訂記錄」只到 rev75，rev76～rev80 只寫在檔頭。本版在修訂記錄補上 rev76～rev81 的條目，摘自各版檔頭，不改寫原文。frozen 快照（m0／m1／m1.5 plan，`SHA256SUMS` 三份全部 OK）不修改。其他票與點數都不變。
+> 版本：rev82（2026-10-10）：**A5 關票**（owner 2026-10-10 授權先做小票）。A5 的處置已由 `9cb2e67`（2026-09-08，owner 裁定方案 A：只同步 `models.ts` 的 `GateEntryDTO.terminal_cause` 兩行）完成，但本檔一直沒有記錄。本版在 main 現況重新執行 `wails generate module`（Wails v2.13.0），結果內容差異為零，只有 runtime 三個檔的權限副作用；詳見[驗證紀錄](evidence/2026-10-10-a5-bindings-sync-verification.md)（首次產生因缺少 `frontend/dist` 而 rc 1，補上佔位檔後重新產生成功，兩次 log 都保留）。本版未提交任何產生檔的內容變更；驗證只在隔離 worktree 中重寫出相同內容，另有權限副作用。CI 目前沒有產生檔漂移檢查，列為觀察，是否處理另案決定。其他票與點數都不變。
+
+> 前版：rev81（2026-10-10）：**A3 關票＋修訂記錄補齊**（owner 2026-10-10 授權先做小票）。A3 的驗收三項都有證據：header 同步與 frozen／living 原則已由 `26de25d`（2026-08-27）完成，凍結清單已由 `66a7110`（2026-09-06）收斂；本版補上同類掃描紀錄（[收尾紀錄](evidence/2026-10-10-a3-doc-version-closure.md)）。掃描找到一處 living 文件不一致：本檔的「修訂記錄」只到 rev75，rev76～rev80 只寫在檔頭。本版在修訂記錄補上 rev76～rev81 的條目，摘自各版檔頭，不改寫原文。frozen 快照（m0／m1／m1.5 plan，`SHA256SUMS` 三份全部 OK）不修改。其他票與點數都不變。
 
 > 前版：rev80（2026-10-10）：**B3b-CI-1 停止**（owner 2026-10-10 決定）。B3b-CI-1 停在 repo 外的 candidate-013，codex-reviewer 判定 CHANGES_REQUIRED（review013），兩項 P1 未解；不交付、不發布，B3b-CI-1 尚未整合 repo 程式或 L1 workflow。B3b-CI-2 因缺少可驗收的 L1 實作，整合與實跑驗收受阻；B3b-ready、B3b-RC-1、B3b-RC-2 的範圍不受影響。本次只在 B3b 段落新增狀態條目，並在估點表的 B3b-CI-1 列標註狀態；驗收原文、其他票與點數都不變，rev79 以前的內容保留為歷史。
 
@@ -473,7 +475,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | A2-1 | 前端同步與 error lifecycle：`withEscalationReload`、Spec／Plan optional prop、`decideGate` 補重載、`spec:changed`／`plan:changed` 監聽、store 序號守衛、Spec 專門回歸（17 條新測試） | **0.6**（6.0 hr） | **已完成**（2026-09-09 驗收通過；review PASS＋補正＋GUI 四段，agent 操作歸屬） |
 | A2-2 | 後端三類 blocker 回歸：`missing-binding`／`negative-control-missed`／`journal-degraded` 建立、擋下 pending（`blocked by`＋key＋pending 狀態）、同一筆 resolved（3 條新測試＋5 helper） | **0.47**（4.7 hr） | **已完成**（2026-09-09 驗收通過；review PASS，G1–G7，全套 race rc 0）；不動 production、不加注入介面 |
 | A3（**已完成，rev81**） | 文件版本同步＋frozen／living 原則＋同型掃描 | 0.2 | 主體已由 `26de25d`／`66a7110` 完成；rev81 補同類掃描紀錄與修訂記錄 |
-| A5 | **bindings 產生檔同步**（rev32 新增）：`wails build` 會使 `frontend/wailsjs/go/models.ts` 產生 `terminal_cause` 欄位差異，代表 committed 產生檔相對 Go 端過期（來源 `53c94f0`，B6 Task 6b）。範圍：**先唯讀核對**產生方式（何時、由誰、是否應進版控）、完整差異、使用端影響；處置方式與是否更新產生檔另案授權 | **待估**（不計入小計） | owner 2026-09-07 裁定另立小票；不夾帶進 A1a，不直接授權更新產生檔 |
+| A5（**已完成，rev82**） | **bindings 產生檔同步**（rev32 新增）：`wails build` 會使 `frontend/wailsjs/go/models.ts` 產生 `terminal_cause` 欄位差異，代表 committed 產生檔相對 Go 端過期（來源 `53c94f0`，B6 Task 6b）。範圍：**先唯讀核對**產生方式（何時、由誰、是否應進版控）、完整差異、使用端影響；處置方式與是否更新產生檔另案授權 | **待估**（不計入小計） | owner 2026-09-07 裁定另立小票；不夾帶進 A1a，不直接授權更新產生檔；**處置已由 `9cb2e67`（2026-09-08，方案 A）完成；rev82 在 main 現況重新產生，驗證內容差異為零** |
 | A4 | 1.25／1.26.5 比較矩陣＋go.mod toolchain＋README | 0.4 | 兩腳全套執行屬監督型等候（約 1 hr 內），計入；建議 B1a 後執行 |
 | B1a-1 | #1 `TestAppServerTerminateKillsGroup`——`Proc` 未匯出 timer／signal-event seam＋(a) codex 端契約改寫＋(b) `internal/proc` 新增 deterministic white-box 測試 | **1.13**（0.90-1.35） | **已完成（2026-09-03，Gate 3 APPROVED；plan `efdc82c`、implementation `82caf8b`＋`f7ad1ed`）**。原估點維持不變作為歷史記錄。理解 1.0-1.5／production seam 1.5-2.5／測試改寫 2.5-3.5／mutation 2.5-3.5／獨立 design gate＋implementation review 1.5-2.5。**(a)(b) 必須同票**——兩者共同界定同一個 `Proc.Terminate()` seam，拆開會使 production 修改與契約驗證失去原子性。負載驗證移入 B1a-4 |
 | B1a-2 | #2 `TestClaudeAssistFailsLoudOnOversizedLine`、#3 `TestMultiTurnSendAndTurnBoundaries`、#4 `TestInFlightTurnDoesNotBlockNewSession`——非 process 類純測試確定性化 | **1.01**（0.81-1.21） | **已完成**（2026-09-04 Gate B APPROVED；plan `6dd8edf`、implementation `7b1bb0c`＋`05069e2`＋`b0a8404`）。production 零改動已由 range diff 機械確認。負載驗證仍在 B1a-4 |
@@ -605,6 +607,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev82（2026-10-10）：A5 關票。處置已由 `9cb2e67` 完成；重新產生驗證內容差異為零（見 `evidence/2026-10-10-a5-bindings-sync-verification.md`）。CI 沒有產生檔漂移檢查，列為觀察。
 - rev81（2026-10-10）：A3 關票（同類掃描紀錄見 `evidence/2026-10-10-a3-doc-version-closure.md`）；在本修訂記錄補上 rev76～rev80 的條目。
 - rev80（2026-10-10）：記錄 B3b-CI-1 停止，停在 repo 外的 candidate-013（review013 CHANGES_REQUIRED，兩項 P1 未解）；CI-2 因缺少可驗收的 L1 而受阻；依發布門檻政策，目前不具備發布資格。（PR #34，main `367526b`；本條為 rev81 補登，全文見檔頭「前版：rev80」。）
 - rev79（2026-10-01）：新增 D6 票（AI 探索式測試與規格回饋流程，拆 D6a／D6b）與 D7 票（Gherkin runner 導入，拆 D7a／D7b）；修訂 D5 一句。（rev81 補登，全文見檔頭「前版：rev79」。）
