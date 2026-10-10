@@ -92,7 +92,9 @@ Gate、TCA 與阻擋事項的目前狀態一律由既有紀錄重新計算（pro
 
 ### 從原始碼建置
 
-需求：macOS、Go 1.26+、Node.js、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)
+需求：macOS、Go（最低 1.25.0，對應 `go.mod` 的 `go 1.25.0`；已驗證版本為 1.26.5，對應 `toolchain go1.26.5`，CI 也使用此版本）、Node.js、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)
+
+> 本機 Go 低於 1.26.5 時，預設 `GOTOOLCHAIN=auto` 會切換至建議工具鏈，先找 PATH 中的 go1.26.5，否則使用快取或下載。若要使用符合最低 1.25.0 要求的本機 Go，請設定 `GOTOOLCHAIN=local`。
 
 ```bash
 git clone https://github.com/slam0504/ai-software-engineering.git
@@ -511,7 +513,7 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 
 | 層 | 技術 |
 |---|---|
-| Host | Go 1.26、Wails v2 |
+| Host | Go（最低 1.25.0、已驗證 1.26.5）、Wails v2 |
 | Frontend | Vue 3、TypeScript、Pinia、Vite、vue-i18n、CodeMirror 6 |
 | 渲染 | marked + DOMPurify（Markdown）、Mermaid（圖表，strict） |
 | 測試 | `go test -race`、vitest + @vue/test-utils、wire log replay 測試資料 |

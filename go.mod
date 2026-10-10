@@ -2,6 +2,8 @@ module github.com/slam0504/sdlc-workbench
 
 go 1.25.0
 
+toolchain go1.26.5
+
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/fsnotify/fsnotify v1.10.1
