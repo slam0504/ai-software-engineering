@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev80·估點版）
+# Pre-M4 Readiness Backlog（rev81·估點版）
 
-> 版本：rev80（2026-10-10）：**B3b-CI-1 停止**（owner 2026-10-10 決定）。B3b-CI-1 停在 repo 外的 candidate-013，codex-reviewer 判定 CHANGES_REQUIRED（review013），兩項 P1 未解；不交付、不發布，B3b-CI-1 尚未整合 repo 程式或 L1 workflow。B3b-CI-2 因缺少可驗收的 L1 實作，整合與實跑驗收受阻；B3b-ready、B3b-RC-1、B3b-RC-2 的範圍不受影響。本次只在 B3b 段落新增狀態條目，並在估點表的 B3b-CI-1 列標註狀態；驗收原文、其他票與點數都不變，rev79 以前的內容保留為歷史。
+> 版本：rev81（2026-10-10）：**A3 關票＋修訂記錄補齊**（owner 2026-10-10 授權先做小票）。A3 的驗收三項都有證據：header 同步與 frozen／living 原則已由 `26de25d`（2026-08-27）完成，凍結清單已由 `66a7110`（2026-09-06）收斂；本版補上同類掃描紀錄（[收尾紀錄](evidence/2026-10-10-a3-doc-version-closure.md)）。掃描找到一處 living 文件不一致：本檔的「修訂記錄」只到 rev75，rev76～rev80 只寫在檔頭。本版在修訂記錄補上 rev76～rev81 的條目，摘自各版檔頭，不改寫原文。frozen 快照（m0／m1／m1.5 plan，`SHA256SUMS` 三份全部 OK）不修改。其他票與點數都不變。
+
+> 前版：rev80（2026-10-10）：**B3b-CI-1 停止**（owner 2026-10-10 決定）。B3b-CI-1 停在 repo 外的 candidate-013，codex-reviewer 判定 CHANGES_REQUIRED（review013），兩項 P1 未解；不交付、不發布，B3b-CI-1 尚未整合 repo 程式或 L1 workflow。B3b-CI-2 因缺少可驗收的 L1 實作，整合與實跑驗收受阻；B3b-ready、B3b-RC-1、B3b-RC-2 的範圍不受影響。本次只在 B3b 段落新增狀態條目，並在估點表的 B3b-CI-1 列標註狀態；驗收原文、其他票與點數都不變，rev79 以前的內容保留為歷史。
 
 > 前版：rev79（2026-10-01）：**新增 D6 票、D7 票（各拆為兩張子票）；修訂 D5 一句**（owner 2026-10-01 決定；codex-reviewer review686 依工作性質拆票）。D6 票「AI 探索式測試與規格回饋流程」拆為 D6a 流程與證據契約設計、D6b 受控 browser 試跑，落實參考型 SDLC v2.1 附錄 A.5；D7 票「Gherkin runner 導入」拆為 D7a runner 選型與相容性 spike、D7b bounded integration，排在 D6b 之後。D5 在 D7b 證明等價 traceability 之前維持有效。D 軌維持「待立項後估」，本次不新增點數；其他票與點數不變；參考型 SDLC 文件本次不修改；rev78 以前內容保留為歷史。
 
@@ -136,6 +138,7 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **驗收條件**：header 版本與最新 revision 同步；文件明確標注 frozen（核可綁定 digest）／living 的區分原則；同型檢查掃過 `docs/architecture/` 其他規劃文件。
 - **建議模組**：`docs/architecture/*.md`。
 - **依賴／裁決**：無；無需裁決。
+- **狀態（rev81）**：**已完成**。驗收 (1)(2) 由 `26de25d` 完成（app-plan header v1.14，以及版本原則：header＝修訂記錄最新版、核可綁定為 frozen 語意），凍結清單由 `66a7110` 收斂為三份里程碑 plan；驗收 (3) 的同類掃描見[收尾紀錄](evidence/2026-10-10-a3-doc-version-closure.md)。掃描結果：frozen 快照的 digest 全部相符，不修改；m1-plan 狀態行的「草案」是核可快照的原文。living 文件中只有本檔的修訂記錄落後，已在 rev81 補齊。
 
 ### A4 Go minimum／validated toolchain 語意
 
@@ -469,7 +472,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | A2（aggregate） | Error lifecycle 三原則＋escalation 同步＋回歸測試 | **不單獨計入**（原列 0.4 pt 已由子票 0.6＋0.47＝1.07 pt／10.7 hr 取代，rev3 design gate 2026-09-08 核定） | **已完成／關票**（2026-09-09，owner 裁定綁定 base `6a32b23`＋兩份受測快照，見 A2 段）；實作在工作樹未提交。**實際工時未完整統計**（無工時紀錄；子代理執行時長不等於工時，不以等待時間推算） |
 | A2-1 | 前端同步與 error lifecycle：`withEscalationReload`、Spec／Plan optional prop、`decideGate` 補重載、`spec:changed`／`plan:changed` 監聽、store 序號守衛、Spec 專門回歸（17 條新測試） | **0.6**（6.0 hr） | **已完成**（2026-09-09 驗收通過；review PASS＋補正＋GUI 四段，agent 操作歸屬） |
 | A2-2 | 後端三類 blocker 回歸：`missing-binding`／`negative-control-missed`／`journal-degraded` 建立、擋下 pending（`blocked by`＋key＋pending 狀態）、同一筆 resolved（3 條新測試＋5 helper） | **0.47**（4.7 hr） | **已完成**（2026-09-09 驗收通過；review PASS，G1–G7，全套 race rc 0）；不動 production、不加注入介面 |
-| A3 | 文件版本同步＋frozen／living 原則＋同型掃描 | 0.2 | — |
+| A3（**已完成，rev81**） | 文件版本同步＋frozen／living 原則＋同型掃描 | 0.2 | 主體已由 `26de25d`／`66a7110` 完成；rev81 補同類掃描紀錄與修訂記錄 |
 | A5 | **bindings 產生檔同步**（rev32 新增）：`wails build` 會使 `frontend/wailsjs/go/models.ts` 產生 `terminal_cause` 欄位差異，代表 committed 產生檔相對 Go 端過期（來源 `53c94f0`，B6 Task 6b）。範圍：**先唯讀核對**產生方式（何時、由誰、是否應進版控）、完整差異、使用端影響；處置方式與是否更新產生檔另案授權 | **待估**（不計入小計） | owner 2026-09-07 裁定另立小票；不夾帶進 A1a，不直接授權更新產生檔 |
 | A4 | 1.25／1.26.5 比較矩陣＋go.mod toolchain＋README | 0.4 | 兩腳全套執行屬監督型等候（約 1 hr 內），計入；建議 B1a 後執行 |
 | B1a-1 | #1 `TestAppServerTerminateKillsGroup`——`Proc` 未匯出 timer／signal-event seam＋(a) codex 端契約改寫＋(b) `internal/proc` 新增 deterministic white-box 測試 | **1.13**（0.90-1.35） | **已完成（2026-09-03，Gate 3 APPROVED；plan `efdc82c`、implementation `82caf8b`＋`f7ad1ed`）**。原估點維持不變作為歷史記錄。理解 1.0-1.5／production seam 1.5-2.5／測試改寫 2.5-3.5／mutation 2.5-3.5／獨立 design gate＋implementation review 1.5-2.5。**(a)(b) 必須同票**——兩者共同界定同一個 `Proc.Terminate()` seam，拆開會使 production 修改與契約驗證失去原子性。負載驗證移入 B1a-4 |
@@ -602,6 +605,12 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev81（2026-10-10）：A3 關票（同類掃描紀錄見 `evidence/2026-10-10-a3-doc-version-closure.md`）；在本修訂記錄補上 rev76～rev80 的條目。
+- rev80（2026-10-10）：記錄 B3b-CI-1 停止，停在 repo 外的 candidate-013（review013 CHANGES_REQUIRED，兩項 P1 未解）；CI-2 因缺少可驗收的 L1 而受阻；依發布門檻政策，目前不具備發布資格。（PR #34，main `367526b`；本條為 rev81 補登，全文見檔頭「前版：rev80」。）
+- rev79（2026-10-01）：新增 D6 票（AI 探索式測試與規格回饋流程，拆 D6a／D6b）與 D7 票（Gherkin runner 導入，拆 D7a／D7b）；修訂 D5 一句。（rev81 補登，全文見檔頭「前版：rev79」。）
+- rev78（2026-10-01）：B3b 重新定位為三層（L1 B3b-CI、L2 B3b-ready、L3 B3b-RC），拆為五張票；唯一一次 P0 為 FAILURE／不驗收。（rev81 補登，全文見檔頭「前版：rev78」。）
+- rev77（2026-09-28）：B3a aggregate 在既定範圍內技術驗收完成（review545）。（rev81 補登，全文見檔頭「前版：rev77」。）
+- rev76（2026-09-28）：B3a-CI 的 CI-1／CI-2 在受控、label-triggered、non-required 範圍技術驗收完成（review538／review541）。（rev81 補登，全文見檔頭「前版：rev76」。）
 - rev75（2026-09-25）：B3a-2a 限定技術驗收完成（mailroom #459），source PR #23 已於 2026-09-25T09:06:29Z rebase merge 為 `41257e0d86a0fb6dddef9d38ec3809f305f97d02`；tree `09d70242011fe161af8c6fe227339402450e0b5b` 與受審 head `e66045d34f59373e023821079156b981277aa7ce` 相同，parent `be099dfa1f35c0a5ccbe36b35123bb4c3f41645c`。PR CI `36115456033` attempt=1 四項 success。新增結案紀錄，保留 Gate1 r4／Gate2與STALE r5 的快照差異、啟動前失敗、Gate2首跑失敗、diagnostic-only、單次樣本與其他驗證限制。原逾時原因未完整定位、共用程序身分問題未修復；B3a aggregate 仍待正式 CI 整合。點數欄與舊修訂不變，未量測工時維持未知。
 - rev74（2026-09-22）：**最終快照 `default`／`controls` 回歸實跑完成＋範圍裁定＋冷啟動候選票（codex-reviewer #411）**——受測快照 `aec7d2588509d8e404e72f7423d38697b8ab2cb5`（PR #21 mergeCommit）。A `test:e2e` run `20260922T003535Z-885415` PASSED、B `test:e2e:controls` run `20260922T003926Z-3503c4` PASSED（1 skipped／2 passed）；**control A 的預期失敗已自 `playwright-results.json` 逐項核對**（`errors.length===1` 且為目標斷言、`diskSha256`=`baselineSha256`、wrapper 延遲 2000ms），control B 完整新內容、延遲 2001ms；**`reverse-check` 預設跳過、本輪未啟用故無證據**。兩次 run 前後 source 未變、埠與程序已釋放；網路證據為取樣。**範圍裁定**：recovery 範圍限同一 App 執行期／既定 WSID 的 End→resume；**App 冷啟動讀盤拆為後續候選票**（不實作、不給點數、不稱已驗、不以 reload 或 same-App resume 代替）；default／controls 最終回歸列為 2b 關票前剩餘驗證。**Task F／2b 目前狀態：限定功能與最終回歸均已驗收，Task F／B3a-2b 於 #411 範圍內技術驗收完成（複核 #414）；結案文件待交付**，本 rev 不自行宣告關票。PR #21 已合併（CI 四項 success；一般 CI 不跑 browser E2E）。**未核定任何新總量 pt、未回填未量測工時**，其餘子票不變，rev73 及更早原文未動。
 - rev73（2026-09-22）：**B3a-2b-2 Claude approval deny 限定檢查點技術驗收通過（codex-reviewer #407）＋確認 PR #20 已合併**——範圍為「受控 fake Claude ＋ 真 App／MCP／broker／UI，使用者填入 run 專屬理由後實際按下拒絕」；**Task F 整體與 B3a-2b／B3a aggregate 仍未完成**。唯一 browser run `20260922T000918Z-c85e82` PASSED（第一次嘗試即通過），基底 `46df1d88`。交付 8 檔全在 `frontend/e2e/`、**未修改 production 程式碼**（無新增 source 檔，未動 `package.json`）。設計要點：`decision` 為必填欄位、`protocolDecisionFor()` 明確 decline→deny 且未知值 throw、判定依核定 decision 分流而**既有 allow 判定條件保留**（fail-closed 錯誤訊息後綴有調整）、deny 要求 `updatedInput` 連欄位都不存在且 message 逐字等於核定理由（據此排除 fail-closed 自動 deny 冒充）。新增 38 項檢查（**含正控制、負控制與 routing／builder 檢查**）。PR #20（recovery 檢查點）已 rebase merge 進 main，mergeCommit `46df1d88…`。未驗項（真實 provider／逾時自動 deny 實跑／空理由 deny／多 session／cold restart／正式 CI／單一樣本／binary 未重新 hash／`waitForChildExit` 未解）照實保留。**未核定任何新總量 pt**，其餘子票不變，rev72 及更早原文未動。
