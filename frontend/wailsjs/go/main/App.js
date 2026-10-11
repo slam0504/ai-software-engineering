@@ -26,6 +26,10 @@ export function ConfirmSpecCommit(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
 }
 
+export function ConfirmWorkspace(arg1) {
+  return window['go']['main']['App']['ConfirmWorkspace'](arg1);
+}
+
 export function CreateSession(arg1, arg2) {
   return window['go']['main']['App']['CreateSession'](arg1, arg2);
 }
@@ -208,4 +212,8 @@ export function TerminateSession(arg1) {
 
 export function ValidateTestCommit(arg1, arg2, arg3) {
   return window['go']['main']['App']['ValidateTestCommit'](arg1, arg2, arg3);
+}
+
+export function WorkspaceConfirmationStatus() {
+  return window['go']['main']['App']['WorkspaceConfirmationStatus']();
 }

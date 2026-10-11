@@ -85,6 +85,9 @@ func TestStateBindingsRejectedAfterShutdown(t *testing.T) {
 		{"PreviewAnalysisBaseBump", func() error { _, err := a.PreviewAnalysisBaseBump("p.md", ""); return err }},
 		{"ConfirmAnalysisBaseBump", func() error { _, err := a.ConfirmAnalysisBaseBump(BumpToken{}, "p.md", ""); return err }},
 		{"PlanAssist", func() error { _, err := a.PlanAssist("claude", "x"); return err }},
+		// B4：確認狀態雖然只在記憶體，兩個 binding 仍是 state binding——收尾之後一律被拒。
+		{"WorkspaceConfirmationStatus", func() error { _, err := a.WorkspaceConfirmationStatus(); return err }},
+		{"ConfirmWorkspace", func() error { return a.ConfirmWorkspace("whatever") }},
 	}
 	evidenceBefore := ""
 	if _, serr := os.Stat(filepath.Join(a.stateDir, "evidence", "evidence.jsonl")); serr == nil {

@@ -19,6 +19,8 @@ export function ConfirmPlanCommit(arg1:spec.CommitToken,arg2:string):Promise<voi
 
 export function ConfirmSpecCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
 
+export function ConfirmWorkspace(arg1:string):Promise<void>;
+
 export function CreateSession(arg1:string,arg2:string):Promise<string>;
 
 export function EndSession(arg1:string):Promise<void>;
@@ -110,3 +112,5 @@ export function SubmitTestContract(arg1:string,arg2:string,arg3:string,arg4:stri
 export function TerminateSession(arg1:string):Promise<void>;
 
 export function ValidateTestCommit(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function WorkspaceConfirmationStatus():Promise<main.WorkspaceConfirmationInfo>;
