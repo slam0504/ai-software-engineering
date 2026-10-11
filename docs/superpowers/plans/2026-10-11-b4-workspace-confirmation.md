@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
+> **版本：** rev2（2026-10-11），依 Codex plan review001（對 rev1 commit `25cfe11` 的 CHANGES_REQUIRED）修正五項：（1）前端 `parseStatus` 改為完整 DTO 形狀驗證、fail closed，刪除「null 可容忍」並改加 refresh 層級的負例；（2）Task 4 `specAssist` 在 purpose pin 之後、確認閘之前加 `defer cancel()`（inline `cancel()` 保留），cancel mutant 改為拿掉所有取消保護；（3）Task 3 自動修補只限 `newTestAppIn` 那一行，其餘失敗先追責任歸屬並回報 owner，`TestAcquireStateLeaseResolvesWorkspaceConfirmation`／`TestProductionStartupPath_*` 失敗視為可能的 production 接線回歸；（4）所有 focused 測試、mutation、完整 gate 的指令改為先存完整輸出與 rc 再讀 log，每個 mutant 獨立 log／rc／備份／cmp 並確認紅在目標測試，Task 8 改用 Task 0 的 base 做三點比較，Self-review 驗證表改為逐次紀錄；（5）Task 8 的 Gherkin 不再寫成會持久保存的稽核保證。前版：rev1（commit `25cfe11`）。
+>
 > **審閱狀態：** owner 已於 2026-10-11 14:53 審閱本計畫，並選擇 subagent-driven 執行方式；「給審查者的待決事項」已全部裁定（見文末）。
 >
 > **專案紀律（優先於一般慣例）：** 實作者就是最終執行者，不得再轉派 subagent 做驗證；每個 task 完成後先回報 owner 再進下一個 task（review 檢查點先告知）；回報只引用本次實際執行過的 tool result，沒跑過的標成未驗證。
@@ -46,8 +48,8 @@
 22. `frontend/wailsjs` 的產生檔以 `wails generate module` 重新產生後提交，做法比照 A5：只提交內容差異，三個 runtime 檔（`runtime/package.json`、`runtime.d.ts`、`runtime.js`）的權限副作用要還原成 644。
 23. 既有測試 `TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease`、`TestNoWriterOpensBeforeLeaseIsAcquired`、`CLIInfo` 系列測試、Assist 的 root＋purpose 形狀測試（`TestAssistImplementationsTakeRootContextFirst`），**都必須不修改就能通過**；若必須修改，先停下來回報。
 24. 非目標：不改 App 自己對 workspace 的寫入時機、不做啟動時 picker、不允許執行期更換 workspace、不建立檔案沙箱、不持久化確認、Codex 登入與帳號狀態查詢（`AuthStatus`、`StartLogin`）不在閘門範圍內；owner 裁定（2026-10-11）`Logout`、`RestartCodexServerRecorded`、`RecoverCodexRecording` 同樣**不加閘門**，但須與登入一樣以 fake app-server 驗證不會送出 `thread/start`、`turn/start`。
-25. 驗證指令：Go 用 `GOTOOLCHAIN=local PATH=$HOME/sdk/go1.26.5/bin:$PATH go test -race ./... -count=1`，加上 `gofmt -l .` 與 `go vet ./...`；前端在 `frontend` 目錄用 `npm run build`（含 vue-tsc）與 vitest，node 路徑 `export PATH=$HOME/.nvm/versions/node/v26.8.1/bin:$PATH`。
-26. 首次紅燈要保留，不得重跑到綠燈後掩蓋；失敗要先分類（真實缺陷／fixture 前提／環境）再處理；不使用全域 `ps`，不寫 `/tmp`，不碰 owner 的主工作區，不推送。
+25. 驗證指令：Go 用 `GOTOOLCHAIN=local PATH=$HOME/sdk/go1.26.5/bin:$PATH go test -race ./... -count=1`，加上 `gofmt -l .` 與 `go vet ./...`（一律以 `run_logged` 保存完整輸出與 rc）；前端在 `frontend` 目錄用 `npm run build`（含 vue-tsc）與 vitest，node 路徑 `export PATH=$HOME/.nvm/versions/node/v26.8.1/bin:$PATH`。
+26. 首次紅燈要保留，不得重跑到綠燈後掩蓋；失敗要先分類（真實缺陷／fixture 前提／環境）再處理——**分類要追責任歸屬，不能只憑錯誤字串**；每個 focused 測試、mutation 與完整 gate 都先把完整輸出與測試行程本身的 rc 存檔（`run_logged`），之後的 grep 只讀已存好的 log；不使用全域 `ps`，不寫 `/tmp`，不碰 owner 的主工作區，不推送。
 
 ---
 
@@ -58,7 +60,7 @@ spec 隱含、但 spec 自己的測試清單沒有明列、又最可能出錯的
 1. **從沒解析過 workspace 的 App（零值）必須 fail closed，而且 `ConfirmWorkspace("")` 不得把它確認掉。** 空字串的 `expectedPath` 恰好「等於」空的快照；若零值被當成 `NotRequired`，任何沒走 `acquireStateLease` 的啟動路徑都會靜默放行。→ Task 2 `TestWorkspaceConfirmation_UnresolvedFailsClosed`；production 接線由 Task 2 `TestAcquireStateLeaseResolvesWorkspaceConfirmation` 與 Task 3 `TestProductionStartupPath_*` 守住。
 2. **`expectedPath` 的字串比對陷阱**：尾端斜線、大小寫（macOS 預設不分大小寫的檔案系統）、`~` 簡寫、symlink 別名、NFC／NFD 組合字元，都必須被拒；含空白、中日文與 NFD 的原始字串則必須原樣通過。→ Task 2 `TestConfirmWorkspace_PathMismatchRejectedInEveryState`、`TestConfirmWorkspace_RawStringRoundTripWithUnicodePath`；前端原樣轉發由 Task 7 `workspaceConfirmation.test.ts`、`bindings.test.ts` 守住。
 3. **既有檢查的錯誤優先順序不得改變**：未知 wsid 仍回 `ErrSessionNotFound`；`startSession` 的 `registryUncertain` 仍先於確認閘，且沒有被加到 `sendMessage`；未知 provider 仍回 `unknown provider`；`planAssist` 的確認閘早於 `ensureGate`。→ Task 3 `TestGate_PreservesExistingErrorPrecedence`、Task 4 兩個 Assist 測試。
-4. **前端 fail closed 的邊角**：壞掉的回覆（`{}`、缺 `required`、`reasons: null`）不得解除封鎖；先前已確認、之後查詢失敗要重新封鎖；確認成功但重新查詢失敗仍封鎖；連點確認只送一次；被封鎖時按 Enter 不得清掉輸入框的草稿；`runAssist` 自己也要擋（不只靠 disabled 按鈕）。→ Task 7 `workspaceConfirmation.test.ts`、`workspaceGate.test.ts`。
+4. **前端 fail closed 的邊角**：壞掉的回覆（`{}`、缺 `required`／`source`、`reasons` 缺少／`null`／非陣列／含非字串元素）不得解除封鎖，**也不得被補成空值或用 `String()` 轉成合法資料**——parser 驗證完整 DTO 形狀，錯了就丟錯，由 refresh 轉成 failed；從已放行狀態收到壞回覆要回到 failed 且 `blocked=true`；先前已確認、之後查詢失敗要重新封鎖；確認成功但重新查詢失敗仍封鎖；連點確認只送一次；被封鎖時按 Enter 不得清掉輸入框的草稿；`runAssist` 自己也要擋（不只靠 disabled 按鈕）。→ Task 7 `workspaceConfirmation.test.ts`（`BAD` 表的 15 種壞回覆各有 parser、尚未取得、已放行三個層級的負例）、`workspaceGate.test.ts`。
 5. **被拒絕的請求不得污染之後的啟動**：拒絕後確認，同一個 session 的啟動必須成功（Manager 沒有洩漏 `ErrSessionActive`／`ErrSubmitActive`）；resume 案例中，拒絕不得把已結束 session 的 reducer 從 `done` 重設成 `idle`（偷呼叫 `BeginNewSessionSubmit` 再 `RejectSubmit` 的實作會被抓到）；Assist 拒絕後同一 provider 不得出現 `ErrAssistActive`，且本次 context 必須已被取消。→ Task 3 `TestStartSessionGate_*`、Task 4 `TestSpecAssistGate_*`／`TestPlanAssistGate_*`。
 
 ---
@@ -78,7 +80,7 @@ spec 隱含、但 spec 自己的測試清單沒有明列、又最可能出錯的
 | 8 | README、feature 檔、backlog 收尾、E2E 決定、完整 gate | §5.7、§6.3 | 0.9 hr |
 | **合計** | | | **11.5 hr（約 1.15 pt）** |
 
-**與 spec §8 的核對**：spec 合計約 9.5 hr（resolver 2.0／狀態＋binding 1.5／閘門 2.5／audit＋登入 1.0／前端 2.0／文件 0.5）。本計畫 11.5 hr，多 2.0 hr，**+21.1%，超過 20% 門檻**，原因如下：（a）前端 +1.0 hr——spec 的 2.0 hr 沒有計入「需要讓既有 5 個測試檔補確認狀態前提、4 個測試檔補新 binding 的 mock、新增 store 與獨立警示元件、約 60 個新測試」；（b）狀態＋binding +0.2 hr——production 接線測試與 Unicode／別名路徑測試；（c）文件 +0.4 hr——新增 `workspace-confirmation.feature` 與 E2E 取捨決定；（d）閘門＋audit＋登入 +0.1 hr；（e）**+0.2 hr 來自 owner 在審閱計畫時追加的範圍**（2026-10-11 14:53：`Logout`、`RestartCodexServerRecorded`、`RecoverCodexRecording` 納入 Task 6 的 fake app-server 驗證），這一項不在 spec §8 的原估內。若扣除 (e)，是 11.3 hr、+18.9%，在門檻內。完整 Go gate（`-race`，實測約 4–7 分鐘）與 vitest（約 2 分鐘）屬於等候時間，不計工時。
+**與 spec §8 的核對**：spec 合計約 9.5 hr（resolver 2.0／狀態＋binding 1.5／閘門 2.5／audit＋登入 1.0／前端 2.0／文件 0.5）。本計畫 11.5 hr，多 2.0 hr，**+21.1%，超過 20% 門檻**，原因如下：（a）前端 +1.0 hr——spec 的 2.0 hr 沒有計入「需要讓既有 5 個測試檔補確認狀態前提、4 個測試檔補新 binding 的 mock、新增 store 與獨立警示元件、約 99 個新測試」；（b）狀態＋binding +0.2 hr——production 接線測試與 Unicode／別名路徑測試；（c）文件 +0.4 hr——新增 `workspace-confirmation.feature` 與 E2E 取捨決定；（d）閘門＋audit＋登入 +0.1 hr；（e）**+0.2 hr 來自 owner 在審閱計畫時追加的範圍**（2026-10-11 14:53：`Logout`、`RestartCodexServerRecorded`、`RecoverCodexRecording` 納入 Task 6 的 fake app-server 驗證），這一項不在 spec §8 的原估內。若扣除 (e)，是 11.3 hr、+18.9%，在門檻內。完整 Go gate（`-race`，實測約 4–7 分鐘）與 vitest（約 2 分鐘）屬於等候時間，不計工時。
 
 ---
 
@@ -107,9 +109,26 @@ export EVID=/Users/eason_tseng/b3a-evidence/b4/impl-evidence
 export GOTOOLCHAIN=local
 export PATH=$HOME/sdk/go1.26.5/bin:$HOME/go/bin:$HOME/.nvm/versions/node/v26.8.1/bin:$PATH
 cd $WT
+
+# run_logged <name> <命令...>：完整輸出（stdout＋stderr）存進 $EVID/<name>.log，並「立即」把測試行程本身的
+# 結束碼存進 $EVID/<name>.rc——中間不經管線，所以 rc 是測試行程的，不是 grep／head 的。
+run_logged() { local n=$1; shift; "$@" > "$EVID/$n.log" 2>&1; local rc=$?; echo $rc > "$EVID/$n.rc"; return $rc; }
+# show <name> [grep -E 樣式] [行數]：只讀已存好的 log／rc，不重跑。
+show() { echo "[$1] rc=$(cat "$EVID/$1.rc")"; if [ -n "$2" ]; then grep -E -e "$2" "$EVID/$1.log" | head -${3:-20}; else tail -${3:-20} "$EVID/$1.log"; fi; }
+# mutant_check <name> <目標失敗樣式> <命令...>：跑 mutant、完整輸出與 rc 先存檔（$EVID/<name>.log／.rc），
+# 再確認 (1) 不是 build failed／timeout／解析失敗等非目標失敗，(2) rc≠0，(3) log 裡有預期的目標測試名稱或斷言。
+mutant_check() {
+  local n=$1 pat=$2; shift 2
+  run_logged "$n" "$@"; local rc; rc=$(cat "$EVID/$n.rc")
+  if grep -qE '\[build failed\]|panic: test timed out|Failed to resolve import|SyntaxError|Transform failed' "$EVID/$n.log"; then
+    echo "$n: 非目標失敗（build／timeout／解析）rc=$rc"; return 2; fi
+  if [ "$rc" != 0 ] && grep -qE -e "$pat" "$EVID/$n.log"; then echo "$n: 紅在目標（$pat）rc=$rc"; else echo "$n: 沒有紅在目標 rc=$rc"; return 1; fi
+}
+# restore_check <備份> <目標>：還原並 cmp。
+restore_check() { cp "$1" "$2" && cmp "$1" "$2" && echo "restored: $2"; }
 ```
 
-zsh 提醒（`zsh-shell-gotchas`）：不要用名為 `path` 的變數（會清掉 `$PATH`）；rc 用 `echo "rc=$?" >> log`，不要用 `PIPESTATUS`；變數後接冒號要寫 `${VAR}:`。所有證據 log 寫進 `$EVID`（非揮發目錄），不寫 `/tmp`。
+zsh 提醒（`zsh-shell-gotchas`）：不要用名為 `path` 的變數（會清掉 `$PATH`）；rc 一律用 `run_logged`（`cmd > log 2>&1; echo $? > rc`，不經管線），不要用 `PIPESTATUS`；變數後接冒號要寫 `${VAR}:`。所有證據 log 寫進 `$EVID`（非揮發目錄），不寫 `/tmp`。
 
 ---
 
@@ -144,11 +163,14 @@ Expected：rc=0。（`npm ci` 只寫 `frontend/node_modules`，同樣被 gitigno
 
 - [ ] **Step 3：基準測量（未改任何程式碼）**
 
+每個指令都用 `run_logged`：完整輸出先存進 `$EVID/<name>.log`、測試行程本身的 rc 立即存進 `$EVID/<name>.rc`，之後的 `show` 只讀已存好的檔。
+
 ```bash
-gofmt -l . > $EVID/baseline-gofmt.log; wc -l < $EVID/baseline-gofmt.log      # Expected：0
-go vet ./... > $EVID/baseline-vet.log 2>&1; echo "rc=$?" >> $EVID/baseline-vet.log; tail -2 $EVID/baseline-vet.log
-go test -race ./... -count=1 -timeout 30m > $EVID/baseline-go.log 2>&1; echo "rc=$?" >> $EVID/baseline-go.log; grep -cE "^ok" $EVID/baseline-go.log; grep -E "^(--- FAIL|FAIL|rc=)" $EVID/baseline-go.log
-(cd frontend && npx vitest run > $EVID/baseline-vitest.log 2>&1; echo "rc=$?" >> $EVID/baseline-vitest.log; grep -E "Test Files|Tests |rc=" $EVID/baseline-vitest.log)
+run_logged baseline-gofmt gofmt -l . ; wc -c < $EVID/baseline-gofmt.log                  # Expected：0
+run_logged baseline-vet go vet ./... ; show baseline-vet                                  # Expected：rc=0
+run_logged baseline-go go test -race ./... -count=1 -timeout 30m
+show baseline-go '^(--- FAIL|FAIL|panic|WARNING: DATA RACE)'; grep -cE '^ok' $EVID/baseline-go.log
+(cd frontend && run_logged baseline-vitest npx vitest run); show baseline-vitest 'Test Files|Tests '
 ```
 
 Expected（計畫撰寫時在相同原始碼的複本上量到）：vet rc=0；根 package `ok`，約 4–7 分鐘；vitest `44 passed`／`605 passed`。**若基準就有紅燈**：先對照 `docs/architecture/wall-clock-test-register.md`（例如 `internal/codex` 的 `TestAppServerMidStreamDeath` 是登記在案的牆鐘測試，計畫撰寫時的全套 `-race` 在同時有其他負載時曾失敗一次，單獨重跑 `-count=5` 全過）分類，**不得重跑到綠燈後掩蓋**，把分類與 log 寫進 `$EVID/baseline-notes.txt`。
@@ -566,7 +588,8 @@ func TestResolveWorkspaceWith_OnlyCreatesEmptyStateDir(t *testing.T) {
 - [ ] **Step 2：跑一次確認失敗（保留首次紅燈）**
 
 ```bash
-go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 . > $EVID/t1-red.log 2>&1; echo "rc=$?" >> $EVID/t1-red.log; head -12 $EVID/t1-red.log
+run_logged t1-red go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 .
+show t1-red '(\[build failed\]|undefined)' 12
 ```
 
 Expected：rc=1，`[build failed]`，錯誤為 `undefined: workspaceProvenance`／`workspacePolicy`／`workspaceEnv`／`resolveWorkspaceWith`。這是「符號尚未存在」的紅燈（預期的紅，不是環境問題）。
@@ -776,36 +799,40 @@ go build ./... && gofmt -l .                                              # Expe
 - [ ] **Step 4：跑測試確認通過，並確認受保護的既有測試不修改就通過**
 
 ```bash
-go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 -v . 2>&1 | grep -E "^(--- |ok|FAIL)"
-go test -run 'TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease|TestNoWriterOpensBeforeLeaseIsAcquired|CLIInfo|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestAssistImplementationsTakeRootContextFirst' -count=1 -v . 2>&1 | grep -E "^(--- |ok|FAIL)"
-go vet . && git diff --stat -- '*_test.go'   # Expected：測試檔沒有被修改（只有新增的 workspace_*_test.go 未追蹤）
+run_logged t1-green go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 -v .
+show t1-green '^(--- |ok|FAIL)' 40
+run_logged t1-protected go test -run 'TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease|TestNoWriterOpensBeforeLeaseIsAcquired|CLIInfo|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestAssistImplementationsTakeRootContextFirst' -count=1 -v .
+show t1-protected '^(--- |ok|FAIL)' 40
+run_logged t1-vet go vet . ; show t1-vet
+git diff --stat -- '*_test.go'   # Expected：空（測試檔沒有被修改；新增的 workspace_*_test.go 尚未追蹤）
 ```
 
-Expected：全部 PASS（計畫撰寫時在複本上：新測試 `ok`；受保護測試 9 條 `--- PASS`）。
+Expected：兩組 rc=0、全部 PASS（計畫撰寫時在複本上，受保護測試那一組有 10 條 `--- PASS`）。
 
 - [ ] **Step 5：Mutation 證據（測試要紅在正題）**
 
-用位元組備份還原（不用 git）：
+每個 mutant 都有自己的來源備份（`$EVID/t1-mN.orig`）、log（`$EVID/t1-mN.log`）、rc（`$EVID/t1-mN.rc`），以及還原後的 `cmp`。`mutant_check` 會確認失敗的是**目標測試**，並排除 build failed／timeout 等非目標失敗；非目標失敗要先處理，不得進下一個 mutant。
 
 ```bash
-cp workspace_confirmation.go $EVID/wc.t1.orig
 # M1：(d) 反向——身分無法判定時當成已知
+cp workspace_confirmation.go $EVID/t1-m1.orig
 sed -i '' 's/if !p.HomeIdentityKnown {/if false {/' workspace_confirmation.go
-go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head
-cp $EVID/wc.t1.orig workspace_confirmation.go && cmp $EVID/wc.t1.orig workspace_confirmation.go && echo restored
+mutant_check t1-m1 '^--- FAIL: (TestWorkspacePolicy|TestResolveWorkspaceWith_HomeIdentityUnknown)' go test -run 'TestWorkspacePolicy|TestResolveWorkspaceWith' -count=1 .
+restore_check $EVID/t1-m1.orig workspace_confirmation.go
+
 # M2：isHome 改用路徑前綴比對（Invariant 的反例）
-cp app.go $EVID/app.t1.orig
+cp app.go $EVID/t1-m2.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
 old = "return os.SameFile(homeInfo, wsInfo), true"
 assert old in s
 open('app.go', 'w', encoding='utf-8').write(s.replace(old, "return strings.HasPrefix(workspace, home) && homeInfo != nil && wsInfo != nil, true", 1))
 EOF
-go test -run 'TestResolveWorkspaceWith' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|build)" | head
-cp $EVID/app.t1.orig app.go && cmp $EVID/app.t1.orig app.go && echo restored
+mutant_check t1-m2 '^--- FAIL: TestResolveWorkspaceWith_ProjectUnderHomeIsNotHome' go test -run 'TestResolveWorkspaceWith' -count=1 .
+restore_check $EVID/t1-m2.orig app.go
 ```
 
-Expected：M1 → `TestWorkspacePolicy`（`(d)` 與多原因案例）與 `HomeIdentityUnknown` 紅；M2 → `ProjectUnderHomeIsNotHome` 紅（路徑前綴相同但不是同一個目錄）。**把每個 mutant 的紅燈摘要貼進 `$EVID/t1-mutation.txt`**；mutant 若沒有變紅，停下來回報（測試失效）。
+Expected：兩個 `mutant_check` 都印出「紅在目標」。M1 → `TestWorkspacePolicy`（`(d)` 與多原因案例）與 `HomeIdentityUnknown`；M2 → `ProjectUnderHomeIsNotHome`（路徑前綴相同但不是同一個目錄）。印出「非目標失敗」或「沒有紅在目標」就停下來回報（測試失效或 mutant 寫壞）。
 
 - [ ] **Step 6：Commit**
 
@@ -1129,7 +1156,8 @@ func TestAcquireStateLeaseResolvesWorkspaceConfirmation(t *testing.T) {
 - [ ] **Step 2：跑一次確認失敗（保留首次紅燈）**
 
 ```bash
-go test -run 'TestWorkspaceConfirmation|TestConfirmWorkspace|TestWorkspaceBindings|TestCLIInfoShapeUnchanged|TestAcquireStateLeaseResolves|TestStateBindingsRejectedAfterShutdown' -count=1 . > $EVID/t2-red.log 2>&1; echo "rc=$?" >> $EVID/t2-red.log; head -12 $EVID/t2-red.log
+run_logged t2-red go test -run 'TestWorkspaceConfirmation|TestConfirmWorkspace|TestWorkspaceBindings|TestCLIInfoShapeUnchanged|TestAcquireStateLeaseResolves|TestStateBindingsRejectedAfterShutdown' -count=1 .
+show t2-red '(\[build failed\]|undefined)' 12
 ```
 
 Expected：rc=1，`[build failed]`：`a.workspaceConfirm undefined`、`a.WorkspaceConfirmationStatus undefined`、`undefined: wsReasonUnresolved` 等。
@@ -1312,16 +1340,19 @@ func (a *App) ConfirmWorkspace(expectedPath string) error {
 - [ ] **Step 4：跑測試確認通過（含 binding surface 與受保護測試）**
 
 ```bash
-gofmt -l . && go vet . && go test -run 'TestWorkspaceConfirmation|TestConfirmWorkspace|TestWorkspaceBindings|TestCLIInfoShapeUnchanged|TestAcquireStateLeaseResolves|TestStateBindingsRejectedAfterShutdown|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestProtectedImplementations|TestStartupSafeBindingHasFixedShape|TestStartupStateIsTheOnlyAccessPath|TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease|TestNoWriterOpensBeforeLeaseIsAcquired|CLIInfo' -count=1 -v . 2>&1 | grep -E "^(--- |ok|FAIL)"
+run_logged t2-gofmt gofmt -l . ; wc -c < $EVID/t2-gofmt.log                                # Expected：0
+run_logged t2-vet go vet . ; show t2-vet                                                    # Expected：rc=0
+run_logged t2-green go test -run 'TestWorkspaceConfirmation|TestConfirmWorkspace|TestWorkspaceBindings|TestCLIInfoShapeUnchanged|TestAcquireStateLeaseResolves|TestStateBindingsRejectedAfterShutdown|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestProtectedImplementations|TestStartupSafeBindingHasFixedShape|TestStartupStateIsTheOnlyAccessPath|TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease|TestNoWriterOpensBeforeLeaseIsAcquired|CLIInfo' -count=1 -v .
+show t2-green '^(--- |ok|FAIL)' 60
 ```
 
-Expected：全部 PASS。`TestEveryBindingIsClassifiedAndHonoursItsShape` 會自動把兩個新 binding 算進薄包裝；若它紅，代表形狀不合，不得改測試。
+Expected：rc=0、全部 PASS。`TestEveryBindingIsClassifiedAndHonoursItsShape` 會自動把兩個新 binding 算進薄包裝；若它紅，代表形狀不合，不得改測試。
 
 - [ ] **Step 5：Mutation 證據**
 
 ```bash
-cp workspace_confirmation.go $EVID/wc.t2.orig; cp app.go $EVID/app.t2.orig
 # M1：ConfirmWorkspace 不拒絕未解析的零值狀態（空字串 expectedPath 恰好等於空快照）
+cp workspace_confirmation.go $EVID/t2-m1.orig
 python3 - <<'EOF'
 s = open('workspace_confirmation.go', encoding='utf-8').read()
 old = """	if c.state == wcUnresolved {
@@ -1331,42 +1362,48 @@ old = """	if c.state == wcUnresolved {
 assert old in s
 open('workspace_confirmation.go', 'w', encoding='utf-8').write(s.replace(old, '', 1))
 EOF
-go test -run 'TestWorkspaceConfirmation_UnresolvedFailsClosed' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head -3
-cp $EVID/wc.t2.orig workspace_confirmation.go && cmp $EVID/wc.t2.orig workspace_confirmation.go && echo restored
+mutant_check t2-m1 '^--- FAIL: TestWorkspaceConfirmation_UnresolvedFailsClosed' go test -run 'TestWorkspaceConfirmation_UnresolvedFailsClosed' -count=1 .
+restore_check $EVID/t2-m1.orig workspace_confirmation.go
+
 # M2：路徑比對改成忽略尾端斜線與大小寫
+cp workspace_confirmation.go $EVID/t2-m2.orig
 python3 - <<'EOF'
 s = open('workspace_confirmation.go', encoding='utf-8').read()
 old = "if expectedPath != c.workspace {"
 assert old in s
-open('workspace_confirmation.go', 'w', encoding='utf-8').write(
-    s.replace(old, 'if strings.ToLower(strings.TrimRight(expectedPath, "/")) != strings.ToLower(c.workspace) {', 1).replace('import (\n\t"errors"', 'import (\n\t"strings"\n\t"errors"', 1))
+s = s.replace(old, 'if strings.ToLower(strings.TrimRight(expectedPath, "/")) != strings.ToLower(c.workspace) {', 1)
+if '\t"strings"\n' not in s:  # Task 2 時還沒有 strings import；Task 3 之後已有，不能重複
+    s = s.replace('import (\n\t"errors"', 'import (\n\t"strings"\n\t"errors"', 1)
+open('workspace_confirmation.go', 'w', encoding='utf-8').write(s)
 EOF
-go test -run 'TestConfirmWorkspace_PathMismatch|TestConfirmWorkspace_RawString' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head -4
-cp $EVID/wc.t2.orig workspace_confirmation.go && cmp $EVID/wc.t2.orig workspace_confirmation.go && echo restored
+mutant_check t2-m2 '^--- FAIL: TestConfirmWorkspace_(PathMismatchRejectedInEveryState|RawStringRoundTripWithUnicodePath)' go test -run 'TestConfirmWorkspace_PathMismatch|TestConfirmWorkspace_RawString' -count=1 .
+restore_check $EVID/t2-m2.orig workspace_confirmation.go
+
 # M3：拿掉 acquireStateLease 的接線
+cp app.go $EVID/t2-m3.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
 old = "		a.workspaceConfirm.resolve(r) // B4：與 workspace 一起決定，閘門與 status binding 都讀這一份\n"
 assert old in s
 open('app.go', 'w', encoding='utf-8').write(s.replace(old, '', 1))
 EOF
-go test -run 'TestAcquireStateLeaseResolvesWorkspaceConfirmation' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head -3
-cp $EVID/app.t2.orig app.go && cmp $EVID/app.t2.orig app.go && echo restored
+mutant_check t2-m3 '^--- FAIL: TestAcquireStateLeaseResolvesWorkspaceConfirmation' go test -run 'TestAcquireStateLeaseResolvesWorkspaceConfirmation' -count=1 .
+restore_check $EVID/t2-m3.orig app.go
 ```
 
-Expected：M1 → `UnresolvedFailsClosed` 紅（`未解析時 ConfirmWorkspace("") 必須回 unavailable，實得 <nil>`）；M2 → `PathMismatchRejectedInEveryState`（尾端斜線、大小寫）與 NFC／NFD 紅；M3 → `AcquireStateLeaseResolvesWorkspaceConfirmation` 紅。結果寫入 `$EVID/t2-mutation.txt`。
+Expected：三個 `mutant_check` 都印出「紅在目標」：M1 → `未解析時 ConfirmWorkspace("") 必須回 unavailable，實得 <nil>`；M2 → 尾端斜線、大小寫與 NFC／NFD 紅；M3 → `AcquireStateLeaseResolvesWorkspaceConfirmation` 紅。
 
 - [ ] **Step 6：重新產生 wailsjs（比照 A5，只提交內容差異）**
 
 `wails generate module` 需要 `frontend/dist` 存在（Task 0 已建佔位檔）。若仍失敗，保留 log 並依 A5 先例補佔位後重跑，不得只留成功那份。
 
 ```bash
-wails generate module > $EVID/t2-wails-generate.log 2>&1; echo "rc=$?" >> $EVID/t2-wails-generate.log; tail -3 $EVID/t2-wails-generate.log
+run_logged t2-wails wails generate module ; show t2-wails '' 5                              # Expected：rc=0
 # Wails CLI 會把 runtime 三個檔的權限改成 755（A5 記錄的副作用，內容沒有差異）——還原成 644
 chmod 644 frontend/wailsjs/runtime/package.json frontend/wailsjs/runtime/runtime.d.ts frontend/wailsjs/runtime/runtime.js
-git diff --summary -- frontend/wailsjs          # Expected：空（沒有任何權限變化；go/ 底下三檔本來就以 755 提交）
-git diff --stat -- frontend/wailsjs             # Expected：App.d.ts、App.js、models.ts 三個檔，只有新增行
-git status --short frontend | grep -v wailsjs   # Expected：空
+run_logged t2-wails-summary git diff --summary -- frontend/wailsjs ; wc -c < $EVID/t2-wails-summary.log   # Expected：0（沒有任何權限變化；go/ 底下三檔本來就以 755 提交）
+run_logged t2-wails-stat git diff --stat -- frontend/wailsjs ; cat $EVID/t2-wails-stat.log              # Expected：App.d.ts、App.js、models.ts 三個檔，只有新增行
+git status --short frontend | grep -v wailsjs                                                           # Expected：空
 ```
 
 預期的內容差異（計畫撰寫時在複本上重新產生的結果；你的產生結果必須逐位元組相同，否則停下來回報）：
@@ -1375,17 +1412,17 @@ git status --short frontend | grep -v wailsjs   # Expected：空
 --- a/frontend/wailsjs/go/main/App.d.ts
 +++ b/frontend/wailsjs/go/main/App.d.ts
 @@ -19,6 +19,8 @@
- 
+
  export function ConfirmSpecCommit(arg1:spec.CommitToken,arg2:string):Promise<void>;
- 
+
 +export function ConfirmWorkspace(arg1:string):Promise<void>;
 +
  export function CreateSession(arg1:string,arg2:string):Promise<string>;
- 
+
  export function EndSession(arg1:string):Promise<void>;
 @@ -110,3 +112,5 @@
  export function TerminateSession(arg1:string):Promise<void>;
- 
+
  export function ValidateTestCommit(arg1:string,arg2:string,arg3:string):Promise<void>;
 +
 +export function WorkspaceConfirmationStatus():Promise<main.WorkspaceConfirmationInfo>;
@@ -1397,7 +1434,7 @@ git status --short frontend | grep -v wailsjs   # Expected：空
 @@ -26,6 +26,10 @@
    return window['go']['main']['App']['ConfirmSpecCommit'](arg1, arg2);
  }
- 
+
 +export function ConfirmWorkspace(arg1) {
 +  return window['go']['main']['App']['ConfirmWorkspace'](arg1);
 +}
@@ -1444,7 +1481,7 @@ git status --short frontend | grep -v wailsjs   # Expected：空
 +	        this.reasons = source["reasons"];
 +	    }
  	}
- 
+
  }
 ```
 
@@ -1917,7 +1954,8 @@ func TestProductionStartupPath_EnvProjectNeedsNoConfirmation(t *testing.T) {
 - [ ] **Step 2：跑一次確認失敗（保留首次紅燈）**
 
 ```bash
-go test -run 'TestStartSessionGate|TestSendMessageGate|TestGate_|TestProductionStartupPath' -count=1 -v . > $EVID/t3-red.log 2>&1; echo "rc=$?" >> $EVID/t3-red.log; grep -E "^(--- |ok|FAIL|rc=)" $EVID/t3-red.log
+run_logged t3-red go test -run 'TestStartSessionGate|TestSendMessageGate|TestGate_|TestProductionStartupPath' -count=1 -v .
+show t3-red '^(--- |ok|FAIL)' 30
 ```
 
 Expected（計畫撰寫時在複本上、閘門尚未接上時量到）：`TestStartSessionGate_ClaudeRejectedWithoutSideEffects`、`TestStartSessionGate_CodexRejectedWithoutThreadOrTurn`、`TestStartSessionGate_OneConfirmationCoversEverySession`、`TestSendMessageGate_ClaudeRejectedWithoutSendingTurn`、`TestSendMessageGate_CodexRejectedWithoutTurnStart`、`TestProductionStartupPath_EnvEqualsHomeRequiresConfirmation` 紅（錯誤是「必須回 workspace_confirmation_required，實得 <nil>」——被拒的呼叫真的啟動了）；`TestGate_PreservesExistingErrorPrecedence` 與 `TestProductionStartupPath_EnvProjectNeedsNoConfirmation` 此時就是綠（它們守的是「不退步」）。
@@ -1972,18 +2010,28 @@ func (a *App) requireWorkspaceConfirmed(op, provider, wsid string) error {
 	}
 ```
 
-- [ ] **Step 4：先跑整個根 package（不加 `-race`），保留「夾具前提」紅燈並分類——此時還不要補夾具**
+- [ ] **Step 4：先跑整個根 package（不加 `-race`），保留紅燈並逐一追查責任歸屬——此時還不要補夾具**
 
-零值 fail closed 會讓所有「經 `newTestAppIn` 建 App、卻沒有解析 workspace」的既有測試在 `StartSession`／`SendMessage` 被拒；本 task 自己的測試裡「先在不需確認狀態下啟動、再 `makePending`」的幾處（`workspace_gate_test.go` 的 prior run 與 `SendMessage` 前置啟動）也一樣。這是**預期的第二類紅燈**，不是回歸；要保留 log 並分類，再處理：
+零值 fail closed 會讓所有「經 `newTestAppIn` 建 App、卻沒有解析 workspace」的既有測試在 `StartSession`／`SendMessage` 被拒；本 task 自己的測試裡「先在不需確認狀態下啟動、再 `makePending`」的幾處（`workspace_gate_test.go` 的 prior run 與 `SendMessage` 前置啟動）也一樣。
 
 ```bash
-go test -count=1 -timeout 20m . > $EVID/t3-full-red.log 2>&1; echo "rc=$?" >> $EVID/t3-full-red.log
-grep -c "^--- FAIL" $EVID/t3-full-red.log                                                                  # 含子測試的 FAIL 行數
-grep -E "^\s+[A-Za-z0-9_]+_test.go:[0-9]+:" $EVID/t3-full-red.log | grep -vc "workspace_unresolved"         # Expected：0
-grep -E "^\s+[A-Za-z0-9_]+_test.go:[0-9]+:" $EVID/t3-full-red.log | sed -E 's/^\s+([A-Za-z0-9_]+_test.go):.*/\1/' | sort | uniq -c
+run_logged t3-full-red go test -count=1 -timeout 20m .
+show t3-full-red '^--- FAIL' 5
+grep -c '^--- FAIL' $EVID/t3-full-red.log                                                                         # 含子測試的 FAIL 行數
+grep -E '^\s+[A-Za-z0-9_]+_test.go:[0-9]+:' $EVID/t3-full-red.log | grep -vc 'workspace_unresolved'              # 不含 workspace_unresolved 的失敗行數（Expected：0）
+grep -E '^\s+[A-Za-z0-9_]+_test.go:[0-9]+:' $EVID/t3-full-red.log | sed -E 's/^\s+([A-Za-z0-9_]+_test.go):.*/\1/' | sort | uniq -c
+grep -E '^(--- )?FAIL: (TestAcquireStateLeaseResolvesWorkspaceConfirmation|TestProductionStartupPath_)' $EVID/t3-full-red.log   # Expected：空
 ```
 
-Expected（計畫撰寫時在「Task 3 完成、Task 4／5 尚未實作」的複本上量到，約 2.5 分鐘）：`--- FAIL` 87 行（含子測試）；每一處錯誤訊息都含 `workspace_unresolved`，**不含的為 0**；失敗分散在 `app_claude_multi`、`app_codex_dispatch`、`app_invariants`、`app_lease_boundary`、`app_per_wsid_writer`、`app_registry_uncertain`、`app_remove`、`app_test`、`app_wire_frame_jobs`、`app_wire_frames`、`app_wire_segments`、`app_wirelog_latch`、`app_wsid` 等測試檔，以及本 task 的 `workspace_gate_test.go` 三處。**分類標準**：錯誤訊息含 `workspace_unresolved` ＝ 夾具前提（零值 fail closed 的預期結果）；任何**不含**這個字串的失敗是真實缺陷或環境問題，要另行處理，不得併入夾具修補。
+Expected（計畫撰寫時在「Task 3 完成、Task 4／5 尚未實作」的複本上量到，約 2.5 分鐘）：`--- FAIL` 87 行（含子測試）；每一處錯誤訊息都含 `workspace_unresolved`；失敗分散在 `app_claude_multi`、`app_codex_dispatch`、`app_invariants`、`app_lease_boundary`、`app_per_wsid_writer`、`app_registry_uncertain`、`app_remove`、`app_test`、`app_wire_frame_jobs`、`app_wire_frames`、`app_wire_segments`、`app_wirelog_latch`、`app_wsid` 等測試檔，以及本 task 的 `workspace_gate_test.go` 三處。
+
+**分類規則（不能只憑錯誤字串 `workspace_unresolved` 就補 seed）：** 這個字串也可能是 production 接線漏掉 `workspaceConfirm.resolve` 的症狀，所以先分流，再決定能不能動夾具：
+
+1. **允許自動修補的只有一個地方：`newTestAppIn` 那一行**（下一步）。它代表「已完成 startup 的正常專案夾具」；零值 App 的獨立測試仍用 `NewApp()`，production 啟動測試也自行走 `startup`，兩者都不經過這行。
+2. 對每個失敗的測試，**先追它的 App 從哪個建構函式來**：`grep -nE 'NewApp\(\)|&App\{|newTestApp[A-Za-z]*\(' <失敗的測試檔>`。經 `newTestApp`／`newTestAppIn` 建立者屬第 1 類；經 `newTestAppAt` 或其他 `NewApp()` 直建 helper、或其他任何不是 `newTestAppIn` 的路徑建立者，**不得補 seed**——停下來，追 caller 與解析／接線責任，分類（夾具前提／production 接線回歸／其他）後回報 owner。
+3. `TestAcquireStateLeaseResolvesWorkspaceConfirmation`、`TestProductionStartupPath_*` 失敗（上面最後一條 grep 非空）一律視為**可能的 production 接線回歸**：先檢查 `acquireStateLease` 的 `a.workspaceConfirm.resolve(r)` 是否還在、`resolveWorkspace` 的回傳是否被正確解構，修的是 production，不是夾具。
+4. 受保護的 lease、CLIInfo、Assist 形狀測試即使因此失敗也不得修改。
+5. 任何失敗訊息**不含** `workspace_unresolved` 的，是真實缺陷或環境問題，另行處理。
 
 （反面教材：若在 Task 4 之後才補夾具，未補前提的 Assist 測試會在 `waitAssistActive` 逾時後卡住整個 package——計畫撰寫時一次未補夾具的全套跑到 30 分鐘 `-timeout` 才中止。所以夾具前提必須在 Task 3 解決。）
 
@@ -2010,17 +2058,21 @@ Expected（計畫撰寫時在「Task 3 完成、Task 4／5 尚未實作」的複
 - [ ] **Step 6：新測試轉綠，整個根 package 轉綠**
 
 ```bash
-gofmt -l . && go vet . && go test -race -run 'TestStartSessionGate|TestSendMessageGate|TestGate_|TestProductionStartupPath' -count=1 -v . 2>&1 | grep -E "^(--- |ok|FAIL)"
-go test -count=1 -timeout 20m . > $EVID/t3-full-green.log 2>&1; echo "rc=$?" >> $EVID/t3-full-green.log; tail -3 $EVID/t3-full-green.log
+run_logged t3-gofmt gofmt -l . ; wc -c < $EVID/t3-gofmt.log                                # Expected：0
+run_logged t3-vet go vet . ; show t3-vet                                                    # Expected：rc=0
+run_logged t3-green go test -race -run 'TestStartSessionGate|TestSendMessageGate|TestGate_|TestProductionStartupPath' -count=1 -v .
+show t3-green '^(--- |ok|FAIL)' 40
+run_logged t3-full-green go test -count=1 -timeout 20m .
+show t3-full-green '' 5
 ```
 
-Expected：新測試全部 PASS；根 package `ok`（計畫撰寫時不加 `-race` 約 3 分鐘）。若仍有失敗：訊息含 `workspace_unresolved` 的，找出它的 App 是哪個建構函式（`NewApp()` 直建者，例如 `app_restore_dormant_test.go` 的 `newTestAppAt`），**在該夾具 helper 補同一行**，不改個別測試；不含的，依分類處理並回報。
+Expected：兩組 rc=0；新測試全部 PASS；根 package `ok`（計畫撰寫時不加 `-race` 約 3 分鐘）。若仍有失敗：依 Step 4 的分類規則處理——**只有**經 `newTestAppIn` 建立、且錯誤含 `workspace_unresolved` 的才屬於這一行夾具的責任；其餘（含 `NewApp()` 直建的 helper）先追責任歸屬並回報 owner，不得自行補 seed。
 
 - [ ] **Step 7：Mutation 證據**
 
 ```bash
-cp app.go $EVID/app.t3.orig
 # M1：閘門挪到 BeginNewSessionSubmit 之後（事後 RejectSubmit）——抓「偷呼叫 Begin」
+cp app.go $EVID/t3-m1.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
 g = '''	if err := a.requireWorkspaceConfirmed("start_session", string(prov), wsid); err != nil {
@@ -2041,16 +2093,17 @@ s = s.replace(anchor, anchor + '''	if err := a.requireWorkspaceConfirmed("start_
 ''', 1)
 open('app.go', 'w', encoding='utf-8').write(s)
 EOF
-go test -run 'TestStartSessionGate_Claude' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|\s+workspace_gate)" | head -3
-cp $EVID/app.t3.orig app.go && cmp $EVID/app.t3.orig app.go && echo restored
+mutant_check t3-m1 'Manager 狀態不得改變：done → idle' go test -run 'TestStartSessionGate_Claude' -count=1 .
+restore_check $EVID/t3-m1.orig app.go
+
 # M2：閘門恆放行
-cp workspace_confirmation.go $EVID/wc.t3.orig
+cp workspace_confirmation.go $EVID/t3-m2.orig
 sed -i '' 's/if snap.state == wcNotRequired || snap.state == wcConfirmed {/if snap.state != wcUnresolved {/' workspace_confirmation.go
-go test -run 'TestStartSessionGate|TestSendMessageGate' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head -6
-cp $EVID/wc.t3.orig workspace_confirmation.go && cmp $EVID/wc.t3.orig workspace_confirmation.go && echo restored
+mutant_check t3-m2 '^--- FAIL: (TestStartSessionGate_|TestSendMessageGate_)' go test -run 'TestStartSessionGate|TestSendMessageGate' -count=1 .
+restore_check $EVID/t3-m2.orig workspace_confirmation.go
 ```
 
-Expected：M1 → `ClaudeRejectedWithoutSideEffects/resume` 紅，訊息 `Manager 狀態不得改變：done → idle`；M2 → Start／Send 兩組全紅。結果寫入 `$EVID/t3-mutation.txt`。
+Expected：兩個 `mutant_check` 都印出「紅在目標」：M1 → `ClaudeRejectedWithoutSideEffects/resume`，訊息 `Manager 狀態不得改變：done → idle`；M2 → Start／Send 兩組全紅。
 
 - [ ] **Step 8：Commit**
 
@@ -2086,8 +2139,8 @@ EOF
 
 | 入口 | 位置 | 說明 |
 |---|---|---|
-| `specAssist` | base 行 6324 `ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)` → 行 6331 `purpose = "spec_assist"` → **（新增閘門）** → 行 6332 `gen := &assistGen{…}` | 第一個敘述（`knownProvider` 守門之後）是 root context、緊接 purpose pin，閘門在兩者**之後**；拒絕時 gen 尚未建立，所以閘門分支自己 `cancel()`，與既有 `ErrAssistActive` 分支（行 6339–6343）的 inline `cancel()` 同一個慣例，不依賴 gen 建立之後才安排的 `teardown` |
-| `planAssist` | base 行 6515 root context → 行 6516 `defer cancel()` → **（新增閘門）** → 行 6518 `ensureGate()` | 拒絕時由行 6516 的 `defer cancel()` 取消 |
+| `specAssist` | base 行 6324 `ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)` → 行 6331 `purpose = "spec_assist"` → **（新增閘門）** → 行 6332 `gen := &assistGen{…}` | 第一個敘述（`knownProvider` 守門之後）是 root context、緊接 purpose pin，閘門在兩者**之後**；拒絕時 gen 尚未建立，所以在 purpose pin 之後、閘門**之前**先 `defer cancel()`（spec §5.4 要求的「拒絕時一定會執行的 cancel 收尾」），拒絕分支再保留 inline `cancel()`（與既有 `ErrAssistActive` 分支，行 6339–6343，同一個慣例；`CancelFunc` 可重複呼叫，之後既有 `teardown` 再取消也無害，不需要條件式解除），不依賴 gen 建立之後才安排的 `teardown` |
+| `planAssist` | base 行 6515 root context → 行 6516 `defer cancel()` → **（新增閘門）** → 行 6518 `ensureGate()` | 拒絕時由行 6516 的既有 `defer cancel()` 取消，不需更動 |
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -2230,7 +2283,8 @@ func TestPlanAssistGate_RejectedBeforeEnsureGateAndCancelsContext(t *testing.T) 
 - [ ] **Step 2：跑一次確認失敗（保留首次紅燈）**
 
 ```bash
-go test -run 'TestSpecAssistGate|TestPlanAssistGate' -count=1 . > $EVID/t4-red.log 2>&1; echo "rc=$?" >> $EVID/t4-red.log; head -8 $EVID/t4-red.log
+run_logged t4-red go test -run 'TestSpecAssistGate|TestPlanAssistGate' -count=1 .
+show t4-red '(\[build failed\]|undefined)' 8
 ```
 
 Expected：rc=1，`[build failed]`：`a.hookAssistGateRejected undefined`。
@@ -2241,19 +2295,22 @@ Expected：rc=1，`[build failed]`：`a.hookAssistGateRejected undefined`。
 
 ```go
 	// hookAssistGateRejected：測試注入——Assist 被 B4 確認閘拒絕時，在 return 之前以**本次
-	// 呼叫自己的 context** 呼叫（specAssist 在自己 cancel() 之前、planAssist 在既有
+	// 呼叫自己的 context** 呼叫（specAssist 在拒絕分支的 inline cancel() 之前、planAssist 在既有
 	// defer cancel() 之前）。測試在呼叫返回後檢查該 context 已被取消。production 恆為 nil。
 	hookAssistGateRejected func(ctx context.Context)
 ```
 
-(3b) `specAssist`：緊接 `purpose = "spec_assist"` 之後、`gen := &assistGen{` 之前：
+(3b) `specAssist`：緊接 `purpose = "spec_assist"` 之後、`gen := &assistGen{` 之前。**依 Codex plan review001，採 `defer cancel()`＋拒絕分支 inline `cancel()` 雙重保護**（符合 spec §5.4「確認閘之前先安排一定會執行的 cancel 收尾」）：
 
 ```go
 	// B4 確認閘（spec §5.4 固定順序）：外層交易 → knownProvider → root context → purpose pin
-	// → 確認閘 → gen／assistActive／runner。閘門不得插在 root context 與 purpose pin 之間
-	// （TestAssistImplementationsTakeRootContextFirst）。拒絕時 gen 尚未建立，所以由這裡
-	// 自己取消本次 context，不依賴 gen 建立之後才安排的 teardown；也不登記 gen、不進
-	// assistActive、不執行 runner。不新增內層 beginTxn。
+	// → 拒絕時一定會執行的 cancel 收尾 → 確認閘 → gen／assistActive／runner。閘門不得插在
+	// root context 與 purpose pin 之間（TestAssistImplementationsTakeRootContextFirst）。
+	// 拒絕時 gen 尚未建立，所以取消不能依賴 gen 建立之後才安排的 teardown：這裡先 defer cancel()，
+	// 拒絕分支再 inline cancel() 一次（CancelFunc 可重複呼叫；通過閘門之後既有的 teardown 再取消
+	// 也無害，不需要條件式解除）。拒絕時不登記 gen、不進 assistActive、不執行 runner。
+	// 不新增內層 beginTxn。
+	defer cancel()
 	if gerr := a.requireWorkspaceConfirmed("spec_assist", provider, ""); gerr != nil {
 		if h := a.hookAssistGateRejected; h != nil {
 			h(ctx)
@@ -2263,7 +2320,7 @@ Expected：rc=1，`[build failed]`：`a.hookAssistGateRejected undefined`。
 	}
 ```
 
-(3c) `planAssist`：緊接 `defer cancel() // 下面成功走到 run 時…` 那一行與其後空行之後、`if _, err := a.ensureGate(); err != nil {` 之前：
+(3c) `planAssist` **不需更動取消保護**：它本來就有緊接 root context 的既有 `defer cancel()`。緊接該行與其後空行之後、`if _, err := a.ensureGate(); err != nil {` 之前加入：
 
 ```go
 	// B4 確認閘（spec §5.4）：root context 與既有的 defer cancel() 之後、ensureGate() 之前。
@@ -2281,30 +2338,41 @@ Expected：rc=1，`[build failed]`：`a.hookAssistGateRejected undefined`。
 - [ ] **Step 4：跑測試確認通過，並確認形狀測試與所有既有 Assist 測試不修改就通過**
 
 ```bash
-gofmt -l . && go vet . && go test -race -run 'TestSpecAssistGate|TestPlanAssistGate|TestAssistImplementationsTakeRootContextFirst|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestProtectedImplementations|Assist' -count=1 -v . 2>&1 | grep -E "^(--- |ok|FAIL)" | sort | uniq -c | sort -rn | head -40
+run_logged t4-gofmt gofmt -l . ; wc -c < $EVID/t4-gofmt.log                                # Expected：0
+run_logged t4-vet go vet . ; show t4-vet                                                    # Expected：rc=0（lostcancel 不得報）
+run_logged t4-green go test -race -run 'TestSpecAssistGate|TestPlanAssistGate|TestAssistImplementationsTakeRootContextFirst|TestEveryBindingIsClassified|TestOnlyThinWrappersAdmit|TestProtectedImplementations|Assist' -count=1 -v .
+show t4-green '^(--- |ok|FAIL)' 60
+git diff --stat -- app_binding_surface_test.go                                              # Expected：空
 ```
 
-Expected：全部 PASS；`TestAssistImplementationsTakeRootContextFirst` 沒有被修改（`git diff --stat -- app_binding_surface_test.go` 為空）。
+Expected：rc=0、全部 PASS；`TestAssistImplementationsTakeRootContextFirst` 沒有被修改。
 
 - [ ] **Step 5：Mutation 證據**
 
 ```bash
-cp app.go $EVID/app.t4.orig
-# M1：specAssist 拒絕分支漏掉 cancel()
+# M1：specAssist 拒絕分支拿掉**所有**取消保護（新加的 defer cancel() 與 inline cancel() 都拿掉）
+#     ——只拿掉其中一個不是有效的 mutant：另一個仍會取消，測試正確地維持綠燈
+cp app.go $EVID/t4-m1.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
-old = '''			h(ctx)
+d = '''	defer cancel()
+	if gerr := a.requireWorkspaceConfirmed("spec_assist", provider, ""); gerr != nil {'''
+i = '''			h(ctx)
 		}
 		cancel()
 		return "", gerr'''
-assert old in s
-open('app.go', 'w', encoding='utf-8').write(s.replace(old, '''			h(ctx)
+assert d in s and i in s
+s = s.replace(d, '''	if gerr := a.requireWorkspaceConfirmed("spec_assist", provider, ""); gerr != nil {''', 1)
+s = s.replace(i, '''			h(ctx)
 		}
-		return "", gerr''', 1))
+		return "", gerr''', 1)
+open('app.go', 'w', encoding='utf-8').write(s)
 EOF
-go test -run 'TestSpecAssistGate' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|\s+workspace_assist)" | head -3
-cp $EVID/app.t4.orig app.go && cmp $EVID/app.t4.orig app.go && echo restored
+mutant_check t4-m1 'context 必須已被取消' go test -run 'TestSpecAssistGate' -count=1 .
+restore_check $EVID/t4-m1.orig app.go
+
 # M2：planAssist 的閘門挪到 ensureGate 之後
+cp app.go $EVID/t4-m2.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
 blk = '''	if gerr := a.requireWorkspaceConfirmed("plan_assist", provider, ""); gerr != nil {
@@ -2328,9 +2396,11 @@ s = s.replace(anchor, '''	if _, err := a.ensureGate(); err != nil {
 ''' + blk + '''	entries, err := a.gateList()''', 1)
 open('app.go', 'w', encoding='utf-8').write(s)
 EOF
-go test -run 'TestPlanAssistGate' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|\s+workspace_assist)" | head -3
-cp $EVID/app.t4.orig app.go && cmp $EVID/app.t4.orig app.go && echo restored
-# M3：specAssist 的閘門插在 root context 與 purpose pin 之間（違反 spec 固定順序）
+mutant_check t4-m2 'gate.jsonl 不應被建立' go test -run 'TestPlanAssistGate' -count=1 .
+restore_check $EVID/t4-m2.orig app.go
+
+# M3：specAssist 的閘門（連同 defer）插在 root context 與 purpose pin 之間（違反 spec 固定順序）
+cp app.go $EVID/t4-m3.orig
 python3 - <<'EOF'
 s = open('app.go', encoding='utf-8').read()
 a0 = s.index('	// B4 確認閘（spec §5.4 固定順序）')
@@ -2342,11 +2412,11 @@ assert anchor in s
 s = s.replace(anchor, '	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)\n' + blk + '	// Pin the assist purpose', 1)
 open('app.go', 'w', encoding='utf-8').write(s)
 EOF
-go test -run 'TestAssistImplementationsTakeRootContextFirst' -count=1 . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|\s+app_binding)" | head -3
-cp $EVID/app.t4.orig app.go && cmp $EVID/app.t4.orig app.go && echo restored
+mutant_check t4-m3 '^--- FAIL: TestAssistImplementationsTakeRootContextFirst' go test -run 'TestAssistImplementationsTakeRootContextFirst' -count=1 .
+restore_check $EVID/t4-m3.orig app.go
 ```
 
-Expected：M1 → `SpecAssistGate…` 紅（`本次呼叫的 context 必須已被取消（Err=<nil>）`）；M2 → `PlanAssistGate…` 紅（`拒絕時不得觸發 ensureGate（gate.jsonl 不應被建立）`）；M3 → `TestAssistImplementationsTakeRootContextFirst` 紅（既有守門有效）。寫入 `$EVID/t4-mutation.txt`。
+Expected：三個 `mutant_check` 都印出「紅在目標」：M1 → `本次呼叫的 context 必須已被取消（Err=<nil>）`；M2 → `拒絕時不得觸發 ensureGate（gate.jsonl 不應被建立）`；M3 → `TestAssistImplementationsTakeRootContextFirst`（既有守門有效）。
 
 - [ ] **Step 6：Commit**
 
@@ -2355,8 +2425,8 @@ git add workspace_assist_gate_test.go app.go
 git commit -m "$(cat <<'EOF'
 feat(b4): specAssist／planAssist 的確認閘（Task 4）
 
-specAssist：purpose pin 之後、gen 之前，拒絕時自行 cancel 本次 context；planAssist：既有
-defer cancel() 之後、ensureGate 之前。拒絕時不登記 gen、不進 assistActive、不跑 runner／
+specAssist：purpose pin 之後先 defer cancel()、再確認閘（拒絕分支保留 inline cancel()），gen 之前；
+planAssist：既有 defer cancel() 之後、ensureGate 之前。拒絕時不登記 gen、不進 assistActive、不跑 runner／
 preflight。不新增內層 beginTxn；root＋purpose 形狀測試不修改即通過。
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
@@ -2644,7 +2714,8 @@ func readAuditRaw(t *testing.T, a *App) string {
 - [ ] **Step 2：跑一次確認失敗（保留首次紅燈）**
 
 ```bash
-go test -race -run 'TestWorkspaceConfirmedAudit|TestWorkspaceBlockedAudit|TestWorkspaceConfirmationAudit|TestConfirmTransition|TestConcurrentConfirm' -count=1 -timeout 120s . > $EVID/t5-red.log 2>&1; echo "rc=$?" >> $EVID/t5-red.log; grep -E "^(--- |FAIL|ok|rc=)|workspace_audit_test" $EVID/t5-red.log | head -20
+run_logged t5-red go test -race -run 'TestWorkspaceConfirmedAudit|TestWorkspaceBlockedAudit|TestWorkspaceConfirmationAudit|TestConfirmTransition|TestConcurrentConfirm' -count=1 -timeout 120s .
+show t5-red '^(--- FAIL|FAIL)|workspace_audit_test' 20
 ```
 
 Expected：rc=1；五條測試因「還沒有 audit」而紅（count 為 0、`兩種 audit 都必須被檢查到：0`、`Confirm 沒有走到 audit`）。
@@ -2723,16 +2794,21 @@ func (a *App) requireWorkspaceConfirmed(op, provider, wsid string) error {
 - [ ] **Step 4：跑測試（含 `-race`、重複執行抓間歇性）**
 
 ```bash
-gofmt -l . && go vet . && go test -race -run 'TestWorkspaceConfirmedAudit|TestWorkspaceBlockedAudit|TestWorkspaceConfirmationAudit|TestConfirmTransition|TestConcurrentConfirm' -count=5 -timeout 300s . 2>&1 | tail -3
+run_logged t5-gofmt gofmt -l . ; wc -c < $EVID/t5-gofmt.log                                # Expected：0
+run_logged t5-vet go vet . ; show t5-vet                                                    # Expected：rc=0
+run_logged t5-green go test -race -run 'TestWorkspaceConfirmedAudit|TestWorkspaceBlockedAudit|TestWorkspaceConfirmationAudit|TestConfirmTransition|TestConcurrentConfirm' -count=5 -timeout 300s -v .
+show t5-green '^(--- FAIL|FAIL|ok|WARNING: DATA RACE)' 20
+run_logged t5-prev go test -race -run 'TestStartSessionGate|TestSendMessageGate|TestSpecAssistGate|TestPlanAssistGate|TestProductionStartupPath' -count=1 .
+show t5-prev '' 5
 ```
 
-Expected：`ok`，沒有 `WARNING: DATA RACE`。再跑 Task 3／4 的測試確認 blocked audit 沒有破壞它們：`go test -race -run 'TestStartSessionGate|TestSendMessageGate|TestSpecAssistGate|TestPlanAssistGate|TestProductionStartupPath' -count=1 .`。
+Expected：兩組 rc=0，沒有 `WARNING: DATA RACE`；後者確認 blocked audit 沒有破壞 Task 3／4 的測試。
 
 - [ ] **Step 5：Mutation 證據**
 
 ```bash
-cp workspace_confirmation.go $EVID/wc.t5.orig
 # M1：audit 放進鎖內
+cp workspace_confirmation.go $EVID/t5-m1.orig
 python3 - <<'EOF'
 s = open('workspace_confirmation.go', encoding='utf-8').read()
 old = '''		info := snap.info()
@@ -2745,15 +2821,17 @@ open('workspace_confirmation.go', 'w', encoding='utf-8').write(s.replace(old, ''
 			"workspace": info.Workspace, "source": info.Source, "reasons": info.Reasons})
 		a.workspaceConfirm.mu.Unlock()''', 1))
 EOF
-go test -run 'TestWorkspaceConfirmationAudit_WrittenOutsideMutex|TestConfirmTransitionCompletesBeforeStartCanPass' -count=1 -timeout 90s . 2>&1 | grep -E "^(--- FAIL|ok|FAIL|panic|\s+workspace_audit)" | head -5
-cp $EVID/wc.t5.orig workspace_confirmation.go && cmp $EVID/wc.t5.orig workspace_confirmation.go && echo restored
+mutant_check t5-m1 '^--- FAIL: (TestWorkspaceConfirmationAudit_WrittenOutsideMutex|TestConfirmTransitionCompletesBeforeStartCanPass)' go test -run 'TestWorkspaceConfirmationAudit_WrittenOutsideMutex|TestConfirmTransitionCompletesBeforeStartCanPass' -count=1 -timeout 90s .
+restore_check $EVID/t5-m1.orig workspace_confirmation.go
+
 # M2：每次 Confirm 都寫 audit（不看 transitioned）
+cp workspace_confirmation.go $EVID/t5-m2.orig
 sed -i '' 's/	if transitioned {/	if transitioned || true {/' workspace_confirmation.go
-go test -run 'TestWorkspaceConfirmedAudit|TestConcurrentConfirm' -count=1 -timeout 90s . 2>&1 | grep -E "^(--- FAIL|ok|FAIL)" | head -4
-cp $EVID/wc.t5.orig workspace_confirmation.go && cmp $EVID/wc.t5.orig workspace_confirmation.go && echo restored
+mutant_check t5-m2 '^--- FAIL: (TestWorkspaceConfirmedAudit_OncePerTransitionWithFields|TestConcurrentConfirmAndGate_SingleAuditAndMonotonic)' go test -run 'TestWorkspaceConfirmedAudit|TestConcurrentConfirm' -count=1 -timeout 90s .
+restore_check $EVID/t5-m2.orig workspace_confirmation.go
 ```
 
-Expected：M1 → `WrittenOutsideMutex` 紅、`ConfirmTransitionCompletesBeforeStartCanPass` 在 5 秒後紅（`啟動被確認的 audit 擋住了`），**而且不會卡住整個 run**（測試已用 `t.Cleanup` 放行被擋住的 goroutine，且不在鎖內直接讀 `snapshot()`）；M2 → `OncePerTransition…` 紅（2 筆）、`ConcurrentConfirm…` 紅（16 筆）。寫入 `$EVID/t5-mutation.txt`。
+Expected：兩個 `mutant_check` 都印出「紅在目標」，**而且不會卡住整個 run**（測試已用 `t.Cleanup` 放行被擋住的 goroutine，且不在鎖內直接讀 `snapshot()`；若出現 `panic: test timed out`，`mutant_check` 會判為非目標失敗）。M1 → `WrittenOutsideMutex` 紅、`ConfirmTransitionCompletesBeforeStartCanPass` 在 5 秒後紅（`啟動被確認的 audit 擋住了`）；M2 → `OncePerTransition…` 紅（2 筆）、`ConcurrentConfirm…` 紅（16 筆）。
 
 - [ ] **Step 6：Commit**
 
@@ -3005,18 +3083,19 @@ func TestCodexServerEntryPointsSendNoThreadOrTurn(t *testing.T) {
 - [ ] **Step 2：跑測試（預期直接通過，明確標示「非先紅後綠」）**
 
 ```bash
-go test -race -run 'TestCodexLoginAndStatusSendNoThreadOrTurn|TestCodexServerEntryPointsSendNoThreadOrTurn' -count=3 -v . 2>&1 | grep -E "^(\s*--- |ok|FAIL)"
+run_logged t6-green go test -race -run 'TestCodexLoginAndStatusSendNoThreadOrTurn|TestCodexServerEntryPointsSendNoThreadOrTurn' -count=3 -v .
+show t6-green '^(\s*--- |ok|FAIL|WARNING: DATA RACE)' 40
 ```
 
-Expected：PASS。記錄於 `$EVID/t6-first-run.txt`：「本測試驗證既有行為，首次執行即綠；紅燈證據見 mutation」。
+Expected：rc=0、全部 PASS。本測試驗證既有行為，首次執行即綠；紅燈證據見 Step 3 的 mutation。
 
 - [ ] **Step 3：Mutation 證據（測試要紅在正題）——四個入口各一個 mutant**
 
-每個 mutant 都是在該入口的 production 路徑多送一個 `thread/start`；用位元組備份還原：
+每個 mutant 都是在該入口的 production 路徑多送一個 `thread/start`；每個 mutant 有自己的備份、log、rc，並在還原後 `cmp`：
 
 ```bash
-cp app.go $EVID/app.t6.orig
 for M in auth logout restart recover; do
+cp app.go $EVID/t6-$M.orig
 python3 - "$M" <<'EOF'
 import sys
 m = sys.argv[1]
@@ -3043,14 +3122,18 @@ else:
     s = s.replace(old, inj + old, 1)
 open('app.go', 'w', encoding='utf-8').write(s)
 EOF
-echo "== mutant $M"
-go test -run 'TestCodexLoginAndStatusSendNoThreadOrTurn|TestCodexServerEntryPointsSendNoThreadOrTurn' -count=1 -v . 2>&1 | grep -E "^\s*--- FAIL|workspace_login_boundary_test.go:[0-9]+" | head -4
-cp $EVID/app.t6.orig app.go
+case $M in
+  auth)    PAT='^--- FAIL: TestCodexLoginAndStatusSendNoThreadOrTurn' ;;
+  logout)  PAT='--- FAIL: TestCodexServerEntryPointsSendNoThreadOrTurn/Logout' ;;
+  restart) PAT='--- FAIL: TestCodexServerEntryPointsSendNoThreadOrTurn/RestartCodexServerRecorded' ;;
+  recover) PAT='--- FAIL: TestCodexServerEntryPointsSendNoThreadOrTurn/RecoverCodexRecording' ;;
+esac
+mutant_check t6-$M "$PAT" go test -run 'TestCodexLoginAndStatusSendNoThreadOrTurn|TestCodexServerEntryPointsSendNoThreadOrTurn' -count=1 -v .
+restore_check $EVID/t6-$M.orig app.go
 done
-cmp $EVID/app.t6.orig app.go && echo restored
 ```
 
-Expected（計畫撰寫時在複本上量到）：`auth` → `TestCodexLoginAndStatusSendNoThreadOrTurn` 紅，訊息 `登入與狀態查詢不得送出 thread/start：[initialize thread/start account/read account/login/start]`；`logout` → `…EntryPoints…/Logout` 紅（`Logout 不得送出 thread/start：[initialize thread/start account/logout]`）；`restart` → `…/RestartCodexServerRecorded` 紅（`[initialize thread/start]`）；`recover` → `…/RecoverCodexRecording` 紅。每個 mutant 只讓對應的那一個入口變紅。寫入 `$EVID/t6-mutation.txt`。
+Expected：四個 `mutant_check` 都印出「紅在目標」，每個 mutant 只讓對應的那一個入口變紅：`auth` → `登入與狀態查詢不得送出 thread/start：[initialize thread/start account/read account/login/start]`；`logout` → `Logout 不得送出 thread/start：[initialize thread/start account/logout]`；`restart`／`recover` → `…不得送出 thread/start：[initialize thread/start]`。
 
 - [ ] **Step 4：未驗證範圍照實記錄（Fail Loud）**
 
@@ -3148,15 +3231,37 @@ describe('workspace confirmation store：封鎖判定', () => {
     expect(wsc.blocked).toBe(false)
   })
 
-  // Review Focus 4：壞掉的回覆不得解除封鎖。缺 required 若被當成 false，就會放行。
-  it.each([
+  // Review Focus 4：壞掉的回覆不得解除封鎖，也不得被補成合法資料。
+  const BAD: Array<[string, unknown]> = [
     ['空物件', {}],
-    ['缺 required', { confirmed: false, workspace: '/w' }],
-    ['required 不是 boolean', { required: 'false', confirmed: false, workspace: '/w' }],
-    ['缺 workspace', { required: false, confirmed: false }],
+    ['缺 required', { confirmed: false, workspace: '/w', source: 'env', reasons: [] }],
+    ['required 不是 boolean', { required: 'false', confirmed: false, workspace: '/w', source: 'env', reasons: [] }],
+    ['缺 confirmed', { required: false, workspace: '/w', source: 'env', reasons: [] }],
+    ['缺 workspace', { required: false, confirmed: false, source: 'env', reasons: [] }],
+    ['缺 source', { required: false, confirmed: false, workspace: '/w', reasons: [] }],
+    ['source 不是字串', { required: false, confirmed: false, workspace: '/w', source: 1, reasons: [] }],
+    ['缺 reasons', { required: false, confirmed: false, workspace: '/w', source: 'env' }],
+    ['reasons 是 null', { required: false, confirmed: false, workspace: '/w', source: 'env', reasons: null }],
+    ['reasons 不是陣列', { required: false, confirmed: false, workspace: '/w', source: 'env', reasons: 'is_home' }],
+    ['reasons 含數字', { required: false, confirmed: false, workspace: '/w', source: 'env', reasons: ['is_home', 1] }],
+    ['reasons 含 null', { required: false, confirmed: false, workspace: '/w', source: 'env', reasons: [null] }],
     ['null', null],
     ['undefined', undefined],
-  ])('形狀不對的回覆（%s）→ 封鎖（failed），不放行', async (_name, raw) => {
+    ['字串', 'ok'],
+  ]
+
+  it.each(BAD)('parseStatus 拒絕形狀不對的回覆（%s）：丟錯，不補空值', (_name, raw) => {
+    expect(() => parseStatus(raw)).toThrow('malformed')
+  })
+
+  it('parseStatus 接受完整且正確的 DTO，並回傳 reasons 的複本', () => {
+    const reasons = ['source_home', 'is_home']
+    const st = parseStatus({ required: true, confirmed: false, workspace: '/w', source: 'home', reasons })
+    expect(st).toEqual({ required: true, confirmed: false, workspace: '/w', source: 'home', reasons })
+    expect(st.reasons).not.toBe(reasons)
+  })
+
+  it.each(BAD)('refresh：尚未取得時收到壞回覆（%s）→ failed，blocked=true', async (_name, raw) => {
     const wsc = useWorkspaceConfirmation()
     await wsc.refresh(async () => raw)
     expect(wsc.status).toBeNull()
@@ -3164,12 +3269,24 @@ describe('workspace confirmation store：封鎖判定', () => {
     expect(wsc.blocked).toBe(true)
   })
 
-  it('Go 的 nil slice 序列化成 null：reasons 容忍 null，不炸', () => {
-    const st = parseStatus({ required: true, confirmed: false, workspace: '/w', source: 'tmp', reasons: null })
-    expect(st.reasons).toEqual([])
+  // 最重要的一格：已經放行（confirmed／notRequired）之後收到壞回覆，必須回到 failed 並重新封鎖，
+  // 不能沿用舊的放行狀態，也不能因為壞回覆而「看起來沒事」。
+  it.each(BAD)('refresh：已放行後收到壞回覆（%s）→ 回到 failed，blocked=true', async (_name, raw) => {
+    const wsc = useWorkspaceConfirmation()
+    await wsc.refresh(async () => CONFIRMED)
+    expect(wsc.blocked).toBe(false)
+    await wsc.refresh(async () => raw)
+    expect(wsc.status).toBeNull()
+    expect(wsc.blockKind).toBe('failed')
+    expect(wsc.blocked).toBe(true)
+    await wsc.refresh(async () => NOT_REQUIRED)
+    expect(wsc.blocked).toBe(false)
+    await wsc.refresh(async () => raw)
+    expect(wsc.blockKind).toBe('failed')
+    expect(wsc.blocked).toBe(true)
   })
 
-  // Review Focus 4：先前已確認，之後的查詢失敗要重新封鎖（fail closed），不沿用舊的 confirmed。
+  // 先前已確認、之後查詢失敗要重新封鎖（fail closed），不沿用舊的 confirmed。
   it('先前 confirmed、之後查詢失敗 → 重新封鎖', async () => {
     const wsc = useWorkspaceConfirmation()
     await wsc.refresh(async () => CONFIRMED)
@@ -3825,7 +3942,7 @@ export function seedWorkspaceConfirmation(over: Partial<WorkspaceStatus> = {}) {
 +  ConfirmWorkspace: vi.fn(async (..._a: string[]) => {}),
  }))
  vi.mock('../../wailsjs/go/main/App', () => h)
- 
+
 @@ -183,4 +185,18 @@
      await b.EscalationResolve('esc-1', 'fixed', 'because reasons')
      expect(h.EscalationResolve).toHaveBeenCalledWith('esc-1', 'fixed', 'because reasons')
@@ -3919,7 +4036,8 @@ export function seedWorkspaceConfirmation(over: Partial<WorkspaceStatus> = {}) {
 
 ```bash
 cd frontend
-npx vitest run src/stores/workspaceConfirmation.test.ts src/components/WorkspaceConfirmBanner.test.ts src/components/workspaceGate.test.ts src/workspaceConfirmationApp.test.ts src/i18n/workspaceReasonKeys.test.ts src/lib/bindings.test.ts > $EVID/t7-red.log 2>&1; echo "rc=$?" >> $EVID/t7-red.log; grep -E "Test Files|Tests |rc=|Failed to resolve|Error:" $EVID/t7-red.log | head -12
+run_logged t7-red npx vitest run src/stores/workspaceConfirmation.test.ts src/components/WorkspaceConfirmBanner.test.ts src/components/workspaceGate.test.ts src/workspaceConfirmationApp.test.ts src/i18n/workspaceReasonKeys.test.ts src/lib/bindings.test.ts
+show t7-red 'Test Files|Tests |Failed to resolve|Error:' 12
 cd ..
 ```
 
@@ -3931,7 +4049,6 @@ Expected：rc=1；新檔案因 `Failed to resolve import "./workspaceConfirmatio
 
 ```ts
 import { defineStore } from 'pinia'
-import type { main } from '../../wailsjs/go/models'
 
 // B4 workspace 確認狀態（spec §5.6）：App 頂部列警示、composer、Spec／Plan Assist 共用的
 // 單一來源。沿用 escalation store 的慣例——不在 store 內 import wailsjs，真正的 binding 由
@@ -3958,20 +4075,27 @@ interface State {
   confirmError: string // 最近一次確認失敗的原文
 }
 
-// parseStatus：Go 端保證 required／confirmed 是 boolean、workspace 是 string；reasons 可能是
-// null（Go nil slice 序列化）。形狀不對（例如 {}）一律丟錯——缺 required 若被當成 false，
-// 一個壞掉的回覆就會解除封鎖。
+// parseStatus：驗證完整 DTO 形狀，不補空值、不用 String() 把錯誤資料轉成合法資料。
+// Go 端保證 required／confirmed 是 boolean、workspace／source 是 string、reasons 是**非 nil** 的
+// string 陣列（見 WorkspaceConfirmationInfo.info()）——所以任何缺少、null、型別不符的欄位都是
+// 壞回覆，一律丟錯，由 refresh 轉成封鎖（failed）。缺 required 若被當成 false、reasons 缺少
+// 若被補成 []，一個壞掉的回覆就會解除封鎖。
 export function parseStatus(raw: unknown): WorkspaceStatus {
-  const r = raw as Partial<main.WorkspaceConfirmationInfo> | null | undefined
-  if (!r || typeof r.required !== 'boolean' || typeof r.confirmed !== 'boolean' || typeof r.workspace !== 'string') {
+  const r = raw as Partial<Record<keyof WorkspaceStatus, unknown>> | null | undefined
+  if (
+    !r || typeof r !== 'object' ||
+    typeof r.required !== 'boolean' || typeof r.confirmed !== 'boolean' ||
+    typeof r.workspace !== 'string' || typeof r.source !== 'string' ||
+    !Array.isArray(r.reasons) || !r.reasons.every((x): x is string => typeof x === 'string')
+  ) {
     throw new Error('WorkspaceConfirmationStatus: malformed response')
   }
   return {
     required: r.required,
     confirmed: r.confirmed,
     workspace: r.workspace,
-    source: typeof r.source === 'string' ? r.source : '',
-    reasons: Array.isArray(r.reasons) ? r.reasons.map(String) : [],
+    source: r.source,
+    reasons: [...r.reasons],
   }
 }
 
@@ -4032,7 +4156,7 @@ export const useWorkspaceConfirmation = defineStore('workspaceConfirmation', {
 @@ -1,4 +1,4 @@
 -import type { evidence, escalation } from '../wailsjs/go/models'
 +import type { evidence, escalation, main } from '../wailsjs/go/models'
- 
+
  // Envelope v1（M1 凍結契約）：欄位名對齊 Go contract.Envelope 的 json tag。
  export interface Usage { input_tokens: number; output_tokens: number; cached_input_tokens?: number }
 @@ -151,3 +151,9 @@
@@ -4061,7 +4185,7 @@ export const useWorkspaceConfirmation = defineStore('workspaceConfirmation', {
 -  TurnWindowBindings, PaneLayoutBindings, EvidenceBindings, EscalationBindings,
 +  TurnWindowBindings, PaneLayoutBindings, EvidenceBindings, EscalationBindings, WorkspaceConfirmationBindings,
  } from '../types'
- 
+
  // production bindings adapter（M1.5 第三輪 review P1-1：SendMessage 必須
 @@ -29,7 +30,7 @@
  // 綁定個別當 prop 傳給 TcaWorkspace／EscalationInbox 等元件。
@@ -4345,7 +4469,7 @@ function cancel() {
 +    }
    } catch { /* dev 無綁定時忽略 */ }
  }
- 
+
 +// refreshWorkspaceConfirmation：store 自己做 request sequencing（晚到的舊回應整筆丟棄）、
 +// 失敗時維持封鎖（fail closed）。重新掛載只會重新查詢，不會自動確認。
 +async function refreshWorkspaceConfirmation() {
@@ -4378,14 +4502,14 @@ function cancel() {
 +import { useWorkspaceConfirmation } from '../stores/workspaceConfirmation'
 +import { resolveState, sessionStateKeys, workspaceBlockKeys } from '../i18n/stateKeys'
  import { isAtBottom, isAtTop } from '../lib/scroll'
- 
+
  // PaneView（Task 28，spec §3.7）：單一 pane，綁定 DualPane 分配給它的 WSID
 @@ -19,6 +20,7 @@
  const props = defineProps<{ idx: 0 | 1 }>()
  const { t } = useI18n()
  const s = useSession()
 +const wsc = useWorkspaceConfirmation() // B4：required && !confirmed、尚未取得、查詢失敗 → composer 停用
- 
+
  const wsid = computed(() => s.pins[props.idx] ?? '')
  const meta = computed(() => (wsid.value ? s.sessions[wsid.value] : undefined))
 @@ -62,6 +64,7 @@
@@ -4430,7 +4554,7 @@ function cancel() {
 +import { workspaceBlockKeys } from '../i18n/stateKeys'
 +import { useWorkspaceConfirmation } from './workspaceConfirmation'
  import type { Bindings, ChatItem, Envelope, PaneLayoutInfo, SessionInfo, TimelineItem } from '../types'
- 
+
  const NOISE_KINDS = new Set(['system_other', 'unknown'])
 @@ -612,6 +614,13 @@
          this.pushNotice(t('store.bindingsNotReady'))
@@ -4463,11 +4587,11 @@ function cancel() {
  import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
  import { isWriteConflict } from '../lib/writeConflict'
 @@ -37,6 +39,7 @@
- 
+
  const s = useSession()
  const assist = useAssist()
 +const wsc = useWorkspaceConfirmation() // B4：未確認／尚未取得／查詢失敗時停用三個 AI 輔助按鈕
- 
+
  const files = ref<main.FileNode[]>([])
  // selectedPath 是唯一權威來源（A1a-1 缺口 3 修正）：props.path 只在宣告當下 seed
 @@ -396,6 +399,10 @@
@@ -4483,7 +4607,7 @@ function cancel() {
    try {
 @@ -751,10 +758,11 @@
      <p v-if="saveError" class="err" data-test="save-error" :data-conflict="saveConflict ? 'true' : undefined">{{ saveError }}</p>
- 
+
      <div class="assist-buttons">
 -      <button data-test="assist-draft" :disabled="assistBusy" @click="draftGherkin">{{ t('spec.action.draftGherkin') }}</button>
 -      <button data-test="assist-ambiguity" :disabled="assistBusy" @click="detectAmbiguity">{{ t('spec.action.detectAmbiguity') }}</button>
@@ -4494,7 +4618,7 @@ function cancel() {
      </div>
 +    <p v-if="wsc.blocked" class="err" data-test="assist-blocked">{{ t(workspaceBlockKeys[wsc.blockKind]) }}</p>
      <p v-if="assistError" class="err">{{ assistError }}</p>
- 
+
      <div class="draft-area">
 ```
 
@@ -4512,10 +4636,10 @@ function cancel() {
  // domain 耦合（沿用既有、已測試涵蓋的 fence 擷取邏輯，不重複實作）。
 @@ -21,6 +23,7 @@
  import ExternalChangeCompare from './ExternalChangeCompare.vue'
- 
+
  const { t } = useI18n()
 +const wsc = useWorkspaceConfirmation() // B4：未確認／尚未取得／查詢失敗時停用 AI 草稿（含 bump 的重新執行）
- 
+
  // PlanWorkspace（Task 13，spec §7 Stage B）：鏡射 SpecWorkspace.vue 的資料流與
  // props 慣例（`path`/`draft`/`write` 皆可注入，測試走這條路徑，避開 CM6 DOM／
 @@ -512,6 +515,10 @@
@@ -4538,7 +4662,7 @@ function cancel() {
      </div>
 +    <p v-if="wsc.blocked" class="err" data-test="assist-blocked">{{ t(workspaceBlockKeys[wsc.blockKind]) }}</p>
      <p v-if="assistError" class="err">{{ assistError }}</p>
- 
+
      <div class="draft-area">
 @@ -846,7 +854,7 @@
            <li v-for="f in bumpPreview.touched_files" :key="f">{{ f }}</li>
@@ -4555,13 +4679,14 @@ function cancel() {
 
 ```bash
 cd frontend
-npx vue-tsc --noEmit; echo "tsc rc=$?"                                   # Expected：rc=0、無輸出
-npx vitest run > $EVID/t7-full-red.log 2>&1; echo "rc=$?" >> $EVID/t7-full-red.log
-grep -E "Test Files|Tests |rc=" $EVID/t7-full-red.log; grep -E "^ FAIL" $EVID/t7-full-red.log | sed 's/ > .*//' | sort | uniq -c
+run_logged t7-tsc npx vue-tsc --noEmit ; show t7-tsc                                       # Expected：rc=0、無輸出
+run_logged t7-full-red npx vitest run
+show t7-full-red 'Test Files|Tests '
+grep -E '^ FAIL' $EVID/t7-full-red.log | sed 's/ > .*//' | sort | uniq -c
 cd ..
 ```
 
-Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試 **5 個檔案、12 條**紅：`stores/session.test.ts`（5）、`components/DualPane.test.ts`（1）、`components/PlanWorkspace.test.ts`（2）、`components/SpecWorkspace.test.ts`（2）、`registryUncertain.test.ts`（2）。**分類**：這些測試驗的是「不需確認時」的既有行為，它們的 store 從沒被餵過確認狀態，所以 fail closed 的 `loading` 封鎖了 composer／Assist——是夾具前提，不是回歸。
+Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試 **5 個檔案、12 條**紅：`stores/session.test.ts`（5）、`components/DualPane.test.ts`（1）、`components/PlanWorkspace.test.ts`（2）、`components/SpecWorkspace.test.ts`（2）、`registryUncertain.test.ts`（2）。**分類**：這些測試驗的是「不需確認時」的既有行為，它們的 store 從沒被餵過確認狀態，所以 fail closed 的 `loading` 封鎖了 composer／Assist——是夾具前提，不是回歸。**若失敗的檔案或數量與上面不同**（例如新測試檔紅、或 App 層級測試紅），不得套用 Step 6 的 seed，先追責任歸屬並回報 owner。
 
 - [ ] **Step 6：補夾具前提（只加 seed，不改任何斷言）**
 
@@ -4576,18 +4701,18 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
  import { useSession } from './session'
 +import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
  import type { Envelope } from '../types'
- 
+
  // env：所有 conversation lane 事件都帶 workspace_session_id（§3.1.5 之後為必填）。
 @@ -158,7 +159,10 @@
  })
- 
+
  describe('session store：focused pane 操作（§3.7）', () => {
 -  beforeEach(() => setActivePinia(createPinia()))
 +  beforeEach(() => {
 +    setActivePinia(createPinia())
 +    seedWorkspaceConfirmation() // B4：submit 在 workspace 需確認時不送出；這組驗的是不需確認時的既有行為
 +  })
- 
+
    // pin() 的 action 契約（owner 2026-08-17 追加裁決）：「釘進第 N 格」＝同時明確
    // 選了 session 與 pane，所以第 N 格必須成為作用中的那一格。
 ```
@@ -4601,7 +4726,7 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
  import { makeI18n } from '../test/i18n'
 +import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
  import type { Bindings } from '../types'
- 
+
  // DualPane（Task 28，spec §3.7）：兩個 pane 都持續接收串流（不管是否
 @@ -31,6 +32,7 @@
    beforeEach(() => {
@@ -4621,7 +4746,7 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
  import { usePlan } from '../stores/plan'
  import { mountWithI18n } from '../test/i18n'
 +import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
- 
+
  // wailsjs 綁定 mock：控制 PlanAssist 的 resolve 時機（同 SpecWorkspace.test.ts 慣例）。
  // PlanList/PlanRead 給穩定預設值，避免 onMounted 的載入路徑撞到未定義行為。
 @@ -25,6 +26,7 @@
@@ -4643,7 +4768,7 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
  import { mountWithI18n } from '../test/i18n'
 +import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
  import zhTW from '../i18n/locales/zh-TW'
- 
+
  // wailsjs 綁定 mock：控制 SpecAssist 的 resolve 時機，模擬「assist 進行中操作者
 @@ -25,6 +26,7 @@
  describe('SpecWorkspace draft accept', () => {
@@ -4672,7 +4797,7 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
  import type { Envelope } from './types'
  import { makeI18n } from './test/i18n'
 +import { seedWorkspaceConfirmation } from './test/workspaceConfirmation'
- 
+
  // memStorage：這個 jsdom 環境沒有 localStorage（vitest 啟動時就印
  // 「localStorage is not available」），而 lib/persist 的 load/save 對缺席是靜默
 @@ -123,6 +126,7 @@
@@ -4686,20 +4811,24 @@ Expected（計畫撰寫時在複本上量到）：新檔案全綠；既有測試
 ```
 
 ```bash
-cd frontend && npx vitest run > $EVID/t7-full-green.log 2>&1; echo "rc=$?" >> $EVID/t7-full-green.log; grep -E "Test Files|Tests |rc=" $EVID/t7-full-green.log; cd ..
+cd frontend
+run_logged t7-full-green npx vitest run ; show t7-full-green 'Test Files|Tests '
+cd ..
 ```
 
-Expected：`49 passed`／`665 passed`（605 基準＋60 新測試），rc=0。若數字不同，**當場數過再寫**，並說明差異來源。
+Expected：rc=0，`49 passed`／`704 passed`（605 基準＋99 新測試）。若數字不同，**當場數過再寫**，並說明差異來源。
 
 - [ ] **Step 7：Mutation 證據（測試要紅在正題）**
 
-用位元組備份還原。每個 mutant 只跑本 task 的新測試檔：
+每個 mutant 有自己的備份、log、rc，並在還原後 `cmp`；`mutant_check` 會確認失敗的是目標測試，並排除 `Failed to resolve import`／`SyntaxError` 等非目標失敗。每個 mutant 只跑本 task 的新測試檔：
 
 ```bash
 cd frontend
 T=(src/stores/workspaceConfirmation.test.ts src/components/WorkspaceConfirmBanner.test.ts src/components/workspaceGate.test.ts src/workspaceConfirmationApp.test.ts)  # 用陣列：zsh 不會對未加引號的變數做 word splitting
-cp src/stores/workspaceConfirmation.ts $EVID/ws.store.orig; cp src/components/PaneView.vue $EVID/ws.pane.orig; cp src/components/SpecWorkspace.vue $EVID/ws.spec.orig; cp src/components/PlanWorkspace.vue $EVID/ws.plan.orig
+run_logged t7-base-focused npx vitest run "${T[@]}" ; show t7-base-focused 'Test Files|Tests '        # Expected：rc=0、全綠（mutation 的基準）
+
 # M1：尚未取得／查詢失敗時視為放行
+cp src/stores/workspaceConfirmation.ts $EVID/t7-m1.orig
 python3 - <<'EOF'
 p = 'src/stores/workspaceConfirmation.ts'
 s = open(p, encoding='utf-8').read()
@@ -4707,26 +4836,48 @@ old = "if (s.status === null) return s.queryError === '' ? 'loading' : 'failed'"
 assert old in s
 open(p, 'w', encoding='utf-8').write(s.replace(old, "if (s.status === null) return 'ok'", 1))
 EOF
-npx vitest run "${T[@]}" 2>&1 | grep -E "Test Files|Tests "; cp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && cmp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && echo restored
-# M2：缺 required 當成 false（壞回覆解除封鎖）
+mutant_check t7-m1 'FAIL .*(workspaceConfirmation|WorkspaceConfirmBanner|workspaceGate|workspaceConfirmationApp)\.test\.ts' npx vitest run "${T[@]}"
+restore_check $EVID/t7-m1.orig src/stores/workspaceConfirmation.ts
+
+# M2：壞回覆被補成合法資料（parser 補空值、用 String() 轉型）
+cp src/stores/workspaceConfirmation.ts $EVID/t7-m2.orig
 python3 - <<'EOF'
+import re
 p = 'src/stores/workspaceConfirmation.ts'
 s = open(p, encoding='utf-8').read()
-old = "if (!r || typeof r.required !== 'boolean' || typeof r.confirmed !== 'boolean' || typeof r.workspace !== 'string') {"
-assert old in s
-s = s.replace(old, "if (!r) {", 1).replace("required: r.required,", "required: r.required === true,", 1).replace("confirmed: r.confirmed,", "confirmed: r.confirmed === true,", 1).replace("workspace: r.workspace,", "workspace: String(r.workspace ?? ''),", 1)
+g0 = s.index('  if (\n    !r ||')
+g1 = s.index('    throw new Error(\'WorkspaceConfirmationStatus: malformed response\')\n  }\n') + len('    throw new Error(\'WorkspaceConfirmationStatus: malformed response\')\n  }\n')
+s = s[:g0] + "  if (!r) throw new Error('WorkspaceConfirmationStatus: malformed response')\n" + s[g1:]
+r0 = s.index('  return {\n    required: r.required,')
+r1 = s.index('  }\n}', r0) + len('  }\n')
+s = s[:r0] + '''  return {
+    required: r.required === true,
+    confirmed: r.confirmed === true,
+    workspace: String(r.workspace ?? ''),
+    source: String(r.source ?? ''),
+    reasons: Array.isArray(r.reasons) ? r.reasons.map(String) : [],
+  }
+''' + s[r1:]
 open(p, 'w', encoding='utf-8').write(s)
 EOF
-npx vitest run "${T[@]}" 2>&1 | grep -E "Test Files|Tests "; cp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && cmp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && echo restored
+mutant_check t7-m2 'FAIL .*workspaceConfirmation\.test\.ts.*(parseStatus|refresh)' npx vitest run "${T[@]}"
+restore_check $EVID/t7-m2.orig src/stores/workspaceConfirmation.ts
+
 # M3：拿掉 request sequencing
+cp src/stores/workspaceConfirmation.ts $EVID/t7-m3.orig
 python3 - <<'EOF'
 p = 'src/stores/workspaceConfirmation.ts'
 s = open(p, encoding='utf-8').read()
-s = s.replace("if (token !== this.seq) return // 較新的 refresh 已發出：這筆是舊回應，丟棄", "", 1).replace("if (token !== this.seq) return // 舊呼叫的失敗不得覆蓋新狀態", "", 1)
-open(p, 'w', encoding='utf-8').write(s)
+a = "if (token !== this.seq) return // 較新的 refresh 已發出：這筆是舊回應，丟棄"
+b = "if (token !== this.seq) return // 舊呼叫的失敗不得覆蓋新狀態"
+assert a in s and b in s
+open(p, 'w', encoding='utf-8').write(s.replace(a, '', 1).replace(b, '', 1))
 EOF
-npx vitest run "${T[@]}" 2>&1 | grep -E "Test Files|Tests "; cp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && cmp $EVID/ws.store.orig src/stores/workspaceConfirmation.ts && echo restored
+mutant_check t7-m3 'FAIL .*(workspaceConfirmation|workspaceConfirmationApp)\.test\.ts.*(舊|晚)' npx vitest run "${T[@]}"
+restore_check $EVID/t7-m3.orig src/stores/workspaceConfirmation.ts
+
 # M4：PaneView.send() 沒有先檢查封鎖（會清掉被擋下的草稿）
+cp src/components/PaneView.vue $EVID/t7-m4.orig
 python3 - <<'EOF'
 p = 'src/components/PaneView.vue'
 s = open(p, encoding='utf-8').read()
@@ -4734,29 +4885,37 @@ old = "  if (wsc.blocked) return // 早於清空 draft：被擋下的草稿要�
 assert old in s
 open(p, 'w', encoding='utf-8').write(s.replace(old, '', 1))
 EOF
-npx vitest run "${T[@]}" 2>&1 | grep -E "Test Files|Tests "; cp $EVID/ws.pane.orig src/components/PaneView.vue && cmp $EVID/ws.pane.orig src/components/PaneView.vue && echo restored
+mutant_check t7-m4 'FAIL .*workspaceGate\.test\.ts.*send\(\)' npx vitest run "${T[@]}"
+restore_check $EVID/t7-m4.orig src/components/PaneView.vue
+
 # M5：Spec／Plan 的 runAssist 沒有自己的守門
+cp src/components/SpecWorkspace.vue $EVID/t7-m5-spec.orig; cp src/components/PlanWorkspace.vue $EVID/t7-m5-plan.orig
 python3 - <<'EOF'
 import re
 for p in ('src/components/SpecWorkspace.vue', 'src/components/PlanWorkspace.vue'):
     s = open(p, encoding='utf-8').read()
-    s = re.sub(r"  if \(wsc\.blocked\) \{[^\n]*\n    assistError\.value = t\(workspaceBlockKeys\[wsc\.blockKind\]\)\n    return\n  \}\n", "", s, count=1)
-    open(p, 'w', encoding='utf-8').write(s)
+    s2 = re.sub(r"  if \(wsc\.blocked\) \{[^\n]*\n    assistError\.value = t\(workspaceBlockKeys\[wsc\.blockKind\]\)\n    return\n  \}\n", "", s, count=1)
+    assert s2 != s, p
+    open(p, 'w', encoding='utf-8').write(s2)
 EOF
-npx vitest run "${T[@]}" 2>&1 | grep -E "Test Files|Tests "; cp $EVID/ws.spec.orig src/components/SpecWorkspace.vue; cp $EVID/ws.plan.orig src/components/PlanWorkspace.vue; cmp $EVID/ws.spec.orig src/components/SpecWorkspace.vue && cmp $EVID/ws.plan.orig src/components/PlanWorkspace.vue && echo restored
+mutant_check t7-m5 'FAIL .*workspaceGate\.test\.ts.*(SpecWorkspace|PlanWorkspace)' npx vitest run "${T[@]}"
+restore_check $EVID/t7-m5-spec.orig src/components/SpecWorkspace.vue; restore_check $EVID/t7-m5-plan.orig src/components/PlanWorkspace.vue
 cd ..
 ```
 
-Expected（計畫撰寫時在複本上量到，基準為 56 條全綠）：M1 → 4 個檔案、23 條紅；M2 → 4 條紅（`形狀不對的回覆`）；M3 → 3 條紅（晚到舊回應）；M4 → 1 條紅（`輸入草稿後才被封鎖：send() 不會清掉草稿`）；M5 → 6 條紅（Spec 三種封鎖＋Plan 三種封鎖）。**每個 mutant 都必須變紅**；沒變紅就是測試失效（例如 disabled 的元素收不到事件，所以 M4／M5 的測試改為直接呼叫元件的 `send()`／`runAssist()`）。結果寫入 `$EVID/t7-mutation.txt`。
+Expected：五個 `mutant_check` 都印出「紅在目標」（計畫撰寫時在複本上的紅燈數量見 Self-review 的驗證紀錄；數字以你當場數到的為準）。**每個 mutant 都必須變紅**；沒變紅就是測試失效（例如 disabled 的元素收不到事件，所以 M4／M5 的測試改為直接呼叫元件的 `send()`／`runAssist()`）。
 
 - [ ] **Step 8：build 與完整前端 gate**
 
 ```bash
-cd frontend && npm run build > $EVID/t7-build.log 2>&1; echo "rc=$?" >> $EVID/t7-build.log; tail -4 $EVID/t7-build.log; cd ..
+cd frontend
+run_logged t7-build npm run build ; show t7-build '' 4
+run_logged t7-final-vitest npx vitest run ; show t7-final-vitest 'Test Files|Tests '
+cd ..
 git status --short | grep -v "^[AM?]" ; git status --short frontend/dist      # Expected：dist 不出現（gitignore）
 ```
 
-Expected：rc=0（`vue-tsc --noEmit` 與 `vite build` 皆過；chunk size 警告是既有的）。
+Expected：兩組 rc=0（`vue-tsc --noEmit` 與 `vite build` 皆過；chunk size 警告是既有的；vitest 數字見 Step 6）。
 
 - [ ] **Step 9：Commit**
 
@@ -4831,15 +4990,16 @@ Feature: 高風險 workspace 必須先經使用者確認，才能開始 AI 工�
     And 送出訊息與 Spec／Plan 的 AI 輔助都是停用的
     When 前端被繞過而直接呼叫 StartSession
     Then 後端回 workspace_confirmation_required，沒有任何 provider 行程、broker、MCP config、recorder 被建立
-    And 稽核流記下一筆 workspace_confirmation_blocked，不含 prompt
+    And 後端 best-effort 嘗試寫入一筆 workspace_confirmation_blocked 稽核（不含 prompt）；稽核寫入失敗不影響拒絕本身
 
   Scenario: 明確確認之後可以開始，且同一次執行內所有 session 共用（R3、R4）
-    Given workspace 處於待確認
+    Given workspace 處於待確認，且 audit writer 運作正常
     When 我按下「確認在此目錄進行 AI 工作」並在對話中再確認一次
-    Then 後端把狀態轉為已確認，稽核流記下恰好一筆 workspace_confirmed
+    Then 後端把狀態轉為已確認，並 best-effort 嘗試寫入一筆 workspace_confirmed 稽核（audit writer 正常時恰好留下一筆）
+    And 稽核寫入失敗不阻擋確認與後續啟動
     And 所有 session 與 Spec／Plan 的 AI 輔助都可以開始
     When 我重複確認
-    Then 結果成功，狀態不變，不再寫稽核
+    Then 結果成功，狀態不變，不再嘗試寫稽核
 
   Scenario: 取消確認不改變狀態（R5）
     Given 警示的確認對話已開啟
@@ -4880,7 +5040,7 @@ Feature: 高風險 workspace 必須先經使用者確認，才能開始 AI 工�
   Scenario: 前端顯示的目錄與後端快照不一致時，確認被拒（R3）
     Given 畫面上的目錄與後端實際的 workspace 字串不完全相同
     When 呼叫 ConfirmWorkspace
-    Then 回傳錯誤，狀態維持原樣，不寫成功稽核
+    Then 回傳錯誤，狀態維持原樣，不嘗試寫成功稽核
 
   Scenario: 查詢失敗或尚未取得狀態時，前端不放行（R5）
     Given WorkspaceConfirmationStatus 尚未回覆、查詢失敗，或回覆形狀不對
@@ -4890,20 +5050,24 @@ Feature: 高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 
 - [ ] **Step 3：完整 gate（收尾驗證）**
 
+每個指令都用 `run_logged`（完整輸出先存檔、rc 立即存檔），`show` 只讀已存好的檔。`git diff --check` 使用 Task 0 記錄的 base 做**三點比較**（`${BASE}...HEAD`），**不得**在一個範圍失敗後改用另一個範圍；失敗就照實回報 rc 與內容，不以第二次的 rc 代表整個檢查通過。
+
 ```bash
-gofmt -l . > $EVID/final-gofmt.log; wc -l < $EVID/final-gofmt.log                # Expected：0
-go vet ./... > $EVID/final-vet.log 2>&1; echo "rc=$?" >> $EVID/final-vet.log; tail -2 $EVID/final-vet.log
-go test -race ./... -count=1 -timeout 30m > $EVID/final-go.log 2>&1; echo "rc=$?" >> $EVID/final-go.log
-grep -E "^(--- FAIL|FAIL|panic|WARNING: DATA RACE|rc=)" $EVID/final-go.log; grep -cE "^ok" $EVID/final-go.log
-(cd frontend && npm run build > $EVID/final-build.log 2>&1; echo "rc=$?" >> $EVID/final-build.log; tail -2 $EVID/final-build.log; npx vitest run > $EVID/final-vitest.log 2>&1; echo "rc=$?" >> $EVID/final-vitest.log; grep -E "Test Files|Tests |rc=" $EVID/final-vitest.log)
-git diff --check main..HEAD 2>/dev/null || git diff --check $(cat $EVID/base.txt)..HEAD; echo "diff-check rc=$?"
+BASE=$(cat $EVID/base.txt)
+run_logged final-gofmt gofmt -l . ; wc -c < $EVID/final-gofmt.log                          # Expected：0
+run_logged final-vet go vet ./... ; show final-vet                                         # Expected：rc=0
+run_logged final-go go test -race ./... -count=1 -timeout 30m
+show final-go '^(--- FAIL|FAIL|panic|WARNING: DATA RACE)'; grep -cE '^ok' $EVID/final-go.log
+(cd frontend && run_logged final-build npm run build && run_logged final-vitest npx vitest run)
+show final-build '' 3; show final-vitest 'Test Files|Tests '
+run_logged final-diffcheck git diff --check ${BASE}...HEAD ; show final-diffcheck '' 20  # Expected：rc=0
 ```
 
-Expected：gofmt 0 行、vet rc=0、`go test -race` rc=0 且無 `DATA RACE`；vitest 49／665 全綠；build rc=0；`git diff --check` rc=0。**任何紅燈先分類**（真實缺陷／夾具前提／已登記的牆鐘測試，見 `docs/architecture/wall-clock-test-register.md`），不得重跑到綠燈後掩蓋；已登記牆鐘測試的紅燈要單獨重跑並把「首次紅燈＋重跑結果」都寫進回報。再確認受保護的既有測試沒有被修改：
+Expected：gofmt 0 位元組、vet rc=0、`go test -race` rc=0 且無 `DATA RACE`；vitest 全綠；build rc=0；`git diff --check` rc=0。**任何紅燈先分類**（真實缺陷／夾具前提／已登記的牆鐘測試，見 `docs/architecture/wall-clock-test-register.md`），不得重跑到綠燈後掩蓋；已登記牆鐘測試的紅燈要單獨重跑並把「首次紅燈＋重跑結果」都寫進回報。再確認受保護的既有測試沒有被修改：
 
 ```bash
-git diff $(cat $EVID/base.txt)..HEAD --stat -- app_binding_surface_test.go app_startup_state_test.go main_singleinstance_test.go app_cliinfo_ready_test.go
-# Expected：空（四個檔案都沒有變更）
+run_logged final-protected git diff ${BASE}...HEAD --stat -- app_binding_surface_test.go app_startup_state_test.go main_singleinstance_test.go app_cliinfo_ready_test.go ; wc -c < $EVID/final-protected.log
+# Expected：0（四個檔案都沒有變更）
 ```
 
 - [ ] **Step 4：backlog 的 B4 狀態（收尾步驟，不在本 task 預先寫死數字）**
@@ -4986,23 +5150,29 @@ EOF
 - 前端 `blockKind` 的值（`ok`／`loading`／`failed`／`pending`）與 `workspaceBlockKeys` 的 key（`loading`／`failed`／`pending`）一致；`workspaceReasonKeys` 的 key 與 Go `wsReason*` 的值一致，由 `workspaceReasonKeys.test.ts` drift guard 機械檢查。
 - binding 簽章：Go `WorkspaceConfirmationStatus() (WorkspaceConfirmationInfo, error)`／`ConfirmWorkspace(expectedPath string) error` ↔ wailsjs `WorkspaceConfirmationStatus():Promise<main.WorkspaceConfirmationInfo>`／`ConfirmWorkspace(arg1:string):Promise<void>` ↔ `types.ts` `WorkspaceConfirmationBindings`，由 `vue-tsc` 與 `bindings.test.ts` 鎖住。
 
-### 4. 計畫撰寫時的驗證範圍（照實揭露）
+### 4. 驗證紀錄（rev2；逐次列出，**全部是起草者在複本上的回報，未經獨立驗證**）
 
-本計畫的程式碼**不是憑空撰寫**：在 repo 外的複本（`/Users/eason_tseng/b3a-evidence/b4/plan-scratch`，由 spec-wt 複製、不含 `.git`；`frontend/node_modules` 是指向另一個 worktree `b3a-evidence/a4/wt` 的唯讀 symlink，`package-lock.json` 逐位元組相同）依序實作並執行過。**最終版本**（計畫內所有程式碼區塊即取自這份複本）的實測結果：
+複本：`/Users/eason_tseng/b3a-evidence/b4/plan-scratch`（由 spec-wt 複製、不含 `.git`；`frontend/node_modules` 是指向另一個 worktree `b3a-evidence/a4/wt` 的唯讀 symlink，`package-lock.json` 逐位元組相同）。**檔案版本**：以複本內所有非忽略檔案（排除 `.git`、`node_modules`、`dist`、`.workbench`、`*.orig`）的 `find | sort | shasum -a 256 | shasum -a 256` 摘要識別：rev2 驗證前 `299a334dc1081e0291c17e2a3092ff5fa2e95761f2a819324c7ef3b3b8689bdf`，驗證全部結束後 `299a334dc1081e0291c17e2a3092ff5fa2e95761f2a819324c7ef3b3b8689bdf`（相同，確認所有 mutant 都已還原）。計畫內的程式碼區塊取自這個版本。原始 log 與 rc：`/Users/eason_tseng/b3a-evidence/b4/plan-rev2-verify/evid/<name>.log`／`<name>.rc`（計畫內各 Step 逐字抽出後以 `source` 執行，所以這些指令本身也被執行過）。
 
-| 項目 | 結果 |
-|---|---|
-| `gofmt -l .` | 無輸出 |
-| `go vet ./...` | rc=0 |
-| `go test -race ./... -count=1 -timeout 30m` | rc=0；23 個 package `ok`；根 package 240 秒；無 `DATA RACE` |
-| `npm run build`（`vue-tsc --noEmit` ＋ `vite build`） | rc=0 |
-| `vitest run` | 49 檔／665 條全綠（基準 44 檔／605 條，新增 5 檔、60 條） |
-| `wails generate module`（Wails v2.13.0） | 內容差異只有 `App.d.ts`、`App.js`、`models.ts` 的新增行（即 Task 2 Step 6 的 diff）；runtime 三檔權限變 755，已 `chmod 644` 還原 |
-| Mutation | Go：Task 1（2 個）、2（3）、3（2）、4（3）、5（2）、6（4）；前端 Task 7（5 個）；每個 mutant 都變紅，且還原後 `cmp` 相同 |
+| # | 時間（2026-10-11） | 範圍 | 項目 | 結果（log 名稱） |
+|---|---|---|---|---|
+| 1 | 15:47:10–15:52:20 | **完整** | `go vet ./...`；`go test -race ./... -count=1 -timeout 30m` | 兩者 rc=0；23 個 package `ok`；根 package 302 秒；無 `FAIL`／`panic`／`DATA RACE`（`v-vet`、`v-go-race`） |
+| 2 | 約 15:43–15:47 | 完整（僅根 package，不加 `-race`） | `go test -count=1 -timeout 20m .`（Task 3 Step 6） | rc=0，250.6 秒（`t3-full-green`） |
+| 3 | 15:39–15:42 | **完整**（前端） | `npm run build`（`vue-tsc --noEmit` ＋ `vite build`）；`vitest run` | 兩者 rc=0；49 檔／704 條全綠（基準 44 檔／605 條，新增 5 檔、99 條）（`t7-build`、`t7-final-vitest`） |
+| 4 | 約 15:42 | 完整（產生檔） | `wails generate module`（Wails v2.13.0）後 runtime 三檔 `chmod 644` | rc=0；產出與複本內 `frontend/wailsjs` 逐檔相同，`diff -r` 無差異（`v-wails`） |
+| 5 | 15:52:30–15:56:32 | focused | Task 1 Step 4／5、Task 2 Step 4／5、Task 3 Step 7、Task 4 Step 4／5、Task 5 Step 4／5、Task 6 Step 2 | 各 `run_logged` rc=0（正向）；Go mutant 12 個（T1×2、T2×3、T3×2、T4×3、T5×2），`mutant_check` 全數印出「紅在目標」，還原後 `cmp` 相同 |
+| 6 | 約 15:37 | focused | Task 6 Step 3（4 個 mutant） | 全部「紅在目標」，還原 `cmp` 相同（`t6-auth`／`t6-logout`／`t6-restart`／`t6-recover`） |
+| 7 | 約 15:36–15:38 | focused | Task 7 Step 7：基準 95 條全綠（4 個測試檔），5 個 mutant | 全部「紅在目標」，紅燈數 47／39／3／1／6（共 95 條），還原 `cmp` 相同（`t7-base-focused`、`t7-m1`…`t7-m5`） |
 
-以上是**複本上的觀察值**；實作者必須在實作 worktree 重新量測並以實測為準，數字不同時要說明差異來源。
+**這次 rev2 修改後有重跑完整 gate**：第 1–3 列是在含 Task 6 追加測試（`TestCodexServerEntryPointsSendNoThreadOrTurn`）、Task 4 的 `defer cancel()`、嚴格 `parseStatus` 的最終版本上執行的；rev1 時 Task 6 追加的測試只跑過 focused 與 4 個 mutant，那個缺口在 rev2 已補上（第 1、2、5、6 列）。
 
-**未驗證**：Playwright E2E、`wails build`、GUI 實機操作、CI 上的行為（`HOME` 環境、`b3a-e2e-ci`）；Task 8 的 README、feature 檔與 backlog 文字（無法機械驗證）；plan 內 `git worktree add`／`git commit` 指令本身（為避免碰 owner 的 repo，撰寫計畫時未執行）。撰寫過程中另外發現並修正的計畫問題（保留以供審查者了解測試設計演進）：（a）一個 `hookAudit` 阻塞測試在 mutant 下會死鎖整個 package——已改成不在鎖內讀 `snapshot()` 並用 `t.Cleanup` 放行；（b）disabled 的 `textarea`／`button` 收不到 VTU 事件，使兩個 frontend 守門測試一度是空測試（mutant 不變紅）——已改為先在放行狀態輸入、再翻成封鎖，並直接呼叫 `send()`／`runAssist()`；（c）閘門若挪到 `BeginNewSessionSubmit` 之後並 `RejectSubmit`，原測試抓不到——已加入「先前跑完的 session 不得被重設成 idle」的比對；（d）`T=(…)` 必須用陣列，zsh 不對未加引號的變數做 word splitting。
+**尚未重跑，或無法在最終版本上重現**：
+- 各 Task 的 Step 2「首次紅燈」（Task 1、2、4、5、7）：是起草過程中逐步實作時觀察到的；最終版本的符號已存在，無法重現，也沒有保存完整原始 log。計畫內寫的 Expected 是當時觀察，不是 rev2 的驗證結果。
+- Task 3 Step 4 的「未補夾具的整包紅燈」（87 行 `--- FAIL`、全部含 `workspace_unresolved`）與 Task 7 Step 5 的「5 個檔案、12 條既有測試紅燈」：起草 rev1 時在「該 task 剛完成」的複本上量到（Task 3 那份 log 為 `/Users/eason_tseng/b3a-evidence/b4/measure-t3-red2.log`），rev2 的修改（parser、`defer cancel()`、Task 6 追加測試）之後**未重跑**。
+- Task 0、Task 8 的指令（`git worktree add`、`git commit`、三點 `git diff --check`、backlog、README 與 feature 檔文字）：未執行，也無法機械驗證。
+- Playwright E2E、`wails build`、GUI 實機、CI 上的行為（`HOME` 環境、`b3a-e2e-ci`）。
+
+**撰寫過程中發現並修正的計畫問題**（保留以供審查者了解測試設計演進）：（a）`hookAudit` 阻塞測試在 mutant 下會死鎖整個 package——已改成不在鎖內讀 `snapshot()` 並用 `t.Cleanup` 放行；（b）disabled 的 `textarea`／`button` 收不到 VTU 事件，使兩個前端守門測試一度是空測試——已改為先在放行狀態輸入、再翻成封鎖，並直接呼叫 `send()`／`runAssist()`；（c）閘門若挪到 `BeginNewSessionSubmit` 之後並 `RejectSubmit`，原測試抓不到——已加入「先前跑完的 session 不得被重設成 idle」的比對；（d）`T=(…)` 必須用陣列，zsh 不對未加引號的變數做 word splitting；（e）rev2 抽出計畫內指令實際執行時發現：`mutant_check` 的目標樣式以 `-` 開頭時 `grep` 會當成選項（已改 `grep -e`）、Task 2 的 M2 在 Task 3 之後會重複加 `strings` import 而 build failed（已改為先檢查再加）——這正是「排除非目標失敗」要擋的情形。
 
 ---
 
@@ -5012,7 +5182,7 @@ EOF
 
 1. **`WorkspaceConfirmationStatus` 必須回傳 `(T, error)`。** spec §5.3 表格只寫回傳 `{required, confirmed, workspace, source, reasons[]}`；但 binding surface 的薄包裝守門（`thinWrapperViolationTyped`）要求最後一個回傳值是 `beginTxn` 的 `err`。本計畫採 `(WorkspaceConfirmationInfo, error)`（前端 Promise 在 lifecycle 拒絕時 reject，fail closed）。屬於 spec 未寫明的簽章細節，不違反任何 spec 條文。→ **裁定（2026-10-11）：照主審建議，維持 `(T, error)`。**
 2. **零值（從未解析 workspace）的行為，spec 沒有規定。** 本計畫選 fail closed（`wcUnresolved`：閘門拒絕、`ConfirmWorkspace` 也拒絕），代價是共用夾具 `newTestAppIn`（`app_test.go`，不在 §6.1 受保護清單）要補 1 行把 workspace 放進「已解析且不需確認」。複本上驗證：只補這 1 行，整個根 package 測試即全數恢復（無需改任何個別測試）。替代方案「零值＝`NotRequired`」不需改夾具，但任何沒走 `acquireStateLease` 的路徑會靜默放行。→ **裁定（2026-10-11 14:53）：同意零值 fail closed，在 `newTestAppIn` 補 1 行的做法照計畫進行。**
-3. **§5.4 對 `specAssist` 寫「安排拒絕時一定會執行的 cancel 收尾」。** 本計畫在拒絕分支用 inline `cancel()`（與既有 `ErrAssistActive` 分支同一個慣例），而非 `defer`；因為拒絕發生在 gen／`teardown` 建立之前，且單一拒絕路徑上 inline 呼叫等價。若審查者要求字面上的 `defer`，需改成「通過閘門後解除」的條件式 defer，會多一個旗標變數。→ **裁定（2026-10-11 14:53）：同意 inline `cancel()`，沿用 `ErrAssistActive` 的慣例。** 送 Codex plan gate 時，主審會特別標出這點請 Codex 確認。
+3. **§5.4 對 `specAssist` 寫「安排拒絕時一定會執行的 cancel 收尾」。** rev1 在拒絕分支只用 inline `cancel()`（沿用既有 `ErrAssistActive` 分支的慣例）；Codex plan review001 指出那是在確認閘與測試 hook 執行**之後**才取消，與 spec §5.4 的固定順序（閘門之前先安排取消）不一致。→ **裁定／修訂（2026-10-11，依 Codex plan review001）：改為 `defer cancel()`（purpose pin 之後、確認閘之前）＋拒絕分支 inline `cancel()` 雙重保護，符合 spec §5.4。** （owner 於 14:53 對 rev1 的「同意 inline `cancel()`」被本次修訂取代；`CancelFunc` 可重複呼叫，不需要旗標。）送 Codex plan gate 時主審仍會特別標出這一點。
 4. **為了斷言「本次 context 已被取消」新增了 `hookAssistGateRejected` 測試 hook。** context 在函式內部建立，沒有其他可觀察點。B6a 驗收 (4) 曾要求「不新增 ad-hoc test hook 於 App aggregate」，但那是 B6a 的範圍；B4 沿用 `App` 上既有約 15 個 `hook*` 欄位的慣例。替代：不加 hook，改靠 `go vet` 的 `lostcancel` 靜態檢查——但那不是單元測試。→ **裁定（2026-10-11 14:53）：同意新增 `hookAssistGateRejected`。**
 5. **spec 只討論 `AuthStatus`／`StartLogin`（H3），但 `Logout`、`RestartCodexServerRecorded`、`RecoverCodexRecording` 同樣會以 workspace 為 cwd 啟動（或替換）app-server**（`app.go:8086`），且 claude 的 `auth status`／`logout` 以 `exec.Command` 啟動、沒有設定 `Dir`。→ **裁定（2026-10-11 14:53）：這三個入口不加閘門，維持 spec 範圍；但要加進 Task 6 的 fake app-server 驗證，斷言不會送出 `thread/start`、`turn/start`，做法與 `AuthStatus`／`StartLogin` 相同。** 計畫已依此修訂 Task 6（新增 `TestCodexServerEntryPointsSendNoThreadOrTurn` 與三個 mutant，估時 +0.2 hr）。claude 分支的 `exec` 不在 fake app-server 的觀察範圍內，列為未驗證。
 6. **`isHome`／`homeIdentityKnown` 在 CI 或 E2E 的環境風險。** 若 CI runner 的 `HOME` 未設或指向不存在的目錄，R1 (d) 會讓 env 注入的 E2E 也要求確認，composer 會被停用。spec §6.3 已承認這個前提；本計畫無法在本機驗證 CI 環境，已列為未驗證。建議 PR 開出後由 `b3a-e2e-ci` 的實跑確認。→ **已告知 owner（2026-10-11 14:53），屬於風險，不需裁定。**
