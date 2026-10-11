@@ -198,9 +198,20 @@ func (a *App) workspaceConfirmationStatus() (WorkspaceConfirmationInfo, error) {
 	return a.workspaceConfirm.snapshot().info(), nil
 }
 
+// confirmWorkspace：R3 + §5.5。「是否為第一次確認」由 confirm 的單一臨界區決定
+// （transitioned），audit 在鎖外寫——所以 workspace_confirmed 只會有一筆，也沒有鎖序問題。
+// audit 沿用 a.audit 的 best-effort：寫入失敗不影響確認，也不是放行的條件。
 func (a *App) confirmWorkspace(expectedPath string) error {
-	_, _, err := a.workspaceConfirm.confirm(expectedPath)
-	return err
+	transitioned, snap, err := a.workspaceConfirm.confirm(expectedPath)
+	if err != nil {
+		return err
+	}
+	if transitioned {
+		info := snap.info()
+		a.audit("workspace_confirmed", map[string]any{
+			"workspace": info.Workspace, "source": info.Source, "reasons": info.Reasons})
+	}
+	return nil
 }
 
 // ---- 閘門（spec R2、§5.4）----
@@ -210,13 +221,24 @@ func (a *App) confirmWorkspace(expectedPath string) error {
 // 「workspace_confirmation_required…」開頭的錯誤。
 //
 // 呼叫端必須把它放在任何 session／provider 啟動副作用**之前**（位置見 spec §5.4）。本函式
-// 自己不做 I/O、不改變 lifecycle phase。op／provider／wsid 供 Task 5 的稽核使用。
+// 不改變 lifecycle phase；拒絕時寫一筆 best-effort 的 workspace_confirmation_blocked audit
+// （不含 prompt，且在鎖外）。op／provider／wsid 只用於這筆稽核。
 func (a *App) requireWorkspaceConfirmed(op, provider, wsid string) error {
 	snap := a.workspaceConfirm.snapshot()
 	if snap.state == wcNotRequired || snap.state == wcConfirmed {
 		return nil
 	}
 	info := snap.info()
+	// 每一次真正被拒絕的 AI 工作請求寫一筆（§5.5）；不含 prompt。鎖已在 snapshot() 內釋放。
+	data := map[string]any{"workspace": info.Workspace, "source": info.Source,
+		"reasons": info.Reasons, "op": op}
+	if provider != "" {
+		data["provider"] = provider
+	}
+	if wsid != "" {
+		data["wsid"] = wsid
+	}
+	a.audit("workspace_confirmation_blocked", data)
 	return fmt.Errorf("%w：目前的 workspace（%s，來源 %s）需要先在畫面頂端確認，確認前不會開始任何 AI 工作（原因：%s）",
 		errWorkspaceConfirmationRequired, info.Workspace, info.Source, strings.Join(info.Reasons, ","))
 }
