@@ -19,6 +19,23 @@ export const codexToolStatusKeys: Record<string, string> = {
 export const evidenceResultKeys: Record<string, string> = {
   passed: 'evidence.result.passed', failed: 'evidence.result.failed', error: 'evidence.result.error',
 }
+// B4：workspace 確認的原因代碼（Go 端 workspacePolicy 的輸出）與封鎖種類。未知代碼原樣顯示
+// （resolveState 的既有行為），新增或改名要和 workspace_confirmation.go 的 wsReason* 同步。
+export const workspaceReasonKeys: Record<string, string> = {
+  source_home: 'workspaceConfirm.reason.sourceHome',
+  source_tmp: 'workspaceConfirm.reason.sourceTmp',
+  env_rejected: 'workspaceConfirm.reason.envRejected',
+  env_rejected_normalize_failed: 'workspaceConfirm.reason.envRejectedNormalize',
+  env_rejected_mkdir_failed: 'workspaceConfirm.reason.envRejectedMkdir',
+  is_home: 'workspaceConfirm.reason.isHome',
+  home_identity_unknown: 'workspaceConfirm.reason.homeIdentityUnknown',
+  workspace_unresolved: 'workspaceConfirm.reason.unresolved',
+}
+export const workspaceBlockKeys: Record<string, string> = {
+  loading: 'workspaceConfirm.blocked.loading',
+  failed: 'workspaceConfirm.blocked.failed',
+  pending: 'workspaceConfirm.blocked.pending',
+}
 export function resolveState(map: Record<string, string>, raw: string, translate: (k: string) => string): string {
   const key = map[raw]
   return key ? translate(key) : raw // unknown → 原樣，不洩漏缺漏 key

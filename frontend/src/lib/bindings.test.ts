@@ -23,6 +23,8 @@ const h = vi.hoisted(() => ({
   EscalationCreate: vi.fn(async () => 'esc-id'),
   EscalationAck: vi.fn(async () => {}),
   EscalationResolve: vi.fn(async () => {}),
+  WorkspaceConfirmationStatus: vi.fn(async () => ({ required: false, confirmed: false, workspace: '/w', source: 'env', reasons: [] })),
+  ConfirmWorkspace: vi.fn(async (..._a: string[]) => {}),
 }))
 vi.mock('../../wailsjs/go/main/App', () => h)
 
@@ -182,5 +184,19 @@ describe('production bindings adapter', () => {
     const b = makeBindings()
     await b.EscalationResolve('esc-1', 'fixed', 'because reasons')
     expect(h.EscalationResolve).toHaveBeenCalledWith('esc-1', 'fixed', 'because reasons')
+  })
+
+  // B4：ConfirmWorkspace 的唯一參數是 status.workspace 的原始字串——原樣轉發，不得改寫。
+  it('ConfirmWorkspace 原樣轉發 expectedPath（含空白與中文）', async () => {
+    const b = makeBindings()
+    await b.ConfirmWorkspace('/Users/測試 user/proj ')
+    expect(h.ConfirmWorkspace).toHaveBeenCalledWith('/Users/測試 user/proj ')
+  })
+
+  it('WorkspaceConfirmationStatus 轉發至 Go 綁定（無參數）並回傳其結果', async () => {
+    const b = makeBindings()
+    const st = await b.WorkspaceConfirmationStatus()
+    expect(h.WorkspaceConfirmationStatus).toHaveBeenCalledWith()
+    expect(st.required).toBe(false)
   })
 })

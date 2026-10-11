@@ -19,7 +19,7 @@ function walk(dir: string, acc: string[] = []): string[] {
   }
   return acc
 }
-import { sessionStateKeys, gateStateKeys, codexToolStatusKeys, evidenceResultKeys, riskTierKeys } from './stateKeys'
+import { sessionStateKeys, gateStateKeys, codexToolStatusKeys, evidenceResultKeys, riskTierKeys, workspaceReasonKeys, workspaceBlockKeys } from './stateKeys'
 describe('t() key references exist', () => {
   it('every literal t(\'...\') key is a locale leaf', () => {
     const keys = leafSet(zhTW)
@@ -37,6 +37,7 @@ describe('t() key references exist', () => {
     const mapVals = [
       ...Object.values(sessionStateKeys), ...Object.values(gateStateKeys), ...Object.values(codexToolStatusKeys),
       ...Object.values(evidenceResultKeys), ...Object.values(riskTierKeys),
+      ...Object.values(workspaceReasonKeys), ...Object.values(workspaceBlockKeys),
     ]
     expect(mapVals.filter(v => !keys.has(v))).toEqual([])
   })

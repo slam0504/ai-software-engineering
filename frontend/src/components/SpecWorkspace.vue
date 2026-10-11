@@ -7,6 +7,8 @@ import {
 import type { main, spec } from '../../wailsjs/go/models'
 import { useSession } from '../stores/session'
 import { useAssist } from '../stores/assist'
+import { useWorkspaceConfirmation } from '../stores/workspaceConfirmation'
+import { workspaceBlockKeys } from '../i18n/stateKeys'
 import { extractGherkin } from '../lib/gherkin'
 import { templateFor, inScope, SPEC_SCOPE_PATTERNS } from '../lib/planTemplates'
 import { isWriteConflict } from '../lib/writeConflict'
@@ -37,6 +39,7 @@ const emit = defineEmits<{ (e: 'busy', v: boolean): void; (e: 'dirty', v: boolea
 
 const s = useSession()
 const assist = useAssist()
+const wsc = useWorkspaceConfirmation() // B4：未確認／尚未取得／查詢失敗時停用三個 AI 輔助按鈕
 
 const files = ref<main.FileNode[]>([])
 // selectedPath 是唯一權威來源（A1a-1 缺口 3 修正）：props.path 只在宣告當下 seed
@@ -396,6 +399,10 @@ async function createNewFile() {
 // 為操作者已經放棄這次結果，草稿留空。
 async function runAssist(prompt: string) {
   assistError.value = ''
+  if (wsc.blocked) { // B4：後端 R2 閘門是最後防線，這裡先擋下並說明原因
+    assistError.value = t(workspaceBlockKeys[wsc.blockKind])
+    return
+  }
   assistBusy.value = true
   const startedForPath = effectivePath.value
   try {
@@ -751,10 +758,11 @@ async function confirmCommit() {
     <p v-if="saveError" class="err" data-test="save-error" :data-conflict="saveConflict ? 'true' : undefined">{{ saveError }}</p>
 
     <div class="assist-buttons">
-      <button data-test="assist-draft" :disabled="assistBusy" @click="draftGherkin">{{ t('spec.action.draftGherkin') }}</button>
-      <button data-test="assist-ambiguity" :disabled="assistBusy" @click="detectAmbiguity">{{ t('spec.action.detectAmbiguity') }}</button>
-      <button data-test="assist-oracle" :disabled="assistBusy" @click="checkOracleCoverage">{{ t('spec.action.checkOracle') }}</button>
+      <button data-test="assist-draft" :disabled="assistBusy || wsc.blocked" @click="draftGherkin">{{ t('spec.action.draftGherkin') }}</button>
+      <button data-test="assist-ambiguity" :disabled="assistBusy || wsc.blocked" @click="detectAmbiguity">{{ t('spec.action.detectAmbiguity') }}</button>
+      <button data-test="assist-oracle" :disabled="assistBusy || wsc.blocked" @click="checkOracleCoverage">{{ t('spec.action.checkOracle') }}</button>
     </div>
+    <p v-if="wsc.blocked" class="err" data-test="assist-blocked">{{ t(workspaceBlockKeys[wsc.blockKind]) }}</p>
     <p v-if="assistError" class="err">{{ assistError }}</p>
 
     <div class="draft-area">

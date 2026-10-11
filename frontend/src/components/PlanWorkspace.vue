@@ -7,6 +7,8 @@ import {
 } from '../../wailsjs/go/main/App'
 import type { main, spec } from '../../wailsjs/go/models'
 import { usePlan } from '../stores/plan'
+import { useWorkspaceConfirmation } from '../stores/workspaceConfirmation'
+import { workspaceBlockKeys } from '../i18n/stateKeys'
 // extractGherkin 只在 info tag 為 gherkin/feature 時才特殊處理，其餘（含無 tag／yaml
 // tag）一律走通用 fence 擷取路徑——對 plan YAML 草稿一樣適用，別名匯入避免誤讀成
 // domain 耦合（沿用既有、已測試涵蓋的 fence 擷取邏輯，不重複實作）。
@@ -21,6 +23,7 @@ import ExternalChangeChoice from './ExternalChangeChoice.vue'
 import ExternalChangeCompare from './ExternalChangeCompare.vue'
 
 const { t } = useI18n()
+const wsc = useWorkspaceConfirmation() // B4：未確認／尚未取得／查詢失敗時停用 AI 草稿（含 bump 的重新執行）
 
 // PlanWorkspace（Task 13，spec §7 Stage B）：鏡射 SpecWorkspace.vue 的資料流與
 // props 慣例（`path`/`draft`/`write` 皆可注入，測試走這條路徑，避開 CM6 DOM／
@@ -512,6 +515,10 @@ async function createNewFile() {
 // await 期間操作者可能已切到另一個檔案，只在 effectivePath 沒變時才採用回傳的 id。
 async function runAssist() {
   assistError.value = ''
+  if (wsc.blocked) { // B4：onBumpRerunAssist 也走這裡；後端 R2 閘門是最後防線
+    assistError.value = t(workspaceBlockKeys[wsc.blockKind])
+    return
+  }
   assistBusy.value = true
   const startedForPath = effectivePath.value
   try {
@@ -790,8 +797,9 @@ async function confirmCommit() {
         <option value="codex">codex</option>
       </select>
       <textarea v-model="promptInput" data-test="prompt-input" :placeholder="t('planWorkspace.prompt.placeholder')" />
-      <button data-test="generate-draft" :disabled="assistBusy" @click="runAssist">{{ t('planWorkspace.action.generateDraft') }}</button>
+      <button data-test="generate-draft" :disabled="assistBusy || wsc.blocked" @click="runAssist">{{ t('planWorkspace.action.generateDraft') }}</button>
     </div>
+    <p v-if="wsc.blocked" class="err" data-test="assist-blocked">{{ t(workspaceBlockKeys[wsc.blockKind]) }}</p>
     <p v-if="assistError" class="err">{{ assistError }}</p>
 
     <div class="draft-area">
@@ -846,7 +854,7 @@ async function confirmCommit() {
           <li v-for="f in bumpPreview.touched_files" :key="f">{{ f }}</li>
         </ul>
         <p class="bump-warning" data-test="bump-warning">{{ t('bump.warning') }}</p>
-        <button type="button" data-test="bump-rerun-assist" @click="onBumpRerunAssist">{{ t('bump.action.rerunAssist') }}</button>
+        <button type="button" data-test="bump-rerun-assist" :disabled="wsc.blocked" @click="onBumpRerunAssist">{{ t('bump.action.rerunAssist') }}</button>
         <button type="button" data-test="bump-confirm" :disabled="busyReason !== ''" @click="confirmBump">{{ t('bump.action.confirm') }}</button>
       </div>
       <!-- bumpConfirmError 獨立於面板外層——Confirm 失敗後觸發的重新預覽

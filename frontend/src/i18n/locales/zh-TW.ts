@@ -29,6 +29,43 @@ export default {
       restoreFailed: '無法還原釘選的 pane——兩個 pane 以空白啟動，請重新釘選需要的 session：{error}',
     },
   },
+  workspaceConfirm: {
+    title: '高風險 workspace：AI 工作已停用',
+    intro: 'AI 可以在這個目錄執行工具並修改檔案。確認之前，送出訊息與 Spec／Plan 的 AI 輔助都會停用。',
+    field: {
+      path: '實際目錄',
+      source: '來源',
+      reasons: '原因',
+    },
+    reason: {
+      sourceHome: '退回使用者家目錄（從 Finder 開啟時工作目錄是 /）',
+      sourceTmp: '所有候選目錄都無法使用，退回系統暫存目錄',
+      envRejected: 'WORKBENCH_WORKSPACE 被拒絕，已退回其他候選目錄',
+      envRejectedNormalize: 'WORKBENCH_WORKSPACE 指向的路徑無法解析（不存在或無法存取），已退回其他候選目錄',
+      envRejectedMkdir: 'WORKBENCH_WORKSPACE 指向的目錄無法建立 .workbench，已退回其他候選目錄',
+      isHome: '實際目錄就是使用者家目錄',
+      homeIdentityUnknown: '無法判定這個目錄是不是使用者家目錄',
+      unresolved: 'workspace 尚未解析完成',
+    },
+    action: {
+      open: '確認在此目錄進行 AI 工作',
+      confirm: '確認',
+      cancel: '取消',
+      retry: '重新查詢',
+    },
+    dialog: {
+      prompt: '你要讓 AI 在這個目錄進行工作嗎？{path}',
+    },
+    confirming: '確認中…',
+    confirmFailed: '確認失敗：{error}',
+    loading: '正在取得 workspace 確認狀態…',
+    queryFailed: '無法取得 workspace 確認狀態，AI 工作已停用：{error}',
+    blocked: {
+      loading: '正在取得 workspace 確認狀態，AI 工作暫時停用',
+      failed: '無法取得 workspace 確認狀態，AI 工作已停用',
+      pending: '尚未確認 workspace，AI 工作已停用——請先在畫面頂端確認',
+    },
+  },
   settings: {
     action: {
       new: '開新對話',

@@ -6,6 +6,7 @@ import { EditorView } from '@codemirror/view'
 import PlanWorkspace from './PlanWorkspace.vue'
 import { usePlan } from '../stores/plan'
 import { mountWithI18n } from '../test/i18n'
+import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
 
 // wailsjs 綁定 mock：控制 PlanAssist 的 resolve 時機（同 SpecWorkspace.test.ts 慣例）。
 // PlanList/PlanRead 給穩定預設值，避免 onMounted 的載入路徑撞到未定義行為。
@@ -25,6 +26,7 @@ vi.mock('../../wailsjs/go/main/App', () => mocks)
 describe('PlanWorkspace', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+    seedWorkspaceConfirmation() // B4：這些測試驗的是 Assist 本身；不需確認的 workspace 與既有行為相同
     for (const fn of Object.values(mocks)) fn.mockReset()
     mocks.PlanList.mockResolvedValue([])
     mocks.PlanRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })

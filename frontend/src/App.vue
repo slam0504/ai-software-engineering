@@ -11,6 +11,7 @@ import { useAssist } from './stores/assist'
 import { usePlan } from './stores/plan'
 import { useEvidence } from './stores/evidence'
 import { useEscalation } from './stores/escalation'
+import { useWorkspaceConfirmation } from './stores/workspaceConfirmation'
 import { routeEnvelope } from './lib/gateRouting'
 import { load, save } from './lib/persist'
 import { escalationBadge } from './lib/escalationBadge'
@@ -21,6 +22,7 @@ import DualPane from './components/DualPane.vue'
 import SessionList from './components/SessionList.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
+import WorkspaceConfirmBanner from './components/WorkspaceConfirmBanner.vue'
 import FileTree from './components/FileTree.vue'
 import PreviewPane from './components/PreviewPane.vue'
 import ApprovalDialog from './components/ApprovalDialog.vue'
@@ -40,6 +42,7 @@ const assist = useAssist()
 const plan = usePlan()
 const evidence = useEvidence()
 const escalation = useEscalation()
+const wsc = useWorkspaceConfirmation()
 const wailsBindings = makeBindings() // Task 22：TCA workspace 六個綁定＋Task 25：escalation 收件匣四個綁定的唯一 production 來源（見 bindings.test.ts）
 const selectedEvidenceId = ref('')
 const gateDegraded = ref(false) // GateList().journal_degraded（任一筆為 true）→ 停用核可／駁回（spec §3.2）
@@ -318,8 +321,20 @@ async function refreshCliInfo() {
   const token = ++cliInfoReq
   try {
     const info = await CLIInfo()
-    if (token === cliInfoReq) cliInfo.value = info
+    if (token === cliInfoReq) {
+      cliInfo.value = info
+      // B4（spec §5.6）：先等 CLIInfo ready，再查 workspace 確認狀態。未 ready 時後端的
+      // WorkspaceConfirmationStatus 會被 lifecycle 拒絕，store 維持封鎖；cli-ready 事件
+      // 到達時 refreshCliInfo 會再走一次。
+      if (info.ready === 'true') await refreshWorkspaceConfirmation()
+    }
   } catch { /* dev 無綁定時忽略 */ }
+}
+
+// refreshWorkspaceConfirmation：store 自己做 request sequencing（晚到的舊回應整筆丟棄）、
+// 失敗時維持封鎖（fail closed）。重新掛載只會重新查詢，不會自動確認。
+async function refreshWorkspaceConfirmation() {
+  await wsc.refresh(wailsBindings.WorkspaceConfirmationStatus)
 }
 
 // wailsDisposers：onMounted 註冊的 Wails listener 全部收在這裡，unmount 一併清
@@ -378,6 +393,7 @@ onMounted(async () => {
       ws: {{ cliInfo.workspaceSource }} @ {{ cliInfo.workspace }} | tools: {{ cliInfo.toolsSource }} | node {{ cliInfo.node }}
       <span v-if="cliInfo.startupError" class="err">{{ t('app.startupError', { error: cliInfo.startupError }) }}</span>
     </div>
+    <WorkspaceConfirmBanner :confirm="wailsBindings.ConfirmWorkspace" :refresh="refreshWorkspaceConfirmation" />
     <div class="body">
       <aside class="side">
         <div class="side-sessions"><SessionList /></div>

@@ -52,6 +52,8 @@ const appMocks = vi.hoisted(() => ({
   SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
   AuthStatus: vi.fn(), StartLogin: vi.fn(), CancelLogin: vi.fn(), Logout: vi.fn(),
   RestartCodexServerRecorded: vi.fn(),
+  WorkspaceConfirmationStatus: vi.fn(async () => ({ required: false, confirmed: false, workspace: '/w', source: 'env', reasons: [] as string[] })),
+  ConfirmWorkspace: vi.fn(async (_p: string) => {}),
   EscalationList: vi.fn(async () => [] as any[]), EscalationAck: vi.fn(),
   EscalationCreate: vi.fn(), EscalationResolve: vi.fn(),
 }))
@@ -61,6 +63,7 @@ import App from './App.vue'
 import { useSession } from './stores/session'
 import type { Envelope } from './types'
 import { makeI18n } from './test/i18n'
+import { seedWorkspaceConfirmation } from './test/workspaceConfirmation'
 
 // memStorage：這個 jsdom 環境沒有 localStorage（vitest 啟動時就印
 // 「localStorage is not available」），而 lib/persist 的 load/save 對缺席是靜默
@@ -123,6 +126,7 @@ const STUBS = {
 async function mountApp() {
   const pinia = createPinia()
   setActivePinia(pinia)
+  seedWorkspaceConfirmation() // B4：本檔的 CLIInfo mock 沒有 ready，App 不會查詢；先放進不需確認的狀態
   const w = mount(App, { global: { plugins: [pinia, makeI18n()], stubs: STUBS }, attachTo: document.body })
   await flushPromises()
   return w

@@ -2,7 +2,8 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useSession } from '../stores/session'
-import { resolveState, sessionStateKeys } from '../i18n/stateKeys'
+import { useWorkspaceConfirmation } from '../stores/workspaceConfirmation'
+import { resolveState, sessionStateKeys, workspaceBlockKeys } from '../i18n/stateKeys'
 import { isAtBottom, isAtTop } from '../lib/scroll'
 
 // PaneView（Task 28，spec §3.7）：單一 pane，綁定 DualPane 分配給它的 WSID
@@ -19,6 +20,7 @@ import { isAtBottom, isAtTop } from '../lib/scroll'
 const props = defineProps<{ idx: 0 | 1 }>()
 const { t } = useI18n()
 const s = useSession()
+const wsc = useWorkspaceConfirmation() // B4：required && !confirmed、尚未取得、查詢失敗 → composer 停用
 
 const wsid = computed(() => s.pins[props.idx] ?? '')
 const meta = computed(() => (wsid.value ? s.sessions[wsid.value] : undefined))
@@ -62,6 +64,7 @@ async function onScroll() {
 async function send() {
   const text = draft.value.trim()
   if (!text || !meta.value || meta.value.busy) return
+  if (wsc.blocked) return // 早於清空 draft：被擋下的草稿要留在輸入框
   draft.value = ''
   follow.value = true
   await s.submit(text) // submit() 作用於 focused pane，composer 只在 focused 時渲染，故一致
@@ -100,11 +103,12 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
           <div class="text">{{ m.text }}<span v-if="m.streaming" class="cursor">▌</span></div>
         </div>
       </div>
+      <p v-if="focused && wsc.blocked" class="blocked-hint" data-test="composer-blocked">{{ t(workspaceBlockKeys[wsc.blockKind]) }}</p>
       <div v-if="focused" class="composer" data-test="composer">
-        <textarea v-model="draft" rows="2" :disabled="meta?.busy" data-test="composer-textarea"
+        <textarea v-model="draft" rows="2" :disabled="meta?.busy || wsc.blocked" data-test="composer-textarea"
           :placeholder="t('chat.input.placeholder')"
           @keydown.enter.exact.prevent="send" @click.stop />
-        <button :disabled="meta?.busy || !draft.trim()" data-test="composer-send" @click.stop="send">{{ t('chat.action.send') }}</button>
+        <button :disabled="meta?.busy || wsc.blocked || !draft.trim()" data-test="composer-send" @click.stop="send">{{ t('chat.action.send') }}</button>
       </div>
     </template>
   </div>
@@ -127,6 +131,7 @@ watch(() => (view.value?.chat.length ?? 0) + (view.value?.chat.at(-1)?.text.leng
 .thinking pre { font-size: 12px; color: var(--text-muted); white-space: pre-wrap; }
 .cursor { animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+.blocked-hint { margin: 0; padding: 4px 8px; font-size: var(--fs-s); color: var(--err); text-align: left; }
 .composer { display: flex; gap: 8px; padding: 8px; border-top: 1px solid var(--border); cursor: default; }
 .composer textarea { flex: 1; resize: none; padding: 8px; }
 </style>

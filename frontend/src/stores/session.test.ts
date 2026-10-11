@@ -1,6 +1,7 @@
 import { setActivePinia, createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useSession } from './session'
+import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
 import type { Envelope } from '../types'
 
 // env：所有 conversation lane 事件都帶 workspace_session_id（§3.1.5 之後為必填）。
@@ -158,7 +159,10 @@ describe('session store：approval 路由（§3.6.4）', () => {
 })
 
 describe('session store：focused pane 操作（§3.7）', () => {
-  beforeEach(() => setActivePinia(createPinia()))
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    seedWorkspaceConfirmation() // B4：submit 在 workspace 需確認時不送出；這組驗的是不需確認時的既有行為
+  })
 
   // pin() 的 action 契約（owner 2026-08-17 追加裁決）：「釘進第 N 格」＝同時明確
   // 選了 session 與 pane，所以第 N 格必須成為作用中的那一格。

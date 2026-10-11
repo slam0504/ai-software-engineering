@@ -6,6 +6,7 @@ import DualPane from './DualPane.vue'
 import SettingsBar from './SettingsBar.vue'
 import { useSession } from '../stores/session'
 import { makeI18n } from '../test/i18n'
+import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
 import type { Bindings } from '../types'
 
 // DualPane（Task 28，spec §3.7）：兩個 pane 都持續接收串流（不管是否
@@ -31,6 +32,7 @@ describe('DualPane（雙 pane 並看＋單一 focused pane 操作語意，§3.7�
   beforeEach(() => {
     pinia = createPinia()
     setActivePinia(pinia)
+    seedWorkspaceConfirmation() // B4：不需確認的 workspace（既有行為）
     // jsdom 未實作 scrollTo（PaneView 的 follow-tail watch 會呼叫）
     Element.prototype.scrollTo = Element.prototype.scrollTo ?? (() => {})
     const s = useSession()
