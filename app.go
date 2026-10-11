@@ -549,6 +549,10 @@ type App struct {
 	procRootCancel      context.CancelFunc
 	assistRunnerFactory func(provider string) (assist.Runner, error) // 測試注入：換 fake Runner
 	hookAssistBeforeTxn func()                                       // 測試注入：gen 已入 assistActive、beginTxn 未開始
+	// hookAssistGateRejected：測試注入——Assist 被 B4 確認閘拒絕時，在 return 之前以**本次
+	// 呼叫自己的 context** 呼叫（specAssist 在拒絕分支的 inline cancel() 之前、planAssist 在既有
+	// defer cancel() 之前）。測試在呼叫返回後檢查該 context 已被取消。production 恆為 nil。
+	hookAssistGateRejected func(ctx context.Context)
 
 	// PlanAssist provider capability preflight（M3a.1 Task 7：spec §3.4）——
 	// key=binPath+"|"+完整 binary SHA-256 hex（不截斷）；只快取 OK 結果
@@ -6413,6 +6417,21 @@ func (a *App) specAssist(provider, purpose, prompt string) (string, error) {
 	// assist (scope=session) events into the provider slot — restore.go's
 	// replayViewWindow buckets by purpose, and EmitAssist has no purpose guard.
 	purpose = "spec_assist"
+	// B4 確認閘（spec §5.4 固定順序）：外層交易 → knownProvider → root context → purpose pin
+	// → 拒絕時一定會執行的 cancel 收尾 → 確認閘 → gen／assistActive／runner。閘門不得插在
+	// root context 與 purpose pin 之間（TestAssistImplementationsTakeRootContextFirst）。
+	// 拒絕時 gen 尚未建立，所以取消不能依賴 gen 建立之後才安排的 teardown：這裡先 defer cancel()，
+	// 拒絕分支再 inline cancel() 一次（CancelFunc 可重複呼叫；通過閘門之後既有的 teardown 再取消
+	// 也無害，不需要條件式解除）。拒絕時不登記 gen、不進 assistActive、不執行 runner。
+	// 不新增內層 beginTxn。
+	defer cancel()
+	if gerr := a.requireWorkspaceConfirmed("spec_assist", provider, ""); gerr != nil {
+		if h := a.hookAssistGateRejected; h != nil {
+			h(ctx)
+		}
+		cancel()
+		return "", gerr
+	}
 	gen := &assistGen{correlationID: contract.NewULID(time.Now()), cancel: cancel, done: make(chan struct{})}
 
 	// gen（含 cancel）必須早於 beginTxn 進 assistActive——shutdown 的 reclaim
@@ -6598,6 +6617,16 @@ func (a *App) planAssist(provider, prompt string) (string, error) {
 	// ——cancel 根 context 也影響不到還沒拿到它的工作。
 	ctx, cancel := context.WithTimeout(a.procRoot(), assistTimeout)
 	defer cancel() // 下面成功走到 run 時會把 cancel 交給 gen，這裡的 defer 冪等
+
+	// B4 確認閘（spec §5.4）：root context 與既有的 defer cancel() 之後、ensureGate() 之前。
+	// 拒絕時由上面的 defer cancel() 取消本次 context；不登記 gen、不跑 gate／git／preflight／
+	// runner。不新增內層 beginTxn。
+	if gerr := a.requireWorkspaceConfirmed("plan_assist", provider, ""); gerr != nil {
+		if h := a.hookAssistGateRejected; h != nil {
+			h(ctx)
+		}
+		return "", gerr
+	}
 
 	if _, err := a.ensureGate(); err != nil {
 		return "", err
