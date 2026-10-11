@@ -577,6 +577,26 @@ export namespace main {
 	        this.digest = source["digest"];
 	    }
 	}
+	export class WorkspaceConfirmationInfo {
+	    required: boolean;
+	    confirmed: boolean;
+	    workspace: string;
+	    source: string;
+	    reasons: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new WorkspaceConfirmationInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.required = source["required"];
+	        this.confirmed = source["confirmed"];
+	        this.workspace = source["workspace"];
+	        this.source = source["source"];
+	        this.reasons = source["reasons"];
+	    }
+	}
 
 }
 

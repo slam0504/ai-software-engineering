@@ -61,6 +61,11 @@ type App struct {
 	workspaceDir string
 	stateDir     string
 	workspaceSrc string
+	// workspaceConfirm：B4 的 workspace 確認狀態（spec §5.2）。獨立欄位＋自己的 mutex，
+	// 刻意不放進 startupState——那會動到 CLIInfo 的形狀與 startupInfo 的欄位枚舉守門。
+	// 零值＝尚未解析＝fail closed（閘門拒絕），production 在 acquireStateLease 解析完
+	// workspace 的當下寫入。
+	workspaceConfirm workspaceConfirmation
 	// startupMu 保護**啟動資訊這一組欄位**：startupErr／startupBlockers／
 	// toolsDirPath／toolsSource／nodePath（owner 2026-08-19）。
 	//
@@ -2108,6 +2113,7 @@ func (a *App) acquireStateLease() (*stateLease, error) {
 	if a.stateDir == "" {
 		r := resolveWorkspace()
 		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = r.Workspace, r.State, r.Source, r.Err
+		a.workspaceConfirm.resolve(r) // B4：與 workspace 一起決定，閘門與 status binding 都讀這一份
 	}
 	a.publishWorkspace(a.workspaceDir, a.workspaceSrc)
 	// **建立空的 state directory 是取鎖之前唯一允許的冪等初始化**（owner
@@ -3558,6 +3564,28 @@ func (a *App) CLIInfo() map[string]string {
 		"workspaceSource": si.workspaceSr, "startupError": si.startupErr,
 		"ready": strconv.FormatBool(si.ready),
 	}
+}
+
+// WorkspaceConfirmationStatus：B4 的唯讀 binding（spec §5.3）——回報實際 workspace、
+// 來源、是否需要確認與是否已確認。Wails binding 的固定形狀；刻意**不**列入
+// startupSafeBindings（只在 ready 之後可呼叫，啟動期間被 beginTxn 拒絕），也不寫 audit。
+func (a *App) WorkspaceConfirmationStatus() (WorkspaceConfirmationInfo, error) {
+	if err := a.beginTxn(); err != nil {
+		return WorkspaceConfirmationInfo{}, err
+	}
+	defer a.endTxn()
+	return a.workspaceConfirmationStatus()
+}
+
+// ConfirmWorkspace：B4 的確認 binding（spec §5.3／R3）。expectedPath 必須是前端從
+// WorkspaceConfirmationStatus 拿到的 workspace 原始字串；後端只接受完全相同的字串，
+// 不接受縮短、`~` 改寫或 canonical 別名。Wails binding 的固定形狀。
+func (a *App) ConfirmWorkspace(expectedPath string) error {
+	if err := a.beginTxn(); err != nil {
+		return err
+	}
+	defer a.endTxn()
+	return a.confirmWorkspace(expectedPath)
 }
 
 // ---- workspace 檔案（canonical 邊界）----
