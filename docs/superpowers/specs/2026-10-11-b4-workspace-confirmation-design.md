@@ -1,6 +1,15 @@
 # B4 Workspace 確認閘與高風險警示：設計
 
-> 版本：rev1（2026-10-11，初稿）
+> 版本：rev2（2026-10-11）：依 codex-reviewer design gate review001（CHANGES_REQUIRED，`b3a-evidence/b4/codex-spec-review-001/REVIEW.md`，SHA256 `12ee2626…fec7`）修訂：
+> - (1) 移除過期的「gen 先於 txn」依據，固定 Assist 的閘門順序與拒絕時的 cancel 責任（R2、§5.4、H2）；
+> - (2) R2 的前置條件改成「各入口既有的檢查」，`registryUncertain` 只屬於 startSession；
+> - (3) R2 明確允許 root context 的建立與取消；
+> - (4) R3 改為先核對路徑，再依狀態決定結果；
+> - (5) 「不受影響」限定在家目錄身分可判定的情況；SameFile 測試改用真實的 `os.Stat`；
+> - (6) 前端在尚未取得 status 或查詢失敗時也不可送出；
+> - (7) 並行測試要斷言行為，audit 在鎖外寫入；
+> - (8) 新增剩餘風險：啟動後外部檔案系統的變動，以及 `cmd/probe-*`。
+> 前版：rev1（2026-10-11，初稿，commit `a96801a`）
 > 狀態：**草案，尚未通過 design gate**。待 owner 審閱、codex-reviewer design gate 後，才能撰寫實作計畫。
 > 來源：Pre-M4 Readiness Backlog B4（`docs/architecture/pre-m4-readiness-backlog.md` 的「B4 Workspace 明確確認」段）。
 > owner 決定（2026-10-11）：
@@ -137,7 +146,7 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 
 ### Rule R2：閘門
 
-- **Pre**：AI 工作入口被呼叫，而且已經通過既有的 `beginTxn` 與 `registryUncertain` 檢查。
+- **Pre**：AI 工作入口被呼叫，而且已經通過**該入口既有的** lifecycle 檢查（外層 binding 的 `beginTxn`）與參數檢查；`startSession` 另外保留它原有的 `registryUncertain` 檢查。本票**不會**把 `registryUncertain` 加到其他三個入口，也不改變各入口既有檢查的錯誤優先順序；確認閘只加在 §5.4 所列的副作用之前。
 - **Post（拒絕時）**：
   - 回傳的 error 以 `workspace_confirmation_required` 開頭；
   - 不呼叫 `BeginNewSessionSubmit`／`BeginSubmit`；
@@ -145,7 +154,11 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
   - 不建立 broker、socket、MCP config、recorder、host；
   - 不送 `thread/start`、`turn/start`；
   - Manager 的 submit 狀態不變；
-  - 唯一允許的副作用是一筆 `workspace_confirmation_blocked` audit，加上交易計數。
+  - 允許的副作用只有三種：
+    - 一筆 `workspace_confirmation_blocked` audit；
+    - 交易計數；
+    - Assist 入口在閘門之前必須做的 lifecycle 管理，也就是 root context 的惰性建立（`procRoot`），以及這次呼叫自己的 context 的取消。
+  - **禁止**新增任何 session、provider 或 AI 持久狀態方面的副作用。Assist 入口被拒絕時，不登記 gen、不進入 `assistActive`、不執行 runner 或 preflight，而且本次的 context 一定會被取消。
 - **Post（通過時）**：行為與現在完全相同。
 - **Invariant**：閘門不改變 App 的 lifecycle phase，所以未確認時，`WorkspaceConfirmationStatus` 與 `ConfirmWorkspace` 仍然可以呼叫。
 - Examples：§2.2 的 1、9、10。另外，不論 claude 或 codex、首輪或 resume、`approvalPolicy` 是 `untrusted` 還是 `never`，都要被拒。
@@ -153,11 +166,14 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 ### Rule R3：確認
 
 - **Pre**：App 處於 ready 狀態；呼叫者傳入 `expectedPath`，也就是前端顯示給使用者的實際目錄。
-- **Post（成功）**：
-  - `expectedPath` 與後端快照的 workspace 字串完全相同時，狀態從 `Pending` 變成 `Confirmed`，並寫一筆 `workspace_confirmed` audit（best-effort）；
-  - 在 `Confirmed` 狀態下重複確認，結果相同，**不會**再寫 audit；
-  - 在 `NotRequired` 狀態下呼叫，回傳成功，不寫 audit。
-- **Post（拒絕）**：路徑不符或狀態查詢失敗時回傳 error，狀態維持不變，也**不**寫成功 audit。
+- **處理順序**：**先核對路徑**，再依狀態決定結果。
+  1. `expectedPath` 與後端快照的 workspace **字串不完全相同**時，不論狀態是 `Pending`、`Confirmed` 或 `NotRequired`，一律回傳 error，狀態不變，也不寫成功 audit。
+  2. 路徑相同時：
+     - `Pending` → `Confirmed`，寫一筆 `workspace_confirmed` audit（best-effort）；
+     - `Confirmed` → 回傳成功，狀態不變，**不會**再寫 audit；
+     - `NotRequired` → 回傳成功，狀態不變，不寫 audit。
+- **比對對象**：前端必須傳入 `status.workspace` 的原始字串，不可傳縮短的路徑、改寫成 `~` 的路徑，或任何顯示用的字串。後端不接受 canonical 別名。
+- **Post（拒絕）**：除了路徑不符之外，App 不在 ready 狀態等既有 lifecycle 拒絕情況，也一樣回傳 error，狀態不變，不寫成功 audit。
 - **Invariant**：`ConfirmWorkspace` 不能設定或更改 workspace，也不接受由前端提供的 confirmed、reason 等欄位。
 - Examples：§2.2 的 11、12。
 
@@ -210,8 +226,8 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 |---|---|---|
 | `startSession`（`app.go:6946`） | `registryUncertain` 檢查之後、`BeginNewSessionSubmit`（`:6962`）之前 | 失敗時不需要 `RejectSubmit` |
 | `sendMessage`（`app.go:7026`） | `resolveWSID` 之後、兩個 `BeginSubmit`（`:7033`、`:7047`）之前 | 防禦性檢查：一般情況下，未確認時不會有 active session |
-| `specAssist`（`app.go:6318`） | `knownProvider` 檢查與取得 root context 之後，在任何 runner、preflight、spawn 或寫檔之前 | 必須符合 `TestAssistImplementationsTakeRootContextFirst`，以及「gen 先於 txn 進入 assistActive」的 reclaim 順序；實作計畫要逐行標出確切位置 |
-| `planAssist`（`app.go:6506`） | 取得 root context 之後、`ensureGate()` 之前 | 同上 |
+| `specAssist`（`app.go:6318`） | 固定順序：外層交易（薄包裝 `SpecAssist` 的 `beginTxn`）→ `knownProvider` → 取得 root context → **purpose pin**（`purpose = "spec_assist"`）→ 安排「拒絕時一定會執行」的 cancel 收尾 → **確認閘** → gen／`assistActive`／runner | root context 之後的下一個敘述必須是 purpose pin（binding surface test:233-235），閘門不得插在兩者之間。拒絕時不登記 gen、不進入 `assistActive`；context 由閘門前已安排好的收尾取消，不依賴 gen 建立之後才安排的 teardown。通過時沿用原本的 generation 收尾。**不新增內層 `beginTxn`**（內部不得再次 admission，見 binding surface test:122）。實作計畫要逐行標出確切位置 |
+| `planAssist`（`app.go:6506`） | 取得 root context 與既有的 `defer cancel()` 之後、`ensureGate()` 之前 | 拒絕時由既有的 `defer cancel()` 取消 context；不登記 gen、不執行 preflight、git 或 runner。不新增內層 `beginTxn` |
 
 - Codex 登入（`AuthStatus` `app.go:8890`、`StartLogin` `:8923`）只送出 `account/read`、`account/login/start`，沒有 prompt，也沒有 `turn/start`，因此不在閘門範圍內。但 app-server 仍會以 workspace 作為 cwd 被啟動（`app.go:8086`），CLI 本身初始化時的寫入行為**未驗證**。實作階段要用 fake app-server 測試確認：登入與狀態查詢不會建立 thread 或 turn。若 owner 之後要求連這種啟動也要禁止，那是另一個邊界，需要另外決定。
 
@@ -250,14 +266,17 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
   - symlink 指向家目錄；
   - 家目錄底下的專案子目錄；
   - 家目錄身分無法判定。
+  - `isHome` 的測試一律對隔離的**真實目錄**呼叫 `os.Stat` 取得 FileInfo，**不得**使用自製的 FileInfo 假物件，否則 `os.SameFile` 可能只會回傳 false，測試等於沒有驗證到任何東西。
 - **閘門**：
   - 四個入口在 `Pending` 時都會拒絕：claude 與 codex、首輪與 resume、`approvalPolicy=never` 各自涵蓋；
   - 斷言拒絕時沒有任何啟動副作用：Manager 沒有 Begin、沒有 host、broker、MCP config、recorder，也沒有 thread／turn（使用 fake provider 或 recorder 計數）；
+  - Assist 被拒時，斷言本次 context 已取消、gen 未登記、`assistActive` 沒有新增項目；既有的 root context 與 purpose 形狀測試保持不變並通過；
   - `NotRequired` 與 `Confirmed` 的行為和現在相同。
 - **確認**：
-  - 路徑不符會被拒；
+  - 路徑不符會被拒，`Pending`、`Confirmed`、`NotRequired` 三種狀態各有一個測試；
   - 重複確認冪等，audit 只寫一筆；
-  - 並行的 Confirm 與 StartSession 不產生競態（需要 `-race`）；
+  - 並行的 Confirm 與 StartSession：除了以 `-race` 確認沒有 data race 之外，還要斷言**只有在確認的狀態轉換完成之後，啟動才可能通過**。沒有 data race 不等於這個行為已經成立；
+  - audit 必須在**不持有** `workspaceConfirm` mutex 的情況下寫入；「是否為第一次確認」由一次不可分割的狀態轉換決定，確保 `workspace_confirmed` 只會有一筆，也避免鎖順序問題；
   - 多個 session 共用同一個確認；
   - 新的 App instance 會回到 `Pending`；
   - shutdown 或尚未 ready 時，binding 的行為與既有的 lifecycle 規則一致。
@@ -270,19 +289,22 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 - 警示的渲染：包含實際目錄、source、原因，以及 `role="alert"`。
 - 確認流程：成功、失敗、取消。
 - 晚到的舊回應不會覆蓋新狀態；元件重新掛載時不會自動確認。
-- `required && !confirmed` 時，送出與 Assist 都被停用。
+- 以下情況都必須停用送出與 Assist：`required && !confirmed`、**尚未取得** status、status 查詢**失敗**。不能只判斷 `required && !confirmed`。
+- 「取消」只關閉這次確認操作，不改變確認狀態。
 - i18n 的守門測試都通過。
 
 ### 6.3 E2E
 
-- 既有用 env 注入的 E2E 與 B3b 證據契約都不需修改（env 有效且不是家目錄時，狀態是 `NotRequired`）。
+- 既有用 env 注入的 E2E 與 B3b 證據契約都不需修改。前提是：env 有效、沒有被拒，指向的不是家目錄，而且家目錄身分可以判定；此時狀態是 `NotRequired`。家目錄身分無法判定時，即使 env 正常也會要求確認（R1 (d)），警示中會顯示可辨認的原因。
 - 新增一個反例：用 env 指向家目錄的隔離替身目錄，斷言會出現警示，而且送出訊息會被拒。這項是否放進 E2E，或改由單元與整合測試涵蓋，由實作計畫決定。
 
 ## 7. 相容性與風險
 
 - **binding 介面**：新增兩個 binding，必須同步更新 `frontend/wailsjs` 的產生檔、前端的 adapter 與 mock。不修改既有 binding。
 - **與 B3b-ready 的衝突**：兩者都會改 `app.go`、`App.vue`、`wailsjs`。B3b-ready 目前沒有在進行，所以 B4 先完成。
-- **行為改變（使用者可見）**：從 Finder 開啟的使用者，第一次送出訊息前必須先確認，這是本票刻意造成的改變。`wails dev` 與從專案目錄啟動的流程不受影響。
+- **行為改變（使用者可見）**：從 Finder 開啟的使用者，第一次送出訊息前必須先確認，這是本票刻意造成的改變。`wails dev`，以及從專案目錄啟動的流程，在「家目錄身分可以判定、目錄不是家目錄，而且 env 沒有被拒」的前提下不受影響。
+- **剩餘風險：啟動後的外部檔案系統變動**。路徑字串完全相同只能證明前端與後端的快照一致，無法保證 App 啟動之後，workspace 沒有被外部 rename，或被換成 symlink。App 目前不支援更換 workspace，這類外部變動屬於未處理的剩餘風險；本票不擴大成檔案沙箱。
+- **剩餘風險：`cmd/probe-*`**。這些是獨立的 CLI，不受 App 記憶體中的確認狀態管理，本閘門不保護它們。
 - **`sendMessage` 的閘門是防禦性的**：一般情況下，active session 一定是在確認之後才建立。如果未來支援 restore 時自動啟動 host，這道閘門就是最後一道保護。
 
 ## 8. 估點
@@ -302,6 +324,6 @@ Feature：高風險 workspace 必須先經使用者確認，才能開始 AI 工�
 ## 9. 待驗證假設
 
 - H1：`os.SameFile` 能正確處理 symlink 指向家目錄的情況（`os.Stat` 會跟隨 symlink）。實作時以測試確認。
-- H2：在 `specAssist` 中，閘門可以放在取得 root context 之後、gen 進入 assistActive 之前或之後，而不違反既有的形狀與 reclaim 測試。確切位置由實作計畫讀程式碼後決定；若做不到，要先停下來回報。
+- H2（已由 rev2 的固定順序取代，不再是開放假設）：Assist 的順序與 cancel 責任依 §5.4 決定。實作計畫只負責標出確切行號；如果發現既有的形狀測試或 reclaim 規則無法同時滿足，要先停下來回報，不得自行調整順序。
 - H3：fake app-server 能觀察到登入流程送出的所有 method，以確認沒有 `thread/start`、`turn/start`。
 - H4：`a.audit` 在拒絕路徑中被呼叫，不會造成額外的副作用或鎖順序問題。
