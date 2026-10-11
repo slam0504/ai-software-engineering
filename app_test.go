@@ -152,6 +152,10 @@ func newTestAppIn(t *testing.T, ws, stateDir string) (*App, *uiCapture) {
 	a.ctx = context.Background()
 	a.workspaceDir = ws
 	a.stateDir = stateDir
+	// B4：測試夾具代表「workspace 已解析且不需確認」（env 注入的正常專案目錄，與 E2E／CI
+	// 相同的形狀）。不設的話 workspaceConfirm 是零值＝fail closed，所有 AI 工作入口都會被
+	// 閘門拒絕。要測 Pending 的測試呼叫 makePending(a)。
+	a.workspaceConfirm.resolve(notRequiredResolution(ws))
 	// 測試基盤明確出示 ownership capability。沒有這一行，openStateWriters 與
 	// 所有 writer 入口一律拒絕（owner 2026-08-18：production 的空 lease 一律
 	// fail closed，不得恢復成「空值就跳過檢查」）。
