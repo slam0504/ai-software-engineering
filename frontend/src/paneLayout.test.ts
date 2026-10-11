@@ -54,6 +54,8 @@ const appMocks = vi.hoisted(() => {
     SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
     AuthStatus: vi.fn(), StartLogin: vi.fn(), CancelLogin: vi.fn(), Logout: vi.fn(),
     RestartCodexServerRecorded: vi.fn(),
+    WorkspaceConfirmationStatus: vi.fn(async () => ({ required: false, confirmed: false, workspace: '/w', source: 'env', reasons: [] as string[] })),
+    ConfirmWorkspace: vi.fn(async (_p: string) => {}),
     EscalationList: vi.fn(async () => [] as any[]), EscalationAck: vi.fn(),
     EscalationCreate: vi.fn(), EscalationResolve: vi.fn(),
   }

@@ -29,6 +29,43 @@ export default {
       restoreFailed: 'Pinned panes could not be restored — both panes start empty; pin the sessions you want again: {error}',
     },
   },
+  workspaceConfirm: {
+    title: 'High-risk workspace: AI work is disabled',
+    intro: 'The AI can run tools and modify files in this directory. Until you confirm, sending messages and Spec/Plan AI assist stay disabled.',
+    field: {
+      path: 'Actual directory',
+      source: 'Source',
+      reasons: 'Reasons',
+    },
+    reason: {
+      sourceHome: 'Fell back to the home directory (a Finder launch starts in /)',
+      sourceTmp: 'Every candidate directory was unusable; fell back to the system temp directory',
+      envRejected: 'WORKBENCH_WORKSPACE was rejected; fell back to another candidate',
+      envRejectedNormalize: 'The path in WORKBENCH_WORKSPACE could not be resolved (missing or inaccessible); fell back to another candidate',
+      envRejectedMkdir: 'WORKBENCH_WORKSPACE points to a directory where .workbench cannot be created; fell back to another candidate',
+      isHome: 'The actual directory is your home directory',
+      homeIdentityUnknown: 'Could not determine whether this directory is your home directory',
+      unresolved: 'The workspace has not been resolved yet',
+    },
+    action: {
+      open: 'Confirm AI work in this directory',
+      confirm: 'Confirm',
+      cancel: 'Cancel',
+      retry: 'Retry',
+    },
+    dialog: {
+      prompt: 'Let the AI work in this directory? {path}',
+    },
+    confirming: 'Confirming…',
+    confirmFailed: 'Confirmation failed: {error}',
+    loading: 'Fetching the workspace confirmation status…',
+    queryFailed: 'Could not fetch the workspace confirmation status; AI work is disabled: {error}',
+    blocked: {
+      loading: 'Fetching the workspace confirmation status; AI work is temporarily disabled',
+      failed: 'Could not fetch the workspace confirmation status; AI work is disabled',
+      pending: 'The workspace is not confirmed; AI work is disabled — confirm it at the top of the window first',
+    },
+  },
   settings: {
     action: {
       new: 'New',

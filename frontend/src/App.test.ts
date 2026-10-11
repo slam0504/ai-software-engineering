@@ -32,6 +32,8 @@ const wailsAppMocks = vi.hoisted(() => ({
   RegisterMutation: vi.fn(), RunEvidence: vi.fn(), EvidenceGet: vi.fn(),
   SubmitTestContract: vi.fn(), ValidateTestCommit: vi.fn(), EvidenceCommitCandidates: vi.fn(),
   EscalationList: vi.fn(async () => [] as any[]), EscalationCreate: vi.fn(), EscalationAck: vi.fn(), EscalationResolve: vi.fn(),
+  WorkspaceConfirmationStatus: vi.fn(async () => ({ required: false, confirmed: false, workspace: '/w', source: 'env', reasons: [] as string[] })),
+  ConfirmWorkspace: vi.fn(async (_p: string) => {}),
   // A2-1：Spec／Plan 送核與 Plan assist——App.vue 用 withEscalationReload 包裝
   // 這三個綁定，未 mock 時 props('submit')／props('assist') 呼叫會撞 window.go。
   SubmitForApproval: vi.fn(), SubmitPlanForApproval: vi.fn(), PlanAssist: vi.fn(),

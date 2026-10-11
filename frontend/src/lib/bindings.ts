@@ -4,10 +4,11 @@ import {
   PaneLayout, SetPaneLayout,
   RegisterMutation, RunEvidence, EvidenceGet, SubmitTestContract, ValidateTestCommit, EvidenceCommitCandidates,
   EscalationList, EscalationCreate, EscalationAck, EscalationResolve,
+  WorkspaceConfirmationStatus, ConfirmWorkspace,
 } from '../../wailsjs/go/main/App'
 import type {
   Bindings, SessionLifecycleBindings, WorkspaceSessionBindings, CodexRecordingBindings,
-  TurnWindowBindings, PaneLayoutBindings, EvidenceBindings, EscalationBindings,
+  TurnWindowBindings, PaneLayoutBindings, EvidenceBindings, EscalationBindings, WorkspaceConfirmationBindings,
 } from '../types'
 
 // production bindings adapter（M1.5 第三輪 review P1-1：SendMessage 必須
@@ -29,7 +30,7 @@ import type {
 // 綁定個別當 prop 傳給 TcaWorkspace／EscalationInbox 等元件。
 export function makeBindings(): Bindings & SessionLifecycleBindings & WorkspaceSessionBindings
   & CodexRecordingBindings & TurnWindowBindings & PaneLayoutBindings & EvidenceBindings
-  & EscalationBindings {
+  & EscalationBindings & WorkspaceConfirmationBindings {
   return {
     StartSession: (wsid, prompt, resume, rc, task, policy) => StartSession(wsid, prompt, resume, rc, task, policy),
     SendMessage: (wsid, text) => SendMessage(wsid, text),
@@ -55,5 +56,7 @@ export function makeBindings(): Bindings & SessionLifecycleBindings & WorkspaceS
     EscalationCreate: (sourceRef, blockScope, summary) => EscalationCreate(sourceRef, blockScope, summary),
     EscalationAck: (id) => EscalationAck(id),
     EscalationResolve: (id, resolution, reason) => EscalationResolve(id, resolution, reason),
+    WorkspaceConfirmationStatus: () => WorkspaceConfirmationStatus(),
+    ConfirmWorkspace: (expectedPath) => ConfirmWorkspace(expectedPath),
   }
 }

@@ -1,4 +1,4 @@
-import type { evidence, escalation } from '../wailsjs/go/models'
+import type { evidence, escalation, main } from '../wailsjs/go/models'
 
 // Envelope v1（M1 凍結契約）：欄位名對齊 Go contract.Envelope 的 json tag。
 export interface Usage { input_tokens: number; output_tokens: number; cached_input_tokens?: number }
@@ -150,4 +150,10 @@ export interface EscalationBindings {
   EscalationCreate(sourceRef: string, blockScope: string, summary: string): Promise<string>
   EscalationAck(id: string): Promise<void>
   EscalationResolve(id: string, resolution: string, reason: string): Promise<void>
+}
+// WorkspaceConfirmationBindings：B4 的兩個綁定。ConfirmWorkspace 的唯一參數必須是
+// WorkspaceConfirmationStatus 回傳的 workspace 原始字串（逐參數轉發鎖在 bindings.test.ts）。
+export interface WorkspaceConfirmationBindings {
+  WorkspaceConfirmationStatus(): Promise<main.WorkspaceConfirmationInfo>
+  ConfirmWorkspace(expectedPath: string): Promise<void>
 }

@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia'
 import { t } from '../i18n'
+import { workspaceBlockKeys } from '../i18n/stateKeys'
+import { useWorkspaceConfirmation } from './workspaceConfirmation'
 import type { Bindings, ChatItem, Envelope, PaneLayoutInfo, SessionInfo, TimelineItem } from '../types'
 
 const NOISE_KINDS = new Set(['system_other', 'unknown'])
@@ -610,6 +612,13 @@ export const useSession = defineStore('session', {
       if (m.busy) return
       if (!this.bindings) {
         this.pushNotice(t('store.bindingsNotReady'))
+        return
+      }
+      // B4：required && !confirmed、尚未取得 status、查詢失敗，一律不送出（後端的 R2 閘門仍是
+      // 最後防線；這裡讓使用者立刻看到原因，而不是等一次被拒絕的呼叫）。
+      const wsc = useWorkspaceConfirmation()
+      if (wsc.blocked) {
+        this.pushNotice(t(workspaceBlockKeys[wsc.blockKind]))
         return
       }
       m.busy = true

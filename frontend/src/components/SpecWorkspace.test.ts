@@ -6,6 +6,7 @@ import { EditorView } from '@codemirror/view'
 import SpecWorkspace from './SpecWorkspace.vue'
 import { useAssist } from '../stores/assist'
 import { mountWithI18n } from '../test/i18n'
+import { seedWorkspaceConfirmation } from '../test/workspaceConfirmation'
 import zhTW from '../i18n/locales/zh-TW'
 
 // wailsjs 綁定 mock：控制 SpecAssist 的 resolve 時機，模擬「assist 進行中操作者
@@ -25,6 +26,7 @@ vi.mock('../../wailsjs/go/main/App', () => mocks)
 describe('SpecWorkspace draft accept', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+    seedWorkspaceConfirmation() // B4：這些測試驗的是 Assist 本身；不需確認的 workspace 與既有行為相同
     for (const fn of Object.values(mocks)) fn.mockReset()
     mocks.SpecList.mockResolvedValue([])
     mocks.SpecRead.mockResolvedValue({ content: '', digest: 'sha256:stub' })
