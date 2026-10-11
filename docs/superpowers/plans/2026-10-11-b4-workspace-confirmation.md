@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **版本：** rev3（2026-10-11），依 Codex plan review002 修正一項：定義 Wails 產物 `frontend/wailsjs/go/models.ts` 中 `WorkspaceConfirmationInfo` 類別兩行 tab 空行的**狹窄例外**——保留產生器原樣輸出、不做空白正規化（比照 A5），Task 2 明寫不得手動修改，Task 8 的 `git diff --check` 收尾改為「原始輸出與 rc 存檔，再對原始輸出做精確比對」兩步（其餘任何警告必須為 0），Global Constraints 第 22 條同步。前版：rev2（commit `8690d7a`）。
+> **版本：** rev4（2026-10-11），依 Codex plan review003：Task 8 Step 2 的過濾腳本改經 `run_logged final-whitespace-filter` 執行，保存 log 與 rc，並以 `show` 讀取；判定以 `.rc` 為準。過濾邏輯不變。
+>
+> 前版：rev3（2026-10-11），依 Codex plan review002 修正一項：定義 Wails 產物 `frontend/wailsjs/go/models.ts` 中 `WorkspaceConfirmationInfo` 類別兩行 tab 空行的**狹窄例外**——保留產生器原樣輸出、不做空白正規化（比照 A5），Task 2 明寫不得手動修改，Task 8 的 `git diff --check` 收尾改為「原始輸出與 rc 存檔，再對原始輸出做精確比對」兩步（其餘任何警告必須為 0），Global Constraints 第 22 條同步。前版：rev2（commit `8690d7a`）。
 >
 > rev2（2026-10-11），依 Codex plan review001（對 rev1 commit `25cfe11` 的 CHANGES_REQUIRED）修正五項：（1）前端 `parseStatus` 改為完整 DTO 形狀驗證、fail closed，刪除「null 可容忍」並改加 refresh 層級的負例；（2）Task 4 `specAssist` 在 purpose pin 之後、確認閘之前加 `defer cancel()`（inline `cancel()` 保留），cancel mutant 改為拿掉所有取消保護；（3）Task 3 自動修補只限 `newTestAppIn` 那一行，其餘失敗先追責任歸屬並回報 owner，`TestAcquireStateLeaseResolvesWorkspaceConfirmation`／`TestProductionStartupPath_*` 失敗視為可能的 production 接線回歸；（4）所有 focused 測試、mutation、完整 gate 的指令改為先存完整輸出與 rc 再讀 log，每個 mutant 獨立 log／rc／備份／cmp 並確認紅在目標測試，Task 8 改用 Task 0 的 base 做三點比較，Self-review 驗證表改為逐次紀錄；（5）Task 8 的 Gherkin 不再寫成會持久保存的稽核保證。前版：rev1（commit `25cfe11`）。
 >
@@ -5087,7 +5089,7 @@ show final-diffcheck '' 20                                  # 照實顯示：rc 
 *步驟 2：對步驟 1 已存好的原始輸出做精確比對。* 允許的只有 `frontend/wailsjs/go/models.ts` 中、屬於 `WorkspaceConfirmationInfo` 類別範圍內的兩行 `+<tab>` trailing whitespace；其餘任何警告（含手寫程式、其他檔案、`models.ts` 的其他位置）都不允許。比對腳本只讀 `$EVID/final-diffcheck.log` 與 `HEAD:models.ts`，過濾後剩下的必須為空，且被過濾的剛好是 2 項、行號都落在該類別範圍內、行內容恰為一個 tab：
 
 ```bash
-python3 - "$EVID/final-diffcheck.log" <<'EOF'
+run_logged final-whitespace-filter python3 - "$EVID/final-diffcheck.log" <<'EOF'
 import re, subprocess, sys
 MODELS = 'frontend/wailsjs/go/models.ts'
 log = open(sys.argv[1], encoding='utf-8').read().split('\n')
@@ -5109,7 +5111,8 @@ for r in rest:
     print('不允許：', r)
 sys.exit(0 if (len(allowed) == 2 and not rest) else 1)
 EOF
-echo "filter rc=$?"                                         # Expected：允許的警告 2 項、其餘 0 項、filter rc=0
+show final-whitespace-filter '' 30                         # 判定以 $EVID/final-whitespace-filter.rc 為準（Expected：允許 2 項、其餘 0 項、rc=0）；
+                                                            # show／echo 成功不代表 python 成功。若需重跑，改用新名稱（例如 final-whitespace-filter-2），保留第一次的紀錄。
 ```
 
 任何一項不符（允許的不是剛好 2 項、或有任何「不允許」的警告）就**停下來回報**，不得放寬腳本、不得改用其他範圍、不得用 `.gitattributes`／`core.whitespace`／`-c` 忽略空白。**任何紅燈先分類**（真實缺陷／夾具前提／已登記的牆鐘測試，見 `docs/architecture/wall-clock-test-register.md`），不得重跑到綠燈後掩蓋；已登記牆鐘測試的紅燈要單獨重跑並把「首次紅燈＋重跑結果」都寫進回報。再確認受保護的既有測試沒有被修改：
