@@ -2106,7 +2106,8 @@ func (a *App) acquireStateLease() (*stateLease, error) {
 		return a.lease, nil
 	}
 	if a.stateDir == "" {
-		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = resolveWorkspace()
+		r := resolveWorkspace()
+		a.workspaceDir, a.stateDir, a.workspaceSrc, a.workspaceErr = r.Workspace, r.State, r.Source, r.Err
 	}
 	a.publishWorkspace(a.workspaceDir, a.workspaceSrc)
 	// **建立空的 state directory 是取鎖之前唯一允許的冪等初始化**（owner
@@ -3243,38 +3244,93 @@ func (a *App) teardownHook(h func(appcore.WSID), w appcore.WSID) {
 //
 // 可寫性的候選判準因此從「建得出 recordings」變成「建得出 .workbench」——同樣
 // 是一次真的 MkdirAll，擋得住唯讀候選，但不留下多餘的目錄。
-func resolveWorkspace() (workspace, state, source string, err error) {
+func resolveWorkspace() workspaceResolution {
+	return resolveWorkspaceWith(productionWorkspaceEnv())
+}
+
+// workspaceEnv：resolveWorkspace 的環境輸入 seam（B4 spec §5.1）。production 用
+// productionWorkspaceEnv() 的真實實作；測試注入隔離目錄與故障，不碰真實的家目錄、
+// 也不依賴 chmod。Stat 必須回傳 os.Stat 的真實 FileInfo（os.SameFile 只認得真實
+// 檔案系統的 FileInfo，自製假物件只會回 false）。
+type workspaceEnv struct {
+	Getenv    func(key string) string
+	Getwd     func() (string, error)
+	HomeDir   func() (string, error)
+	TempDir   func() string
+	Normalize func(dir string) (string, error)
+	MkdirAll  func(path string, perm os.FileMode) error
+	Stat      func(path string) (os.FileInfo, error)
+}
+
+func productionWorkspaceEnv() workspaceEnv {
+	return workspaceEnv{
+		Getenv: os.Getenv, Getwd: os.Getwd, HomeDir: os.UserHomeDir, TempDir: os.TempDir,
+		Normalize: claude.NormalizeCWD, MkdirAll: os.MkdirAll, Stat: os.Stat,
+	}
+}
+
+// resolveWorkspaceWith：resolveWorkspace 的本體。候選順序、判準與回傳的 workspace／
+// state／source／err 與 B4 之前逐字相同（成功候選不回傳先前候選的錯誤；tmp fallback
+// 的 workspace 仍是 TempDir 本身），新增的只有 provenance——而且 provenance 的判定只做
+// Stat，不新增任何寫入。
+func resolveWorkspaceWith(e workspaceEnv) workspaceResolution {
 	type cand struct{ dir, src string }
 	var cands []cand
-	if d := os.Getenv("WORKBENCH_WORKSPACE"); d != "" {
+	var prov workspaceProvenance
+	if d := e.Getenv("WORKBENCH_WORKSPACE"); d != "" {
+		prov.EnvSet = true
 		cands = append(cands, cand{d, "env"})
 	}
-	if cwd, cerr := os.Getwd(); cerr == nil && cwd != "/" {
+	if cwd, cerr := e.Getwd(); cerr == nil && cwd != "/" {
 		cands = append(cands, cand{cwd, "cwd"})
 	}
-	if home, herr := os.UserHomeDir(); herr == nil {
+	if home, herr := e.HomeDir(); herr == nil {
 		cands = append(cands, cand{home, "home"})
 	}
 	var lastErr error
 	for _, c := range cands {
-		n, nerr := claude.NormalizeCWD(c.dir)
+		n, nerr := e.Normalize(c.dir)
 		if nerr != nil {
 			lastErr = nerr
+			prov.noteRejected(c.src, envRejectNormalizeFailed)
 			continue
 		}
 		st := filepath.Join(n, ".workbench")
-		if merr := os.MkdirAll(st, 0o755); merr != nil {
+		if merr := e.MkdirAll(st, 0o755); merr != nil {
 			lastErr = merr
+			prov.noteRejected(c.src, envRejectMkdirFailed)
 			continue
 		}
-		return n, st, c.src, nil
+		prov.IsHome, prov.HomeIdentityKnown = workspaceIsHome(e, n)
+		return workspaceResolution{Workspace: n, State: st, Source: c.src, Provenance: prov}
 	}
-	tmp := os.TempDir()
+	tmp := e.TempDir()
 	st := filepath.Join(tmp, "sdlc-workbench", ".workbench")
-	if merr := os.MkdirAll(st, 0o755); merr != nil {
-		return tmp, st, "tmp", errors.Join(lastErr, merr)
+	prov.IsHome, prov.HomeIdentityKnown = workspaceIsHome(e, tmp)
+	if merr := e.MkdirAll(st, 0o755); merr != nil {
+		return workspaceResolution{Workspace: tmp, State: st, Source: "tmp",
+			Err: errors.Join(lastErr, merr), Provenance: prov}
 	}
-	return tmp, st, "tmp", lastErr
+	return workspaceResolution{Workspace: tmp, State: st, Source: "tmp", Err: lastErr, Provenance: prov}
+}
+
+// workspaceIsHome：實際 workspace 是否就是家目錄（B4 spec §5.1）。對家目錄與 workspace
+// 各做一次 Stat（會跟隨 symlink），再用 os.SameFile 比目錄身分——不比路徑字串，所以家目錄
+// 底下的子目錄不會因為字串前綴相同被誤判。任何一步失敗都回 known=false（R1 (d)）。
+func workspaceIsHome(e workspaceEnv, workspace string) (isHome, known bool) {
+	home, herr := e.HomeDir()
+	if herr != nil || home == "" {
+		return false, false
+	}
+	homeInfo, serr := e.Stat(home)
+	if serr != nil {
+		return false, false
+	}
+	wsInfo, serr := e.Stat(workspace)
+	if serr != nil {
+		return false, false
+	}
+	return os.SameFile(homeInfo, wsInfo), true
 }
 
 // stateSubdirs：session 狀態的目錄骨架。**必須在出示 lease 之後才建立**——
