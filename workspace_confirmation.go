@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -200,4 +201,22 @@ func (a *App) workspaceConfirmationStatus() (WorkspaceConfirmationInfo, error) {
 func (a *App) confirmWorkspace(expectedPath string) error {
 	_, _, err := a.workspaceConfirm.confirm(expectedPath)
 	return err
+}
+
+// ---- 閘門（spec R2、§5.4）----
+
+// requireWorkspaceConfirmed：四個 AI 工作入口（startSession／sendMessage／specAssist／
+// planAssist）共用的政策檢查。只有 NotRequired 與 Confirmed 通過；其餘一律回
+// 「workspace_confirmation_required…」開頭的錯誤。
+//
+// 呼叫端必須把它放在任何 session／provider 啟動副作用**之前**（位置見 spec §5.4）。本函式
+// 自己不做 I/O、不改變 lifecycle phase。op／provider／wsid 供 Task 5 的稽核使用。
+func (a *App) requireWorkspaceConfirmed(op, provider, wsid string) error {
+	snap := a.workspaceConfirm.snapshot()
+	if snap.state == wcNotRequired || snap.state == wcConfirmed {
+		return nil
+	}
+	info := snap.info()
+	return fmt.Errorf("%w：目前的 workspace（%s，來源 %s）需要先在畫面頂端確認，確認前不會開始任何 AI 工作（原因：%s）",
+		errWorkspaceConfirmationRequired, info.Workspace, info.Source, strings.Join(info.Reasons, ","))
 }

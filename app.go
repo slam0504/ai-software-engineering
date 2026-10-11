@@ -7040,6 +7040,11 @@ func (a *App) startSession(wsid, prompt, resume, recordCase, taskLabel, approval
 	if a.registryUncertain() {
 		return errRegistryUncertain
 	}
+	// B4 確認閘（spec §5.4）：registryUncertain 之後、BeginNewSessionSubmit 之前。拒絕時
+	// 尚未取得 submit ownership，所以不需要 RejectSubmit。
+	if err := a.requireWorkspaceConfirmed("start_session", string(prov), wsid); err != nil {
+		return err
+	}
 	if resume == "" { // 第三輪 P1-3：view 未被 New 清除時自動接續（plan D6 resume 意圖）
 		resume = a.registryResume(w)
 	}
@@ -7110,6 +7115,11 @@ func (a *App) SendMessage(wsid, prompt string) error {
 func (a *App) sendMessage(wsid, prompt string) error {
 	w, pv, err := a.resolveWSID("send message", wsid)
 	if err != nil {
+		return err
+	}
+	// B4 確認閘（防禦性，spec §5.4）：一般情況下未確認時不會有 active session；若未來支援
+	// restore 時自動啟動 host，這裡就是最後一道保護。必須早於兩個 BeginSubmit。
+	if err := a.requireWorkspaceConfirmed("send_message", string(pv), wsid); err != nil {
 		return err
 	}
 	h := a.hostFor(w)
