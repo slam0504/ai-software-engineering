@@ -124,6 +124,12 @@ wails build                  # → build/bin/sdlc-workbench.app
 
    第一次送出訊息前，先確認畫面頂端的 `ws: <source> @ <path>` 是你要的目錄——
    否則 AI 會在家目錄而不是你的專案內操作。
+
+   **高風險 workspace 需要明確確認**：實際 workspace 是家目錄（含 `cd ~` 後啟動、`WORKBENCH_WORKSPACE`
+   指向家目錄或指向家目錄的 symlink）、退回系統暫存目錄、`WORKBENCH_WORKSPACE` 無效而退回其他候選，
+   或 App 無法判定它是不是家目錄時，畫面頂端會出現紅色警示，列出實際目錄、來源與原因。按下「確認在此
+   目錄進行 AI 工作」並再確認一次之前，送出訊息與 Spec／Plan 的 AI 輔助都會停用（後端同樣會拒絕）。
+   確認只在這次執行有效，重啟後要重新確認；它不是檔案沙箱，也不取代逐工具的核可。
 2. **登入 provider**——在設定列操作：Claude 會開啟系統終端機執行 `claude auth login`；
    Codex 走瀏覽器 OAuth。App 不接收密碼、不保管 token。
 3. **建立第一個 session**——左欄 SessionList 選擇 provider 建立 session，在輸入框送出第一句訊息，
@@ -527,7 +533,7 @@ AI 要求變更檔案或執行指令之前，由你決定是否放行，核可�
 
 | 變數 | 用途 |
 |---|---|
-| `WORKBENCH_WORKSPACE` | 覆寫 workspace 根目錄（預設：目前工作目錄；不可寫時改用使用者家目錄） |
+| `WORKBENCH_WORKSPACE` | 覆寫 workspace 根目錄（預設：目前工作目錄；不可寫時改用使用者家目錄；都不可用時退回系統暫存目錄）。路徑無效或無法建立 `.workbench` 時**會靜默退回下一個候選，並觸發高風險確認**（見「第一次使用」） |
 | `WORKBENCH_TOOLS_DIR` | 覆寫 CLI tools 目錄（預設：bundle Resources/tools → repo tools/） |
 | `WORKBENCH_APPROVAL_TIMEOUT` | 核可逾時（Go duration，例如 `5s`；逾時時自動拒絕） |
 | `WORKBENCH_MCP_COMMAND_OVERRIDE` | 測試用：覆寫 MCP approval server 指令 |
