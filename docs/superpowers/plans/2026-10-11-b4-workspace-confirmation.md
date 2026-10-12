@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **版本：** rev4（2026-10-11），依 Codex plan review003：Task 8 Step 2 的過濾腳本改經 `run_logged final-whitespace-filter` 執行，保存 log 與 rc，並以 `show` 讀取；判定以 `.rc` 為準。過濾邏輯不變。
+> **版本：** rev5（2026-10-12），修正 rev3 的錯誤判斷：CI `checksums` job（required）會對 PR 與 push 執行 `git diff --check`，rev3 保留的兩行 tab 空行會讓 PR 失敗。owner 於 2026-10-12 選擇做法 A：新增 `.gitattributes`，只對 `frontend/wailsjs/**` 設 `-whitespace`；產生檔仍維持 Wails 原樣、不得手改。Global Constraints 第 22 條、Task 2 Step 6 的已知特性說明、Task 8 Step 3 的 `git diff --check` 收尾同步修改（改為新增 `.gitattributes` 後重跑，預期 rc=0，並加範圍對照）；rev4 版本的第一次結果（原始 rc=2＋過濾 rc=0）保留為紀錄，不覆寫。
+>
+> 前版：rev4（2026-10-11，commit `a31a743`），依 Codex plan review003：Task 8 Step 2 的過濾腳本改經 `run_logged final-whitespace-filter` 執行，保存 log 與 rc，並以 `show` 讀取；判定以 `.rc` 為準。過濾邏輯不變。
 >
 > 前版：rev3（2026-10-11），依 Codex plan review002 修正一項：定義 Wails 產物 `frontend/wailsjs/go/models.ts` 中 `WorkspaceConfirmationInfo` 類別兩行 tab 空行的**狹窄例外**——保留產生器原樣輸出、不做空白正規化（比照 A5），Task 2 明寫不得手動修改，Task 8 的 `git diff --check` 收尾改為「原始輸出與 rc 存檔，再對原始輸出做精確比對」兩步（其餘任何警告必須為 0），Global Constraints 第 22 條同步。前版：rev2（commit `8690d7a`）。
 >
@@ -49,7 +51,7 @@
 19. R5：`required && !confirmed` 時，頂部列顯示高風險警示——使用 `--err` 樣式並設 `role="alert"`，內容包含實際目錄、source 與原因，並提供「確認在此目錄進行 AI 工作」按鈕；送出訊息與 Assist 的操作在此期間停用；**尚未取得 status、status 查詢失敗**時也不可送出，不能只判斷 `required && !confirmed`。
 20. R5 Invariant：元件重新掛載時不會自動確認；晚到的舊回應不會覆蓋較新的狀態（沿用 `refreshCliInfo` 的 request sequencing）；「取消」只關閉這次確認操作，不改變確認狀態；頂部列的 `ws:` 顯示維持不變；資料取得順序為先等 CLIInfo ready，再查詢 `WorkspaceConfirmationStatus`。
 21. i18n：`zh-TW.ts` 與 `en.ts` 同時新增 key，並通過 parity、keyRefs 等守門測試。
-22. `frontend/wailsjs` 的產生檔以 `wails generate module` 重新產生後提交，做法比照 A5：只提交內容差異，三個 runtime 檔（`runtime/package.json`、`runtime.d.ts`、`runtime.js`）的權限副作用要還原成 644。**唯一的空白例外**：Wails 產生的 `frontend/wailsjs/go/models.ts` 中，新類別 `WorkspaceConfirmationInfo` 內有兩行只含一個 tab 的空行（`git diff --check` 會報 trailing whitespace）——這是產生器的原樣輸出，**原樣提交、不得手動修改**，未來重新產生才不會出現差異；收尾的 `git diff --check` 只容許這兩項（見 Task 8 Step 3），其餘任何空白警告（手寫程式、其他檔案、`models.ts` 的其他位置）必須為 0。不得用 `.gitattributes`、`core.whitespace` 或 `-c` 參數整檔忽略空白，也不得格式化整份 `models.ts`。
+22. `frontend/wailsjs` 的產生檔以 `wails generate module` 重新產生後提交，做法比照 A5：只提交內容差異，三個 runtime 檔（`runtime/package.json`、`runtime.d.ts`、`runtime.js`）的權限副作用要還原成 644。Wails 產生的 `frontend/wailsjs/go/models.ts` 中，新類別 `WorkspaceConfirmationInfo` 內有兩行只含一個 tab 的空行——這是產生器的原樣輸出，**原樣提交、不得手動修改**，也不得格式化整份 `models.ts`。**（rev5）** CI 的 `checksums` job 會對 PR 執行 `git diff --check`，所以 repo 根目錄新增 `.gitattributes`，內容只有一行 `frontend/wailsjs/** -whitespace`：只讓 Wails 產生檔目錄不做空白檢查。不得擴大範圍（其他路徑、整個 `frontend/`），也不得改用 `core.whitespace` 或 `-c` 參數；收尾的 `git diff --check` 必須 rc=0，其餘檔案的空白警告照常檢查（見 Task 8 Step 3）。
 23. 既有測試 `TestProductionResolverCreatesOnlyEmptyStateDirBeforeLease`、`TestNoWriterOpensBeforeLeaseIsAcquired`、`CLIInfo` 系列測試、Assist 的 root＋purpose 形狀測試（`TestAssistImplementationsTakeRootContextFirst`），**都必須不修改就能通過**；若必須修改，先停下來回報。
 24. 非目標：不改 App 自己對 workspace 的寫入時機、不做啟動時 picker、不允許執行期更換 workspace、不建立檔案沙箱、不持久化確認、Codex 登入與帳號狀態查詢（`AuthStatus`、`StartLogin`）不在閘門範圍內；owner 裁定（2026-10-11）`Logout`、`RestartCodexServerRecorded`、`RecoverCodexRecording` 同樣**不加閘門**，但須與登入一樣以 fake app-server 驗證不會送出 `thread/start`、`turn/start`。
 25. 驗證指令：Go 用 `GOTOOLCHAIN=local PATH=$HOME/sdk/go1.26.5/bin:$PATH go test -race ./... -count=1`，加上 `gofmt -l .` 與 `go vet ./...`（一律以 `run_logged` 保存完整輸出與 rc）；前端在 `frontend` 目錄用 `npm run build`（含 vue-tsc）與 vitest，node 路徑 `export PATH=$HOME/.nvm/versions/node/v26.8.1/bin:$PATH`。
@@ -1410,7 +1412,7 @@ run_logged t2-wails-stat git diff --stat -- frontend/wailsjs ; cat $EVID/t2-wail
 git status --short frontend | grep -v wailsjs                                                           # Expected：空
 ```
 
-**已知特性（狹窄例外，不得手動修改）：** `models.ts` 的新類別 `WorkspaceConfirmationInfo` 內有**兩行只含一個 tab 的空行**（`static createFrom` 之前、`constructor` 之前各一行，下方 diff 中顯示為 `+<tab>`）。這是 Wails 產生器的原樣輸出；它們會讓 `git diff --check` 報 `trailing whitespace`。**原樣保留，不得刪除、改成空行或對整份 `models.ts` 做格式化**——提交產生器原樣的輸出，未來重新產生時才不會出現差異（比照 A5）。收尾的 `git diff --check` 在 Task 8 Step 3 只對這兩項訂例外。確認產物裡剛好是這兩行：
+**已知特性（不得手動修改）：** `models.ts` 的新類別 `WorkspaceConfirmationInfo` 內有**兩行只含一個 tab 的空行**（`static createFrom` 之前、`constructor` 之前各一行，下方 diff 中顯示為 `+<tab>`）。這是 Wails 產生器的原樣輸出；它們會讓 `git diff --check` 報 `trailing whitespace`。**原樣保留，不得刪除、改成空行或對整份 `models.ts` 做格式化**——提交產生器原樣的輸出，未來重新產生時才不會出現差異（比照 A5）。（rev5）這兩行由 Task 8 Step 3 新增的 `.gitattributes`（`frontend/wailsjs/** -whitespace`）排除在 `git diff --check` 之外；在那之前，`git diff --check` 會報這兩項。確認產物裡剛好是這兩行：
 
 ```bash
 run_logged t2-wails-tabs git diff -U0 -- frontend/wailsjs/go/models.ts
@@ -5076,46 +5078,18 @@ show final-build '' 3; show final-vitest 'Test Files|Tests '
 
 Expected：gofmt 0 位元組、vet rc=0、`go test -race` rc=0 且無 `DATA RACE`；vitest 全綠；build rc=0。
 
-**`git diff --check` 分兩步（Wails 產物有兩行 tab 空行的狹窄例外，見 Global Constraints 第 22 條與 Task 2 Step 6）：**
-
-*步驟 1：完整檢查，原始輸出與 rc 存檔；`${BASE}...HEAD` 三點比較，不得改用其他範圍。* **預期 rc 不是 0**（`models.ts` 的兩行已知警告，git 以 rc=2 結束）——**不得把這個非零 rc 寫成 clean**，回報時照實寫出原始 rc 與原始輸出：
+**`git diff --check`（rev5）：** 先新增 `.gitattributes`（見 Global Constraints 第 22 條），再以三點比較重跑，不得改用其他範圍。rev4 版本的第一次結果（`final-diffcheck` 原始 rc=2、`final-whitespace-filter` rc=0）保留為紀錄，不覆寫；新結果用新名稱。
 
 ```bash
+printf 'frontend/wailsjs/** -whitespace\n' > .gitattributes
+git add .gitattributes && git commit -m "build(b4): .gitattributes 讓 Wails 產生檔不做 diff --check 空白檢查（rev5）"
 BASE=$(cat $EVID/base.txt)
-run_logged final-diffcheck git diff --check ${BASE}...HEAD
-show final-diffcheck '' 20                                  # 照實顯示：rc 與完整原始輸出
+run_logged final-diffcheck-2 git diff --check ${BASE}...HEAD ; show final-diffcheck-2 '' 20      # Expected：rc=0、輸出 0 位元組
+run_logged final-checkattr git check-attr whitespace -- frontend/wailsjs/go/models.ts frontend/src/App.vue app.go README.md
+show final-checkattr '' 10   # Expected：models.ts 為 unset，其餘三個為 unspecified（範圍只限 wailsjs）
 ```
 
-*步驟 2：對步驟 1 已存好的原始輸出做精確比對。* 允許的只有 `frontend/wailsjs/go/models.ts` 中、屬於 `WorkspaceConfirmationInfo` 類別範圍內的兩行 `+<tab>` trailing whitespace；其餘任何警告（含手寫程式、其他檔案、`models.ts` 的其他位置）都不允許。比對腳本只讀 `$EVID/final-diffcheck.log` 與 `HEAD:models.ts`，過濾後剩下的必須為空，且被過濾的剛好是 2 項、行號都落在該類別範圍內、行內容恰為一個 tab：
-
-```bash
-run_logged final-whitespace-filter python3 - "$EVID/final-diffcheck.log" <<'EOF'
-import re, subprocess, sys
-MODELS = 'frontend/wailsjs/go/models.ts'
-log = open(sys.argv[1], encoding='utf-8').read().split('\n')
-if log and log[-1] == '':
-    log.pop()
-if len(log) % 2:
-    print('FAIL: 輸出不是「檔名:行號: 訊息 / +內容」成對的格式，行數 =', len(log)); sys.exit(1)
-head = subprocess.check_output(['git', 'show', 'HEAD:' + MODELS], text=True).split('\n')
-start = next(i for i, l in enumerate(head, 1) if l == '\texport class WorkspaceConfirmationInfo {')
-end = next(i for i in range(start, len(head) + 1) if head[i - 1] == '\t}')   # 類別結尾（縮排恰為一個 tab）
-allowed, rest = [], []
-for i in range(0, len(log), 2):
-    m = re.match(r'^(.*):(\d+): (.*)$', log[i])
-    ok = (m and m.group(1) == MODELS and m.group(3) == 'trailing whitespace.' and log[i + 1] == '+\t'
-          and start < int(m.group(2)) < end and head[int(m.group(2)) - 1] == '\t')
-    (allowed if ok else rest).append((log[i], log[i + 1]))
-print('類別範圍 %d-%d；允許的警告 %d 項；其餘 %d 項' % (start, end, len(allowed), len(rest)))
-for r in rest:
-    print('不允許：', r)
-sys.exit(0 if (len(allowed) == 2 and not rest) else 1)
-EOF
-show final-whitespace-filter '' 30                         # 判定以 $EVID/final-whitespace-filter.rc 為準（Expected：允許 2 項、其餘 0 項、rc=0）；
-                                                            # show／echo 成功不代表 python 成功。若需重跑，改用新名稱（例如 final-whitespace-filter-2），保留第一次的紀錄。
-```
-
-任何一項不符（允許的不是剛好 2 項、或有任何「不允許」的警告）就**停下來回報**，不得放寬腳本、不得改用其他範圍、不得用 `.gitattributes`／`core.whitespace`／`-c` 忽略空白。**任何紅燈先分類**（真實缺陷／夾具前提／已登記的牆鐘測試，見 `docs/architecture/wall-clock-test-register.md`），不得重跑到綠燈後掩蓋；已登記牆鐘測試的紅燈要單獨重跑並把「首次紅燈＋重跑結果」都寫進回報。再確認受保護的既有測試沒有被修改：
+`.gitattributes` 只排除 `frontend/wailsjs/**`；`final-diffcheck-2` 的 rc 不是 0 就**停下來回報**，不得擴大 `.gitattributes` 的範圍、不得改用其他範圍、不得用 `core.whitespace`／`-c` 忽略空白。**任何紅燈先分類**（真實缺陷／夾具前提／已登記的牆鐘測試，見 `docs/architecture/wall-clock-test-register.md`），不得重跑到綠燈後掩蓋；已登記牆鐘測試的紅燈要單獨重跑並把「首次紅燈＋重跑結果」都寫進回報。再確認受保護的既有測試沒有被修改：
 
 ```bash
 run_logged final-protected git diff ${BASE}...HEAD --stat -- app_binding_surface_test.go app_startup_state_test.go main_singleinstance_test.go app_cliinfo_ready_test.go ; wc -c < $EVID/final-protected.log
@@ -5218,7 +5192,7 @@ EOF
 
 **這次 rev2 修改後有重跑完整 gate**：第 1–3 列是在含 Task 6 追加測試（`TestCodexServerEntryPointsSendNoThreadOrTurn`）、Task 4 的 `defer cancel()`、嚴格 `parseStatus` 的最終版本上執行的；rev1 時 Task 6 追加的測試只跑過 focused 與 4 個 mutant，那個缺口在 rev2 已補上（第 1、2、5、6 列）。
 
-**rev3 補充驗證（Task 8 Step 3 的 `git diff --check` 過濾，起草者在複本上的回報，未經獨立驗證）**：在 `/Users/eason_tseng/b3a-evidence/b4/plan-rev3-verify/repo`（小型 git repo：base＝spec-wt 的 `models.ts`，HEAD＝原型產物 `plan-scratch/frontend/wailsjs/go/models.ts`）以計畫內逐字抽出的 Step 1／Step 2 指令執行；各情境的原始 log、rc 在 `plan-rev3-verify/evid-<情境>/`（`final-diffcheck.log|.rc`、`step2.out`、`filter.rc`）。結果：**正例**（原型產物）原始 `git diff --check` rc=2、4 行輸出，過濾後「允許 2 項、其餘 0 項」，filter rc=0；**反例**全部判為失敗（filter rc=1）：其他檔案多一項 trailing whitespace（`foo.go`）、`models.ts` 其他位置多一項、類別範圍內多一行 tab 空行（變成 3 項）、少一行（只剩 1 項）、其中一行內容改成兩個空格。
+**rev3 補充驗證（Task 8 Step 3 的 `git diff --check` 過濾，起草者在複本上的回報，未經獨立驗證；rev5 起該過濾步驟已改為 `.gitattributes`，此段僅保留為紀錄）**：在 `/Users/eason_tseng/b3a-evidence/b4/plan-rev3-verify/repo`（小型 git repo：base＝spec-wt 的 `models.ts`，HEAD＝原型產物 `plan-scratch/frontend/wailsjs/go/models.ts`）以計畫內逐字抽出的 Step 1／Step 2 指令執行；各情境的原始 log、rc 在 `plan-rev3-verify/evid-<情境>/`（`final-diffcheck.log|.rc`、`step2.out`、`filter.rc`）。結果：**正例**（原型產物）原始 `git diff --check` rc=2、4 行輸出，過濾後「允許 2 項、其餘 0 項」，filter rc=0；**反例**全部判為失敗（filter rc=1）：其他檔案多一項 trailing whitespace（`foo.go`）、`models.ts` 其他位置多一項、類別範圍內多一行 tab 空行（變成 3 項）、少一行（只剩 1 項）、其中一行內容改成兩個空格。
 
 **尚未重跑，或無法在最終版本上重現**：
 - 各 Task 的 Step 2「首次紅燈」（Task 1、2、4、5、7）：是起草過程中逐步實作時觀察到的；最終版本的符號已存在，無法重現，也沒有保存完整原始 log。計畫內寫的 Expected 是當時觀察，不是 rev2 的驗證結果。
