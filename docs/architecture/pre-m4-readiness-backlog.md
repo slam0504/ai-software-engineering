@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev83·估點版）
+# Pre-M4 Readiness Backlog（rev84·估點版）
 
-> 版本：rev83（2026-10-10）：**A4 關票**（owner 2026-10-10 授權執行並安裝 Go 1.25.0／1.26.5）。在同一個受測 commit（已加上 `toolchain go1.26.5`）上，以 Go 1.25.0（`GOTOOLCHAIN=local`，binary 經 `go version -m` 確認為 go1.25.0）與 Go 1.26.5 分別執行完整 Go gate（gofmt、build、vet、`go test -race`）與 `wails build -s`，兩腳全綠，1368 個測試的結果逐筆相同，沒有可歸因於 Go 版本的失敗。依驗收 (2)，minimum 維持 `go 1.25.0`；依裁決 (4)，`go.mod` 加上 `toolchain go1.26.5`；README 同步為「最低 1.25.0、已驗證 1.26.5」。詳見[矩陣紀錄](evidence/2026-10-10-a4-go-toolchain-matrix.md)。其他票與點數都不變。
+> 版本：rev84（2026-10-12）：**B4 工程交付**（Workspace 明確確認）。實作在 `feat/b4-workspace-confirmation` 分支（base `a31a743`，範圍 `a31a743...fcb41c1`，8 個 commit：resolver provenance＋R1 policy、確認狀態與兩個 binding、`requireWorkspaceConfirmed` 閘門（startSession／sendMessage）、specAssist／planAssist 閘門、audit、Codex 登入等入口邊界測試、前端警示與確認流程、README＋Gherkin）。收尾 gate 在 `fcb41c1` 上執行：`gofmt -l .` 0 位元組、`go vet ./...` rc=0、`go test -race ./... -count=1 -timeout 30m` rc=0（23 個 package `ok`、3 個 package 無測試檔、無 `FAIL`／`panic`／`DATA RACE`）、前端 `npm run build` rc=0、`vitest run` 49 檔 704 條全綠（基準 44 檔 605 條，新增 5 檔、99 條）；新增 Go 測試 41 個（皆為頂層 `Test` 函式，不含 subtest），全部在 7 個新增檔案內。原始 log 與 rc 在 `b3a-evidence/b4/impl-evidence/final-*.log|.rc`。`git diff --check` 照實記錄：三點比較 `a31a743...HEAD` 的原始 rc=2，內容是 `frontend/wailsjs/go/models.ts` 第 586、590 行兩行 `+<tab>` trailing whitespace（Wails 產生檔的 `WorkspaceConfirmationInfo` 類別內）；再以精確比對腳本判定：允許 2 項、其餘 0 項、腳本 rc=0，所以**不是 `--check` 乾淨**，而是「只剩該產生檔的兩行已知例外」。四個受保護的既有測試檔（`app_binding_surface_test.go`、`app_startup_state_test.go`、`main_singleinstance_test.go`、`app_cliinfo_ready_test.go`）沒有變更（`final-protected.log` 0 位元組）。驗收對照：(1) 確認閘——`workspace_gate_test.go`、`workspace_assist_gate_test.go`、`workspace_confirm_test.go`、`workspace_audit_test.go`；(2) 高風險警示——前端 `WorkspaceConfirmBanner.test.ts`、`workspaceGate.test.ts`、`workspaceConfirmationApp.test.ts`；(3) fallback 路徑的確認閘測試——`workspace_resolver_test.go`（14 個）、`workspace_policy_test.go`、`workspace_gate_test.go` 的 `TestProductionStartupPath_*`（整條 production 啟動路徑）。**保留限制**：codex CLI 自身的初始化寫入未驗證；啟動後的外部檔案系統變動與 `cmd/probe-*` 不受保護（spec §7 明列不處理）；Playwright E2E 與 CI 的 `b3a-e2e-ci` 在本機未跑，E2E 反例改由 Go 整合測試與前端 App 層級測試涵蓋（見 Task 8 的決定），`HOME` 在 CI 環境的行為列為未驗證，待 PR 上的 `b3a-e2e-ci` 確認；Go 全套件的總測試條數本次未以 `-json` 統計，只計 package 與新增的頂層測試數。**本版尚未 push、尚未開 PR、尚未經 owner 確認關票**；點數不變（原估 0.6 pt 與實際工程量的差異屬於估點檢討，不在此回填）。其他票與點數都不變。
+
+> 前版：rev83（2026-10-10）：**A4 關票**（owner 2026-10-10 授權執行並安裝 Go 1.25.0／1.26.5）。在同一個受測 commit（已加上 `toolchain go1.26.5`）上，以 Go 1.25.0（`GOTOOLCHAIN=local`，binary 經 `go version -m` 確認為 go1.25.0）與 Go 1.26.5 分別執行完整 Go gate（gofmt、build、vet、`go test -race`）與 `wails build -s`，兩腳全綠，1368 個測試的結果逐筆相同，沒有可歸因於 Go 版本的失敗。依驗收 (2)，minimum 維持 `go 1.25.0`；依裁決 (4)，`go.mod` 加上 `toolchain go1.26.5`；README 同步為「最低 1.25.0、已驗證 1.26.5」。詳見[矩陣紀錄](evidence/2026-10-10-a4-go-toolchain-matrix.md)。其他票與點數都不變。
 
 > 前版：rev82（2026-10-10）：**A5 關票**（owner 2026-10-10 授權先做小票）。A5 的處置已由 `9cb2e67`（2026-09-08，owner 裁定方案 A：只同步 `models.ts` 的 `GateEntryDTO.terminal_cause` 兩行）完成，但本檔一直沒有記錄。本版在 main 現況重新執行 `wails generate module`（Wails v2.13.0），結果內容差異為零，只有 runtime 三個檔的權限副作用；詳見[驗證紀錄](evidence/2026-10-10-a5-bindings-sync-verification.md)（首次產生因缺少 `frontend/dist` 而 rc 1，補上佔位檔後重新產生成功，兩次 log 都保留）。本版未提交任何產生檔的內容變更；驗證只在隔離 worktree 中重寫出相同內容，另有權限副作用。CI 目前沒有產生檔漂移檢查，列為觀察，是否處理另案決定。其他票與點數都不變。
 
@@ -303,6 +305,7 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **驗收條件**：(1) 首次工具寫入前強制確認 workspace 或啟動時 workspace picker；(2) `$HOME` fallback 顯示高風險警示（非普通狀態文字）；(3) 測試覆蓋 fallback 路徑的確認閘。
 - **建議模組**：startup／workspace 決議路徑（`main.go`／`app.go` 相關區）、frontend 頂部列。
 - **依賴／裁決**：無；無需裁決（macOS-first 定位 #1 不變）。
+- **狀態（rev84）**：**工程交付，待 PR 與 owner 確認關票**。範圍 `a31a743...fcb41c1`（8 個 commit）。驗收 (1) 確認閘：`workspace_gate_test.go`、`workspace_assist_gate_test.go`、`workspace_confirm_test.go`、`workspace_audit_test.go`；(2) 高風險警示：前端 `WorkspaceConfirmBanner.test.ts`、`workspaceGate.test.ts`、`workspaceConfirmationApp.test.ts`；(3) fallback 路徑的確認閘測試：`workspace_resolver_test.go`、`workspace_gate_test.go`。完整 gate：`go test -race ./...` rc=0（23 個 package ok、無 `FAIL`／`DATA RACE`）、`go vet` rc=0、gofmt 0 位元組、`npm run build` rc=0、vitest 49 檔 704 條全綠；新增 Go 頂層測試 41 個、前端 +5 檔 +99 條。`git diff --check` 原始 rc=2，只剩 `models.ts` 兩行 tab 空行（Wails 產生檔），精確比對判定允許 2 項、其餘 0 項。證據（`b3a-evidence/b4/impl-evidence/`，SHA256 前 12 碼）：`final-go.log` `0badc218f63d`、`final-vitest.log` `b1e565898825`、`final-build.log` `1d3a5e0b2494`、`final-diffcheck.log` `1cbd3f2f87ea`、`final-whitespace-filter.log` `7bd6a87175af`。限制：codex CLI 自身的初始化寫入未驗證；啟動後外部檔案系統變動與 `cmd/probe-*` 不受保護；E2E 與 `b3a-e2e-ci` 未在本機跑，`HOME` 於 CI 的行為未驗證。
 
 ### B5 TaskRun／Gate 3／forge 契約設計（spec 級）
 
@@ -517,7 +520,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | B3b-ready | L2 前端與 binding 就緒訊號（產品票） | 0.6–1.0 | 6–10 hr；含 binding 分類守門、exactly-once、wailsjs 重新產生、App.vue 與 mock、CLIInfo sequencing、audit lifecycle |
 | B3b-RC-1 | L3 檢查清單與 release 政策 | 0.2–0.3 | 2–3 hr |
 | B3b-RC-2 | 首次 RC 實機執行與證據封存 | 0.1–0.2 | 1–2 hr；排機與等待不計工時 |
-| B4 | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | — |
+| B4（**工程交付，待 PR 與 owner 確認關票，rev84**） | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | —；點數不改，與實際工程量的差異屬估點檢討 |
 | B5 | TaskRun／Gate 3／forge 契約 spec（authoring＋gate 修訂輪工作量） | 1.2 | design gate 往返等候不計工時；(6c)(6d)(6e) owner 決議於 gate 中取得 |
 | B6a | gate 單一寫入者＋Gate 3 policy／manifest seams（rev6 拆） | 1.45 | B6 plan rev3 bottom-up 重估（原 1.4 pt 前提破壞作廢）；plan Task 1-6b＋10a |
 | B6b | 綁定持久化＋freeze latch seams（rev6 拆） | 0.6 | 同上；plan Task 7-9＋10b；B6a→B6b 為建議順序非相依 |
@@ -610,6 +613,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev84（2026-10-12）：B4 工程交付（範圍 `a31a743...fcb41c1`）。完整 gate 全綠（`go test -race` 23 個 package ok、vitest 49 檔 704 條）；`git diff --check` 原始 rc=2 僅剩 `models.ts` 兩行已知 tab 空行；E2E 與 CI 未在本機跑；尚未 push／PR／owner 確認關票。點數與其他票不變。
 - rev83（2026-10-10）：A4 關票。同一個 commit 上 Go 1.25.0／1.26.5 兩腳全綠，minimum 維持 `go 1.25.0`；`go.mod` 加上 `toolchain go1.26.5`；README 同步版本語意（見 `evidence/2026-10-10-a4-go-toolchain-matrix.md`）。
 - rev82（2026-10-10）：A5 關票。處置已由 `9cb2e67` 完成；重新產生驗證內容差異為零（見 `evidence/2026-10-10-a5-bindings-sync-verification.md`）。CI 沒有產生檔漂移檢查，列為觀察。
 - rev81（2026-10-10）：A3 關票（同類掃描紀錄見 `evidence/2026-10-10-a3-doc-version-closure.md`）；在本修訂記錄補上 rev76～rev80 的條目。
