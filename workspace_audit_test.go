@@ -256,3 +256,68 @@ func readAuditRaw(t *testing.T, a *App) string {
 	}
 	return string(b)
 }
+
+// audit best-effort（workspace-confirmation.feature；workspace_confirmation.go 註解）：audit 寫入失敗
+// 不影響確認，也不是放行的條件。做法：把 auditF 換成唯讀開啟的檔案，a.audit 的 Fprintf 因此寫入失敗
+// （錯誤被忽略）；測試先直接證明這個 writer 真的寫不進去，再驗證確認與後續啟動不受影響。
+func TestWorkspaceConfirm_AuditWriteFailureDoesNotBlockConfirmOrStart(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.wsReg = &stubRegistry{}
+	spawnLog, inputLog := writeCountingClaude(t, a)
+	w := mustCreate(t, a, "claude")
+
+	auditPath := filepath.Join(a.stateDir, "audit.jsonl")
+	if err := os.WriteFile(auditPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := os.Open(auditPath) // O_RDONLY：任何寫入都會失敗
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ro.Close() })
+	if _, werr := ro.WriteString("probe\n"); werr == nil {
+		t.Fatal("前提：唯讀 writer 的寫入必須失敗，否則這個測試沒有在測 audit 寫入失敗")
+	}
+	a.auditMu.Lock()
+	a.auditF = ro
+	a.auditState = auditReady // 與 production 一致：writer 開成功＝ready（寫入失敗不會改變狀態）
+	a.auditMu.Unlock()
+
+	makePending(a)
+	var audited atomic.Int32
+	a.hookAudit = func(kind string) {
+		if kind == "workspace_confirmed" || kind == "workspace_confirmation_blocked" {
+			audited.Add(1)
+		}
+	}
+	// 確認之前：啟動被閘門拒絕（blocked audit 也寫不出去，但拒絕不受影響）。
+	requireConfirmationError(t, a.StartSession(string(w), "hi", "", "", "t", ""))
+
+	if err := a.ConfirmWorkspace(a.workspaceDir); err != nil {
+		t.Fatalf("audit 寫入失敗不得讓確認失敗：%v", err)
+	}
+	if st := mustStatus(t, a); !st.Required || !st.Confirmed {
+		t.Fatalf("audit 寫入失敗時確認仍須轉為 Confirmed：%+v", st)
+	}
+	if audited.Load() != 2 { // blocked 一次、confirmed 一次：兩筆都「嘗試」寫了，才算真的走過失敗路徑
+		t.Fatalf("前提：blocked 與 confirmed 的 audit 都必須被嘗試寫入（2 次），實得 %d", audited.Load())
+	}
+
+	if err := a.StartSession(string(w), "hi", "", "", "t", ""); err != nil {
+		t.Fatalf("確認之後（audit 仍寫不進去）啟動不得被閘門擋下：%v", err)
+	}
+	t.Cleanup(func() { _ = a.EndSession(string(w)) })
+	waitTurnSettled(t, a, w)
+	if got := lineCount(t, spawnLog); got != 1 {
+		t.Fatalf("啟動必須真的 exec claude CLI 一次：%d", got)
+	}
+	if err := a.SendMessage(string(w), "second"); err != nil {
+		t.Fatalf("確認之後（audit 仍寫不進去）SendMessage 不得被閘門擋下：%v", err)
+	}
+	waitFor(t, "第二輪送進 CLI", func() bool { return lineCount(t, inputLog) == 2 })
+
+	// 證明寫入全程確實失敗：沒有任何 audit 內容落地。
+	if raw := readAuditRaw(t, a); raw != "" {
+		t.Fatalf("唯讀 writer 不應寫進任何 audit 內容：%q", raw)
+	}
+}

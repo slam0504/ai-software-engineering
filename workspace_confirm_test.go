@@ -62,15 +62,29 @@ func TestWorkspaceConfirmation_UnresolvedFailsClosed(t *testing.T) {
 // R3 處理順序：先核對路徑，再依狀態決定結果。三種狀態都要有「路徑不符會被拒」的測試，
 // 而且被拒之後狀態不變（Review Focus 2：字串必須完全相同，不接受任何別名）。
 func TestConfirmWorkspace_PathMismatchRejectedInEveryState(t *testing.T) {
-	setups := map[string]func(a *App){
-		"Pending":     func(a *App) { makePending(a) },
-		"Confirmed":   func(a *App) { makePending(a); _ = a.ConfirmWorkspace(a.workspaceDir) },
-		"NotRequired": func(a *App) { makeNotRequired(a) },
+	// wantRequired／wantConfirmed：子測試名稱宣稱的前置狀態。setup 之後、跑壞輸入之前逐一斷言，
+	// 否則 setup 悄悄失敗（例如 Confirmed 其實還是 Pending）時，整個測試仍會綠但沒有在測它宣稱的狀態。
+	setups := map[string]struct {
+		setup                       func(t *testing.T, a *App)
+		wantRequired, wantConfirmed bool
+	}{
+		"Pending": {func(t *testing.T, a *App) { makePending(a) }, true, false},
+		"Confirmed": {func(t *testing.T, a *App) {
+			makePending(a)
+			if err := a.ConfirmWorkspace(a.workspaceDir); err != nil {
+				t.Fatalf("前提：Confirmed 的 setup 必須確認成功：%v", err)
+			}
+		}, true, true},
+		"NotRequired": {func(t *testing.T, a *App) { makeNotRequired(a) }, false, false},
 	}
-	for name, setup := range setups {
+	for name, tc := range setups {
 		t.Run(name, func(t *testing.T) {
 			a, _ := newTestApp(t)
-			setup(a)
+			tc.setup(t, a)
+			if st := mustStatus(t, a); st.Required != tc.wantRequired || st.Confirmed != tc.wantConfirmed {
+				t.Fatalf("前提：[%s] 的前置狀態不符（want required=%v confirmed=%v）：%+v",
+					name, tc.wantRequired, tc.wantConfirmed, st)
+			}
 			ws := a.workspaceDir
 			alias := filepath.Join(filepath.Dir(ws), "alias-of-"+filepath.Base(ws))
 			if err := os.Symlink(ws, alias); err != nil {

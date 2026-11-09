@@ -154,7 +154,10 @@ describe('workspace confirmation store：確認流程', () => {
 
   // R3：前端必須傳 status.workspace 的原始字串——不縮短、不改寫成 ~、不 trim。
   it('ConfirmWorkspace 收到的是 status.workspace 原樣（含空白、中文、NFD 組合字元）', async () => {
-    const raw = '/Users/測試 user/café 專案 '
+    // 用 \u0301 逸出寫成真正的 NFD（e + 組合銳音符）；字面寫 é 可能被編輯器自動正規化成 NFC。
+    const raw = '/Users/測試 user/cafe\u0301 專案 '
+    expect(raw).toContain('\u0301')
+    expect(raw.normalize('NFC')).not.toBe(raw) // 確認字串真的是 NFD，被正規化成 NFC 時這裡會紅
     const wsc = await pendingStore(raw)
     const confirmFn = vi.fn(async (_p: string) => {})
     await wsc.confirm(confirmFn, async () => { await wsc.refresh(async () => ({ ...CONFIRMED, workspace: raw })) })
