@@ -361,9 +361,13 @@ func TestGate_PreservesExistingErrorPrecedence(t *testing.T) {
 	}
 	// 確認閘不會把 registryUncertain 加到 sendMessage：沒有 active session 時，
 	// 既有行為是 BeginSubmit 的錯誤，而不是 registryUncertain；Pending 時則是確認閘。
-	if err := a.SendMessage(string(w), "hi"); errors.Is(err, errRegistryUncertain) {
+	err := a.SendMessage(string(w), "hi")
+	if errors.Is(err, errRegistryUncertain) {
 		t.Fatalf("不得把 registryUncertain 加到 sendMessage：%v", err)
 	}
+	// 正向斷言：此刻 registry 不確定、狀態是 Pending，SendMessage 必須是被確認閘拒絕；
+	// 只排除 registryUncertain 的話，閘門被拔掉（改回 BeginSubmit 的錯誤）也會綠。
+	requireConfirmationError(t, err)
 }
 
 // 整條 production 啟動路徑（acquireStateLease → resolveWorkspace → 確認狀態 → 閘門）：
