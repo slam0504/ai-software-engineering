@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev86·估點版）
+# Pre-M4 Readiness Backlog（rev87·估點版）
 
-> 版本：rev86（2026-11-09）：**B3a-1 狀態文字補正**。B3a-1、B3a-1a、B3a-1b、B3a-1a-S1-offline 四列「目前狀態」仍寫「未提交、未推送、未開 PR、未合併」，與事實不符：PR #10（head `b3a-1/browser-e2e`）已於 2026-09-17 以 rebase merge 併入 main `0d3c113`，tree `7d43ff99` 與受審 commit `9ad67a6` 相同；README 對應更新為 PR #11（`b42025f`）。只改這四列的開頭狀態句；各列「以下保留歷史狀態」之後的同句、前版說明與修訂記錄中的同句屬歷史紀錄，不改。技術驗收結論、點數與其他票不變；未重跑任何測試。
+> 版本：rev87（2026-11-09）：**B4-F1 關票**。PR #41 以 rebase merge 併入 main `dee1a16`（1 個 commit、4 個測試檔，未改 production；tree `788d7276` 與受審 commit `d374405` 相同）。PR CI（run 42588104761）與合併後 main push CI（run 42593638898）的 checksums／frontend／go／wails-build 四項皆通過。驗收：四項完成；(1)(2)(3) 各以 mutation 證明紅在目標斷言（主審於隔離複本重跑），mutant 1、2 下舊版測試為綠（獨立審查確認），第 (3) 項為新增測試、無舊版對照；workspace 相關 42 個 Go 測試 `-race` 與前端該測試檔 58 條經獨立審查重跑通過；全量 `go test -race ./...`（23 個 package ok）、`go vet`、前端 build、vitest 49 檔 704 條為實作端 log，未獨立重跑。證據在 `~/b3a-evidence/b4-f1/`（repo 外，備份未確認）。**觀察**：實作端第一次全量 `-race`（與 vitest 同時執行）有三條 5 秒逾時，單獨重跑後全綠——`TestSessionDoneCarriesWSID`（`pump quiesce timeout`，不在牆鐘名單）、`internal/codex` `TestAppServerMidStreamDeath`（名單 #5，no-change disposition）、`internal/codex` `TestAppServerStderrCaptured`（不在牆鐘名單）；原因未明，「CPU 競爭」為假設，未改到相關檔案不足以確認無關，不以重跑變綠視為已處置，`wall-clock-test-register.md` 未更新。點數與其他票不變。
+
+> 前版：rev86（2026-11-09）：**B3a-1 狀態文字補正**。B3a-1、B3a-1a、B3a-1b、B3a-1a-S1-offline 四列「目前狀態」仍寫「未提交、未推送、未開 PR、未合併」，與事實不符：PR #10（head `b3a-1/browser-e2e`）已於 2026-09-17 以 rebase merge 併入 main `0d3c113`，tree `7d43ff99` 與受審 commit `9ad67a6` 相同；README 對應更新為 PR #11（`b42025f`）。只改這四列的開頭狀態句；各列「以下保留歷史狀態」之後的同句、前版說明與修訂記錄中的同句屬歷史紀錄，不改。技術驗收結論、點數與其他票不變；未重跑任何測試。
 
 > 前版：rev85（2026-10-12）：**B4 關票**（owner 2026-10-12 確認）。PR #38 以 rebase merge 併入 main `435b579`（範圍 `facf5df...435b579`，23 個 commit、48 個檔案；tree `a0e7ad69` 與 codex-reviewer 審查固定版本 `7c5921f` 相同，mailroom #1322／#1323）。PR CI（run 38235523244）與合併後 main push CI（run 38236372726）的 checksums／frontend／go／wails-build 四項皆通過。`b3a-e2e-ci` 沒有跑（只在 head 為 `ci/b3a-e2e-integration` 且加上指定 label 時觸發）；E2E、GUI 實際畫面、真實 CLI、CI 環境的 `HOME` 行為仍未驗證，保留為限制。B4-F1 維持待做；`RunEvidence` 不納入確認閘（owner 裁定）。點數與其他票不變。
 
@@ -319,6 +321,8 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **驗收條件**：四項完成；(1)(2)(3) 各以 mutation 證明會紅在目標測試；Go 相關套件與前端 vitest 全綠。
 - **依賴／裁決**：B4 合併後進行；不改 production 程式碼。
 - **不在範圍**：`RunEvidence` 納入確認閘（owner 2026-10-12 裁定不納入）。
+- **狀態（rev87）**：**已完成／關票**。PR #41 併入 main `dee1a16`（tree 與受審 `d374405` 相同）；PR 與 main CI 四項皆通過。mutation 證據與驗證範圍見版本行 rev87。
+- **觀察（rev87，原因未明，不阻擋關票）**：第一次全量 `-race` 與 vitest 同時執行時三條 5 秒逾時（`TestSessionDoneCarriesWSID`、`internal/codex` `TestAppServerMidStreamDeath`〔名單 #5〕、`TestAppServerStderrCaptured`），單獨重跑全綠；細節見版本行 rev87。
 
 ### B5 TaskRun／Gate 3／forge 契約設計（spec 級）
 
@@ -534,7 +538,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | B3b-RC-1 | L3 檢查清單與 release 政策 | 0.2–0.3 | 2–3 hr |
 | B3b-RC-2 | 首次 RC 實機執行與證據封存 | 0.1–0.2 | 1–2 hr；排機與等待不計工時 |
 | B4（**已完成，rev85**） | Workspace 確認閘＋高風險警示＋fallback 測試 | 0.6 | —；點數不改，與實際工程量的差異屬估點檢討 |
-| B4-F1（rev84 新增） | B4 確認閘測試強化四項（最終整體審查的 follow-up） | 0.1 | 約 0.5–1 hr；B4 合併後進行，不改 production |
+| B4-F1（**已完成，rev87**） | B4 確認閘測試強化四項（最終整體審查的 follow-up） | 0.1 | 約 0.5–1 hr；B4 合併後進行，不改 production |
 | B5 | TaskRun／Gate 3／forge 契約 spec（authoring＋gate 修訂輪工作量） | 1.2 | design gate 往返等候不計工時；(6c)(6d)(6e) owner 決議於 gate 中取得 |
 | B6a | gate 單一寫入者＋Gate 3 policy／manifest seams（rev6 拆） | 1.45 | B6 plan rev3 bottom-up 重估（原 1.4 pt 前提破壞作廢）；plan Task 1-6b＋10a |
 | B6b | 綁定持久化＋freeze latch seams（rev6 拆） | 0.6 | 同上；plan Task 7-9＋10b；B6a→B6b 為建議順序非相依 |
@@ -627,6 +631,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev87（2026-11-09）：B4-F1 關票。PR #41 併入 main `dee1a16`（只改 4 個測試檔）；PR 與 main CI 四項皆通過；三項 mutation 紅在目標斷言。三條逾時記為原因未明的觀察。點數不變。
 - rev86（2026-11-09）：B3a-1 四列「目前狀態」補正為已合併（PR #10，main `0d3c113`）；只改文件，點數不變。
 - rev85（2026-10-12）：B4 關票。PR #38 併入 main `435b579`（23 個 commit）；PR 與 main CI 四項皆通過；E2E、GUI、真實 CLI、CI `HOME` 未驗證。B4-F1 待做。點數與其他票不變。
 - rev84（2026-10-12）：B4 工程交付（範圍 `a31a743...fcb41c1`）。完整 gate 全綠（`go test -race` 23 個 package ok、vitest 49 檔 704 條）；`git diff --check` 第一次 rc=2（`models.ts` 兩行 Wails tab 空行），依 plan rev5 新增 `.gitattributes` 後重跑 rc=0；以 main 為基準時再依 plan rev6 加計畫檔單檔例外，rc=0；E2E 與 CI 未在本機跑；尚未 push／PR／owner 確認關票。B4 點數不變；新增 B4-F1（0.1 pt，最終審查的測試強化 follow-up）；`RunEvidence` 不納入確認閘（owner 裁定）。其他票不變。
