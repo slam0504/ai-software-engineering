@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev87·估點版）
+# Pre-M4 Readiness Backlog（rev88·估點版）
 
-> 版本：rev87（2026-11-09）：**B4-F1 關票**。PR #41 以 rebase merge 併入 main `dee1a16`（1 個 commit、4 個測試檔，未改 production；tree `788d7276` 與受審 commit `d374405` 相同）。PR CI（run 42588104761）與合併後 main push CI（run 42593638898）的 checksums／frontend／go／wails-build 四項皆通過。驗收：四項完成；(1)(2)(3) 各以 mutation 證明紅在目標斷言（主審於隔離複本重跑），mutant 1、2 下舊版測試為綠（獨立審查確認），第 (3) 項為新增測試、無舊版對照；workspace 相關 42 個 Go 測試 `-race` 與前端該測試檔 58 條經獨立審查重跑通過；全量 `go test -race ./...`（23 個 package ok）、`go vet`、前端 build、vitest 49 檔 704 條為實作端 log，未獨立重跑。證據在 `~/b3a-evidence/b4-f1/`（repo 外，備份未確認）。**觀察**：實作端第一次全量 `-race`（與 vitest 同時執行）有三條 5 秒逾時，單獨重跑後全綠——`TestSessionDoneCarriesWSID`（`pump quiesce timeout`，不在牆鐘名單）、`internal/codex` `TestAppServerMidStreamDeath`（名單 #5，no-change disposition）、`internal/codex` `TestAppServerStderrCaptured`（不在牆鐘名單）；原因未明，「CPU 競爭」為假設，未改到相關檔案不足以確認無關，不以重跑變綠視為已處置，`wall-clock-test-register.md` 未更新。點數與其他票不變。
+> 版本：rev88（2026-11-11）：**新增外部設計參考的連結**。新增 [`external-references.md`](external-references.md)（Grounder 規劃書 v1.0 與 review-bridge `50185a2` 的固定版本、可借用的機制、限制與對應票號；Grounder 全文沒有收錄）與 [`../collaboration/mailroom-templates.md`](../collaboration/mailroom-templates.md)（mailroom 交付信與審查信範本，限本專案試用）。C1、D1、D4、D5 各加一行「設計參考」連到對照文件的段落。這些都只是設計時的參考，不改變任何票的驗收條件、已凍結的契約或點數；未重跑任何測試。
+
+> 前版：rev87（2026-11-09）：**B4-F1 關票**。PR #41 以 rebase merge 併入 main `dee1a16`（1 個 commit、4 個測試檔，未改 production；tree `788d7276` 與受審 commit `d374405` 相同）。PR CI（run 42588104761）與合併後 main push CI（run 42593638898）的 checksums／frontend／go／wails-build 四項皆通過。驗收：四項完成；(1)(2)(3) 各以 mutation 證明紅在目標斷言（主審於隔離複本重跑），mutant 1、2 下舊版測試為綠（獨立審查確認），第 (3) 項為新增測試、無舊版對照；workspace 相關 42 個 Go 測試 `-race` 與前端該測試檔 58 條經獨立審查重跑通過；全量 `go test -race ./...`（23 個 package ok）、`go vet`、前端 build、vitest 49 檔 704 條為實作端 log，未獨立重跑。證據在 `~/b3a-evidence/b4-f1/`（repo 外，備份未確認）。**觀察**：實作端第一次全量 `-race`（與 vitest 同時執行）有三條 5 秒逾時，單獨重跑後全綠——`TestSessionDoneCarriesWSID`（`pump quiesce timeout`，不在牆鐘名單）、`internal/codex` `TestAppServerMidStreamDeath`（名單 #5，no-change disposition）、`internal/codex` `TestAppServerStderrCaptured`（不在牆鐘名單）；原因未明，「CPU 競爭」為假設，未改到相關檔案不足以確認無關，不以重跑變綠視為已處置，`wall-clock-test-register.md` 未更新。點數與其他票不變。
 
 > 前版：rev86（2026-11-09）：**B3a-1 狀態文字補正**。B3a-1、B3a-1a、B3a-1b、B3a-1a-S1-offline 四列「目前狀態」仍寫「未提交、未推送、未開 PR、未合併」，與事實不符：PR #10（head `b3a-1/browser-e2e`）已於 2026-09-17 以 rebase merge 併入 main `0d3c113`，tree `7d43ff99` 與受審 commit `9ad67a6` 相同；README 對應更新為 PR #11（`b42025f`）。只改這四列的開頭狀態句；各列「以下保留歷史狀態」之後的同句、前版說明與修訂記錄中的同句屬歷史紀錄，不改。技術驗收結論、點數與其他票不變；未重跑任何測試。
 
@@ -359,6 +361,7 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **驗收條件**：以**一個 provider＋GitHub＋一個 task＋一套 required checks**跑通——選定 task → 建立不可變 TaskRun snapshot → 注入核准 spec／plan／risk／permissions／TCA → 啟動 implementation session → 收集 diff 與測試證據 → 建立 PR → 讀取 required checks → Gate 3 人工決議；此段全程不離開 app；TaskRun 能回答「這段實作在什麼核准上下文中完成」。**Forge 回傳 eligible CR 不得經篩除後假綠（rev7 新增，B6 Task 5 施工事實核對對應）**：C1 決議時必須自 Forge 重讀完整 review 集合並查齊 permissions；針對「Forge 實際回傳了某具效力 reviewer 的 `CHANGES_REQUESTED`」的情形，驗收須證明該筆不會被篩除而得到假綠——`VerifyReviewSection`（B6 Task 5）依設計無法偵測 caller 整筆刪除某 reviewer 的 review（見該函式 doc-comment 之範圍聲明），完整性責任在 C1 的重讀重建路徑，非 Task 5 的 section-level 驗證。
 - **建議模組**：依 B5／B6 產出的 application service、forge adapter（GitHub）、frontend Gate 3 檢視。
 - **依賴／裁決**：依賴 **B1、B2、B3a、B3b、B4、B5、B6a、B6b**（rev3 明列；rev6 依拆票改 B6→B6a＋B6b）；完整 SC4 驗收由 **C2** 承載（rev3 新增，不再是「完成後另開」）；forge 裁決已定（#4）；**pilot provider 已裁決（owner 2026-08-27）：Claude**——現有實機證據已跑過 Bash 核可並實際寫檔，per-WSID 子行程是較自然的 TaskRun ownership 邊界；Codex 的共用 app-server generation 會為第一條垂直切片多帶一層共享生命週期複雜度。
+- **設計參考（rev88）**：[`external-references.md`](external-references.md) §2.4（事實來源與接受依據、歷史追溯）、§3.3（變更紀錄）、§3.5（授權紀錄規則）。只是設計時的參考；沿用 B5／B6 已凍結的契約，新增 schema 或判定語意須另列契約變更。
 
 ### C2 SC4 authoring-to-Gate-3 端到端驗收
 
@@ -378,6 +381,7 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **HEAD 證據**：`docs/superpowers/specs/2026-08-26-domainspec-spike-results.md` §六——step_rank 自動交叉檢查（擴規則面前必做）、`spec/rules/**` scope 擴充另立提案、A9 案例穩定 fixture repo、`CostEstimate.Max`＋static cost limit sign-off、host 層規則 I/O→facts 路徑設計。
 - **驗收條件**：M4.5 立項時逐項處理上列五項；正式採用與否為獨立 GO／NO-GO。
 - **依賴／裁決**：scope 擴充與 cost 策略需 owner 裁決；其餘工程項。
+- **設計參考（rev88）**：[`external-references.md`](external-references.md) §2.1–§2.3、§2.5（發布生命週期、判定順序漂移偵測、驗收案例、維護成本估算、語意差異）。只是設計時的參考；上列五項採用前提不變。
 
 ### D2a Audit tamper-evident 機制
 
@@ -402,12 +406,14 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
 - **背景**：單一 idle Claude 子行程實測約 385 MB RSS；「長對話、多工具、高頻輸出」尖峰未量測；第三 provider／ACP 前需有上限與警示。
 - **驗收條件**：定義並落地——每 provider session 上限、idle parking／suspend、CPU／RSS 警示、context 長度與 log 體積上限、evidence runner 併行上限。
 - **依賴／裁決**：上限數值需 owner 裁決；機制為工程項。
+- **設計參考（rev88）**：[`external-references.md`](external-references.md) §3.7（預算模型：絕對期限、以剩餘時間為上限、partial／unknown 用量標記）。只是設計時的參考；外部專案的預設值不沿用，範圍也與本票不等價。
 
 ### D5 BDD scenario 與測試的 metadata 自動追蹤
 
 - **背景**：目前條款→測試對應靠人工矩陣，測試名稱漂移無機制偵測。（rev78 以前原寫「不必導入 Cucumber runner」；rev79 起，owner 2026-10-01 決定 runner 由 **D7 票**在 D6b 之後導入。**本票在 D7b 證明等價 traceability 之前維持有效**；只有 D7b 對本票 (1)–(4) 逐項證明等價或更強，並提供 migration／rollback 與既有 ID 對照之後，才能把本票標為 superseded，否則只能整合、不能取代。）
 - **驗收條件**：(1) active scenario 具穩定 ID；(2) 測試以 metadata 宣告 scenario ID；(3) CI 驗證每個 active scenario 至少一個對應測試（掛 B2）；(4) 驗收報告可從 metadata 自動產生。
 - **依賴／裁決**：CI 部分依賴 B2；無需裁決。
+- **設計參考（rev88）**：[`external-references.md`](external-references.md) §3.2（驗收 ID 集合檢查）。只是設計時的參考；scenario 與測試之間允許多對多，並對齊本票與 D7b 的關係，不另建平行的追蹤機制。
 
 ### D6 票 AI 探索式測試與規格回饋流程（rev79 新增；aggregate，D6a＋D6b 完成才關）
 
@@ -631,6 +637,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev88（2026-11-11）：新增外部參考對照文件與 mailroom 範本；C1、D1、D4、D5 各加一行設計參考連結。不改驗收條件、契約或點數。
 - rev87（2026-11-09）：B4-F1 關票。PR #41 併入 main `dee1a16`（只改 4 個測試檔）；PR 與 main CI 四項皆通過；三項 mutation 紅在目標斷言。三條逾時記為原因未明的觀察。點數不變。
 - rev86（2026-11-09）：B3a-1 四列「目前狀態」補正為已合併（PR #10，main `0d3c113`）；只改文件，點數不變。
 - rev85（2026-10-12）：B4 關票。PR #38 併入 main `435b579`（23 個 commit）；PR 與 main CI 四項皆通過；E2E、GUI、真實 CLI、CI `HOME` 未驗證。B4-F1 待做。點數與其他票不變。
