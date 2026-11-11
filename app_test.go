@@ -100,10 +100,22 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // 不需要靠這裡放行。
 func waitTurnSettled(t *testing.T, a *App, w appcore.WSID) {
 	t.Helper()
-	waitFor(t, "turn 收尾（"+string(w)+"）", func() bool {
-		st, err := a.manager.State(w)
-		return err == nil && (st == contract.StateDone || st == contract.StateFailed)
-	})
+	// 不改通用的 waitFor：這裡自己輪詢（上限 15s、間隔 10ms、判定條件都與原本相同），
+	// 為的是逾時時能報出最後觀察到的 state 與讀取錯誤，方便區分「卡在 awaiting_approval」
+	// 與「從未進入 terminal」。失敗訊息仍以原本的前綴開頭，既有紀錄與搜尋對得上。
+	deadline := time.Now().Add(15 * time.Second)
+	var (
+		st  contract.SessionState
+		err error
+	)
+	for time.Now().Before(deadline) {
+		st, err = a.manager.State(w)
+		if err == nil && (st == contract.StateDone || st == contract.StateFailed) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for turn 收尾（%s）：last state=%v, last State() err=%v", w, st, err)
 }
 
 // newTestStateLease：**唯一的**測試用 ownership capability 產生點。
