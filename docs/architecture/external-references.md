@@ -17,7 +17,7 @@
 
 | 代號 | 來源 | 固定版本 | 取得與核對 |
 |---|---|---|---|
-| GR | Grounder 知識處理與規則推理系統規劃書 v1.0（2026-11-04） | SHA256 `f8b28d1abcbe5b7d80751edfc0cce7f81e45372c12b35abcf0332bcca674d269`（45,557 bytes） | owner 持有的個人規劃草稿，**尚未實作**；其中的門檻、工時、容量都是規劃假設。**全文沒有收錄在本 repo**，要等作者、來源與可公開的範圍確認之後再決定。本文件引用的 GR 段落編號，是給持有原檔的人對照用的；借用的內容在 §2 已經摘述。 |
+| GR | Grounder 知識處理與規則推理系統規劃書 v1.0（2026-11-04） | SHA256 `f8b28d1abcbe5b7d80751edfc0cce7f81e45372c12b35abcf0332bcca674d269`（45,557 bytes） | owner 持有的個人規劃草稿，**尚未實作**；其中的門檻、工時、容量都是規劃假設。**本 repo 不收錄全文**（owner 2026-11-11 決定）：我們只借用它的想法、邏輯與方法，原構想的作者也還在實驗中。SHA256 只用來識別當時參考的是哪一版草稿。本文件引用的 GR 段落編號，是給持有原檔的人對照用的；借用的內容在 §2 已經摘述。 |
 | RB | review-bridge（<https://github.com/fortes1219/review-bridge/tree/50185a26b14251969dbe0725fe2decb0e5599fd3>） | commit `50185a26b14251969dbe0725fe2decb0e5599fd3`，版本 0.3.0-rc.3，MIT 授權 | **只審查了選取的 18 個檔案**，清單見 §1.1。這 18 個檔的 git blob 雜湊，已和該 commit 的 tree 逐一比對相符（2026-11-11）。該 commit 共有 315 個檔，其餘 297 個沒有讀。**沒有執行過這個工具。** |
 
 ### 1.1 review-bridge 的審查範圍（18 個檔案）
@@ -42,10 +42,6 @@
   - `review-bridge/features/workOrder/acceptance.mjs`
   - `review-bridge/features/setupCheck/reviewerProbe.mjs`
   - `review-bridge/features/workOrder/workspaceEvidence.mjs`
-
-### 1.2 收錄 GR 全文時的做法（尚未執行）
-
-如果之後決定收錄 GR 全文，要保留原檔的位元組，不在檔案內加前言，以免原本的 SHA256 失效。作者、來源、版本、授權與 SHA256，改用旁邊的 README 記錄。
 
 ## 2. Grounder（GR）
 
@@ -196,4 +192,5 @@ DomainSpec 的整體 truth 順序是 conflict → deny → unknown → true（`i
 
 ## 5. 修訂記錄
 
+- 2026-11-11：GR 改為不收錄全文，只借用想法（owner 決定）；刪除原 §1.2「收錄 GR 全文時的做法」。
 - 2026-11-11：初版。依 owner 對兩份分析與草稿 1 的審查意見整理；GR 全文沒有收錄。
