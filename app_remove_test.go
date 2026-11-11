@@ -109,8 +109,14 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 取得 submission 後立刻註冊清理：測試中途失敗也要讓 slot 回到可正常收尾的狀態
-	// （LIFO：先於 mustStartClaude 的 EndSession 執行）。
-	t.Cleanup(func() { _ = a.manager.RejectSubmit(w, subID) })
+	// （LIFO：先於 mustStartClaude 的 EndSession 執行）。正常走到結尾時由下方的
+	// RejectSubmit 負責並檢查錯誤，這裡就不再重複。
+	submissionRejected := false
+	t.Cleanup(func() {
+		if !submissionRejected {
+			_ = a.manager.RejectSubmit(w, subID)
+		}
+	})
 	id := seedApproval(t, a, w)
 
 	if err := a.RemoveSession(string(w)); err == nil {
@@ -125,6 +131,12 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 	if got := a.manager.SlotCount("claude"); got != 1 {
 		t.Fatalf("失敗的移除必須保留 slot：%d", got)
 	}
+
+	// 讓 slot 回到可正常收尾的狀態，t.Cleanup 的 EndSession 才收得乾淨。
+	if err := a.manager.RejectSubmit(w, subID); err != nil {
+		t.Fatal(err)
+	}
+	submissionRejected = true
 }
 
 // TestRemoveOrderIsFrozen（§3.6.2）：六步凍結順序——釋放名額（decrement_count）
