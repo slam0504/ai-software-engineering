@@ -96,14 +96,22 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 	a, _ := newTestApp(t)
 	w := mustCreate(t, a, "claude")
 	mustStartClaude(t, a, w)
-	id := seedApproval(t, a, w)
 	mcpPath := filepath.Join(a.stateDir, "mcp-"+string(w)+".json")
 
+	// 順序必須受控：approval 事件與第一輪 result 若不分先後，result 先到時 reducer
+	// 會被晚到的 approval 從 done 改成 awaiting_approval（contract/state.go），
+	// waitTurnSettled 與 BeginSubmit 都會卡住。所以先等第一輪落地（done）、取得
+	// submission，**之後**才 seedApproval：submitting 期間 approval 只進 pendingBuf，
+	// 不碰 reducer，因此 state 與 submission 都不受影響，而 apprPending 照常登記。
 	waitTurnSettled(t, a, w) // §1.1 in-flight guard：先讓第一輪落地才拿得到 submission
 	subID, err := a.manager.BeginSubmit(w)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 取得 submission 後立刻註冊清理：測試中途失敗也要讓 slot 回到可正常收尾的狀態
+	// （LIFO：先於 mustStartClaude 的 EndSession 執行）。
+	t.Cleanup(func() { _ = a.manager.RejectSubmit(w, subID) })
+	id := seedApproval(t, a, w)
 
 	if err := a.RemoveSession(string(w)); err == nil {
 		t.Fatal("in-flight submission 期間移除必須 fail loud")
@@ -116,11 +124,6 @@ func TestRemoveGateBlocksSideEffectsWhenNotRemovable(t *testing.T) {
 	}
 	if got := a.manager.SlotCount("claude"); got != 1 {
 		t.Fatalf("失敗的移除必須保留 slot：%d", got)
-	}
-
-	// 讓 slot 回到可正常收尾的狀態，t.Cleanup 的 EndSession 才收得乾淨。
-	if err := a.manager.RejectSubmit(w, subID); err != nil {
-		t.Fatal(err)
 	}
 }
 
