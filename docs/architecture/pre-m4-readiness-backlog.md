@@ -1,6 +1,8 @@
-# Pre-M4 Readiness Backlog（rev88·估點版）
+# Pre-M4 Readiness Backlog（rev89·估點版）
 
-> 版本：rev88（2026-11-11）：**新增外部設計參考的連結**。新增 [`external-references.md`](external-references.md)（Grounder 規劃書 v1.0 與 review-bridge `50185a2` 的固定版本、可借用的機制、限制與對應票號；Grounder 全文沒有收錄）與 [`../collaboration/mailroom-templates.md`](../collaboration/mailroom-templates.md)（mailroom 交付信與審查信範本，限本專案試用）。C1、D1、D4、D5 各加一行「設計參考」連到對照文件的段落。這些都只是設計時的參考，不改變任何票的驗收條件、已凍結的契約或點數；未重跑任何測試。
+> 版本：rev89（2026-11-11）：**回填 B3b-CI-1 在 2026-11-10～11 的進展**。分成三種狀態記錄：方案核准（proposal-014 定稿，兩層 custody）、CI-1a 授權（拆成 CI-1a／CI-1b，只授權 CI-1a）、T0 未通過且 CI-1a 暫停（基線可重複性不足，目標項在全套 2 次與同檔診斷 1 次都失敗、單項 3 次通過，原因未明）。**沒有任何實作完成，也沒有任何驗收通過。** 依據在 repo 外、由 owner 持有，SHA256 記在 B3b 條目。估點表的數字不變；新的低信心估計只記在備註，尚未併入。未重跑任何測試。
+
+> 前版：rev88（2026-11-11）：**新增外部設計參考的連結**。新增 [`external-references.md`](external-references.md)（Grounder 規劃書 v1.0 與 review-bridge `50185a2` 的固定版本、可借用的機制、限制與對應票號；Grounder 全文沒有收錄）與 [`../collaboration/mailroom-templates.md`](../collaboration/mailroom-templates.md)（mailroom 交付信與審查信範本，限本專案試用）。C1、D1、D4、D5 各加一行「設計參考」連到對照文件的段落。這些都只是設計時的參考，不改變任何票的驗收條件、已凍結的契約或點數；未重跑任何測試。
 
 > 前版：rev87（2026-11-09）：**B4-F1 關票**。PR #41 以 rebase merge 併入 main `dee1a16`（1 個 commit、4 個測試檔，未改 production；tree `788d7276` 與受審 commit `d374405` 相同）。PR CI（run 42588104761）與合併後 main push CI（run 42593638898）的 checksums／frontend／go／wails-build 四項皆通過。驗收：四項完成；(1)(2)(3) 各以 mutation 證明紅在目標斷言（主審於隔離複本重跑），mutant 1、2 下舊版測試為綠（獨立審查確認），第 (3) 項為新增測試、無舊版對照；workspace 相關 42 個 Go 測試 `-race` 與前端該測試檔 58 條經獨立審查重跑通過；全量 `go test -race ./...`（23 個 package ok）、`go vet`、前端 build、vitest 49 檔 704 條為實作端 log，未獨立重跑。證據在 `~/b3a-evidence/b4-f1/`（repo 外，備份未確認）。**觀察**：實作端第一次全量 `-race`（與 vitest 同時執行）有三條 5 秒逾時，單獨重跑後全綠——`TestSessionDoneCarriesWSID`（`pump quiesce timeout`，不在牆鐘名單）、`internal/codex` `TestAppServerMidStreamDeath`（名單 #5，no-change disposition）、`internal/codex` `TestAppServerStderrCaptured`（不在牆鐘名單）；原因未明，「CPU 競爭」為假設，未改到相關檔案不足以確認無關，不以重跑變綠視為已處置，`wall-clock-test-register.md` 未更新。點數與其他票不變。
 
@@ -305,6 +307,44 @@ cleanup_incomplete，四案皆符合，非推自測試通過；四案的等待�
   - **B3b-CI-2** 因缺少可驗收的 L1 實作，整合與實跑驗收受阻。**B3b-ready、B3b-RC-1** 的產品實作與檢查清單／政策設計不以前置 L1 實作為條件，可獨立規劃；仍需遵循各票的授權與驗收；**B3b-RC-2** 的依賴維持原樣（B3b-RC-1 與可用的 Mac）。
   - **對發布門檻的影響**：rev78 的發布門檻要求 current `main` SHA 對應的 L1 run 已完成且 success。L1 尚未完成整合與實跑驗收，因此依此政策目前**不具備 Workbench App 版本發布資格**；這是發布政策，實際自動阻擋尚未整合／驗證，不影響一般文件 PR 合併；要例外放行，需要 owner 的書面同意並留下紀錄（沿用 rev78 的例外規則）。
   - 估點：原估 0.6–1.0 pt；已投入，實際工程人時未量測，不回填數字。
+- **B3b-CI-1 狀態（rev89，2026-11-10～11；接續上面的 rev80 狀態）**：以下分成三種不同的狀態，互不代表。**沒有任何實作完成，也沒有任何驗收通過。** 依據都在 repo 外、由 owner 持有的證據目錄，檔案與 SHA256 見本條目末。
+  1. **方案核准（不是實作授權，也不是驗收）**——DECISION 補充決策 6、7（2026-11-10）：
+     - 恢復 B3b-CI-1，範圍先限定為修訂方案、有界 spike 與剩餘估點。
+     - proposal-014 從 draft 2 改到 draft 8；方案審查前六輪都是 NEEDS_REVISION，draft 8 通過。定稿為 `PROPOSAL-FINAL.md`，整併時另外處理了 13 項 draft 之間的不一致，記錄在定稿 §13。
+     - 主案是兩層 custody：driver 自己 fork、子程序 exec，取代原本由 supervise 中介的三層架構。上面 rev80 狀態所說「若採 driver 直接持有…需另行立項」的方向，即由補充決策 6 選定。
+     - 已核准的契約變更：DECISION 第 1 點改為原子建立新的 rundir、已存在即拒絕；K2 改為完整觀察窗加上窗後由 driver 直接判定；node 在「未確認 exec、因 signal 終止、driver 事先未送 signal」時改判 error（驗收契約收緊）；spawn 的期限例外只限 kernel fork 沒有硬性時間上限。
+     - 明列為既有剩餘風險、沒有解決的項目：gate 檢查與 exec 之間的窗口；受測程序可以修改原目錄內的內容（P-R4 不解除）。
+     - 定稿 §11 列出 35 項實作階段的必要驗證（V-01～V-35），**全部尚未執行**。
+  2. **CI-1a 授權（不是驗收通過）**——DECISION 補充決策 8（2026-11-10）：
+     - B3b-CI-1 拆成 CI-1a（custody 模組、rundir、期限、外部 signal、讀取路徑、靜態檢查與單元層驗證）與 CI-1b（driver 整合、K2、移除 supervise、整合測試、預設值重新量測、正式 run、整體 mutation）。每張最多兩輪複審，仍有阻擋項就停止回報。
+     - 只授權 CI-1a，而且限定在 repo 外、離線、fake-only 的環境。**CI-1b、native、repo 修改、CI、發布都沒有授權。**
+     - 補充決策 7 記錄的低信心估計：CI-1a 1.3–1.7 pt、CI-1b 0.9–1.4 pt，不含等待審查的時間。這組估計**還沒有併入下方估點表的數字**。
+  3. **T0 未通過，CI-1a 暫停**——DECISION 補充決策 9（2026-11-11）：
+     - CI-1a 的第一步（T0）是在 source032 的複本上重新建立全套測試的基線。**T0 沒有通過；T1 之後的任務都還沒有開始，沒有寫任何實作程式碼。** source、測試與 timeout 都沒有修改。
+     - 目標項是 `TestM1PlantedFifoLeavesNothingBehind.test_fifo_at_unreaped_children_log_is_never_touched_on_a_normal_run`，症狀是 `cli_probe_codex` 內 node 探測的 `outer_subprocess_timeout_exceeded:6.0`。各次執行：
+
+       | 執行 | 範圍 | 結果 | 目標項 |
+       |---|---|---|---|
+       | run 001 | 全套 | 439/447（7 個失敗、1 個錯誤） | 失敗 |
+       | run 002 | 全套（補齊兩支測試輸入之後） | 446/447（1 個失敗） | 失敗 |
+       | 單項量測 | 目標項與一個對照項，各 3 次 | 6/6 通過 | 3/3 通過 |
+       | 診斷 D1 | 完整 discovery 後，依原順序篩出同一個測試檔的 16 項 | 14/16（2 個失敗） | 失敗 |
+       | 診斷 D2 | 沒有執行（D1 已重現，依停止條件不跑） | — | — |
+
+     - run 001 的那個錯誤，原因是基線計畫漏了兩支測試會讀取的輸入檔，補齊後消失；這是計畫的錯誤，已揭露。
+     - D1 的另一個失敗是 `TestH1WedgedHelperLeavesNothingBehind.test_node_helper_supervise_frozen`，沒有分析。
+     - **原因未明。** D1 證明不必執行其他檔案的測試就能重現；但 D1 仍然做了完整的 discovery，不能排除其他模組載入的影響。負載、執行順序與其他環境因素的影響都還沒有分離。現有的負載取樣不能證明負載尖峰來自其他工作；即使在低負載下重現，也不足以完全排除環境因素。
+     - 這個失敗和 rev80 之前記錄的 O6 **只是症狀同形**，不視為已確認是同一個問題。
+     - 基線的可重複性不足，T0 的驗收條件不放寬；也不核准「之後同一個 timeout 就不算回歸」。
+     - 下一步：先安排可以控制的驗證時段或環境，重新建立 T0 基線，通過之後才進 T1；O6 的調查範圍之後再決定。
+  - **不變的部分**：B3b-CI-2 仍然因為缺少可驗收的 L1 實作而受阻；發布門檻與「目前不具備 Workbench App 版本發布資格」的結論不變；B3b-ready、B3b-RC-1、B3b-RC-2 的狀態不變。
+  - **repo 外的依據（owner 持有；備份狀況未確認）**：
+    - 交接檔 `HANDOFF-2026-11-11.md`：SHA256 `7b011b5664d09cfc12c88dcd822987ad6a88bd371bc6ccbf6770c10d366cc0fe`
+    - `DECISION.md`（含補充決策 6～9）：SHA256 `f29d817ce5be87b518b91c0978a02fb0743e2424f45f798bb9a6a4030554a10a`
+    - 方案定稿 `PROPOSAL-FINAL.md`：SHA256 `09e2f505eab8700ed96ce2494bd9ad9aa81d760a118b47e82b79e37d4c1d4998`
+    - CI-1a 計畫 `ci1a-plan-001/plan.md`：SHA256 `01292a0176149f723a768a0d1d0aec6b1ed74234c1d692aa88f8a3092c8a7066`
+    - 單項量測 `MEASURE.md`：SHA256 `8127334b68fa6f7d05cd468f7bf7848a325a6217575a656090bef333df85ec2e`
+    - 診斷 `DIAG.md`：SHA256 `09c0429e17caf8758a275f8f6e9b9f4bbe2c07d843e917db6a05a1ea697f5548`
 
 ### B4 Workspace 明確確認
 
@@ -538,7 +578,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 | B3a-2b | session recovery、approval 兩條流程，以 replay provider 驅動 | **spike 後再估，不計入小計** | **Task B**（bounded App 探索，經 `codexHostOverride` seam）**已完成**；**Task C**（單一 browser 整合檢查點 `commandExecution-allow`）**技術驗收通過，帶明列限制**（結案 [`2026-09-21-b3a-2b-2-task-c-closure.md`](evidence/2026-09-21-b3a-2b-2-task-c-closure.md)）；**Task D**（四案 browser matrix，含 F1／F2）**技術驗收通過；PR #17 已合併**（結案 [`2026-09-21-b3a-2b-2-task-d-f1-f2-closure.md`](evidence/2026-09-21-b3a-2b-2-task-d-f1-f2-closure.md)）；**Task E**（E1 兩輪 fake 協定＋共用判定，E2 真 UI End→Start recovery）**技術驗收完成**——範圍限於**單一 `commandExecution`／兩輪 accept、同一 App 執行期／同一 WSID／同一 generation** 的受控 fake checkpoint（結案 [`2026-09-21-b3a-2b-2-task-e-recovery-closure.md`](evidence/2026-09-21-b3a-2b-2-task-e-recovery-closure.md)）；**Task F1／F2**（Claude 單一 fresh-start approval allow：F1a／F1b 離線協定判定＋真 `mcp-approval` 與真 broker，F2 真 App／UI 檢查點）**限定技術驗收完成**（rev71，結案 [`2026-09-21-b3a-2b-2-task-f1-f2-claude-approval-closure.md`](evidence/2026-09-21-b3a-2b-2-task-f1-f2-claude-approval-closure.md)）；**Claude same-App recovery 限定檢查點**（同一 App 執行期／同一 WSID／canonical cwd，fresh → allow → 自然退出 → UI End → `--resume S` → 第二輪 allow）**技術驗收通過**（rev72，結案 [`2026-09-22-b3a-2b-2-claude-recovery-checkpoint-closure.md`](evidence/2026-09-22-b3a-2b-2-claude-recovery-checkpoint-closure.md)）；**Claude approval deny 限定檢查點**（使用者填入 run 專屬理由後實際按下拒絕，決策逐層傳遞）**技術驗收通過**（rev73，結案 [`2026-09-22-b3a-2b-2-claude-approval-deny-closure.md`](evidence/2026-09-22-b3a-2b-2-claude-approval-deny-closure.md)）；**最終快照 `default`／`controls` 回歸已實跑**（rev74，A run `20260922T003535Z-885415`／B run `20260922T003926Z-3503c4` 皆 PASSED，回歸紀錄 [`2026-09-22-b3a-2b-2-final-regression.md`](evidence/2026-09-22-b3a-2b-2-final-regression.md)）；**目前狀態：限定功能與最終回歸均已驗收，Task F／B3a-2b 於 #411 範圍內技術驗收完成（複核 #414）；結案文件待交付**；**B3a aggregate 仍未完成**——**App 冷啟動讀盤已於 rev74 拆為後續候選票**（待設計／估點／施工授權，未核定為要求、未給點數）；其餘未驗能力包含 server replacement、真實 Claude provider、多 session、三輪以上、逾時自動 deny 實跑、正式 CI（**依原契約判定是否為必要條件；本系列未新增需求**，且條件 (2) 明文把 live provider 排除在 required 之外），亦未證明 backend 空 resume 的 registry fallback（rev70）。**Claude 端的 provider 一律是受控 fake**，三份 Claude 結案都不涵蓋真實 provider 行為。**票面兩條流程（session recovery／approval）目前對兩個 provider 皆已有限定檢查點**；rev73 的關票前追溯已於 rev74 完成範圍裁定與最終回歸複核；**B3a aggregate 另需 B3a-2a 核心流與 B3a-CI 的正式 CI 整合**，兩者不由本票承擔 |
 | B3a-CI | **單次可行性驗收完成（rev64）；CI-1／CI-2 限定技術驗收完成（rev76）。** 原始可行性範圍：macOS runner 能啟動 `wails dev`、完成 smoke、收尾及上傳證據。後續受控整合已完成同一 source 的 13 個 entry 與代表性 timeout／cancel／artifact 負例；source PR [#26](https://github.com/slam0504/ai-software-engineering/pull/26) 已合併為 `a3c3e39a`，main tree 與受測 tree 相同，main push CI `36381327268` 首跑四項 success。診斷 PR #27 已關閉未合併。兩次歷史 failure、驗證界線、artifact 保存期限與 watcher 差異見[結案紀錄](evidence/2026-09-28-b3a-ci-1-ci-2-closure.md)。 | **0.4**（3–5 hr，中位 4 hr；CI 等候時間另列，不算工時） | **受控、label-triggered、non-required 範圍技術驗收完成**；CI-3(a) 日常啟用與 CI-3(b) required 化均未授權。B3a aggregate 已依原條件在 rev77 技術驗收完成；此列 0.4 pt 只保留原始可行性估算，不代表 CI-1／CI-2 工程量或實際工時。 |
 | B3b（aggregate） | 最小 native smoke（rev78 重新定位為三層） | **不單獨計入**（原 0.5 pt 改列歷史估計；rev78 以前已投入工時「已投入、未量測」，不回填） | 由下列五張子票承接；剩餘工程暫估合計 17–29 hr（1.7–2.9 pt），開工前逐張細估 |
-| B3b-CI-1（**已停止，rev80**；停在 repo 外的 candidate-013，review013 CHANGES_REQUIRED） | L1 實作與離線測試（重用 P0 已驗證元件、CLI probe、反例矩陣、mutation） | 0.6–1.0 | 6–10 hr（原估）；已投入，實際工程人時未量測 |
+| B3b-CI-1（**rev89：方案已核准；CI-1a 已授權但 T0 未通過、暫停；沒有實作完成**。rev80：停在 repo 外的 candidate-013，review013 CHANGES_REQUIRED） | L1 實作與離線測試（重用 P0 已驗證元件、CLI probe、反例矩陣、mutation） | 0.6–1.0 | 6–10 hr（原估）；已投入，實際工程人時未量測。rev89：拆成 CI-1a／CI-1b 後的低信心估計為 1.3–1.7 pt 與 0.9–1.4 pt，尚未併入本表的數字 |
 | B3b-CI-2 | L1 實跑與 CI 發布（`push` 至 `main` 時執行、首輪證據；non-required、非 pre-merge；發布只在 current main SHA 的 L1 已完成且 success 時允許，缺席、未完成或非 success 一律阻擋） | 0.2–0.4 | 2–4 hr；runner 等候不計工時；native 執行需另外授權 |
 | B3b-ready | L2 前端與 binding 就緒訊號（產品票） | 0.6–1.0 | 6–10 hr；含 binding 分類守門、exactly-once、wailsjs 重新產生、App.vue 與 mock、CLIInfo sequencing、audit lifecycle |
 | B3b-RC-1 | L3 檢查清單與 release 政策 | 0.2–0.3 | 2–3 hr |
@@ -637,6 +677,7 @@ rev1／rev2 誤將此系列列為 pending——實際工作**均已於外部審�
 ---
 
 ## 修訂記錄
+- rev89（2026-11-11）：回填 B3b-CI-1 的進展——方案核准、CI-1a 授權、T0 未通過且暫停，三種狀態分開記錄；沒有實作完成。估點表的數字不變。
 - rev88（2026-11-11）：新增外部參考對照文件與 mailroom 範本；C1、D1、D4、D5 各加一行設計參考連結。不改驗收條件、契約或點數。
 - rev87（2026-11-09）：B4-F1 關票。PR #41 併入 main `dee1a16`（只改 4 個測試檔）；PR 與 main CI 四項皆通過；三項 mutation 紅在目標斷言。三條逾時記為原因未明的觀察。點數不變。
 - rev86（2026-11-09）：B3a-1 四列「目前狀態」補正為已合併（PR #10，main `0d3c113`）；只改文件，點數不變。
